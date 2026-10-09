@@ -933,8 +933,9 @@ class Engine:
     async def _dr_release_drain(self) -> dict[str, object]:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
         listeners (stop accepting new intake), drain the staged queue (every drainable NOT-DONE row
-        delivered or dead-lettered), then latch the run-profile OFF and clear the runner's threshold,
-        so a later operator reload stops parking feeds (vault BACKLOG #3067). Within the DR store
+        delivered or dead-lettered), then latch the run-profile OFF and clear the runner's threshold
+        (vault BACKLOG #3067). The box is then passive, so the runner parks every outbound at once
+        and a later reload starts none (vault BACKLOG #3262). Within the DR store
         at-least-once + idempotency make the drain safe; cross-store reconciliation is
         operator-verified per the runbook. Returns only once intake is unbound and the drain has
         ended (no dual-accept window).
@@ -974,6 +975,7 @@ class Engine:
             rr.restore_dr_intake(before)
             raise
         self._set_dr_active(False)
+        await rr.close_passive_connectors()  # a passive box holds no partner session open
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
 
     async def _drain_pipeline(

@@ -102,6 +102,7 @@ import {
 import { buildSegmentScope, sampleSegments } from "./hl7scope";
 import { pickHl7Path, type PickScope } from "./hl7Picker";
 import { nonce } from "./cspNonce";
+import { STARTUP_BANNERS } from "./webviewMessaging";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
@@ -1300,6 +1301,7 @@ function pageHtml(
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <div class="bar">
     <span data-tip="Filter the visible steps by text — segment, field path, action, or Send target"><input id="stepsFilter" type="search" placeholder="Filter steps…" /></span>
     <span class="sep"></span>

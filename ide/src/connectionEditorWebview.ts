@@ -5,7 +5,7 @@
 // loaded without `vscode`. connectionEditor.ts builds the page and embeds this; the unit suite
 // evaluates the SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise
 // is what ships.
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, embedJson, guardScript } from "./webviewMessaging";
+import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 /** What the connection editor's script is seeded with, each embedded as JSON. */
 export interface ConnectionEditorScriptInputs {
@@ -21,7 +21,7 @@ export interface ConnectionEditorScriptInputs {
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
 export function connectionEditorScript(token: string, p: ConnectionEditorScriptInputs): string {
   return `
-    const vscode = acquireVsCodeApi();${guardScript(token)}${SHAPE_HELPERS}
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const INITIAL = ${embedJson(p.initial)};
     const ROUTERS = ${embedJson(p.routers)};
     // The installed engine's transport list when it could be fetched, else the legacy constant.

@@ -29,7 +29,9 @@ import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
+import httpx
 import pytest
+from _ui_clients import HEADERLESS_UI_REQUEST
 
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
@@ -205,3 +207,43 @@ def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
         yield
     finally:
         logging.raiseExceptions = prior_raise
+
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
+    """Give a state-changing /ui request that names no provenance ``Sec-Fetch-Site: same-origin``.
+
+    ``assert_same_origin`` refuses a write carrying neither ``Sec-Fetch-Site`` nor ``Origin``
+    (BACKLOG #1116, #1124). These suites drive /ui through an in-process ASGI client standing in for
+    the operator's browser, and a browser sends ``Sec-Fetch-Site`` on its own form POST. Without this
+    every such test would have to spell that header out, and the ones that forgot would measure the
+    provenance refusal instead of their subject.
+
+    It only fills a GAP. A request that already carries either header is sent untouched, so every
+    cross-site, same-site and ``Origin``-fallback test still exercises the branch it names. A request
+    marked :data:`HEADERLESS_UI_REQUEST` is sent untouched too. Only the in-process ASGI transport is
+    wrapped, so a real outbound ``httpx`` call is never altered.
+    """
+    original = httpx.ASGITransport.handle_async_request
+
+    @functools.wraps(original)
+    async def as_a_browser(self: httpx.ASGITransport, request: httpx.Request) -> httpx.Response:
+        if (
+            request.method not in _SAFE_METHODS
+            and request.url.path.startswith("/ui")
+            and not request.extensions.get(HEADERLESS_UI_REQUEST)
+            and "sec-fetch-site" not in request.headers
+            and "origin" not in request.headers
+        ):
+            request.headers["sec-fetch-site"] = "same-origin"
+        return await original(self, request)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(httpx.ASGITransport, "handle_async_request", as_a_browser)
+    try:
+        yield
+    finally:
+        patch.undo()

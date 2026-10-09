@@ -16,7 +16,7 @@ import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
 import { testBenchScript } from "./testBenchWebview";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import {
   judgeCollectionRun,
   heldAfterIncoming,
@@ -699,6 +699,7 @@ export class TestBench {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <div class="bar">
     <button id="load">Load Message Set</button>
     <button id="savecoll" ${this.rows.length ? "" : "hidden"}>Save as Collection…</button>

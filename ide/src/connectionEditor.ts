@@ -10,7 +10,7 @@ import { configDir, runJson, workspaceDir } from "./cli";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
-import { openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { connectionEditorScript } from "./connectionEditorWebview";
 
 // The ConnObj shape lives in the pure connectionMerge.ts (the mocha-run unit tests import it and
@@ -296,6 +296,7 @@ export function connectionFormHtml(
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <div id="conn-picker-row" style="display:none;margin-bottom:10px;">
     <label for="connPicker">Connection in this file</label>
     <select id="connPicker"></select>

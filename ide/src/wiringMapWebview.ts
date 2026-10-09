@@ -4,13 +4,13 @@
 // The Wiring Map webview's inline script, split out of wiringMap.ts so it can be loaded without
 // `vscode`. wiringMap.ts builds the page and embeds this; the unit suite evaluates the SAME source
 // in a jsdom page (webview-receivers.test.ts), so what the tests exercise is what ships.
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, guardScript } from "./webviewMessaging";
+import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, guardScript } from "./webviewMessaging";
 
 /** The whole inline `<script>` body for one render, guard included. `token` is this render's
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
 export function wiringMapScript(token: string): string {
   return `
-    const vscode = acquireVsCodeApi();${guardScript(token)}${SHAPE_HELPERS}
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const SVGNS = 'http://www.w3.org/2000/svg';
     const KINDS = ['inbound', 'router', 'handler', 'outbound'];
     const HEADERS = ['INBOUND', 'ROUTERS', 'HANDLERS', 'OUTBOUND'];

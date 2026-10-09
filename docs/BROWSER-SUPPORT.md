@@ -1,9 +1,16 @@
 # Browser support
 
-**The console warns, it never blocks.** Every browser security feature it relies on is
-defense-in-depth. When a browser does not support one, the console keeps working and either shows you
-a warning or falls back to a server-side control that does the same job. This page states which
-features those are and what each absence costs you.
+**When a browser lacks a security feature the console relies on, the product warns you, refuses the
+request, or leans on a control that does not need the browser.** Each row on this page says which of
+the three applies:
+
+- **Warns.** The page shows a message you can read.
+- **Fails closed.** The server refuses the request, or the page does nothing.
+- **Named control.** Something that does not depend on the browser does the same job, and the row
+  names it.
+
+Where a row has none of the three, the row says so in those words. At least one such case is left:
+see [Two configurations turn the warnings off](#two-configurations-turn-the-warnings-off).
 
 It covers the operator UI at `/ui`, the IDE extension's webviews, and at least these engine routes
 outside `/ui` that a browser reaches:
@@ -12,6 +19,9 @@ outside `/ui` that a browser reaches:
   checks the handshake's `Origin` header before it accepts the socket.
 - **The API documentation pages**, served only when you set `[api].expose_docs = true`. They are off
   by default. See [the engine's API pages](#the-engines-api-pages-load-third-party-scripts) below.
+- **The client-network denial page**, served in place of any route when
+  `[security].allowed_client_networks` refuses your address. See
+  [the denial page](#the-client-network-denial-page-needs-no-browser-feature) below.
 
 The engine's other routes serve programs, mostly with JSON. This page makes no claim about what a
 browser does with them.
@@ -25,7 +35,9 @@ browser does with them.
 >   console's code, or in the engine's WebSocket check, has no row, if a row's
 >   **Allowed** or **Refused** verdict stops matching what the code does without that header, if
 >   the opt-out cookie names or the HSTS conditions change, or if the list of IDE webviews or the
->   one with a startup check changes.
+>   one with a host-side startup check changes. It also fails if an IDE panel stops carrying the two
+>   banners quoted below, if their wording here drifts from the code, if the denial page's header
+>   or policy changes, or if FastAPI's API pages gain or lose a no-JavaScript message.
 >
 > Nothing checks the middle column of the request-header table, the API pages' list of what they
 > load, or the IDE table's description of each panel. Those were read or measured when written.
@@ -99,7 +111,7 @@ paired with a control that does not depend on the browser.
 | `Referrer-Policy` | Referrer suppression via the header. | The same policy is carried in the page itself by a `<meta name="referrer">` tag, and `/ui` URLs carry no operator-typed search term and link off-site nowhere. |
 | `Strict-Transport-Security` | The browser's own downgrade protection. The engine sends it only when you supplied a certificate chain or declared a TLS terminator. It is absent on the engine's minted self-signed certificate, which is the shipped default, and on any IP-literal host such as `127.0.0.1`. RFC 6797 tells a browser to ignore it in both places anyway. | The engine's own listener speaks only TLS unless `[api].tls_terminated_upstream` declares a proxy in front of it. Behind such a proxy, redirecting cleartext to HTTPS is the proxy's job, and nothing in the engine checks that it does. The insecure-connection banner above makes a cleartext hop visible in the page. |
 | Session cookie `__Host-` prefix (`__Secure-` under the opt-out below), `Secure`, `HttpOnly` | Prefix and transport binding on the session cookie. | `HttpOnly` is what makes these invisible to a page script in the first place. They are only ever set where a browser will honour them, session termination is server-side, and every state-changing `/ui` POST carries a server-side `Sec-Fetch-Site` / `Origin` check. |
-| Session cookie `SameSite=Strict` | The browser's own cross-site request block. | That same server-side `Sec-Fetch-Site` / `Origin` check, on every state-changing `/ui` POST including login and logout. A browser that ignores `SameSite` still cannot be driven cross-site, as long as it sends one of those two headers. The request-header table below says what happens when it sends neither. |
+| Session cookie `SameSite=Strict` | The browser's own cross-site request block. | That same server-side `Sec-Fetch-Site` / `Origin` check, on every state-changing `/ui` POST including login and logout. A browser that ignores `SameSite` still cannot be driven cross-site: a state-changing request that carries neither header **fails closed** with a 403, as the request-header table below says. |
 | `sandbox` in the attachment download's `Content-Security-Policy` | On `/ui/messages/<id>/attachments/<id>`, the engine serves the file under `default-src 'none'; sandbox; frame-ancestors 'none'; base-uri 'none'`. A browser that ignores `sandbox` no longer puts the file in a unique, script-less origin of its own. | The response is always `Content-Disposition: attachment`, so the browser saves the file rather than showing it. Its declared type is an allow-listed inert type (PDF, image, plain text, CSV, JSON, DICOM) or `application/octet-stream`, and `nosniff` applies. The same policy's `default-src 'none'` still blocks every script in a browser that enforces CSP at all. Only a browser that ignored `sandbox`, `Content-Disposition` and `default-src` together would open the file in the console's origin, and nothing would warn you. |
 
 ### Request headers the browser sends
@@ -110,11 +122,11 @@ unchecked by that rule.
 
 | Header | What the server does with it | When the browser does not send it |
 |---|---|---|
-| `Sec-Fetch-Site` | On every `/ui` request, static files included, a value of `cross-site` or `same-site` is refused with a 403. The one exception is a safe top-level navigation, defined by the next three rows. Every state-changing `/ui` POST refuses those two values again. | **Allowed.** The middleware passes the request. On a POST, the `Origin` check below takes over. The `SameSite=Strict` session cookie stays the main cross-site control. |
+| `Sec-Fetch-Site` | On every `/ui` request, static files included, a value of `cross-site` or `same-site` is refused with a 403. The one exception is a safe top-level navigation, defined by the next three rows. Every state-changing `/ui` POST refuses those two values again, and refuses any other non-empty value that is not exactly `same-origin` or `none`. Only those two let the POST through on this header alone. The complete rule is the table in the `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which a test drives row by row. | **Allowed** by the middleware, which passes the request. A page read then rests on the `SameSite=Strict` session cookie. A state-changing POST does not get through on this alone: the `Origin` check below takes over, and it refuses a POST that carries neither header. |
 | `Sec-Fetch-Mode` | A `cross-site` or `same-site` request passes only as a `navigate` GET or HEAD. The Kerberos and OIDC sign-in routes also reject, and audit, any mode other than `navigate`. | **Refused** by the middleware, which reads it only after `Sec-Fetch-Site` said `cross-site` or `same-site`. The sign-in routes allow a request without it. |
 | `Sec-Fetch-Dest` | That navigation must be for a `document`. This refuses cross-site framing before anything is served. | **Refused**, and read only after `Sec-Fetch-Site` said `cross-site` or `same-site`. |
 | `Sec-Fetch-User` | A `same-site` navigation must carry `?1`, meaning the user started it with a click or a key. A `cross-site` one is not asked for it, so an identity provider's redirect back to the console still works. | **Refused**, and read only for a `same-site` navigation. |
-| `Origin` on a form POST | Read only when `Sec-Fetch-Site` is missing. It must equal `[security].web_console_public_address` when that is set, or else the request's `Host`. Behind a proxy in front of a loopback bind with no public address set, nothing matches and the POST is refused. | **Allowed.** The code assumes a browser sends `Sec-Fetch-Site` or `Origin` on every cross-site POST. A browser that sends neither passes, and `SameSite=Strict` is then the only cross-site control. On the sign-in POST, which has no session cookie yet, that leaves none. |
+| `Origin` on a form POST | Read only when `Sec-Fetch-Site` is missing or empty. It must equal `[security].web_console_public_address` when that is set, or else the request's `Host`. Behind a proxy in front of a loopback bind with no public address set, nothing matches and the POST is refused. | **Refused.** A state-changing `/ui` request that carries neither `Sec-Fetch-Site` nor `Origin` **fails closed** with a 403 that says so, and nothing is changed. That covers the sign-in POST, which has no session cookie yet for `SameSite=Strict` to withhold, and sign-out. A browser that sends neither header on its own form POST cannot sign in. **Three sign-in GETs are deliberately not blocked for missing fetch metadata**, under owner rulings R4 and R4b of 2026-09-28: `GET /ui/sso`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its "leaving this site" page is skipped. The first two never run this check. The third runs it as a GET, and a GET that carries neither header goes on to the identity provider; the GET rows of the docstring table named in the `Sec-Fetch-Site` row above say the rest. Not measured in a real browser: the console sends `Referrer-Policy: no-referrer`, and the Fetch standard then has a browser send `Origin: null` on a form POST, which this check refuses as a mismatch. Measured against the code, not a browser: a POST with no `Sec-Fetch-Site` and `Origin: null` was already refused before this rule existed, so nothing is new for a browser that sends `Origin` and no `Sec-Fetch-Site`. The rule is new only for a browser that sends neither header on its own form POST, and whether such a browser can run the console at all is unmeasured. If one exists and Kerberos or federated sign-in is on, one of those three GETs could still give it a session whose writes are refused, sign-out included; that session would end at least by expiry or by an administrator revoking it. At least one `/ui` POST is outside this rule, the CSP report sink `/ui/csp-report`: it reads `Sec-Fetch-Site` only, because a browser's reporting agent sends no fetch metadata, and it changes nothing. |
 | `Origin` on the `/ws/stats` WebSocket handshake | The console's cookie handshake must come from the console's own origin, by the same rule as a form POST, or it is refused. The engine's own handshake path accepts a browser `Origin` only if `[api].ws_allowed_origins` lists it, and that list is empty by default. | **Allowed** by the `Origin` rule. A handshake with no `Origin` is treated as a program's, and the next check wants an `Authorization` header that a browser cannot set, so a browser still gets no socket. The dashboard then keeps its table current by polling over HTTP, and its queue-count line stays empty. Only an app built with authentication explicitly turned off, an embedding or development case, accepts the handshake. |
 
 ---
@@ -134,6 +146,12 @@ and **those three banners disappear from the page**:
 In both cases the console falls back to the engine's static `script-src 'self'` policy, and drops
 `Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy` and `Reporting-Endpoints`. The passkey
 line still appears, because it lives in the console's main script, which that policy still runs.
+
+**In these two configurations those three absences have none of the three answers.** The page does
+not warn, the server does not refuse, and no other control tells you that the browser ignores CSP or
+runs no script. The server-side controls in the tables above still hold. The first configuration is a choice you
+make by setting the variable. The second cannot be reached through `messagefoundry serve`, and
+nothing else covers it.
 
 The cookies differ between the two cases:
 
@@ -174,8 +192,17 @@ What that means for a browser:
 - **Their only CSP is `frame-ancestors 'none'; base-uri 'none'`.** It blocks framing and `<base>`
   injection and nothing else, so no script source is restricted, and the files carry no integrity
   hash. What runs is whatever those hosts serve that day.
-- **They need JavaScript and a route to those hosts.** Without either, the page renders blank, and
-  nothing tells you why.
+- **They need JavaScript and a route to those hosts, and they fail closed without either.** The
+  page then shows no documentation and offers nothing to click. What it tells you differs:
+  - `/redoc` with JavaScript off shows FastAPI's own line, "ReDoc requires Javascript to function."
+    That is a warning.
+  - `/docs` with JavaScript off is a blank page. It has no such line, so nothing tells you why.
+  - Either page with JavaScript on and those hosts unreachable is blank too, with no message.
+
+  A blank page here loses the page's own function. The `/openapi.json` schema the pages read is
+  served the same way with or without JavaScript, so a blank page hides nothing that a direct
+  request would not get. A blank page is still not a warning, and this page does not count it as
+  one.
 - The engine still sends `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and
   `Referrer-Policy: no-referrer` on them, as on every response.
 
@@ -190,32 +217,88 @@ The VS Code extension draws its forms and views as webviews. A webview is a page
 with its own built-in browser engine, so the browser here is whichever one your VS Code release
 ships. The extension declares `engines.vscode ^1.95.0` and states no separate browser floor.
 
-**Only one webview checks that its script started.** The rest have no startup check and no banner. If
-a panel's script does not run, the panel shows whatever the extension rendered into it, and every
-button and field that talks to the extension does nothing.
+**Every panel that runs a script warns you when that script has not started.** The panel's page
+carries a plain-text banner that shows by itself one second after the page loads, and the panel's own script hides it as soon
+as it has the VS Code API. The banner needs no script, no stylesheet and no message from the
+extension, so it stays up whenever the script is blocked, fails to load, or stops at that first
+step:
 
-| Webview | Source | What you see if its script does not run |
+> MessageFoundry: this panel's script has not started, so its buttons and fields do nothing. Close
+> the panel and open it again. If this message stays, VS Code is not running the panel's script.
+
+Under the banner, the panel shows whatever the extension rendered into it, and every button and
+field that talks to the extension does nothing. The table says what that is for each panel.
+
+The banner does not cover a script that starts and fails later. **Only one webview also has a
+host-side startup check**: the Steps view, in its row below.
+
+| Webview | Source | What you see under the banner if its script does not run |
 |---|---|---|
 | Home, in the side bar | `home.ts` | The search box and the list of actions. Clicking one does nothing. |
 | Route Wizard | `newRoute.ts` | The heading and the Back, Next and Cancel buttons. Every step's fields stay hidden, because the script is what shows them. |
-| Connection form | `connectionEditor.ts` | The fields, with the Transport and Router lists empty. Save does nothing. |
+| Connection form | `connectionEditor.ts` | The heading "New Connection", even for a connection that already exists, and a form with none of its saved values. The Transport and Router lists are empty, the Settings area has no rows, and the inbound and outbound options both show at once. Save does nothing. |
 | Alert rules | `alertEditor.ts` | The headings and an empty rules table. The Event and Severity lists are empty. |
 | Translation table | `codeSetEditor.ts` | The heading and an empty grid. The row and column buttons do nothing. |
-| `connections.toml` and code-set editors | `configEditors.ts` | The connection form and the translation table above, with the same result. A file outside the config directory gets a one-line text notice instead, rendered with scripts turned off and no CSP, since it has no script to restrict. |
+| `connections.toml` and code-set editors | `configEditors.ts` | The connection form and the translation table above, with the same result. A file outside the config directory gets a one-line text notice instead, rendered with scripts turned off and no CSP, since it has no script to restrict. That notice runs no script, so it carries neither banner. |
 | Security settings | `securityEditor.ts` | The heading and the Save and Close buttons. The form itself is blank, because the script builds it. |
 | Config repo storage | `sourceControl.ts` | The options, with the current choice marked. Save does nothing. |
 | Cookbook | `cookbook.ts` | Every recipe card. Search and Insert do nothing. |
 | Engine setup | `engineSetup.ts` | Every section. Its buttons do nothing. |
 | Wiring map | `wiringMap.ts` | The toolbar and the legend. The graph is blank, because the script draws it. |
 | Test Bench | `testBench.ts` | The toolbar and any results already rendered. Its buttons do nothing. |
-| Steps view | `stepsView.ts` | The rows. **If its script has not reported in within 3 seconds, VS Code shows an error** saying the view's script did not initialize and pointing you to the code view. When it falls back to text, it shows a one-line notice whose CSP allows no script at all. |
+| Steps view | `stepsView.ts` | The rows. **If its script has not reported in within 3 seconds, VS Code shows an error** saying the view's script did not initialize and pointing you to the code view. When it falls back to text, it shows a one-line notice whose CSP allows no script at all, and which carries neither banner. |
 
-**If VS Code's browser engine ignored CSP**, every panel above would look and work the same, and
-nothing would warn you. Each panel that runs a script carries a `<meta>` CSP with `default-src 'none'`
-and a per-render `script-src` nonce. The Steps view also allows scripts from the extension's own
-`media` folder. Without that CSP, script injection into a panel would no longer be blocked. The
-message checks in `ide/src/webviewMessaging.ts` would still reject a message from another origin,
-but they do not stop a script already running inside a panel.
+**If VS Code's browser engine ignored CSP, each of those panels would warn you.** Each panel that
+runs a script carries a `<meta>` CSP with `default-src 'none'` and a per-render `script-src` nonce.
+The Steps view also allows scripts from the extension's own `media` folder. Each such panel also
+carries one small script with no nonce. An engine that enforces the policy must refuse that script.
+An engine that ignores the policy runs it, and it reveals a second banner:
+
+> MessageFoundry: VS Code is not enforcing this panel's Content Security Policy, so the panel's
+> defense against injected script is not active. Update VS Code, and treat what this panel shows
+> with care until the message is gone.
+
+This is the same idea as the console's CSP-enforcement banner above, with one difference. The
+console loads its test script from a file. A webview has nowhere to report a blocked file and most
+panels may load no files at all, so the webview's test script is inline.
+
+What the second banner does not show:
+
+- It proves that the engine blocks an inline script with no nonce. It says nothing about any other
+  part of the policy.
+- It warns, and it does not stop anything. With the policy ignored, script injection into a panel
+  would no longer be blocked. The message checks in `ide/src/webviewMessaging.ts` would still reject
+  a message from another origin, but they do not stop a script already running inside a panel.
+- An enforcing engine logs one blocked-script line per panel in the webview's developer console.
+  That line is the check working.
+
+---
+
+## The client-network denial page needs no browser feature
+
+When `[security].allowed_client_networks` is set and your address is outside it, the engine refuses
+the request before sign-in and before any route runs. This is a block, not a degraded page. At
+least the `/health` probe is exempt from the rule.
+
+The answer has two shapes, and both are a `403` that carries the header
+`X-MessageFoundry-Denied: client-network`:
+
+| Request | What comes back |
+|---|---|
+| A path at or under `/ui`, or any request whose `Accept` header names `text/html` | A plain HTML page: "Blocked: your network is not permitted". It names the address the engine saw and the setting an operator changes. |
+| Anything else | A JSON body with the same message, a `denied` field of `client-network`, and the observed address. |
+
+The page is built to work in a browser that supports nothing beyond HTML:
+
+- It runs no script and loads nothing from outside itself. Its policy is `default-src 'none'` with
+  inline styles allowed, plus `frame-ancestors 'none'` and `base-uri 'none'`. A browser that
+  ignored the policy would have no script on the page to run.
+- A browser that ignored its one inline style block would still show the same text, unstyled.
+- The console's own banners do not appear on it, because the console never serves this response.
+
+A WebSocket handshake from a refused address gets the same `403` where the server supports refusing
+a handshake that way, and a plain close otherwise. The console's dashboard is then the page above,
+since its own page request was refused first.
 
 ---
 

@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, workspaceDir } from "./cli";
 import { nonce } from "./cspNonce";
+import { SCRIPT_STARTED_MARK, STARTUP_BANNERS } from "./webviewMessaging";
 
 interface RoutePayload {
   ib: { kind: "mllp-in" | "file-in"; name: string; port?: string; directory?: string; pattern?: string };
@@ -148,6 +149,7 @@ function wizardHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
+  ${STARTUP_BANNERS}
   <h2>New Route</h2>
   <div class="steps" id="stepLabel"></div>
 
@@ -218,7 +220,7 @@ function wizardHtml(webview: vscode.Webview): string {
   </div>
 
   <script nonce="${n}">
-    const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}
     const $ = (id) => document.getElementById(id);
     const STEPS = ['ib', 'router', 'handler', 'ob', 'review'];
     const TITLES = { ib: 'Inbound connection', router: 'Router', handler: 'Handler', ob: 'Outbound connection', review: 'Review' };
