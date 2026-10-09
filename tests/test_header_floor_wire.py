@@ -379,6 +379,51 @@ async def test_a_parser_rejected_upgrade_is_answered_floored_and_closed(
     assert _protocol_floored(shipped[1]), shipped[1]
 
 
+async def test_a_parse_error_with_no_queued_answer_is_closed_with_nothing_written() -> None:
+    """The parser's third branch: a request it cannot parse at all (here, one that declares a
+    body). It queues an end-of-stream and no answer. The floor closes and writes nothing: it never
+    makes up an answer the library did not queue."""
+    request = (
+        _HANDSHAKE.format(path="/ws/stats").replace("\r\n\r\n", "\r\nContent-Length: 5\r\n\r\n")
+        + "hello"
+    ).encode()
+    floored = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
+    async with _served(_raises, ws=floored) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(request)
+            await writer.drain()
+            raw = await asyncio.wait_for(reader.read(), 10.0)
+        finally:
+            writer.close()
+    assert raw == b""
+
+
+def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted() -> None:
+    """What uvicorn does at server stop to a connection it already answered: a second
+    send_response. On websockets' own ServerProtocol that asserts, which is the control. With the
+    floor's hook it returns, and queues nothing more."""
+    from websockets.server import ServerProtocol
+
+    def _answered() -> Any:
+        conn = ServerProtocol()
+        conn.send_response(conn.reject(500, "first"))
+        assert conn.eof_sent
+        return conn
+
+    bare = _answered()
+    with pytest.raises(AssertionError):
+        bare.send_response(bare.reject(500, "second"))
+
+    floored = ServerProtocol()
+    protocol_headers._floor_the_conn_responses(floored)
+    floored.send_response(floored.reject(500, "first"))
+    first = floored.data_to_send()
+    assert b"nosniff" in first[0] and floored.eof_sent
+    floored.send_response(floored.reject(500, "second"))
+    assert floored.data_to_send() == []
+
+
 async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() -> None:
     """The control, and a pin on uvicorn's own behaviour at the measured version: no answer, the
     connection left open, and a server stop that raises from inside websockets. If this fails,

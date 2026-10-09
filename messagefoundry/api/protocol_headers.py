@@ -32,14 +32,26 @@ dependency. uvicorn
 names it; handed to the class build, it is checked for the HTTP hooks like any other base.
 uvicorn's interim ``100 Continue`` carries no header either.
 
-**One answer this module WRITES, where everything else only adds headers.** uvicorn 0.54.0's
-sans-I/O protocol never writes the ``414`` or ``431`` the websockets parser queues. The peer gets no
-answer and the connection stays open; at server stop, uvicorn's own ``500`` for that connection
-then fails an assertion inside websockets, and ``Server.shutdown`` raises before the lifespan
-shutdown runs. The legacy server answered the same request and closed. So the floored sans-I/O
-class writes what the parser queued and closes, the way uvicorn's own ``handle_connect`` does for a
-rejection it does see. ``tests/test_header_floor_wire.py`` pins the upstream behaviour on the bare
-class, so a uvicorn that fixes it turns that test red and this step can go.
+**Two things this module does on the sans-I/O protocol beyond adding headers.** Both work around
+uvicorn 0.54.0 behaviour that its legacy server did not have, and both are measured on the bare
+class too.
+
+*It writes what the websockets parser queued, and closes.* When that parser rejects a request
+itself, uvicorn never writes the result. The peer gets no answer and the connection stays open.
+The parser queues a ``414`` for an over-long request line and a ``431`` for an over-long or
+over-numerous header block; for any other parse error it queues only an end-of-stream, with no
+answer. :func:`_answer_a_parser_rejection` writes whatever was queued, which may be nothing, and
+closes, the way uvicorn's own ``handle_connect`` does for a rejection it does see. It writes no
+answer of its own making. ``tests/test_header_floor_wire.py`` pins the upstream behaviour on the
+bare class, so a uvicorn that fixes it turns that test red and this step can go.
+
+*It drops a second handshake answer on a conn that has already ended its stream.* At server stop
+uvicorn sends its ``500`` to every connection whose handshake it has not marked complete. That
+includes one it already answered and is still closing, such as a pre-handshake ``500`` to a TLS
+peer that has not yet acknowledged the close, and one the parser rejected. websockets asserts on
+the second end-of-stream, ``Server.shutdown`` raises, and the lifespan shutdown, which stops the
+engine, never runs. Nothing more can be written on that conn, so
+:func:`_send_floored_handshake_response` returns without calling the library.
 
 **Never HSTS here.** Whether HSTS belongs on a response depends on the request's host and the served
 chain (:func:`~messagefoundry.api.header_floor.hsts_notable`). On the default posture, a self-signed
@@ -57,13 +69,16 @@ prepends the cycle's ``default_headers``, so the override extends those for that
 handshake answer, on either WebSocket protocol, is a headers object the library has not serialized
 yet, so the override adds to that object.
 
-**Refuse at startup.** Every hook this module overrides or reads is checked when the class is
-built, against the server class it is handed: the HTTP protocol's ``send_400_response``, its
+**Refuse at startup.** Each hook this module overrides is checked when the class is built,
+against the server class it is handed. The flags the two sans-I/O steps above read
+(``handshake_initiated``, ``handshake_exc``, ``eof_sent``) are NOT checked at build: a rename
+there turns those steps off silently, and only the startup self-test's parser-rejection drive would
+notice the first. The checked hooks are: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
-protocol they are the ``conn`` attribute, and a synchronous ``send_response`` and
-``data_to_send`` on the ``ServerProtocol`` its module imports. The methods the floor wraps synchronously must still be
+protocol they are ``data_received``, the ``conn`` attribute, and a synchronous ``send_response``
+and ``data_to_send`` on the ``ServerProtocol`` its module imports. The methods the floor wraps synchronously must still be
 synchronous. An attribute counts as present when a method of the server's own class for the hook
 using it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
 installed uvicorn and websockets versions, and ``serve`` refuses to start on it. There is no
@@ -442,6 +457,11 @@ def _send_floored_handshake_response(conn_ref: weakref.ref[Any], *args: Any, **k
     if conn is None:
         _degraded("ws-sansio", "conn reference", ReferenceError("conn already freed"))
         return
+    if getattr(conn, "eof_sent", False) is True:
+        # The conn has ended its stream: an answer already went out, or the parser gave up. The
+        # library asserts on a second end-of-stream, and uvicorn makes this call at server stop
+        # for a connection it answered and has not finished closing. See the module docstring.
+        return
     try:
         # No named parameters, for the reason write_http_response below gives. At websockets 17.1
         # it is (response).
@@ -466,9 +486,11 @@ def _floor_the_conn_responses(conn: Any) -> None:
 
 
 def _answer_a_parser_rejection(protocol: Any) -> None:
-    """Write the answer the websockets parser queued for a request it rejected, and close.
+    """Write what the websockets parser queued for a request it rejected, and close. For a 414 or
+    431 that is the answer; for any other parse error the parser queued no answer, and this only
+    closes.
 
-    See the module docstring: uvicorn 0.54.0 leaves that answer unwritten and the connection open.
+    See the module docstring: uvicorn 0.54.0 leaves the answer unwritten and the connection open.
     The parser sets ``handshake_exc`` and yields no request, so uvicorn's ``handle_connect`` never
     runs and ``handshake_initiated`` stays false. That pair is the whole test. The three flags are
     set the way ``handle_connect`` sets them for a rejection, so uvicorn's ``shutdown`` reads the
@@ -570,8 +592,12 @@ def _build_floored_sansio_ws(base: type[Any]) -> type[asyncio.Protocol]:
                 _floor_the_conn_responses(value)
 
         def data_received(self, *args: Any, **kwargs: Any) -> None:
+            # Only until the handshake is under way: after that this is the frame path, and the
+            # parser rejection can no longer happen.
+            pending = not getattr(self, "handshake_initiated", True)
             super().data_received(*args, **kwargs)
-            _answer_a_parser_rejection(self)
+            if pending:
+                _answer_a_parser_rejection(self)
 
     return _FlooredWebSocketProtocol
 
