@@ -216,14 +216,6 @@ export function securityEditorScript(token: string, fields: unknown): string {
       string: { ok: mfStr, want: 'text' },
       tristate: { ok: (x) => x === null || mfBool(x), want: 'true, false or null' },
     };
-    // The kind of a value, for the refusal. Never the value itself. A number that is not an int says
-    // which way, or "must be a whole number, got number" would name no difference.
-    function kindOf(v) {
-      if (v === null) { return 'null'; }
-      if (Array.isArray(v)) { return 'list'; }
-      if (typeof v !== 'number') { return typeof v; }
-      return Number.isInteger(v) ? (mfInt(v) ? 'number' : 'a number too large') : 'a fraction';
-    }
 
     // What is wrong with the first switch in o (state.values or state.defaults) that is missing or
     // has the wrong type, or null when every FIELDS switch is there with its type.
@@ -240,7 +232,7 @@ export function securityEditorScript(token: string, fields: unknown): string {
         // Own-property lookup, so a FIELDS type with no entry here fails closed and does not throw.
         const t = Object.prototype.hasOwnProperty.call(TYPE_OK, f.type) ? TYPE_OK[f.type] : null;
         if (!t) { return name + ' has a type this form does not know'; }
-        if (t.ok(v) !== true) { return name + ' must be ' + t.want + ', got ' + kindOf(v); }
+        if (t.ok(v) !== true) { return name + ' must be ' + t.want + ', got ' + mfKind(v); }
       }
       return null;
     }

@@ -223,18 +223,39 @@ function badMessages(ok: Payload): [string, Payload][] {
   ];
 }
 
+const ALERT_REFUSAL = "These rules cannot be shown.";
+
+/** Every Remove button on the Alert Rules page. Each one is bound to a rule ordinal. */
+function removeButtons(p: Page): DomNode[] {
+  return [...p.window.document.querySelectorAll("#rows button")];
+}
+
 const alertRules: Receiver = {
   panel: "Alert Rules",
   key: "command",
   load: () =>
     page(
       alertEditorScript(TOKEN, ["any", "queue_buildup"], ["info", "warning", "critical"]),
-      `<table id="rules"><tbody id="rows"><tr><td>${SENTINEL}</td></tr></tbody></table>
+      `${ERROR_CSS}<table id="rules"><tbody id="rows"><tr><td>${SENTINEL}</td></tr></tbody></table>
        <div id="empty"></div>
        <select id="event_type"></select><input id="connection" value="*" />
+       <input id="min_depth" /><input id="min_oldest_seconds" /><input id="cooldown_seconds" />
        <select id="severity"></select><select id="transports"></select>
-       <div id="error">${SENTINEL}</div><button id="add"></button><button id="close"></button>`,
+       ${ERROR_ELEMENT}${SENTINEL}</div><button id="add"></button><button id="close"></button>`,
     ),
+  shownDiscard: {
+    // A discarded list is SHOWN (BACKLOG #1123), so the page changes. What must hold instead: no
+    // row and so no Remove button is left, the "No rules yet" note is not up, the refusal is, and
+    // Add is off.
+    rules: (p) => () => {
+      const doc = p.window.document;
+      assert.strictEqual(doc.getElementById("rows").children.length, 0, "rows were left on the page");
+      assert.strictEqual(doc.getElementById("rules").style.display, "none", "the table stayed up");
+      assert.strictEqual(doc.getElementById("empty").style.display, "none", "the page says there are no rules");
+      assert.ok(refusalShown(p).startsWith(ALERT_REFUSAL), `no refusal on the page: "${refusalShown(p)}"`);
+      assert.strictEqual(doc.getElementById("add").disabled, true, "Add is on after a discard");
+    },
+  },
   wellFormed: {
     rules: [
       ALERT_OK,
@@ -537,14 +558,14 @@ function refusalShown(p: Page): string {
   return computed.display === "none" ? "" : String(el.textContent);
 }
 
-/** The rule securityEditor.ts formHtml() ships for the error element, and the element as it ships.
- *  That file imports `vscode`, so it cannot be loaded here; a test below reads its text instead and
- *  fails if this rule or that element is no longer in it. */
-const SECURITY_ERROR_RULE = ".error { display: none;";
-const SECURITY_ERROR_ELEMENT = '<div id="error" class="error">';
-const SECURITY_ERROR_CSS = `<style>${SECURITY_ERROR_RULE} }</style>`;
+/** The rule securityEditor.ts and alertEditor.ts formHtml() ship for the error element, and the
+ *  element as it ships. Those files import `vscode`, so they cannot be loaded here; a test below
+ *  reads their text instead and fails if this rule or that element is no longer in one. */
+const ERROR_RULE = ".error { display: none;";
+const ERROR_ELEMENT = '<div id="error" class="error">';
+const ERROR_CSS = `<style>${ERROR_RULE} }</style>`;
 function securityBody(seed: string): string {
-  return `${SECURITY_ERROR_CSS}<div id="form"></div>${SECURITY_ERROR_ELEMENT}${seed}</div>
+  return `${ERROR_CSS}<div id="form"></div>${ERROR_ELEMENT}${seed}</div>
        <button id="save"></button><button id="close"></button>`;
 }
 const REFUSAL = "These settings cannot be shown.";
@@ -840,12 +861,119 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     }
   });
 
-  test("Security Settings: the test page hides its error element by the rule the panel ships", () => {
+  test("Security Settings and Alert Rules: the test page hides its error element by the rule the panel ships", () => {
     // refusalShown() reads a computed style under a COPY of the panel's rule. This ties the copy to
     // the source: if formHtml() changes how it hides the element, this fails and the copy is redone.
-    const host = fs.readFileSync(path.resolve(__dirname, "../../../src/securityEditor.ts"), "utf8");
-    assert.ok(host.includes(SECURITY_ERROR_RULE), "securityEditor.ts no longer hides .error this way");
-    assert.ok(host.includes(SECURITY_ERROR_ELEMENT), "securityEditor.ts no longer ships this error element");
+    for (const file of ["securityEditor.ts", "alertEditor.ts"]) {
+      const host = fs.readFileSync(path.resolve(__dirname, "../../../src", file), "utf8");
+      assert.ok(host.includes(ERROR_RULE), `${file} no longer hides .error this way`);
+      assert.ok(host.includes(ERROR_ELEMENT), `${file} no longer ships this error element`);
+    }
+  });
+
+  test("Alert Rules: after a discarded list, Remove on a rule that was showing posts nothing", () => {
+    // THE REGRESSION (BACKLOG #1123). Three rules render, each with a Remove bound to its ordinal.
+    // The file is then hand-edited: a rule is inserted at the top with a quoted number, which the
+    // engine loads. Every ordinal moved, and the new list is discarded. A Remove left over from the
+    // first render would delete a different rule than the row it sits on.
+    const p = alertRules.load();
+    const doc = p.window.document;
+    p.deliver(ALERT_OK);
+    const stale = removeButtons(p);
+    assert.strictEqual(stale.length, 3, "the three rules did not render with a Remove each");
+    p.deliver({
+      command: "rules",
+      rules: [{ event_type: "queue_buildup", min_depth: "500", index: 0 }, ...ALERT_RULES.map((r, i) => ({ ...r, index: i + 1 }))],
+    });
+    for (const button of stale) {
+      button.click();
+    }
+    for (const button of removeButtons(p)) {
+      button.click();
+    }
+    assert.strictEqual(p.posted.length, 0, `a Remove posted after a discarded list: ${JSON.stringify(p.posted)}`);
+    // Add is off too: it would append to a list the operator cannot see.
+    doc.getElementById("add").click();
+    assert.strictEqual(p.posted.length, 0, `Add posted after a discarded list: ${JSON.stringify(p.posted)}`);
+    // THE CONTROL: before any discard the same click does post the ordinal.
+    const q = alertRules.load();
+    q.deliver(ALERT_OK);
+    removeButtons(q)[1].click();
+    // Through JSON: the posted object comes from the page's realm, so it is not reference-equal.
+    assert.strictEqual(JSON.stringify(q.posted), JSON.stringify([{ command: "remove", index: 1 }]));
+  });
+
+  test("Alert Rules: a discarded list names the rule, the field and what was wrong", () => {
+    const SENT = '<img src=x onerror="window.pwned=1"><b id="planted">';
+    const cases: [string, (c: Payload) => void, string][] = [
+      ["a quoted number", (c) => (c.rules[2].min_depth = "500"), "rule 2, min_depth: expected a number, got string"],
+      ["a boolean age", (c) => (c.rules[0].min_oldest_seconds = true), "rule 0, min_oldest_seconds: expected a number, got boolean"],
+      ["a null cooldown", (c) => (c.rules[1].cooldown_seconds = null), "rule 1, cooldown_seconds: expected a number, got null"],
+      ["markup for a number", (c) => (c.rules[1].min_depth = SENT), "rule 1, min_depth: expected a number, got string"],
+      ["markup for a connection list", (c) => (c.rules[0].connection = [SENT]), "rule 0, connection: expected text, got list"],
+      ["transports is text", (c) => (c.rules[0].transports = SENT), "rule 0, transports: expected a list of text, got string"],
+      ["a rule with no index", (c) => delete c.rules[1].index, "entry 2 of the list has no whole-number index"],
+      ["an entry that is text", (c) => (c.rules[2] = SENT), "entry 3 of the list is not a rule"],
+      ["no list", (c) => delete c.rules, "the list is missing or is not a list"],
+    ];
+    for (const [why, change, problem] of cases) {
+      const p = alertRules.load();
+      const doc = p.window.document;
+      p.deliver(variant(ALERT_OK, change));
+      assert.deepStrictEqual(p.errors.map(String), [], `${why}: the page threw`);
+      const shown = refusalShown(p);
+      assert.ok(shown.startsWith(ALERT_REFUSAL), `${why}: no refusal, got "${shown}"`);
+      assert.ok(shown.includes(problem), `${why}: the refusal does not say "${problem}": "${shown}"`);
+      assert.ok(shown.includes("a number must not be quoted"), `${why}: the refusal does not say what to do`);
+      assert.ok(p.warnings.some((w) => w.includes('discarded a malformed "rules"')), `${why}: console.warn was dropped`);
+      // Nothing the message carried is echoed, and nothing in it became an element.
+      assert.ok(!shown.includes("onerror"), `${why}: the refusal echoed a value from the message`);
+      assert.strictEqual(doc.getElementById("error").children.length, 0, `${why}: markup was parsed`);
+      assert.strictEqual(doc.getElementById("planted"), null);
+      assert.strictEqual(p.window.pwned, undefined);
+    }
+  });
+
+  test("Alert Rules: a well-formed list after a refusal brings back the table, Remove and Add", () => {
+    const p = alertRules.load();
+    const doc = p.window.document;
+    doc.getElementById("connection").value = "OB_*";
+    p.deliver(variant(ALERT_OK, (c) => (c.rules[0].min_depth = "500")));
+    assert.strictEqual(doc.getElementById("add").disabled, true);
+    p.deliver(ALERT_OK);
+    assert.strictEqual(refusalShown(p), "", "the refusal outlived the list that replaced it");
+    assert.strictEqual(doc.getElementById("rules").style.display, "");
+    assert.strictEqual(doc.getElementById("add").disabled, false, "Add stayed off");
+    removeButtons(p)[2].click();
+    doc.getElementById("add").click();
+    assert.strictEqual(p.posted.length, 2);
+    assert.strictEqual(JSON.stringify(p.posted[0]), JSON.stringify({ command: "remove", index: 2 }));
+    assert.strictEqual(p.posted[1].command, "add");
+    // An empty list after a refusal brings back the "No rules yet" note, which is true again.
+    p.deliver(variant(ALERT_OK, (c) => (c.rules[0].min_depth = "500")));
+    p.deliver({ command: "rules", rules: [] });
+    assert.strictEqual(doc.getElementById("empty").style.display, "");
+    assert.strictEqual(doc.getElementById("add").disabled, false);
+  });
+
+  test("Alert Rules: an error after a refusal is shown as the error, and the page stays off", () => {
+    // The refusal described the list before this error. It is not repeated as if it were current.
+    const p = alertRules.load();
+    const doc = p.window.document;
+    p.deliver(variant(ALERT_OK, (c) => (c.rules[0].min_depth = "500")));
+    p.deliver(ERROR_OK);
+    const shown = refusalShown(p);
+    assert.ok(shown.startsWith(CLI_ERROR), `the error is not what is shown: "${shown}"`);
+    assert.ok(!shown.includes("min_depth"), "the earlier refusal is still presented");
+    assert.ok(shown.includes("Remove and Add stay off"), "nothing says why the page is still off");
+    assert.strictEqual(doc.getElementById("add").disabled, true);
+    assert.strictEqual(removeButtons(p).length, 0);
+    // The control: with no refusal up, an error shows alone and is visible under the panel's CSS.
+    const q = alertRules.load();
+    q.deliver(ALERT_OK);
+    q.deliver(ERROR_OK);
+    assert.strictEqual(refusalShown(q), CLI_ERROR);
+    assert.strictEqual(q.window.document.getElementById("add").disabled, false);
   });
 
   test("Security Settings: an error that follows a refusal keeps the reason on the page", () => {

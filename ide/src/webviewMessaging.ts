@@ -256,6 +256,14 @@ export const SHAPE_HELPERS = `
     // host's type for the field and from what the sender really sends.
     function mfOpt(x, f) { return x === undefined || f(x) === true; }
     function mfNullable(x, f) { return x === null || f(x) === true; }
+    // The kind of a value, for a refusal a panel shows. Never the value itself. A number that is not
+    // an int says which way, or "must be a whole number, got number" would name no difference.
+    function mfKind(v) {
+      if (v === null) { return 'null'; }
+      if (Array.isArray(v)) { return 'list'; }
+      if (typeof v !== 'number') { return typeof v; }
+      return Number.isInteger(v) ? (mfInt(v) ? 'number' : 'a number too large') : 'a fraction';
+    }
     function mfShapeOk(d, key, shapes, panel) {
       const k = d[key];
       const check = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k) ? shapes[k] : null;

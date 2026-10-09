@@ -19,6 +19,8 @@ export function alertEditorScript(
     const SEVERITIES = ${embedJson(severities)};
     const $ = (id) => document.getElementById(id);
     const errorEl = $('error');
+    // True while a discarded list is the last word on the rules. See refuse().
+    let refused = false;
 
     for (const t of EVENT_TYPES) { const o = document.createElement('option'); o.value = t; o.textContent = t; $('event_type').appendChild(o); }
     for (const s of SEVERITIES) { const o = document.createElement('option'); o.value = s; o.textContent = s; $('severity').appendChild(o); }
@@ -61,9 +63,28 @@ export function alertEditorScript(
       errorEl.style.display = 'none';
       return true;
     }
-    function show(msg) { errorEl.textContent = msg; errorEl.style.display = ''; }
+    // 'block', not '': the page's stylesheet hides .error, and clearing the inline value would hand
+    // the element back to that rule, so the text would be set and never seen.
+    function show(msg) { errorEl.textContent = msg; errorEl.style.display = 'block'; }
+
+    // A list this panel cannot read. Every row goes, and with it every Remove: each is bound to a
+    // rule ordinal, and the ordinals of a list nobody could read are not known. The "No rules yet"
+    // note stays down, because it would be a claim about the file. Add goes off: it appends to a
+    // first-match-wins list the operator cannot see. Close stays on. textContent (through show).
+    function refuse(problem) {
+      refused = true;
+      $('rows').innerHTML = '';
+      $('rules').style.display = 'none';
+      $('empty').style.display = 'none';
+      $('add').disabled = true;
+      show('These rules cannot be shown. The list sent to this panel is malformed: ' + problem +
+        '. Fix that value in [[alerts.rules]] of the service-settings file (a number must not be quoted),' +
+        ' then run the Alert Rules command again. Remove and Add are off until a well-formed list arrives.');
+    }
 
     function renderRules(rules) {
+      refused = false;
+      $('add').disabled = false;
       const tbody = $('rows');
       tbody.innerHTML = '';
       $('empty').style.display = rules.length ? 'none' : '';
@@ -83,13 +104,16 @@ export function alertEditorScript(
         cells.forEach((text, i) => { const td = document.createElement('td'); if (i === 0) td.className = 'idx'; td.textContent = String(text); tr.appendChild(td); });
         const tdBtn = document.createElement('td');
         const rm = document.createElement('button'); rm.className = 'rm'; rm.textContent = 'Remove';
-        rm.addEventListener('click', () => vscode.postMessage({ command: 'remove', index: r.index }));
+        // The guard covers a button from an earlier render: refuse() takes it off the page, and a
+        // click that still reached it must not post an ordinal from a list that was replaced.
+        rm.addEventListener('click', () => { if (!refused) { vscode.postMessage({ command: 'remove', index: r.index }); } });
         tdBtn.appendChild(rm); tr.appendChild(tdBtn);
         tbody.appendChild(tr);
       }
     }
 
     $('add').addEventListener('click', () => {
+      if (refused) return;
       const rule = build();
       if (!validate(rule)) return;
       vscode.postMessage({ command: 'add', rule });
@@ -103,19 +127,46 @@ export function alertEditorScript(
     // renderRules() still tests "== null", which is how it sees an absent field.
     // The three numerics are numbers. A hand-edited file can hold a quoted number, which the
     // engine's lax model loads; that row is not a Rule, so the list is discarded (BACKLOG #1123).
+    const RULE_FIELDS = [
+      ['event_type', mfStr, 'text'], ['connection', mfStr, 'text'], ['severity', mfStr, 'text'],
+      ['min_depth', mfNum, 'a number'], ['min_oldest_seconds', mfNum, 'a number'],
+      ['cooldown_seconds', mfNum, 'a number'], ['transports', (t) => mfArrOf(t, mfStr), 'a list of text'],
+    ];
+    // What is wrong with the first entry of a 'rules' message that is not a Rule, or null. It names
+    // the rule by its ordinal, the field, and the kind of value found. Never the value.
+    function rulesProblem(d) {
+      if (!Array.isArray(d.rules)) { return 'the list is missing or is not a list'; }
+      // By index, not for-of or every(): a hole must be seen as an entry that is not a rule.
+      for (let i = 0; i < d.rules.length; i++) {
+        const r = d.rules[i];
+        if (!mfObj(r)) { return 'entry ' + (i + 1) + ' of the list is not a rule'; }
+        if (!mfInt(r.index)) { return 'entry ' + (i + 1) + ' of the list has no whole-number index'; }
+        for (const [key, ok, want] of RULE_FIELDS) {
+          if (!mfOpt(r[key], ok)) { return 'rule ' + r.index + ', ' + key + ': expected ' + want + ', got ' + mfKind(r[key]); }
+        }
+      }
+      return null;
+    }
     const SHAPES = {
-      rules: (d) => mfArrOf(d.rules, (r) => mfObj(r) && mfInt(r.index) &&
-        mfOpt(r.event_type, mfStr) && mfOpt(r.connection, mfStr) && mfOpt(r.severity, mfStr) &&
-        mfOpt(r.min_depth, mfNum) && mfOpt(r.min_oldest_seconds, mfNum) &&
-        mfOpt(r.cooldown_seconds, mfNum) && mfOpt(r.transports, (t) => mfArrOf(t, mfStr))),
+      rules: (d) => rulesProblem(d) === null,
       error: (d) => mfStr(d.message),
     };
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
       const d = mfTrusted(e);
-      if (!d || !mfShapeOk(d, 'command', SHAPES, 'Alert Rules')) { return; }
+      if (!d) { return; }
+      if (!mfShapeOk(d, 'command', SHAPES, 'Alert Rules')) {
+        // A discarded list is shown as well as warned, and the page stops acting on the old one.
+        const problem = d.command === 'rules' ? rulesProblem(d) : null;
+        if (problem !== null) { refuse(problem); }
+        return;
+      }
       if (d.command === 'rules') { renderRules(d.rules); errorEl.style.display = 'none'; }
-      else if (d.command === 'error') { show(d.message); }
+      // After a refusal the rows are still gone. The error is the newer fact, so it is shown in the
+      // refusal's place, with the reason the page is still off.
+      else if (d.command === 'error') {
+        show(refused ? d.message + ' The rules are still not shown. Remove and Add stay off until a well-formed list arrives.' : d.message);
+      }
     });
   `;
 }
