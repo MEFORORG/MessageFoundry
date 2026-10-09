@@ -361,11 +361,17 @@ in-flight rows stranded.
 > isolated as [ADR 0031](0031-startup-connection-fault-isolation.md) isolates them: the lane CA
 > check (a pin, ACL or path refusal), the build, and `validate_startup`. The reload's CA
 > pre-check used to read these lanes, and one refusal refused the whole takeover. The lane is
-> built before it is unparked, so no held row is claimed while it has no connector. A lane that
-> fails stays parked and reads `failed`. Its held rows stay queued: none is charged an attempt
-> or dead-lettered for a fault found at the takeover. Fix the fault, then start the connection.
-> A later reload does lift that park, and the lane's rows then retry as on any failed lane.
-> Only the owning engine shard builds a lane this way.
+> built before it is unparked, so no held row is claimed while it has no connector. Every engine
+> shard builds the lane this way, as every shard builds every lane at a start (ADR 0073).
+>
+> **A lane that fails there stays parked and reads `failed`.** Its held rows stay queued: none is
+> charged an attempt or dead-lettered for a fault found at the takeover. Fix the fault, then
+> reload or start the connection. Each builds the lane again and resumes it only once the build
+> succeeds. A build that fails again leaves the lane parked, with its rows still held. The
+> scheduler and an alert rule's restart leave the lane alone, so neither reads its CA again on
+> every tick or every alert. It still pages: its buildup and stall checks run on the in-flight
+> watch's clock, as ADR 0031's paging does for any failed lane. An operator stop makes the pause
+> the operator's, and then it is silent, as any paused lane is.
 >
 > **Other faults still refuse the whole activation.** The reload runs its build check over every
 > connector first. At least these refuse there: an outbound CA file that is missing or does not
