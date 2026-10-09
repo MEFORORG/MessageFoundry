@@ -23,12 +23,14 @@ import ipaddress
 import math
 from collections.abc import Collection
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     LOCKOUT_THRESHOLD_CEILING,
     AlertsSettings,
@@ -390,6 +392,15 @@ _LOOSER_THAN_DEFAULT = [
     ("max_sessions_per_user", -1),
     ("max_sessions_per_user", 6),
     ("max_sessions_per_user", 1_000_000_000),
+    # Vault BACKLOG #2600 step 4: the step-up window, the TOTP skew and the temporary-password life.
+    ("step_up_max_age_seconds", 301),
+    ("step_up_max_age_seconds", 86_400),
+    ("totp_skew_steps", 1),
+    ("totp_skew_steps", 2),  # the load refuses anything wider
+    ("initial_password_expiry_hours", 73),
+    ("initial_password_expiry_hours", 1_000_000),
+    ("initial_password_expiry_hours", 0),  # no expiry at all
+    ("initial_password_expiry_hours", -1),
 ]
 
 #: (field, value at or stricter than its shipped default). None is named. The defaults are listed
@@ -435,6 +446,16 @@ _STRICTER_OR_DEFAULT = [
     ("max_sessions_per_user", 5),
     ("max_sessions_per_user", 4),
     ("max_sessions_per_user", 1),
+    # 0 or less passes no session and ends every action-bound grant at once.
+    ("step_up_max_age_seconds", 300),
+    ("step_up_max_age_seconds", 299),
+    ("step_up_max_age_seconds", 0),
+    ("step_up_max_age_seconds", -1),
+    # 0 is the strict default and the floor: the load refuses a negative skew.
+    ("totp_skew_steps", 0),
+    ("initial_password_expiry_hours", 72),
+    ("initial_password_expiry_hours", 71),
+    ("initial_password_expiry_hours", 1),
 ]
 _SIGN_IN_FIELDS = {
     field for field, _ in _SIGN_IN_OFF_VALUES + _LOOSER_THAN_DEFAULT + _STRICTER_OR_DEFAULT
@@ -548,6 +569,59 @@ def test_a_weak_value_says_looser_than_the_default_and_an_off_value_says_off() -
     t_nist = _risk(AuthSettings(lockout_threshold=101), "lockout_threshold")
     assert t_nist is not None
     assert "NIST SP 800-63B" in t_nist
+
+
+def test_the_step_up_window_entry_quotes_the_window_and_its_default() -> None:
+    """Vault BACKLOG #2600 step 4. The text states both numbers and what the window gates."""
+    risk = _risk(AuthSettings(step_up_max_age_seconds=3600), "step_up_max_age_seconds")
+    assert risk is not None
+    assert "3600 s, longer than the default of 300 s" in risk
+    assert "action-bound" in risk
+
+
+@pytest.mark.parametrize("skew", [1, 2])
+def test_the_totp_skew_entry_never_quotes_the_configured_value(skew: int) -> None:
+    """The entry reaches a log line and stdout, and a ``totp_*`` name reads as a secret source to
+    the clear-text-logging query, so the text is a literal. Both loose values get the same text."""
+    risk = _risk(AuthSettings(totp_skew_steps=skew), "totp_skew_steps")
+    assert risk is not None
+    assert risk == _risk(AuthSettings(totp_skew_steps=3 - skew), "totp_skew_steps")
+    assert "30 s step" in risk
+
+
+def test_a_wider_totp_skew_is_refused_at_load_so_it_needs_no_entry() -> None:
+    """The control for listing 1 and 2 alone: nothing wider, and nothing negative, loads."""
+    for bad in (3, -1):
+        with pytest.raises(ValueError, match="totp_skew_steps must be 0, 1, or 2"):
+            AuthSettings(totp_skew_steps=bad)
+
+
+def test_the_temporary_password_entry_tells_off_from_longer_and_quotes_no_value() -> None:
+    """At 0 or less nothing expires, and the entry says so and names the lost reminder. Above the
+    default the entry quotes the DEFAULT alone, never the configured number."""
+    field = "initial_password_expiry_hours"
+    off = _risk(AuthSettings(initial_password_expiry_hours=0), field)
+    assert off is not None
+    assert "NEVER expires" in off
+    assert "No reminder" in off
+    assert off == _risk(AuthSettings(initial_password_expiry_hours=-7), field)
+    longer = _risk(AuthSettings(initial_password_expiry_hours=4321), field)
+    assert longer is not None
+    assert "longer than the default of 72 hours" in longer
+    assert "4321" not in longer
+    assert "NEVER" not in longer
+
+
+@pytest.mark.parametrize(
+    ("hours", "deadline"), [(0, None), (-1, None), (72, 259_200.0), (73, 262_800.0)]
+)
+def test_the_temporary_password_direction_is_the_consumers(
+    hours: int, deadline: float | None
+) -> None:
+    """The direction the entry rests on, read from the consumer: no deadline at 0 or less, and a
+    later one for a longer life. The method reads only its settings, so a stand-in carries them."""
+    holder = SimpleNamespace(_settings=AuthSettings(initial_password_expiry_hours=hours))
+    assert AuthService.initial_credential_deadline(holder, 0.0) == deadline  # type: ignore[arg-type]
 
 
 def test_the_near_off_values_the_vault_measured_are_named() -> None:

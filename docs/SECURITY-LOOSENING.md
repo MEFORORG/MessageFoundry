@@ -84,6 +84,9 @@ section reference.
 | | `[auth].oidc_callback_floor_exempt_amr` | `[]` (*conditional* — a loosening only with OIDC on and the callback floor on; any value listed) |
 | | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
 | | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
+| | `[auth].step_up_max_age_seconds` | `300` s (a window above `300` s is named. `0` or less passes no session, which is stricter) |
+| | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
+| | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
@@ -111,6 +114,7 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
+`[auth].step_up_max_age_seconds`, `[auth].totp_skew_steps`, `[auth].initial_password_expiry_hours`,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
@@ -908,6 +912,55 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   a proxy limiter.
 - **Reversible:** yes, immediately — restore `512` (or delete the line) and restart.
 
+### `[auth].step_up_max_age_seconds` above `300` s — a re-verified session runs sensitive operations for longer
+> No other setting gates it (vault BACKLOG #2600, ASVS 7.5.3). A window above `300` s is named, with
+> the configured value. A window of `0` or less passes no session, which is stricter, and is not named.
+- **What you lose:** a sensitive operation asks whether the session re-verified its credential within
+  this many seconds. A local sign-in can count as that first verification; the
+  `step_up_max_age_seconds` row of [CONFIGURATION.md](CONFIGURATION.md) says when. With a longer
+  window, a session taken over after sign-in can run those operations for longer with no fresh
+  proof. An action-bound proof that was issued and not used also stays usable for the same time.
+- **When acceptable:** a site that has measured that five minutes interrupts real operator work, and
+  accepts the longer exposure.
+- **Compensating controls:** keep `[auth].require_action_step_up` and `[auth].admin_new_ip_step_up`
+  on, and keep the idle session limit short.
+- **Where it is reported:** `security_loosenings()` names it, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it.
+- **Reversible:** yes, immediately — restore `300` (or delete the line) and restart.
+
+### `[auth].totp_skew_steps` of `1` or `2` — a TOTP code is accepted outside its own step
+> No other setting gates it: an account may hold a TOTP factor whatever `[security].require_mfa`
+> says (vault BACKLOG #2600, ASVS 6.5.5). The default `0` accepts the current 30 s step only. The
+> load refuses a value outside `0` to `2`. The entry does not quote the configured value.
+- **What you lose:** the tightest replay window. At `0` a captured code is usable for at most the
+  rest of its own step. At `1` or `2` a code from a neighbouring step is accepted too, so a captured
+  code stays usable for at least one more step.
+- **When acceptable:** authenticators or hosts whose clocks drift, where strict verification is
+  measured to refuse honest codes.
+- **Compensating controls:** none that substitute; fix the clock source instead. Above `0` a code
+  can also verify a second time, and [SECURITY.md](SECURITY.md) says when, where it describes
+  `totp_skew_steps`.
+- **Where it is reported:** `security_loosenings()` names it, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it.
+- **Reversible:** yes, immediately — restore `0` (or delete the line) and restart.
+
+### `[auth].initial_password_expiry_hours` of `0`, or above `72` — a temporary password lasts longer, or forever
+> No other setting gates it (vault BACKLOG #2600, ASVS 6.4.1 and 6.4.5). `0` or less means no expiry
+> and is named as off. A life above `72` hours is named as longer. The entry quotes the default and
+> not the configured value.
+- **What you lose:** an administrator-issued temporary password that nobody claims stops working
+  after this many hours. With a longer life, or none, it admits whoever learns it for longer, and
+  what it permits includes setting the account's password. At `0` the
+  `initial_credential_expiring` reminder and its two notices never run either.
+- **When acceptable:** a site whose onboarding really takes longer than three days. There is no
+  good case for `0` on an instance that carries PHI.
+- **Compensating controls:** issue the temporary password at the moment the user is ready to claim
+  it, and reset it again if it goes unclaimed.
+- **Where it is reported:** `security_loosenings()` names it, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it.
+- **Reversible:** yes, immediately — restore `72` (or delete the line) and restart. Restoring it
+  expires every temporary password already older than the restored life.
+
 ### `[approvals].min_dwell_seconds` below `2.0` s, or `expiry_hours` above `72` h — a held action is released sooner, or later
 > **Conditional** on `[approvals].enabled` with at least one operation in `[approvals].operations`
 > ([BACKLOG #2489](BACKLOG.md), ASVS 2.3.5 and 2.4.2). Dual control ships off, so turning it off is the
@@ -1632,6 +1685,9 @@ chapter was not part of the verification above.
 | `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`, `[auth].oidc_callback_floor_exempt_amr` (PHI-read and admin-write pacing, second-step time floors and the federated floor's exemption) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
 | `[auth].max_sessions_per_user` (concurrent-session cap) | V7 Session Management (7.1.2) | **AC-10** Concurrent Session Control | §164.312(a)(1) Access Control |
 | `[auth].oidc_flow_cache_max` (pending federated sign-in bound) | V2 Validation and Business Logic (anti-automation) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
+| `[auth].step_up_max_age_seconds` (step-up re-verification window) | V7 Session Management (7.5.3) | **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication |
+| `[auth].totp_skew_steps` (TOTP acceptance window) | V6 Authentication (6.5.5) | **IA-2(8)** Access to Accounts — Replay Resistant | §164.312(d) Person or Entity Authentication |
+| `[auth].initial_password_expiry_hours` (life of an administrator-issued temporary password) | V6 Authentication (6.4.1, 6.4.5) | **IA-5(1)** Authenticator Management | §164.308(a)(5)(ii)(D) Password Management |
 | `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |

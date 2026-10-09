@@ -7581,6 +7581,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       directory call may hold a worker thread, so a value above its default is looser, named while
       AD is on. They are timeouts and not rate limits; they sit here because they are read the same
       way, against the shipped default.
+    * ``step_up_max_age_seconds``, ``totp_skew_steps`` and ``initial_password_expiry_hours`` (vault
+      BACKLOG #2600 step 4) are read the same way too. A step-up window or a temporary-password
+      life above its default is looser, and so is any TOTP skew above the strict 0. A
+      temporary-password life of 0 or less means no expiry, and is named as off. None is gated on
+      another setting. The last two entries quote no configured value.
 
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
@@ -7966,6 +7971,63 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                         "sign-in shares for longer",
                     )
                 )
+
+    # --- the three numeric [auth] knobs vault BACKLOG #2600 step 4 names. None is a rate limit;
+    # they sit here because each is read the same way, against the shipped default. None is gated:
+    # sign-in is always on, a local account may hold a TOTP factor whatever require_mfa says, and
+    # an administrator may issue a temporary password on any instance.
+
+    # has_recent_step_up passes a session that re-verified within this many seconds, and
+    # _grant_action_step_up ends an action-bound grant this long after it is minted. Longer is looser.
+    # 0 or less passes no session and ends every grant at once, which is stricter: not named.
+    window, default_window = auth.step_up_max_age_seconds, _auth_default("step_up_max_age_seconds")
+    if window > default_window:
+        out.append(
+            (
+                "step_up_max_age_seconds",
+                f"the step-up window is {window} s, longer than the default of {default_window} s, "
+                "so a session that re-verified its credential (a local sign-in can count) may run "
+                "sensitive operations for longer before it is asked again, and an action-bound "
+                "proof that was minted and not used stays usable for as long",
+            )
+        )
+
+    # verify_totp_step accepts the current 30 s step alone at 0, and the load refuses anything
+    # outside 0..2, so any value above the default widens the window in which a captured code is
+    # accepted. The entry quotes no configured value: totp_* and *password* are names the
+    # clear-text-logging query reads as secret sources (ADR 0034's 2026-10-03 amendment), so each
+    # value below only picks a literal.
+    if auth.totp_skew_steps > _auth_default("totp_skew_steps"):
+        out.append(
+            (
+                "totp_skew_steps",
+                "a TOTP code is accepted outside its own 30 s step (the default accepts the "
+                "current step only), so a code captured in transit stays usable for at least one "
+                "more step than the default allows",
+            )
+        )
+
+    # initial_credential_deadline returns no deadline at 0 or less, so a temporary password an
+    # administrator issued never expires and its reminder never runs. A longer life is looser too.
+    expiry_field = "initial_password_expiry_hours"
+    if auth.initial_password_expiry_hours <= 0:
+        out.append(
+            (
+                expiry_field,
+                "a temporary password an administrator issued NEVER expires, so an unclaimed one "
+                "admits whoever learns it for as long as the account exists, and what it permits "
+                "includes setting the account's password. No reminder about it is sent either",
+            )
+        )
+    elif auth.initial_password_expiry_hours > _auth_default(expiry_field):
+        out.append(
+            (
+                expiry_field,
+                "a temporary password an administrator issued lasts longer than the default of "
+                f"{_auth_default(expiry_field)} hours, so an unclaimed one admits whoever learns "
+                "it for longer, and what it permits includes setting the account's password",
+            )
+        )
     return out
 
 
@@ -8204,8 +8266,8 @@ def security_loosenings(
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
     BACKLOG #2600), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache
-    and AD timeout
+    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache,
+    AD timeout, step-up window, TOTP skew and temporary-password life
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
     (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
@@ -8239,15 +8301,10 @@ def security_loosenings(
     ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's
     lone flip never builds; its own tests pin it.
 
-    **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
-    load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
-    It is not a ``[security]`` field, so the completeness floor (which iterates
-    ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
-    matters is the consequence: it is the ONLY bound on an admin-issued temporary password, so
-    setting it to 0 unbounds every such credential, and nothing in this registry says so. Reporting it
-    needs a new REQUIRED parameter (every one here is required by design, so an optional detector
-    cannot be added quietly), which is a larger change than the item that exposed it — filed as
-    content rather than folded in.
+    **``[auth].initial_password_expiry_hours`` is reported since vault BACKLOG #2600 step 4.**
+    BACKLOG #1245 made it load-bearing: it is the ONLY bound on an admin-issued temporary password,
+    so 0 unbounds every such credential. :func:`_auth_limit_loosenings` names it at 0 or less and
+    above its default. This paragraph once recorded it as unreported.
 
     **One entry is read from the process environment and from no argument:**
     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (vault BACKLOG #2599), named while
@@ -8268,9 +8325,8 @@ def security_loosenings(
     warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
     below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
     transport (:func:`_reminder_loosenings`). Not every way is named.
-    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder and is unreported. The
-    paragraph above gives the reason as a new required parameter, and that premise no longer
-    holds: ``auth`` is already a parameter here, so naming it is one more arm, owed and not built.
+    ``[auth].initial_password_expiry_hours = 0`` also stops a reminder, and its entry says so
+    (vault BACKLOG #2600 step 4).
     ``[alerts].security_notifications_required = false`` with no recipient sends every reminder to
     the log alone; serve audits that waiver, and this registry does not list it.
 
