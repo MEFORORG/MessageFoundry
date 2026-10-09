@@ -835,7 +835,8 @@ class Engine:
         and an activation is not where it changes."""
         was_active = self._dr_active
         rr = self._registry_runner
-        # What an operator had bound before this call, which a failed activation leaves bound.
+        # What an operator had bound before this call, which a failed activation does not unbind.
+        # It does not bind again one the attempt's own reload had parked.
         listening = rr.listening_inbounds() if rr is not None else frozenset()
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
         # graph is what the operator last applied, through whatever approval that reload needed, so
@@ -878,11 +879,17 @@ class Engine:
                 # stops this, which is the caller insisting, as in the runner's reload rollback.
                 try:
                     await rr.park_intake(standby, keep=listening)
-                    await rr.close_passive_connectors()
                 except Exception:
                     log.exception(
                         "DR activation failed, and unbinding the listeners it had bound failed "
                         "too; POST /config/reload unbinds them"
+                    )
+                try:
+                    await rr.close_passive_connectors()
+                except Exception:
+                    log.exception(
+                        "DR activation failed, and closing the outbound sessions it had opened "
+                        "failed too; POST /config/reload closes them"
                     )
             raise
 

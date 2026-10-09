@@ -362,21 +362,28 @@ in-flight rows stranded.
 > check (a pin, ACL or path refusal), the build, and `validate_startup`. The reload's CA
 > pre-check used to read these lanes, and one refusal refused the whole takeover. The lane is
 > built before it is unparked, so no held row is claimed while it has no connector. A lane that
-> fails is then not parked: it reads `failed`, and its rows retry as they do on any failed lane.
+> fails stays parked and reads `failed`. Its held rows stay queued: none is charged an attempt
+> or dead-lettered for a fault found at the takeover. Fix the fault, then start the connection.
+> A later reload does lift that park, and the lane's rows then retry as on any failed lane.
+> Only the owning engine shard builds a lane this way.
 >
 > **Other faults still refuse the whole activation.** The reload runs its build check over every
 > connector first. At least these refuse there: an outbound CA file that is missing or does not
-> parse, and an `env()` value that does not resolve. The start-time check above reports both at
-> boot. An inbound is unchanged too: a listener that cannot bind, or a poller whose CA is
-> refused, aborts the activation, as acquire-VIP-or-abort requires. An activation that fails
-> some outbounds still answers success, and its `dr.activate` row does not name them; the
-> per-connection status and alerts do.
+> parse, and an `env()` value that does not resolve. The start-time check above reports a
+> missing file and an unresolved value at boot. It builds nothing, so a file that is readable
+> and does not parse first shows at a reload or at the activation. An inbound is unchanged
+> too: a listener that cannot bind, or a poller whose CA is refused, aborts the activation, as
+> acquire-VIP-or-abort requires. An activation that fails some outbounds still answers success,
+> and its `dr.activate` row does not name them; the per-connection status and alerts do. The
+> first builds run one after another, so a `validate_startup` probe that hangs delays the lanes
+> behind it and the activation's answer.
 >
-> **A failed activation leaves no listener bound.** The box is passive again, so the engine
-> unbinds what the attempt bound and closes the outbound sessions it opened. Two paths needed
+> **A failed activation unbinds the listeners the attempt bound.** The box is passive again, so
+> the engine unbinds them and closes the outbound sessions the attempt opened. Two paths needed
 > it: a reload that committed and was then cancelled, and an operator reload already running
-> when the threshold flipped. A listener an operator had started before the attempt stays
-> bound, as the #3140 amendment allows.
+> when the threshold flipped. It is not a guarantee that nothing is bound. A listener an
+> operator had started before the attempt is left as it is. An error in the unbind is logged,
+> and a second cancellation stops it; a reload then unbinds.
 >
 > **A release is complete once its `dr.release` row is written.** The engine turns the profile
 > off and returns with no await in between, and the coordinator records the hand-back. Closing

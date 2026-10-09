@@ -3250,6 +3250,9 @@ class RegistryRunner:
             and not self._dr_passive
             and name not in self._destinations
             and not self._below_dr_threshold(oc.priority)
+            # Only the owning engine shard (ADR 0073). Elsewhere the lane is built as before,
+            # with no startup probe of the partner and no second alert for the one fault.
+            and self._owns_destination(name)
         )
 
     async def _preflight_passive_lanes(self) -> None:
@@ -3270,7 +3273,10 @@ class RegistryRunner:
         records it, and the rest are still read. It marks no lane for
         :meth:`_keeps_anchor_failure`, so a reload on a passive box reads the file again and
         refuses on one still refused. A reload that commits clears the record, including for a
-        lane it did not read, such as a poller whose window has closed."""
+        lane it did not read: at least a poller whose window has closed.
+
+        It builds no connector, so it misses what only a build finds: at least a CA file that
+        is readable and does not parse."""
         if self._lane_anchor_check is None:
             return
         for conn in self._reload_anchor_candidates(self.registry, self.registry, ()):
@@ -3541,7 +3547,9 @@ class RegistryRunner:
                 or (not oc.auto_start and not self._outbound_lane_live(name))
                 or self._below_dr_threshold(oc.priority)
                 or self._leaves_passive_park(name, oc)
-                or self._keeps_anchor_failure("outbound", name, old, oc)
+                # A passive standby builds no lane, so it keeps no failure unread: its reload
+                # reads the CA again, and the park's clearing of the record is then earned.
+                or (not self._dr_passive and self._keeps_anchor_failure("outbound", name, old, oc))
             ):
                 continue
             lanes.append(oc)
@@ -3622,6 +3630,11 @@ class RegistryRunner:
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
             # refusal the engine start path gives it, isolated the same way (this method never raises).
             await connector.validate_startup()
+        except asyncio.CancelledError:
+            # A reload awaits this for a lane leaving the passive park, and a reload can be
+            # cancelled (vault BACKLOG #3263). The built connector is closed, not dropped.
+            await self._aclose_quietly(connector, name)
+            raise
         except Exception as exc:
             await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)
@@ -6206,13 +6219,14 @@ class RegistryRunner:
                 if not unpark_permitted:
                     if name not in self._outbound_paused:
                         self._pause_delivery_lanes([name])
-                    elif self._dr_parked(name):
-                        # The halt holds the lane, and its DR marker is still judged again
-                        # (vault BACKLOG #3263). An activation under a halt used to leave the
-                        # passive standby's marker on a lane the profile now runs. The halt's
-                        # recovery is to start the connection, and that door then answered
-                        # "activate DR first" on a box that was already active.
-                        self._dr_filters_out(name, oc.priority, kind="outbound")
+                    # The halt holds the lane, and its DR marker is still judged again (vault
+                    # BACKLOG #3263). An activation under a halt used to leave the passive
+                    # standby's marker on a lane the profile now runs. The halt's recovery is
+                    # to start the connection, and that door then answered "activate DR first"
+                    # on a box that was already active. A lane this reload adds below the
+                    # threshold gets its marker here too, so that door refuses it. A no-op
+                    # with no DR profile.
+                    self._dr_filters_out(name, oc.priority, kind="outbound")
                     continue
             if (
                 name in self._gate_parked
@@ -6238,7 +6252,17 @@ class RegistryRunner:
                 self._filtered.pop(("outbound", name), None)
                 self._failed.pop(("outbound", name), None)
                 await self._ensure_destination_built(name)
-                self._unpark_outbound_lane(name)
+                if self._dr_passive:
+                    # The box went passive while the build awaited: a failed activation hands
+                    # the threshold back without the reload lock. The lane stays parked, under
+                    # the passive marker again.
+                    self._dr_filters_out(name, oc.priority, kind="outbound")
+                elif name in self._destinations:
+                    self._unpark_outbound_lane(name)
+                # else the build failed, and the lane stays parked with its rows held: it reads
+                # failed, and none of them is claimed with no connector, charged an attempt or
+                # dead-lettered for a fault found at the takeover. Starting the connection, once
+                # the fault is fixed, builds it and resumes it.
                 if worker is None or worker.done():
                     self._spawn_worker(name)
                 continue

@@ -249,10 +249,43 @@ async def test_an_activation_fails_one_lane_on_a_refused_ca_and_starts_the_rest(
         await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))  # the good lane delivers
         assert set(runner.filtered_outbound()) == set()
 
+        # Released with the CA still refused: a reload on the passive box reads it again. Red
+        # when the lane's kept failure left it out and the park then cleared its record.
+        runner.set_dr_threshold(None, standby=Priority.CRITICAL)
+        with pytest.raises(WiringError):
+            await runner.reload()
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # and activated again
+        await runner.reload()
+        assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
+
         # Recovery is the ordinary one for a lane its CA failed: fix the file, start the lane.
         ca.write_bytes(_block(b"partner-ca"))
         await runner.start_outbound(_OB_CA)
         assert _OB_CA in runner._destinations and runner.outbound_failed(_OB_CA) is None
+        assert runner.outbound_running(_OB_CA)
+    finally:
+        await runner.stop()
+
+
+async def test_a_lane_that_fails_at_an_activation_keeps_its_rows_held(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The failed lane stays parked. Red when it was unparked anyway: the row was claimed with
+    no connector and charged an attempt, and a finite ``max_attempts`` dead-lettered it."""
+    ca, pin = _swapped_ca(tmp_path)
+    runner = _runner(store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL)
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(
+            channel_id=_IB, raw=_ADT, deliveries=[(_OB_CA, _ADT), (_OB_FILE, _ADT)]
+        )
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))  # the control lane sent
+        await asyncio.sleep(0.3)
+        held = [r for r in await store.outbox_for(row_id) if r["destination_name"] == _OB_CA]
+        assert [(r["status"], r["attempts"]) for r in held] == [("pending", 0)]
+        assert not runner.outbound_running(_OB_CA)
     finally:
         await runner.stop()
 

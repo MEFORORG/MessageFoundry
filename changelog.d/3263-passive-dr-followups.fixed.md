@@ -3,11 +3,11 @@
   not activated reads the CA file of each connection an activation would start. A refused one
   reads `status: "failed"` and alerts. It builds, binds and dials nothing to do so. At
   `POST /dr/activate`, an outbound whose CA pin, ACL or path check, build or `validate_directory`
-  check fails is failed on its own, and the rest start. Such a CA used to refuse the whole
-  activation, and the `validate_directory` check never ran. A missing CA file or an unresolved
-  `env()` value still refuses the activation. A failed or cancelled activation now leaves no
-  listener bound. A release cut short while it closed outbound sessions is still recorded as a
-  release; the engine and the DR coordinator used to disagree about it. An activation while the
-  application log is unwritable no longer leaves outbounds answering `409` "activate DR first"
-  once the log is repaired. **Breaking:** `[dr].enabled` with `[cluster].enabled` is now refused
-  at load, as `[dr].activate` already was. (`vault BACKLOG #3263`)
+  check fails is failed on its own and keeps its rows queued, and the rest start. Such a CA
+  used to refuse the whole activation, and the `validate_directory` check never ran. At least a
+  CA file that is missing or does not parse, and an unresolved `env()` value, still refuse the
+  activation. A failed or cancelled activation now unbinds the listeners the attempt bound. A
+  release cut short while it closed outbound sessions is still recorded as a release; the
+  engine and the DR coordinator used to disagree about it. An activation while the application
+  log is unwritable no longer leaves outbounds answering `409` "activate DR first" once the log
+  is repaired. (`vault BACKLOG #3263`)
