@@ -192,6 +192,11 @@ def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hin
         # Near [cluster], and vip is a sub-table there. MEFOR_CLUSTER_VIP would fail validation,
         # so it is not offered.
         "MEFOR_CLUSTR_VIP",
+        # Near [alerts], and rules is a list: one string cannot fill it.
+        "MEFOR_ALERT_RULES",
+        # Near [auth] and [api], and each key moved to [security]: that spelling is refused.
+        "MEFOR_AUHT_REQUIRE_MFA",
+        "MEFOR_APII_HOST",
         "MEFOR_PORT",  # what a Kubernetes Service named "mefor" injects
         "MEFOR_PORT_8765_TCP_ADDR",
         # The test suite's own switches (tests/conftest.py and ci.yml). TEST_FORCE is close to
@@ -237,6 +242,21 @@ def test_a_sub_table_is_not_offered_but_a_scalar_beside_it_is() -> None:
     assert _unread_env_notes({"MEFOR_CLUSTR_VIP": "true"}, {}) == []
     (note,) = _unread_env_notes({"MEFOR_CLUSTR_ENABLED": "true"}, {})
     assert "did you mean MEFOR_CLUSTER_ENABLED?" in note
+
+
+def test_serve_logs_the_warnings_again_after_configure_logging() -> None:
+    """``serve`` loads its settings before ``configure_logging``, so the warnings that load logged
+    reached bare stderr only. It logs them again once logging is configured. Read from the source,
+    because running ``serve`` far enough to reach that point starts an engine."""
+    import inspect
+
+    from messagefoundry import __main__ as cli
+
+    source = inspect.getsource(cli._serve)
+    configured = source.index("configure_logging(")
+    replayed = source.index("unread_env_warnings(settings)")
+    assert configured < replayed
+    assert source.index("_load_service_settings(") < configured  # the control: the load is first
 
 
 def test_a_refusal_does_not_hide_the_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -450,8 +470,8 @@ def test_service_links_for_the_shipped_service_names_load_and_draw_no_warning() 
 
 
 def test_every_shipped_pod_spec_turns_service_links_off() -> None:
-    """The engine reads no service-link variable, and one named like a setting stops the start or
-    is read as that setting. Off at source in every shipped workload."""
+    """The engine reads no service-link variable, and one named like a setting stops the start.
+    Off at source in every shipped workload."""
     specs = [
         (name, doc["spec"]["template"]["spec"])
         for name, doc in _k8s_docs()

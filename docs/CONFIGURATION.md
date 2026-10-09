@@ -76,8 +76,9 @@
 >   the `[service]` section, which has no env layer, so the load is refused.
 > - **`mefor-<section>`**, such as `mefor-auth`, `mefor-api` or `mefor-store`. It gives the pod
 >   `MEFOR_AUTH_SERVICE_HOST` and the like, which name a section and no setting, so the load is
->   refused. Some injected names are real settings: `mefor-store` gives `MEFOR_STORE_PORT`, with
->   a URL for a value, which the loader reads as `[store].port`.
+>   refused. Some injected names are also real settings, such as `MEFOR_STORE_PORT` from
+>   `mefor-store`. They always arrive beside names the loader refuses, so the start stops before
+>   any of them applies.
 >
 > The shipped manifests under `docker/k8s/` set `enableServiceLinks: false` on the pod, so the
 > kubelet injects none of these. Their own Services have names that start `mefor-engine`, and

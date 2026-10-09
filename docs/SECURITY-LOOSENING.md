@@ -84,7 +84,7 @@ section reference.
 | | `[auth].oidc_callback_floor_exempt_amr` | `[]` (*conditional* — a loosening only with OIDC on and the callback floor on; any value listed) |
 | | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
 | | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
-| | `[auth].step_up_max_age_seconds` | `300` s (a window above `300` s is named. `0` or less passes no session, which is stricter) |
+| | `[auth].step_up_max_age_seconds` | `300` s (a window above `300` s is named. `0` or less is stricter: it passes no session, except briefly after the system clock steps back) |
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
@@ -914,7 +914,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 
 ### `[auth].step_up_max_age_seconds` above `300` s — a re-verified session runs sensitive operations for longer
 > No other setting gates it (vault BACKLOG #2600, ASVS 7.5.3). A window above `300` s is named, with
-> the configured value. A window of `0` or less passes no session, which is stricter, and is not named.
+> the configured value. A window of `0` or less is stricter and is not named. It passes no
+> session, except briefly after the system clock steps back.
 - **What you lose:** a sensitive operation asks whether the session re-verified its credential within
   this many seconds. A local sign-in can count as that first verification; the
   `step_up_max_age_seconds` row of [CONFIGURATION.md](CONFIGURATION.md) says when. With a longer

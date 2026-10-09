@@ -144,7 +144,7 @@ spec:
       terminationGracePeriodSeconds: 40
       # No service-link variables. The engine reads none, and it treats MEFOR_<SECTION>_<KEY> as a
       # setting: a Service named `mefor`, or `mefor-<section>`, in this namespace would otherwise
-      # inject names the settings loader refuses or misreads (docs/CONFIGURATION.md). DNS is unaffected.
+      # inject names the settings loader refuses at start (docs/CONFIGURATION.md). DNS is unaffected.
       enableServiceLinks: false
       securityContext:
         runAsNonRoot: true

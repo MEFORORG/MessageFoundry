@@ -49,7 +49,8 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, get_args
+from types import UnionType
+from typing import Any, Literal, Union, get_args, get_origin
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -6015,17 +6016,21 @@ class ApprovalsSettings(_Section):
 _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 
 #: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).
-_CLOUD_DEST_SCHEMES = ("s3://", "gs://", "gcs://", "azure://", "http://", "https://", "ftp://")
+#: ``<scheme>://`` at the start of a value. Two characters at least, so a drive letter
+#: (``C://backups``) is still a path.
+_URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]+://")
 
 
 def _cloud_scheme(value: str) -> str | None:
-    """The :data:`_CLOUD_DEST_SCHEMES` entry ``value`` starts with, or ``None``.
+    """The ``<scheme>://`` that ``value`` starts with, or ``None``. Any scheme: these settings take
+    a LOCAL or UNC path. A fixed list of seven cloud schemes let ``sftp://`` or ``s3a://`` load as
+    a bogus local path (vault BACKLOG #2600).
 
     A refusal quotes this and never the URL. A URL can carry a credential (``https://user:pw@``,
     a signed query), and :func:`settings_error_detail` prints a validator's message as written:
     to stderr, a service log, and since vault BACKLOG #2600 ``security show``'s JSON."""
-    low = value.strip().lower()
-    return next((scheme for scheme in _CLOUD_DEST_SCHEMES if low.startswith(scheme)), None)
+    match = _URL_SCHEME.match(value.strip().lower())
+    return match.group(0) if match else None
 
 
 class BackupSettings(_Section):
@@ -6249,7 +6254,9 @@ class DrSettings(_Section):
         # that will resolve it: a rooted path with no drive is relative on Windows.
         value = value.strip()
         if value and not os.path.isabs(value):
-            raise ValueError(f"[dr].seed_dir must be an absolute path, or omitted ({value!r})")
+            # The value is not quoted: a URL whose scheme _cloud_scheme missed could carry a
+            # credential (vault BACKLOG #2600).
+            raise ValueError("[dr].seed_dir must be an absolute path, or omitted")
         return value
 
     @field_validator("restore_token")
@@ -7227,6 +7234,23 @@ def _unspared_env_names(
             yield name, name[len(_ENV_PREFIX) :].lower()
 
 
+#: Container types the env layer cannot fill: it hands every field one string.
+_NOT_FROM_ONE_STRING = (list, dict, tuple, set, frozenset)
+
+
+def _env_can_hold(field: Any) -> bool:
+    """Whether the one string the env layer gives ``field`` can validate: not a sub-table
+    (``[cluster].vip``) and not a container (``[alerts].rules``), alone or in a union with
+    ``None``. A hint naming such a field would point at a variable that fails the load."""
+    annotation = field.annotation
+    members = [a for a in get_args(annotation) if a is not type(None)]
+    for member in members if get_origin(annotation) in (Union, UnionType) else [annotation]:
+        base = get_origin(member) or member
+        if base in _NOT_FROM_ONE_STRING or (isinstance(base, type) and issubclass(base, BaseModel)):
+            return False
+    return True
+
+
 def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
     """One note per ``MEFOR_*`` variable that :func:`_reject_unknown_env_keys` lets through and
     that LOOKS like a setting nothing will read (vault BACKLOG #2600). Never quotes a value.
@@ -7255,6 +7279,7 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     by_parts: dict[int, list[str]] = {}
     for section in sorted(models):
         by_parts.setdefault(section.count("_") + 1, []).append(section)
+    gone = set(_RELOCATED_TO_SECURITY) | set(_REMOVED_KEYS)
     notes: list[str] = []
     for name, rest in _unspared_env_names(environ, referenced):
         if rest in models:
@@ -7280,12 +7305,12 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
                 continue
             meant = f"{_ENV_PREFIX}{near[0].upper()}_{key.upper()}"
             field = models[near[0]].model_fields.get(key)
-            is_field = field is not None
-            # A sub-table (``[cluster].vip``) is a field the environment cannot set: the env layer
-            # hands it a string. :func:`_near_env_name` withholds such a hint for the same reason.
-            annotation = field.annotation if field is not None else None
-            is_table = isinstance(annotation, type) and issubclass(annotation, _Section)
-            if near[0] in _SECTIONS and ((is_field and not is_table) or meant in _OUT_OF_BAND_ENV):
+            # A key that moved to [security] or was removed is refused in that spelling, as
+            # :func:`_near_env_name` knows, so it is no hint either.
+            is_field = field is not None and (near[0], key) not in gone
+            if near[0] in _SECTIONS and (
+                (is_field and _env_can_hold(field)) or meant in _OUT_OF_BAND_ENV
+            ):
                 hint = f"{meant}?"
             elif near[0] not in _SECTIONS and is_field:
                 hint = (
@@ -8119,7 +8144,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     # has_recent_step_up passes a session that re-verified within this many seconds, and
     # _grant_action_step_up ends an action-bound grant this long after it is minted. Longer is looser.
-    # 0 or less passes no session and ends every grant at once, which is stricter: not named.
+    # 0 or less passes no session and ends every grant at once, which is stricter: not named. The
+    # check reads the wall clock, so a backward clock step can pass a session briefly even at 0.
     window, default_window = auth.step_up_max_age_seconds, _auth_default("step_up_max_age_seconds")
     if window > default_window:
         out.append(

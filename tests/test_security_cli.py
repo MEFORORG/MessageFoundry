@@ -297,6 +297,7 @@ def test_show_gives_no_partial_reason_when_the_file_loads(
     assert data["loosenings_partial_reason"] is None
 
 
+@pytest.mark.parametrize("scheme", ["https", "sftp", "s3a"])
 @pytest.mark.parametrize(
     ("table", "key"),
     [
@@ -307,21 +308,30 @@ def test_show_gives_no_partial_reason_when_the_file_loads(
     ],
 )
 def test_a_cloud_url_refusal_in_the_partial_reason_quotes_the_scheme_only(
-    table: str, key: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    table: str, key: str, scheme: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A URL can carry a credential, and the reason prints each validator's message. The cloud-URL
-    refusals quote the scheme and never the URL (vault BACKLOG #2600)."""
+    refusals take any scheme, quote it, and never quote the URL (vault BACKLOG #2600)."""
     planted = "canary-canary-canary"
     toml = tmp_path / "mf.toml"
     toml.write_text(
-        f'[{table}]\n{key} = "https://svc:{planted}@blob.example/x?sig=SYNTHTOKEN"\n',
+        f'[{table}]\n{key} = "{scheme}://svc:{planted}@blob.example/x?sig=SYNTHTOKEN"\n',
         encoding="utf-8",
     )
     data = _show(toml, capsys)
     assert data["loosenings_partial"] is True
     reason = data["loosenings_partial_reason"]
-    assert f"{table}.{key}" in reason and "not a cloud URL (https://...)" in reason
+    assert f"{table}.{key}" in reason and f"not a cloud URL ({scheme}://...)" in reason
     assert planted not in json.dumps(data) and "SYNTHTOKEN" not in json.dumps(data)
+
+
+@pytest.mark.parametrize("path", ["D:/mefor-backups", "C://mefor-backups", r"\\\\nas\\share\\x"])
+def test_a_local_or_unc_path_is_not_read_as_a_url(path: str) -> None:
+    """The control: a drive letter is one character, so ``C://`` is a path, and a UNC path has
+    no scheme."""
+    from messagefoundry.config.settings import BackupSettings
+
+    assert BackupSettings(destination=path).destination == path
 
 
 def test_show_names_the_stray_variable_that_made_the_report_partial(
