@@ -353,8 +353,9 @@ async def test_an_accepted_handshake_is_still_a_101_with_each_header_once(base: 
 
 #: A request line longer than the 8192 bytes the websockets parser reads, and a header block with
 #: more lines than it accepts. Both pass uvicorn's HTTP protocol and reach the WebSocket one.
+_LONG_LINE_UPGRADE = _HANDSHAKE.format(path="/" + "a" * 9000).encode()
 _PARSER_REJECTED = [
-    pytest.param(_HANDSHAKE.format(path="/" + "a" * 9000).encode(), 414, id="long-request-line"),
+    pytest.param(_LONG_LINE_UPGRADE, 414, id="long-request-line"),
     pytest.param(
         _HANDSHAKE.format(path="/ws/stats")
         .replace("\r\n\r\n", "\r\n" + "".join(f"X-{n}: 1\r\n" for n in range(200)) + "\r\n")
@@ -383,18 +384,30 @@ async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() 
     connection left open, and a server stop that raises from inside websockets. If this fails,
     uvicorn has changed that path: re-read it, and remove the floor's ``data_received`` step if it
     is no longer needed."""
-    request_bytes = _PARSER_REJECTED[0].values[0]
-    with pytest.raises(AssertionError):
-        async with _served(_raises, ws=WebSocketsSansIOProtocol) as port:
-            reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            try:
+    request_bytes = _LONG_LINE_UPGRADE
+    answered: bool | None = None
+    reading: asyncio.Future[bytes] | None = None
+    writer: asyncio.StreamWriter | None = None
+    try:
+        # The connection must still be open when the block ends, because the raise comes from the
+        # 500 uvicorn tries to send it at server stop. Nothing in the block asserts: an assertion
+        # there would satisfy pytest.raises on its own.
+        with pytest.raises(AssertionError) as stopped:
+            async with _served(_raises, ws=WebSocketsSansIOProtocol) as port:
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
                 writer.write(request_bytes)
                 await writer.drain()
-                # Raised here, a TimeoutError would be the wrong exception for the block.
-                answer = await asyncio.wait({asyncio.ensure_future(reader.read())}, timeout=1.0)
-                assert not answer[0], "the bare protocol answered; uvicorn changed this path"
-            finally:
-                writer.close()
+                reading = asyncio.ensure_future(reader.read())
+                done, _ = await asyncio.wait({reading}, timeout=1.0)
+                answered = bool(done)
+    finally:
+        if reading is not None:
+            reading.cancel()
+        if writer is not None:
+            writer.close()
+    assert answered is False, "the bare protocol answered; uvicorn changed this path"
+    raised_in = str(stopped.traceback[-1].path)
+    assert "websockets" in raised_in, f"the stop raised somewhere else: {raised_in}"
 
 
 def test_the_sans_io_websocket_protocol_is_floored() -> None:

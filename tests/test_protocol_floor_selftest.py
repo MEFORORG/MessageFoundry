@@ -101,7 +101,15 @@ def test_the_unfloored_classes_are_refused_for_every_response(ws_base: type[Any]
     """The vacuity control for the whole check: uvicorn's own classes, with no floor, fail every
     drive."""
     assert len(_ALL_RESPONSES) == 6 and len(_WS_RESPONSES) == 4
-    _names_only(_refusal(HttpToolsProtocol, ws_base), *_ALL_RESPONSES)
+    message = _refusal(HttpToolsProtocol, ws_base)
+    # uvicorn's own sans-I/O protocol never writes the answer its parser queued, so that drive
+    # fails as unwritten there. Every other drive, on either protocol, is written bare.
+    unwritten = ["WebSocket parser rejection"] if ws_base is WebSocketsSansIOProtocol else []
+    for response in _ALL_RESPONSES:
+        if response in unwritten:
+            assert f"the {response} was never written" in message, message
+        else:
+            _names(message, response)
 
 
 # --- one hook knocked out per response -----------------------------------------------------------
@@ -313,7 +321,8 @@ def test_the_driven_servers_own_logging_stays_quiet(
     caplog.clear()
     selftest_protocol_floor(*_floored())
     assert _server_records(caplog) == 0, [r.getMessage() for r in caplog.records]
-    logging.getLogger("uvicorn.error").warning("the mute is lifted once the self-test returns")
+    # CRITICAL, so the record gets through whatever level an earlier test left on this logger.
+    logging.getLogger("uvicorn.error").critical("the mute is lifted once the self-test returns")
     assert _server_records(caplog) == 1
 
 
