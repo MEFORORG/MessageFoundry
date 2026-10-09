@@ -185,8 +185,10 @@ const ALERT_RULES_QUOTED = [{ event_type: "queue_buildup", min_depth: "500", ind
  *  so a bare `[[alerts.rules]]` arrives as this. */
 const ALERT_RULES_BARE = [{ index: 0 }];
 
-/** A HAND-EDITED rule carrying AlertRule keys the host's Rule does not name (settings.py). The
- *  receiver reads none of them and must not refuse a list for having them. */
+/** A rule carrying AlertRule keys the host's Rule does not name: recipients, id, mute and an
+ *  escalate tier (AlertRule and EscalationTier, config/settings.py). Written by hand here, not
+ *  recorded; the rule minus its index was checked once against AlertRule.model_validate. The
+ *  receiver reads none of these keys and must not refuse a list for having them. */
 const ALERT_RULES_EXTRA_KEYS = [
   {
     event_type: "queue_buildup",
@@ -194,9 +196,7 @@ const ALERT_RULES_EXTRA_KEYS = [
     recipients: ["oncall@example.org"],
     id: "depth-page",
     mute: false,
-    control_action: "restart_outbound",
-    schedule: { days: ["mon"], start: "08:00", end: "17:00" },
-    escalate: [{ after_occurrences: 3, severity: "critical" }],
+    escalate: [{ after_count: 3, severity: "critical" }],
     index: 0,
   },
 ];
