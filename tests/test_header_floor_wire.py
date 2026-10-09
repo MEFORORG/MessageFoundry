@@ -63,8 +63,9 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 #: The uvicorn this suite was measured against. See the module docstring before moving it.
-_MEASURED_UVICORN = "0.49.0"
-#: The websockets library writes the legacy protocol's own handshake rejections, so it is pinned too.
+_MEASURED_UVICORN = "0.54.0"
+#: The websockets library writes both WebSocket protocols' own handshake rejections, so it is
+#: pinned too.
 _MEASURED_WEBSOCKETS = "17.1"
 
 _HANDSHAKE = (
@@ -274,20 +275,101 @@ async def test_the_app_error_500_carries_nosniff(
     _assert_protocol_family(control, shipped, 500)
 
 
-async def test_the_websocket_500_carries_nosniff() -> None:
-    request = _HANDSHAKE.format(path="/ws/stats").encode()
-    async with _served(_raises, ws=WebSocketProtocol) as port:
+#: Both WebSocket protocols the floor covers: the sans-I/O one ``ws="auto"`` resolves to at the
+#: measured uvicorn, and the legacy server ``ws="websockets"`` still names.
+_WS_BASES = [WebSocketsSansIOProtocol, WebSocketProtocol]
+
+
+async def _ws_family(base: type[Any], app: Any, request: bytes, status: int) -> None:
+    """One WebSocket handshake answer, on the bare protocol and on the floored one."""
+    async with _served(app, ws=base) as port:
         control = await _exchange(port, request)
-    async with _served(_raises, ws=floored_ws_protocol_class(base=WebSocketProtocol)) as port:
+    async with _served(app, ws=floored_ws_protocol_class(base=base)) as port:
         shipped = await _exchange(port, request)
-    _assert_protocol_family(control, shipped, 500)
+    _assert_protocol_family(control, shipped, status)
 
 
-def test_the_sans_io_websocket_protocol_is_refused_not_served_bare() -> None:
-    """It writes its own handshake rejections without ``write_http_response``, so the floor cannot
-    reach them. The build refuses it rather than serving those answers without the headers."""
-    with pytest.raises(ProtocolFloorUnavailable, match="write_http_response method"):
-        floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
+@pytest.mark.parametrize("base", _WS_BASES)
+async def test_the_websocket_500_carries_nosniff(base: type[Any]) -> None:
+    await _ws_family(base, _raises, _HANDSHAKE.format(path="/ws/stats").encode(), 500)
+
+
+async def test_a_websocket_app_that_returns_without_answering_gets_a_floored_500() -> None:
+    """The sans-I/O protocol only: the legacy server answers this case twice on one connection,
+    so its bytes are not one response to compare."""
+    request = _HANDSHAKE.format(path="/ws/stats").encode()
+    await _ws_family(WebSocketsSansIOProtocol, _returns_without_a_response, request, 500)
+
+
+@pytest.mark.parametrize("base", _WS_BASES)
+async def test_the_servers_own_403_for_a_bare_close_carries_nosniff(base: type[Any]) -> None:
+    """An app with no floor of its own closes before accepting, and the SERVER writes the 403. The
+    API's apps never do this bare: the ASGI floor answers first. This is the protocol layer alone."""
+    await _ws_family(base, _bare_ws_refusal, _HANDSHAKE.format(path="/ws/stats").encode(), 403)
+
+
+async def _denies_with_a_response(scope: Scope, receive: Receive, send: Send) -> None:
+    """A pre-accept denial through the ``websocket.http.response`` extension, with no header of
+    its own: the answer the server builds from the app's status and body."""
+    await receive()
+    await send({"type": "websocket.http.response.start", "status": 401, "headers": []})
+    await send({"type": "websocket.http.response.body", "body": b"denied"})
+
+
+@pytest.mark.parametrize("base", _WS_BASES)
+async def test_an_apps_bare_denial_response_carries_nosniff(base: type[Any]) -> None:
+    await _ws_family(
+        base, _denies_with_a_response, _HANDSHAKE.format(path="/ws/stats").encode(), 401
+    )
+
+
+async def _accepts_then_closes(scope: Scope, receive: Receive, send: Send) -> None:
+    await receive()
+    await send({"type": "websocket.accept"})
+    await send({"type": "websocket.close", "code": 1000})
+
+
+@pytest.mark.parametrize("base", _WS_BASES)
+async def test_an_accepted_handshake_is_still_a_101_with_each_header_once(base: type[Any]) -> None:
+    """Adding to the conn must not break the answer that is not a rejection. The 101 has no body
+    for these headers to act on; what matters is that the upgrade still completes."""
+    request = _HANDSHAKE.format(path="/ws/stats").encode()
+    async with _served(_accepts_then_closes, ws=floored_ws_protocol_class(base=base)) as port:
+        # An accepted connection stays open for the closing handshake, so read the head only.
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(request)
+            await writer.drain()
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10.0)
+        finally:
+            writer.close()
+    lines = head.decode("latin-1").split("\r\n")
+    assert lines[0].startswith("HTTP/1.1 101 "), lines[0]
+    names = [line.partition(":")[0].strip().lower() for line in lines[1:] if line]
+    assert "sec-websocket-accept" in names
+    for name, _ in protocol_headers.PROTOCOL_SECURITY_HEADERS:
+        assert names.count(name.lower()) == 1, names
+
+
+def test_the_sans_io_websocket_protocol_is_floored() -> None:
+    """It was refused until BACKLOG #1120 floored it: uvicorn 0.50 and later resolve
+    ``ws="auto"`` to it, so on the measured uvicorn every start goes through this class."""
+    floored = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
+    assert floored is not None and issubclass(floored, WebSocketsSansIOProtocol)
+    assert isinstance(vars(floored)["conn"], property)
+    assert "write_http_response" not in vars(floored)
+    resolved = floored_ws_protocol_class()
+    assert resolved is not None and issubclass(resolved, WebSocketsSansIOProtocol)
+
+
+def test_a_protocol_with_neither_hook_set_is_refused_not_served_bare() -> None:
+    """wsproto's shape: it keeps a ``conn`` and has no ``write_http_response``, but its module has
+    no websockets ``ServerProtocol`` for the floor to wrap. Built from parts, since wsproto is not
+    a dependency and is not installed."""
+    base = _fake_sansio_ws("ServerProtocol")
+    with pytest.raises(ProtocolFloorUnavailable) as refused:
+        floored_ws_protocol_class(base=base)
+    assert refused.value.hook == "ServerProtocol in its module"
 
 
 def test_no_websocket_library_means_no_websocket_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -295,18 +377,14 @@ def test_no_websocket_library_means_no_websocket_protocol(monkeypatch: pytest.Mo
     assert floored_ws_protocol_class() is None
 
 
-async def test_the_legacy_websocket_handshake_rejection_carries_nosniff() -> None:
-    """The legacy websockets server answers a malformed handshake itself (here, no
-    Sec-WebSocket-Key) before the app runs. The sans-I/O protocol's equivalent is NOT covered and
-    is not what ``ws="auto"`` resolves to at the locked versions; see protocol_headers."""
+@pytest.mark.parametrize("base", _WS_BASES)
+async def test_the_librarys_own_handshake_rejection_carries_nosniff(base: type[Any]) -> None:
+    """The websockets library answers a malformed handshake itself (here, no Sec-WebSocket-Key)
+    before the app runs, under both protocols."""
     request = _HANDSHAKE.format(path="/ws/stats").replace(
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", ""
     )
-    async with _served(_raises, ws=WebSocketProtocol) as port:
-        control = await _exchange(port, request.encode())
-    async with _served(_raises, ws=floored_ws_protocol_class(base=WebSocketProtocol)) as port:
-        shipped = await _exchange(port, request.encode())
-    _assert_protocol_family(control, shipped, 400)
+    await _ws_family(base, _raises, request.encode(), 400)
 
 
 # --- per-response steps degrade: a failure on the header path never changes a status -----------
@@ -421,6 +499,28 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             lambda: {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
             id="legacy-handshake-400",
         ),
+        pytest.param(
+            "PROTOCOL_SECURITY_HEADERS",
+            _Boom(),
+            "ws-sansio: header addition",
+            _raises,
+            _HANDSHAKE.format(path="/ws")
+            .replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "")
+            .encode(),
+            400,
+            lambda: {"ws": floored_ws_protocol_class(base=WebSocketsSansIOProtocol)},
+            id="sansio-handshake-400",
+        ),
+        pytest.param(
+            "weakref",
+            SimpleNamespace(ref=_boom),
+            "ws-sansio: hook",
+            _raises,
+            _HANDSHAKE.format(path="/ws").encode(),
+            500,
+            lambda: {"ws": floored_ws_protocol_class(base=WebSocketsSansIOProtocol)},
+            id="sansio-conn-hook",
+        ),
     ],
 )
 async def test_every_per_response_header_step_degrades(
@@ -467,6 +567,52 @@ def test_a_hooked_cycle_is_still_freed_by_refcount(cycle_module: str) -> None:
     finally:
         if enabled:
             gc.enable()
+
+
+def test_a_hooked_conn_is_still_freed_by_refcount() -> None:
+    """The same weakref rule as the cycle hook, GC off. On a stand-in: websockets' real
+    ServerProtocol holds itself through its own parser, so it is never freed by refcount, hooked
+    or not, and could not show what the hook adds."""
+    import gc
+    import weakref
+
+    class _Conn:
+        def send_response(self, response: Any) -> None:
+            pass
+
+    conn = _Conn()
+    protocol_headers._floor_the_conn_responses(conn)
+    assert "send_response" in vars(conn)  # the hook is installed, so the check is not vacuous
+    ref = weakref.ref(conn)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del conn
+        assert ref() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_a_changed_conn_writer_signature_reaches_the_library_unchanged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Degrade on a signature change: called with no response at all, the wrapper still calls the
+    library's method with what it was given, and logs once."""
+    seen: list[tuple[Any, ...]] = []
+
+    class _Conn:
+        def send_response(self, *args: Any) -> None:
+            seen.append(args)
+
+    monkeypatch.setattr(protocol_headers, "_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
+    conn = _Conn()
+    protocol_headers._floor_the_conn_responses(conn)
+    conn.send_response()
+    assert seen == [()]
+    hits = [r.getMessage() for r in caplog.records if r.name == protocol_headers.__name__]
+    assert len(hits) == 1 and "ws-sansio: header addition" in hits[0], hits
 
 
 def test_a_changed_handshake_writer_signature_reaches_the_server_unchanged(
@@ -566,10 +712,56 @@ def _fake_ws(drop: str | None) -> type[Any]:
     return type("FakeWebSocketProtocol", (asyncio.Protocol,), members)
 
 
+def _sets_conn(self: Any) -> None:
+    self.conn = None
+
+
+_FAKE_SANSIO_MODULE = "tests._fake_uvicorn_sansio_module"
+
+
+def _fake_sansio_ws(drop: str | None, monkeypatch: pytest.MonkeyPatch | None = None) -> type[Any]:
+    """A WebSocket protocol shaped like uvicorn's sans-I/O one with ``drop`` removed: it keeps a
+    ``conn``, has no ``write_http_response``, and its module names a ``ServerProtocol`` whose
+    ``send_response`` is synchronous. ``monkeypatch`` registers that module; without it the class
+    lives in a module that was never imported, which is the ``ServerProtocol`` drop."""
+    conn_members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE}
+    if drop != "send_response":
+        conn_members["send_response"] = _async_hook if drop == "sync send_response" else _writes
+    if monkeypatch is not None:
+        module = ModuleType(_FAKE_SANSIO_MODULE)
+        if drop != "ServerProtocol":
+            module.ServerProtocol = type("ServerProtocol", (), conn_members)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, _FAKE_SANSIO_MODULE, module)
+    members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE, "__init__": _sets_conn}
+    if drop != "send_500_response":
+        members["send_500_response"] = _writes
+    return type("FakeSansIOProtocol", (asyncio.Protocol,), members)
+
+
 def test_the_complete_fakes_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The control for every refusal below: with nothing dropped, both fakes are floored."""
+    """The control for every refusal below: with nothing dropped, every fake is floored."""
     assert floored_http_protocol_class(base=_fake_http(monkeypatch, None)) is not None
     assert floored_ws_protocol_class(base=_fake_ws(None)) is not None
+    floored = floored_ws_protocol_class(base=_fake_sansio_ws(None, monkeypatch))
+    assert floored is not None and isinstance(vars(floored)["conn"], property)
+
+
+@pytest.mark.parametrize(
+    ("drop", "named"),
+    [
+        ("send_500_response", "synchronous send_500_response method"),
+        ("ServerProtocol", "ServerProtocol in its module"),
+        ("send_response", "synchronous send_response method"),
+        ("sync send_response", "synchronous send_response method"),
+    ],
+)
+def test_a_sans_io_base_missing_a_hook_is_refused(
+    drop: str, named: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(ProtocolFloorUnavailable) as refused:
+        floored_ws_protocol_class(base=_fake_sansio_ws(drop, monkeypatch))
+    assert refused.value.hook == named
+    assert f"has no {named}" in str(refused.value), str(refused.value)
 
 
 @pytest.mark.parametrize(
@@ -665,7 +857,7 @@ def test_the_installed_uvicorn_passes_the_check() -> None:
     ``http="auto"`` and ``ws="auto"`` resolve to, all build."""
     for base in (HttpToolsProtocol, H11Protocol, None):
         assert floored_http_protocol_class(base=base) is not None
-    for ws_base in (WebSocketProtocol, None):
+    for ws_base in (WebSocketsSansIOProtocol, WebSocketProtocol, None):
         assert floored_ws_protocol_class(base=ws_base) is not None
 
 
@@ -680,6 +872,7 @@ def test_a_wrapper_over_uvicorns_hook_still_sees_uvicorns_assignments() -> None:
     assert floored_http_protocol_class(base=Wrapped) is not None
     assert floored_http_protocol_class(base=floored_http_protocol_class(base=H11Protocol))
     assert floored_ws_protocol_class(base=floored_ws_protocol_class(base=WebSocketProtocol))
+    assert floored_ws_protocol_class(base=floored_ws_protocol_class(base=WebSocketsSansIOProtocol))
 
 
 def _serve_captured(

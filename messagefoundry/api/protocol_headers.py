@@ -10,17 +10,23 @@ base-uri 'none'`` (the floor's :data:`~messagefoundry.api.header_floor.FLOOR_CSP
 * the ``400`` for a request uvicorn cannot parse (``send_400_response`` on the HTTP protocol);
 * the ``500`` when the app raised, or returned, without starting a response
   (``send_500_response`` on uvicorn's per-request cycle object, not on the protocol);
-* the ``500`` when a WebSocket app fails before the handshake is answered (``send_500_response`` on
-  the WebSocket protocol); and
-* on the legacy websockets server that ``ws="auto"`` resolves to, every handshake answer that
-  library writes through ``write_http_response``: its own rejection of a malformed handshake (for
-  example a ``400`` for a missing ``Sec-WebSocket-Key``), its ``503`` on shutdown, and its ``500``.
+* the ``500`` when a WebSocket app fails before the handshake is answered;
+* on the sans-I/O WebSocket protocol that ``ws="auto"`` resolves to from uvicorn 0.50, every
+  handshake answer, because that protocol hands each one to ``send_response`` on its ``conn``, a
+  websockets ``ServerProtocol``: the library's own rejection of a malformed handshake (for example
+  a ``400`` for a missing ``Sec-WebSocket-Key``), uvicorn's ``500``, its ``403`` for an app that
+  closes before accepting, the app's own denial, and the ``101``; and
+* on the legacy websockets server, which ``ws="auto"`` resolved to before uvicorn 0.50 and
+  ``ws="websockets"`` still names, the pre-handshake ``500`` (``send_500_response``) and every
+  handshake answer that library writes through ``write_http_response``: its own rejection of a
+  malformed handshake, its ``503`` on shutdown, and its ``500``.
 
-**Known gaps, not covered here.** The sans-I/O WebSocket protocol builds its own handshake
-rejections through ``ServerProtocol.reject``, and wsproto writes its own ``400`` for a bad handshake
-straight to the transport. Neither is what ``ws="auto"`` resolves to at the locked versions, and
-neither has ``write_http_response``, so the class build below refuses both. uvicorn's interim
-``100 Continue`` carries no header either.
+**Known gaps, not covered here.** wsproto writes its own ``400`` for a bad handshake straight to the
+transport. It has neither hook set, so the class build below refuses it; it is what ``ws="auto"``
+resolves to only when websockets is not installed, and websockets is a declared dependency. uvicorn
+0.54 also ships a ``zttp`` HTTP protocol. ``http="auto"`` does not resolve to it and ``serve`` never
+names it; handed to the class build, it is checked for the HTTP hooks like any other base.
+uvicorn's interim ``100 Continue`` carries no header either.
 
 **Never HSTS here.** Whether HSTS belongs on a response depends on the request's host and the served
 chain (:func:`~messagefoundry.api.header_floor.hsts_notable`). On the default posture, a self-signed
@@ -39,14 +45,16 @@ that one call. The HTTP ``500`` goes through the cycle's ``send``, which prepend
 **Refuse at startup.** Every hook this module overrides or reads is checked when the class is
 built, against the server class it is handed: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
-``send_500_response`` and ``default_headers``, and the WebSocket protocol's ``send_500_response``,
-``transport`` and ``write_http_response``. The methods the floor wraps synchronously must still be
+``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
+server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
+protocol they are ``send_500_response``, the ``conn`` attribute, and a synchronous
+``send_response`` on the ``ServerProtocol`` its module imports. The methods the floor wraps synchronously must still be
 synchronous. An attribute counts as present when a method of the server's own class for the hook
 using it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
 installed uvicorn and websockets versions, and ``serve`` refuses to start on it. There is no
 fallback to the server's own protocol and no opt-out: a server that would answer below the floor
-without these headers does not start. So a WebSocket base without ``write_http_response`` (the
-sans-I/O protocol, or wsproto) is refused rather than served with its handshake answers bare.
+without these headers does not start. So a WebSocket base with neither hook set (wsproto) is
+refused rather than served with its handshake answers bare.
 
 **Then measure, and refuse on that too.** The checks above read shape, and a hook can keep its shape
 and stop adding the headers. So ``serve`` and ``supervise`` next run
@@ -64,7 +72,7 @@ response would change its status, which the floor must never do. The overrides t
 ``tests/test_header_floor_wire.py`` injects failures into those steps.
 
 **This leans on uvicorn and websockets INTERNALS.** None of the hooks above is public API.
-``pyproject.toml`` bounds uvicorn below the next minor and does not bound websockets.
+``pyproject.toml`` bounds uvicorn below the next minor and websockets below the next major.
 ``tests/test_header_floor_wire.py`` fails unless the installed versions are the ones it measured,
 ``_MEASURED_UVICORN`` and ``_MEASURED_WEBSOCKETS``, and drives every family on the wire against a
 control. The two startup checks are what hold between those. An upgrade that removes a hook, or
@@ -239,9 +247,17 @@ def _require_assigned(base: type[Any], attr: str, *, hook: str) -> None:
         raise _refusal(base, f"{attr} attribute")
 
 
-def _cycle_class(base: type[Any]) -> type[Any] | None:
+#: The class the sans-I/O WebSocket protocol builds each connection's ``conn`` from, looked up in
+#: the protocol's own module. It is websockets' ``ServerProtocol``, and every handshake answer that
+#: protocol writes goes through its ``send_response``.
+_CONN_CLASS = "ServerProtocol"
+
+
+def _module_class(base: type[Any], name: str) -> type[Any] | None:
+    """The class called ``name`` in the module of ``base`` or of one of its bases: what the server's
+    own code builds when it spells that name."""
     for klass in base.__mro__:
-        found = getattr(sys.modules.get(klass.__module__), _CYCLE_CLASS, None)
+        found = getattr(sys.modules.get(klass.__module__), name, None)
         if isinstance(found, type):
             return found
     return None
@@ -252,7 +268,7 @@ def _require_http_hooks(base: type[Any]) -> None:
     _require_sync_method(base, "send_400_response")
     _require_assigned(base, "cycle", hook="send_400_response")
     _require_assigned(base, "transport", hook="send_400_response")
-    cycle_cls = _cycle_class(base)
+    cycle_cls = _module_class(base, _CYCLE_CLASS)
     if cycle_cls is None:
         raise _refusal(base, f"{_CYCLE_CLASS} in its module")
     if not inspect.iscoroutinefunction(getattr(cycle_cls, "send_500_response", None)):
@@ -260,11 +276,27 @@ def _require_http_hooks(base: type[Any]) -> None:
     _require_assigned(cycle_cls, "default_headers", hook="send_500_response")
 
 
+def _answers_through_conn(base: type[Any]) -> bool:
+    """Whether ``base`` keeps its handshake in a ``conn`` object and has no ``write_http_response``:
+    the sans-I/O protocol's shape. wsproto's protocol has it too, and is then refused for the
+    ``ServerProtocol`` its module lacks."""
+    if callable(getattr(base, "write_http_response", None)):
+        return False
+    owner = _root_definer(base, "send_500_response")
+    return owner is not None and _assigns(base, "conn", upto=owner)
+
+
 def _require_ws_hooks(base: type[Any]) -> None:
     """Refuse, at class build, a base lacking any hook :func:`_build_floored_ws` relies on."""
     _require_sync_method(base, "send_500_response")
-    _require_assigned(base, "transport", hook="send_500_response")
-    _require_sync_method(base, "write_http_response")
+    if not _answers_through_conn(base):
+        _require_assigned(base, "transport", hook="send_500_response")
+        _require_sync_method(base, "write_http_response")
+        return
+    conn_cls = _module_class(base, _CONN_CLASS)
+    if conn_cls is None:
+        raise _refusal(base, f"{_CONN_CLASS} in its module")
+    _require_sync_method(conn_cls, "send_response")
 
 
 def _after_status_line(data: bytes) -> bytes:
@@ -372,6 +404,44 @@ def _floor_the_cycle_500(cycle: Any) -> None:
         _degraded("http-500", "hook", exc)
 
 
+def _add_where_absent(headers: Any) -> None:
+    """Add each protocol header a handshake answer does not already carry. The 101 and an app's
+    denial come through the ASGI floor first, so they are not stamped twice."""
+    for name, value in PROTOCOL_SECURITY_HEADERS:
+        if name not in headers:
+            headers[name] = value
+
+
+def _send_floored_handshake_response(conn_ref: weakref.ref[Any], *args: Any, **kwargs: Any) -> None:
+    """A sans-I/O connection's ``send_response`` with the headers added to the response first."""
+    # The protocol calls this through the conn it holds, so the referent is alive. If it ever is
+    # not, there is no connection left to answer on, with or without this module.
+    conn: Any = conn_ref()
+    if conn is None:
+        _degraded("ws-sansio", "conn reference", ReferenceError("conn already freed"))
+        return
+    try:
+        # No named parameters, for the reason write_http_response below gives. At websockets 17.1
+        # it is (response).
+        response = kwargs["response"] if "response" in kwargs else args[0]
+        _add_where_absent(response.headers)
+    except Exception as exc:
+        _degraded("ws-sansio", "header addition", exc)
+    type(conn).send_response(conn, *args, **kwargs)
+
+
+def _floor_the_conn_responses(conn: Any) -> None:
+    """Point this conn's ``send_response`` at :func:`_send_floored_handshake_response`.
+
+    Per instance, and holding a WEAK reference, for the reasons :func:`_floor_the_cycle_500` gives.
+    websockets' own parser calls ``self.send_response`` for the answers it writes before uvicorn
+    sees a request (an over-long request line, too many headers), so those pass through too."""
+    try:
+        conn.send_response = partial(_send_floored_handshake_response, weakref.ref(conn))
+    except Exception as exc:
+        _degraded("ws-sansio", "hook", exc)
+
+
 def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
     """uvicorn's HTTP protocol with the headers on its ``400`` and on each cycle's ``500``.
 
@@ -413,9 +483,9 @@ def _build_floored_http(base: type[Any]) -> type[asyncio.Protocol]:
 
 def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol] | None:
     """uvicorn's WebSocket protocol with the headers on its pre-handshake ``500`` and on every
-    handshake answer the legacy websockets server writes. See the module docstring for what is NOT
-    covered. Raises :class:`ProtocolFloorUnavailable` when ``base`` lacks a hook, which includes the
-    sans-I/O and wsproto protocols; there is no fallback.
+    handshake answer it writes, for the sans-I/O protocol and for the legacy websockets server. See
+    the module docstring for what is NOT covered. Raises :class:`ProtocolFloorUnavailable` when
+    ``base`` lacks a hook, which includes the wsproto protocol; there is no fallback.
 
     ``base`` defaults to uvicorn's resolved ``AutoWebSocketsProtocol``. That is ``None`` when no
     WebSocket library is installed, and then this returns ``None`` too, which uvicorn reads exactly
@@ -433,6 +503,35 @@ def floored_ws_protocol_class(base: type[Any] | None = None) -> type[asyncio.Pro
 
 
 def _build_floored_ws(base: type[Any]) -> type[asyncio.Protocol]:
+    return (
+        _build_floored_sansio_ws(base)
+        if _answers_through_conn(base)
+        else _build_floored_legacy_ws(base)
+    )
+
+
+def _build_floored_sansio_ws(base: type[Any]) -> type[asyncio.Protocol]:
+    class _FlooredWebSocketProtocol(base):  # type: ignore[misc]
+        # The sans-I/O protocol writes every handshake answer by handing a response to
+        # `self.conn.send_response` and then writing what the conn serialized: the library's
+        # rejection of a bad handshake, the 500, the 403, the app's denial and the 101. So the conn
+        # is the one place to add the headers, and a property sees it whenever it is assigned.
+        # send_500_response is NOT wrapped here: it goes through the conn like the rest, and a
+        # second wrapper would stamp it twice.
+        @property
+        def conn(self) -> Any:
+            return self._mf_conn
+
+        @conn.setter
+        def conn(self, value: Any) -> None:
+            self._mf_conn = value  # first, so no failure below can lose the conn
+            if value is not None:
+                _floor_the_conn_responses(value)
+
+    return _FlooredWebSocketProtocol
+
+
+def _build_floored_legacy_ws(base: type[Any]) -> type[asyncio.Protocol]:
     class _FlooredWebSocketProtocol(base):  # type: ignore[misc]
         def send_500_response(self, *args: Any, **kwargs: Any) -> None:
             _write_with_headers(self, "ws-500", partial(super().send_500_response, *args, **kwargs))
@@ -445,10 +544,7 @@ def _build_floored_ws(base: type[Any]) -> type[asyncio.Protocol]:
             # unchanged instead of raising here. At 16.0 and at 17.1 it is
             # (status, headers, body=None).
             try:
-                headers = kwargs["headers"] if "headers" in kwargs else args[1]
-                for name, value in PROTOCOL_SECURITY_HEADERS:
-                    if name not in headers:
-                        headers[name] = value
+                _add_where_absent(kwargs["headers"] if "headers" in kwargs else args[1])
             except Exception as exc:
                 _degraded("ws-handshake", "header addition", exc)
             super().write_http_response(*args, **kwargs)

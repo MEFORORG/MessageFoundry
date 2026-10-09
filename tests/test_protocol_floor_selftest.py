@@ -26,6 +26,7 @@ import pytest
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
+from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
 
 from messagefoundry.api import protocol_floor_selftest, protocol_headers
 from messagefoundry.api.protocol_floor_selftest import selftest_protocol_floor
@@ -37,11 +38,17 @@ from messagefoundry.api.protocol_headers import (
 )
 
 _HTTP_BASES = [HttpToolsProtocol, H11Protocol]
+#: Both WebSocket protocols the floor covers. The sans-I/O one is what ``ws="auto"`` resolves to
+#: at the locked uvicorn, so it is the default every test below uses unless it names the other.
+_WS_BASES = [WebSocketsSansIOProtocol, WebSocketProtocol]
 _ALL_RESPONSES = [drive.response for drive in protocol_floor_selftest._DRIVES]
+_WS_RESPONSES = {drive.response for drive in protocol_floor_selftest._DRIVES if drive.websocket}
 
 
-def _floored(http_base: type[Any] = HttpToolsProtocol) -> tuple[type[Any], type[Any]]:
-    ws = floored_ws_protocol_class(base=WebSocketProtocol)
+def _floored(
+    http_base: type[Any] = HttpToolsProtocol, ws_base: type[Any] = WebSocketsSansIOProtocol
+) -> tuple[type[Any], type[Any]]:
+    ws = floored_ws_protocol_class(base=ws_base)
     assert ws is not None
     return floored_http_protocol_class(base=http_base), ws
 
@@ -62,20 +69,22 @@ def _names(message: str, response: str) -> None:
         assert f"the {response} lacked {name}" in message, message
 
 
-def _names_only(message: str, response: str) -> None:
-    """The refusal names ``response`` with every header it lacked, and no other response."""
-    _names(message, response)
+def _names_only(message: str, *responses: str) -> None:
+    """The refusal names each of ``responses`` with every header it lacked, and no other."""
+    for response in responses:
+        _names(message, response)
     for other in _ALL_RESPONSES:
-        if other != response:
+        if other not in responses:
             assert other not in message, message
 
 
 # --- the controls: nothing knocked out ------------------------------------------------------------
 
 
+@pytest.mark.parametrize("ws_base", _WS_BASES)
 @pytest.mark.parametrize("http_base", _HTTP_BASES)
-def test_the_real_classes_pass(http_base: type[Any]) -> None:
-    selftest_protocol_floor(*_floored(http_base))
+def test_the_real_classes_pass(http_base: type[Any], ws_base: type[Any]) -> None:
+    selftest_protocol_floor(*_floored(http_base, ws_base))
 
 
 def test_the_classes_serve_resolves_pass() -> None:
@@ -87,11 +96,12 @@ def test_no_websocket_protocol_drives_the_http_families_alone() -> None:
     selftest_protocol_floor(floored_http_protocol_class(), None)
 
 
-def test_the_unfloored_classes_are_refused_for_every_response() -> None:
-    """The vacuity control for the whole check: uvicorn's own classes, with no floor, fail all four."""
-    message = _refusal(HttpToolsProtocol, WebSocketProtocol)
-    for response in _ALL_RESPONSES:
-        _names(message, response)
+@pytest.mark.parametrize("ws_base", _WS_BASES)
+def test_the_unfloored_classes_are_refused_for_every_response(ws_base: type[Any]) -> None:
+    """The vacuity control for the whole check: uvicorn's own classes, with no floor, fail every
+    drive."""
+    assert len(_ALL_RESPONSES) == 5 and len(_WS_RESPONSES) == 3
+    _names_only(_refusal(HttpToolsProtocol, ws_base), *_ALL_RESPONSES)
 
 
 # --- one hook knocked out per response -----------------------------------------------------------
@@ -114,17 +124,41 @@ def test_a_bare_500_is_refused(http_base: type[Any], monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.parametrize(
-    ("hook", "response"),
+    ("ws_base", "hook", "responses"),
     [
-        ("write_http_response", "WebSocket handshake rejection"),
-        ("send_500_response", "WebSocket pre-handshake 500"),
+        # The sans-I/O protocol has ONE hook: every handshake answer goes through its conn.
+        pytest.param(WebSocketsSansIOProtocol, "conn", sorted(_WS_RESPONSES), id="sansio-conn"),
+        # The legacy server has two. Its library writes the rejection and the 403 through one.
+        pytest.param(
+            WebSocketProtocol,
+            "write_http_response",
+            ["WebSocket handshake rejection", "WebSocket refusal 403"],
+            id="legacy-write_http_response",
+        ),
+        pytest.param(
+            WebSocketProtocol,
+            "send_500_response",
+            ["WebSocket pre-handshake 500"],
+            id="legacy-send_500_response",
+        ),
     ],
 )
-def test_a_bare_websocket_answer_is_refused(hook: str, response: str) -> None:
+def test_a_bare_websocket_answer_is_refused(
+    ws_base: type[Any], hook: str, responses: list[str]
+) -> None:
+    http, ws = _floored(ws_base=ws_base)
+    selftest_protocol_floor(http, ws)
+    delattr(ws, hook)  # the server's own behaviour answers
+    _names_only(_refusal(http, ws), *responses)
+
+
+def test_a_conn_whose_hook_does_nothing_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shape holds and the behaviour does not: the conn property is in place and its hook adds
+    nothing. Only driving the class can see this."""
     http, ws = _floored()
     selftest_protocol_floor(http, ws)
-    delattr(ws, hook)
-    _names_only(_refusal(http, ws), response)
+    monkeypatch.setattr(protocol_headers, "_floor_the_conn_responses", lambda conn: None)
+    _names_only(_refusal(http, ws), *sorted(_WS_RESPONSES))
 
 
 def test_one_missing_header_is_named_alone(monkeypatch: pytest.MonkeyPatch) -> None:
