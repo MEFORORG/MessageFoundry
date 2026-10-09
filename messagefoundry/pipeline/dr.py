@@ -418,13 +418,16 @@ class DrCoordinator:
         async with self._lock:
             now = self._clock()
             if not self._active:
-                # Never success for a hand-back with no dr.release row: write the one a cut-short
-                # release owes first, or refuse (vault BACKLOG #2752).
-                if self._unrecorded_release is not None:
-                    await self._record_owed_release()
-                # A release whose row or cleanup was cut short never ran the cleanup, or not to
-                # its end. It is safe to repeat, so a retry finishes it (vault BACKLOG #3263).
-                await self._run_after_release()
+                try:
+                    # Never success for a hand-back with no dr.release row: write the one a
+                    # cut-short release owes first, or refuse (vault BACKLOG #2752).
+                    if self._unrecorded_release is not None:
+                        await self._record_owed_release()
+                finally:
+                    # A release whose row or cleanup was cut short never ran the cleanup, or not
+                    # to its end. It is safe to repeat, so a retry finishes it, and does so
+                    # whether or not the owed row lands now (vault BACKLOG #3263).
+                    await self._run_after_release()
                 return self._last_release or DrResult(
                     action="release",
                     active=False,
@@ -466,7 +469,15 @@ class DrCoordinator:
                 self._last_release = self._release_result(detail)
                 # Owed from here: a write cut short is made good by the next activate or release.
                 self._unrecorded_release = (detail, actor, now)
-                await self._record_owed_release(late=False)
+                try:
+                    await self._record_owed_release(late=False)
+                finally:
+                    # The box has handed back, so it holds no partner session whether or not
+                    # the row was written (vault BACKLOG #3262). A refused write still refuses
+                    # the release, and the row stays owed. A cancellation of the cleanup is
+                    # in the record phase, so the arm below does not read it as a failed
+                    # release (vault BACKLOG #3263).
+                    await self._run_after_release()
             except asyncio.CancelledError:
                 # A cancellation is not an Exception, so the drain's arm above never sees one (vault
                 # BACKLOG #2752). The API runs a release so that a request deadline does not cancel it
@@ -491,9 +502,6 @@ class DrCoordinator:
                         hook_ran = bool(self._settings.release_hook)
                     await self._record_release_failed("interrupted", phase, hook_ran, actor, now)
                 raise
-            # The box has handed back and the row says so. The cleanup runs below the arm above,
-            # so a cancellation here is not read as a failed release (vault BACKLOG #3263).
-            await self._run_after_release()
             return self._release_result(detail)
 
     async def _run_after_release(self) -> None:

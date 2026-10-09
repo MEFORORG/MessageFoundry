@@ -42,6 +42,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.pipeline import Engine, wiring_runner
+from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import DrParkedError, RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.file import FileDestination
@@ -913,6 +914,42 @@ async def test_a_release_that_cannot_close_a_connector_has_still_handed_back(
 
     assert result.active is False and engine.dr_active is False and coordinator.active is False
     assert "dr_release_failed" not in await _audit_actions(engine)
+
+
+async def test_a_release_whose_row_cannot_be_written_still_closes_its_sessions(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The box has handed back when the ``dr.release`` row is written, so a released box holds
+    no partner session whether that write lands or not (vault BACKLOG #3262). Red when the
+    cleanup ran only after the row: an audit store that refused the write left every session
+    open, and each retry refused at the same write before it reached the cleanup."""
+    rr = await _started(engine, tmp_path)
+    coordinator = engine.dr_coordinator
+    assert coordinator is not None
+    await engine._dr_activate_profile()
+    coordinator._active = True
+    store = coordinator._store
+    real_record = store.record_audit
+
+    async def refuse_release_row(action: str, *args: Any, **kwargs: Any) -> Any:
+        if action == "dr.release":
+            raise OSError("the audit store refused the write")
+        return await real_record(action, *args, **kwargs)
+
+    closed: list[bool] = []
+
+    async def close() -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(store, "record_audit", refuse_release_row)
+    monkeypatch.setattr(rr, "close_passive_connectors", close)
+    with pytest.raises(DrActivationError):
+        await coordinator.release(actor="operator")
+    assert closed == [True] and engine.dr_active is False
+
+    with pytest.raises(DrActivationError):  # the row is still owed, and the retry closes again
+        await coordinator.release(actor="operator")
+    assert closed == [True, True]
 
 
 async def test_an_activation_cancelled_after_its_reload_commits_leaves_no_listener_bound(
