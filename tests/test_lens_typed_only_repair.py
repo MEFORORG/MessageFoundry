@@ -10,6 +10,7 @@ findings are numbered as the review numbers them; S-4 is spike S-4's review of t
 from __future__ import annotations
 
 import ast
+import itertools
 from typing import Any
 
 import pytest
@@ -1846,7 +1847,11 @@ def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
             "    with c:\n        if a:\n            return 1\n        else:\n            return 2\n    f()\n",
             lens._MAYBE_DEAD,
         ),
-        ("    with c:\n        with d:\n            return 1\n    f()\n", lens._DEAD),
+        # Review of 19e20ebbd6: these could still raise inside the ``with``, so they only count.
+        ("    with c:\n        with d:\n            return 1\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c, d:\n        return 1\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c:\n        return g()\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c:\n        return x\n    f()\n", lens._DEAD),
         ("    with c:\n        g()\n        return 1\n    return 2\n    f()\n", lens._DEAD),
         # A suite can be deader than its block: a ``try``'s ``else``, and a ``while True``'s.
         (
@@ -1867,6 +1872,9 @@ def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
         "with-statement-then-return",
         "with-if-else",
         "with-with-return",
+        "with-two-managers",
+        "with-return-call",
+        "with-return-name",
         "return-below-with",
         "try-else-below-return",
         "try-handler",
@@ -1956,6 +1964,26 @@ def test_rule_8_a_row_below_a_swallowing_with_cannot_move_below_a_return() -> No
     _refused(_SWALLOW, edit, match=NEVER_RUNS, typed_only=True)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        '        return Send(ROUTES[msg.field("MSH-4")], msg)\n',
+        "        with lookup(msg) as dest:\n            return Send(dest, msg)\n",
+    ],
+    ids=["return-of-a-lookup", "inner-with"],
+)
+def test_rule_8_a_row_below_a_with_that_returns_at_once_is_not_exempt(body: str) -> None:
+    # Review of 19e20ebbd6: working out the returned value, or entering the inner manager, may
+    # raise KeyError, and ``suppress`` swallows it. So the rows below may run, and are not exempt:
+    # one may not move below the guard's return. A row may still not be written there (D7).
+    src = _SWALLOW.replace('        msg.set("A", "1")\n        return Send("OB", msg)\n', body)
+    last = len(src.splitlines())
+    move = _edit("move_row", last, to_line_start=last - 1, to_position="after")
+    assert rewrite_source(src, move) != src
+    _refused(src, move, match=NEVER_RUNS, typed_only=True)
+    _refused(src, _edit("insert_row", last, **_SET_PID8), match=NEVER_RUNS, typed_only=True)
+
+
 @pytest.mark.parametrize("position", ["before", "after"])
 def test_rule_8_an_insert_below_a_swallowing_with_is_accepted(position: str) -> None:
     # Blocking finding 2, case 3: the tail may run, so a row written there is as live as its
@@ -1967,23 +1995,33 @@ def test_rule_8_an_insert_below_a_swallowing_with_is_accepted(position: str) -> 
 
 
 def test_rule_8_a_kept_row_may_not_run_less_surely_than_it_did() -> None:
-    # The three levels, at the function level. A row that ran may not be left to run only when a
-    # ``with`` swallows an exception, and a row that might run may not be left dead.
-    swallow = "    with c:\n        g()\n        return 1\n"
-    ran = _handler("    f()\n" + swallow)
-    might = _handler(swallow + "    f()\n")
-    never = _handler("    with c:\n        return 1\n        g()\n    f()\n")
+    # The four levels, at the function level. ``f()`` is the last statement of each body and the
+    # only row whose level differs, so each verdict below is about ``f()`` alone.
+    bodies = [
+        "    g()\n    f()\n",  # runs
+        "    with c:\n        g()\n        return 1\n    f()\n",  # might not run
+        "    with c:\n        return g()\n    f()\n",  # counted as never running
+        "    return 1\n    f()\n",  # surely never runs
+    ]
+    funcs = [_handler(body) for body in bodies]
+    last = [len(lens._reachability(func)) - 1 for func in funcs]
+    assert [_level(body) for body in bodies] == [0, 1, 2, 3]
     stranded = LensRewriteError("stranded")
-    # Statements in source order. ran: f, with, g, return. might and never: with, 2 rows, f.
-    with pytest.raises(LensRewriteError, match="stranded"):
-        _never_run(ran, might, {0: 1, 1: 2, 2: 3, 3: 0}, stranded)
-    with pytest.raises(LensRewriteError, match="stranded"):
-        _never_run(might, never, {0: 0, 1: 2, 2: 1, 3: 3}, stranded)
-    # Controls: the other direction, and a row the edit wrote where it might run.
-    _never_run(might, ran, {0: 3, 1: 0, 2: 1, 3: 2}, stranded)
-    _never_run(ran, might, {0: 1, 1: 2, 2: 3}, stranded)
-    with pytest.raises(LensRewriteError, match="stranded"):
-        _never_run(never, never, {0: 0, 1: 1, 2: 2}, stranded)
+    for was, now in itertools.product(range(4), repeat=2):
+        # A kept row: refused exactly when its level got worse, by any step.
+        kept = {last[now]: last[was]}
+        if now > was:
+            with pytest.raises(LensRewriteError, match="stranded"):
+                _never_run(funcs[was], funcs[now], kept, stranded)
+        else:
+            _never_run(funcs[was], funcs[now], kept, stranded)
+    for now in range(4):
+        # A row the edit wrote: refused where it never runs, accepted where it might.
+        if now >= lens._COUNTED_DEAD:
+            with pytest.raises(LensRewriteError, match="stranded"):
+                _never_run(funcs[0], funcs[now], {}, stranded)
+        else:
+            _never_run(funcs[0], funcs[now], {}, stranded)
 
 
 _DEAD_ABOVE = """@handler("H")
@@ -2060,8 +2098,10 @@ def test_rule_8_identity_of_a_move_and_of_a_rewritten_row() -> None:
     # Every row of ``twins`` has the same text, so text could not tell them apart.
     def identity(src: str, edit: dict[str, Any]) -> dict[int, int]:
         out = rewrite_source(src, edit)
-        before, after = ast.parse(src).body[0], ast.parse(out).body[0]
-        assert isinstance(before, ast.FunctionDef) and isinstance(after, ast.FunctionDef)
+        before, after = (
+            next(n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef))
+            for text in (src, out)
+        )
         carried = lens._carried_lines(src, out, before, after, edit)
         return lens._row_identity(
             carried,
@@ -2092,6 +2132,16 @@ def test_rule_8_identity_of_a_move_and_of_a_rewritten_row() -> None:
     # A moved block takes its rows with it.
     block_down = _edit("move_row", 3, direction="down")
     assert identity(_TERMINAL, block_down) == {0: 3, 1: 0, 2: 1, 3: 2, 4: 4}
+    # The last row moved up past a blank line: the handler then ends one line sooner (review of
+    # 19e20ebbd6, which paired these rows by their text).
+    row = '    msg.set("A", "1")\n'
+    gap = '@handler("H")\ndef h(msg):\n' + row * 2 + "\n" + row
+    assert identity(gap, _edit("move_row", 6, direction="up")) == {0: 0, 1: 2, 2: 1}
+    assert identity(gap.rstrip("\n"), _edit("move_row", 6, direction="up")) == {0: 0, 1: 2, 2: 1}
+    # A fresh fan-out writes at three places, and injects an import above the handler.
+    send = _edit("insert_send", 3, destination="OB", position="after")
+    assert identity(gap, send) == {1: 0, 3: 1, 4: 2}
+    assert rewrite_source(gap, send, typed_only=True) == rewrite_source(gap, send)
 
 
 def test_rule_8_a_row_that_never_ran_may_move_where_it_never_runs() -> None:

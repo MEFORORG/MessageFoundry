@@ -2436,8 +2436,8 @@ def _typed_only_refusal(op: str, line_start: int, line_end: int, why: str) -> Le
 
 _UNTYPED = "it would move or remove code the Steps view does not show as typed steps"
 _NEVER_RUNS = (
-    "it would leave a row that never runs, below a return, raise, break or continue, or below a "
-    "block that never falls through"
+    "it would leave a row that never runs, or that runs less surely than it did, below a return, "
+    "raise, break or continue, or below a block that may not fall through"
 )
 
 
@@ -2988,14 +2988,14 @@ def _refuse_new_unbound_reads(
         )
 
 
-# Whether a statement runs (:func:`_reachability`), in order of how sure rule 8 is that it does not.
-_LIVE, _MAYBE_DEAD, _DEAD = 0, 1, 2
+# Whether a statement runs (:func:`_reachability`), in order of how sure rule 8 is that it does not:
+# it runs; it might not; rule 8 counts it as never running, though it could; it surely never runs.
+_LIVE, _MAYBE_DEAD, _COUNTED_DEAD, _DEAD = 0, 1, 2, 3
 
 # The ops that write before or after their anchor row, by the edit's ``position``.
 _POSITIONED_OPS = frozenset(
     {
         "insert_row",
-        "paste_block",
         "template",
         "insert_comment",
         "insert_code_lookup",
@@ -3005,30 +3005,36 @@ _POSITIONED_OPS = frozenset(
 )
 
 
-def _ends(stmts: list[ast.stmt], *, raise_ends: bool = True, sure: bool = True) -> bool:
+def _ends(stmts: list[ast.stmt], *, raise_ends: bool = True, level: int = _DEAD) -> bool:
     """Whether control never reaches the end of suite ``stmts``: some statement in it is terminal
     (:func:`_is_terminal`)."""
-    return any(_is_terminal(stmt, raise_ends=raise_ends, sure=sure) for stmt in stmts)
+    return any(_is_terminal(stmt, raise_ends=raise_ends, level=level) for stmt in stmts)
 
 
-def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, sure: bool = True) -> bool:
+def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, level: int = _DEAD) -> bool:
     """Whether control never falls through ``stmt`` to the next statement of its suite.
 
     At least these are terminal (Manager decisions 2026-10-08, after review):
 
     * a ``return``, ``raise``, ``break`` or ``continue``;
     * an ``if`` with an ``else`` whose every arm ends;
-    * a ``with`` whose first body statement is a ``return``, ``break`` or ``continue``, or another
-      such ``with``;
+    * a ``with``, as far as ``level`` allows, below;
     * a ``try`` whose ``finally`` ends, or whose body or ``else`` ends and whose every handler ends;
     * a loop with no ``break`` of its own whose ``else`` ends, and a ``while True:`` with no
       ``break``;
     * a ``match`` whose last case is irrefutable and whose every case ends.
 
-    ``sure=False`` asks a looser question: whether ``stmt`` MIGHT never fall through. It differs for
-    a ``with`` only. A context manager may swallow an exception, so a ``with`` whose body ends below
-    an earlier statement falls through whenever that statement raises: it might not fall through,
-    but it is not sure. A body that ends in ``raise`` is never counted (``raise_ends=False``).
+    ``level`` says how sure the answer must be, and it matters for a ``with`` only, because a
+    context manager may swallow an exception and let control fall through:
+
+    * ``_DEAD``, surely terminal: one context manager, and a first body statement that is a
+      ``break``, a ``continue``, or a ``return`` of nothing, a constant or a name. Nothing there
+      can raise inside the ``with``;
+    * ``_COUNTED_DEAD``, counted as terminal: the first body statement is a ``return``, ``break``
+      or ``continue``, or another such ``with``. Working out the returned value, or entering an
+      inner manager, could still raise;
+    * ``_MAYBE_DEAD``, might be terminal: the body ends below an earlier statement, which could
+      raise. A body that ends in ``raise`` is never counted (``raise_ends=False``).
 
     Anything this cannot decide is judged to fall through, which keeps rule 8 permissive."""
     if isinstance(stmt, ast.Return | ast.Break | ast.Continue):
@@ -3037,16 +3043,18 @@ def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, sure: bool = True) 
         return raise_ends
 
     def ends(stmts: list[ast.stmt]) -> bool:
-        return _ends(stmts, raise_ends=raise_ends, sure=sure)
+        return _ends(stmts, raise_ends=raise_ends, level=level)
 
     if isinstance(stmt, ast.If):
         return ends(stmt.body) and ends(stmt.orelse)
     if isinstance(stmt, ast.With | ast.AsyncWith):
-        if not sure:
-            return _ends(stmt.body, raise_ends=False, sure=False)
         first = stmt.body[0]
-        if isinstance(first, ast.With | ast.AsyncWith):
-            return _is_terminal(first)
+        if level <= _MAYBE_DEAD:
+            return _ends(stmt.body, raise_ends=False, level=level)
+        if level == _COUNTED_DEAD and isinstance(first, ast.With | ast.AsyncWith):
+            return _is_terminal(first, level=level)
+        if level == _DEAD and (len(stmt.items) > 1 or not _returns_without_raising(first)):
+            return False
         return isinstance(first, ast.Return | ast.Break | ast.Continue)
     if isinstance(stmt, ast.Try | ast.TryStar):
         if ends(stmt.finalbody):
@@ -3066,6 +3074,14 @@ def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, sure: bool = True) 
             and all(ends(case.body) for case in stmt.cases)
         )
     return False
+
+
+def _returns_without_raising(stmt: ast.stmt) -> bool:
+    """Whether ``stmt`` is a ``return`` whose value cannot raise: none, a constant or a name. Any
+    other statement passes, since only a ``return`` works out a value."""
+    if not isinstance(stmt, ast.Return):
+        return True
+    return stmt.value is None or isinstance(stmt.value, ast.Constant | ast.Name)
 
 
 def _is_always_true(test: ast.expr) -> bool:
@@ -3101,16 +3117,16 @@ def _breaks(stmts: list[ast.stmt]) -> bool:
 
 
 def _stop_level(stmts: list[ast.stmt]) -> int:
-    """How far suite ``stmts`` stops what follows it from running: ``_DEAD`` when control surely
-    never reaches its end, ``_MAYBE_DEAD`` when it might not, else ``_LIVE``."""
-    if _ends(stmts):
-        return _DEAD
-    return _MAYBE_DEAD if _ends(stmts, sure=False) else _LIVE
+    """How surely suite ``stmts`` stops what follows it from running: the highest of ``_DEAD``,
+    ``_COUNTED_DEAD`` and ``_MAYBE_DEAD`` at which it ends (:func:`_is_terminal`), else ``_LIVE``."""
+    return next(
+        (lvl for lvl in (_DEAD, _COUNTED_DEAD, _MAYBE_DEAD) if _ends(stmts, level=lvl)), _LIVE
+    )
 
 
 def _reachability(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[ast.stmt, int]]:
-    """Each statement of ``func`` in source order, with whether it runs: ``_DEAD`` when it surely
-    never does, ``_MAYBE_DEAD`` when it might not, else ``_LIVE``.
+    """Each statement of ``func`` in source order, with whether it runs: ``_LIVE``,
+    ``_MAYBE_DEAD``, ``_COUNTED_DEAD`` or ``_DEAD``.
 
     A statement takes the level of the statements above it in its suite (:func:`_is_terminal`) and
     of the block it sits in. Two suites are deader than their block: a ``try``'s ``else`` runs only
@@ -3175,8 +3191,10 @@ def _carried_lines(
     above the place the op wrote are matched first. That makes the map exact for a ``set_params``,
     a delete, a move and an anchored insert, whatever text sits elsewhere. Lines an op wrote at a
     second place, such as the fan-out scaffold, are found by matching the rest in order."""
-    old_text = _physical_lines(src)
-    new_text = _physical_lines(result)
+    # Without the empty piece a final newline leaves: an op may add that newline, and the two
+    # line counts must not differ for it.
+    old_text = _physical_lines(src)[: -1 if src.endswith(("\n", "\r")) else None]
+    new_text = _physical_lines(result)[: -1 if result.endswith(("\n", "\r")) else None]
     op = edit.get("op", "set_params")
     lifted = range(0)
     anchor: int = edit["line_start"]
@@ -3184,12 +3202,15 @@ def _carried_lines(
         lifted, anchor = _move_site(before_func, edit) or (lifted, anchor)
     elif op in _POSITIONED_OPS and edit.get("position", "after") == "after":
         anchor = edit["line_end"] + 1
-    old = [
-        n
-        for n in range(before_func.lineno, (before_func.end_lineno or before_func.lineno) + 1)
-        if n not in lifted
-    ]
-    new = range(after_func.lineno, (after_func.end_lineno or after_func.lineno) + 1)
+    # A move can take the last statement up past a blank or comment line, and an insert can land
+    # below one. The element then ends on a different line, so both ranges run to the same
+    # distance from the end of the file.
+    below = min(
+        len(old_text) - (before_func.end_lineno or before_func.lineno),
+        len(new_text) - (after_func.end_lineno or after_func.lineno),
+    )
+    old = [n for n in range(before_func.lineno, len(old_text) - below + 1) if n not in lifted]
+    new = range(after_func.lineno, len(new_text) - below + 1)
 
     def same(i: int, j: int) -> bool:
         return old_text[old[i] - 1] == new_text[new[j] - 1]
@@ -3253,9 +3274,9 @@ def _refuse_rows_that_never_run(
     ``same`` says which row each statement of the result was (:func:`_row_identity`). So each row
     is compared with itself, and never with another row of the same text. Two things are refused:
 
-    * a row the edit kept, moved or rewrote that runs less surely than it did: it ran and now
-      might not, or it might have run and now never does. A row that surely never ran is exempt;
-    * a row the edit wrote that surely never runs.
+    * a row the edit kept, moved or rewrote that runs less surely than it did, by any step of
+      the four levels. Only a row that surely never ran is exempt everywhere;
+    * a row the edit wrote that never runs, surely or as rule 8 counts it.
 
     A row written where it might not run, below a ``with`` that may swallow an exception, is as
     live as the rows already there. Whatever verb placed the row, a move, an insert or a

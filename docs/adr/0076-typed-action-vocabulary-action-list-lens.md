@@ -1399,18 +1399,26 @@ invariant rather than a property of the moved row):
    already dead, or to a row with a twin of the same text anywhere in the handler, is accepted, and
    a row may move out of a dead block. A dead `pass` seed does not count.
 
-   A row has one of three levels: it runs, it might not run, or it never runs. A row might not run
-   when it sits below a `with` whose body ends after an earlier statement. That statement may
-   raise, and the context manager may swallow the exception, so control may fall through. A `with`
-   whose first body statement is a `return`, `break` or `continue` never falls through. A row
-   inside a block takes the block's level, and two suites are deader than their block: a `try`'s
-   `else` runs only when the body reaches its end, and the `else` of a `while True:` never runs. A
-   row the edit kept, moved or rewrote is refused when its level gets worse: from runs to might
-   not, or from might not to never. A row that never ran is exempt, wherever a move puts it. A row the
-   edit wrote is refused when it never runs. A row written where it might not run is accepted,
-   since it is as live as the rows already there (same repair; the three levels are the Builder's
-   reading of that review, and a Manager has not yet confirmed them). The default mode applies
-   none of this rule (Manager decision 2026-10-08; AC-G7).
+   A row has one of four levels, and a `with` is what separates them, because a context manager
+   may swallow an exception and let control fall through:
+
+   - it runs;
+   - it might not run: it sits below a `with` whose body ends after an earlier statement, which
+     may raise;
+   - it is counted as never running: it sits below a `with` whose first body statement is a
+     `return`, `break` or `continue`, or another such `with`. Working out the returned value, or
+     entering an inner manager, could still raise, so the row could run;
+   - it surely never runs. For a `with`, that needs one context manager and a first body
+     statement that is a `break`, a `continue`, or a `return` of nothing, a constant or a name.
+
+   A row inside a block takes the block's level, and two suites are deader than their block: a
+   `try`'s `else` runs only when the body reaches its end, and the `else` of a `while True:`
+   never runs. A row the edit kept, moved or rewrote is refused when its level gets worse by any
+   step. Only a row that surely never ran is exempt, wherever a move puts it. A row the edit
+   wrote is refused at the last two levels. A row written where it might not run is accepted,
+   since it is as live as the rows already there (same repair; the levels are the Builder's
+   reading of that review and of its own code review, and a Manager has not yet confirmed them).
+   The default mode applies none of this rule (Manager decision 2026-10-08; AC-G7).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
 block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
@@ -1562,12 +1570,18 @@ is closed for the cases its tests pin:
     returns;
   - a `with` whose first body statement is a `return` counts as never falling through. Working out
     the returned value could raise, and the context manager could swallow that, so a row below it
-    could run. An insert there is refused all the same;
+    could run. An insert there is refused all the same. A row already there is not exempt, so it
+    cannot move below a `return`;
+  - only a `with` separates the levels. A `return` of a constant or a name is taken not to raise,
+    and a `try` whose handlers all end is taken to end;
   - a `return` moved below another `return` of the same text is refused as itself, because it ran
     and would not. Moving the rows between them up gives the same text and is accepted;
   - row identity is exact for a `set_params`, a delete, a move and an insert at its anchor row.
     Where the lens picks the place itself, as for a send added to the fan-out, a new line beside
-    lines of the same text may be taken for one of them. Those lines sit in one suite;
+    lines of the same text may be taken for one of them. Those lines sit in one suite. The lens
+    works identity out from the edit after the op has run; the ops do not yet report the lines
+    they wrote, and `_move_site` reads a move the way `_apply_move_row` does, so the two must
+    change together;
   - a send cannot be added in typed-only mode to a handler that ends in `raise`, because the
     fan-out's `return sends` would land below it and never run.
 
