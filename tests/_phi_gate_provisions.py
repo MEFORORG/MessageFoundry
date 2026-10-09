@@ -216,12 +216,11 @@ def make_syslog_ca_and_crl(dir_path: Path) -> str:
 _SYSLOG_CLIENT_PEM = "syslog_client.pem"
 
 
-def verified_log_forwarding_env(
-    bundle: str, host: str = VERIFIED_LOG_FORWARDING_HOST
-) -> dict[str, str]:
+def verified_log_forwarding_env(bundle: str, host: str | None = None) -> dict[str, str]:
     """The environment that satisfies the #1966 gate and lists its collector in
     ``[egress].allowed_syslog``, given a CA+CRL bundle path. ``host`` replaces the collector, for
     a test that needs an IP-literal one."""
+    host = host or VERIFIED_LOG_FORWARDING_HOST
     return {
         "MEFOR_LOGGING_FORWARD_HOST": host,
         "MEFOR_LOGGING_FORWARD_PROTOCOL": "tls",
@@ -234,7 +233,7 @@ def verified_log_forwarding_env(
 
 
 def setenv_verified_log_forwarding(
-    monkeypatch: pytest.MonkeyPatch, bundle: str, host: str = VERIFIED_LOG_FORWARDING_HOST
+    monkeypatch: pytest.MonkeyPatch, bundle: str, host: str | None = None
 ) -> None:
     """Set :func:`verified_log_forwarding_env` on the environment for one test."""
     for name, value in verified_log_forwarding_env(bundle, host).items():

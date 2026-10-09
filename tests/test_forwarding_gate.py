@@ -587,13 +587,9 @@ def _serve(
 
     monkeypatch.chdir(tmp_path)
     setenv_retention_windows(monkeypatch)
-    assert forwarding or host is None
+    assert forwarding or host is None, "host= needs forwarding=True: the provision sets both"
     if forwarding:
-        bundle = make_syslog_ca_and_crl(tmp_path)
-        if host is None:
-            setenv_verified_log_forwarding(monkeypatch, bundle)
-        else:
-            setenv_verified_log_forwarding(monkeypatch, bundle, host)
+        setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path), host)
     (tmp_path / "messagefoundry.toml").write_text(
         PHI_GATE_PROVISIONS_TOML + extra, encoding="utf-8"
     )

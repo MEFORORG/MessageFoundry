@@ -1854,8 +1854,8 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     default root is beside ``--db``, because each engine shard's ``[store].path`` is derived from
     that flag, so the supervisor's directory lands next to theirs. ``db_base`` is anchored only by
     ``--project-root`` here, so a base_dir set in the file or the environment is applied too, as
-    each shard's ``serve`` applies it to its own ``[store].path``. No shard directory can take the
-    name: those are ``engine`` or start ``shard-``."""
+    each engine shard's ``serve`` applies it to its own ``[store].path``. No engine shard's
+    directory can take the name: those are ``engine`` or start ``shard-``."""
     from messagefoundry.config.anchor import resolve_project_root
 
     store_path = Path(db_base)
@@ -2011,10 +2011,10 @@ def _start_logging(
     # BACKLOG #2356: the collector is an outbound destination, and until this check no [egress]
     # list governed it. The forwarder is not a connection, so the graph's egress check never sees
     # it. Decided here, last of the forwarding gates and before the handler is installed, so the
-    # forwarder never dials a refused collector and no packet goes to it. The forwarding gate
-    # above has already asked the routing table about an IP-literal collector, which connects a
-    # UDP socket and sends nothing. It refuses under either enforcement dial, as every [egress]
-    # list does.
+    # forwarder never dials a refused collector and no packet goes to it. One socket can come
+    # first: for a verified-TLS collector given as a non-loopback IP literal, the forwarding gate
+    # above has asked the routing table for a source address, which connects a UDP socket and
+    # sends nothing. It refuses under either enforcement dial, as every [egress] list does.
     if log_forward is not None:
         from messagefoundry.transports.egress import syslog_forward_refusal
 
@@ -4661,13 +4661,13 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
 
     # BACKLOG #2356: the supervisor forwards its own log lines off-box, as each engine shard does.
-    # Before this it logged to stdout only, so a shard crash loop left no copy off the host. It
-    # passes the forwarding gates `serve` passes, in the same helper, and refuses the fleet on
-    # the same refusals: every shard would refuse on them too. A refusal printed to stderr here
-    # is still not forwarded; only log records are. Placed after the gates above, as in `serve`,
-    # and before the renewal below, so a refused start changes nothing on disk. The logging call
-    # is the bare one at the top plus the forwarder. `--env` is what each shard is started with,
-    # so it names the environment here as well.
+    # Before this it logged to stdout only, so an engine shard crash loop left no copy off the
+    # host. It passes the forwarding gates `serve` passes, in the same helper, and refuses the
+    # fleet on the same refusals: every engine shard would refuse on them too. A refusal printed
+    # to stderr here is still not forwarded; only log records are. Placed after the gates above,
+    # as in `serve`, and before the renewal below, so a refused start changes nothing on disk.
+    # The logging call is the bare one at the top plus the forwarder. `--env` is what each engine
+    # shard is started with, so it names the environment here as well.
     forwarder_installed = False
 
     def configure_with_forwarder(forward: SyslogForward | None) -> bool:

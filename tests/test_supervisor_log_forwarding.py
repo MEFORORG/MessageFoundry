@@ -124,7 +124,8 @@ def test_the_supervisor_installs_the_forwarder_when_forwarding_is_configured(
 def test_the_supervisor_spool_is_its_own_directory_beside_the_shards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The spool locks its directory, so the supervisor must not share one with a shard."""
+    """The spool locks its directory, so the supervisor must not share one with an engine
+    shard."""
     rc, recorder = _run("supervise", tmp_path, monkeypatch, verified_forwarding=True)
     assert rc == 0
     spool = Path(recorder.forwards[0].spool_dir or "")
@@ -143,13 +144,14 @@ def test_no_shard_can_be_given_the_supervisor_spool_directory(tmp_path: Path) ->
         own = _supervisor_forward_spool_dir(settings, db)
         shards = {_forward_spool_dir(settings, shard) for shard in (None, "supervisor", "a")}
         assert own not in shards and len(shards) == 3
-        # Same parent, so the supervisor's directory sits beside its shards'.
+        # Same parent, so the supervisor's directory sits beside its engine shards'.
         assert {Path(own).parent} == {Path(shard).parent for shard in shards}
 
 
 def test_the_supervisor_spool_follows_a_base_dir_set_in_the_settings(tmp_path: Path) -> None:
     """``--db`` is anchored only by ``--project-root`` in the supervisor. A base_dir from the file
-    or the environment moves each shard's store, so it must move the supervisor's spool too."""
+    or the environment moves each engine shard's store, so it must move the supervisor's spool
+    too."""
     from messagefoundry.__main__ import _forward_spool_dir, _supervisor_forward_spool_dir
     from messagefoundry.config.settings import (
         EnvironmentsSettings,
@@ -161,10 +163,11 @@ def test_the_supervisor_spool_follows_a_base_dir_set_in_the_settings(tmp_path: P
     settings = ServiceSettings(environments=EnvironmentsSettings(base_dir=str(data)))
     own = Path(_supervisor_forward_spool_dir(settings, "mefor.db"))
     assert own == (data / "log-spool" / "supervisor").resolve()
-    # What a shard's `serve` computes once it has anchored its own relative --db under base_dir.
+    # What an engine shard's `serve` computes once it has anchored its own relative --db under
+    # base_dir.
     shard = ServiceSettings(store=StoreSettings(path=str(data / "mefor_a.db")))
     assert Path(_forward_spool_dir(shard, "a")).parent == own.parent
-    # An absolute --db stays put, as it does for the shard.
+    # An absolute --db stays put, as it does for the engine shard.
     absolute = Path(_supervisor_forward_spool_dir(settings, str(tmp_path / "x" / "mefor.db")))
     assert absolute == (tmp_path / "x" / "log-spool" / "supervisor").resolve()
 
@@ -202,7 +205,7 @@ def test_the_supervisor_is_refused_by_each_gate_exactly_as_serve_is(
     rc, recorder = _run("supervise", tmp_path, monkeypatch, toml)
     assert rc == 2
     assert _errors(capsys.readouterr().err) == serve_errors
-    assert recorder.spawned == 0, "the supervisor spawned shards past a refused gate"
+    assert recorder.spawned == 0, "the supervisor spawned engine shards past a refused gate"
     assert recorder.forwards == [], "the supervisor installed a forwarder past a refused gate"
 
 
@@ -229,7 +232,7 @@ def test_a_collector_that_is_this_host_is_refused_for_the_supervisor_exactly_as_
     rc, recorder = _run("supervise", tmp_path, monkeypatch, verified_forwarding=True)
     assert rc == 2
     assert _errors(capsys.readouterr().err) == serve_errors
-    assert recorder.spawned == 0, "the supervisor spawned shards past the own-host refusal"
+    assert recorder.spawned == 0, "the supervisor spawned engine shards past the refusal"
     assert recorder.forwards == [], "the supervisor installed a forwarder to its own host"
 
 
@@ -237,23 +240,37 @@ _NO_NAME_NOTE = "the OS gave no host name"
 
 
 class _NoteWatch(_Recorder):
-    """A recorder that notes what stderr held when the forwarding ``configure_logging`` call was
-    made, and reports no live forwarder when ``live`` is false, as a collector that is down does."""
+    """A recorder that notes what stderr and the log held when the forwarding
+    ``configure_logging`` call was made. With ``live`` false it reports that no forwarder was
+    installed, as ``configure_logging`` does for a collector it skipped."""
 
-    def __init__(self, capsys: pytest.CaptureFixture[str], *, live: bool) -> None:
+    def __init__(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+        *,
+        live: bool = True,
+    ) -> None:
         super().__init__()
         self._capsys = capsys
+        self._caplog = caplog
         self._live = live
         self.stderr_before_configure = ""
+        self.logged_before_configure = 0
 
     def configure_logging(self, *args: Any, **kwargs: Any) -> bool:
         if "forward" in kwargs:
             self.stderr_before_configure += self._capsys.readouterr().err
+            self.logged_before_configure = len(_note_records(self._caplog))
         return super().configure_logging(*args, **kwargs) and self._live
 
-    @property
-    def configured(self) -> bool:
-        return any("forward" in kw for _, kw in self.logging_calls)
+
+def _note_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if _NO_NAME_NOTE in r.getMessage()]
+
+
+def _no_host_name() -> str:
+    raise OSError("no host name")
 
 
 @pytest.mark.parametrize("live", [True, False], ids=["forwarder-up", "forwarder-down"])
@@ -267,39 +284,48 @@ def test_a_fail_open_note_is_printed_before_logging_and_logged_after_it_is_confi
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The own-host check fails open when the OS gives no name, and its note is the record of
-    that pass. It goes to stderr at the gate, once and before ``configure_logging``, because a
-    start refused after the gate never configures logging. It is logged once that call has
-    returned, whether or not a forwarder came up: stdout and the log file are handlers too."""
-
-    def no_name() -> str:
-        raise OSError("no host name")
-
-    monkeypatch.setattr(socket, "gethostname", no_name)
-    recorder = _NoteWatch(capsys, live=live)
-    configured_when_logged: list[bool] = []
-
-    class _Watch(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            if _NO_NAME_NOTE in record.getMessage():
-                configured_when_logged.append(recorder.configured)
-
-    watch = _Watch(level=logging.WARNING)
-    main_log = logging.getLogger("messagefoundry.__main__")
-    main_log.addHandler(watch)
-    try:
-        with caplog.at_level("WARNING"):
-            rc, _ = _run(
-                command, tmp_path, monkeypatch, verified_forwarding=True, recorder=recorder
-            )
-    finally:
-        main_log.removeHandler(watch)
+    that pass. It goes to stderr at the gate, once and before ``configure_logging``. It is logged
+    once that call has returned, whether or not a forwarder came up: stdout and the log file are
+    handlers too."""
+    monkeypatch.setattr(socket, "gethostname", _no_host_name)
+    recorder = _NoteWatch(capsys, caplog, live=live)
+    with caplog.at_level("WARNING"):
+        rc, _ = _run(command, tmp_path, monkeypatch, verified_forwarding=True, recorder=recorder)
     assert rc == 0 and len(recorder.forwards) == 1
     assert recorder.stderr_before_configure.count(f"warning: {_NO_NAME_NOTE}") == 1
     assert _NO_NAME_NOTE not in capsys.readouterr().err, "printed again after configure_logging"
     # Logged once, by the start code and not by the gate itself, and only once configured.
-    notes = [r for r in caplog.records if _NO_NAME_NOTE in r.getMessage()]
-    assert [r.name for r in notes] == ["messagefoundry.__main__"], notes
-    assert configured_when_logged == [True]
+    assert recorder.logged_before_configure == 0
+    assert [r.name for r in _note_records(caplog)] == ["messagefoundry.__main__"]
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_a_fail_open_note_still_reaches_stderr_when_the_next_gate_refuses_the_start(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Why the stderr copy is printed at the gate and not beside the log copy: a start the
+    allow-list refuses next never configures logging, so stderr holds the only record that the
+    forwarding gate passed without its own-host check."""
+    monkeypatch.setattr(socket, "gethostname", _no_host_name)
+    recorder = _NoteWatch(capsys, caplog)
+    with caplog.at_level("WARNING"):
+        rc, _ = _run(
+            command,
+            tmp_path,
+            monkeypatch,
+            verified_forwarding=True,
+            allowed_syslog="other.example.org",
+            recorder=recorder,
+        )
+    err = capsys.readouterr().err
+    assert rc == 2 and recorder.forwards == [] and recorder.spawned == 0
+    assert err.count(f"warning: {_NO_NAME_NOTE}") == 1
+    assert len(_errors(err)) == 1 and "allowed_syslog" in _errors(err)[0]
+    assert _note_records(caplog) == [], "logged for a start that never configured logging"
 
 
 # --- forwarding not configured ------------------------------------------------------------------

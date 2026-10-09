@@ -32,6 +32,7 @@ from messagefoundry.config.settings import EgressSettings, StoreBackend
 from messagefoundry.config.wiring import Registry, WiringError, load_config
 from messagefoundry.pipeline import supervisor as supervisor_mod
 from messagefoundry.pipeline.engine import Engine
+from tests._phi_gate_provisions import make_syslog_ca_and_crl, setenv_verified_log_forwarding
 from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
 
 _LOG = logging.getLogger("tests.retention_override_gate")
@@ -484,6 +485,9 @@ def _supervise_guard(
     _clear_posture_env(monkeypatch)
     # The at-rest gate comes first in supervise; this test is about the gate after it.
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    # So do serve's forwarding gates (BACKLOG #2356), which refuse a fleet with no collector.
+    # Logging setup is stubbed below, so nothing is forwarded.
+    setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(service_toml, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
