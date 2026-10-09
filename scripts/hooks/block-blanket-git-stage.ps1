@@ -175,10 +175,12 @@ $reason = $null
 # unknown tool gets both, which can only add a deny. Each lookbehind skips an ESCAPED escape
 # character, which continues nothing.
 #
-# TWO WIDER READINGS WERE BUILT HERE AND WITHDRAWN, each on a measured false deny. Starting a
-# segment after an opening bracket refused prose that a slipped quote state exposes. Joining
-# the lines of a quoted span let one stray apostrophe glue later lines onto git's arguments.
-# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the forms both would have closed.
+# THREE WIDER READINGS WERE BUILT FOR THIS FILE AND WITHDRAWN. Two went on a measured false deny.
+# Starting a segment after an opening bracket refused prose that a slipped quote state exposes.
+# Joining the lines of a quoted span let one stray apostrophe glue later lines onto git's
+# arguments. The third went on a measured fail-open: Hide-HeredocBodies stopped taking a bash
+# here-string ('<<<word') for a heredoc, and one command that was denied before became allowed.
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the forms all three would have closed.
 $views = New-Object 'System.Collections.Generic.List[string[]]'
 $views.Add(@($scan, $cmd))
 $joined = @($scan, $cmd)

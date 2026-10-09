@@ -711,62 +711,122 @@ ADDED_NOT_REPLACED = [
     ("Bash", "git add ." + "/" * 40 + "x; git add -A"),
 ]
 
-# THE MEASURED REMAINDER: NEITHER ACCEPTED BY THE OWNER NOR CLOSED HERE. Each row stages or commits
-# the whole tree in a real shell and is ALLOWED. They are pinned the same way as the quote class
-# above, and for the same reason: the assertion demands the DENY, `strict` turns a repair into a
-# visible XPASS, and nobody can write today's ALLOW down as a requirement. Closing any of them
-# needs a quote-state parser, a program-position test, or knowledge of the working directory, or
-# was built here and withdrawn on a measured false deny. The first two are declined (BACKLOG
-# #1341, #1229). The list for the owner, with what git did for
-# each, is docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md. AT LEAST these.
-_REMAINDER = pytest.mark.xfail(
+# THE MEASURED FAIL-OPENS THAT ARE STILL OPEN, IN TWO TABLES. Each row stages or commits the whole
+# tree in a real shell and is ALLOWED. They are pinned the same way as the quote class above, and
+# for the same reason: the assertion demands the DENY, `strict` turns a repair into a visible
+# XPASS, and nobody can write today's ALLOW down as a requirement. Closing any of them needs a
+# quote-state parser, a program-position test, or knowledge of the working directory, or was built
+# and withdrawn on a measured false deny. The first two are declined (BACKLOG #1341, #1229).
+#
+# WHICH TABLE A ROW SITS IN IS THE RECORD OF WHO ACCEPTED IT, so do not move a row without an
+# owner answer to cite. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the answers, the full
+# tables and what git did for each form. The answers are reported by the Special seat; no other
+# seat saw the dialogs. AT LEAST these.
+_ACCEPTED = pytest.mark.xfail(
     strict=True,
-    reason="BACKLOG #1339: measured to stage the whole tree and allowed; awaiting the owner's "
-    "answer on docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md",
+    reason="BACKLOG #1339: measured to stage the whole tree and allowed; a fail-open the owner "
+    "accepted, as reported in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md sections 2 and 3",
 )
 
-MEASURED_REMAINDER = [
-    # a word before git: needs a program-position test
+ACCEPTED_FAIL_OPENS = [
+    # answer 2 (a), a word before git: needs a program-position test
     ("Bash", "if true; then git add -A; fi"),
     ("Bash", "for i in 1; do git add -A; done"),
     ("Bash", "true && ! git add -A"),
     ("Bash", "time git add -A"),
     ("Bash", "FOO=1 git add -A"),
     ("Bash", ">/dev/null git add -A"),
-    # grouping and substitution: git is not at the front of a separator segment
-    ("Bash", "(git add -A)"),
-    ("Bash", "{ git add -A; }"),
-    ("Bash", "echo $(git add -A)"),
-    ("Bash", "(cd sub && git add -A)"),
-    ("PowerShell", "& { git add -A }"),
-    ("PowerShell", "if ($true) { git add -A }"),
-    # a pathspec or flag after a message that spans lines
-    ("Bash", 'git commit -m "subject\n\nbody" .'),
-    ("PowerShell", "git commit -m 'subject\nbody' -a"),
-    # a stage on a line after a bash here-string, which the heredoc reader blanks
-    ("Bash", "cat <<<x\ngit add -A"),
-    # a parent-directory pathspec: whole tree or scoped, by a directory the guard cannot see
+    # answer 2 (b), a parent-directory pathspec: whole tree or scoped, by a directory the guard
+    # cannot see
     ("Bash", "cd sub && git add .."),
     ("Bash", "git -C sub add .."),
     ("Bash", "cd sub && git commit -m wip .."),
     ("Bash", "git add sub/.."),
-    # quoting the guard cannot read without quote state
+    # answer 2 (c), quoting the guard cannot read without quote state
     ("Bash", "git commit -m wip '.'"),
     ("PowerShell", "git commit '-a' -m wip"),
     ("Bash", 'git "add" -A'),
     ("Bash", '"git" add -A'),
+    ("Bash", "git add $'-A'"),
+    ("Bash", f'git add "-{_BS}\nA"'),
+    ("Bash", f"git commit -m fix{_BS}(x ."),
+    ("Bash", 'echo "see <<EOF"\ngit add -A'),
+    # answer 2 (d), the shell supplies the pathspec
+    ("Bash", 'git add "$PWD"'),
+    ("Bash", "git add ~+"),
+    ("Bash", "git add {.,}"),
+    ("PowerShell", "git add (Get-Location)"),
+    # answer 2 (e), grouping and substitution: git is not at the front of a separator segment
+    ("Bash", "(git add -A)"),
+    ("Bash", "{ git add -A; }"),
+    ("Bash", "echo $(git add -A)"),
+    ("Bash", "(cd sub && git add -A)"),
     ("Bash", 'echo "$(git add -A)"'),
     ("Bash", "cat <<EOF\n$(git add -A)\nEOF"),
-    ("Bash", 'echo "see <<EOF"\ngit add -A'),
-    # the shell or git supplies the pathspec
-    ("Bash", 'git add "$PWD"'),
-    ("PowerShell", "git add (Get-Location)"),
+    ("PowerShell", "& { git add -A }"),
+    ("PowerShell", "if ($true) { git add -A }"),
+    # answer 3, form 1: an escaped quote that hides a bracket or a hash before the dot
+    ("Bash", f'git commit -m "a {_BS}" (b {_BS}" c" .'),
+    ("Bash", f'git commit -m "a {_BS}" #b {_BS}" c" .'),
+    ("PowerShell", f'git commit -m "a {_BT}" (b {_BT}" c" .'),
+    # answer 3, form 2: a PowerShell block comment before the dot
+    ("PowerShell", "git commit -m wip <# note #> ."),
+    # answer 3, form 3: a piped substitution followed by a dot
+    ("Bash", "git commit -m $(echo wip | cat) ."),
+    ("Bash", "git add $(echo a.txt | cat) ."),
+    # answer 3, form 4: a stage on a line after a bash here-string, which the heredoc reader blanks
+    ("Bash", "cat <<<x\ngit add -A"),
+    ("Bash", "cat <<<x\ngit commit -m wip ."),
+]
+
+# NOT ACCEPTED BY ANY OWNER ANSWER. No line in the three answers describes these rows, and they
+# are why the guard is not wired. The page lists them in section 5, with the nearest accepted line
+# for each.
+_NOT_ACCEPTED = pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1339: measured to stage the whole tree and allowed; under no owner answer, "
+    "listed in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5",
+)
+
+NOT_ACCEPTED_FAIL_OPENS = [
+    # under no answer at all
+    ("PowerShell", "Write-Host hi\rgit add -A"),
+    ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A"),
+    ("Bash", "echo $((1<<n))\ngit add -A"),
+    ("Bash", "git diff | git apply --cached"),
+    # next to an accepted line whose words do not fit
+    ("PowerShell", "<# note #> git add -A"),
+    ("Bash", "git commit -m $(echo wip | cat) -a"),
+    ("Bash", "git commit -m `echo wip | cat` ."),
+    ("Bash", "git commit -m $(true && echo wip) ."),
+    ("Bash", "git commit -m $(cat <<'EOF'\nsubject\nEOF\n) ."),
+    # a pathspec or flag after a message that spans lines
+    ("Bash", 'git commit -m "subject\n\nbody" .'),
+    ("PowerShell", "git commit -m 'subject\nbody' -a"),
+    ("PowerShell", "git commit -m @'\nx\n'@ ."),
+    # git supplies the command, or another git command does the staging
     ("Bash", "git -c alias.aa=add aa ."),
     ("Bash", "git ls-files -m | git update-index --stdin"),
 ]
 
+# THE CONTROLS FOR THE TWO TABLES ABOVE. Each is the nearest form that the guard DOES deny, and
+# each was measured to stage or commit the whole tree. Without them a row above could be allowed
+# because the guard allows everything of that shape, not because of the one thing the row names.
+STILL_OPEN_CONTROLS = [
+    ("Bash", 'git commit -m "a (b c" .'),
+    ("Bash", 'git commit -m "a #b c" .'),
+    ("PowerShell", "git commit -m wip <#note#> ."),
+    ("PowerShell", "git commit -m wip <# note #> -a"),
+    ("Bash", "git commit -m $(echo wip) ."),
+    ("Bash", "cat <<<x; git add -A"),
+    ("Bash", "cat <<EOF\nx\nEOF\ngit add -A"),
+    ("Bash", "echo $((1 << 2))\ngit add -A"),
+    ("PowerShell", '$m = @"\nx\n"@\ngit add -A'),
+]
+
 # HARMLESS COMMANDS THE GUARD REFUSES, PINNED THE SAME WAY. The assertion demands the ALLOW each is
-# owed. Both are the price of the commit pathspec rule. AT LEAST these; the page lists more.
+# owed. The first six are the price of the commit pathspec rule; the last is older. AT LEAST
+# these; the page lists more, with what git did for each.
 _OVER_DENY = pytest.mark.xfail(
     strict=True,
     reason="BACKLOG #1339: a harmless command the guard refuses; listed in "
@@ -776,6 +836,11 @@ _OVER_DENY = pytest.mark.xfail(
 KNOWN_OVER_DENY = [
     ("Bash", "git commit -m . a.py"),
     ("Bash", "git stash push -m commit -- ."),
+    ("Bash", "git commit --dry-run ."),
+    ("Bash", "cd sub && git commit -m wip ."),
+    ("Bash", "git -C sub commit -m wip ."),
+    ("Bash", "git commit -m wip . ':!sub'"),
+    ("Bash", "git add a.py  # not ."),
 ]
 
 # ONE pwsh PROCESS FOR ALL THE TABLES ABOVE. Every other test in this file starts the hook the way
@@ -804,7 +869,9 @@ _BATCHED: list[tuple[str, str]] = sorted(
     | {(tool, scoped) for tool, _, scoped in BLANKET_AND_SCOPED_CONTROL}
     | set(MUST_STAY_ALLOWED)
     | set(ADDED_NOT_REPLACED)
-    | set(MEASURED_REMAINDER)
+    | set(ACCEPTED_FAIL_OPENS)
+    | set(NOT_ACCEPTED_FAIL_OPENS)
+    | set(STILL_OPEN_CONTROLS)
     | set(KNOWN_OVER_DENY)
 )
 
@@ -889,10 +956,27 @@ def test_an_unknown_tool_gets_both_continuation_characters(continuation: str) ->
 
 
 @pytest.mark.parametrize(
-    ("tool", "command"), [pytest.param(*r, marks=_REMAINDER) for r in MEASURED_REMAINDER]
+    ("tool", "command"), [pytest.param(*r, marks=_ACCEPTED) for r in ACCEPTED_FAIL_OPENS]
 )
-def test_the_measured_remainder_is_still_allowed_and_should_not_be(tool: str, command: str) -> None:
+def test_an_accepted_fail_open_is_still_allowed(tool: str, command: str) -> None:
     assert_denied(verdict(tool, command))
+
+
+@pytest.mark.parametrize(
+    ("tool", "command"), [pytest.param(*r, marks=_NOT_ACCEPTED) for r in NOT_ACCEPTED_FAIL_OPENS]
+)
+def test_a_fail_open_nobody_accepted_is_still_allowed(tool: str, command: str) -> None:
+    assert_denied(verdict(tool, command))
+
+
+@pytest.mark.parametrize(("tool", "command"), STILL_OPEN_CONTROLS)
+def test_the_nearest_form_to_a_fail_open_is_denied(tool: str, command: str) -> None:
+    assert_denied(verdict(tool, command))
+
+
+def test_no_row_is_both_accepted_and_not_accepted() -> None:
+    """The two tables are a record of who accepted what, so a row in both says nothing."""
+    assert not set(ACCEPTED_FAIL_OPENS) & set(NOT_ACCEPTED_FAIL_OPENS)
 
 
 @pytest.mark.parametrize(
@@ -907,8 +991,29 @@ def test_a_known_over_deny_is_still_refused_and_should_not_be(tool: str, command
 
 @pytest.mark.parametrize(
     "raw",
-    ["", "   ", "not json at all", "{}", '{"tool_input": {}}', '{"tool_input": {"command": ""}}'],
+    [
+        "",
+        "   ",
+        "not json at all",
+        "{}",
+        "[]",
+        '{"tool_input": {}}',
+        '{"tool_name": "Bash"}',
+        '{"tool_input": {"command": ""}}',
+        '{"tool_input": {"command": null}}',
+        '{"tool_input": {"script": "git add -A"}}',
+        # A real blanket stage in a payload that is cut short, or has text after it. The guard
+        # cannot read either, so the stage passes. This is accepted fail-open 5 on the page.
+        '{"tool_name": "Bash", "tool_input": {"command": "git add -A"',
+        '{"tool_name": "Bash", "tool_input": {"command": "git add -A"}} trailing',
+    ],
 )
 def test_a_payload_the_guard_cannot_read_allows(raw: str) -> None:
     """A guardrail must never wedge all git work. Anything unreadable passes silently."""
     assert_allowed(run_guard(raw))
+
+
+def test_a_readable_payload_with_no_tool_name_still_denies() -> None:
+    """The control for the test above: the allow there comes from the payload being unreadable,
+    and not from the guard allowing every odd payload."""
+    assert_denied(run_guard('{"tool_input": {"command": "git add -A"}}'))
