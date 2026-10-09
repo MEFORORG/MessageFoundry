@@ -57,7 +57,7 @@ tomlkit==0.15.1
 truststore==0.10.4
 typing-extensions==4.16.0
 typing-inspection==0.4.4
-tzdata==2026.4
+tzdata==2026.5
 uvicorn==0.54.0
 uvloop==0.23.0
 websockets==17.2
