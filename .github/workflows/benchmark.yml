@@ -78,6 +78,7 @@ jobs:
           # CA+CRL is minted in the run block. The two `warn` legs below only warn, so they need none.
           MEFOR_LOGGING_FORWARD_HOST: siem.invalid
           MEFOR_LOGGING_FORWARD_PROTOCOL: tls
+          MEFOR_EGRESS_ALLOWED_SYSLOG: siem.invalid  # BACKLOG #2356: the collector is an egress destination
         run: |
           set -o pipefail
           syslogCa="$(python scripts/ci/make_syslog_ca_crl.py "$RUNNER_TEMP/syslog-ca")"

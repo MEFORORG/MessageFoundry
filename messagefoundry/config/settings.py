@@ -2364,7 +2364,8 @@ class LoggingSettings(_Section):
     # --- On-disk spool behind the forwarder (BACKLOG #1966, ADR 0200) ----------
     # Records the collector does not take (down, backing off, or still queued at shutdown) are kept
     # here, in order, and sent when it answers again. None (the default) puts it at
-    # `<dir of [store].path>/log-spool/<engine or shard id>`, so each engine shard gets its own. It
+    # `<dir of [store].path>/log-spool/<engine or shard id>`, so each engine shard gets its own, and
+    # the `supervise` process takes `log-spool/supervisor` beside them (BACKLOG #2356). It
     # holds only text the filters already processed (they run before the hand-off queue). That
     # redaction is best-effort, so the spool may still hold PHI: PL-1 like the app log.
     forward_spool_dir: str | None = None
@@ -4546,6 +4547,15 @@ class EgressSettings(_Section):
     # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
     allowed_proxy: list[str] = []
+    # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
+    # ``forward_port``; BACKLOG #2356): each entry is "host" (any port) or "host:port". The forwarder
+    # is not a connection, so no graph check sees it; ``serve`` and ``supervise`` check it at start,
+    # before the forwarder opens a socket, through ``syslog_forward_refusal`` in
+    # messagefoundry/transports/egress.py. Empty and unset mean what they mean for ``allowed_tcp``:
+    # refused while ``deny_by_default`` is on, unrestricted under the audited opt-out. It never
+    # counts toward serve's open-egress start gate, because it names no message destination.
+    # Env (comma-separated): MEFOR_EGRESS_ALLOWED_SYSLOG.
+    allowed_syslog: list[str] = []
 
     # Deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every destination
     # of that type instead of allowing any, and so do at least the DATABASE/REMOTEFILE sources and the
@@ -4572,6 +4582,7 @@ class EgressSettings(_Section):
         "allowed_recipient_domains",
         "proxy_no_proxy",
         "allowed_proxy",
+        "allowed_syslog",
         mode="before",
     )
     @classmethod

@@ -1528,8 +1528,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
   only if another audit hook refused the engine's.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
-  the engine's own process. `supervise` logs one WARNING at start for the supervisor process, and
-  no API reports that process afterwards. The engine's Python children start with the interface
+  the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
+  It logs the line a second time once its off-box log forwarder is installed, so the collector's
+  copy has it. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook
@@ -1633,7 +1634,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
   for the engine's own process. The posture's `interpreter` block carries the whole reading: the
   flags, each file found with its verdict, and the directories. `supervise` logs one WARNING for
-  each entry at start for the supervisor process. `messagefoundry security show` is a separate
+  each entry at start for the supervisor process, and logs each a second time once its off-box
+  log forwarder is installed. `messagefoundry security show` is a separate
   process, so it reports none of them, and its scope line says so.
 - **The reading is taken once, at start.** Start-up code runs when the interpreter starts, so a
   file added later has not run in this process. Restart the engine to read again.

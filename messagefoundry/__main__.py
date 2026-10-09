@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
@@ -1836,9 +1837,496 @@ def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
 
     A per-shard subdirectory in both cases: the spool takes an exclusive lock on its directory, so
     engine shards sharing one would leave all but the first without a spool."""
-    base = settings.logging.forward_spool_dir
-    root = Path(base) if base else Path(settings.store.path).resolve().parent / "log-spool"
+    root = _forward_spool_root(settings, settings.store.path)
     return str(root / (f"shard-{shard}" if shard else "engine"))
+
+
+def _forward_spool_root(settings: ServiceSettings, store_path: str) -> Path:
+    """The directory the per-process spool directories sit in: ``[logging].forward_spool_dir``, or
+    ``log-spool`` beside ``store_path``."""
+    base = settings.logging.forward_spool_dir
+    return Path(base) if base else Path(store_path).resolve().parent / "log-spool"
+
+
+def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> str:
+    """The supervisor process's own spool directory, beside its engine shards' (BACKLOG #2356).
+
+    Its own for the reason :func:`_forward_spool_dir` gives: the spool locks its directory. The
+    default root is beside ``--db``, because each engine shard's ``[store].path`` is derived from
+    that flag, so the supervisor's directory lands next to theirs. ``db_base`` is anchored only by
+    ``--project-root`` here, so a base_dir set in the file or the environment is applied too, as
+    each engine shard's ``serve`` applies it to its own ``[store].path``. No engine shard's
+    directory can take the name: those are ``engine`` or start ``shard-``."""
+    from messagefoundry.config.anchor import resolve_project_root
+
+    store_path = Path(db_base)
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=Path.cwd())
+    if root is not None and not store_path.is_absolute():
+        store_path = root / store_path
+    return str(_forward_spool_root(settings, str(store_path)) / "supervisor")
+
+
+def _forwarder_posture_refused(
+    settings: ServiceSettings, *, production: bool, env_name: str, enforcing: bool
+) -> bool:
+    """The three posture steps ``serve`` takes last before it configures logging. Returns whether
+    the start is refused; the refusal is already on stderr.
+
+    One body for ``serve`` and ``supervise`` (BACKLOG #2356), in serve's order: the open-egress
+    gate (Q5b), the announcement or AUDIT line for ``[security].block_unlisted_outbound``, and the
+    production DEBUG refusal. All three read settings only, so every engine shard reaches the
+    same verdict. The supervisor needs the middle one for its own sake: under the audited opt-out
+    an empty ``[egress].allowed_syslog`` allows any collector, and that AUDIT line is the record
+    of it. The open-egress gate does not refuse every such state; a start with another
+    ``[egress]`` list declared passes it. ``_serve`` holds the reasoning for the gate, above its
+    call."""
+    eg = settings.egress
+    listed = (
+        eg.allowed_mllp
+        or eg.allowed_tcp
+        or eg.allowed_http
+        or eg.allowed_db
+        or eg.allowed_remote
+        or eg.allowed_file_dirs
+    )
+    deny_written = "deny_by_default" in eg.model_fields_set
+    if not deny_written:
+        listed = listed or eg.allowed_smtp or eg.allowed_direct
+    # The gate reads whether the operator WROTE the switch, not only the field's value. The model
+    # default has been deny since vault BACKLOG #2605, so the value alone is true on a stock instance
+    # and this refusal would never fire. Without it a stock instance would start and fail every
+    # outbound as a degraded lane, rather than refusing here with one clear message. The two states
+    # the gate catches differ, and each message says which: written false is allow-any egress, and
+    # left unset with nothing declared is every outbound refused.
+    egress_open = not (deny_written and eg.deny_by_default) and not listed
+    if egress_open:
+        tier = f"{'production ' if production else ''}PHI instance ({env_name!r})"
+        if deny_written:
+            # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when the
+            # switch was written false (otherwise those two count above), so name that override
+            # rather than leaving the operator to wonder why a declared allowlist did not count.
+            mail_only_note = (
+                " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this "
+                "gate only when [security].block_unlisted_outbound is left unset — setting it false "
+                "opts out of the deny default, which would leave every OTHER transport allow-any. "
+                "Remove that override (or set it true) and a mail-only/Direct-only allowlist is "
+                "accepted."
+                if (eg.allowed_smtp or eg.allowed_direct)
+                else ""
+            )
+            if enforcing:
+                print(
+                    f"error: outbound egress is UNRESTRICTED on a {tier}; refusing to start — a "
+                    "transform could send PHI to any destination. Set "
+                    "[security].block_unlisted_outbound=true, or declare the permitted destinations "
+                    f"with per-transport [egress].allowed_* allowlists.{mail_only_note}",
+                    file=sys.stderr,
+                )
+                return True
+            print(
+                "warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
+                f"({env_name!r}) — a transform may send to any destination. Set "
+                "[security].block_unlisted_outbound=true, or declare per-transport "
+                f"[egress].allowed_* allowlists, to fail closed.{mail_only_note}",
+                file=sys.stderr,
+            )
+        else:
+            if enforcing:
+                print(
+                    f"error: no outbound destination is declared on a {tier}; refusing to start — "
+                    "[security].block_unlisted_outbound is on by default, so every outbound would "
+                    "be refused. Declare the permitted destinations with per-transport "
+                    "[egress].allowed_* allowlists.",
+                    file=sys.stderr,
+                )
+                return True
+            print(
+                f"warning: no outbound destination is declared on a {tier} — "
+                "[security].block_unlisted_outbound is on by default, so every outbound will be "
+                "refused. Declare the permitted destinations with per-transport "
+                "[egress].allowed_* allowlists.",
+                file=sys.stderr,
+            )
+
+    # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
+    # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
+    # [egress].allowed_* list is EMPTY refuses every destination of that type, including on a
+    # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
+    # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
+    # and this block only announces the posture, or audits the explicit opt-out. No instance is
+    # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
+    # staging instance is held to it exactly as a production one is.
+    if not deny_written:
+        # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
+        # like the sibling posture gates rather than logging.info.
+        print(
+            f"info: [security].block_unlisted_outbound defaulted ON for a "
+            f"{'production ' if production else ''}PHI instance "
+            f"({env_name!r}) — a transport with an empty [egress].allowed_* list now refuses every "
+            "destination of that type (secure-by-default). Declare the permitted destinations per "
+            "transport, or set [security].block_unlisted_outbound=false to restore allow-any.",
+            file=sys.stderr,
+        )
+    elif not settings.egress.deny_by_default:
+        # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
+        # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
+        # line is WARNING-level so the root lastResort handler still surfaces it before
+        # configure_logging.
+        logging.getLogger(__name__).warning(
+            "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
+            "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
+            "send to ANY destination of that type); the secure-by-default deny is opted out.",
+            "production " if production else "",
+            env_name,
+        )
+        print(
+            f"warning: [security].block_unlisted_outbound=false on a "
+            f"{'production ' if production else ''}PHI instance ({env_name!r}) "
+            "— a transport with an empty [egress].allowed_* list may send PHI to ANY destination of "
+            "that type. Remove the override (or set it true) to fail closed.",
+            file=sys.stderr,
+        )
+
+    # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
+    # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
+    # instance may use DEBUG for diagnostics. The predicate is shared with the run-time setter behind
+    # PATCH /logging/level, so a production instance refused DEBUG here is refused it there too
+    # (vault BACKLOG #2777).
+    if level_refused_on_production(settings.logging.level, production=production):
+        print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
+        return True
+    return False
+
+
+def _managed_identity_refused(settings: ServiceSettings, *, enforcing: bool) -> bool:
+    """The ``[store].require_managed_identity`` precondition (#203). Returns whether the start is
+    refused. One body for ``serve`` and ``supervise`` (BACKLOG #2356): the supervisor opens the
+    store itself when it renews the API pair, and every engine shard would refuse."""
+    mi_reason = settings.store.managed_identity_precondition()
+    if mi_reason is None:
+        return False
+    if enforcing:
+        print(
+            f"error: [store].require_managed_identity is set but {mi_reason}; refusing to start.",
+            file=sys.stderr,
+        )
+        return True
+    print(
+        f"warning: [store].require_managed_identity is set but {mi_reason}.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _sqlserver_extra_refused(settings: ServiceSettings) -> bool:
+    """Whether the SQL Server backend is chosen without its driver installed; the refusal is then
+    on stderr. One body for ``serve`` and ``supervise`` (BACKLOG #2356)."""
+    import importlib.util
+
+    from messagefoundry.config.settings import StoreBackend
+
+    if settings.store.backend is not StoreBackend.SQLSERVER:
+        return False
+    if importlib.util.find_spec("aioodbc") is not None:
+        return False
+    print(
+        "error: the SQL Server backend needs the 'sqlserver' extra: "
+        "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _environment_or_refusal(
+    settings: ServiceSettings, *, fleet: str = ""
+) -> tuple[str, bool] | None:
+    """The active environment's name and production tier, or ``None`` with the refusal on stderr.
+
+    The environment gate (ADR 0017), one body for ``serve`` and ``supervise`` (BACKLOG #2356):
+    a name is required, and a custom name needs an explicit production tier. ``fleet`` is the
+    sentence the supervisor adds after serve's own words."""
+    env_name = settings.ai.environment
+    refusal: str | None = None
+    production = False
+    if env_name is None:
+        refusal = _NO_ACTIVE_ENVIRONMENT
+    else:
+        try:
+            production = settings.ai.require_posture()
+        except ValueError as exc:
+            refusal = str(exc)
+    if refusal is None:
+        assert env_name is not None
+        return env_name, production
+    if fleet:
+        refusal = f"{refusal if refusal.endswith('.') else refusal + '.'} {fleet}"
+    print(f"error: {refusal}", file=sys.stderr)
+    return None
+
+
+#: The refusal ``serve`` and ``supervise`` share when no environment is named (ADR 0017).
+_NO_ACTIVE_ENVIRONMENT = (
+    "no active environment set — pass --env <name> or set [ai].environment. It selects "
+    "environments/<name>.toml and, with [security].production_instance, the instance's "
+    "production tier."
+)
+
+
+def _static_credential_settings_gate(
+    settings: ServiceSettings, *, enforcing: bool
+) -> tuple[StaticCredentialGateOutcome | None, bool]:
+    """Run the settings half of the opt-in static-credential gate and report it on stderr.
+
+    Returns the outcome and whether the start is refused. One body for ``serve`` and ``supervise``
+    (BACKLOG #2356): the half reads settings only, and its ``settings:logging.forward`` hop is the
+    off-box collector, so the supervisor must not install its forwarder past a refusal an engine
+    shard would make. The audit lines and a warn-mode refusal go to stderr here, where no log
+    level filters them; :func:`_log_static_credential_outcome` writes them to the log once the
+    caller has configured it (BACKLOG #1989)."""
+    from messagefoundry.config.static_credentials import run_static_credential_gate
+    from messagefoundry.controlchars import scrub_control_chars
+
+    outcome = run_static_credential_gate(settings, registry=None)
+    if outcome is None:
+        return None, False
+    for line in outcome.audit:
+        # Scrubbed as the logged copy is: an operator's reason is free text, and a newline in it
+        # must not forge a second stderr line.
+        print(f"warning: {scrub_control_chars(line)}", file=sys.stderr)
+    if outcome.refusal is not None:
+        if enforcing:
+            print(f"error: {outcome.refusal}; refusing to start.", file=sys.stderr)
+            return outcome, True
+        print(f"warning: {outcome.refusal}.", file=sys.stderr)
+    return outcome, False
+
+
+def _log_static_credential_outcome(outcome: StaticCredentialGateOutcome | None) -> None:
+    """Log what :func:`_static_credential_settings_gate` printed, once logging is configured, so
+    the lines reach the handlers and the forwarder (BACKLOG #1989). A warn-mode refusal too."""
+    if outcome is None:
+        return
+    log = logging.getLogger(__name__)
+    for line in outcome.audit:
+        log.warning("%s", line)
+    if outcome.refusal is not None:
+        log.warning("%s", outcome.refusal)
+
+
+def _start_logging(
+    settings: ServiceSettings,
+    *,
+    env_name: str | None,
+    enforcing: bool,
+    spool_dir: str,
+    configure: Callable[[SyslogForward | None], bool],
+) -> int | None:
+    """Pass the off-box forwarding gates, then install this process's log handlers.
+
+    Returns the exit code of a refused start, or ``None`` once logging is configured. One body for
+    ``serve`` and ``supervise`` (BACKLOG #2356), so both pass the gates in it and print the same
+    refusal. It does not hold every gate that guards the collector: at least the static-credential
+    and open-egress gates run in each caller before it, so a new one must be given to both.
+    ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
+    locks it.
+
+    ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
+    passed (``None`` with no collector). It stays at the call site because level, format and the
+    application-log file are the caller's, and it runs only after every gate here has passed."""
+    from messagefoundry.config.settings import (
+        SyslogProtocol,
+        forward_hop_disposition,
+        forwarding_gate_check,
+        hop_posture_from_ai,
+    )
+    from messagefoundry.config.tls_policy import HopDisposition, InsecureHopRefused
+    from messagefoundry.controlchars import scrub_control_chars
+    from messagefoundry.keywrap import KeyWrapRefused
+
+    # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
+    # so evidence survives a host compromise. PHI redaction + control-char scrubbing apply to the
+    # forwarded stream exactly as to stdout (configure_logging installs the same filters on both).
+    # Derived once and used twice below: by the #200 forward_hop_disposition gate, and (BACKLOG #1498,
+    # ADR 0173 §4.3) threaded onto SyslogForward so the forwarder's own revocation guard can key on it.
+    # That handler is built outside the connectors' active_hop_posture scope, so the posture cannot be
+    # read ambiently there and has to travel with the target.
+    _forward_posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    log_forward = (
+        SyslogForward(
+            host=settings.logging.forward_host,
+            port=settings.logging.forward_port,
+            protocol=settings.logging.forward_protocol.value,
+            fmt=settings.logging.forward_format.value,
+            # Native TLS-syslog (ADR 0080): applied only when protocol == "tls"; unused otherwise.
+            tls_ca_file=settings.logging.forward_tls_ca_file,
+            tls_verify=settings.logging.forward_tls_verify,
+            tls_client_cert=settings.logging.forward_tls_client_cert,
+            tls_crl_file=settings.logging.forward_tls_crl_file,
+            hop_posture=_forward_posture,
+            # BACKLOG #1966 (ADR 0200): the on-disk spool, one directory per process.
+            spool_dir=spool_dir,
+            spool_max_bytes=settings.logging.forward_spool_max_bytes,
+        )
+        if settings.logging.forward_enabled and settings.logging.forward_host
+        else None
+    )
+    # #200 (ADR 0092) residual: the forwarder was the ONE egress path with no posture gate — its
+    # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
+    # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
+    # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
+    # Loopback (the ADR 0080 local-agent deployment) passes THIS hop check, though the BACKLOG #1966
+    # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
+    # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
+    # [logging].forward_hop_attested, which lets the hop through silently under either dial.
+    if log_forward is not None:
+        _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
+        # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
+        # (encrypted but unauthenticated => MITM-able). Both land on the gradient.
+        _forward_why = (
+            "certificate verification is disabled (forward_tls_verify=false)"
+            if settings.logging.forward_protocol is SyslogProtocol.TLS
+            else f"forward_protocol={settings.logging.forward_protocol.value!r} is plaintext"
+        )
+        if _forward_hop is HopDisposition.REFUSE:
+            print(
+                "error: [logging] off-box forwarding to "
+                f"{settings.logging.forward_host}:{settings.logging.forward_port} is not a verified-TLS "
+                f"hop ({_forward_why}) — the log/audit evidence stream would cross the network "
+                f"unprotected on a PHI instance under [security].enforcement=enforce ({env_name!r}). "
+                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file and "
+                "[logging].forward_tls_crl_file (ADR 0080) and a TLS port such as 6514. Attesting "
+                "the hop ([logging].forward_hop_attested) clears this check only; a PHI instance "
+                "under enforce still refuses to start without verified TLS to a separate collector "
+                "(BACKLOG #1966).",
+                file=sys.stderr,
+            )
+            return 2
+        if _forward_hop is HopDisposition.WARN:
+            # Crossed, but never silent — the point of the fix. WARNING surfaces via the root
+            # lastResort handler even though configure_logging has not run yet.
+            logging.getLogger(__name__).warning(
+                "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
+                "evidence stream crosses the network unprotected on a PHI instance. Set "
+                "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
+                "(ADR 0080) to a collector on another host.",
+                settings.logging.forward_host,
+                settings.logging.forward_port,
+                _forward_why,
+            )
+    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
+    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
+    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
+    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
+    # and local host state: it sends no packet and resolves no name, so a collector that is down
+    # cannot hold a clinical message path from starting through this gate. It keys on forwarding,
+    # not on the spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not
+    # this gate. Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start
+    # opens no spool and contacts no collector.
+    #
+    # Vault BACKLOG #2375: the gate's own-host check FAILS OPEN and logs a WARNING when it does,
+    # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach bare
+    # stderr only in `serve`, where configure_logging has not run, and in `supervise` it would
+    # reach stdout but never the forwarder. So the gate hands the notes back as text and each is
+    # written TWICE, as the #1989 static-credential lines are: to stderr now, and to the
+    # configured handlers once `configure` below has returned.
+    _forwarding_gap, _gate_notes = forwarding_gate_check(settings.logging)
+    for _gate_note in _gate_notes:
+        print(f"warning: {scrub_control_chars(_gate_note)}", file=sys.stderr)
+    if _forwarding_gap is not None:
+        _forwarding_fix = (
+            "Set [logging].forward_host to a collector on another host, "
+            "[logging].forward_protocol='tls', [logging].forward_port to its TLS syslog port "
+            "(6514 by convention; the default 514 is the plaintext port), "
+            "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
+            "from that CA (an enforcing instance also refuses verified TLS with no revocation "
+            "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
+            "separate system. List the collector in [egress].allowed_syslog as well, or the next "
+            "start check refuses it."
+        )
+        if enforcing:
+            print(
+                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
+                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
+                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
+            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
+            f"{_forwarding_fix}",
+            file=sys.stderr,
+        )
+
+    # BACKLOG #2356: the collector is an outbound destination, and until this check no [egress]
+    # list governed it. The forwarder is not a connection, so the graph's egress check never sees
+    # it. Decided here, last of the forwarding gates and before the handler is installed, so the
+    # forwarder never dials a refused collector and no packet goes to it. One socket can come
+    # first: for a verified-TLS collector given as a non-loopback IP literal, the forwarding gate
+    # above has asked the routing table for a source address, which connects a UDP socket and
+    # sends nothing. It refuses under either enforcement dial, as every [egress] list does.
+    if log_forward is not None:
+        from messagefoundry.transports.egress import syslog_forward_refusal
+
+        _egress_gap = syslog_forward_refusal(log_forward.host, log_forward.port, settings.egress)
+        if _egress_gap is not None:
+            print(
+                f"error: {_egress_gap}; refusing to start. List the collector in "
+                "[egress].allowed_syslog as 'host' (any port) or 'host:port'.",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        forwarder_live = configure(log_forward)
+    except OSError as exc:
+        # FAIL CLOSED at configuration time: the operator named an application-log path this process
+        # cannot open. Starting anyway is precisely the silent blindness #122 exists to end, so refuse
+        # — and say so on stderr, since the log we would normally warn on is the thing that failed.
+        print(
+            f"error: [logging].file ({settings.logging.file!r}) cannot be opened for writing: {exc}. "
+            "The engine refuses to start rather than run unable to log (BACKLOG #122, ADR 0162); fix "
+            "the path/permissions, or unset [logging].file to run stdout-only.",
+            file=sys.stderr,
+        )
+        return 2
+    except InsecureHopRefused as exc:
+        # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
+        # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
+        # as a clean exit 2 rather than a traceback, matching the #200 forward-hop refusal above.
+        #
+        # stderr because that is where every other serve-gate refusal goes and it is unfiltered by the
+        # log level and the PHI/credential filters. NOT because no handler exists: by the time this
+        # raises, configure_logging HAS installed the stdout and file handlers and published the write
+        # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
+        # which would have misled anyone reasoning about the guard's WARN arm at the same site.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
+        # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
+        # the text names the setting and the fix, never the key.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
+    # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
+    # applies to them. Logged whether or not a forwarder came up: stdout and the log file are
+    # handlers too. Each caller logs its #1989 static-credential lines next, for the same reason.
+    for _gate_note in _gate_notes:
+        logging.getLogger(__name__).warning("%s", _gate_note)
+    if forwarder_live and log_forward is not None:
+        # Only announce forwarding when configure_logging actually installed the handler. With the
+        # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
+        # deferred and installed. A permanent failure (bad certificate, unresolvable name) is skipped
+        # at ERROR either way (BACKLOG #1966). This line must not contradict any of those.
+        logging.getLogger(__name__).info(
+            "off-box log forwarding enabled -> %s:%d (%s, %s)",
+            log_forward.host,
+            log_forward.port,
+            log_forward.protocol,
+            log_forward.fmt,
+        )
+    return None
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -1864,16 +2352,11 @@ def _serve(args: argparse.Namespace) -> int:
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         LogWriteFailurePolicy,
         StoreBackend,
-        SyslogProtocol,
-        forward_hop_disposition,
-        hop_posture_from_ai,
         insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
     )
     from messagefoundry.config.tls_policy import (
-        HopDisposition,
-        InsecureHopRefused,
         in_process_tls_revocation_refused,
         proxy_mtls_declared_but_unverified,
         tls_revocation_attested,
@@ -1974,16 +2457,8 @@ def _serve(args: argparse.Namespace) -> int:
     # ONCE: a second copy is how the ASVS 11.7.1 and 6.3.3 arms once disagreed about one boot (#326).
     instance_exposed = not settings.api.host_is_browser_origin
 
-    if settings.store.backend is StoreBackend.SQLSERVER:
-        import importlib.util
-
-        if importlib.util.find_spec("aioodbc") is None:
-            print(
-                "error: the SQL Server backend needs the 'sqlserver' extra: "
-                "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)",
-                file=sys.stderr,
-            )
-            return 2
+    if _sqlserver_extra_refused(settings):
+        return 2
 
     # Active environment is REQUIRED (ADR 0017): no silent default, so a missing env can never resolve
     # another environment's values/secrets. Its production TIER is derived for the built-in names
@@ -1992,20 +2467,10 @@ def _serve(args: argparse.Namespace) -> int:
     # (BACKLOG #1279).
     from messagefoundry.config.ai_policy import SecurityEnforcement
 
-    if settings.ai.environment is None:
-        print(
-            "error: no active environment set — pass --env <name> or set [ai].environment. It selects "
-            "environments/<name>.toml and, with [security].production_instance, the instance's "
-            "production tier.",
-            file=sys.stderr,
-        )
+    environment = _environment_or_refusal(settings)
+    if environment is None:
         return 2
-    try:
-        production = settings.ai.require_posture()
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    env_name = settings.ai.environment
+    env_name, production = environment
 
     # The security REFUSE/WARN dial (this refactor): the serve-gate posture gates + the ADR 0092 escape-
     # clamp key on this, NOT the production-tier `production` fact. ENFORCE (the secure default)
@@ -2041,18 +2506,8 @@ def _serve(args: argparse.Namespace) -> int:
     # turns this on and leaves a static credential is REFUSED, not warned. It downgrades to a warning
     # only under enforcement = warn. Off by default → byte-identical. Admin device posture and AD/SMTP
     # managed identity stay deployment-delegated (documented in docs/SECURITY.md), not engine-checked.
-    mi_reason = settings.store.managed_identity_precondition()
-    if mi_reason is not None:
-        if enforcing:
-            print(
-                f"error: [store].require_managed_identity is set but {mi_reason}; refusing to start.",
-                file=sys.stderr,
-            )
-            return 2
-        print(
-            f"warning: [store].require_managed_identity is set but {mi_reason}.",
-            file=sys.stderr,
-        )
+    if _managed_identity_refused(settings, enforcing=enforcing):
+        return 2
 
     # Static-credential refusal (BACKLOG #1182, ASVS 13.2.1), OPT-IN and off by default (owner decision
     # 2026-09-23). [security].require_nonstatic_credentials refuses every backend hop that presents an
@@ -2067,24 +2522,12 @@ def _serve(args: argparse.Namespace) -> int:
     # which every exit before configure_logging still sees and no log level can filter, and to the
     # configured handlers after configure_logging below. Under NSSM both streams are captured, so a
     # line can appear in both captures; that duplicate is the price of losing it from neither.
-    from messagefoundry.config.static_credentials import (
-        make_static_credential_guard,
-        run_static_credential_gate,
-    )
-    from messagefoundry.controlchars import scrub_control_chars
+    from messagefoundry.config.static_credentials import make_static_credential_guard
 
     _credlog = logging.getLogger(__name__)
-    sc_outcome = run_static_credential_gate(settings, registry=None)
-    if sc_outcome is not None:
-        for line in sc_outcome.audit:
-            # Scrubbed as the logged copy is: an operator's reason is free text, and a newline in it
-            # must not forge a second stderr line.
-            print(f"warning: {scrub_control_chars(line)}", file=sys.stderr)
-    if sc_outcome is not None and sc_outcome.refusal is not None:
-        if enforcing:
-            print(f"error: {sc_outcome.refusal}; refusing to start.", file=sys.stderr)
-            return 2
-        print(f"warning: {sc_outcome.refusal}.", file=sys.stderr)
+    sc_outcome, sc_refused = _static_credential_settings_gate(settings, enforcing=enforcing)
+    if sc_refused:
+        return 2
     static_credential_guard = make_static_credential_guard(
         settings, enforcing=enforcing, log=_credlog
     )
@@ -2217,236 +2660,10 @@ def _serve(args: argparse.Namespace) -> int:
     # transport closed, so such an instance starts fail-closed. An instance that explicitly opted OUT
     # of deny-by-default is deliberately unchanged: it cannot satisfy this gate on smtp/direct alone,
     # because there the other six transports stay allow-any.
-    eg = settings.egress
-    listed = (
-        eg.allowed_mllp
-        or eg.allowed_tcp
-        or eg.allowed_http
-        or eg.allowed_db
-        or eg.allowed_remote
-        or eg.allowed_file_dirs
-    )
-    deny_written = "deny_by_default" in eg.model_fields_set
-    if not deny_written:
-        listed = listed or eg.allowed_smtp or eg.allowed_direct
-    # The gate reads whether the operator WROTE the switch, not only the field's value. The model
-    # default has been deny since vault BACKLOG #2605, so the value alone is true on a stock instance
-    # and this refusal would never fire. Without it a stock instance would start and fail every
-    # outbound as a degraded lane, rather than refusing here with one clear message. The two states
-    # the gate catches differ, and each message says which: written false is allow-any egress, and
-    # left unset with nothing declared is every outbound refused.
-    egress_open = not (deny_written and eg.deny_by_default) and not listed
-    if egress_open:
-        tier = f"{'production ' if production else ''}PHI instance ({env_name!r})"
-        if deny_written:
-            # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when the
-            # switch was written false (otherwise those two count above), so name that override
-            # rather than leaving the operator to wonder why a declared allowlist did not count.
-            mail_only_note = (
-                " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this "
-                "gate only when [security].block_unlisted_outbound is left unset — setting it false "
-                "opts out of the deny default, which would leave every OTHER transport allow-any. "
-                "Remove that override (or set it true) and a mail-only/Direct-only allowlist is "
-                "accepted."
-                if (eg.allowed_smtp or eg.allowed_direct)
-                else ""
-            )
-            if enforcing:
-                print(
-                    f"error: outbound egress is UNRESTRICTED on a {tier}; refusing to start — a "
-                    "transform could send PHI to any destination. Set "
-                    "[security].block_unlisted_outbound=true, or declare the permitted destinations "
-                    f"with per-transport [egress].allowed_* allowlists.{mail_only_note}",
-                    file=sys.stderr,
-                )
-                return 2
-            print(
-                "warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
-                f"({env_name!r}) — a transform may send to any destination. Set "
-                "[security].block_unlisted_outbound=true, or declare per-transport "
-                f"[egress].allowed_* allowlists, to fail closed.{mail_only_note}",
-                file=sys.stderr,
-            )
-        else:
-            if enforcing:
-                print(
-                    f"error: no outbound destination is declared on a {tier}; refusing to start — "
-                    "[security].block_unlisted_outbound is on by default, so every outbound would "
-                    "be refused. Declare the permitted destinations with per-transport "
-                    "[egress].allowed_* allowlists.",
-                    file=sys.stderr,
-                )
-                return 2
-            print(
-                f"warning: no outbound destination is declared on a {tier} — "
-                "[security].block_unlisted_outbound is on by default, so every outbound will be "
-                "refused. Declare the permitted destinations with per-transport "
-                "[egress].allowed_* allowlists.",
-                file=sys.stderr,
-            )
-
-    # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
-    # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
-    # [egress].allowed_* list is EMPTY refuses every destination of that type, including on a
-    # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
-    # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
-    # and this block only announces the posture, or audits the explicit opt-out. No instance is
-    # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
-    # staging instance is held to it exactly as a production one is.
-    if not deny_written:
-        # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
-        # like the sibling posture gates rather than logging.info.
-        print(
-            f"info: [security].block_unlisted_outbound defaulted ON for a "
-            f"{'production ' if production else ''}PHI instance "
-            f"({env_name!r}) — a transport with an empty [egress].allowed_* list now refuses every "
-            "destination of that type (secure-by-default). Declare the permitted destinations per "
-            "transport, or set [security].block_unlisted_outbound=false to restore allow-any.",
-            file=sys.stderr,
-        )
-    elif not settings.egress.deny_by_default:
-        # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
-        # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
-        # line is WARNING-level so the root lastResort handler still surfaces it before
-        # configure_logging.
-        logging.getLogger(__name__).warning(
-            "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
-            "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
-            "send to ANY destination of that type); the secure-by-default deny is opted out.",
-            "production " if production else "",
-            env_name,
-        )
-        print(
-            f"warning: [security].block_unlisted_outbound=false on a "
-            f"{'production ' if production else ''}PHI instance ({env_name!r}) "
-            "— a transport with an empty [egress].allowed_* list may send PHI to ANY destination of "
-            "that type. Remove the override (or set it true) to fail closed.",
-            file=sys.stderr,
-        )
-
-    # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
-    # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
-    # instance may use DEBUG for diagnostics. The predicate is shared with the run-time setter behind
-    # PATCH /logging/level, so a production instance refused DEBUG here is refused it there too
-    # (vault BACKLOG #2777).
-    if level_refused_on_production(settings.logging.level, production=production):
-        print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
+    if _forwarder_posture_refused(
+        settings, production=production, env_name=env_name, enforcing=enforcing
+    ):
         return 2
-
-    # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
-    # so evidence survives a host compromise. PHI redaction + control-char scrubbing apply to the
-    # forwarded stream exactly as to stdout (configure_logging installs the same filters on both).
-    # Derived once and used twice below: by the #200 forward_hop_disposition gate, and (BACKLOG #1498,
-    # ADR 0173 §4.3) threaded onto SyslogForward so the forwarder's own revocation guard can key on it.
-    # That handler is built outside the connectors' active_hop_posture scope, so the posture cannot be
-    # read ambiently there and has to travel with the target.
-    _forward_posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
-    log_forward = (
-        SyslogForward(
-            host=settings.logging.forward_host,
-            port=settings.logging.forward_port,
-            protocol=settings.logging.forward_protocol.value,
-            fmt=settings.logging.forward_format.value,
-            # Native TLS-syslog (ADR 0080): applied only when protocol == "tls"; unused otherwise.
-            tls_ca_file=settings.logging.forward_tls_ca_file,
-            tls_verify=settings.logging.forward_tls_verify,
-            tls_client_cert=settings.logging.forward_tls_client_cert,
-            tls_crl_file=settings.logging.forward_tls_crl_file,
-            hop_posture=_forward_posture,
-            # BACKLOG #1966 (ADR 0200): the on-disk spool, one directory per engine shard.
-            spool_dir=_forward_spool_dir(settings, getattr(args, "shard", None)),
-            spool_max_bytes=settings.logging.forward_spool_max_bytes,
-        )
-        if settings.logging.forward_enabled and settings.logging.forward_host
-        else None
-    )
-    # #200 (ADR 0092) residual: the forwarder was the ONE egress path with no posture gate — its
-    # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
-    # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
-    # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
-    # Loopback (the ADR 0080 local-agent deployment) passes THIS hop check, though the BACKLOG #1966
-    # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
-    # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
-    # [logging].forward_hop_attested, which lets the hop through silently under either dial.
-    if log_forward is not None:
-        _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
-        # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
-        # (encrypted but unauthenticated => MITM-able). Both land on the gradient.
-        _forward_why = (
-            "certificate verification is disabled (forward_tls_verify=false)"
-            if settings.logging.forward_protocol is SyslogProtocol.TLS
-            else f"forward_protocol={settings.logging.forward_protocol.value!r} is plaintext"
-        )
-        if _forward_hop is HopDisposition.REFUSE:
-            print(
-                "error: [logging] off-box forwarding to "
-                f"{settings.logging.forward_host}:{settings.logging.forward_port} is not a verified-TLS "
-                f"hop ({_forward_why}) — the log/audit evidence stream would cross the network "
-                f"unprotected on a PHI instance under [security].enforcement=enforce ({env_name!r}). "
-                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file and "
-                "[logging].forward_tls_crl_file (ADR 0080) and a TLS port such as 6514. Attesting "
-                "the hop ([logging].forward_hop_attested) clears this check only; a PHI instance "
-                "under enforce still refuses to start without verified TLS to a separate collector "
-                "(BACKLOG #1966).",
-                file=sys.stderr,
-            )
-            return 2
-        if _forward_hop is HopDisposition.WARN:
-            # Crossed, but never silent — the point of the fix. WARNING surfaces via the root
-            # lastResort handler even though configure_logging has not run yet.
-            logging.getLogger(__name__).warning(
-                "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
-                "evidence stream crosses the network unprotected on a PHI instance. Set "
-                "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
-                "(ADR 0080) to a collector on another host.",
-                settings.logging.forward_host,
-                settings.logging.forward_port,
-                _forward_why,
-            )
-    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
-    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
-    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
-    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
-    # and local host state: it sends no packet and resolves no name, so a collector that is down
-    # cannot hold a clinical message path from starting through this gate. It keys on forwarding,
-    # not on the spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not
-    # this gate. Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start
-    # opens no spool and contacts no collector.
-    #
-    # Vault BACKLOG #2375: the gate's own-host check FAILS OPEN and logs a WARNING when it does,
-    # which ADR 0200 Amendment A calls the record of that pass. Logged here it would reach bare
-    # stderr only, since configure_logging has not run. So the gate hands the notes back as text
-    # and each is written TWICE, as the #1989 static-credential lines are: to stderr now, and to
-    # the configured handlers below.
-    from messagefoundry.config.settings import forwarding_gate_check
-
-    _forwarding_gap, _gate_notes = forwarding_gate_check(settings.logging)
-    for _gate_note in _gate_notes:
-        print(f"warning: {scrub_control_chars(_gate_note)}", file=sys.stderr)
-    if _forwarding_gap is not None:
-        _forwarding_fix = (
-            "Set [logging].forward_host to a collector on another host, "
-            "[logging].forward_protocol='tls', [logging].forward_port to its TLS syslog port "
-            "(6514 by convention; the default 514 is the plaintext port), "
-            "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
-            "from that CA (an enforcing instance also refuses verified TLS with no revocation "
-            "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
-            "separate system."
-        )
-        if enforcing:
-            print(
-                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
-                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
-                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
-                file=sys.stderr,
-            )
-            return 2
-        print(
-            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
-            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
-            f"{_forwarding_fix}",
-            file=sys.stderr,
-        )
 
     # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
     # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
@@ -2460,71 +2677,29 @@ def _serve(args: argparse.Namespace) -> int:
         if settings.logging.file is not None
         else None
     )
-    try:
-        forwarder_live = configure_logging(
+    _logging_refused = _start_logging(
+        settings,
+        env_name=env_name,
+        enforcing=enforcing,
+        spool_dir=_forward_spool_dir(settings, getattr(args, "shard", None)),
+        configure=lambda forward: configure_logging(
             settings.logging.level,
             fmt=settings.logging.format.value,
-            forward=log_forward,
+            forward=forward,
             log_file=_log_file,
             stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
-        )
-    except OSError as exc:
-        # FAIL CLOSED at configuration time: the operator named an application-log path this process
-        # cannot open. Starting anyway is precisely the silent blindness #122 exists to end, so refuse
-        # — and say so on stderr, since the log we would normally warn on is the thing that failed.
-        print(
-            f"error: [logging].file ({settings.logging.file!r}) cannot be opened for writing: {exc}. "
-            "The engine refuses to start rather than run unable to log (BACKLOG #122, ADR 0162); fix "
-            "the path/permissions, or unset [logging].file to run stdout-only.",
-            file=sys.stderr,
-        )
-        return 2
-    except InsecureHopRefused as exc:
-        # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
-        # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
-        # as a clean exit 2 rather than a traceback, matching the #200 forward-hop refusal above.
-        #
-        # stderr because that is where every other serve-gate refusal goes and it is unfiltered by the
-        # log level and the PHI/credential filters. NOT because no handler exists: by the time this
-        # raises, configure_logging HAS installed the stdout and file handlers and published the write
-        # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
-        # which would have misled anyone reasoning about the guard's WARN arm at the same site.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except KeyWrapRefused as exc:
-        # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
-        # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
-        # the text names the setting and the fix, never the key.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    if forwarder_live and log_forward is not None:
-        # Only announce forwarding when configure_logging actually installed the handler. With the
-        # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
-        # deferred and installed. A permanent failure (bad certificate, unresolvable name) is skipped
-        # at ERROR either way (BACKLOG #1966). This line must not contradict any of those.
-        logging.getLogger(__name__).info(
-            "off-box log forwarding enabled -> %s:%d (%s, %s)",
-            log_forward.host,
-            log_forward.port,
-            log_forward.protocol,
-            log_forward.fmt,
-        )
+        ),
+    )
+    if _logging_refused is not None:
+        return _logging_refused
 
     # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
     # the gate ran above and logged again here, so they reach the handlers and forwarder
     # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
-    if sc_outcome is not None:
-        for line in sc_outcome.audit:
-            _credlog.warning("%s", line)
-        if sc_outcome.refusal is not None:
-            _credlog.warning("%s", sc_outcome.refusal)
-    # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged here for the same reason,
-    # at WARNING and the ordinary way, so [logging].level applies to them as it does to those.
-    for _gate_note in _gate_notes:
-        _credlog.warning("%s", _gate_note)
+    _log_static_credential_outcome(sc_outcome)
     # Vault BACKLOG #2600: the unread-variable warnings load_settings logged before logging was
     # configured, so to bare stderr only. Logged again here, under the settings logger they came
-    # from, for the same reason.
+    # from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
     from messagefoundry.config.settings import unread_env_warnings
 
     for _env_line in unread_env_warnings(settings):
@@ -4482,12 +4657,17 @@ def _supervise(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.supervisor import supervise
 
+    # Stdout first, so nothing below runs with no handler. Once the settings are read and the
+    # gates ahead of it have passed, `_start_logging` installs the handlers again, with the off-box
+    # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
     # The supervisor has no API and builds no loosening list, so its own reading is reported here.
     # Each shard reports its own through `serve`.
+    security_lines: list[tuple[str, str]] = []
     remote_debug = remote_debug_loosening(remote_debug_posture())
     if remote_debug is not None:
+        security_lines.append(remote_debug)
         logging.getLogger(__name__).warning(
             "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
         )
@@ -4511,7 +4691,12 @@ def _supervise(args: argparse.Namespace) -> int:
     # anchor_under_root(None, ...) returns None (config/anchor.py), so this is safe when unset; each child
     # re-anchors the raw --service-config to the same path under the forwarded --project-root.
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
-    settings, detail = _load_service_settings(service_config)
+    # `--env` goes into the settings as `serve` puts it (BACKLOG #2356), so one validated value
+    # names the environment for every gate below, and a name `serve` refuses at load is refused
+    # here. Each engine shard is still started with the flag itself.
+    settings, detail = _load_service_settings(
+        service_config, cli={"ai": {"environment": args.env}} if args.env is not None else None
+    )
     if settings is None:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
@@ -4525,6 +4710,20 @@ def _supervise(args: argparse.Namespace) -> int:
     # The same again for the client-certificate shim, when the settings ask each shard for one.
     if not _client_cert_shim_or_refusal(settings, *floor, "start the fleet")[0]:
         return 2
+
+    # BACKLOG #2356: the two checks `serve` makes next, in its order. The SQL Server driver, then
+    # the environment gate (ADR 0017): a name, and a production tier for it. Every engine shard
+    # would refuse on each, so the fleet is refused here in serve's words instead of being
+    # spawned.
+    if _sqlserver_extra_refused(settings):
+        return 2
+    environment = _environment_or_refusal(
+        settings,
+        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
+    )
+    if environment is None:
+        return 2
+    env_name, production = environment
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
@@ -4546,9 +4745,21 @@ def _supervise(args: argparse.Namespace) -> int:
         )
         return 2
     for startup_entry in startup_loosenings(startup):
+        security_lines.append(startup_entry)
         logging.getLogger(__name__).warning(
             "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
         )
+
+    # BACKLOG #2356: the two credential gates `serve` makes next, in its order. The
+    # managed-identity gate, because the renewal below
+    # opens the store with the credential it judges. Then the settings half of the
+    # static-credential gate: its `settings:logging.forward` hop is the collector this process
+    # forwards to, and the half reads settings only, so every engine shard reaches this verdict.
+    if _managed_identity_refused(settings, enforcing=enforcing):
+        return 2
+    sc_outcome, sc_refused = _static_credential_settings_gate(settings, enforcing=enforcing)
+    if sc_refused:
+        return 2
 
     # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the
     # renewal below. Renewing first and then refusing to audit it would replace the pair with no
@@ -4582,6 +4793,50 @@ def _supervise(args: argparse.Namespace) -> int:
 
     if not _store_key_file_gate(settings, enforcing=enforcing):
         return 2
+
+    # BACKLOG #2356: the supervisor forwards its own log lines off-box, as each engine shard does.
+    # Before this it logged to stdout only, so an engine shard crash loop left no copy off the
+    # host. It passes the forwarding gates `serve` passes, in the same helper, and refuses the
+    # fleet on the same refusals: every engine shard would refuse on them too. A refusal printed
+    # to stderr here is still not forwarded; only log records are. Placed after the gates above,
+    # as in `serve`, and before the renewal below, so a refused start changes nothing on disk.
+    # The logging call is the bare one at the top plus the forwarder. `--env` is what each engine
+    # shard is started with, so it names the environment here as well.
+    #
+    # Last before it, the posture steps `serve` takes there: the open-egress gate, the AUDIT line
+    # for the `block_unlisted_outbound` opt-out, and the production DEBUG refusal. The engine
+    # shards read `[logging].level` from the same settings, so each would refuse on it.
+    if _forwarder_posture_refused(
+        settings, production=production, env_name=env_name, enforcing=enforcing
+    ):
+        return 2
+    forwarder_installed = False
+
+    def configure_with_forwarder(forward: SyslogForward | None) -> bool:
+        nonlocal forwarder_installed
+        forwarder_installed = configure_logging("INFO", forward=forward)
+        return forwarder_installed
+
+    logging_refused = _start_logging(
+        settings,
+        env_name=env_name,
+        enforcing=enforcing,
+        spool_dir=_supervisor_forward_spool_dir(settings, db_base),
+        configure=configure_with_forwarder,
+    )
+    if logging_refused is not None:
+        return logging_refused
+    _log_static_credential_outcome(sc_outcome)
+    if forwarder_installed:
+        # The readings above were logged before a forwarder existed. Log them once more so the
+        # off-box copy has them. With no forwarder installed this writes nothing.
+        for security_line in security_lines:
+            logging.getLogger(__name__).warning(
+                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
+                "forwarder.)",
+                *security_line,
+            )
+
     try:
         state_dir = _renew_api_tls_before_spawning(settings, db_base)
     except KeylessAuditChainRefused as exc:  # #1916: a named key the provider did not resolve
@@ -4606,8 +4861,7 @@ def _supervise(args: argparse.Namespace) -> int:
             registry,
             acknowledged=settings.retention.allow_unbounded_phi,
             enforcing=enforcing,
-            # The engine shards take --env; the settings loaded here do not carry it.
-            env_name=args.env if args.env is not None else settings.ai.environment,
+            env_name=env_name,
         )
         if verdict.refusal is not None:
             raise WiringError(

@@ -68,7 +68,7 @@ engine's own update check makes no network call: `[update_check].mode` accepts o
 | Active Directory over LDAP | One target, `[auth].ad_server` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Store database on SQL Server or PostgreSQL | One target, `[store].server`. The default SQLite store is a local file | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | HashiCorp Vault, for the store key or for Connection secrets | One target each: `MEFOR_STORE_VAULT_ADDR` and `MEFOR_SECRETS_VAULT_ADDR`. With one unset, the Vault client falls back to its own `VAULT_ADDR` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer`. The syslog collector is also limited by `[egress].allowed_syslog` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Startup TLS-floor probe, behind a declared TLS terminator under `enforce` | One target, `[security].web_console_public_address` | `probe_tls_floor` in `messagefoundry/config/tls_probe.py` |
 | Backup to a network share | `[backup].destination` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 
