@@ -6018,6 +6018,16 @@ _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 _CLOUD_DEST_SCHEMES = ("s3://", "gs://", "gcs://", "azure://", "http://", "https://", "ftp://")
 
 
+def _cloud_scheme(value: str) -> str | None:
+    """The :data:`_CLOUD_DEST_SCHEMES` entry ``value`` starts with, or ``None``.
+
+    A refusal quotes this and never the URL. A URL can carry a credential (``https://user:pw@``,
+    a signed query), and :func:`settings_error_detail` prints a validator's message as written:
+    to stderr, a service log, and since vault BACKLOG #2600 ``security show``'s JSON."""
+    low = value.strip().lower()
+    return next((scheme for scheme in _CLOUD_DEST_SCHEMES if low.startswith(scheme)), None)
+
+
 class BackupSettings(_Section):
     """``[backup]`` — engine-managed scheduled + on-demand DR backup of the config bundle + the SQLite
     store, written as one AES-256-GCM ``.mfbak`` archive to a local/UNC destination (ADR 0049, #60).
@@ -6101,10 +6111,10 @@ class BackupSettings(_Section):
     def _no_cloud_destination(cls, value: str) -> str:
         # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a cloud-URL destination
         # at config load rather than silently treating it as a (bogus) local path at 02:00.
-        low = value.strip().lower()
-        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+        scheme = _cloud_scheme(value)
+        if scheme is not None:
             raise ValueError(
-                f"[backup].destination must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[backup].destination must be a LOCAL or UNC path, not a cloud URL ({scheme}...); "
                 "MessageFoundry DR backups have no cloud target (ADR 0049 — no new egress)"
             )
         return value
@@ -6222,10 +6232,10 @@ class DrSettings(_Section):
     @field_validator("seed_archive", "seed_dir")
     @classmethod
     def _no_cloud_seed(cls, value: str, info: ValidationInfo) -> str:
-        low = value.strip().lower()
-        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+        scheme = _cloud_scheme(value)
+        if scheme is not None:
             raise ValueError(
-                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[dr].{info.field_name} must be a LOCAL or UNC path, not a cloud URL ({scheme}...); "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
         return value
@@ -6247,10 +6257,10 @@ class DrSettings(_Section):
     def _no_cloud_restore_token(cls, value: str) -> str:
         # The restore-token is a DBA-placed local artifact on the DR box (BACKLOG #223, ADR 0102); like
         # seed_archive it is LOCAL/UNC only — a cloud URL would imply new egress, which DR forbids.
-        low = value.strip().lower()
-        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+        scheme = _cloud_scheme(value)
+        if scheme is not None:
             raise ValueError(
-                f"[dr].restore_token must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                f"[dr].restore_token must be a LOCAL or UNC path, not a cloud URL ({scheme}...); "
                 "the DR restore-token is a local artifact on the DR box (ADR 0102 — no new egress)"
             )
         return value
@@ -7248,9 +7258,15 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     notes: list[str] = []
     for name, rest in _unspared_env_names(environ, referenced):
         if rest in models:
+            # Say how to set one, so the obvious fix is not a name the refusal then stops.
+            how = (
+                f"a setting in it is {_ENV_PREFIX}{rest.upper()}_<KEY>"
+                if rest in _SECTIONS
+                else "that section has no environment layer; set it in the file"
+            )
             notes.append(
                 f"{_printable(name)} names the [{rest}] section and no setting in it, so "
-                "nothing reads it"
+                f"nothing reads it ({how})"
             )
             continue
         tokens = rest.split("_")
@@ -7263,8 +7279,13 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
             if not near:
                 continue
             meant = f"{_ENV_PREFIX}{near[0].upper()}_{key.upper()}"
-            is_field = key in models[near[0]].model_fields
-            if near[0] in _SECTIONS and (is_field or meant in _OUT_OF_BAND_ENV):
+            field = models[near[0]].model_fields.get(key)
+            is_field = field is not None
+            # A sub-table (``[cluster].vip``) is a field the environment cannot set: the env layer
+            # hands it a string. :func:`_near_env_name` withholds such a hint for the same reason.
+            annotation = field.annotation if field is not None else None
+            is_table = isinstance(annotation, type) and issubclass(annotation, _Section)
+            if near[0] in _SECTIONS and ((is_field and not is_table) or meant in _OUT_OF_BAND_ENV):
                 hint = f"{meant}?"
             elif near[0] not in _SECTIONS and is_field:
                 hint = (
@@ -7278,6 +7299,30 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
             )
             break
     return notes
+
+
+def _unread_env_lines(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
+    """:func:`_unread_env_notes` as the WARNING lines :func:`load_settings` logs."""
+    return [
+        f"environment variable {note}. It is NOT applied."
+        for note in _unread_env_notes(environ, data)
+    ]
+
+
+def unread_env_warnings(
+    settings: ServiceSettings, environ: Mapping[str, str] | None = None
+) -> list[str]:
+    """The unread-variable WARNING lines :func:`load_settings` logged for ``settings``, again.
+
+    For ``serve``: it loads its settings before ``configure_logging`` runs, so those lines reached
+    bare stderr only, never the log file or the off-box forwarder. It logs these once logging is
+    configured, as it does the other pre-logging warnings (BACKLOG #1989). The secret-reference
+    spare is read from ``settings``, which holds what ``data`` held at load."""
+    environ = os.environ if environ is None else environ
+    data: dict[str, dict[str, Any]] = {"secrets": {"provider": settings.secrets.provider}}
+    for section, key in _SECRET_REFERENCE_KEYS:
+        data.setdefault(section, {})[key] = getattr(getattr(settings, section), key)
+    return _unread_env_lines(environ, data)
 
 
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
@@ -9132,10 +9177,11 @@ def settings_error_detail(exc: Exception) -> str:
     reads the environment.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
-    refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``
-    cloud-URL refusals and the ``[api].trusted_proxies`` entry refusals do. None of them is meant to
-    hold a secret, but a URL can carry one, so a validator message must name the setting and never
-    quote a secret value. The OIDC URL refusals quote no part of the URL for that reason.
+    refused still shows it, here and in ``str(exc)``: at least the ``[api].trusted_proxies`` entry
+    refusals do, and several path and enum refusals. A URL can carry a credential, so a validator
+    message must name the setting and never quote a secret value. The OIDC URL refusals quote no
+    part of the URL for that reason, and since vault BACKLOG #2600 the ``[backup]`` and ``[dr]``
+    cloud-URL refusals quote only the scheme (:func:`_cloud_scheme`).
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
     is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
@@ -9196,6 +9242,13 @@ def load_settings(
     # ADR 0118: the [security] section is the canonical home for the posture switches. Reject the legacy
     # keys in their old sections (file+env), then desugar [security] into the internal fields it replaces
     # — BEFORE the CLI merge, so a --host/--db override still wins over a [security] value.
+    #
+    # First, what the env refusal below lets through and still looks like a setting nothing will
+    # read (vault BACKLOG #2600): a warning, because the engine cannot know every MEFOR_* name
+    # another tool owns. Names only, no value. Logged before every refusal here, so a refused key
+    # does not hide a mistyped variable until the next start.
+    for line in _unread_env_lines(environ, data):
+        _log.warning("%s", line)
     _reject_relocated_keys(data)
     # After _reject_relocated_keys so a MOVED key keeps its specific "moved to [security].X" message, and
     # over `file_data` rather than `data` so it never sees a key the env overlay or the desugar wrote.
@@ -9205,12 +9258,6 @@ def load_settings(
     # typo that causes a validation error is named. Over `environ` itself, so it reports the
     # variable as the operator spelled it; `data` is read for what the settings name.
     _reject_unknown_env_keys(environ, data)
-    # What that refusal lets through and still looks like a setting nothing will read: a warning,
-    # because the engine cannot know every MEFOR_* name another tool owns. Names only, no value.
-    for note in _unread_env_notes(environ, data):
-        _log.warning(
-            "environment variable %s. It is NOT applied; fix its spelling or unset it.", note
-        )
     _desugar_security(data)
 
     if cli:

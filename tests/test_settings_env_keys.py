@@ -160,8 +160,14 @@ def test_a_name_that_names_no_modelled_section_is_not_refused(name: str) -> None
         ("MEFOR_SECRET_PROVIDER", "did you mean MEFOR_SECRETS_PROVIDER?"),
         ("MEFOR_STOER_VAULT_ADDR", "did you mean MEFOR_STORE_VAULT_ADDR?"),  # a spared name
         ("MEFOR_CERT_MONITR_WARN_DAYS", "[cert_monitor].warn_days"),  # a file-only section
-        ("MEFOR_STORE", "names the [store] section and no setting"),
-        ("MEFOR_UPDATE_CHECK", "names the [update_check] section and no setting"),
+        (
+            "MEFOR_STORE",
+            "no setting in it, so nothing reads it (a setting in it is MEFOR_STORE_<KEY>)",
+        ),
+        (
+            "MEFOR_UPDATE_CHECK",
+            "[update_check] section and no setting in it, so nothing reads it (that section has no environment layer",
+        ),
     ],
 )
 def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hint: str) -> None:
@@ -183,6 +189,9 @@ def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hin
         "MEFOR_CERTIFICATE_PATH",  # close to no section
         "MEFOR_STOER_PATHH",  # a typo in BOTH parts: still dropped with no message
         "MEFOR_STOER_ZZZZ",  # near a section, and the key is no setting of it
+        # Near [cluster], and vip is a sub-table there. MEFOR_CLUSTER_VIP would fail validation,
+        # so it is not offered.
+        "MEFOR_CLUSTR_VIP",
         "MEFOR_PORT",  # what a Kubernetes Service named "mefor" injects
         "MEFOR_PORT_8765_TCP_ADDR",
         # The test suite's own switches (tests/conftest.py and ci.yml). TEST_FORCE is close to
@@ -220,6 +229,45 @@ def test_a_clean_environment_logs_no_such_warning(caplog: pytest.LogCaptureFixtu
     with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
         _load({"MEFOR_STORE_PATH": "ok.db", "MEFOR_ALLOW_INSECURE_TLS": "1"})
     assert not [r for r in caplog.records if "NOT applied" in r.getMessage()]
+
+
+def test_a_sub_table_is_not_offered_but_a_scalar_beside_it_is() -> None:
+    """``[cluster].vip`` is a sub-table, so ``MEFOR_CLUSTER_VIP`` would fail validation. The
+    control: a scalar of the same section is offered."""
+    assert _unread_env_notes({"MEFOR_CLUSTR_VIP": "true"}, {}) == []
+    (note,) = _unread_env_notes({"MEFOR_CLUSTR_ENABLED": "true"}, {})
+    assert "did you mean MEFOR_CLUSTER_ENABLED?" in note
+
+
+def test_a_refusal_does_not_hide_the_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """The warnings are logged before any refusal, so one refused variable does not hide a
+    mistyped one until the next start."""
+    environ = {"MEFOR_STORE_REQUIRE_ENCRYPTON": "true", "MEFOR_STOER_PATH": _SENTINEL}
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.config.settings"),
+        pytest.raises(ValueError, match="MEFOR_STORE_REQUIRE_ENCRYPTON"),
+    ):
+        load_settings(environ=environ, default_file=False)
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "MEFOR_STOER_PATH" in text and "NOT applied" in text
+
+
+def test_serve_can_log_the_warnings_again_once_logging_is_configured() -> None:
+    """``serve`` loads before ``configure_logging``, so it logs these again afterwards from the
+    loaded settings. They match what the load logged, the secret-reference spare included."""
+    environ = {
+        "MEFOR_STOER_PATH": _SENTINEL,
+        "MEFOR_SECRETS_PROVIDER": "env",
+        "MEFOR_ALERTS_EMAIL_PASSWORD_SECRET": "MEFOR_AUHT_LOCKOUT_MINUTES",
+        "MEFOR_AUHT_LOCKOUT_MINUTES": _SENTINEL,
+    }
+    loaded = load_settings(environ=environ, default_file=False)
+    lines = settings_module.unread_env_warnings(loaded, environ)
+    assert lines == settings_module._unread_env_lines(
+        environ, settings_module._env_overrides(environ)
+    )
+    assert len(lines) == 1 and "MEFOR_STOER_PATH" in lines[0]
+    assert _SENTINEL not in lines[0]
 
 
 def test_a_secret_reference_variable_is_not_warned_about() -> None:
@@ -480,9 +528,11 @@ _SETTINGS_MODULE = "messagefoundry/config/settings.py"
 
 @functools.cache
 def _spelled_names(tree: str) -> dict[str, frozenset[str]]:
-    """Every string constant under ``tree`` that is, whole, a ``MEFOR_*`` name -> the files."""
+    """Every string constant under ``tree``, a directory or one file, that is, whole, a
+    ``MEFOR_*`` name -> the files."""
     found: dict[str, set[str]] = {}
-    for path in sorted((_REPO / tree).rglob("*.py")):
+    root = _REPO / tree
+    for path in [root] if root.is_file() else sorted(root.rglob("*.py")):
         if ".venv" in path.parts or "node_modules" in path.parts:
             continue
         try:
@@ -541,10 +591,15 @@ def test_no_name_the_project_spells_draws_the_unread_setting_warning() -> None:
     """The warning guesses. A name the engine, a harness, a script or a shipped deployment file
     really uses must never draw it, or a correct environment would log that a variable in use is
     not applied. The last line is the control that the same call does fire."""
-    spelled = {name for tree in _CODE_TREES for name in _spelled_names(tree)}
+    # tests/conftest.py too: the suite's own switches are set in a real environment. The rest of
+    # tests/ spells mistyped names on purpose, so it is not scanned.
+    spelled = {
+        name for tree in (*_CODE_TREES, "tests/conftest.py") for name in _spelled_names(tree)
+    }
     spelled |= set(_deployment_names())
     assert len(spelled) >= 100
     assert "MEFOR_CONNSCALE_COUNT" in spelled and "MEFOR_ALLOW_INSECURE_TLS" in spelled
+    assert "MEFOR_TEST_FORCE_AAD_BIND" in spelled
     noted = {name: _unread_env_notes({name: "x"}, {}) for name in sorted(spelled)}
     assert {name: notes for name, notes in noted.items() if notes} == {}
     assert _unread_env_notes({"MEFOR_STOER_PATH": "x"}, {})

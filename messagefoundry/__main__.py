@@ -50,7 +50,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import sqlite3  # noqa: E402  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys  # noqa: E402
-import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
+import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name)
 from collections.abc import Awaitable, Callable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
@@ -2522,6 +2522,13 @@ def _serve(args: argparse.Namespace) -> int:
     # at WARNING and the ordinary way, so [logging].level applies to them as it does to those.
     for _gate_note in _gate_notes:
         _credlog.warning("%s", _gate_note)
+    # Vault BACKLOG #2600: the unread-variable warnings load_settings logged before logging was
+    # configured, so to bare stderr only. Logged again here, under the settings logger they came
+    # from, for the same reason.
+    from messagefoundry.config.settings import unread_env_warnings
+
+    for _env_line in unread_env_warnings(settings):
+        logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
@@ -9631,9 +9638,10 @@ def _security(args: argparse.Namespace) -> int:
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
-    # None unless the file exists and will not load. Then: WHY, rendered (vault BACKLOG #2600). A
-    # stray MEFOR_<SECTION>_<KEY> variable in this shell refuses the load, and a bare `true` sent
-    # the reader to a file that was fine.
+    # None unless the file exists and will not load. Then: WHY (vault BACKLOG #2600). A stray
+    # MEFOR_<SECTION>_<KEY> variable in this shell refuses the load, and a bare `true` sent the
+    # reader to a file that was fine. Rendered by settings_error_detail, which hides the refused
+    # input but prints each validator's message; its docstring says which messages quote a value.
     _loosenings_partial_reason: str | None = None
     _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
     # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
@@ -9653,8 +9661,7 @@ def _security(args: argparse.Namespace) -> int:
         # and `security show` is expected to work offline before any config exists. Only a file that
         # exists and will not resolve is partial.
         # The shared load: its catch is the specific ways a settings file fails to resolve, and
-        # anything else is a programming error that surfaces. It renders the failure rather than
-        # stringifying it, so no configured value is echoed.
+        # anything else is a programming error that surfaces.
         _full, _loosenings_partial_reason = _load_service_settings(path)
         if _full is not None:
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
