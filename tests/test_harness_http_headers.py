@@ -21,6 +21,7 @@ reporting presence.
 from __future__ import annotations
 
 import http.client
+import platform
 import socket
 from typing import Any
 
@@ -160,9 +161,14 @@ _CASES: list[Any] = [
     pytest.param(200, b"POST /x\r\n", [400], id="http-0.9-two-word-not-get"),
 ]
 
-#: The cases above that the stdlib would answer with no header block at all, by id.
+#: The cases above that SOME stdlib answers with no header block at all, by id, each with the
+#: statuses the sink must answer it with. Which of them a given Python answers bare is observed by
+#: the control below, never assumed: CPython 3.14.6 answers all seven bare, and 3.14.8 clears
+#: request_version before the errors it sends from parse_request, so it answers four of them (the
+#: bad version, the 505, the one-word line and the two-word line that is not a GET) with a status
+#: line of its own.
 _BARE_UNDER_THE_STDLIB = [
-    pytest.param(case.values[1], id=case.id)
+    pytest.param(case.values[1], case.values[2], id=case.id)
     for case in _CASES
     if case.id in ("stdlib-400-malformed", "stdlib-505-version") or case.id.startswith("http-0.9-")
 ]
@@ -199,26 +205,51 @@ def test_the_probe_sees_absence_when_the_choke_point_is_removed(
         _assert_floored(raw, statuses)
 
 
-@pytest.mark.parametrize("request_bytes", _BARE_UNDER_THE_STDLIB)
-def test_the_stdlib_alone_answers_these_bare(
-    request_bytes: bytes, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("request_bytes", "statuses"), _BARE_UNDER_THE_STDLIB)
+def test_the_request_version_override_is_what_gives_a_bare_answer_its_headers(
+    request_bytes: bytes, statuses: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the HTTP/0.9 half. With the sink's request_version override removed, the
-    stdlib answers each of these with no status line, so no header block exists to carry
-    anything. With it, each is a floored answer (the cases above)."""
+    """The control for the HTTP/0.9 half, and it OBSERVES what this Python's stdlib does.
+
+    The sink's answer is asserted first, on every Python: the baseline, each header once. Then the
+    same request goes to a sink whose request_version override is removed. Where the stdlib then
+    answers with no header block, that is the control: the override is what made the difference.
+    Where this Python's stdlib writes a status line itself, there is nothing bare to control for.
+    That half is skipped and says so, after checking the answer is floored and nothing is doubled."""
+    _assert_floored(_answer(monkeypatch, request_bytes), statuses)
+
     _without(monkeypatch, "request_version")
     raw = _answer(monkeypatch, request_bytes)
     assert raw, "the sink wrote nothing, so this says nothing about its form"
-    assert _blocks(raw) == [], raw[:80]
+    if _blocks(raw):
+        _assert_floored(raw, statuses)  # end_headers alone covers it here, exactly once
+        pytest.skip(
+            f"Python {platform.python_version()}: the stdlib answers this with a status line of "
+            "its own, so there is no bare answer for the request_version override to repair. "
+            "The sink's headers were asserted above."
+        )
 
 
 def test_the_bare_control_covers_seven_cases() -> None:
     assert len(_BARE_UNDER_THE_STDLIB) == 7, [case.id for case in _BARE_UNDER_THE_STDLIB]
 
 
-@pytest.mark.parametrize("request_bytes", _BARE_UNDER_THE_STDLIB)
+def test_the_stdlib_still_answers_an_http_0_9_request_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """So the control above cannot skip its way to nothing: a well-formed HTTP/0.9 GET is answered
+    bare by every stdlib read so far (3.14.6 by running it, 3.14.8 by its source), and the
+    override is what floors it. If this fails, the stdlib stopped answering in HTTP/0.9 form at
+    all, and the override can go."""
+    request_bytes = b"GET /x\r\n"
+    _assert_floored(_answer(monkeypatch, request_bytes), [200])
+    _without(monkeypatch, "request_version")
+    assert _blocks(_answer(monkeypatch, request_bytes)) == []
+
+
+@pytest.mark.parametrize(("request_bytes", "statuses"), _BARE_UNDER_THE_STDLIB)
 def test_an_answer_the_stdlib_would_write_bare_has_a_status_line(
-    request_bytes: bytes, monkeypatch: pytest.MonkeyPatch
+    request_bytes: bytes, statuses: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The status line names the handler's protocol_version, HTTP/1.1, whatever the request said."""
     assert _answer(monkeypatch, request_bytes).startswith(b"HTTP/1.1 ")
