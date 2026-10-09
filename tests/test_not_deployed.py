@@ -535,6 +535,42 @@ async def test_reload_cannot_resurrect_a_not_deployed_outbound(
         await runner.stop()
 
 
+async def test_a_refused_restart_leaves_a_not_deployed_outbound_for_the_reload_that_deploys_it(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A restart's stop half makes the lane's pause the operator's, and its start half refuses a
+    not-deployed lane. Red when the operator's pause stood: the reload that flips the flag built
+    the lane and left it paused, so its retained row never drained (vault BACKLOG #3263)."""
+    out = tmp_path / "egress"
+    out.mkdir()
+
+    def _reg(*, deployed: bool) -> Registry:
+        r = Registry()
+        r.add_outbound(_file_out("OB_OFF", out, deployed=deployed))
+        return r
+
+    runner = RegistryRunner(
+        _reg(deployed=False),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        await store.enqueue_message(channel_id="IB", raw=ADT, deliveries=[("OB_OFF", ADT)])
+        with pytest.raises(NotDeployedError):
+            await runner.restart_outbound("OB_OFF")
+        await runner.reload(_reg(deployed=True))
+        assert runner.outbound_running("OB_OFF")
+        for _ in range(500):
+            if list(out.iterdir()):
+                break
+            await asyncio.sleep(0.02)
+        assert [p.name for p in out.iterdir()] == ["MSG1.hl7"]
+    finally:
+        await runner.stop()
+
+
 async def test_reload_cannot_bind_a_not_deployed_inbound(store: MessageStore) -> None:
     port = _free_port()
 

@@ -746,7 +746,9 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         engine = cast(Engine, SimpleNamespace(registry_runner=runner))
         await _alert_control_action(engine, "restart_outbound", _OB_CA, default_target=False)
         await asyncio.sleep(0.3)
-        assert sink.buildup == []  # the control: a lane the halt holds is silent
+        # Not a control for the restart: a lane the halt holds is silent with or without it.
+        # It shows the page below is the build's, not the halt's.
+        assert sink.buildup == []
 
         guard.writable = True  # the disk is repaired
         await runner.reload()  # raised WiringError before
@@ -794,12 +796,52 @@ async def test_a_refused_restart_keeps_an_operator_stop_of_a_lane_a_log_halt_lef
         guard.writable = True  # the disk is repaired
         await runner.reload()
         assert _OB_FILE in runner._destinations  # the reload built it
+        # The halt has lifted, so what holds the lane below is the pause and not the halt.
+        assert not runner._delivery_halted
         await asyncio.sleep(0.3)
         assert not runner.outbound_running(_OB_FILE)
         assert not any((tmp_path / _OB_FILE).iterdir())
 
         await runner.start_outbound(_OB_FILE)  # the control: the operator's start delivers
         await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+    finally:
+        await runner.stop()
+
+
+async def test_a_restart_whose_build_fails_keeps_an_operator_stop(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator stops a lane a log halt kept from its first build, and its CA is refused.
+    Once the log is repaired an alert rule's restart builds it, and the build fails. Red when
+    that failure made the lane the engine's park: the reload after the CA was fixed resumed it,
+    undoing the stop, and its held row was claimed."""
+    ca, pin = _swapped_ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL, alert_sink=_LogPageSink()
+    )
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_CA, _ADT)])
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        await runner.stop_outbound(_OB_CA)  # the operator's stop
+
+        guard.writable = True  # the disk is repaired
+        engine = cast(Engine, SimpleNamespace(registry_runner=runner))
+        await _alert_control_action(engine, "restart_outbound", _OB_CA, default_target=False)
+        assert runner.outbound_dr_failed(_OB_CA)  # the restart's build ran and failed
+
+        ca.write_bytes(_block(b"partner-ca"))
+        await runner.reload()
+        assert _OB_CA in runner._destinations  # the reload built it
+        await asyncio.sleep(0.3)
+        assert not runner.outbound_running(_OB_CA)
+        assert await _ca_row(store, row_id) == ("pending", 0)
     finally:
         await runner.stop()
 

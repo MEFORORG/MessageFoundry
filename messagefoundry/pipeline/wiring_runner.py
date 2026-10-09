@@ -3130,8 +3130,9 @@ class RegistryRunner:
         it is still paused on the way out: the gate refused, the start raised (such as
         ``NotDeployedError``), or the call was cancelled. Otherwise the reload that builds or
         re-deploys it left it paused, and a held failed lane stopped paging. A lane the operator
-        had stopped stays theirs, so no reload undoes the stop (vault BACKLOG #3263). Only the
-        ``_gate_parked`` marker is put back: a calendar park the stop half drops is not.
+        had stopped stays theirs, even when the start half's build fails and parks it as the
+        engine's, so no reload undoes the stop (vault BACKLOG #3263). Only the ``_gate_parked``
+        marker is put back: a calendar park the stop half drops is not.
 
         Raises :class:`DrParkedError` for a lane the DR run-profile parks, before either half, so
         neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067)."""
@@ -3144,8 +3145,13 @@ class RegistryRunner:
                 if self._outbound_start_permitted(name):
                     await self._start_outbound_unsafe(name)
             finally:
-                if engine_parked and name in self._outbound_paused:
-                    self._gate_parked.add(name)
+                if name in self._outbound_paused:
+                    if engine_parked:
+                        self._gate_parked.add(name)
+                    else:
+                        # A failed build in the start half parks the lane as the engine's; the
+                        # operator's stop outranks that, as a refused start leaves it.
+                        self._gate_parked.discard(name)
 
     def _stop_outbound_unsafe(self, name: str) -> None:
         """stop_outbound body without the reload lock (callers hold it). Sync + returns fast: it flags
