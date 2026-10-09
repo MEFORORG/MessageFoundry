@@ -150,7 +150,8 @@ an assessor may count for them.
 
 **Text must pass two tests to count as documentation.** A reader can reach it without opening the
 source code. It also states the rule in words a reviewer can compare with the code. The two lists
-below settle the cases they name. At least these count:
+below settle the cases they name, except text that sits on both lists. The open list further down
+covers that case. At least these count:
 
 - a page under the project's `docs/`;
 - an ADR;
@@ -164,31 +165,35 @@ At least these do not count:
 - an error message, because a reader reaches it only by breaking the rule.
 
 **Which lines are the owner's own words.** The owner ruled on the docstring and the code comment in
-these words: *"No, neither counts"*. The help-text line is a reading that adversarial review reached,
-and the owner then built on it. The other lines are as the Manager seat that took the ruling
-recorded them.
+these words: *"No, neither counts"*. The first test, reach without opening the source code, is in
+the option the owner chose. The second test, words a reviewer can compare with the code, is this
+method's reading and not the owner's words. The help-text line is a reading that adversarial review
+reached, and the owner then built on it. The other lines are as the Manager seat that took the
+ruling recorded them.
 
 **Why documentation is read more widely than prose pages.** ASVS 5.0 allows it. Its front matter
 says a security decision may be written in a document that developers refer to. It also allows one
 *"documented and implemented in a common code library"*, where every developer must use that
 library. It treats both as meeting the aim. The passage is in `0x03-What-is-the-ASVS.md`, fetched at
-the pinned release tag `v5.0.0_release`, under the §2.1a rule for citing prose. Only the quoted words are verbatim, so read the passage
-before relying on the rest. The two tests above are this ruling's line, and the standard does not
-draw it. The line is narrower than the passage, which also accepts a decision kept in shared code.
+the pinned release tag `v5.0.0_release`, under the §2.1a rule for citing prose. Only the quoted
+words are verbatim, so read the passage before relying on the rest. The two tests above are this
+section's line, and the standard does not draw it. The line is narrower than the passage, which
+also accepts a decision kept in shared code.
 
 **What this ruling does not decide.** It leaves at least these alone:
 
-- It applies to requirements that ask what the documentation defines. It does not change what counts as
-  evidence that a control exists: code and tests remain evidence (§3).
+- It applies to requirements that ask what the documentation defines. It does not change what
+  counts as evidence that a control exists: code and tests remain evidence (§3).
 - It names which text may be counted. Rules 1 to 6 still grade the cell, and the ruling does not say
   which verdict follows when no text counts.
-- Some text is two things at once, such as a docstring that a command prints as its help. The
-  ruling does not address that case. Two assessors who disagree on it follow rule 6.
+- Some text is two things at once, such as a docstring that a command prints as its help. It sits
+  on both lists, and the ruling does not address that case. Until the owner rules, a lone assessor
+  follows §1.3 and takes the worse verdict. Two assessors who disagree follow rule 6.
 - Whether a page that counts is accurate is still the assessor's to check against the code.
 
 The ruling was given in session on 2026-10-08, after adversarial review. It is recorded on a pull
 request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in
-§1.1a, this document names no cell the ruling touches.
+§1.1a, this document records the rule and deliberately not a list of cells.
 
 ### 1.2 Worked examples — the ones that actually broke
 
@@ -485,11 +490,14 @@ At least these passes leave both stamps alone:
 
 - **A partial re-read keeps both stamps.** A partial re-read reads only what a change touched and
   carries the other grounds forward unread. It records its own date and engine commit inside its own
-  dated layer, which is the dated entry the pass adds to the cell's prose. The ruling lets it move
-  `reviewed_by` if it set or re-derived the verdict. A `reviewed_by` date can then be later than
-  `last_verified`, and that is not an error. It tells a reader that a partial re-read set the
-  verdict after the last full read.
+  dated layer, which is the dated entry the pass adds to the cell's prose.
 - **A pass that only repairs anchors or refreshes line numbers moves neither stamp.**
+
+**Which lines are the owner's own words.** The owner approved this statement of the rule: *"the
+stamps name the last full read of every ground the verdict rests on; a partial re-read keeps them
+and dates its own layer"*. The rest is the reading of the Manager seat that took the ruling, after
+adversarial review. That covers at least the definition of a full read and the line on a pass that
+only repairs anchors.
 
 **Why the stamps are held to the whole cell.** At least two things already treat them that way:
 
@@ -506,9 +514,8 @@ and the table prints the date in its own column either way.
 
 - Some grounds are a test result or a measurement. The ruling does not say how much of such a ground
   a full read must run again, and this method does not answer that yet.
-- §3 names the reviewer as the pass that last set or held the verdict. The ruling speaks of a partial
-  re-read that set or re-derived it. It does not address one that held the verdict without
-  re-deriving it.
+- The ruling says nothing about `reviewed_by`. Whether a partial re-read may move it is an open
+  owner question. Until the owner rules, the `reviewed_by` text in §3 stands as written.
 - It does not say what the stamps hold for a cell with no full read on record.
 
 **Tools written before this ruling may read the stamps differently.** The ruling governs what an
@@ -519,7 +526,7 @@ the tools into line is unfiled work.
 
 The ruling was given in session on 2026-10-08, after adversarial review. It is recorded on a pull
 request in the `MessageFoundry-vault` repository, and a rulings file there is pending. As in
-§1.1a, this document names no cell the ruling touches.
+§1.1a, this document records the rule and deliberately not a list of cells.
 
 ---
 
