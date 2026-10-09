@@ -355,12 +355,13 @@ async def test_a_passive_start_reads_the_other_lanes_when_one_does_not_resolve(
         await runner.stop()
 
 
-async def test_an_activation_on_a_shard_that_does_not_own_a_lane_fails_that_lane_only(
+async def test_an_activation_on_an_engine_shard_that_does_not_own_a_lane_fails_that_lane_only(
     store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every engine shard builds every lane at a start, so each one takes the start's checks at
-    an activation too (ADR 0073). Red when only the owning shard did: the shard that does not own
-    the lane sent it to the reload's CA pre-check, and one refused CA refused its whole takeover."""
+    an activation too (ADR 0073). Red when only the owning engine shard did: the engine shard that
+    does not own the lane sent it to the reload's CA pre-check, and one refused CA refused its
+    whole takeover."""
     ca, pin = _swapped_ca(tmp_path)
     runner = _runner(store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL)
     monkeypatch.setattr(runner, "_owns_destination", lambda name: name != _OB_CA)
@@ -596,6 +597,45 @@ async def test_a_lane_built_while_the_box_turns_passive_again_stays_parked(
         await runner.stop()
 
 
+async def test_a_reload_cancelled_in_a_first_build_leaves_the_lane_on_that_path(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The reload drops the lane's passive marker, then is cancelled while the build awaits. Red
+    when the lane was marked unbuilt only after the build: it then had neither mark, so the next
+    reload sent it to the CA pre-check and one refused CA refused that reload whole."""
+    ca, pin = _swapped_ca(tmp_path)
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    armed, building = asyncio.Event(), asyncio.Event()
+
+    async def held(direction: str, name: str, settings: Any) -> None:
+        if name == _OB_CA and armed.is_set():
+            building.set()
+            await asyncio.Event().wait()
+        await check(direction, name, settings)
+
+    runner = _runner(
+        store, _graph(tmp_path, ca, pin), lane_anchor_check=held, dr_standby=Priority.CRITICAL
+    )
+    await runner.start()
+    try:
+        row_id = await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_CA, _ADT)])
+        armed.set()
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        reload = asyncio.create_task(runner.reload())
+        await asyncio.wait_for(building.wait(), timeout=10)
+        reload.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reload
+        armed.clear()
+
+        await runner.reload()  # raised WiringError before
+        assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
+        await asyncio.sleep(0.3)
+        assert await _ca_row(store, row_id) == ("pending", 0)
+    finally:
+        await runner.stop()
+
+
 async def test_a_cancelled_first_build_closes_the_connector_it_built(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -688,6 +728,8 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
         assert runner.outbound_filtered(_OB_CA) is None
+        # Still shown: the passive start's record was dropped here once, and the lane read stopped.
+        assert _PASSIVE_REFUSED in (runner.outbound_failed(_OB_CA) or "")
 
         guard.writable = True  # the disk is repaired
         await runner.reload()  # raised WiringError before
@@ -696,6 +738,38 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         await asyncio.sleep(0.3)
         assert await _ca_row(store, row_id) == ("pending", 0)
         assert not runner.outbound_running(_OB_CA)
+    finally:
+        await runner.stop()
+
+
+async def test_the_calendar_starts_a_lane_a_log_halt_kept_unbuilt_once_the_halt_lifts(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt kept the lane from its first build, and nothing about it failed. Red when the
+    scheduler left every unbuilt lane alone: the window open passed it over, and it stayed down
+    with its rows held and no page until a reload or a start by hand."""
+    ca = _ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store,
+        _graph(tmp_path, ca, _sha(ca), ca_schedule=_ALWAYS),
+        dr_standby=Priority.CRITICAL,
+        alert_sink=_LogPageSink(),
+        schedule_clock=lambda: _NOON,
+    )
+    await runner.start()
+    try:
+        monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+        await runner._respond_to_log_sink_event(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        guard.writable = True  # the disk is repaired
+        await runner.start_outbound(_OB_FILE)  # the halt's recovery, which clears the latch
+
+        await runner._reconcile_schedule(_OB_CA, "outbound", _ALWAYS)  # a window-open tick
+        assert runner.outbound_running(_OB_CA) and _OB_CA in runner._destinations
     finally:
         await runner.stop()
 

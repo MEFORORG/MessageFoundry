@@ -3247,11 +3247,13 @@ class RegistryRunner:
         fault one of those finds fails that lane and the activation goes on. The reload's CA
         pre-check leaves it out (:meth:`_reload_anchor_candidates`), because a refusal there
         refuses the whole reload, which for an activation is the whole takeover. Every engine
-        shard takes this path, as every shard builds every lane at a start (ADR 0073).
+        shard takes this path, as every engine shard builds every lane at a start (ADR 0073).
 
         This does not isolate every outbound fault. The reload runs :meth:`build_check` first,
-        over every connector, and a fault it finds still refuses the activation: at least a CA
-        file that is missing or does not parse, and an ``env()`` value that does not resolve."""
+        over every connector, and a fault it finds still refuses the activation: at least a
+        connector that does not build, a CA file that is missing or does not parse, and an
+        ``env()`` value that does not resolve. So the fault the build step here can isolate is
+        one the build check does not reproduce."""
         return (
             (self._passive_parked(name) or name in self._dr_unbuilt)
             and not self._dr_passive
@@ -3817,7 +3819,7 @@ class RegistryRunner:
             or not self._auto_start_enabled(name, "outbound")
         ):
             return
-        if self._holds_anchor_failure(name) or name in self._dr_unbuilt:
+        if self._holds_anchor_failure(name) or self.outbound_dr_failed(name):
             log.info(
                 "schedule: outbound connection %r no longer has a schedule, but it failed to "
                 "start; start the connection once the cause is fixed",
@@ -3902,7 +3904,9 @@ class RegistryRunner:
         # An outbound whose build failed as it left the DR park is held for a reload or an
         # operator start, which build it first (vault BACKLOG #3263). A window open would only
         # read its CA again each tick. Neither branch has anything to do: the lane is not running.
-        if kind == "outbound" and name in self._dr_unbuilt:
+        # A lane a #122 halt kept unbuilt has not failed, and its window open builds it first
+        # (_start_outbound_unsafe), so the calendar still brings it back.
+        if kind == "outbound" and self.outbound_dr_failed(name):
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
@@ -6285,9 +6289,9 @@ class RegistryRunner:
                         # marker change below would leave it no record of that. The reload or
                         # the start that builds it then takes the isolated first build, and a
                         # start whose build fails holds it rather than resume it with no
-                        # connector. The passive start's record no longer describes this box.
+                        # connector. A failed record the passive start wrote stays, so the
+                        # lane still reads failed.
                         self._dr_unbuilt.add(name)
-                        self._failed.pop(("outbound", name), None)
                     self._dr_filters_out(name, oc.priority, kind="outbound")
                     continue
             if (
@@ -6316,6 +6320,10 @@ class RegistryRunner:
                     # alerted again (_ensure_destination_built).
                     self._filtered.pop(("outbound", name), None)
                     self._failed.pop(("outbound", name), None)
+                # Marked before the await, which a cancelled reload can end there: the passive
+                # marker is gone, and this mark sends the next reload down this path again. A
+                # build that succeeds drops it (_ensure_destination_built).
+                self._dr_unbuilt.add(name)
                 await self._ensure_destination_built(name)
                 if self._dr_passive:
                     # The box went passive while the build awaited: a failed activation hands
@@ -6328,10 +6336,9 @@ class RegistryRunner:
                 else:
                     # The build failed, and the lane stays parked with its rows held: it reads
                     # failed, and none of them is claimed with no connector, charged an attempt
-                    # or dead-lettered for a fault found at the takeover (ADR 0048). The marker
+                    # or dead-lettered for a fault found at the takeover (ADR 0048). Its mark
                     # keeps the scheduler and an alert rule's restart off it. The next reload,
                     # or an operator start, builds it again and resumes it once that succeeds.
-                    self._dr_unbuilt.add(name)
                     if name in self._schedule_parked:
                         # A closed window passed the park to the calendar above, and the
                         # calendar leaves this lane alone. The engine holds it, so it pages.

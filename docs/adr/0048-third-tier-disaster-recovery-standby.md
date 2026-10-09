@@ -354,28 +354,32 @@ in-flight rows stranded.
 > - *An outbound's `validate_startup`.* It is not free of side effects. For a File outbound it
 >   writes and removes a probe file in the delivery directory, under the alternate credential
 >   when one is set. For a RemoteFile outbound it lists the directory over a session to the
->   partner. Every other connector's is a no-op. The activation runs it.
+>   partner. At least those two have side effects. The activation runs it.
 >
-> **At an activation, three outbound faults fail one lane, and the activation goes on.** A lane
+> **At an activation, at least two outbound faults fail one lane, and the activation goes on.** A lane
 > the reload builds for the first time since the passive park takes the checks a start gives it,
 > isolated as [ADR 0031](0031-startup-connection-fault-isolation.md) isolates them: the lane CA
-> check (a pin, ACL or path refusal), the build, and `validate_startup`. The reload's CA
+> check (a pin, ACL or path refusal) and `validate_startup`. The build runs there too, but a
+> connector that does not build is first found by the reload's build check, which refuses the
+> whole activation, as the paragraph after next says. The reload's CA
 > pre-check used to read these lanes, and one refusal refused the whole takeover. The lane is
 > built before it is unparked, so no held row is claimed while it has no connector. Every engine
-> shard builds the lane this way, as every shard builds every lane at a start (ADR 0073).
+> shard builds the lane this way, as every engine shard builds every lane at a start (ADR 0073).
 >
 > **A lane that fails there stays parked and reads `failed`.** Its held rows stay queued: none is
 > charged an attempt or dead-lettered for a fault found at the takeover. Fix the fault, then
 > reload or start the connection. Each builds the lane again and resumes it only once the build
 > succeeds. A build that fails again leaves the lane parked, with its rows still held. The
 > scheduler and an alert rule's restart leave the lane alone, so neither reads its CA again on
-> every tick or every alert. It still pages: its buildup and stall checks run on the in-flight
+> every tick or every alert. It still pages: its buildup and stall checks, and its saturation
+> check where that is turned on, run on the in-flight
 > watch's clock, as ADR 0031's paging does for any failed lane. An operator stop makes the pause
 > the operator's, and then it is silent, as any paused lane is.
 >
 > **Other faults still refuse the whole activation.** The reload runs its build check over every
 > connector first. At least these refuse there: an outbound CA file that is missing or does not
-> parse, and an `env()` value that does not resolve. The start-time check above reports a
+> parse, a connector that does not build, and an `env()` value that does not resolve. The
+> start-time check above reports a
 > missing file and an unresolved value at boot. It builds nothing, so a file that is readable
 > and does not parse first shows at a reload or at the activation. An inbound is unchanged
 > too: a listener that cannot bind, or a poller whose CA is refused, aborts the activation, as
