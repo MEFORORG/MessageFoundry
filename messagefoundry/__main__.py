@@ -9622,6 +9622,7 @@ def _security(args: argparse.Namespace) -> int:
         StoreSettings,
         load_settings,
         security_loosenings,
+        settings_error_detail,
     )
 
     path = args.service_config
@@ -9633,6 +9634,7 @@ def _security(args: argparse.Namespace) -> int:
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
     _loosenings_partial = False
+    _loosenings_partial_reason: str | None = None
     _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
     # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
     # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
@@ -9658,12 +9660,17 @@ def _security(args: argparse.Namespace) -> int:
             _approvals = _full.approvals
             _cert_monitor = _full.cert_monitor
             _backup = _full.backup
-        except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
+        except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError) as exc:
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
             # bad env/section. Anything else is a programming error and must surface, not be degraded
             # into a boolean.
             _loosenings_partial = True
+            # WHY it is partial (vault BACKLOG #2600). A stray MEFOR_<SECTION>_<KEY> variable in
+            # this shell refuses the load, and a bare `true` sent the reader to a file that was
+            # fine. Rendered by settings_error_detail, as every other whole-file load failure is,
+            # so no configured value is echoed (its docstring says what it does and does not hide).
+            _loosenings_partial_reason = settings_error_detail(exc)
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
@@ -9720,6 +9727,8 @@ def _security(args: argparse.Namespace) -> int:
     #: that is the operator's shell, not the service.
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
+        # None unless the report is partial. Then: why the whole-file load failed.
+        "loosenings_partial_reason": _loosenings_partial_reason,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
             "[cert_monitor]/[backup]); the "

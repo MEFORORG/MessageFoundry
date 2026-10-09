@@ -282,6 +282,71 @@ def test_show_declares_a_partial_report_when_the_file_will_not_load(
     assert data["loosenings_partial"] is True
     # ...and it still prints a usable [security] view rather than failing the subcommand.
     assert data["values"]["require_mfa"] is True
+    # ...and it says WHY (vault BACKLOG #2600), naming the setting that refused.
+    assert "ad_session_recheck_seconds" in data["loosenings_partial_reason"]
+
+
+def test_show_gives_no_partial_reason_when_the_file_loads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the reason: a report that is not partial carries none."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    assert data["loosenings_partial_reason"] is None
+
+
+def test_show_names_the_stray_variable_that_made_the_report_partial(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mistyped ``MEFOR_<SECTION>_<KEY>`` in the shell refuses the whole-file load, so the report
+    falls back to shipped defaults. The marker alone sent the reader to a file that was fine. The
+    reason names the variable and never its value."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
+    monkeypatch.setenv("MEFOR_STORE_REQUIRE_ENCRYPTON", "SYNTHETIC-VALUE-9f3c")
+    out_data = _show(toml, capsys)
+    assert out_data["loosenings_partial"] is True
+    reason = out_data["loosenings_partial_reason"]
+    assert "MEFOR_STORE_REQUIRE_ENCRYPTON" in reason
+    assert "SYNTHETIC-VALUE-9f3c" not in json.dumps(out_data)
+
+
+def test_the_partial_reason_is_rendered_and_never_stringified(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``str`` of a pydantic failure can carry the refused input, an environment-supplied secret
+    among it (vault BACKLOG #2760). The reason goes through ``settings_error_detail``. The first
+    assertion is the control: the planted value IS in the raw text."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config import settings as settings_module
+
+    canary = "canary-canary-canary"
+    leaky = ValidationError.from_exception_data(
+        "ServiceSettings",
+        [
+            {
+                "type": "value_error",
+                "loc": ("store",),
+                "input": {"backend": "postgres", "password": canary},
+                "ctx": {"error": ValueError("postgres backend requires: server")},
+            }
+        ],
+    )
+    assert canary in str(leaky)
+
+    def refuse(*_args: object, **_kwargs: object) -> object:
+        raise leaky
+
+    monkeypatch.setattr(settings_module, "load_settings", refuse)
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
+    assert main(["security", "show", "--service-config", str(toml), "--json"]) == 0
+    printed = capsys.readouterr()
+    assert canary not in printed.out + printed.err
+    assert "store: " in json.loads(printed.out)["loosenings_partial_reason"]
 
 
 # --- operator JSON that nests past the decoder (BACKLOG #1855) --------------------------------

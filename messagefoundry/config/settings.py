@@ -7074,9 +7074,24 @@ _SECRET_REFERENCE_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Whether this platform's environment names ignore letter case. On Windows ``os.environ`` holds
+#: every name in upper case and ``os.environ.get`` finds one written in any case, so the ``env``
+#: secret provider resolves a reference spelled ``Mefor_Smtp_Password``. The spare for such a
+#: variable has to match the same way there, or it refuses a variable the provider would read.
+#: A module constant so a test on either platform can drive both arms.
+_ENV_NAMES_IGNORE_CASE = os.name == "nt"
+
+
+def _env_name_key(name: str) -> str:
+    """``name`` as the platform compares environment names: upper-cased on Windows, as written
+    elsewhere."""
+    return name.upper() if _ENV_NAMES_IGNORE_CASE else name
+
+
 def _env_secret_reference_names(data: Mapping[str, Any]) -> set[str]:
-    """The environment variables the settings in ``data`` name as secret references, or an empty
-    set unless ``[secrets].provider`` is exactly ``"env"``, the only provider that reads one."""
+    """The environment variables the settings in ``data`` name as secret references, each through
+    :func:`_env_name_key`, or an empty set unless ``[secrets].provider`` is exactly ``"env"``, the
+    only provider that reads one. Compare a variable's name to these through the same function."""
     secrets = data.get("secrets")
     if not isinstance(secrets, Mapping) or secrets.get("provider") != "env":
         return set()
@@ -7085,7 +7100,7 @@ def _env_secret_reference_names(data: Mapping[str, Any]) -> set[str]:
         values = data.get(section)
         value = values.get(key) if isinstance(values, Mapping) else None
         if isinstance(value, str):
-            names.add(value)
+            names.add(_env_name_key(value))
     return names
 
 
@@ -7149,7 +7164,9 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
       renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
       the replacement;
     * under ``[secrets].provider = "env"`` only, a variable that one of the
-      :data:`_SECRET_REFERENCE_KEYS` settings names as its value.
+      :data:`_SECRET_REFERENCE_KEYS` settings names as its value. The two names are compared as
+      the platform compares environment names (:func:`_env_name_key`): exactly, except on
+      Windows, where letter case is ignored.
 
     A relocated or removed key never reaches here: :func:`_reject_relocated_keys` runs first.
 
@@ -7159,7 +7176,11 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     referenced = _env_secret_reference_names(data)
     offenders: list[str] = []
     for name in sorted(environ):
-        if not name.startswith(_ENV_PREFIX) or name in _OUT_OF_BAND_ENV or name in referenced:
+        if (
+            not name.startswith(_ENV_PREFIX)
+            or name in _OUT_OF_BAND_ENV
+            or _env_name_key(name) in referenced
+        ):
             continue
         rest = name[len(_ENV_PREFIX) :].lower()
         unread = next((s for s in no_env_layer if rest.startswith(f"{s}_")), None)
@@ -7212,7 +7233,11 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     sections = sorted(models)
     notes: list[str] = []
     for name in sorted(environ):
-        if not name.startswith(_ENV_PREFIX) or name in _OUT_OF_BAND_ENV or name in referenced:
+        if (
+            not name.startswith(_ENV_PREFIX)
+            or name in _OUT_OF_BAND_ENV
+            or _env_name_key(name) in referenced
+        ):
             continue
         rest = name[len(_ENV_PREFIX) :].lower()
         if rest in models:

@@ -57,15 +57,32 @@
 > `[secrets].provider = "env"`, spelled exactly so, the value of a reference setting is the name
 > of an environment variable: at least `[auth].ad_bind_password_secret`,
 > `[auth].oidc_client_secret_ref`, `[auth].oidc_client_private_key_ref` and
-> `[alerts].email_password_secret`. The variable such a setting names loads, whatever it is
-> called. Under any other provider nothing is spared this way.
+> `[alerts].email_password_secret`. The variable such a setting names is spared from the
+> unknown-variable refusal and from the warning above. Three limits apply:
+>
+> - The spare covers that refusal only. A name that is a moved or removed key, an unknown
+>   `[security]` key or a renamed `[logging]` key is still refused by its own check. A name that
+>   is also a real setting is still applied as that setting. Pick a name that is none of these.
+> - The name must match the reference. Elsewhere than Windows that means letter for letter. On
+>   Windows, where environment names ignore letter case, the match ignores it too.
+> - Under any other provider nothing is spared this way.
 >
 > **The check reads the whole process environment.** A platform that injects variables can trip
-> it. Kubernetes service links are the known case: a Service named `mefor-auth` in the engine's
-> namespace gives the pod `MEFOR_AUTH_SERVICE_HOST`, and the load is refused. The Services in the
-> shipped manifests have names that start `mefor-engine`, and `engine` is not a section, so those
-> do not trip it. Name your own Services clear of the section names, or set
-> `enableServiceLinks: false` on the pod.
+> it. Kubernetes service links are the known case. For each Service with a cluster IP in the pod's namespace
+> the kubelet injects `<NAME>_SERVICE_HOST`, `<NAME>_SERVICE_PORT`, `<NAME>_PORT` and more, with the
+> Service name in upper case and each `-` turned into `_`. At least these Service names collide:
+>
+> - **`mefor`.** It gives the pod `MEFOR_SERVICE_HOST` and `MEFOR_SERVICE_PORT`. Those read as
+>   the `[service]` section, which has no env layer, so the load is refused.
+> - **`mefor-<section>`**, such as `mefor-auth`, `mefor-api` or `mefor-store`. It gives the pod
+>   `MEFOR_AUTH_SERVICE_HOST` and the like, which name a section and no setting, so the load is
+>   refused. Some injected names are real settings: `mefor-store` gives `MEFOR_STORE_PORT`, with
+>   a URL for a value, which the loader reads as `[store].port`.
+>
+> The shipped manifests under `docker/k8s/` set `enableServiceLinks: false` on the pod, so the
+> kubelet injects none of these. Their own Services have names that start `mefor-engine`, and
+> `engine` is not a section. In your own manifests set `enableServiceLinks: false` too. The
+> engine reads no service-link variable, and cluster DNS still resolves Services with it off.
 >
 > **Variables that are not settings are spared by name.** Their consuming module reads them straight
 > from the environment and they are not fields here: at least `MEFOR_STORE_VAULT_ADDR`,

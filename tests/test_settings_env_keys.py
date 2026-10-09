@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import ast
 import functools
+import os
 import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from messagefoundry.config import settings as settings_module
 from messagefoundry.config.settings import (
@@ -287,6 +289,131 @@ def test_the_reference_spare_needs_the_env_provider_spelled_exactly(provider: st
     """The control for the test above. No other provider reads a reference from the environment,
     and the engine matches the provider name exactly, so the same variable is refused."""
     assert _SECRET_VAR in _refusal(_reference_environ(provider))
+
+
+def _mixed_case_reference() -> dict[str, str]:
+    """The reference is written in another letter case than the variable's name. On Windows the
+    environment holds every name in upper case, so this is what a mixed-case reference meets."""
+    environ = _reference_environ("env")
+    environ["MEFOR_ALERTS_EMAIL_PASSWORD_SECRET"] = _SECRET_VAR.title()
+    return environ
+
+
+def test_where_names_ignore_case_a_reference_in_another_case_still_spares_its_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows ``os.environ.get`` finds a variable whatever case the reference is written in,
+    so the ``env`` provider would read it. The spare matches the same way there."""
+    monkeypatch.setattr(settings_module, "_ENV_NAMES_IGNORE_CASE", True)
+    loaded = load_settings(environ=_mixed_case_reference(), default_file=False)
+    assert loaded.alerts.email_password_secret == _SECRET_VAR.title()
+    # Ignoring case spares no more than the one variable: a typo beside it is still refused.
+    typo = {**_mixed_case_reference(), "MEFOR_STORE_REQUIRE_ENCRYPTON": "true"}
+    message = _refusal(typo)
+    assert "MEFOR_STORE_REQUIRE_ENCRYPTON" in message and _SECRET_VAR not in message
+
+
+def test_where_names_keep_their_case_a_reference_in_another_case_spares_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control. On POSIX the provider reads the name exactly as the reference spells it, so a
+    variable in another case is one nothing reads, and it is refused."""
+    monkeypatch.setattr(settings_module, "_ENV_NAMES_IGNORE_CASE", False)
+    assert _SECRET_VAR in _refusal(_mixed_case_reference())
+
+
+def test_the_case_rule_follows_the_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The constant is the platform's own rule, and the provider's lookup agrees with it here."""
+    assert settings_module._ENV_NAMES_IGNORE_CASE is (os.name == "nt")
+    probe = "MEFOR_CASE_PROBE_SYNTHETIC"
+    monkeypatch.setenv(probe, "1")
+    assert (os.environ.get(probe.title()) == "1") is settings_module._ENV_NAMES_IGNORE_CASE
+
+
+# --- Kubernetes service links ---------------------------------------------------------------------
+
+
+def _service_links(service: str, port: int = 8765) -> dict[str, str]:
+    """The variables a kubelet injects into a pod for a Service of this name, when
+    ``enableServiceLinks`` is on (its default). All values are synthetic."""
+    prefix = service.upper().replace("-", "_")
+    base = f"{prefix}_PORT_{port}_TCP"
+    return {
+        f"{prefix}_SERVICE_HOST": "10.0.0.1",
+        f"{prefix}_SERVICE_PORT": str(port),
+        f"{prefix}_PORT": f"tcp://10.0.0.1:{port}",
+        base: f"tcp://10.0.0.1:{port}",
+        f"{base}_PROTO": "tcp",
+        f"{base}_PORT": str(port),
+        f"{base}_ADDR": "10.0.0.1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("service", "refused"),
+    [
+        ("mefor", "MEFOR_SERVICE_HOST"),  # reads as [service], which has no environment layer
+        ("mefor-auth", "MEFOR_AUTH_SERVICE_HOST"),
+        ("mefor-store", "MEFOR_STORE_SERVICE_HOST"),
+        ("mefor-api", "MEFOR_API_SERVICE_HOST"),
+    ],
+)
+def test_service_links_for_a_service_named_after_a_section_stop_the_load(
+    service: str, refused: str
+) -> None:
+    """What docs/CONFIGURATION.md says of these Service names, measured."""
+    assert refused in _refusal(_service_links(service))
+
+
+def _shipped_service_names() -> list[str]:
+    names = []
+    for path in sorted((_REPO / "docker" / "k8s").glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            if isinstance(doc, dict) and doc.get("kind") == "Service":
+                names.append(doc["metadata"]["name"])
+    return names
+
+
+def test_service_links_for_the_shipped_service_names_load_and_draw_no_warning() -> None:
+    """The shipped manifests turn service links off (below), and their Service names would be
+    harmless with them on: nothing is refused and nothing is warned about."""
+    names = _shipped_service_names()
+    assert len(names) >= 4 and "mefor-engine" in names
+    for name in names:
+        environ = _service_links(name)
+        _load(environ)
+        assert _unread_env_notes(environ, {}) == [], name
+
+
+def test_every_shipped_pod_spec_turns_service_links_off() -> None:
+    """The engine reads no service-link variable, and one named like a setting stops the start or
+    is read as that setting. Off at source in every shipped workload."""
+    specs = []
+    for path in sorted((_REPO / "docker" / "k8s").glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            if isinstance(doc, dict) and doc.get("kind") in {"Deployment", "StatefulSet"}:
+                specs.append((path.name, doc["spec"]["template"]["spec"]))
+    assert len(specs) >= 2
+    assert [name for name, spec in specs if spec.get("enableServiceLinks") is not False] == []
+
+
+def test_no_shipped_file_reads_a_service_link_variable() -> None:
+    """The premise for turning them off: nothing shipped under docker/ or in the engine reads a
+    ``*_SERVICE_HOST`` or ``*_SERVICE_PORT`` variable. The second assertion is the control."""
+    pattern = re.compile(r"[A-Z0-9_]+_SERVICE_(?:HOST|PORT)\b")
+    readers = []
+    for root in ("docker", "messagefoundry", "messagefoundry_webconsole"):
+        for path in sorted((_REPO / root).rglob("*")):
+            if not path.is_file() or path.suffix in {".pyc", ".png", ".ico", ".woff2"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if pattern.search(text):
+                readers.append(path.relative_to(_REPO).as_posix())
+    assert readers == []
+    assert pattern.search("host = os.environ['MEFOR_ENGINE_SERVICE_HOST']")
 
 
 def test_under_the_env_provider_a_variable_no_reference_names_is_refused() -> None:

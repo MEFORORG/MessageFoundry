@@ -206,6 +206,11 @@ The reference manifest ([`ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml)) se
   unauthenticated readiness endpoint — a readinessProbe on `/health` would mark a pod Ready prematurely.
   A standby is intentionally "Ready": it must be a warm failover target. Primary-vs-standby routing is the
   **LB health check's** job (TCP-connect to the MLLP port), not a k8s probe's.
+- **`enableServiceLinks: false`.** Both shipped manifests set it on the pod. The engine reads no
+  service-link variable, and it treats `MEFOR_<SECTION>_<KEY>` as a setting. With links on, a Service
+  named `mefor` or `mefor-<section>` in the engine's namespace would inject names the settings loader
+  refuses at start, and at least one it would read as a setting. Keep it off in your own manifests.
+  [`CONFIGURATION.md`](CONFIGURATION.md) lists the names and what each does.
 
 > **Coordinated, not divergent, config changes.** The manifest ships `strategy: RollingUpdate`, which is
 > the right shape for changes that **do not** alter the baked config/graph (e.g. a base-image bump that

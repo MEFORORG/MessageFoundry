@@ -150,13 +150,15 @@ def test_an_unrecognised_sandbox_mode_is_refused_rather_than_defaulting(tmp_path
 def test_every_section_model_is_env_overridable_or_documented_as_not(tmp_path: Path) -> None:
     """THE GUARD THAT WOULD HAVE CAUGHT #1365, AND WILL CATCH THE NEXT ONE.
 
-    A section absent from ``_SECTIONS`` does not fail -- it DISAPPEARS. ``_env_overrides`` drops the
-    variable and returns normally, so nothing anywhere reports a problem. Only a comparison against the
-    section models makes the absence visible, which is why this is a set difference rather than a test
-    of any one key.
+    A section absent from ``_SECTIONS`` cannot be set from the environment: ``_env_overrides`` drops
+    the variable and returns normally. When #1365 was fixed nothing reported that. Since vault
+    BACKLOG #2600 the load refuses a variable aimed at a modelled section with no env layer
+    (``_reject_unknown_env_keys``), so the operator is told, but the section is still unreachable
+    by environment. Only a comparison against the section models makes that visible ahead of time,
+    which is why this is a set difference rather than a test of any one key.
 
     Each exclusion carries its reason. Adding a new settings section without deciding this question
-    reds here instead of silently shipping an unreachable switch.
+    reds here instead of shipping a switch the environment cannot reach.
     """
     from messagefoundry.config.settings import _ENV_PREFIX, _SECTIONS, _section_models
 
@@ -178,7 +180,7 @@ def test_every_section_model_is_env_overridable_or_documented_as_not(tmp_path: P
     unreachable = sorted(models - set(_SECTIONS) - known_absent)
     assert not unreachable, (
         f"settings section(s) {unreachable} have a model but no _SECTIONS entry, so MEFOR_"
-        f"{_ENV_PREFIX and ''}<SECTION>_<KEY> for them is silently DROPPED rather than refused. Add "
+        f"{_ENV_PREFIX and ''}<SECTION>_<KEY> for them is REFUSED at load and can never apply. Add "
         "the entry, or add the name above with the reason it cannot be env-set."
     )
     # And the inverse: an entry naming no model would route env values into nothing.
