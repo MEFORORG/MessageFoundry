@@ -9620,9 +9620,7 @@ def _security(args: argparse.Namespace) -> int:
         SecretRotationSettings,
         SecuritySettings,
         StoreSettings,
-        load_settings,
         security_loosenings,
-        settings_error_detail,
     )
 
     path = args.service_config
@@ -9633,7 +9631,9 @@ def _security(args: argparse.Namespace) -> int:
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
-    _loosenings_partial = False
+    # None unless the file exists and will not load. Then: WHY, rendered (vault BACKLOG #2600). A
+    # stray MEFOR_<SECTION>_<KEY> variable in this shell refuses the load, and a bare `true` sent
+    # the reader to a file that was fine.
     _loosenings_partial_reason: str | None = None
     _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
     # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
@@ -9652,25 +9652,17 @@ def _security(args: argparse.Namespace) -> int:
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
         # exists and will not resolve is partial.
-        try:
-            _full = load_settings(config_path=path)
+        # The shared load: its catch is the specific ways a settings file fails to resolve, and
+        # anything else is a programming error that surfaces. It renders the failure rather than
+        # stringifying it, so no configured value is echoed.
+        _full, _loosenings_partial_reason = _load_service_settings(path)
+        if _full is not None:
             _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
             _rotation = _full.secret_rotation
             _api = _full.api
             _approvals = _full.approvals
             _cert_monitor = _full.cert_monitor
             _backup = _full.backup
-        except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError) as exc:
-            # The specific ways a settings file fails to resolve: a schema/cross-field violation,
-            # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
-            # bad env/section. Anything else is a programming error and must surface, not be degraded
-            # into a boolean.
-            _loosenings_partial = True
-            # WHY it is partial (vault BACKLOG #2600). A stray MEFOR_<SECTION>_<KEY> variable in
-            # this shell refuses the load, and a bare `true` sent the reader to a file that was
-            # fine. Rendered by settings_error_detail, as every other whole-file load failure is,
-            # so no configured value is echoed (its docstring says what it does and does not hide).
-            _loosenings_partial_reason = settings_error_detail(exc)
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
@@ -9726,7 +9718,7 @@ def _security(args: argparse.Namespace) -> int:
     #: environment variable, and security_loosenings() reads it from the process that calls it. Here
     #: that is the operator's shell, not the service.
     _loosenings_scope = {
-        "loosenings_partial": _loosenings_partial,
+        "loosenings_partial": _loosenings_partial_reason is not None,
         # None unless the report is partial. Then: why the whole-file load failed.
         "loosenings_partial_reason": _loosenings_partial_reason,
         "loosenings_scope": (

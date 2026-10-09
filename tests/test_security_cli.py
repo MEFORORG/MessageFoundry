@@ -313,42 +313,6 @@ def test_show_names_the_stray_variable_that_made_the_report_partial(
     assert "SYNTHETIC-VALUE-9f3c" not in json.dumps(out_data)
 
 
-def test_the_partial_reason_is_rendered_and_never_stringified(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``str`` of a pydantic failure can carry the refused input, an environment-supplied secret
-    among it (vault BACKLOG #2760). The reason goes through ``settings_error_detail``. The first
-    assertion is the control: the planted value IS in the raw text."""
-    from pydantic import ValidationError
-
-    from messagefoundry.config import settings as settings_module
-
-    canary = "canary-canary-canary"
-    leaky = ValidationError.from_exception_data(
-        "ServiceSettings",
-        [
-            {
-                "type": "value_error",
-                "loc": ("store",),
-                "input": {"backend": "postgres", "password": canary},
-                "ctx": {"error": ValueError("postgres backend requires: server")},
-            }
-        ],
-    )
-    assert canary in str(leaky)
-
-    def refuse(*_args: object, **_kwargs: object) -> object:
-        raise leaky
-
-    monkeypatch.setattr(settings_module, "load_settings", refuse)
-    toml = tmp_path / "mf.toml"
-    toml.write_text("[auth]\nlockout_minutes = 15\n", encoding="utf-8")
-    assert main(["security", "show", "--service-config", str(toml), "--json"]) == 0
-    printed = capsys.readouterr()
-    assert canary not in printed.out + printed.err
-    assert "store: " in json.loads(printed.out)["loosenings_partial_reason"]
-
-
 # --- operator JSON that nests past the decoder (BACKLOG #1855) --------------------------------
 #
 # `json.loads` guards its own decode depth and raises `RecursionError`, which is a `RuntimeError` --

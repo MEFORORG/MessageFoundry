@@ -7175,14 +7175,7 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     no_env_layer = sorted(set(models) - set(_SECTIONS), key=len, reverse=True)
     referenced = _env_secret_reference_names(data)
     offenders: list[str] = []
-    for name in sorted(environ):
-        if (
-            not name.startswith(_ENV_PREFIX)
-            or name in _OUT_OF_BAND_ENV
-            or _env_name_key(name) in referenced
-        ):
-            continue
-        rest = name[len(_ENV_PREFIX) :].lower()
+    for name, rest in _unspared_env_names(environ, referenced):
         unread = next((s for s in no_env_layer if rest.startswith(f"{s}_")), None)
         if unread is not None:
             offenders.append(
@@ -7206,6 +7199,22 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
             "dropped one leaves the setting it was meant to apply silently un-applied. Check the "
             "spelling against docs/CONFIGURATION.md, or unset the variable."
         )
+
+
+def _unspared_env_names(
+    environ: Mapping[str, str], referenced: set[str]
+) -> Iterator[tuple[str, str]]:
+    """``(name, rest)`` for each ``MEFOR_*`` variable in ``environ`` that no spare covers, in name
+    order. ``rest`` is the name after the prefix, in lower case. ``referenced`` is
+    :func:`_env_secret_reference_names`. :func:`_reject_unknown_env_keys` and
+    :func:`_unread_env_notes` both read through this, so a spare added here covers both."""
+    for name in sorted(environ):
+        if (
+            name.startswith(_ENV_PREFIX)
+            and name not in _OUT_OF_BAND_ENV
+            and _env_name_key(name) not in referenced
+        ):
+            yield name, name[len(_ENV_PREFIX) :].lower()
 
 
 def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
@@ -7237,14 +7246,7 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     for section in sorted(models):
         by_parts.setdefault(section.count("_") + 1, []).append(section)
     notes: list[str] = []
-    for name in sorted(environ):
-        if (
-            not name.startswith(_ENV_PREFIX)
-            or name in _OUT_OF_BAND_ENV
-            or _env_name_key(name) in referenced
-        ):
-            continue
-        rest = name[len(_ENV_PREFIX) :].lower()
+    for name, rest in _unspared_env_names(environ, referenced):
         if rest in models:
             notes.append(
                 f"{_printable(name)} names the [{rest}] section and no setting in it, so "
@@ -7263,18 +7265,18 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
             meant = f"{_ENV_PREFIX}{near[0].upper()}_{key.upper()}"
             is_field = key in models[near[0]].model_fields
             if near[0] in _SECTIONS and (is_field or meant in _OUT_OF_BAND_ENV):
-                notes.append(
-                    f"{_printable(name)} names no config section, so nothing reads it "
-                    f"(did you mean {meant}?)"
+                hint = f"{meant}?"
+            elif near[0] not in _SECTIONS and is_field:
+                hint = (
+                    f"[{near[0]}].{key}? That section has no environment layer; set it in the file"
                 )
-                break
-            if near[0] not in _SECTIONS and is_field:
-                notes.append(
-                    f"{_printable(name)} names no config section, so nothing reads it (did you "
-                    f"mean [{near[0]}].{key}? That section has no environment layer; set it in "
-                    "the file)"
-                )
-                break
+            else:
+                continue
+            notes.append(
+                f"{_printable(name)} names no config section, so nothing reads it "
+                f"(did you mean {hint})"
+            )
+            break
     return notes
 
 

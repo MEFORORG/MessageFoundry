@@ -17,6 +17,7 @@ import functools
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -374,13 +375,19 @@ def test_service_links_for_a_service_named_after_a_section_stop_the_load(
     assert refused in _refusal(_service_links(service))
 
 
+@functools.cache
+def _k8s_docs() -> tuple[tuple[str, dict[str, Any]], ...]:
+    """``(file name, document)`` for each mapping document in the shipped Kubernetes manifests."""
+    return tuple(
+        (path.name, doc)
+        for path in sorted((_REPO / "docker" / "k8s").glob("*.yaml"))
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8"))
+        if isinstance(doc, dict)
+    )
+
+
 def _shipped_service_names() -> list[str]:
-    names = []
-    for path in sorted((_REPO / "docker" / "k8s").glob("*.yaml")):
-        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
-            if isinstance(doc, dict) and doc.get("kind") == "Service":
-                names.append(doc["metadata"]["name"])
-    return names
+    return [doc["metadata"]["name"] for _, doc in _k8s_docs() if doc.get("kind") == "Service"]
 
 
 def test_service_links_for_the_shipped_service_names_load_and_draw_no_warning() -> None:
@@ -397,11 +404,11 @@ def test_service_links_for_the_shipped_service_names_load_and_draw_no_warning() 
 def test_every_shipped_pod_spec_turns_service_links_off() -> None:
     """The engine reads no service-link variable, and one named like a setting stops the start or
     is read as that setting. Off at source in every shipped workload."""
-    specs = []
-    for path in sorted((_REPO / "docker" / "k8s").glob("*.yaml")):
-        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
-            if isinstance(doc, dict) and doc.get("kind") in {"Deployment", "StatefulSet"}:
-                specs.append((path.name, doc["spec"]["template"]["spec"]))
+    specs = [
+        (name, doc["spec"]["template"]["spec"])
+        for name, doc in _k8s_docs()
+        if doc.get("kind") in {"Deployment", "StatefulSet"}
+    ]
     assert len(specs) >= 2
     assert [name for name, spec in specs if spec.get("enableServiceLinks") is not False] == []
 
@@ -413,7 +420,11 @@ def test_no_shipped_file_reads_a_service_link_variable() -> None:
     readers = []
     for root in ("docker", "messagefoundry", "messagefoundry_webconsole"):
         for path in sorted((_REPO / root).rglob("*")):
-            if not path.is_file() or path.suffix in {".pyc", ".png", ".ico", ".woff2"}:
+            if (
+                not path.is_file()
+                or "__pycache__" in path.parts
+                or path.suffix in {".pyc", ".png", ".ico", ".woff2"}
+            ):
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
