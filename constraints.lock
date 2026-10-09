@@ -283,7 +283,7 @@ uvloop==0.23.0 ; platform_python_implementation != 'PyPy' and sys_platform != 'c
     # via messagefoundry
 webauthn==3.0.1
     # via messagefoundry
-websockets==17.1
+websockets==17.2
     # via messagefoundry
 xmlschema==4.3.2
     # via messagefoundry
