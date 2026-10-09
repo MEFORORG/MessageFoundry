@@ -47,10 +47,11 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
    lineage graded these cells. What it graded them against was a paraphrase, because the ASVS 5.0.0
    text was not held anywhere in the project until 2026-07-31. So an inherited verdict is a verdict
    about a restatement of the requirement, which is why it has to be re-derived rather than trusted —
-   and why re-verification moves some of them.
+   and why re-verification moves some of them. §3.1 says which read a cell's stamps record.
 3. **Does code implementing the requirement's verb exist anywhere in the tree, reachable by any
    configuration?**
-   No → **`fail`**.
+   No → **`fail`**. Where the verb asks what the documentation defines, §1.1c says which text
+   counts.
 4. **Is the verb satisfied by a shipped default, or by a gate that refuses to start when the
    precondition is absent?**
    Yes → **`pass`**. *"It can be configured" is never a pass. A signed relaxation is never a pass.*
@@ -140,6 +141,45 @@ repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
 
 **The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
 it stands.
+
+### 1.1c What counts as documentation — owner ruling, 2026-10-09
+
+Some requirements ask what the application's documentation defines. This subsection says which text
+an assessor may count for them.
+
+**Text counts as documentation when a reader can reach it without opening the source, and it states
+the rule in words a reviewer can compare with the code.** At least these count:
+
+- a page under the project's `docs/`;
+- an ADR;
+- command help text that itself states the rule.
+
+These do not count:
+
+- a docstring;
+- a code comment;
+- a bare option name;
+- an error message, because a reader reaches it only by breaking the rule;
+- a schema that ships switched off.
+
+The owner ruled on the docstring and the code comment in these words: *"No, neither counts"*. The
+help-text line is a reading that adversarial review reached, and the owner then built on it.
+
+**Why documentation is read more widely than prose pages.** ASVS 5.0 allows it. Its front matter
+says a security decision may be written in a document that developers refer to. It also allows one
+*"documented and implemented in a common code library"*, and it treats both as meeting the aim. That
+passage is in `0x03-What-is-the-ASVS.md`, fetched at the `v5.0.0_release` tag as §2.1a requires. Only
+the quoted words are verbatim, so read the passage before relying on the rest. The line this ruling
+draws, at text a reader reaches without opening the source, is the owner's and not the standard's.
+
+**What this ruling does not decide.** It applies to requirements that ask about documentation. It
+does not change what counts as evidence that a control exists: code and tests remain evidence (§3).
+It names which text may be counted, and rules 1 to 6 still grade the cell. Whether a page that counts
+is accurate is still the assessor's to check against the code.
+
+The ruling was given in session on 2026-10-09, after adversarial review, and is recorded in the
+`MessageFoundry-vault` repository. As in §1.1a, this document records the rule and not the cells it
+moves.
 
 ### 1.2 Worked examples — the ones that actually broke
 
@@ -425,6 +465,38 @@ refuses to write one. A blank string is not the legacy form: it loads, and the r
 it like a missing `reviewed_by`. One tool reads old copies of the record from before the migration:
 `scripts/asvs/anchor_provenance.py` reads anchors, not reviewers, so it loads a legacy string as
 review notes with no reviewer rather than refusing the record.
+
+### 3.1 The verification stamps name the last full read — owner ruling, 2026-10-09
+
+**A cell's `last_verified` date and `verified_at` commit name the last full read of the cell.** A
+full read covers every limb of the requirement (§1.1b) and every ground the current verdict rests
+on, read at that commit. History text the cell retains need not be re-derived.
+
+Other passes leave both stamps alone:
+
+- **A partial re-read keeps both stamps.** A partial re-read reads only what a change touched and
+  carries the other grounds forward unread. It records its own date and engine commit inside its own
+  dated layer, which is the dated entry the pass adds to the cell's prose. It may move `reviewed_by`
+  if it set or re-derived the verdict. A `reviewed_by` date can then be later than `last_verified`,
+  and that is not an error.
+- **A pass that only repairs anchors or refreshes line numbers moves neither stamp.**
+
+**Why the stamps are held to the whole cell.** At least three things already treat them that way:
+
+- The tool that re-pins `verified_at` from one commit to another refuses unless the two trees are
+  identical, apart from line endings, over every path the affected cells anchor. So the stamp already
+  vouches for everything the cell cites.
+- The rendered table prints `last_verified` once per cell, with no room for a scope.
+- A note in the cell's prose saying a read was partial is read by no tool, and a reader of the table
+  cannot see that it qualifies the date.
+
+**What this ruling does not decide.** Some grounds are a test result or a measurement. The ruling
+does not say how much of such a ground a full read must run again, and this method does not answer
+that yet.
+
+The ruling was given in session on 2026-10-09, after adversarial review, and is recorded in the
+`MessageFoundry-vault` repository. As in §1.1a, this document records the rule and not the cells it
+moves.
 
 ---
 
