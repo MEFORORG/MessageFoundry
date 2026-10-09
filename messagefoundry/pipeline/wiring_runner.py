@@ -2658,8 +2658,9 @@ class RegistryRunner:
         stay PENDING: none is claimed, charged an attempt or dead-lettered for being parked. A
         row already in flight still resolves, because the pause is cooperative. A lane that is
         not deployed keeps that answer and gets no marker, as in the reload. A lane a reload
-        dropped that was still draining is parked as well. No later reload reads that lane, so
-        its rows wait for the next engine start, which settles rows for a dropped outbound.
+        dropped that was still draining is parked as well. It keeps its connector, which nothing
+        could build again, and the first reload on a box that is no longer passive resumes it
+        (:meth:`_reconcile_outbounds`).
 
         It is synchronous, so every flip to passive parks, including the rollback of a failed
         activation, which runs in an ``except`` block. A parked lane's connector is therefore
@@ -2681,12 +2682,24 @@ class RegistryRunner:
         The engine calls it when a release has made the box passive, so the released box holds
         no session open to a partner the primary must reach. A lane the next activation starts
         builds a new one. A row still in flight on a lane fails that send and is retried, as
-        when a reload replaces a connector."""
+        when a reload replaces a connector. A lane a reload dropped keeps its connector: the
+        graph no longer says how to build one, and the lane must drain after an activation."""
         async with self._reload_lock:
             if not self._dr_passive:
                 return
-            for name in [n for n in self._destinations if self._dr_parked(n)]:
+            declared = self.registry.outbound
+            for name in [n for n in self._destinations if n in declared and self._dr_parked(n)]:
                 await self._aclose_quietly(self._destinations.pop(name), name)
+
+    def _restore_dr_markers(self, cleared: dict[tuple[Direction, str], str] | None) -> None:
+        """Put back the DR markers a reload cleared at its start, for a reload that was refused
+        or rolled back (vault BACKLOG #3262). The reload snapshots them only on a passive standby,
+        and passes ``None`` otherwise. A passive standby's inbound markers are written again only
+        by the listener restart, which such a reload never reaches, so without this every inbound
+        read ``stopped`` with no reason."""
+        if cleared is not None:
+            self._filtered.clear()
+            self._filtered.update(cleared)
 
     def _rewrite_inbound_parks(self, held: frozenset[str] = frozenset()) -> None:
         """Write every inbound DR marker again under the current thresholds (vault BACKLOG #3140).
@@ -6048,6 +6061,19 @@ class RegistryRunner:
                     if name not in self._outbound_paused:
                         self._pause_delivery_lanes([name])
                     continue
+            if (
+                name in self._gate_parked
+                and oc.schedule is not None
+                and not oc.schedule.is_active(self._schedule_clock())
+                and not self._dr_passive
+                and not self._below_dr_threshold(oc.priority)
+            ):
+                # This reload would resume the lane, and its window is closed. So the park passes
+                # to the calendar and the lane stays paused (vault BACKLOG #3262). Lifting it
+                # here delivered held rows outside the window, until the scheduler's own stop
+                # got the reload lock. The scheduler starts the lane when its window opens.
+                self._gate_parked.discard(name)
+                self._schedule_parked.add(name)
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector, and
@@ -6144,6 +6170,15 @@ class RegistryRunner:
                     await old_conn.aclose()
             # else: unchanged & live → leave the worker/connector as-is.
         # Outbounds removed by ``new`` keep their worker so already-queued rows finish draining.
+        if not self._dr_passive and not self._delivery_halted:
+            # One the passive park held goes back to draining (vault BACKLOG #3262). It was
+            # running when the box went passive, and the loop above never reads it. Its
+            # connector is the test: every other engine park of a lane drops the connector.
+            for name in [
+                n for n in self._gate_parked if n not in new.outbound and n in self._destinations
+            ]:
+                self._filtered.pop(("outbound", name), None)
+                self._unpark_outbound_lane(name)
 
     # --- atomic reload (quiesce-and-swap) ------------------------------------
 
@@ -6290,6 +6325,9 @@ class RegistryRunner:
             if new_registry is None:
                 new_registry = self.registry
             self.build_check(new_registry)  # raises before any change on a bad connector
+            # What the clear below removes, so a reload that is refused or rolled back puts it
+            # back and leaves the markers as they were (vault BACKLOG #3262).
+            cleared: dict[tuple[Direction, str], str] | None = None
             if self._dr_threshold is None:
                 # With the profile off the threshold parks no outbound. The loops below drop a
                 # marker only for a connection that passes the earlier gates, so one left down by
@@ -6297,6 +6335,10 @@ class RegistryRunner:
                 # #3067). A passive standby's inbound markers are written again below. Its
                 # outbound markers are written again here, with no await since the clear, so a
                 # reload that stops before the reconcile leaves them in place (vault BACKLOG #3262).
+                if self._dr_passive:
+                    # Only a passive box's markers are current. With DR off they are left over
+                    # from a profile that has ended, and stay cleared whatever the reload does.
+                    cleared = dict(self._filtered)
                 self._filtered.clear()
                 if self._dr_passive and self._running:
                     self._park_outbounds_while_passive()
@@ -6307,9 +6349,13 @@ class RegistryRunner:
             old = self.registry
             old_inbound_names = list(self._sources)
             # vault BACKLOG #2371: before the quiesce, so a refused CA leaves the graph untouched.
-            anchors_passed = await self._check_reload_lane_anchors(
-                old, new_registry, old_inbound_names
-            )
+            try:
+                anchors_passed = await self._check_reload_lane_anchors(
+                    old, new_registry, old_inbound_names
+                )
+            except BaseException:
+                self._restore_dr_markers(cleared)
+                raise
             # Step 2 rebuilds both lookup executors for the new graph; the rollback restores these.
             old_lookup_executor = self._lookup_executor
             old_fhir_lookup_executor = self._fhir_lookup_executor
@@ -6477,6 +6523,7 @@ class RegistryRunner:
                         "reload failed; rolling back inbound intake to the previous graph"
                     )
                 self.registry = old
+                self._restore_dr_markers(cleared)
                 # The lookup executors and ADR 0057 inline eligibility follow the registry back, before
                 # the first await below, so no worker that reads them after the restore pairs the old
                 # graph with the refused graph's lookups (a db_lookup naming a connection only the old

@@ -288,42 +288,48 @@ in-flight rows stranded.
 > passive box's outbounds built. That was a defect. The seed is a backup of the primary's store, and it can
 > hold rows the primary had not delivered when the backup was taken. A box started passive over that store
 > delivered them at once. No operator had decided the primary was gone, and the primary could be alive and
-> delivering the same rows. A test now starts a passive box over such a store and shows no row delivered
-> until the activation.
+> delivering the same rows. `tests/test_dr_passive_delivers_nothing.py` starts a passive box over such a
+> store and shows no row delivered until the activation.
 >
 > **The rule.** A box with `[dr].enabled = true` that is not activated parks every deployed outbound, of
-> any tier, at start and after `POST /dr/release`. Each reads `status: "filtered"`. It is parked the way
-> the run-profile parks a lane below the threshold: no connector is built, and its rows are held PENDING,
-> never claimed, charged an attempt or dead-lettered for being parked. A box that starts passive therefore
-> delivers only after an operator's `POST /dr/activate`. A box started with `[dr].activate = true` is
-> active from its start, and delivers as the run-profile allows. The activation's reload builds the lanes
-> at or above the threshold, and the held rows are delivered in the order they were queued. Delivery is
-> at-least-once, as everywhere in the engine, so a retry can repeat a row. A reload on a passive box
-> reads the CA file of the outbounds an activation would build, as it judges the listeners one would bind.
+> any tier, at start and after `POST /dr/release`. Each reads `status: "filtered"`, and is parked the way
+> the #3067 amendment above parks a lane below the threshold. A box that starts passive therefore delivers
+> only after an operator's `POST /dr/activate`, whose reload starts the lanes at or above the threshold and
+> delivers their held rows in the order they were queued. A reload on a passive box reads the CA file of
+> the outbounds an activation would start, as it judges the listeners one would bind.
 >
-> **The release.** The drain runs as before, with the lanes at or above the threshold delivering. When it
-> ends, the release parks every outbound, without waiting for a reload, and closes their connectors. The
-> park is cooperative, so a row already in flight is not cut off by it; a send the close interrupts is
-> retried after the next activation. This supersedes two sentences above: Decision 3's *"A lane the engine
-> parked then comes up"* on the first reload after a release, and the #3140 amendment's restatement of
-> it. A released box cannot tell a row it accepted while active from a row the seed carried, and the
-> primary is back by then, so that reload was the same defect by another route. Rows left on a released
-> box stay queued there. `depth_left` and `held_on_parked_outbounds` on the `dr.release` row count them.
-> The next activation delivers the ones at or above the threshold. The rest are reconciled against the
-> primary by the operator, under the fail-back runbook below, which already makes the two stores the
-> operator's to reconcile. The rest of Decision 3 stands: the doors refuse while DR parks an outbound, and
-> a lane an operator or the calendar paused first stays theirs.
+> **The release (owner ruling 2026-10-08).** The drain runs as before. When it ends, the release parks
+> every outbound, without waiting for a reload, and closes their connectors. The park does not cut off a
+> row in flight; a send the close interrupts is retried after the next activation. This supersedes two
+> sentences above: Decision 3's *"A lane the engine parked then comes up"*, and the #3140 amendment's
+> restatement of it. A released box cannot tell a row it accepted while active from a row the seed
+> carried, and the primary is back by then, so that reload was the same defect by another route. Rows left
+> on a released box stay queued there, counted on the `dr.release` row. The next activation delivers the
+> ones at or above the threshold. The operator reconciles the rest under the
+> [fail-back runbook](#fail-back). The rest of Decision 3 stands.
 >
-> **What still runs on a passive box.** The router and transform stages run, as AC-3 has them run under
-> the profile, so a restored `ingress` or `routed` row moves to the `outbound` stage and waits there with
-> the rest. Routers and transforms are pure, so running them sends nothing to a partner, and one gate at
-> the delivery stage holds every row whatever stage the seed carried it at. Two effects do leave the box:
-> a handler's read-only `db_lookup` or `fhir_lookup` still runs, and a routing or transform failure still
-> raises its alert. A lookup result is fixed when the transform runs, which is before the activation.
+> **Whose park it is.** The passive park keeps Decision 3's rule that a lane an operator or the calendar
+> paused first stays theirs, and adds three cases:
+>
+> - An activation does not resume a lane whose schedule window is closed. The park passes to the calendar,
+>   which starts the lane when its window opens.
+> - A lane halted by a STOP that needs an operator is parked with the rest. Left unparked, a pooled work
+>   broadcast would re-arm it and it would deliver on a passive box. The activation's reload then re-arms
+>   it, as a reload re-arms such a STOP on any box. An operator's pause is different: it survives.
+> - A lane a reload dropped while it still had work is parked too, keeps its connector, and goes back to
+>   draining on the first reload after the box stops being passive.
+>
+> A reload that is refused or rolled back on a passive box leaves every marker as it was.
+>
+> **What still runs on a passive box.** The router and transform stages, as AC-3 has them run under the
+> profile. A restored `ingress` or `routed` row moves to the `outbound` stage and waits there, so one gate
+> at the delivery stage holds every row. Two effects do leave the box: a handler's read-only `db_lookup`
+> or `fhir_lookup` still runs, and a routing or transform failure still raises its alert. A lookup result
+> is fixed when the transform runs, which is before the activation.
 >
 > **Not changed.** An operator start of an INBOUND still overrides the passive park, as the #3140
 > amendment says. A message it accepts is routed and transformed, and then held with the rest. An
-> operator start, stop or restart of an OUTBOUND on a passive box answers `409`, naming the activation.
+> operator start, stop or restart of an OUTBOUND on a passive box answers `409`.
 
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 

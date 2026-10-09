@@ -626,6 +626,31 @@ async def test_a_calendar_parked_outbound_unscheduled_while_dr_parks_it_comes_up
     assert rr.outbound_status("OB_CRIT_ADT") == "running"
 
 
+async def test_an_activation_leaves_a_lane_its_calendar_has_closed_parked(box: _Box) -> None:
+    """A critical outbound whose window is closed holds a row when the box is activated. The
+    activation's reload must not deliver it. Red before the repair: the reload lifted the passive
+    park and the lane ran until the scheduler's own stop got the reload lock."""
+    engine = box.engine
+    _write_tiered_graph(box.scheduled, box.scheduled.parent, crit_schedule=_NEVER)
+    await engine.reload_detail(box.scheduled)
+    rr = engine.registry_runner
+    assert rr is not None
+    message_id = await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
+    )
+
+    await engine._dr_activate_profile()
+    await asyncio.sleep(0.5)  # ten poll intervals for a lane that would claim the row
+    (row,) = await engine.store.outbox_for(message_id)
+    assert row["status"] == "pending" and row["attempts"] == 0
+    assert rr.outbound_filtered("OB_CRIT_ADT") is None  # DR has let go of it
+    assert "OB_CRIT_ADT" in rr._schedule_parked  # and the calendar holds it
+    assert not rr.outbound_running("OB_CRIT_ADT")
+
+    await engine.reload_detail(box.tiered)  # control: with the schedule gone it delivers
+    await _until_only_row_done(engine, message_id)
+
+
 async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(
     box: _Box, monkeypatch: pytest.MonkeyPatch
 ) -> None:
