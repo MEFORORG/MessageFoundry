@@ -611,8 +611,8 @@ sign-in on every retry. So the sign-in is floored only when the verified `auth_t
 the flow's start, which means the person signed in at the IdP inside this flow. An IdP clock that
 runs ahead can make an older sign-on look fresh. The refusal then clears once the skew has passed,
 and it never lets a flow through early. An IdP clock that runs behind can do the reverse, and then
-that sign-in is not floored. The list under *What these floors do not do*, below, records the single
-sign-on case as a limitation.
+that sign-in is not floored. A sign-on made before the flow starts is the case the list under
+*What these floors do not do*, below, records as a limitation.
 
 **Where the defaults come from.** Both are **provisional**, taken from published human-timing
 research under the owner's ruling of 2026-09-23, not from a timed session on this console. The
@@ -657,12 +657,11 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   it, and a fresh sign-on starts that again. The engine has no human step to time between such a
   start and its callback, and it cannot check the IdP's own anti-automation. This is a decided
   limitation of the floors, recorded on 2026-10-09 under BACKLOG #1115. It is no oversight, and it
-  still counts as a gap. What would still limit that path is a rate, which does not detect
-  automation either. While the sign-in window is in force, both legs charge it. Switching it off, or
-  zeroing its window or both its counts, removes that rate. [Business-logic
-  limits](#business-logic-limits-asvs-213) gives the window's size and settings. The route to
-  limiter map under [Brute-force & abuse protection](#brute-force--abuse-protection) says when the
-  "you are leaving this site" confirm is shown before the start. That confirm is no control on this
+  still counts as a gap. The sign-in rate limit would still apply to that path, and it does not
+  detect automation either. Switching it off, or setting its window to 0 or less or both its counts
+  to 0, removes it. [Business-logic limits](#business-logic-limits-asvs-213) gives its size and
+  settings. The [Route to limiter map](#route--limiter-map) lists the routes that charge it, and
+  says when the "you are leaving this site" confirm is shown before the start. That confirm is no control on this
   path: a script can post the start without loading the page, and nothing times the confirm.
   Revisit the decision if OIDC ever ships on by default.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
