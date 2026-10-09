@@ -1409,18 +1409,18 @@ invariant rather than a property of the moved row):
      `return`, `break` or `continue`, or another such `with`. Working out the returned value, or
      entering an inner manager, could still raise, so the row could run;
    - it surely never runs. For a `with`, that needs one context manager, with no `as` target or
-     a plain name, and a first body statement that is a `break`, a `continue`, or a `return` of
-     nothing, a constant or a name. Any other target can raise inside the `with` when it is
-     bound: a tuple unpacks, and an attribute or an item is set (repair of 2026-10-09, after the
-     Lander's fifth review).
+     a plain name. Its first body statement must be a `break`, a `continue`, or a `return` of
+     nothing or a constant. Any other target can raise inside the `with` when it is bound: a
+     tuple unpacks, and an attribute or an item is set. A returned name can raise too, when it
+     is unbound (repair of 2026-10-09, after the Lander's fifth review).
 
    A row inside a block takes the block's level, and two suites are deader than their block: a
    `try`'s `else` runs only when the body reaches its end, and the `else` of a `while True:`
    never runs. A row the edit kept, moved or rewrote is refused when its level gets worse by any
    step. Only a row that surely never ran is exempt, wherever a move puts it. A row the edit
    wrote is refused at the last two levels. A row written where it might not run is accepted,
-   since it is as live as the rows already there (same repair). The levels were confirmed by the
-   Manager holding the PR on 2026-10-09: a kept row is refused when its level gets worse, and a
+   since it is as live as the rows already there (repair of 2026-10-08). The Manager holding the
+   PR confirmed the levels on 2026-10-09. A kept row is refused when its level gets worse. A
    written row is accepted at "might not run" and refused at "counted dead" and "surely dead".
    The default mode applies none of this rule (Manager decision 2026-10-08; AC-G7).
 
@@ -1576,15 +1576,16 @@ is closed for the cases its tests pin:
     the returned value could raise, and the context manager could swallow that, so a row below it
     could run. An insert there is refused all the same. A row already there is not exempt, so it
     cannot move below a `return`;
-  - only a `with` separates the levels. A `return` of a constant or a name is taken not to raise,
-    and a `try` whose handlers all end is taken to end;
+  - only a `with` separates the levels. A `return` of a constant is taken not to raise, and a
+    `try` whose handlers all end is taken to end;
   - the lens does not know which context managers swallow exceptions, so it treats every one as
     if it might. Take `with LOCK:` whose body is a statement and then `return Send(...)`, where
     `LOCK` swallows nothing. A row below it never runs. The lens rates that place "might not
     run", so an inserted row or a send template there is accepted and never runs. That is the
     levels rule working as stated, and it is a recorded limit;
   - a check that runs out of stack on deeply nested blocks refuses the edit in typed-only mode.
-    A long `elif` chain is walked in a loop and is not such a case; a 300-arm chain is pinned;
+    The rule 8 walk takes a long `elif` chain in a loop, and a 300-arm chain is pinned. Past
+    about 490 arms `parse_source` itself raises RecursionError, in both modes, as on `main`;
   - a `return` moved below another `return` of the same text is refused as itself, because it ran
     and would not. Moving the rows between them up gives the same text and is accepted;
   - row identity is exact for a `set_params`, a delete, a move and an insert at its anchor row.

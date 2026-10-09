@@ -1851,7 +1851,8 @@ def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
         ("    with c:\n        with d:\n            return 1\n    f()\n", lens._COUNTED_DEAD),
         ("    with c, d:\n        return 1\n    f()\n", lens._COUNTED_DEAD),
         ("    with c:\n        return g()\n    f()\n", lens._COUNTED_DEAD),
-        ("    with c:\n        return x\n    f()\n", lens._DEAD),
+        ("    with c:\n        return x\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c:\n        return None\n    f()\n", lens._DEAD),
         ("    with c:\n        g()\n        return 1\n    return 2\n    f()\n", lens._DEAD),
         # A suite can be deader than its block: a ``try``'s ``else``, and a ``while True``'s.
         (
@@ -1875,6 +1876,7 @@ def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
         "with-two-managers",
         "with-return-call",
         "with-return-name",
+        "with-return-none",
         "return-below-with",
         "try-else-below-return",
         "try-handler",
@@ -2249,3 +2251,32 @@ def test_a_typed_only_check_that_runs_out_of_stack_refuses_the_edit(
     monkeypatch.setattr(lens, "_reachability", too_deep)
     assert rewrite_source(_TERMINAL, edit) == expected  # the default mode runs no such check
     _refused(_TERMINAL, edit, match="nested too deeply", typed_only=True)
+
+
+def test_rule_8_a_with_that_returns_a_name_is_not_surely_dead() -> None:
+    # Code review of 8fca7d6aee: ``y`` is unbound unless PID-3 is set, so ``return y`` raises
+    # UnboundLocalError, ``suppress`` swallows it, and the last row runs. It is not exempt.
+    src = _TARGET.format(items="suppress(Exception)").replace("return None", "return y")
+    src = src.replace(
+        "def h(msg):\n", 'def h(msg):\n    if msg.field("PID-3"):\n        y = None\n'
+    )
+    last = len(src.splitlines())
+    move = _edit("move_row", last, to_line_start=last - 1, to_position="after")
+    assert rewrite_source(src, move) != src
+    _refused(src, move, match=NEVER_RUNS, typed_only=True)
+
+
+def test_typed_only_accepts_an_edit_below_a_loop_that_holds_a_long_elif_chain() -> None:
+    # Code review of 8fca7d6aee: the search for a ``break`` took two calls per arm, so typed-only
+    # mode refused as "nested too deeply" an edit the default mode makes.
+    arms = "".join(
+        f"        {'if' if i == 0 else 'elif'} pending(msg) == {i}:\n            continue\n"
+        for i in range(600)
+    )
+    src = (
+        '@handler("H")\ndef h(msg):\n    msg.set("A", "1")\n    while pending(msg):\n'
+        + arms
+        + '    msg.set("B", "2")\n    msg.set("C", "3")\n'
+    )
+    edit = _edit("set_params", len(src.splitlines()), params={"value": "9"})
+    assert rewrite_source(src, edit, typed_only=True) == rewrite_source(src, edit) != src

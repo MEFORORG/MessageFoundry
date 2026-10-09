@@ -3029,9 +3029,9 @@ def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, level: int = _DEAD)
     context manager may swallow an exception and let control fall through:
 
     * ``_DEAD``, surely terminal: one context manager, with no ``as`` target or a plain name,
-      and a first body statement that is a ``break``, a ``continue``, or a ``return`` of nothing,
-      a constant or a name. Nothing there can raise inside the ``with``. Any other target can:
-      binding it unpacks, or sets an attribute or an item;
+      and a first body statement that is a ``break``, a ``continue``, or a ``return`` of nothing
+      or a constant. Nothing there can raise inside the ``with``. Any other target can: binding
+      it unpacks, or sets an attribute or an item. A returned name can too, when it is unbound;
     * ``_COUNTED_DEAD``, counted as terminal: the first body statement is a ``return``, ``break``
       or ``continue``, or another such ``with``. Working out the returned value, or entering an
       inner manager, could still raise;
@@ -3090,11 +3090,10 @@ def _is_terminal(stmt: ast.stmt, *, raise_ends: bool = True, level: int = _DEAD)
 
 
 def _returns_without_raising(stmt: ast.stmt) -> bool:
-    """Whether ``stmt`` is a ``return`` whose value cannot raise: none, a constant or a name. Any
-    other statement passes, since only a ``return`` works out a value."""
-    if not isinstance(stmt, ast.Return):
-        return True
-    return stmt.value is None or isinstance(stmt.value, ast.Constant | ast.Name)
+    """Whether ``stmt`` is a ``return`` whose value cannot raise: none or a constant. A name can,
+    when no binding of it has run. Any other statement passes, since only a ``return`` works out
+    a value."""
+    return not isinstance(stmt, ast.Return) or isinstance(stmt.value, ast.Constant | None)
 
 
 def _is_always_true(test: ast.expr) -> bool:
@@ -3113,19 +3112,21 @@ def _is_irrefutable(pattern: ast.pattern) -> bool:
 
 
 def _breaks(stmts: list[ast.stmt]) -> bool:
-    """Whether ``stmts`` hold a ``break`` of the loop they are the body of."""
-    for stmt in stmts:
+    """Whether ``stmts`` hold a ``break`` of the loop they are the body of. It walks with a list
+    and no recursion, so a long ``elif`` chain in the loop costs no stack."""
+    pending = list(stmts)
+    while pending:
+        stmt = pending.pop()
         if isinstance(stmt, ast.Break):
             return True
         if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             continue
         if isinstance(stmt, ast.For | ast.AsyncFor | ast.While):
             # A ``break`` in an inner loop's body breaks that loop; one in its ``else`` breaks ours.
-            if _breaks(stmt.orelse):
-                return True
+            pending.extend(stmt.orelse)
             continue
-        if any(_breaks(suite) for _, suite, _ in _suites(stmt)):
-            return True
+        for _, suite, _ in _suites(stmt):
+            pending.extend(suite)
     return False
 
 
@@ -3610,6 +3611,7 @@ def rewrite_source(
                 tree, after_tree, row, role, f"{op} at lines {line_start}-{line_end}"
             )
         if typed_only:
+            too_deep = False
             try:
                 _refuse_typed_only_result(
                     tree,
@@ -3625,8 +3627,11 @@ def rewrite_source(
                     line_end,
                 )
             except RecursionError:
-                # A check that cannot finish refuses the edit; it never crashes the rewrite.
-                raise _typed_only_refusal(op, line_start, line_end, _TOO_DEEP) from None
+                # A check that cannot finish refuses the edit. Raised below, outside the
+                # handler, so the refusal carries no chain.
+                too_deep = True
+            if too_deep:
+                raise _typed_only_refusal(op, line_start, line_end, _TOO_DEEP)
     return ("\ufeff" + result) if bom else result
 
 
