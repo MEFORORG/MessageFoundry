@@ -143,7 +143,7 @@ repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
 **The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
 it stands.
 
-### 1.1c Documentation is text a reader can reach without opening the source code — owner ruling, 2026-10-08
+### 1.1c What counts as documentation: a docstring or a code comment does not (owner ruling, 2026-10-08), and the method's reading of what does
 
 Some requirements ask what the application's documentation defines. This subsection says which text
 an assessor may count for them.
@@ -183,10 +183,14 @@ also accepts a decision kept in shared code.
 
 **What this ruling does not decide.** It leaves at least these alone:
 
-- It applies to requirements that ask what the documentation defines. It does not change what
-  counts as evidence that a control exists: code and tests remain evidence (§3).
-- It names which text may be counted. Rules 1 to 6 still grade the cell, and the ruling does not say
-  which verdict follows when no text counts.
+- This section applies to requirements that ask what the documentation defines. The owner ruled in
+  the context of such requirements. That scope is the Manager seat's reading of where the ruling
+  was given, and not the owner's words. The section does not change what counts as evidence that a
+  control exists: code and tests remain evidence (§3).
+- This section lists what counts and what does not. The owner's ruling supplied two items of the
+  do-not-count list, the docstring and the code comment. The rest is the Manager seat's reading.
+  Rules 1 to 6 still grade the cell, and the ruling does not say which verdict follows when no text
+  counts.
 - Some text is two things at once, such as a docstring that a command prints as its help. It sits
   on both lists, and the ruling does not address that case. Until the owner rules, a lone assessor
   follows the §1.3 tie-breakers. Two assessors who disagree follow rule 6.
