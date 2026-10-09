@@ -1508,6 +1508,88 @@ def test_a_dataclass_that_is_a_dict_is_read_by_field_too() -> None:
     assert record.getMessage() == "1"
 
 
+@dataclasses.dataclass
+class _MappingContext(collections.abc.Mapping[str, object]):
+    stored: dict[str, object]
+
+    def __getitem__(self, key: str) -> object:
+        return self.stored[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.stored)
+
+    def __len__(self) -> int:
+        return len(self.stored)
+
+
+def test_a_dataclass_mapping_given_as_the_single_mapping_still_formats_by_key() -> None:
+    # Read only by attribute, so as the record's mapping it is left as it is with no filter: a
+    # note in its place is not a mapping, and "%(key)s" would raise from the log call.
+    held = _MappingContext({"a": 1, "e": _encode_error()})
+    record = _record("%(a)s", (held,))
+    prepare_log_record(record)
+    assert record.args is held
+    assert record.getMessage() == "1"
+    inside = _record("got %s end %d", (held, 1))  # as one argument of several it is a note
+    prepare_log_record(inside)
+    assert inside.getMessage() == "got [_MappingContext holding a codec error, not rendered] end 1"
+
+
+class _SlotError(Exception):
+    __slots__ = ("orig",)
+
+    def __init__(self, orig: object) -> None:
+        super().__init__("slot")
+        self.orig = orig
+
+    def __str__(self) -> str:
+        return f"slot {self.orig}"
+
+
+def test_a_slot_or_a_syntax_error_holding_a_unicode_error_is_a_note() -> None:
+    slotted = _SlotError(_encode_error())
+    assert "\\xe9" in str(slotted)  # control
+    assert redaction.safe_exc(slotted) == f"_SlotError: {_HOLDER}"
+    syntax = SyntaxError(_encode_error())
+    assert "\\xe9" in logging.Formatter().formatException((SyntaxError, syntax, None))  # control
+    assert redaction.safe_exc(syntax) == f"SyntaxError: {_HOLDER}"
+    out = safe_traceback((SyntaxError, syntax, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    assert f"SyntaxError: {_HOLDER}" in out
+    text: Any = _encode_error()  # .text is the source line; here it is the error itself
+    located = SyntaxError("bad token", ("feed.py", 3, 1, text))
+    out = safe_traceback((SyntaxError, located, None))
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+    plain = SyntaxError("bad token", ("feed.py", 3, 1, "x = (\n"))
+    ei = (SyntaxError, plain, None)
+    assert safe_traceback(ei) == logging.Formatter().formatException(ei)  # a clean one is unchanged
+
+
+def test_plain_exceptions_do_not_spend_the_attribute_budget() -> None:
+    crowd: list[object] = [_Outcome("a", _encode_error())]
+    crowd.extend(RuntimeError(i) for i in range(redaction._ATTRIBUTE_BUDGET + 50))
+    record = _record("got %d: %s", (len(crowd), crowd))
+    prepare_log_record(record)
+    text = record.getMessage()
+    assert "[_Outcome holding a codec error, not rendered]" in text
+    assert "caf" not in text
+
+
+def test_a_large_payload_on_an_exception_is_bounded_and_never_raises() -> None:
+    # safe_exc runs where errors are stored, so everything under the exception is charged.
+    error = RuntimeError("failed")
+    error.payload = [[i] for i in range(50_000)] + [_encode_error()]  # type: ignore[attr-defined]
+    scan = redaction._Scan(error, charged_root=True)
+    assert len(scan.nodes) <= redaction._ATTRIBUTE_BUDGET + 2
+    assert redaction.safe_exc(error) == "RuntimeError: failed"  # past the budget: as with no scan
+    wide = [[i] for i in range(50_000)] + [[_encode_error()]]
+    record = _record("got %s", (wide,))  # a builtin container's own elements are not charged
+    prepare_log_record(record)
+    assert "caf" not in record.getMessage()
+
+
 def test_the_attribute_walk_stops_at_its_budget_and_never_raises() -> None:
     # Past the budget an object is left as it is with no filter: a stated limit, pinned here.
     chain: object = _Outcome("leaf", _encode_error())

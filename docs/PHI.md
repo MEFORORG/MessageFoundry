@@ -1506,8 +1506,9 @@ applies in a traceback, as a log argument, in `safe_exc()` and `codec_safe_str()
 text a sandboxed Handler reports across the process boundary. An exception that only stores the
 error, and never prints it, loses its own message the same way.
 
-The filter reads at most 512 objects by attribute in one argument. Past that it leaves the rest
-as they are.
+The filter follows at most 4,096 objects reached through an attribute in one argument, at any
+depth. Past that it leaves the rest as they are, and which ones those are is not defined. A list
+or dict's own elements are not counted.
 
 **What stays the caller's job, at least:**
 
@@ -1518,8 +1519,7 @@ as they are.
   what it returns.
 - **Objects the filter does not read.** At least a `MappingProxyType`, a `slice`, and an object of
   your own class that is not a dataclass or an exception. An error held in one still prints raw,
-  and so does a dataclass or a list that holds such an object. The same goes for an exception
-  that keeps the error where only C code can reach it, such as a `SyntaxError`'s `msg`.
+  and so does a dataclass or a list that holds such an object.
 - **An argument that renders differently the second time.** The three later filters render the
   message again, so an object whose `__repr__` changes or raises on a later call can still raise
   from the log call, or print what the first step did not see.

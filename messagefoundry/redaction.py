@@ -76,6 +76,7 @@ from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
+from itertools import islice
 from string import ascii_lowercase, ascii_uppercase, whitespace
 from types import (
     BuiltinFunctionType,
@@ -90,14 +91,10 @@ from typing import Any
 __all__ = [
     "clamp_untrusted",
     "codec_safe_line",
-    "codec_safe_line",
-    "codec_safe_line",
     "codec_safe_str",
     "json_loads_or_refusal",
     "log_timestamp",
     "prepare_log_record",
-    "prints_a_codec_error",
-    "prints_a_codec_error",
     "prints_a_codec_error",
     "redact",
     "redact_untrusted",
@@ -2214,7 +2211,9 @@ def safe_traceback(ei: ExcInfo) -> str:
     the raw text, and ``tests/test_unicode_error_log_paths.py`` fails if the write stops landing.
 
     A different exception that HOLDS a Unicode error, as ``RuntimeError(exc)``, has the same
-    ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). One whose message
+    ``str()``. Its line prints its class and a fixed note (vault BACKLOG #3295). The stdlib prints
+    a ``SyntaxError`` from ``.msg``, ``.text`` and ``.filename`` instead, so those are replaced or
+    dropped on such a node. One whose message
     was built as text, ``RuntimeError(f"bad: {exc}")``, cannot be told from prose here: that is the
     third path, closed where the wrap is written."""
     value, tb = ei[1], ei[2]
@@ -2234,6 +2233,8 @@ def safe_traceback(ei: ExcInfo) -> str:
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
                 return safe_exc(value) if value is not None else ""
             node._str = line  # the stdlib's private name: see docstring
+            if isinstance(exc, SyntaxError):  # printed from these three, never from _str
+                node.msg, node.text, node.filename = line, None, None
         pending.append((node.__cause__, exc.__cause__))
         pending.append((node.__context__, exc.__context__))
         if node.exceptions:  # set only for an exception group the stdlib will expand
@@ -2321,13 +2322,11 @@ _EXC_ARGS: Any = BaseException.__dict__["args"]
 _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
 _DEQUE_MAXLEN: Any = deque.__dict__["maxlen"]
 _DEFAULT_FACTORY: Any = defaultdict.__dict__["default_factory"]
-#: What an ``OSError`` prints beside its ``.args``: none of the three need be in them.
-_OS_PRINTED: tuple[Any, ...] = tuple(
-    OSError.__dict__[name] for name in ("strerror", "filename", "filename2")
-)
-#: How many objects one scan reads by attribute. Past it the rest are left as they are with no
-#: filter, so a log argument that is a large graph of dataclasses cannot hold the logging thread.
-_ATTRIBUTE_BUDGET = 512
+#: How many objects one scan follows from an attribute, at any depth beneath it. Past it the
+#: rest are left as they are with no filter, so a log argument that is a large graph of
+#: dataclasses, or an exception carrying a large payload, cannot hold the logging thread or the
+#: event loop. Which objects are the ones left is not defined: the walk is not in print order.
+_ATTRIBUTE_BUDGET = 4096
 _TYPE_MRO: Any = type.__dict__["__mro__"]
 _TYPE_DICT: Any = type.__dict__["__dict__"]
 _NOT_FOUND: Any = object()
@@ -2352,8 +2351,10 @@ _SLOT_NAMES_MAX = 1024
 def _slot_names(kind: type[Any]) -> tuple[str, ...] | None:
     """The slots a render of a ``kind`` instance may print, or None when ``kind`` is not read by
     attribute. A dataclass's are its field names, since ``slots=True`` keeps each field in one; a
-    ``UserDict`` view's is the mapping it prints; an exception's own ``__str__`` may print any
-    attribute it set. The instance ``__dict__`` is read as well.
+    ``UserDict`` view's is the mapping it prints. An exception's are every slot its classes
+    define, the builtin ones included (an ``OSError``'s ``strerror`` and ``filename``, a
+    ``SyntaxError``'s ``msg`` and ``text``), since its ``__str__`` may print any of them. The
+    instance ``__dict__`` is read as well.
 
     The answer is kept per class, since this runs for every log argument that is not a scalar. A
     class made a dataclass after an instance of it was first logged keeps its first answer."""
@@ -2375,8 +2376,15 @@ def _read_slot_names(kind: type[Any]) -> tuple[str, ...] | None:
             return tuple(name for name in fields if type(name) is str)
         if base is MappingView:
             return ("_mapping",)
-        if base is SimpleNamespace or base is ChainMap or base is BaseException:
+        if base is SimpleNamespace or base is ChainMap:
             return ()
+        if base is BaseException:
+            return tuple(
+                name
+                for owner in _TYPE_MRO.__get__(kind)
+                for name, value in _TYPE_DICT.__get__(owner).items()
+                if type(value) is MemberDescriptorType and type(name) is str
+            )
     return None
 
 
@@ -2497,9 +2505,6 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     if issubclass(kind, BaseExceptionGroup):
         # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
         return [*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)]
-    if issubclass(kind, OSError):
-        # str() prints .strerror, and .filename and .filename2 by repr, whatever .args holds.
-        return [*_EXC_ARGS.__get__(arg), *(name.__get__(arg) for name in _OS_PRINTED)]
     if issubclass(kind, BaseException):
         return list(_EXC_ARGS.__get__(arg))  # str() and repr() print .args
     if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
@@ -2521,13 +2526,14 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
 
 def prints_a_codec_error(exc: BaseException) -> bool:
     """True when ``exc`` is not a ``UnicodeError`` but its own ``str()`` may print one (vault
-    BACKLOG #3295). It looks, at any depth, in at least: its ``.args``; the attributes in its
-    instance ``__dict__``, which a ``__str__`` of its own may print; its fields, when it is a
-    dataclass; and an ``OSError``'s ``.strerror``, ``.filename`` and ``.filename2``.
+    BACKLOG #3295). It looks in at least: its ``.args``; the attributes in its instance
+    ``__dict__`` and its slots, which a ``__str__`` of its own may print; and its fields, when it
+    is a dataclass.
 
-    IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least a ``SyntaxError``'s
-    ``.msg`` and ``.text``, another C-level attribute, an object of a class that is not read by
-    attribute, or text already built from the error.
+    IT IS NOT A PROOF THAT ``str(exc)`` IS SAFE. It does not read at least an object of a class
+    that is not read by attribute, text already built from the error, or anything past the
+    :data:`_ATTRIBUTE_BUDGET` objects it follows. Unlike a log argument, all of an exception's
+    contents count against that budget here, since this also runs where errors are stored.
 
     ``str(RuntimeError(exc))`` is ``str(exc)``, which names the character or byte, and
     ``str(ValueError("bad", exc))`` prints ``repr(exc)``, the whole input. A caller prints the
@@ -2545,7 +2551,7 @@ def prints_a_codec_error(exc: BaseException) -> bool:
         own_str: Any = kind.__str__
         if issubclass(kind, BaseExceptionGroup) and own_str is BaseExceptionGroup.__str__:
             return False
-        return id(exc) in _Scan(exc).holds
+        return id(exc) in _Scan(exc, charged_root=True).holds
     except Exception:  # noqa: BLE001 -- fail closed: it might
         return True
 
@@ -2559,20 +2565,25 @@ class _Scan:
     fails counts as holding an error: it might.
 
     An object read by attribute (:func:`_slot_names`) adds what its attributes hold to its
-    elements. A dataclass that is also an exception or a container has both. At most
-    :data:`_ATTRIBUTE_BUDGET` objects are read that way in one scan."""
+    elements. A dataclass that is also an exception or a container has both. What is reached
+    through an attribute, and everything beneath it, is CHARGED: one scan follows at most
+    :data:`_ATTRIBUTE_BUDGET` such objects. A builtin container's own elements are followed
+    without limit, as they were before any object was read by attribute. ``charged_root`` charges
+    everything beneath the root too."""
 
     __slots__ = ("holds", "nodes")
 
-    def __init__(self, root: Any) -> None:
+    def __init__(self, root: Any, *, charged_root: bool = False) -> None:
         # id -> (the object, its elements or None when unreadable, why it was unreadable). Holding
         # the object keeps its id from being reused while the walk runs.
         nodes: dict[int, tuple[Any, list[Any] | None, str]] = {}
         seeds: list[int] = []
-        pending = [root]
+        pending: list[Any] = [] if charged_root else [root]
+        charged: list[Any] = [root] if charged_root else []
         budget = _ATTRIBUTE_BUDGET
-        while pending:
-            arg = pending.pop()
+        while pending or charged:
+            is_charged = bool(charged)
+            arg = charged.pop() if is_charged else pending.pop()
             kind = type(arg)
             key = id(arg)
             if kind in _ARG_SCALARS or key in nodes:
@@ -2582,27 +2593,32 @@ class _Scan:
                 seeds.append(key)
                 continue
             walked = issubclass(kind, _ARG_WALKED)
-            slots = _slot_names(kind) if budget else None
+            slots = _slot_names(kind) if budget > 0 else None
             if not walked and slots is None:
                 continue
             try:
                 children = _children(arg, kind) if walked else []
-                if slots is not None:
-                    budget -= 1
-                    children += _attribute_values(arg, kind, slots)
+                held = _attribute_values(arg, kind, slots) if slots is not None else []
             except Exception as exc:  # noqa: BLE001 -- a log call must never raise; fail closed
                 nodes[key] = (arg, None, type(exc).__name__)
                 seeds.append(key)
                 continue
-            nodes[key] = (arg, children, "")
-            pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
+            nodes[key] = (arg, children + held, "")
+            if is_charged:
+                held = children + held
+            else:
+                pending.extend(child for child in children if type(child) not in _ARG_SCALARS)
+            if held and budget > 0:
+                follow = list(islice((c for c in held if type(c) not in _ARG_SCALARS), budget))
+                budget -= len(follow)
+                charged.extend(follow)
         self.nodes = nodes
         self.holds: set[int] = set()
         if not seeds:
             return
         parents: dict[int, list[int]] = {}
-        for key, (_arg, held, _why) in nodes.items():
-            for child in held or ():
+        for key, (_arg, elements, _why) in nodes.items():
+            for child in elements or ():
                 if id(child) in nodes:
                     parents.setdefault(id(child), []).append(key)
         self.holds.update(seeds)
@@ -2819,7 +2835,7 @@ class _Rebuild:
         kind = type(root)
         flat = self.scan.nodes[id(root)][1] or []
         if issubclass(kind, ChainMap):
-            return self._chain_pairs(flat)
+            return self._chain_pairs(root)
         if _slot_names(kind) is not None:
             return []  # a dataclass that is a mapping: its elements are not only keys and values
         if issubclass(kind, UserDict):
@@ -2827,52 +2843,23 @@ class _Rebuild:
             flat = (data[1] or []) if data is not None and issubclass(type(data[0]), dict) else []
         return _pairs([self.arg(child, 1) for child in flat])
 
-    def _chain_pairs(self, attributes: list[Any]) -> list[tuple[Any, Any]]:
+    def _chain_pairs(self, root: Any) -> list[tuple[Any, Any]]:
         """A ``ChainMap``'s plain-dict maps, last map first, so a later ``dict()`` of the pairs
         lets the first map win as the ChainMap's own lookup does. A map that is not read as a
-        plain dict contributes nothing."""
+        plain dict contributes nothing, and neither does a ``maps`` that is not a list."""
         nodes = self.scan.nodes
+        own_dict = _class_attribute(type(root), "__dict__")
+        if type(own_dict) is not GetSetDescriptorType:
+            return []
+        maps = dict.get(own_dict.__get__(root), "maps")
+        listed = nodes.get(id(maps)) if type(maps) is list else None
         found: list[tuple[Any, Any]] = []
-        for held in attributes:  # .maps is the one list among them
-            maps = nodes.get(id(held)) if type(held) is list else None
-            for mapping in reversed(maps[1] or []) if maps is not None else ():
-                kind = type(mapping)
-                node = nodes.get(id(mapping))
-                if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
-                    continue
-                found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
-        return found
-
-    def _chain_pairs(self, attributes: list[Any]) -> list[tuple[Any, Any]]:
-        """A ``ChainMap``'s plain-dict maps, last map first, so a later ``dict()`` of the pairs
-        lets the first map win as the ChainMap's own lookup does. A map that is not read as a
-        plain dict contributes nothing."""
-        nodes = self.scan.nodes
-        found: list[tuple[Any, Any]] = []
-        for held in attributes:  # .maps is the one list among them
-            maps = nodes.get(id(held)) if type(held) is list else None
-            for mapping in reversed(maps[1] or []) if maps is not None else ():
-                kind = type(mapping)
-                node = nodes.get(id(mapping))
-                if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
-                    continue
-                found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
-        return found
-
-    def _chain_pairs(self, attributes: list[Any]) -> list[tuple[Any, Any]]:
-        """A ``ChainMap``'s plain-dict maps, last map first, so a later ``dict()`` of the pairs
-        lets the first map win as the ChainMap's own lookup does. A map that is not read as a
-        plain dict contributes nothing."""
-        nodes = self.scan.nodes
-        found: list[tuple[Any, Any]] = []
-        for held in attributes:  # .maps is the one list among them
-            maps = nodes.get(id(held)) if type(held) is list else None
-            for mapping in reversed(maps[1] or []) if maps is not None else ():
-                kind = type(mapping)
-                node = nodes.get(id(mapping))
-                if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
-                    continue
-                found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
+        for mapping in reversed(listed[1] or []) if listed is not None else ():
+            kind = type(mapping)
+            node = nodes.get(id(mapping))
+            if node is None or not issubclass(kind, dict) or _slot_names(kind) is not None:
+                continue
+            found.extend(_pairs([self.arg(child, 1) for child in node[1] or []]))
         return found
 
 
@@ -2896,8 +2883,13 @@ def _safe_arg(arg: Any, depth: int) -> Any:
 
 def _safe_mapping_args(args: Any) -> Any:
     """The stdlib's single-mapping form, whose values are the arguments, at level 1."""
-    if not issubclass(type(args), _ROOT_MAPPINGS):
-        return _safe_arg(args, 0)  # a ConfigParser is untouched; a bare UnicodeError is replaced
+    kind = type(args)
+    if not issubclass(kind, _ROOT_MAPPINGS):
+        # A ConfigParser is untouched; a bare UnicodeError is replaced. So is an object read only
+        # by attribute: it may be a Mapping that "%(key)s" asks, and a note is not one.
+        if issubclass(kind, UnicodeError) or issubclass(kind, _ARG_WALKED):
+            return _safe_arg(args, 0)
+        return args
     scan = _Scan(args)
     if not scan.holds:
         return args
