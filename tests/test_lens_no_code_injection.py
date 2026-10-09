@@ -558,7 +558,8 @@ def test_the_reported_send_destination_payload_is_refused() -> None:
     [
         {"line_start": _IF, "line_end": _IF, "op": "insert_clause", "clause": "else", "test": "x"},
         {**_ELIF_RAW, "test": ""},
-        {**_IF_RAW, "template": "filter"},
+        # A filter here would strand the send below it (G.6 rule 8), so a loop stands in.
+        {**_IF_RAW, "template": "for_each", "segment_id": "OBX"},
     ],
     ids=["else-ignores-test", "empty-test", "non-if-template"],
 )
@@ -957,11 +958,31 @@ def test_typed_only_delete_walks_the_whole_chain(line: int, ok: bool) -> None:
             rewrite_source(_CHAINS, edit, typed_only=True)
 
 
-def test_typed_only_moves_a_typed_raise_row() -> None:
+def test_typed_only_refuses_a_typed_raise_row_moved_above_a_row() -> None:
+    # The raise would strand the block it passes (ADR 0076 G.6 rule 8); the default mode accepts it.
     rows = parse_source(_CHAINS)[0]["rows"]
     last = next(r for r in rows if r["line_start"] == 24)
     edit = {"line_start": 24, "line_end": last["line_end"], "op": "move_row", "direction": "up"}
-    assert rewrite_source(_CHAINS, edit, typed_only=True) != _CHAINS
+    assert rewrite_source(_CHAINS, edit) != _CHAINS
+    with pytest.raises(LensRewriteError, match="never runs"):
+        rewrite_source(_CHAINS, edit, typed_only=True)
+
+
+def test_typed_only_refuses_a_typed_row_dropped_into_an_untyped_block() -> None:
+    # A row that is not a return or raise, so only the untyped-block rule can refuse it.
+    src = _STRUCT.replace(
+        '    return Send("OB", msg)\n', '    msg.set("A", "1")\n    return Send("OB", msg)\n'
+    )
+    edit = {
+        "line_start": 12,
+        "line_end": 12,
+        "op": "move_row",
+        "to_line_start": 9,
+        "to_position": "after",
+    }
+    assert rewrite_source(src, edit) != src
+    with pytest.raises(LensRewriteError, match="does not show as typed"):
+        rewrite_source(src, edit, typed_only=True)
 
 
 def test_the_cli_typed_only_flag_refuses_moving_a_code_row(tmp_path: Path) -> None:

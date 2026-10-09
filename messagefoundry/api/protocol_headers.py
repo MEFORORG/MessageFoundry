@@ -70,17 +70,24 @@ handshake answer, on either WebSocket protocol, is a headers object the library 
 yet, so the override adds to that object.
 
 **Refuse at startup.** Each hook this module overrides is checked when the class is built,
-against the server class it is handed. The flags the two sans-I/O steps above read
-(``handshake_initiated``, ``handshake_exc``, ``eof_sent``) are NOT checked at build: a rename
-there turns those steps off silently, and only the startup self-test's parser-rejection drive would
-notice the first. The checked hooks are: the HTTP protocol's ``send_400_response``, its
+against the server class it is handed. So is every attribute the two sans-I/O steps above read
+or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
+error. That check sees a name that is no longer assigned. It cannot see a name the server still
+assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
+another object, and no test covers either case. The checked hooks are: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
-protocol they are ``data_received``, the ``conn`` attribute, and a synchronous ``send_response``
-and ``data_to_send`` on the ``ServerProtocol`` its module imports. The methods the floor wraps synchronously must still be
-synchronous. An attribute counts as present when a method of the server's own class for the hook
-using it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
+protocol they are ``data_received``, the ``conn``, ``transport``, ``handshake_initiated``,
+``handshake_complete`` and ``close_sent`` attributes, and on the ``ServerProtocol`` its module
+imports a synchronous ``send_response`` and ``data_to_send`` and the ``eof_sent`` and
+``handshake_exc`` attributes. The methods the floor wraps synchronously must still be
+synchronous. An attribute counts as present when some method assigns it, in the class handed in or
+in a base of it, down to the class that first defines the anchoring method each check names. For
+the HTTP and legacy hooks that anchor is uvicorn's own class. For the sans-I/O attributes it is
+``data_received`` on the protocol and ``data_to_send`` on the conn, whose first definers are
+``asyncio.Protocol`` and websockets' base ``Protocol``, so the whole of each class chain counts.
+A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
 installed uvicorn and websockets versions, and ``serve`` refuses to start on it. There is no
 fallback to the server's own protocol and no opt-out: a server that would answer below the floor
 without these headers does not start. So a WebSocket base that fits neither hook set (wsproto) is
@@ -330,6 +337,22 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
             raise _refusal(base, f"{_CONN_CLASS} in its module")
         _require_sync_method(conn_cls, "send_response")
         _require_sync_method(conn_cls, "data_to_send")
+        # The flags the two uvicorn-0.54 workarounds read. Each is read through getattr with a
+        # default that turns its step OFF, so a rename must refuse here and not pass in silence.
+        # data_to_send anchors the two conn flags: the conn class's own base defines it, and that
+        # base is where websockets assigns them.
+        _require_assigned(base, "handshake_initiated", hook="data_received")
+        # What the parser-rejection step WRITES, and where it writes the answer. The two flags
+        # go together: it sets handshake_complete, and with that set and close_sent NOT taking
+        # effect, uvicorn's shutdown sends a close frame on a conn that never opened, which
+        # raises InvalidState (measured at uvicorn 0.54.0). This proves each name is still
+        # ASSIGNED somewhere in the class chain, which catches a rename. It does not prove
+        # uvicorn still READS them; nothing does.
+        _require_assigned(base, "handshake_complete", hook="data_received")
+        _require_assigned(base, "close_sent", hook="data_received")
+        _require_assigned(base, "transport", hook="data_received")
+        _require_assigned(conn_cls, "eof_sent", hook="data_to_send")
+        _require_assigned(conn_cls, "handshake_exc", hook="data_to_send")
     else:
         _require_sync_method(base, "send_500_response")
         _require_assigned(base, "transport", hook="send_500_response")
@@ -464,7 +487,7 @@ def _send_floored_handshake_response(conn_ref: weakref.ref[Any], *args: Any, **k
         return
     try:
         # No named parameters, for the reason write_http_response below gives. At websockets 17.1
-        # it is (response).
+        # and 17.2 it is (response).
         response = kwargs["response"] if "response" in kwargs else args[0]
         _add_where_absent(response.headers)
     except Exception as exc:
@@ -492,9 +515,13 @@ def _answer_a_parser_rejection(protocol: Any) -> None:
 
     See the module docstring: uvicorn 0.54.0 leaves the answer unwritten and the connection open.
     The parser sets ``handshake_exc`` and yields no request, so uvicorn's ``handle_connect`` never
-    runs and ``handshake_initiated`` stays false. That pair is the whole test. The three flags are
-    set the way ``handle_connect`` sets them for a rejection, so uvicorn's ``shutdown`` reads the
-    connection as already answered."""
+    runs and ``handshake_initiated`` stays false. That pair is the whole test. This then sets
+    ``handshake_initiated``, ``handshake_complete`` and ``close_sent`` the way ``handle_connect``
+    sets them for a rejection, so uvicorn's ``shutdown`` takes its already-closed path and
+    a later ``data_received`` does not come back here. With none of the three set, ``shutdown``
+    would send a 500 that the conn hook drops, which also returns cleanly; with
+    ``handshake_complete`` set and ``close_sent`` not, it raises. So the three are set together,
+    and the class build requires all three, and ``transport``, to be assigned by the server."""
     try:
         conn = protocol.conn
         if getattr(protocol, "handshake_initiated", True):
@@ -612,7 +639,7 @@ def _build_floored_legacy_ws(base: type[Any]) -> type[asyncio.Protocol]:
         # absent, so the 101 and the denial, which the floor already covered, are not stamped twice.
         def write_http_response(self, *args: Any, **kwargs: Any) -> None:
             # No named parameters, so a changed signature reaches the server's own method
-            # unchanged instead of raising here. At 16.0 and at 17.1 it is
+            # unchanged instead of raising here. At 16.0, 17.1 and 17.2 it is
             # (status, headers, body=None).
             try:
                 _add_where_absent(kwargs["headers"] if "headers" in kwargs else args[1])

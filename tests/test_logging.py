@@ -748,6 +748,8 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
     # enforcement=warn, where that gate warns instead of refusing.
     for name in [n for n in os.environ if n.startswith("MEFOR_LOGGING_FORWARD_")]:
         monkeypatch.delenv(name)
+    # The provision also lists ITS collector for egress (BACKLOG #2356); this test lists its own.
+    monkeypatch.delenv("MEFOR_EGRESS_ALLOWED_SYSLOG", raising=False)
     # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet.
     (tmp_path / "messagefoundry.toml").write_text(
         'security.enforcement = "warn"\n'
@@ -759,6 +761,8 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
         "security.allow_unencrypted_phi = true\n"
         "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
         "alerts.security_notifications_required = false\n"
+        # The collector is an egress destination, refused at start unless listed (BACKLOG #2356).
+        'egress.allowed_syslog = ["127.0.0.1:5514"]\n'
         '[logging]\nforward_enabled = true\nforward_host = "127.0.0.1"\nforward_port = 5514\n'
         'forward_protocol = "udp"\nforward_format = "text"\n',
         encoding="utf-8",

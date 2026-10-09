@@ -7,8 +7,8 @@
   denial, and the `101`. It does so in one place,
   the `send_response` of the connection object the protocol hands each answer to. The legacy
   websockets server stays covered as before. wsproto is still refused. The lock moves uvicorn to
-  0.54.0. `websockets` gains an upper bound, `<18`, because the floor wraps two of its internals;
-  the lock stays at 17.1. The startup self-test drives whichever WebSocket class is served, and
+  0.54.0. `websockets` gains an upper bound, `<18`, because the floor wraps two of its internals.
+  The startup self-test drives whichever WebSocket class is served, and
   gains two drives: an app that closes before accepting, and an upgrade the websockets parser
   rejects. On this protocol the floor also does two things beyond adding headers, each a
   workaround for uvicorn 0.54.0 behaviour its legacy server did not have. It writes what the

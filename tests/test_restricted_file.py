@@ -741,6 +741,10 @@ def _supervise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[int, li
         service_config=None,
         project_root=str(tmp_path),
     )
+    # The supervisor runs serve's open-egress gate before it forwards (BACKLOG #2356).
+    from tests._phi_gate_provisions import setenv_declared_egress
+
+    setenv_declared_egress(monkeypatch)
     return cli._supervise(args), spawned
 
 

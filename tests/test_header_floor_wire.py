@@ -38,6 +38,7 @@ from typing import Any
 
 import pytest
 import uvicorn
+import websockets as websockets_package
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
@@ -66,7 +67,7 @@ from messagefoundry.pipeline import Engine
 _MEASURED_UVICORN = "0.54.0"
 #: The websockets library writes both WebSocket protocols' own handshake rejections, so it is
 #: pinned too.
-_MEASURED_WEBSOCKETS = "17.1"
+_MEASURED_WEBSOCKETS = "17.2"
 
 _HANDSHAKE = (
     "GET {path} HTTP/1.1\r\n"
@@ -424,6 +425,93 @@ def test_a_second_answer_on_an_ended_conn_is_dropped_not_asserted() -> None:
     assert floored.data_to_send() == []
 
 
+class _NeverLostTransport(asyncio.Transport):
+    """A transport whose close is never acknowledged: connection_lost is not delivered, as with a
+    TLS peer that withholds its close. The protocol stays in the server's connection set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.written = bytearray()
+        self.closing = False
+
+    def write(self, data: bytes | bytearray | memoryview) -> None:
+        self.written += data
+
+    def close(self) -> None:
+        self.closing = True
+
+    def is_closing(self) -> bool:
+        return self.closing
+
+    def pause_reading(self) -> None:
+        pass
+
+    def resume_reading(self) -> None:
+        pass
+
+
+async def _fed_and_still_open(
+    ws_class: type[Any], request: bytes
+) -> tuple[Any, _NeverLostTransport]:
+    """A WebSocket protocol that has been handed ``request`` and given time to answer, on a
+    transport whose close is never acknowledged."""
+    from uvicorn.server import ServerState
+
+    config = uvicorn.Config(_raises, ws=ws_class, lifespan="off", log_config=None)
+    protocol = ws_class(config=config, server_state=ServerState(), app_state={})
+    transport = _NeverLostTransport()
+    protocol.connection_made(transport)
+    protocol.data_received(request)
+    for _ in range(50):
+        if transport.closing:
+            break
+        await asyncio.sleep(0)
+    return protocol, transport
+
+
+@pytest.mark.parametrize(
+    ("request_bytes", "status", "bare_answers"),
+    [
+        # uvicorn's own pre-handshake 500: both classes answer, and the bare one then asserts.
+        pytest.param(_HANDSHAKE.format(path="/ws/stats").encode(), 500, True, id="app-error-500"),
+        # A parser rejection: the bare class never answers, and asserts at stop all the same.
+        pytest.param(_LONG_LINE_UPGRADE, 414, False, id="parser-rejection-414"),
+    ],
+)
+async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
+    request_bytes: bytes, status: int, bare_answers: bool
+) -> None:
+    """What uvicorn's Server.shutdown does to each connection still in its set: call
+    ``shutdown()``. On the bare sans-I/O class that sends a 500 on a conn that has already ended
+    its stream, and websockets asserts, which is the control. On the floored class the connection
+    was answered and marked so, nothing more is written, and the call returns."""
+    bare, bare_transport = await _fed_and_still_open(WebSocketsSansIOProtocol, request_bytes)
+    assert bool(bare_transport.written) is bare_answers
+    with pytest.raises(AssertionError) as stopped:
+        bare.shutdown()
+    # The websockets PACKAGE, by directory: uvicorn's own file is named websockets_sansio_impl.
+    raised_in = Path(str(stopped.traceback[-1].path)).resolve()
+    library = Path(websockets_package.__file__).resolve().parent
+    assert library in raised_in.parents, f"shutdown raised outside websockets: {raised_in}"
+
+    floored_class = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
+    assert floored_class is not None
+    floored, transport = await _fed_and_still_open(floored_class, request_bytes)
+    written = bytes(transport.written)
+    assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
+    assert b"nosniff" in written and transport.closing
+    if not bare_answers:
+        # The parser-rejection step set these itself; uvicorn never ran handle_connect.
+        assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
+            True,
+            True,
+            True,
+        )
+        floored.data_received(b"more bytes after the rejection")  # no second pass, no raise
+    floored.shutdown()
+    assert bytes(transport.written) == written
+
+
 async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() -> None:
     """The control, and a pin on uvicorn's own behaviour at the measured version: no answer, the
     connection left open, and a server stop that raises from inside websockets. If this fails,
@@ -451,8 +539,9 @@ async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() 
         if writer is not None:
             writer.close()
     assert answered is False, "the bare protocol answered; uvicorn changed this path"
-    raised_in = str(stopped.traceback[-1].path)
-    assert "websockets" in raised_in, f"the stop raised somewhere else: {raised_in}"
+    raised_in = Path(str(stopped.traceback[-1].path)).resolve()
+    library = Path(websockets_package.__file__).resolve().parent
+    assert library in raised_in.parents, f"the stop raised outside websockets: {raised_in}"
 
 
 def test_the_sans_io_websocket_protocol_is_floored() -> None:
@@ -722,7 +811,7 @@ def test_a_changed_conn_writer_signature_reaches_the_library_unchanged(
 def test_a_changed_handshake_writer_signature_reaches_the_server_unchanged(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Degrade on a signature change: a writer called with one argument, where 16.0 and 17.1
+    """Degrade on a signature change: a writer called with one argument, where 16.0, 17.1 and 17.2
     pass (status, headers, body), must still write, not raise inside the override."""
     written: list[tuple[Any, ...]] = []
 
@@ -816,19 +905,40 @@ def _fake_ws(drop: str | None) -> type[Any]:
     return type("FakeWebSocketProtocol", (asyncio.Protocol,), members)
 
 
-def _sets_conn(self: Any) -> None:
-    self.conn = None
+def _init_assigning(*attrs: str) -> Any:
+    """An ``__init__`` that assigns each of ``attrs`` with a literal ``self.<name> = None``. Built
+    from source because the floor's check reads the assignment in the bytecode, which a
+    ``setattr`` loop would not contain."""
+    assert all(attr.isidentifier() for attr in attrs), attrs
+    body = "".join(f"    self.{attr} = None\n" for attr in attrs) or "    pass\n"
+    scope: dict[str, Any] = {}
+    exec(f"def __init__(self):\n{body}", scope)  # noqa: S102  # nosec B102 - fixed test source
+    return scope["__init__"]
+
+
+#: What uvicorn's sans-I/O protocol assigns that the floor reads or writes, and what websockets'
+#: conn assigns that it reads. A drop of one of these names leaves the rest assigned.
+_SANSIO_PROTOCOL_ATTRS = (
+    "conn",
+    "transport",
+    "handshake_initiated",
+    "handshake_complete",
+    "close_sent",
+)
+_SANSIO_CONN_ATTRS = ("eof_sent", "handshake_exc")
 
 
 _FAKE_SANSIO_MODULE = "tests._fake_uvicorn_sansio_module"
 
 
 def _fake_sansio_ws(drop: str | None, monkeypatch: pytest.MonkeyPatch | None = None) -> type[Any]:
-    """A WebSocket protocol shaped like uvicorn's sans-I/O one with ``drop`` removed: it keeps a
-    ``conn``, has no ``write_http_response``, and its module names a ``ServerProtocol`` whose
-    ``send_response`` is synchronous. ``monkeypatch`` registers that module; without it the class
+    """A WebSocket protocol shaped like uvicorn's sans-I/O one with ``drop`` removed: it assigns
+    ``_SANSIO_PROTOCOL_ATTRS``, has no ``write_http_response``, and its module names a
+    ``ServerProtocol`` that assigns ``_SANSIO_CONN_ATTRS`` and whose ``send_response`` and
+    ``data_to_send`` are synchronous. ``monkeypatch`` registers that module; without it the class
     lives in a module that was never imported, which is the ``ServerProtocol`` drop."""
-    conn_members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE}
+    conn_init = _init_assigning(*(attr for attr in _SANSIO_CONN_ATTRS if attr != drop))
+    conn_members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE, "__init__": conn_init}
     if drop != "send_response":
         conn_members["send_response"] = _async_hook if drop == "sync send_response" else _writes
     if drop != "data_to_send":
@@ -839,7 +949,8 @@ def _fake_sansio_ws(drop: str | None, monkeypatch: pytest.MonkeyPatch | None = N
             module.ServerProtocol = type("ServerProtocol", (), conn_members)  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, _FAKE_SANSIO_MODULE, module)
     # No send_500_response: the sans-I/O floor does not use it, so it must not be required.
-    members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE, "__init__": _sets_conn}
+    init = _init_assigning(*(attr for attr in _SANSIO_PROTOCOL_ATTRS if attr != drop))
+    members: dict[str, Any] = {"__module__": _FAKE_SANSIO_MODULE, "__init__": init}
     if drop == "sync data_received":
         members["data_received"] = _async_hook
     return type("FakeSansIOProtocol", (asyncio.Protocol,), members)
@@ -861,6 +972,16 @@ def test_the_complete_fakes_build(monkeypatch: pytest.MonkeyPatch) -> None:
         ("send_response", "synchronous send_response method"),
         ("sync send_response", "synchronous send_response method"),
         ("data_to_send", "synchronous data_to_send method"),
+        # The flags the two uvicorn-0.54 workarounds read. A rename would otherwise turn a
+        # workaround off with no error: the drop of a second answer reads eof_sent.
+        ("eof_sent", "eof_sent attribute"),
+        ("handshake_exc", "handshake_exc attribute"),
+        ("handshake_initiated", "handshake_initiated attribute"),
+        # What the parser-rejection step WRITES so uvicorn's shutdown reads the connection as
+        # answered, and the transport it writes the answer to.
+        ("handshake_complete", "handshake_complete attribute"),
+        ("close_sent", "close_sent attribute"),
+        ("transport", "transport attribute"),
     ],
 )
 def test_a_sans_io_base_missing_a_hook_is_refused(
