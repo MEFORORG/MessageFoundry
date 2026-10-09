@@ -4550,10 +4550,12 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
         service_config=None,
         project_root=str(tmp_path),
     )
-    # The supervisor runs serve's open-egress gate before it forwards (BACKLOG #2356).
+    # The supervisor runs serve's open-egress gate before it forwards (BACKLOG #2356). Its
+    # logging setup is stubbed, so no forwarder is built and no collector name is resolved.
     from tests._phi_gate_provisions import setenv_declared_egress
 
     setenv_declared_egress(monkeypatch)
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
     assert cli._supervise(args) == 0
 
     assert at_spawn["cert"] != old  # renewed BEFORE the fleet was spawned
@@ -4624,10 +4626,12 @@ def test_supervise_renews_the_pair_the_shards_will_serve_under_a_file_set_base_d
         service_config=str(service),
         project_root=None,
     )
-    # The supervisor runs serve's open-egress gate before it forwards (BACKLOG #2356).
+    # The supervisor runs serve's open-egress gate before it forwards (BACKLOG #2356). Its
+    # logging setup is stubbed, so no forwarder is built and no collector name is resolved.
     from tests._phi_gate_provisions import setenv_declared_egress
 
     setenv_declared_egress(monkeypatch)
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
     assert cli._supervise(args) == 0
     assert cert.read_bytes() != old
     assert not (elsewhere / _GENERATED_CERT_NAME).exists()

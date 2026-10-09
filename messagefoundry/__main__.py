@@ -1866,16 +1866,20 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     return str(_forward_spool_root(settings, str(store_path)) / "supervisor")
 
 
-def _open_egress_gate(
+def _forwarder_posture_refused(
     settings: ServiceSettings, *, production: bool, env_name: str, enforcing: bool
-) -> tuple[bool, bool]:
-    """The open-egress posture gate (Q5b). Returns whether the start is refused, and whether the
-    operator wrote ``[security].block_unlisted_outbound``.
+) -> bool:
+    """The three posture steps ``serve`` takes last before it configures logging. Returns whether
+    the start is refused; the refusal is already on stderr.
 
-    One body for ``serve`` and ``supervise`` (BACKLOG #2356). It reads settings only, and the
-    state it refuses is the one in which an empty ``[egress].allowed_syslog`` is unrestricted, so
-    the supervisor must not install its forwarder past it. ``_serve`` holds the reasoning, above
-    its call."""
+    One body for ``serve`` and ``supervise`` (BACKLOG #2356), in serve's order: the open-egress
+    gate (Q5b), the announcement or AUDIT line for ``[security].block_unlisted_outbound``, and the
+    production DEBUG refusal. All three read settings only, so every engine shard reaches the
+    same verdict. The supervisor needs the middle one for its own sake: under the audited opt-out
+    an empty ``[egress].allowed_syslog`` allows any collector, and that AUDIT line is the record
+    of it. The open-egress gate does not refuse every such state; a start with another
+    ``[egress]`` list declared passes it. ``_serve`` holds the reasoning for the gate, above its
+    call."""
     eg = settings.egress
     listed = (
         eg.allowed_mllp
@@ -1918,7 +1922,7 @@ def _open_egress_gate(
                     f"with per-transport [egress].allowed_* allowlists.{mail_only_note}",
                     file=sys.stderr,
                 )
-                return True, deny_written
+                return True
             print(
                 "warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
                 f"({env_name!r}) — a transform may send to any destination. Set "
@@ -1935,7 +1939,7 @@ def _open_egress_gate(
                     "[egress].allowed_* allowlists.",
                     file=sys.stderr,
                 )
-                return True, deny_written
+                return True
             print(
                 f"warning: no outbound destination is declared on a {tier} — "
                 "[security].block_unlisted_outbound is on by default, so every outbound will be "
@@ -1943,10 +1947,58 @@ def _open_egress_gate(
                 "[egress].allowed_* allowlists.",
                 file=sys.stderr,
             )
-    return False, deny_written
+
+    # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
+    # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
+    # [egress].allowed_* list is EMPTY refuses every destination of that type, including on a
+    # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
+    # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
+    # and this block only announces the posture, or audits the explicit opt-out. No instance is
+    # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
+    # staging instance is held to it exactly as a production one is.
+    if not deny_written:
+        # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
+        # like the sibling posture gates rather than logging.info.
+        print(
+            f"info: [security].block_unlisted_outbound defaulted ON for a "
+            f"{'production ' if production else ''}PHI instance "
+            f"({env_name!r}) — a transport with an empty [egress].allowed_* list now refuses every "
+            "destination of that type (secure-by-default). Declare the permitted destinations per "
+            "transport, or set [security].block_unlisted_outbound=false to restore allow-any.",
+            file=sys.stderr,
+        )
+    elif not settings.egress.deny_by_default:
+        # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
+        # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
+        # line is WARNING-level so the root lastResort handler still surfaces it before
+        # configure_logging.
+        logging.getLogger(__name__).warning(
+            "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
+            "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
+            "send to ANY destination of that type); the secure-by-default deny is opted out.",
+            "production " if production else "",
+            env_name,
+        )
+        print(
+            f"warning: [security].block_unlisted_outbound=false on a "
+            f"{'production ' if production else ''}PHI instance ({env_name!r}) "
+            "— a transport with an empty [egress].allowed_* list may send PHI to ANY destination of "
+            "that type. Remove the override (or set it true) to fail closed.",
+            file=sys.stderr,
+        )
+
+    # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
+    # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
+    # instance may use DEBUG for diagnostics. The predicate is shared with the run-time setter behind
+    # PATCH /logging/level, so a production instance refused DEBUG here is refused it there too
+    # (vault BACKLOG #2777).
+    if level_refused_on_production(settings.logging.level, production=production):
+        print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
+        return True
+    return False
 
 
-def _managed_identity_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
+def _managed_identity_refused(settings: ServiceSettings, *, enforcing: bool) -> bool:
     """The ``[store].require_managed_identity`` precondition (#203). Returns whether the start is
     refused. One body for ``serve`` and ``supervise`` (BACKLOG #2356): the supervisor opens the
     store itself when it renews the API pair, and every engine shard would refuse."""
@@ -1964,6 +2016,52 @@ def _managed_identity_gate(settings: ServiceSettings, *, enforcing: bool) -> boo
         file=sys.stderr,
     )
     return False
+
+
+def _sqlserver_extra_refused(settings: ServiceSettings) -> bool:
+    """Whether the SQL Server backend is chosen without its driver installed; the refusal is then
+    on stderr. One body for ``serve`` and ``supervise`` (BACKLOG #2356)."""
+    import importlib.util
+
+    from messagefoundry.config.settings import StoreBackend
+
+    if settings.store.backend is not StoreBackend.SQLSERVER:
+        return False
+    if importlib.util.find_spec("aioodbc") is not None:
+        return False
+    print(
+        "error: the SQL Server backend needs the 'sqlserver' extra: "
+        "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _environment_or_refusal(
+    settings: ServiceSettings, *, fleet: str = ""
+) -> tuple[str, bool] | None:
+    """The active environment's name and production tier, or ``None`` with the refusal on stderr.
+
+    The environment gate (ADR 0017), one body for ``serve`` and ``supervise`` (BACKLOG #2356):
+    a name is required, and a custom name needs an explicit production tier. ``fleet`` is the
+    sentence the supervisor adds after serve's own words."""
+    env_name = settings.ai.environment
+    refusal: str | None = None
+    production = False
+    if env_name is None:
+        refusal = _NO_ACTIVE_ENVIRONMENT
+    else:
+        try:
+            production = settings.ai.require_posture()
+        except ValueError as exc:
+            refusal = str(exc)
+    if refusal is None:
+        assert env_name is not None
+        return env_name, production
+    if fleet:
+        refusal = f"{refusal if refusal.endswith('.') else refusal + '.'} {fleet}"
+    print(f"error: {refusal}", file=sys.stderr)
+    return None
 
 
 #: The refusal ``serve`` and ``supervise`` share when no environment is named (ADR 0017).
@@ -2359,16 +2457,8 @@ def _serve(args: argparse.Namespace) -> int:
     # ONCE: a second copy is how the ASVS 11.7.1 and 6.3.3 arms once disagreed about one boot (#326).
     instance_exposed = not settings.api.host_is_browser_origin
 
-    if settings.store.backend is StoreBackend.SQLSERVER:
-        import importlib.util
-
-        if importlib.util.find_spec("aioodbc") is None:
-            print(
-                "error: the SQL Server backend needs the 'sqlserver' extra: "
-                "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)",
-                file=sys.stderr,
-            )
-            return 2
+    if _sqlserver_extra_refused(settings):
+        return 2
 
     # Active environment is REQUIRED (ADR 0017): no silent default, so a missing env can never resolve
     # another environment's values/secrets. Its production TIER is derived for the built-in names
@@ -2377,15 +2467,10 @@ def _serve(args: argparse.Namespace) -> int:
     # (BACKLOG #1279).
     from messagefoundry.config.ai_policy import SecurityEnforcement
 
-    if settings.ai.environment is None:
-        print(f"error: {_NO_ACTIVE_ENVIRONMENT}", file=sys.stderr)
+    environment = _environment_or_refusal(settings)
+    if environment is None:
         return 2
-    try:
-        production = settings.ai.require_posture()
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    env_name = settings.ai.environment
+    env_name, production = environment
 
     # The security REFUSE/WARN dial (this refactor): the serve-gate posture gates + the ADR 0092 escape-
     # clamp key on this, NOT the production-tier `production` fact. ENFORCE (the secure default)
@@ -2421,7 +2506,7 @@ def _serve(args: argparse.Namespace) -> int:
     # turns this on and leaves a static credential is REFUSED, not warned. It downgrades to a warning
     # only under enforcement = warn. Off by default → byte-identical. Admin device posture and AD/SMTP
     # managed identity stay deployment-delegated (documented in docs/SECURITY.md), not engine-checked.
-    if _managed_identity_gate(settings, enforcing=enforcing):
+    if _managed_identity_refused(settings, enforcing=enforcing):
         return 2
 
     # Static-credential refusal (BACKLOG #1182, ASVS 13.2.1), OPT-IN and off by default (owner decision
@@ -2575,58 +2660,9 @@ def _serve(args: argparse.Namespace) -> int:
     # transport closed, so such an instance starts fail-closed. An instance that explicitly opted OUT
     # of deny-by-default is deliberately unchanged: it cannot satisfy this gate on smtp/direct alone,
     # because there the other six transports stay allow-any.
-    egress_refused, deny_written = _open_egress_gate(
+    if _forwarder_posture_refused(
         settings, production=production, env_name=env_name, enforcing=enforcing
-    )
-    if egress_refused:
-        return 2
-
-    # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
-    # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
-    # [egress].allowed_* list is EMPTY refuses every destination of that type, including on a
-    # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
-    # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
-    # and this block only announces the posture, or audits the explicit opt-out. No instance is
-    # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
-    # staging instance is held to it exactly as a production one is.
-    if not deny_written:
-        # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
-        # like the sibling posture gates rather than logging.info.
-        print(
-            f"info: [security].block_unlisted_outbound defaulted ON for a "
-            f"{'production ' if production else ''}PHI instance "
-            f"({env_name!r}) — a transport with an empty [egress].allowed_* list now refuses every "
-            "destination of that type (secure-by-default). Declare the permitted destinations per "
-            "transport, or set [security].block_unlisted_outbound=false to restore allow-any.",
-            file=sys.stderr,
-        )
-    elif not settings.egress.deny_by_default:
-        # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
-        # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
-        # line is WARNING-level so the root lastResort handler still surfaces it before
-        # configure_logging.
-        logging.getLogger(__name__).warning(
-            "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
-            "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
-            "send to ANY destination of that type); the secure-by-default deny is opted out.",
-            "production " if production else "",
-            env_name,
-        )
-        print(
-            f"warning: [security].block_unlisted_outbound=false on a "
-            f"{'production ' if production else ''}PHI instance ({env_name!r}) "
-            "— a transport with an empty [egress].allowed_* list may send PHI to ANY destination of "
-            "that type. Remove the override (or set it true) to fail closed.",
-            file=sys.stderr,
-        )
-
-    # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
-    # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
-    # instance may use DEBUG for diagnostics. The predicate is shared with the run-time setter behind
-    # PATCH /logging/level, so a production instance refused DEBUG here is refused it there too
-    # (vault BACKLOG #2777).
-    if level_refused_on_production(settings.logging.level, production=production):
-        print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
+    ):
         return 2
 
     # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
@@ -4666,25 +4702,19 @@ def _supervise(args: argparse.Namespace) -> int:
     if not _client_cert_shim_or_refusal(settings, *floor, "start the fleet")[0]:
         return 2
 
-    # The environment gate `serve` makes (ADR 0017, BACKLOG #2356): a name, and a production tier
-    # for it. Every engine shard would refuse on either, so the fleet is refused here in serve's
-    # words instead of being spawned.
-    env_name = settings.ai.environment
-    if env_name is None:
-        print(
-            f"error: {_NO_ACTIVE_ENVIRONMENT} Every engine shard would refuse to start; refusing "
-            "to start the fleet.",
-            file=sys.stderr,
-        )
+    # BACKLOG #2356: the two checks `serve` makes next, in its order. The SQL Server driver, then
+    # the environment gate (ADR 0017): a name, and a production tier for it. Every engine shard
+    # would refuse on each, so the fleet is refused here in serve's words instead of being
+    # spawned.
+    if _sqlserver_extra_refused(settings):
         return 2
-    try:
-        production = settings.ai.require_posture()
-    except ValueError as exc:
-        print(
-            f"error: {exc} Every engine shard would refuse to start; refusing to start the fleet.",
-            file=sys.stderr,
-        )
+    environment = _environment_or_refusal(
+        settings,
+        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
+    )
+    if environment is None:
         return 2
+    env_name, production = environment
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
@@ -4711,12 +4741,12 @@ def _supervise(args: argparse.Namespace) -> int:
             "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
         )
 
-    # BACKLOG #2356: the two credential gates `serve` makes next, in its order, so one config
-    # gets one refusal from both commands. The managed-identity gate, because the renewal below
+    # BACKLOG #2356: the two credential gates `serve` makes next, in its order. The
+    # managed-identity gate, because the renewal below
     # opens the store with the credential it judges. Then the settings half of the
     # static-credential gate: its `settings:logging.forward` hop is the collector this process
     # forwards to, and the half reads settings only, so every engine shard reaches this verdict.
-    if _managed_identity_gate(settings, enforcing=enforcing):
+    if _managed_identity_refused(settings, enforcing=enforcing):
         return 2
     sc_outcome, sc_refused = _static_credential_settings_gate(settings, enforcing=enforcing)
     if sc_refused:
@@ -4764,12 +4794,12 @@ def _supervise(args: argparse.Namespace) -> int:
     # The logging call is the bare one at the top plus the forwarder. `--env` is what each engine
     # shard is started with, so it names the environment here as well.
     #
-    # Last before it, the open-egress gate, where `serve` runs it. The state it refuses is the
-    # one in which an empty `[egress].allowed_syslog` is unrestricted.
-    egress_refused, _ = _open_egress_gate(
+    # Last before it, the posture steps `serve` takes there: the open-egress gate, the AUDIT line
+    # for the `block_unlisted_outbound` opt-out, and the production DEBUG refusal. The engine
+    # shards read `[logging].level` from the same settings, so each would refuse on it.
+    if _forwarder_posture_refused(
         settings, production=production, env_name=env_name, enforcing=enforcing
-    )
-    if egress_refused:
+    ):
         return 2
     forwarder_installed = False
 
@@ -4822,7 +4852,6 @@ def _supervise(args: argparse.Namespace) -> int:
             registry,
             acknowledged=settings.retention.allow_unbounded_phi,
             enforcing=enforcing,
-            # The engine shards take --env; the settings loaded here do not carry it.
             env_name=env_name,
         )
         if verdict.refusal is not None:

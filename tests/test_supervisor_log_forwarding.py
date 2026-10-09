@@ -258,23 +258,27 @@ class _NoteWatch(_Recorder):
         caplog: pytest.LogCaptureFixture,
         *,
         live: bool = True,
+        line: str = _NO_NAME_NOTE,
     ) -> None:
         super().__init__()
         self._capsys = capsys
         self._caplog = caplog
         self._live = live
+        self._line = line
         self.stderr_before_configure = ""
         self.logged_before_configure = 0
 
     def configure_logging(self, *args: Any, **kwargs: Any) -> bool:
         if "forward" in kwargs:
             self.stderr_before_configure += self._capsys.readouterr().err
-            self.logged_before_configure = len(_note_records(self._caplog))
+            self.logged_before_configure = len(_note_records(self._caplog, self._line))
         return super().configure_logging(*args, **kwargs) and self._live
 
 
-def _note_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if _NO_NAME_NOTE in r.getMessage()]
+def _note_records(
+    caplog: pytest.LogCaptureFixture, line: str = _NO_NAME_NOTE
+) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if line in r.getMessage()]
 
 
 def _no_host_name() -> str:
@@ -341,6 +345,12 @@ def test_a_fail_open_note_still_reaches_stderr_when_the_next_gate_refuses_the_st
 _NONSTATIC = "security.require_nonstatic_credentials = true\n"
 _FORWARD_HOP = "settings:logging.forward"
 _WARN = 'security.enforcement = "warn"\n'
+_SQL_SERVER_STORE = (
+    'store.backend = "sqlserver"\n'
+    'store.server = "db.invalid"\n'
+    'store.database = "mefor"\n'
+    'store.auth = "integrated"\n'
+)
 _OPEN_EGRESS = PHI_GATE_PROVISIONS_TOML.replace(
     "security.block_unlisted_outbound = true\n", "security.block_unlisted_outbound = false\n"
 )
@@ -409,18 +419,22 @@ def test_under_warn_the_supervisor_logs_the_static_credential_refusal_for_its_fo
 ) -> None:
     """Under ``enforcement = warn`` the gate warns on stderr and the start goes on. The refusal
     is then logged once the forwarder is installed, so the off-box copy has it, as in ``serve``."""
+    recorder = _NoteWatch(capsys, caplog, line=_FORWARD_HOP)
     with caplog.at_level("WARNING"):
-        rc, recorder = _run(
+        rc, _ = _run(
             "supervise",
             tmp_path,
             monkeypatch,
             _NONSTATIC + _WARN,
             verified_forwarding=True,
             client_cert=False,
+            recorder=recorder,
         )
     assert rc == 0 and recorder.spawned == 1 and len(recorder.forwards) == 1
-    assert f"{_FORWARD_HOP} (" in capsys.readouterr().err
-    logged = [r for r in caplog.records if _FORWARD_HOP in r.getMessage()]
+    assert f"{_FORWARD_HOP} (" in recorder.stderr_before_configure
+    # Not logged before the forwarder was installed, and once after it.
+    assert recorder.logged_before_configure == 0
+    logged = _note_records(caplog, _FORWARD_HOP)
     assert [r.name for r in logged] == ["messagefoundry.__main__"], logged
 
 
@@ -460,6 +474,81 @@ def test_the_supervisor_is_refused_by_the_managed_identity_gate_exactly_as_serve
     assert added == ""
 
 
+def test_the_supervisor_is_refused_a_production_debug_level_exactly_as_serve_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The engine shards read ``[logging].level`` from the settings the supervisor reads, and
+    each refuses DEBUG on a production instance. The supervisor's own level is fixed, so this
+    refusal is for the fleet."""
+    added = _refused_alike(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        "DEBUG",
+        toml='logging.level = "DEBUG"\n',
+        verified_forwarding=True,
+    )
+    assert added == ""
+
+
+def test_the_supervisor_is_refused_a_missing_sql_server_driver_exactly_as_serve_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` refuses the SQL Server backend without its driver before it reads the
+    environment, so no ``--env`` is passed here. The driver is stubbed away, and no database is
+    dialled: both commands refuse before they open the store."""
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **k: None if name == "aioodbc" else real_find_spec(name, *a, **k),
+    )
+    monkeypatch.delenv("MEFOR_AI_ENVIRONMENT", raising=False)
+    added = _refused_alike(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        "'sqlserver' extra",
+        toml=_SQL_SERVER_STORE,
+        verified_forwarding=True,
+        env=None,
+    )
+    assert added == ""
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_the_egress_opt_out_is_audited_by_the_process_that_forwards_under_it(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With ``block_unlisted_outbound`` written false and another list declared, the open-egress
+    gate passes and an empty ``allowed_syslog`` allows any collector. The AUDIT line is the
+    record of that state, so the supervisor writes it too before it forwards."""
+    with caplog.at_level("WARNING"):
+        rc, recorder = _run(
+            command,
+            tmp_path,
+            monkeypatch,
+            'egress.allowed_mllp = ["mllp.invalid:2575"]\n',
+            provisions=_OPEN_EGRESS,
+            verified_forwarding=True,
+            allowed_syslog=None,
+        )
+    assert rc == 0 and len(recorder.forwards) == 1
+    assert "warning: [security].block_unlisted_outbound=false" in capsys.readouterr().err
+    audit = [
+        r
+        for r in caplog.records
+        if "AUDIT: [security].block_unlisted_outbound=false" in r.getMessage()
+    ]
+    assert len(audit) == 1, audit
+
+
 _FLEET = " Every engine shard would refuse to start; refusing to start the fleet."
 
 
@@ -468,7 +557,7 @@ _FLEET = " Every engine shard would refuse to start; refusing to start the fleet
     [
         pytest.param(None, "no active environment set", id="no-environment"),
         pytest.param("qa", "no built-in security posture", id="no-production-tier"),
-        pytest.param("", "", id="empty-name"),
+        pytest.param("", "environment", id="empty-name"),
     ],
 )
 def test_the_supervisor_refuses_an_environment_serve_refuses_in_serves_words(
@@ -483,8 +572,9 @@ def test_the_supervisor_refuses_an_environment_serve_refuses_in_serves_words(
     supervisor refuses the fleet. It used to go on, and print ``(None)`` in its own refusals."""
     monkeypatch.delenv("MEFOR_AI_ENVIRONMENT", raising=False)
     added = _refused_alike(tmp_path, monkeypatch, capsys, needle, verified_forwarding=True, env=env)
-    # A name the settings refuse at load is one error for both; the gate adds why the fleet stops.
-    assert added == ("" if env == "" else _FLEET)
+    # A name the settings refuse at load is one error for both. The gate adds why the fleet
+    # stops, as a sentence of its own: serve's tier refusal ends with no full stop.
+    assert added == {None: _FLEET, "qa": "." + _FLEET, "": ""}[env]
 
 
 # --- forwarding not configured ------------------------------------------------------------------
