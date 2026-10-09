@@ -231,9 +231,11 @@ _INSTALLERS = (
 _KNOWN_UNWIRED: dict[str, str] = {
     "block-blanket-git-stage.ps1": (
         "BACKLOG #1339. Present and fully tested, wired nowhere. Owner ruled 2026-08-25 (relayed "
-        "via the Liaison) that it IS a control and is to be wired AFTER the quote-state splitter "
-        "repair -- wiring it before that shipped a false-deny class to every seat on every clone, "
-        "and that friction is what gets a control disarmed. The repair is BACKLOG #1341."
+        "via the Liaison) that it IS a control. The condition for wiring it is the owner's "
+        "acceptance of the blanket stages it still allows. Three owner answers are reported, and "
+        "docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5 lists the measured forms that none of "
+        "them covers. An older condition, the quote-state repair under BACKLOG #1341, no longer "
+        "applies: that repair was declined."
     ),
     "lane-level.ps1": "Not a PreToolUse guard; invoked directly by coordination scripts.",
     "steer-inject.ps1": "Opt-in steering channel, armed per-session rather than by a matcher.",

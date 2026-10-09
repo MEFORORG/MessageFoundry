@@ -714,9 +714,14 @@ ADDED_NOT_REPLACED = [
 # THE MEASURED FAIL-OPENS THAT ARE STILL OPEN, IN TWO TABLES. Each row stages or commits the whole
 # tree in a real shell and is ALLOWED. They are pinned the same way as the quote class above, and
 # for the same reason: the assertion demands the DENY, `strict` turns a repair into a visible
-# XPASS, and nobody can write today's ALLOW down as a requirement. Closing any of them needs a
-# quote-state parser, a program-position test, or knowledge of the working directory, or was built
-# and withdrawn on a measured false deny. The first two are declined (BACKLOG #1341, #1229).
+# XPASS, and nobody can write today's ALLOW down as a requirement.
+#
+# WHY EACH IS STILL OPEN DIFFERS BY ROW, so read the page before assuming a row cannot be closed.
+# Many need a quote-state parser or a program-position test, which are declined (BACKLOG #1341,
+# #1229), or the working directory, which the guard cannot see. Some were closed by a wider
+# reading that was then withdrawn. And some are plain reading mistakes that look closable and have
+# not been tried: the bare carriage return, the heredoc word with a dash, the arithmetic shift,
+# and the path that only needs normalising.
 #
 # WHICH TABLE A ROW SITS IN IS THE RECORD OF WHO ACCEPTED IT, so do not move a row without an
 # owner answer to cite. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the answers, the full
@@ -735,22 +740,17 @@ ACCEPTED_FAIL_OPENS = [
     ("Bash", "true && ! git add -A"),
     ("Bash", "time git add -A"),
     ("Bash", "FOO=1 git add -A"),
-    ("Bash", ">/dev/null git add -A"),
-    # answer 2 (b), a parent-directory pathspec: whole tree or scoped, by a directory the guard
-    # cannot see
+    # answer 2 (b), the parent directory from a subfolder: whole tree or scoped, by a directory
+    # the guard cannot see
     ("Bash", "cd sub && git add .."),
     ("Bash", "git -C sub add .."),
     ("Bash", "cd sub && git commit -m wip .."),
-    ("Bash", "git add sub/.."),
     # answer 2 (c), quoting the guard cannot read without quote state
     ("Bash", "git commit -m wip '.'"),
     ("PowerShell", "git commit '-a' -m wip"),
     ("Bash", 'git "add" -A'),
     ("Bash", '"git" add -A'),
     ("Bash", "git add $'-A'"),
-    ("Bash", f'git add "-{_BS}\nA"'),
-    ("Bash", f"git commit -m fix{_BS}(x ."),
-    ("Bash", 'echo "see <<EOF"\ngit add -A'),
     # answer 2 (d), the shell supplies the pathspec
     ("Bash", 'git add "$PWD"'),
     ("Bash", "git add ~+"),
@@ -760,6 +760,8 @@ ACCEPTED_FAIL_OPENS = [
     ("Bash", "(git add -A)"),
     ("Bash", "{ git add -A; }"),
     ("Bash", "echo $(git add -A)"),
+    # ... except in this row, where it is. This one is allowed because the closing bracket is
+    # glued to the flag; its control below has a space there and is denied.
     ("Bash", "(cd sub && git add -A)"),
     ("Bash", 'echo "$(git add -A)"'),
     ("Bash", "cat <<EOF\n$(git add -A)\nEOF"),
@@ -777,11 +779,11 @@ ACCEPTED_FAIL_OPENS = [
     # answer 3, form 4: a stage on a line after a bash here-string, which the heredoc reader blanks
     ("Bash", "cat <<<x\ngit add -A"),
     ("Bash", "cat <<<x\ngit commit -m wip ."),
+    ("Bash", 'read -r a b <<< "$line"\ngit commit -am wip'),
 ]
 
-# NOT ACCEPTED BY ANY OWNER ANSWER. No line in the three answers describes these rows, and they
-# are why the guard is not wired. The page lists them in section 5, with the nearest accepted line
-# for each.
+# NOT ACCEPTED BY ANY OWNER ANSWER. No line in the three answers describes these rows. The page
+# lists them in section 5, with the nearest accepted line for each.
 _NOT_ACCEPTED = pytest.mark.xfail(
     strict=True,
     reason="BACKLOG #1339: measured to stage the whole tree and allowed; under no owner answer, "
@@ -795,7 +797,14 @@ NOT_ACCEPTED_FAIL_OPENS = [
     ("Bash", "echo $((1<<n))\ngit add -A"),
     ("Bash", "git diff | git apply --cached"),
     # next to an accepted line whose words do not fit
+    ("Bash", ">/dev/null git add -A"),
     ("PowerShell", "<# note #> git add -A"),
+    ("Bash", "git add sub/.."),
+    ("PowerShell", "(git add -A)"),
+    ("Bash", f'git add "-{_BS}\nA"'),
+    ("Bash", 'echo "see <<EOF"\ngit add -A'),
+    ("Bash", f"git commit -m fix{_BS}(x ."),
+    ("Bash", "git commit -m $(echo wip | cat) :/"),
     ("Bash", "git commit -m $(echo wip | cat) -a"),
     ("Bash", "git commit -m `echo wip | cat` ."),
     ("Bash", "git commit -m $(true && echo wip) ."),
@@ -818,6 +827,9 @@ STILL_OPEN_CONTROLS = [
     ("PowerShell", "git commit -m wip <#note#> ."),
     ("PowerShell", "git commit -m wip <# note #> -a"),
     ("Bash", "git commit -m $(echo wip) ."),
+    ("Bash", "(cd sub && git add -A )"),
+    ("Bash", "{ cd sub; git add -A; }"),
+    ("Bash", f"git add -{_BS}\nA"),
     ("Bash", "cat <<<x; git add -A"),
     ("Bash", "cat <<EOF\nx\nEOF\ngit add -A"),
     ("Bash", "echo $((1 << 2))\ngit add -A"),
@@ -1013,7 +1025,14 @@ def test_a_payload_the_guard_cannot_read_allows(raw: str) -> None:
     assert_allowed(run_guard(raw))
 
 
-def test_a_readable_payload_with_no_tool_name_still_denies() -> None:
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"tool_input": {"command": "git add -A"}}',
+        '{"tool_name": "Bash", "tool_input": {"command": ["git", "add", "-A"]}}',
+    ],
+)
+def test_an_odd_payload_the_guard_can_still_read_denies(raw: str) -> None:
     """The control for the test above: the allow there comes from the payload being unreadable,
     and not from the guard allowing every odd payload."""
-    assert_denied(run_guard('{"tool_input": {"command": "git add -A"}}'))
+    assert_denied(run_guard(raw))
