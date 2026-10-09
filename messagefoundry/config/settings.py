@@ -2567,8 +2567,10 @@ class RetentionSettings(_Section):
     # attached PHI (#150 SetMeta), not disposition, so it can never outlive the body.
     # 0 = keep forever.
     messages_days: int = 0
-    # Past N days, null the bodies of DEAD (dead-lettered) outbound rows — their own window because a
-    # dead row stays replayable until its body is purged. 0 = keep forever.
+    # Past N days, null the bodies of DEAD (dead-lettered) rows at EVERY stage — their own window
+    # because a dead row stays replayable until its body is purged. A dead ingress or routed row
+    # carries the whole raw body, so the purge reaches it as well as a dead outbound row (#1188).
+    # 0 = keep forever.
     dead_letter_days: int = 0
     # Past N days, DELETE transform-state entries (ADR 0005) last written before the cutoff — keeps the
     # in-memory state cache + table bounded. A simple global age purge; per-namespace policy is a

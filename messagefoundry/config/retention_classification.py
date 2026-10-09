@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
+    from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.config.wiring import Registry
 
 
@@ -275,8 +276,246 @@ def unbounded_windows(read: object) -> tuple[RetentionWindow, ...]:
     return tuple(out)
 
 
+@dataclass(frozen=True, slots=True)
+class RetentionGateLine:
+    """One line the retention start gate writes before its verdict."""
+
+    #: ``True`` for a WARNING-level ``AUDIT:`` log record. ``False`` for a stderr line, which
+    #: already carries its ``info:`` or ``warning:`` prefix.
+    audit: bool
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionGateOutcome:
+    """What :func:`evaluate_retention_gate` decided, for its caller to emit."""
+
+    #: The refusal, without the ``error:`` prefix, or ``None`` when the instance may start.
+    refusal: str | None
+    #: The lines the gate writes, in order. A refusal comes after all of them.
+    lines: tuple[RetentionGateLine, ...]
+
+
+def _auto_bound_notice(defaulted: list[RetentionWindow], env_name: str) -> str:
+    """The notice for the windows the gate just defaulted, naming the bound each one took.
+
+    The bound is read from each window (vault BACKLOG #2369). While the windows share one bound
+    the notice names it once, as it always has; if they come to differ, each window carries its
+    own."""
+    bounds = {w.auto_bound_days for w in defaulted}
+    if len(bounds) == 1:
+        named = f"{', '.join(w.setting for w in defaulted)} defaulted ON ({bounds.pop()} days)"
+    else:
+        named = (
+            ", ".join(f"{w.setting} ({w.auto_bound_days} days)" for w in defaulted)
+            + " defaulted ON"
+        )
+    return (
+        f"info: {named} for a PHI instance ({env_name!r}) — these PHI tiers are now bounded at "
+        "rest (secure-by-default, ASVS 14.2.7). Set an explicit window to override, or "
+        f"{BODY_ACKNOWLEDGEMENT_SETTING}=true to retain indefinitely."
+    )
+
+
+def _outcome(refusal: str | None, lines: list[RetentionGateLine]) -> RetentionGateOutcome:
+    """The gate's result so far. A ``refusal`` that is not ``None`` stops the start."""
+    return RetentionGateOutcome(refusal=refusal, lines=tuple(lines))
+
+
+def evaluate_retention_gate(
+    settings: ServiceSettings, *, enforcing: bool, production: bool, env_name: str
+) -> RetentionGateOutcome:
+    """Decide the secure-by-default retention start gate (#186(a), ASVS 14.2.4/14.2.7).
+
+    ``serve`` and ``messagefoundry check`` both call this, so on the same settings they reach the
+    same verdict in the same words (vault BACKLOG #2280). It prints and logs nothing: the caller
+    emits :attr:`RetentionGateOutcome.lines` and then the refusal.
+
+    **It changes ``settings``.** Each auto-bounded window that is UNSET is set to its
+    ``auto_bound_days``, unless ``[security].allow_keeping_phi_indefinitely`` is set. ``serve``
+    relies on that: the same settings object later reaches the retention runner. A caller that
+    must keep its settings as loaded passes a copy.
+
+    ``RetentionSettings`` defaults every window to 0 (keep-forever) and the retention runner then
+    purges nothing, so an instance would accumulate PHI bodies indefinitely. The refuse/warn
+    split is ``[security].enforcement`` (``enforcing``), not the production tier, and no instance
+    is exempt as synthetic or dev. ``production`` only words the lines.
+
+    In order:
+
+    1. A classification shorter than :data:`MIN_PHI_RETENTION_WINDOWS` refuses, on either dial.
+    2. Each unset auto-bounded window takes its bound, with one ``info:`` notice. Only an UNSET
+       window is defaulted (``model_fields_set``), so an explicit value, an explicit 0 included,
+       is respected.
+    3. An auto-bounded window that is still unbounded, which now means an explicit 0 or the
+       acknowledgement: without the acknowledgement it refuses under ``enforce`` and warns under
+       ``warn``; with it, under ``enforce``, it warns and writes an ``AUDIT:`` line.
+    4. A warn-only tier that is unbounded with no acknowledgement of its own refuses under
+       ``enforce`` and warns under ``warn`` (BACKLOG #1967, owner ruling R4 (b) of 2026-09-24).
+       The body acknowledgement does not reach these tiers.
+    5. Each acknowledged warn-only tier writes an ``AUDIT:`` line.
+
+    A connection's own override is not read here. It is in the graph, and
+    :func:`make_retention_override_guard` judges it."""
+    # A FLOOR, not an emptiness check. `if not PHI_RETENTION_WINDOWS` passes for a one-element
+    # tuple, so a bad merge dropping most entries would leave this gate checking one window while
+    # reporting success.
+    if len(PHI_RETENTION_WINDOWS) < MIN_PHI_RETENTION_WINDOWS:
+        return RetentionGateOutcome(
+            refusal=(
+                f"the PHI retention classification has shrunk to "
+                f"{len(PHI_RETENTION_WINDOWS)} windows (floor {MIN_PHI_RETENTION_WINDOWS}); refusing "
+                "to start rather than gate on a partial classification. This is a build defect, not a "
+                "configuration one — see messagefoundry/config/retention_classification.py."
+            ),
+            lines=(),
+        )
+
+    lines: list[RetentionGateLine] = []
+    prod = "production " if production else ""
+
+    # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
+    # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
+    # `enforce` posture an unset window took the refusal below instead of a default.
+    #
+    # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset
+    # window used to REFUSE TO START, which forced an operator to choose a number. It now starts
+    # with 30. What survives is the fail-closed path for an EXPLICIT 0 — choosing keep-forever is
+    # still refused unless the audited opt-out is set. So "unbounded by accident" is still
+    # prevented; "unbounded by inattention" becomes "30 days by inattention".
+    #
+    # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
+    # omission: `purge_state` keys on a timestamp that only moves on a WRITE, so silently bounding
+    # it deletes live operational data a Handler is still reading. (`purge_search_presets` keys on
+    # last use since #306; the 2026-07-30 ruling still covers it.) Since BACKLOG #1967 they are not
+    # merely warned either: each needs a window or its own acknowledgement, below.
+    if not settings.retention.allow_unbounded_phi:
+        defaulted = [
+            w
+            for w in auto_bounded_windows()
+            if w.field not in getattr(settings, w.reads_from.strip("[]")).model_fields_set
+        ]
+        for window in defaulted:
+            setattr(
+                getattr(settings, window.reads_from.strip("[]")),
+                window.field,
+                window.auto_bound_days,
+            )
+        if defaulted:
+            lines.append(RetentionGateLine(False, _auto_bound_notice(defaulted, env_name)))
+
+    # REFUSE / WARN. `unbounded_windows` skips the tiers where 0 does not mean unbounded
+    # (`connection_event_retention_hours` INHERITS the body window; `uploads_retention_days` has a
+    # ge=1 floor so 0 is unrepresentable) and those whose `requires_setting` is unmet — with no
+    # [logging].log_dir there is nothing for the app-log sweep to sweep.
+    still_unbounded = unbounded_windows(settings)
+    refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
+    warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
+
+    if refusable:
+        windows_desc = ", ".join(w.setting for w in refusable)
+        if not settings.retention.allow_unbounded_phi:
+            if enforcing:
+                return _outcome(
+                    f"a data-retention window is explicitly disabled for {windows_desc} on "
+                    f"a {prod}PHI instance ({env_name!r}); refusing "
+                    "to start — PHI message bodies would be retained indefinitely (unbounded PHI "
+                    "at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of days "
+                    "(e.g. 30); or, to deliberately retain forever, set "
+                    f"{BODY_ACKNOWLEDGEMENT_SETTING}=true (audited).",
+                    lines,
+                )
+            lines.append(
+                RetentionGateLine(
+                    False,
+                    f"warning: no data-retention window is configured for {windows_desc} in a "
+                    f"PHI-carrying environment ({env_name!r}) — PHI message bodies accumulate "
+                    "without bound. Set the window(s) to bound PHI at rest (ASVS 14.2.4).",
+                )
+            )
+        elif enforcing:
+            # Explicit, audited override: unbounded PHI retention under strict enforcement.
+            lines.append(
+                RetentionGateLine(
+                    True,
+                    f"AUDIT: starting a {prod}PHI instance (environment {env_name!r}) with "
+                    f"unbounded data retention ({BODY_ACKNOWLEDGEMENT_SETTING}=true; "
+                    f"{windows_desc} = 0) — PHI message bodies are retained INDEFINITELY "
+                    "(retention opt-out override).",
+                )
+            )
+            lines.append(
+                RetentionGateLine(
+                    False,
+                    f"warning: {BODY_ACKNOWLEDGEMENT_SETTING}=true — a "
+                    f"{prod}PHI instance "
+                    f"({env_name!r}) retains PHI message bodies indefinitely ({windows_desc} "
+                    "unset). Configure a window to bound PHI at rest.",
+                )
+            )
+
+    # BACKLOG #1967, owner ruling R4 (b) of 2026-09-24 (ASVS 14.2.7): each warn-only tier needs a
+    # window OR its own acknowledgement. Under `enforce` a tier with neither REFUSES, naming the tier
+    # and its switch; under `warn` it warns, the refuse/warn split every posture gate here shares.
+    # An acknowledged tier starts and writes a WARNING-level AUDIT line naming it, in the shape of the
+    # keyless-PHI second ack. `allow_unbounded_phi` does not reach these: it covers the auto-bounded
+    # body tiers above, and one switch for every tier is what the ruling's "per-window" rules out.
+    # Placed AFTER the body-window gate so an explicit body 0, the PL-1 core, is reported first.
+    acknowledged = [w for w in warn_only if w.is_acknowledged(settings.security)]
+    unacknowledged = [w for w in warn_only if w not in acknowledged]
+    if unacknowledged:
+        # Naming the tier AND its protection level is the point: an operator who sees "PL-1" knows a
+        # full body is involved. Every warn-only tier that can read as unbounded has a switch, pinned
+        # by a test; one without would still refuse, offering only the window.
+        # A tier with a window caveat leads with its acknowledgement, because the window is the
+        # remedy the caveat advises against (#1188); every other tier leads with the window.
+        tiers = "; ".join(
+            (
+                f"{w.setting} ({w.level}): set {w.acknowledgement_setting}=true "
+                f"rather than a window -- {w.window_caveat}"
+            )
+            if w.window_caveat and w.acknowledgement_setting
+            else (
+                f"{w.setting} ({w.level}): set a window"
+                + (
+                    f", or set {w.acknowledgement_setting}=true"
+                    if w.acknowledgement_setting
+                    else ""
+                )
+            )
+            for w in unacknowledged
+        )
+        if enforcing:
+            return _outcome(
+                f"these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and would accumulate without bound; refusing to start, because each "
+                f"needs a window or its own audited acknowledgement (ASVS 14.2.7): {tiers}.",
+                lines,
+            )
+        lines.append(
+            RetentionGateLine(
+                False,
+                "warning: these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and will accumulate without bound. They are deliberately NOT "
+                "defaulted (owner ruling 2026-07-30); under enforcement=enforce this refuses to "
+                f"start: {tiers}.",
+            )
+        )
+    lines.extend(
+        RetentionGateLine(
+            True,
+            f"AUDIT: starting a {prod}PHI instance (environment {env_name!r}) with "
+            f"{window.setting} ({window.level}) unbounded, permitted because "
+            f"{window.acknowledgement_setting}=true -- that tier accumulates without bound "
+            "(retention acknowledgement, ASVS 14.2.7).",
+        )
+        for window in acknowledged
+    )
+    return _outcome(None, lines)
+
+
 #: The switch that acknowledges a connection's own keep-forever override. The same switch covers the
-#: global body windows; the ``serve`` gate for those spells it out in its own messages.
+#: global body windows, and :func:`evaluate_retention_gate` names it from this constant too.
 BODY_ACKNOWLEDGEMENT_SETTING: Final[str] = "[security].allow_keeping_phi_indefinitely"
 
 
@@ -313,8 +552,9 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
 def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
     """The refusal text for ``kept``, the non-empty result of :func:`keep_forever_overrides`.
 
-    Shared by the registry guard and ``connection upsert``, so an edit is refused in the words a
-    reload would use. ``env_name`` is ``None`` where no environment is active."""
+    :func:`judge_keep_forever_overrides` is its one caller, and the registry guard, ``check``,
+    ``supervise`` and ``connection upsert`` reach it through that, so an edit is refused in the
+    words a reload would use. ``env_name`` is ``None`` where no environment is active."""
     where = f" ({env_name!r})" if env_name is not None else ""
     # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
     # window on a tier where a window is the wrong answer, such as transform state.
@@ -328,6 +568,51 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
         f"on each of these windows that is unset: {auto_bounded}. Set each of them to an "
         "explicit number of days first"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class OverrideVerdict:
+    """What :func:`judge_keep_forever_overrides` decided about one graph."""
+
+    #: Why an enforcing instance refuses the graph, or ``None`` when it does not.
+    refusal: str | None
+    #: The line a graph load reports and still passes the graph: the ``AUDIT:`` line once
+    #: acknowledged, or the same reason as a warning under ``enforcement = warn``. Else ``None``.
+    report: str | None
+
+
+def judge_keep_forever_overrides(
+    registry: Registry, *, acknowledged: bool, enforcing: bool, env_name: str | None
+) -> OverrideVerdict:
+    """Decide a graph's keep-forever overrides: refuse, report, or neither.
+
+    The decision behind :func:`make_retention_override_guard`, ``messagefoundry check``, the
+    ``supervise`` pre-check and ``connection upsert`` and ``remove`` (vault BACKLOG #2368), so
+    each reaches the same verdict in the same words for the same registry and switches. It prints
+    and logs nothing.
+
+    ``acknowledged`` is the loaded ``[security].allow_keeping_phi_indefinitely``. With it the
+    graph passes and :attr:`OverrideVerdict.report` is the ``AUDIT:`` line, on either dial.
+    Without it an enforcing instance refuses, and under ``enforcement = warn`` the reason is
+    reported instead."""
+    kept = keep_forever_overrides(registry)
+    if not kept:
+        return OverrideVerdict(refusal=None, report=None)
+    if acknowledged:
+        return OverrideVerdict(
+            refusal=None,
+            report=(
+                f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
+                "graph with per-connection unbounded data retention "
+                f"({BODY_ACKNOWLEDGEMENT_SETTING}=true; {'; '.join(kept)}) -- once that graph is "
+                "live, these connections' PHI message bodies are retained INDEFINITELY (retention "
+                "opt-out override)."
+            ),
+        )
+    reason = keep_forever_override_refusal(kept, env_name=env_name)
+    if enforcing:
+        return OverrideVerdict(refusal=reason, report=None)
+    return OverrideVerdict(refusal=None, report=reason)
 
 
 def make_retention_override_guard(
@@ -346,9 +631,11 @@ def make_retention_override_guard(
     It is not a copy of the body-window gate. At least this differs: that gate writes its AUDIT
     line only under ``enforce``, and this guard writes one on either dial.
 
-    It runs only where the engine calls its registry guard. At least these do not:
-    ``Engine.add_registry`` called by an embedder, the DR re-apply path, and
-    ``messagefoundry check``.
+    It runs only where the engine calls its registry guard. At least these do not call it:
+    ``Engine.add_registry`` called by an embedder, and the DR re-apply path.
+    ``messagefoundry check`` and ``supervise`` do not call it either. Each reads the decision it
+    makes, :func:`judge_keep_forever_overrides`, and reports a refusal in its own way; neither
+    writes the AUDIT line.
 
     The AUDIT line is written each time the guard passes such a graph. That includes a dry-run
     reload, and a reload a later check then refuses, so the line says the gate passed the graph and
@@ -361,30 +648,18 @@ def make_retention_override_guard(
     Like the static-credential guard, it judges every graph against the settings the process started
     with: a reload re-reads the graph and never ``[security]``."""
 
-    def report(line: str) -> None:
-        log.warning("%s", line)
-        print(f"warning: {line}", file=sys.stderr)
-
     def guard(registry: Registry) -> None:
-        kept = keep_forever_overrides(registry)
-        if not kept:
-            return
-        if acknowledged:
-            report(
-                f"AUDIT: the retention gate on a PHI instance (environment {env_name!r}) passed a "
-                "graph with per-connection unbounded data retention "
-                f"({BODY_ACKNOWLEDGEMENT_SETTING}=true; {'; '.join(kept)}) -- once that graph is "
-                "live, these connections' PHI message bodies are retained INDEFINITELY (retention "
-                "opt-out override)."
-            )
-            return
-        reason = keep_forever_override_refusal(kept, env_name=env_name)
-        if enforcing:
+        verdict = judge_keep_forever_overrides(
+            registry, acknowledged=acknowledged, enforcing=enforcing, env_name=env_name
+        )
+        if verdict.report is not None:
+            log.warning("%s", verdict.report)
+            print(f"warning: {verdict.report}", file=sys.stderr)
+        if verdict.refusal is not None:
             # Imported here: wiring is the heavy end of the config package, and this module is
             # otherwise a leaf the settings model can read.
             from messagefoundry.config.wiring import WiringError
 
-            raise WiringError(reason)
-        report(reason)
+            raise WiringError(verdict.refusal)
 
     return guard

@@ -4560,6 +4560,9 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
         "env",
         "service_config",
         "project_root",
+        # Not handed to the engine shards: the supervisor calls it on the graph it loads (vault
+        # BACKLOG #2368), and build_shard_specs never sees it.
+        "registry_guard",
     }  # nothing new handed to the shards
     _load_pair(cert, tmp_path / "api-generated-key.pem")
 

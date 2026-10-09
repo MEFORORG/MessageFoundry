@@ -963,9 +963,10 @@ opt-in on a PHI instance**: each *unset* window that carries an auto-bound —
 `[security].enforcement` dials, and the defaulted settings are named on stderr. A window set
 **explicitly to `0`** is not defaulted: that **refuses to start (exit 2)** under `enforce`, and warns
 under `warn`. This paragraph used to state the opposite split — refusal under `enforce`, auto-bound
-only on a non-enforcing instance — which the shipped gate in
-[`__main__.py`](../messagefoundry/__main__.py) refutes; an *unset* window has not refused since the
-auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
+only on a non-enforcing instance — which the shipped gate
+(`evaluate_retention_gate` in
+[`retention_classification.py`](../messagefoundry/config/retention_classification.py)) refutes; an
+*unset* window has not refused since the auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
 derive PHI. The audited opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
 suppresses the auto-bound as well as the refusal. **Thirty days is the engine's floor against an
 accidentally unbounded window, not your retention policy — set each window to the number your site
@@ -977,6 +978,15 @@ acknowledgement. Under `enforce`, a tier with neither **refuses to start (exit 2
 names the tier and its switch. Under `warn` it warns and starts. A start under an acknowledgement writes
 a WARNING-level `AUDIT:` line naming the tier. `allow_keeping_phi_indefinitely` does not count for
 these tiers, and one tier's switch does not cover another.
+
+`messagefoundry check` runs this gate as a required check, `retention`, through the function
+`serve` calls. So a refusal fails the check in the words `serve` would print. It reads the settings
+file `check` resolves and the environment `check` runs in. `check` has no `--env`, so settings that
+name no environment are still judged, and the line prints a placeholder where `serve` would print
+the name. A pass is about this gate alone; `serve` has other start gates.
+
+`supervise` does not pre-check this gate. On settings it refuses, each engine shard would refuse to
+start, and the supervisor would restart it until its crash-loop breaker trips. Run `check` first.
 
 | Tier | Applies when | Its acknowledgement |
 |---|---|---|
@@ -1032,7 +1042,11 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > each of those windows to an explicit number of days.
 >
 > The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
-> an edit an enforcing engine would refuse. `messagefoundry check` does not run this gate.
+> an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a
+> required check, `retention-overrides`, so a graph an enforcing engine would refuse fails the check
+> in the same words. `supervise` reads it once before it starts an engine shard, and refuses to start
+> the fleet on a graph each engine shard would refuse. Neither writes the warning or the `AUDIT:`
+> line; those belong to the engine that loads the graph.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are

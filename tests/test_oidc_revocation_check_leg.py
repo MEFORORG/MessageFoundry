@@ -173,6 +173,9 @@ _VALID_CONFIG = (
 )
 
 
+# bounded_warn_only_retention: the required retention leg (vault BACKLOG #2280) would otherwise
+# block too, and this test names the one leg that should.
+@pytest.mark.usefixtures("bounded_warn_only_retention")
 @pytest.mark.parametrize(("legs", "refused"), [(_OFF_BOX, True), (_LOOPBACK, False)])
 def test_the_gate_fails_on_this_leg_alone(
     tmp_path: Path, legs: dict[str, str], refused: bool

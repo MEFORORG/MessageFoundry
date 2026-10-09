@@ -2982,11 +2982,15 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
 #: still described a refusal. Then BACKLOG #1188 widened the dead-letter purge to every stage, and the
 #: `dead_letter_days` row kept saying "outbound rows". Both corrections landed by hand with no guard,
 #: so nothing could red on the next divergence. These tests bind the two gate facts the `[retention]`
-#: section's posture paragraph states to the gate in `_serve`, both ways: a gate change the reader
-#: can see reds against the doc, and rewriting the doc reds against the code.
+#: section's posture paragraph states to the gate, both ways: a gate change the reader can see reds
+#: against the doc, and rewriting the doc reds against the code.
 #:
-#: The reader is a SHAPE guard over one slice of `_serve`, and that is its bound. At least these are
-#: not seen: a refusal added elsewhere in the function, and a skip hidden in a helper the slice
+#: The gate is `evaluate_retention_gate` in `messagefoundry/config/retention_classification.py`
+#: since vault BACKLOG #2280 moved it out of `_serve`, so that `messagefoundry check` could call
+#: it too. `_serve` calls it and stops on its refusal, and `_serve_gate_call_findings` reads that.
+#:
+#: The reader is a SHAPE guard over one slice of that function, and that is its bound. At least these
+#: are not seen: a refusal added elsewhere in the function, and a skip hidden in a helper the slice
 #: calls. The behavioural pins in `tests/test_cli.py`, which run `serve`, cover part of that. The test
 #: below checks only that each pin still EXISTS, not what it asserts, and none of them exercises
 #: `reference_snapshot_days`. The row's third claim, that a per-outbound override of 0 meets its
@@ -3015,17 +3019,133 @@ def _is_not_allow_unbounded(test: ast.expr) -> bool:
     )
 
 
-def _retention_gate_slice(serve: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
-    """``_serve``'s TOP-LEVEL statements from the body-window auto-bound arm through its refuse arm.
+_RETENTION_GATE_MODULE = _ROOT / "messagefoundry" / "config" / "retention_classification.py"
+_RETENTION_GATE_FUNCTION = "evaluate_retention_gate"
+
+
+def _returns_a_refusal(stmts: list[ast.stmt]) -> bool:
+    """Whether any of ``stmts`` returns ``_outcome(<refusal>, ...)`` with a refusal that is not the
+    literal ``None``, or raises. The gate function reports a refusal by returning one, so a bare
+    "any return" would also count ``return _outcome(None, ...)``, which lets the instance start."""
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Raise):
+                return True
+            if (
+                isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Call)
+                and callee_name(node.value) == "_outcome"
+                and node.value.args
+                and not (
+                    isinstance(node.value.args[0], ast.Constant)
+                    and node.value.args[0].value is None
+                )
+            ):
+                return True
+    return False
+
+
+def _serve_gate_call_findings(main_source: str) -> list[str]:
+    """What is wrong with how ``_serve`` applies the gate function.
+
+    It must call it once with its own ``settings``, ``enforcing``, ``production`` and
+    ``env_name``, write the lines it returns, and stop on its refusal, the last two at the top
+    level of ``_serve``. A shape read, with the bound stated above. At least this is not seen:
+    whether those four names still hold what their names say when the call is reached."""
+    serve = named_func(_parse(main_source), "_serve")
+    findings: list[str] = []
+    calls = call_sites(serve, _RETENTION_GATE_FUNCTION)
+    if len(calls) != 1:
+        findings.append(f"_serve no longer calls {_RETENTION_GATE_FUNCTION} exactly once")
+    else:
+        passed = {kw.arg: kw.value for kw in calls[0].keywords}
+        own_names = (
+            len(calls[0].args) == 1
+            and isinstance(calls[0].args[0], ast.Name)
+            and calls[0].args[0].id == "settings"
+            and set(passed) == {"enforcing", "production", "env_name"}
+            and all(isinstance(v, ast.Name) and v.id == k for k, v in passed.items())
+        )
+        if not own_names:
+            findings.append(
+                "_serve no longer passes its own `settings`, `enforcing`, `production` and "
+                "`env_name` to the gate, so the gate may judge another dial, or default the "
+                "windows on a copy the retention runner never sees"
+            )
+    emits = [
+        st
+        for st in serve.body
+        if isinstance(st, ast.For)
+        and isinstance(st.iter, ast.Attribute)
+        and st.iter.attr == "lines"
+        and isinstance(st.iter.value, ast.Name)
+        and st.iter.value.id == "retention_gate"
+        and calls_to(st, {"print"})
+        and calls_to(st, {"warning"})
+    ]
+    if len(emits) != 1:
+        findings.append(
+            "_serve no longer has one top-level loop over `retention_gate.lines` that both prints "
+            "and logs, so a warning or an AUDIT record the gate returns may never be written"
+        )
+    stops = [
+        st
+        for st in serve.body
+        if isinstance(st, ast.If)
+        and isinstance(st.test, ast.Compare)
+        and isinstance(st.test.left, ast.Attribute)
+        and st.test.left.attr == "refusal"
+        and isinstance(st.test.left.value, ast.Name)
+        and st.test.left.value.id == "retention_gate"
+        and [type(op) for op in st.test.ops] == [ast.IsNot]
+        and _stmts_can_refuse(st.body)
+    ]
+    if len(stops) != 1:
+        findings.append(
+            "_serve no longer has one top-level `if retention_gate.refusal is not None:` arm that "
+            "stops startup, so a refusal the gate function returns may not refuse the start"
+        )
+    return findings
+
+
+def _gate_preamble_findings(gate_function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    """What is wrong ABOVE the auto-bound arm: only the classification-floor check may return.
+
+    The slice starts at the auto-bound arm, so without this a guard clause above it could invert
+    either documented fact and the slice would still read clean. The floor check is recognised by
+    the two classification names it compares, and it may read no setting and no dial."""
+    findings: list[str] = []
+    for st in gate_function.body:
+        if isinstance(st, ast.If) and _is_not_allow_unbounded(st.test):
+            break
+        if not _stmts_can_refuse([st]):
+            continue
+        names = _referenced_names(st.test) if isinstance(st, ast.If) else set()
+        is_floor = {"PHI_RETENTION_WINDOWS", "MIN_PHI_RETENTION_WINDOWS"} <= names and not (
+            names & {"settings", "enforcing", "production"}
+        )
+        if not is_floor:
+            findings.append(
+                "a statement above the auto-bound arm can return before it, so an unset window "
+                "may skip its auto-bound, or refuse, before the gate's two arms are reached"
+            )
+    return findings
+
+
+def _retention_gate_slice(
+    gate_function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.stmt]:
+    """The gate function's TOP-LEVEL statements from the body-window auto-bound arm through its
+    refuse arm.
 
     The slice starts at the one top-level ``if not settings.retention.allow_unbounded_phi:``, so an
     arm moved under an enforcement test, or given an extra condition, is not found. It ends at the
     top-level ``if refusable:``, BEFORE the BACKLOG #1967 per-tier acknowledgement block that follows.
-    That block has its own ``if enforcing:`` arm that returns 2. A read that ran on into it would
-    still find a refusal after the body-window refusal was deleted, so fact 2 could not fail.
+    That block has its own ``if enforcing:`` arm that returns a refusal. A read that ran on into it
+    would still find a refusal after the body-window refusal was deleted, so fact 2 could not fail.
     Returns an empty list when either end is missing, repeated, or out of order.
     """
-    body = serve.body
+    body = gate_function.body
     starts = [
         i
         for i, st in enumerate(body)
@@ -3042,21 +3162,22 @@ def _retention_gate_slice(serve: ast.FunctionDef | ast.AsyncFunctionDef) -> list
 
 
 def _retention_gate_findings(source: str) -> list[str]:
-    """What is wrong with the retention body-window gate in ``source``'s ``_serve``.
+    """What is wrong with the retention body-window gate in ``source``'s gate function.
 
     Empty means both documented facts hold. (1) An UNSET window is auto-bounded on both enforcement
-    dials. (2) An explicit 0 refuses to start under ``enforce``, by any spelling
-    ``_stmts_can_refuse`` sees. An AST read, so a comment or docstring that still describes the gate
-    cannot stand in for it.
+    dials. (2) An explicit 0 refuses to start under ``enforce``, by a spelling
+    ``_returns_a_refusal`` sees. An AST read, so a comment or docstring that still describes the
+    gate cannot stand in for it.
     """
-    gate = _retention_gate_slice(named_func(_parse(source), "_serve"))
+    gate_function = named_func(_parse(source), _RETENTION_GATE_FUNCTION)
+    gate = _retention_gate_slice(gate_function)
     if not gate:
         return [
             "no top-level `if not settings.retention.allow_unbounded_phi:` auto-bound arm followed by "
-            "a top-level `if refusable:` arm in _serve. The arm was moved under an enforcement test, "
-            "given another condition, renamed or deleted"
+            f"a top-level `if refusable:` arm in {_RETENTION_GATE_FUNCTION}. The arm was moved under "
+            "an enforcement test, given another condition, renamed or deleted"
         ]
-    findings: list[str] = []
+    findings: list[str] = _gate_preamble_findings(gate_function)
     auto, refuse = gate[0], gate[-1]
     # The slice's two ends are both `if` statements by construction; this narrows the type.
     assert isinstance(auto, ast.If) and isinstance(refuse, ast.If)
@@ -3137,12 +3258,12 @@ def _retention_gate_findings(source: str) -> list[str]:
             "refuse before it is auto-bounded"
         )
     # Fact 2: a window still unbounded after the auto-bound (an explicit 0) refuses under enforce.
-    # `refusable` must be every auto-bounded window `_unbounded_windows` reports, filtered by
+    # `refusable` must be every auto-bounded window `unbounded_windows` reports, filtered by
     # nothing but `auto_bound_days is not None`.
     sources = {
         target.id
         for st in gate
-        if isinstance(st, ast.Assign) and calls_to(st.value, {"_unbounded_windows"})
+        if isinstance(st, ast.Assign) and calls_to(st.value, {"unbounded_windows"})
         for target in st.targets
         if isinstance(target, ast.Name)
     }
@@ -3166,7 +3287,7 @@ def _retention_gate_findings(source: str) -> list[str]:
     )
     if not derived:
         findings.append(
-            "`refusable` is no longer every window _unbounded_windows reports with an auto-bound, "
+            "`refusable` is no longer every window unbounded_windows reports with an auto-bound, "
             "so an explicit 0 on some auto-bounded window may start under enforce"
         )
     refuses = any(
@@ -3176,7 +3297,7 @@ def _retention_gate_findings(source: str) -> list[str]:
             isinstance(arm, ast.If)
             and isinstance(arm.test, ast.Name)
             and arm.test.id == "enforcing"
-            and _stmts_can_refuse(arm.body)
+            and _returns_a_refusal(arm.body)
             for arm in opt_out.body
         )
         for opt_out in refuse.body
@@ -3271,7 +3392,7 @@ def _retention_doc_findings(section: str, days: int, auto_bounded: tuple[str, ..
 
 
 def test_retention_gate_behaviour_matches_the_configuration_doc() -> None:
-    """``docs/CONFIGURATION.md`` states two gate facts, and ``_serve`` must still implement both.
+    """``docs/CONFIGURATION.md`` states two gate facts, and the gate must still implement both.
 
     Unset, each auto-bounded PHI body window defaults to its classified bound on both dials. An
     explicit 0 refuses to start under ``enforce``. The same section's ``dead_letter_days`` row must
@@ -3279,12 +3400,15 @@ def test_retention_gate_behaviour_matches_the_configuration_doc() -> None:
     elsewhere, by ``tests/test_retention.py``'s cross-backend stage-predicate guard (BACKLOG #1188).
     """
     days, auto_bounded = _auto_bound()
-    source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    source = _RETENTION_GATE_MODULE.read_text(encoding="utf-8")
     code = _retention_gate_findings(source)
+    code += _serve_gate_call_findings(
+        (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    )
     assert not code, (
-        f"the retention gate in messagefoundry/__main__.py no longer does what docs/CONFIGURATION.md "
-        f"says: {code}. Restore the gate, or correct the [retention] posture paragraph and "
-        "docs/PHI.md section 8 in the same change."
+        f"the retention gate in {_RETENTION_GATE_MODULE.name} no longer does what "
+        f"docs/CONFIGURATION.md says: {code}. Restore the gate, or correct the [retention] posture "
+        "paragraph and docs/PHI.md section 8 in the same change."
     )
     section = _retention_section(_CONFIG_DOC.read_text(encoding="utf-8"))
     doc = _retention_doc_findings(section, days, auto_bounded)
@@ -3292,22 +3416,66 @@ def test_retention_gate_behaviour_matches_the_configuration_doc() -> None:
     cli_tests = _parse((_ROOT / "tests" / "test_cli.py").read_text(encoding="utf-8"))
     missing = [name for name in _RETENTION_GATE_BEHAVIOUR_PINS if not find_funcs(cli_tests, name)]
     assert not missing, (
-        f"tests/test_cli.py no longer has {missing}. This guard reads one slice of _serve and relies "
-        "on those tests to pin the gate by behaviour; re-point _RETENTION_GATE_BEHAVIOUR_PINS."
+        f"tests/test_cli.py no longer has {missing}. This guard reads one slice of the gate function "
+        "and relies on those tests to pin the gate by behaviour; re-point "
+        "_RETENTION_GATE_BEHAVIOUR_PINS."
     )
 
 
 def test_retention_gate_reader_detects_a_planted_violation() -> None:
     """Each reader fails on a planted wrong fact, so a clean result above means something.
 
-    The code plants mutate the real ``__main__.py`` source, and the doc plants the real
-    ``[retention]`` section. The refusal plant deletes only the body-window ``return 2`` and leaves
-    the BACKLOG #1967 block's own ``return 2`` in place, which proves the slice stops before that
-    block. Each plant checks that it changed its text, so a moved anchor fails loudly instead of
-    mutating nothing.
+    The code plants mutate the real gate module's source, and the doc plants the real
+    ``[retention]`` section. The refusal plant turns only the body-window refusal into a line
+    the gate would write, with no return, and leaves the BACKLOG #1967 block's own refusal in
+    place, which proves the slice stops before that block. Each plant checks that it changed its
+    text, so a moved anchor fails loudly instead of mutating nothing.
     """
-    source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    source = _RETENTION_GATE_MODULE.read_text(encoding="utf-8")
     assert not _retention_gate_findings(source), "the real gate must read clean before planting"
+    # A return that passes the literal None lets the instance start, so it is not a refusal.
+    assert _returns_a_refusal(_parse("def f():\n    return _outcome('no', a, b)\n").body)
+    assert not _returns_a_refusal(_parse("def f():\n    return _outcome(None, a, b)\n").body)
+    main_source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    assert not _serve_gate_call_findings(main_source), "the real _serve must read clean first"
+    serve_plants = {
+        # The refusal is printed and the start goes on.
+        "refusal-not-returned": (
+            '        print(f"error: {retention_gate.refusal}", file=sys.stderr)\n        return 2\n',
+            '        print(f"error: {retention_gate.refusal}", file=sys.stderr)\n',
+            "no longer has one top-level",
+        ),
+        # The gate function is no longer called at all.
+        "gate-not-called": (
+            "retention_gate = evaluate_retention_gate(",
+            "retention_gate = _no_gate(",
+            "no longer calls",
+        ),
+        # The gate judges the production tier in place of the enforcement dial.
+        "wrong-dial": (
+            "        settings, enforcing=enforcing, production=production, env_name=env_name\n",
+            "        settings, enforcing=production, production=production, env_name=env_name\n",
+            "no longer passes its own",
+        ),
+        # The gate defaults the windows on a copy, so the retention runner still gets 0.
+        "judged-on-a-copy": (
+            "        settings, enforcing=enforcing, production=production, env_name=env_name\n",
+            "        settings.model_copy(deep=True),\n"
+            "        enforcing=enforcing, production=production, env_name=env_name\n",
+            "no longer passes its own",
+        ),
+        # The returned lines are dropped, so an acknowledged opt-out leaves no AUDIT record.
+        "lines-not-written": (
+            "    for gate_line in retention_gate.lines:\n",
+            "    for gate_line in ():\n",
+            "loop over `retention_gate.lines`",
+        ),
+    }
+    for name, (old, new, expected) in serve_plants.items():
+        mutated = main_source.replace(old, new, 1)
+        assert mutated != main_source, f"plant {name!r} matched nothing; re-point it at _serve"
+        found = _serve_gate_call_findings(mutated)
+        assert any(expected in f for f in found), f"plant {name!r} was not detected: {found}"
     plants = {
         # The pre-inversion shape: auto-bound only on a non-enforcing instance.
         "re-inverted": (
@@ -3322,13 +3490,10 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
             "reads the enforcement dial",
         ),
         "refusal-deleted": (
-            '"[security].allow_keeping_phi_indefinitely=true (audited).",\n'
-            "                    file=sys.stderr,\n"
-            "                )\n"
-            "                return 2\n",
-            '"[security].allow_keeping_phi_indefinitely=true (audited).",\n'
-            "                    file=sys.stderr,\n"
-            "                )\n",
+            "                return _outcome(\n"
+            '                    f"a data-retention window is explicitly disabled',
+            "                lines.append(\n"
+            '                    f"a data-retention window is explicitly disabled',
             "no longer stops startup",
         ),
         # A skip in the loop that applies the bound.
@@ -3359,12 +3524,20 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
             "for w in auto_bounded_windows()\n            if not production\n",
             "filtered only by",
         ),
+        # A guard clause above both arms: no auto-bound at all under warn.
+        "early-pass-above-the-arms": (
+            '    prod = "production " if production else ""\n',
+            '    prod = "production " if production else ""\n'
+            "    if not enforcing:\n"
+            "        return _outcome(None, lines)\n",
+            "above the auto-bound arm",
+        ),
         # A refusal between the two arms, reached before the refuse arm sees the auto-bounded window.
         "early-refusal": (
-            "    still_unbounded = _unbounded_windows(settings)\n",
+            "    still_unbounded = unbounded_windows(settings)\n",
             "    if enforcing and not settings.retention.allow_unbounded_phi:\n"
             "        return 2\n"
-            "    still_unbounded = _unbounded_windows(settings)\n",
+            "    still_unbounded = unbounded_windows(settings)\n",
             "can stop startup",
         ),
     }

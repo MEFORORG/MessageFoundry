@@ -1723,8 +1723,10 @@ still default to `0`, but `serve` applies a posture gate on top of them:
 - These bullets used to say the auto-bound applied only to a *non-enforcing* PHI instance, and that a
   PHI instance under `enforcement = enforce` with a PHI-body window unbounded **refused to start (exit
   code 2)**. Both halves were wrong about the shipped code: the auto-bound in
-  [`__main__.py`](../messagefoundry/__main__.py) is keyed on the retention opt-out alone
-  (`if not settings.retention.allow_unbounded_phi:`), not on the enforcement dial. A site that read
+  `evaluate_retention_gate`
+  ([`retention_classification.py`](../messagefoundry/config/retention_classification.py)) is keyed
+  on the retention opt-out alone (`if not settings.retention.allow_unbounded_phi:`), not on the
+  enforcement dial. A site that read
   the old text and deliberately left a window unset — expecting the refusal to hold the boot until
   someone chose a number — would instead get a started instance that begins purging PHI bodies at 30
   days.
