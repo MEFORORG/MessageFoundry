@@ -7134,16 +7134,17 @@ def _env_secret_reference_names(data: Mapping[str, Any]) -> set[str]:
 
 def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None:
     """What an operator probably meant by ``MEFOR_<section>_<key>``, as the text after "did you
-    mean", or ``None``. Usually a variable name. For a key one string cannot fill
+    mean", or ``None``. Usually a variable name. For a list or dict key one string cannot fill
     (:func:`_env_can_hold`), the ``[section].key`` to set in the file instead.
 
     Matched on the KEY part alone, as :func:`_near_field` matches a file key, so the shared
     ``MEFOR_<SECTION>_`` prefix cannot make two unrelated names look close.
 
-    No hint is given, rather than the next nearest name, when the closest key is one the
-    environment cannot set: a key that MOVED to ``[security]`` or was removed (the loader refuses
-    that spelling too), or a sub-table. Offering the runner-up there would name an unrelated
-    switch. A key that starts with a sub-table's name (``vip_enabled``) gets no hint either."""
+    No hint at all is given, rather than the next nearest name, when the closest key MOVED to
+    ``[security]`` or was removed (the loader refuses that spelling too), or is a sub-table.
+    Offering the runner-up there would name an unrelated switch. A key that starts with a
+    sub-table's name (``vip_enabled``) gets no hint either. The unread-variable note
+    (:func:`_unread_env_notes`) differs here: it names a near sub-table's file setting."""
     prefix = f"{_ENV_PREFIX}{section.upper()}_"
     fields = model.model_fields
     tables = {

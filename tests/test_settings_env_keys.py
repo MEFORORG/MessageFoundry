@@ -89,11 +89,12 @@ def test_the_hint_is_matched_on_the_key_and_not_on_the_shared_prefix() -> None:
         "MEFOR_CLUSTER_VIPP",  # nearest is the sub-table itself
     ],
 )
-def test_no_hint_is_given_when_the_nearest_key_is_one_the_environment_cannot_set(
+def test_no_hint_is_given_when_the_nearest_key_moved_or_is_a_sub_table(
     name: str,
 ) -> None:
     """The runner-up there is an unrelated switch (``MEFOR_CLUSTER_ENABLED`` for the VIP key, a
-    different loosening for the moved ones), so the refusal offers nothing."""
+    different loosening for the moved ones), so the refusal offers nothing. A list or dict key
+    gets a file hint instead (the test after this one)."""
     message = _refusal({name: "true"})
     assert name in message
     assert "did you mean" not in message
@@ -306,10 +307,10 @@ def test_serve_logs_the_warnings_again_after_configure_logging() -> None:
     # _start_logging runs configure_logging (passed to it as `configure`) and returns once the
     # handlers are installed; the replay must follow the check of its result, not just its text.
     started = source.index("_start_logging(")
-    assert "configure_logging(" in source[started:]
+    configured = source.index("configure_logging(", started)
     checked = source.index("if _logging_refused is not None:")
     replayed = source.index("unread_env_warnings(settings)")
-    assert started < checked < replayed
+    assert started < configured < checked < replayed
     assert source.index("_load_service_settings(") < started  # the control: the load is first
 
 
