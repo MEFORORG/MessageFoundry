@@ -165,7 +165,7 @@ def test_a_name_that_names_no_modelled_section_is_not_refused(name: str) -> None
 )
 def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hint: str) -> None:
     """Each loads, so nothing is refused, and each gets one note that names it and not its value."""
-    assert _reject_unknown_env_keys({name: _SENTINEL}, {}) is None
+    _reject_unknown_env_keys({name: _SENTINEL}, {})
     notes = _unread_env_notes({name: _SENTINEL}, {})
     assert len(notes) == 1
     assert name in notes[0] and hint in notes[0]
@@ -197,7 +197,10 @@ def test_the_note_is_logged_at_warning_and_the_load_still_succeeds(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
-        loaded = _load({"MEFOR_STOER_PATH": _SENTINEL, "MEFOR_UPDATE_CHECK": "false"})
+        loaded = load_settings(
+            environ={"MEFOR_STOER_PATH": _SENTINEL, "MEFOR_UPDATE_CHECK": "false"},
+            default_file=False,
+        )
     assert loaded.update_check.enabled is True  # the variable changed nothing, as the note says
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "MEFOR_STOER_PATH" in text and "MEFOR_UPDATE_CHECK" in text
