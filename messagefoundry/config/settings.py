@@ -7140,8 +7140,10 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     At least these names are spared:
 
     * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, a harness
-      variable, another tool's). So a typo in the SECTION part of a name is still dropped silently;
-    * one with no key part;
+      variable, another tool's). So a typo in the SECTION part of a name is not refused.
+      :func:`_unread_env_notes` warns about at least some of those, and the rest are dropped
+      with no message;
+    * one with no key part, which the same function warns about when it is a section's name;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
     * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
       renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
@@ -7183,6 +7185,67 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
             "dropped one leaves the setting it was meant to apply silently un-applied. Check the "
             "spelling against docs/CONFIGURATION.md, or unset the variable."
         )
+
+
+def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
+    """One note per ``MEFOR_*`` variable that :func:`_reject_unknown_env_keys` lets through and
+    that LOOKS like a setting nothing will read (vault BACKLOG #2600). Never quotes a value.
+
+    A WARNING and not a refusal, on purpose. A name the refusal passes names no section the
+    environment can set, and the engine cannot list every such name: harnesses, scripts and an
+    operator's own tooling use ``MEFOR_*`` names this module has never seen. A wrong guess here
+    costs a log line; a wrong refusal would stop the start.
+
+    At least two shapes are noted:
+
+    * the name is ``MEFOR_<SECTION>`` exactly, a modelled section and no key
+      (``MEFOR_UPDATE_CHECK=false``, ``MEFOR_STORE``). No setting has that name;
+    * the name splits as ``MEFOR_<NEAR>_<KEY>`` where ``NEAR`` is no section, is close to one, and
+      ``KEY`` is a real setting of that section or the rest of a :data:`_OUT_OF_BAND_ENV` name
+      (``MEFOR_STOER_PATH``). Requiring a real key keeps an unrelated tool's variable out.
+
+    Everything else is still dropped with no message: at least a name close to no section, and a
+    name with a typo in BOTH parts. Closeness is :func:`difflib.get_close_matches` at its default
+    cutoff, as :func:`_near_field` uses it."""
+    models = _section_models()
+    referenced = _env_secret_reference_names(data)
+    sections = sorted(models)
+    notes: list[str] = []
+    for name in sorted(environ):
+        if not name.startswith(_ENV_PREFIX) or name in _OUT_OF_BAND_ENV or name in referenced:
+            continue
+        rest = name[len(_ENV_PREFIX) :].lower()
+        if rest in models:
+            notes.append(
+                f"{_printable(name)} names the [{rest}] section and no setting in it, so "
+                "nothing reads it"
+            )
+            continue
+        tokens = rest.split("_")
+        for cut in range(1, len(tokens)):
+            near_part, key = "_".join(tokens[:cut]), "_".join(tokens[cut:])
+            if near_part in models:
+                # A real section with a key: the refusal above already judged this name.
+                break
+            near = difflib.get_close_matches(near_part, sections, n=1)
+            if not near:
+                continue
+            meant = f"{_ENV_PREFIX}{near[0].upper()}_{key.upper()}"
+            is_field = key in models[near[0]].model_fields
+            if near[0] in _SECTIONS and (is_field or meant in _OUT_OF_BAND_ENV):
+                notes.append(
+                    f"{_printable(name)} names no config section, so nothing reads it "
+                    f"(did you mean {meant}?)"
+                )
+                break
+            if near[0] not in _SECTIONS and is_field:
+                notes.append(
+                    f"{_printable(name)} names no config section, so nothing reads it (did you "
+                    f"mean [{near[0]}].{key}? That section has no environment layer; set it in "
+                    "the file)"
+                )
+                break
+    return notes
 
 
 # --- ADR 0118: the [security] section desugars into the internal fields it replaces ----------------
@@ -9110,6 +9173,12 @@ def load_settings(
     # typo that causes a validation error is named. Over `environ` itself, so it reports the
     # variable as the operator spelled it; `data` is read for what the settings name.
     _reject_unknown_env_keys(environ, data)
+    # What that refusal lets through and still looks like a setting nothing will read: a warning,
+    # because the engine cannot know every MEFOR_* name another tool owns. Names only, no value.
+    for note in _unread_env_notes(environ, data):
+        _log.warning(
+            "environment variable %s. It is NOT applied; fix its spelling or unset it.", note
+        )
     _desugar_security(data)
 
     if cli:

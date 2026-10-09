@@ -39,9 +39,19 @@
 > `MEFOR_SECRET_ROTATION_WARN_DAYS=0` used to change nothing and say nothing. The four sections
 > are listed under [Mechanism](#mechanism). Set them in the file.
 >
-> **What env still drops in silence:** a variable that names no section at all. A typo in the
-> SECTION part (`MEFOR_STOER_PATH`) is not refused. The loader cannot tell it from the `MEFOR_*`
-> variables that belong to no section, such as `MEFOR_ALLOW_INSECURE_TLS`.
+> **A variable that names no section is not refused. Some are warned about, and the rest are
+> dropped with no message.** The loader cannot tell a typo in the SECTION part from the `MEFOR_*`
+> variables that belong to no section, such as `MEFOR_ALLOW_INSECURE_TLS`, or from a name another
+> tool owns. So it logs a WARNING, naming the variable and never its value, for at least these two
+> shapes, and the load goes on without the setting:
+>
+> - a name that is a section and nothing else, such as `MEFOR_UPDATE_CHECK=false` or `MEFOR_STORE`;
+> - a name whose first part is close to a section and whose remainder is a real setting of that
+>   section, such as `MEFOR_STOER_PATH`. The warning offers the name you probably meant.
+>
+> At least these are still dropped with no message: a name close to no section, and a name with a
+> typo in both parts (`MEFOR_STOER_PATHH`). Nothing checks a key in the CLI layer of
+> `load_settings` either; the `messagefoundry` command builds that layer from its own flags.
 >
 > **A secret reference names a variable of your choosing, and that variable is spared.** Under
 > `[secrets].provider = "env"`, spelled exactly so, the value of a reference setting is the name

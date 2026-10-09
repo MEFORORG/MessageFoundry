@@ -23,6 +23,7 @@ from messagefoundry.config import settings as settings_module
 from messagefoundry.config.settings import (
     _OUT_OF_BAND_ENV,
     _reject_unknown_env_keys,
+    _unread_env_notes,
     load_settings,
 )
 
@@ -133,15 +134,95 @@ def test_a_spared_name_is_spared_only_as_spelled() -> None:
         "MEFOR_ALLOW_INSECURE_TLS",  # a documented process-wide variable; "allow" is no section
         "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE",
         "MEFOR_CONNSCALE_COUNT",  # a harness variable
-        "MEFOR_STOER_PATH",  # a typo in the SECTION: still dropped, and nothing said
+        "MEFOR_STOER_PATH",  # a typo in the SECTION: not refused, and warned about (below)
         "MEFOR_CERTIFICATE_PATH",  # near a section name, and names none
         "MEFOR_STORE",  # no key part
         "PATH",
     ],
 )
 def test_a_name_that_names_no_modelled_section_is_not_refused(name: str) -> None:
-    """The stated limit: a name is checked only when it names a modelled section."""
+    """The stated limit: a name is refused only when it names a modelled section and a key."""
     _reject_unknown_env_keys({name: "x"}, {})
+
+
+# --- the warning for a name the refusal lets through -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "hint"),
+    [
+        ("MEFOR_STOER_PATH", "did you mean MEFOR_STORE_PATH?"),
+        ("MEFOR_AUHT_LOCKOUT_MINUTES", "did you mean MEFOR_AUTH_LOCKOUT_MINUTES?"),
+        ("MEFOR_SECURTY_REQUIRE_MFA", "did you mean MEFOR_SECURITY_REQUIRE_MFA?"),
+        ("MEFOR_SECRET_PROVIDER", "did you mean MEFOR_SECRETS_PROVIDER?"),
+        ("MEFOR_STOER_VAULT_ADDR", "did you mean MEFOR_STORE_VAULT_ADDR?"),  # a spared name
+        ("MEFOR_CERT_MONITR_WARN_DAYS", "[cert_monitor].warn_days"),  # a file-only section
+        ("MEFOR_STORE", "names the [store] section and no setting"),
+        ("MEFOR_UPDATE_CHECK", "names the [update_check] section and no setting"),
+    ],
+)
+def test_a_name_that_looks_like_an_unread_setting_is_warned_about(name: str, hint: str) -> None:
+    """Each loads, so nothing is refused, and each gets one note that names it and not its value."""
+    assert _reject_unknown_env_keys({name: _SENTINEL}, {}) is None
+    notes = _unread_env_notes({name: _SENTINEL}, {})
+    assert len(notes) == 1
+    assert name in notes[0] and hint in notes[0]
+    assert _SENTINEL not in notes[0]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "MEFOR_STORE_PATH",  # a real setting
+        "MEFOR_STORE_VAULT_ADDR",  # a spared name
+        "MEFOR_ALLOW_INSECURE_TLS",  # a process-wide variable; close to no section
+        "MEFOR_CONNSCALE_COUNT",  # a harness variable
+        "MEFOR_CERTIFICATE_PATH",  # close to no section
+        "MEFOR_STOER_PATHH",  # a typo in BOTH parts: still dropped with no message
+        "MEFOR_STOER_ZZZZ",  # near a section, and the key is no setting of it
+        "MEFOR_PORT",  # what a Kubernetes Service named "mefor" injects
+        "MEFOR_PORT_8765_TCP_ADDR",
+        "PATH",
+    ],
+)
+def test_a_name_that_does_not_look_like_an_unread_setting_gets_no_note(name: str) -> None:
+    """The controls. The warning stays off real settings, spared names and other tools' names,
+    and the last few rows are the stated limit: not every dropped variable is noticed."""
+    assert _unread_env_notes({name: "x"}, {}) == []
+
+
+def test_the_note_is_logged_at_warning_and_the_load_still_succeeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
+        loaded = _load({"MEFOR_STOER_PATH": _SENTINEL, "MEFOR_UPDATE_CHECK": "false"})
+    assert loaded.update_check.enabled is True  # the variable changed nothing, as the note says
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "MEFOR_STOER_PATH" in text and "MEFOR_UPDATE_CHECK" in text
+    assert "NOT applied" in text
+    assert _SENTINEL not in text
+
+
+def test_a_clean_environment_logs_no_such_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """The control for the test above."""
+    with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
+        _load({"MEFOR_STORE_PATH": "ok.db", "MEFOR_ALLOW_INSECURE_TLS": "1"})
+    assert not [r for r in caplog.records if "NOT applied" in r.getMessage()]
+
+
+def test_a_secret_reference_variable_is_not_warned_about() -> None:
+    """A reference may name any variable, including one that looks like a section typo."""
+    environ = {
+        "MEFOR_SECRETS_PROVIDER": "env",
+        "MEFOR_ALERTS_EMAIL_PASSWORD_SECRET": "MEFOR_STOER_PATH",
+        "MEFOR_STOER_PATH": _SENTINEL,
+    }
+    data = {
+        "secrets": {"provider": "env"},
+        "alerts": {"email_password_secret": "MEFOR_STOER_PATH"},
+    }
+    assert _unread_env_notes(environ, data) == []
+    assert len(_unread_env_notes(environ, {})) == 1  # the control: unreferenced, it is noted
 
 
 @pytest.mark.parametrize(
@@ -307,6 +388,19 @@ def test_no_engine_code_spells_a_variable_the_loader_would_refuse() -> None:
         f"engine code names MEFOR_ variable(s) the settings loader would refuse: {offenders}. "
         "Make each a settings field, or add it to _OUT_OF_BAND_ENV in config/settings.py."
     )
+
+
+def test_no_name_the_project_spells_draws_the_unread_setting_warning() -> None:
+    """The warning guesses. A name the engine, a harness, a script or a shipped deployment file
+    really uses must never draw it, or a correct environment would log that a variable in use is
+    not applied. The last line is the control that the same call does fire."""
+    spelled = {name for tree in _CODE_TREES for name in _spelled_names(tree)}
+    spelled |= set(_deployment_names())
+    assert len(spelled) >= 100
+    assert "MEFOR_CONNSCALE_COUNT" in spelled and "MEFOR_ALLOW_INSECURE_TLS" in spelled
+    noted = {name: _unread_env_notes({name: "x"}, {}) for name in sorted(spelled)}
+    assert {name: notes for name, notes in noted.items() if notes} == {}
+    assert _unread_env_notes({"MEFOR_STOER_PATH": "x"}, {})
 
 
 def test_the_census_fires_on_a_made_up_name() -> None:
