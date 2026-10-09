@@ -56,4 +56,4 @@ typing-inspection==0.4.4
 tzdata==2026.4
 uvicorn==0.54.0
 uvloop==0.23.0
-websockets==17.1
+websockets==17.2
