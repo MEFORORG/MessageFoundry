@@ -826,6 +826,10 @@ def test_check_fails_when_reference_set_declared_against_unsupporting_backend(
     assert report.ok is False  # a required check failed -> the gate fails
 
 
+# The settings here name no environment, and the required retention leg judges them anyway
+# (vault BACKLOG #2280). This test asserts a green gate, so it takes windows on the two
+# warn-only tiers that ship with none.
+@pytest.mark.usefixtures("bounded_warn_only_retention")
 def test_check_passes_reference_set_against_sqlserver_backend(tmp_path: Path) -> None:
     # THE #235 END STATE: the exact config that was this gate's headline bug — a Reference(...) against
     # [store] backend = "sqlserver" — now PASSES the required check, because the SQL Server store
@@ -837,6 +841,9 @@ def test_check_passes_reference_set_against_sqlserver_backend(tmp_path: Path) ->
     assert report.ok is True
 
 
+# The retention leg is required too (vault BACKLOG #2280), and arm (b) asserts the whole gate is
+# green, so it takes windows on the two warn-only tiers that ship with none.
+@pytest.mark.usefixtures("bounded_warn_only_retention")
 def test_reference_backend_check_skips_and_passes_appropriately(tmp_path: Path) -> None:
     # The three fail-safe arms (the _check_build convention), so the new REQUIRED check can never block
     # an existing green config.
@@ -1036,6 +1043,10 @@ def test_allow_empty_config_does_not_blind_the_graph_advisories(tmp_path: Path) 
     assert send_target.required is False and report.ok is True
 
 
+# The settings here name no environment, and the required retention leg judges them anyway
+# (vault BACKLOG #2280). This test asserts a green gate, so it takes windows on the two
+# warn-only tiers that ship with none.
+@pytest.mark.usefixtures("bounded_warn_only_retention")
 def test_allow_empty_config_does_not_silently_skip_a_required_leg(tmp_path: Path) -> None:
     """``--allow-empty-config`` must not turn a REQUIRED check into a skip.
 

@@ -2568,8 +2568,10 @@ class RetentionSettings(_Section):
     # attached PHI (#150 SetMeta), not disposition, so it can never outlive the body.
     # 0 = keep forever.
     messages_days: int = 0
-    # Past N days, null the bodies of DEAD (dead-lettered) outbound rows — their own window because a
-    # dead row stays replayable until its body is purged. 0 = keep forever.
+    # Past N days, null the bodies of DEAD (dead-lettered) rows at EVERY stage — their own window
+    # because a dead row stays replayable until its body is purged. A dead ingress or routed row
+    # carries the whole raw body, so the purge reaches it as well as a dead outbound row (#1188).
+    # 0 = keep forever.
     dead_letter_days: int = 0
     # Past N days, DELETE transform-state entries (ADR 0005) last written before the cutoff — keeps the
     # in-memory state cache + table bounded. A simple global age purge; per-namespace policy is a
@@ -4693,6 +4695,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
         # events the stop also emits.
         "log_write_failed",
+        # BACKLOG #2612: the off-box log forwarder is absent, losing records or not sending. Keyed
+        # `forwarder:<kind>`, with a process suffix where several engine processes share the
+        # store. No connection can be named that, so it takes no control_action.
+        "log_forward_failed",
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",

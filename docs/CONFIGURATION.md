@@ -872,6 +872,84 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > longer a synthetic arm to fall into. To keep a plaintext off-box hop, either move to `forward_protocol = "tls"` or set
 > `forward_hop_attested` with a reason — an acknowledged escape, not a silent default.
 
+#### When the forwarder is absent or losing records
+
+A configured forwarder whose collector cannot be reached or verified at start does not stop the
+engine. A hop the start gate refuses still does; see `forward_spool_max_bytes` above. The engine tells you
+about a missing or failing forwarder two ways (BACKLOG #2612).
+
+- **The `log_forward_failed` alert.** Its `connection` names the kind and the engine process:
+  `forwarder:<kind>@<process>`, where `<process>` is `node:<node_id>` on a cluster node or
+  `shard:<id>` on an engine shard. A lone engine that owns its store drops the suffix:
+  `forwarder:<kind>`. So each process sharing a store has its own alert, and the alert says which
+  process lost its forwarder. The suffix is built the way the `intake_paused` suffix is, with the
+  same 200-character cap. An `[[alerts.rules]]` rule matches its `connection` glob against the
+  whole key, so where a suffix applies write `forwarder:not_installed*`; a rule on the bare
+  `forwarder:not_installed` matches a lone engine only. On a cluster node with no pinned
+  `[cluster].node_id` the suffix holds this engine's own host name and process id. They go
+  wherever the key goes: at least the log line, the alert list, the email subject and the webhook.
+
+  Every alert event carries a reason in fixed words, as `detail`, and a `count`. The count is a
+  number of lost records on `dropping` only. The other kinds always send `0`, and that `0` says
+  nothing about losses. The alert-list row keeps the reason and not this count. A custom
+  `email_body_template` has no placeholder for either. The engine checks at start and then every
+  30 seconds. `kind` is a fixed word, at least one of these.
+  - `not_installed`: no forwarder is attached, or its sending thread has ended, so the forwarder
+    sends nothing. It fires on the first check that finds the forwarder absent, then again about
+    every five minutes. The reason is `permanent` or `transient` for a failed start, or
+    `stopped`. Whatever the reason word, nothing attaches a forwarder to a running engine: fix
+    the cause, then restart the engine.
+  - `dropping`: a loss count rose. The reason names which. `count` is `lost` from the status
+    field below: the records the engine has counted as lost since the process started. It is a
+    floor, because some losses are not counted.
+  - `spool_unreadable`: a read of the on-disk spool failed. The spool keeps its records, and
+    they are not sent until a read succeeds.
+  - `not_sending`: every check for five minutes found `send_failing` true, and a send has
+    failed since the last alert. A spool keeps the records on disk while it has room. It is
+    not raised when the same check raises `dropping` for an unreachable collector. Without a
+    spool that is the usual case, so page on both kinds.
+
+  The kinds share one window of about five minutes. One check can raise more than one kind.
+  After a check raises any, no check raises one again until the window ends. The one exception
+  is the first check that finds the forwarder absent.
+  With an `[alerts]` notifier the alert has a row in the alert list. Nothing closes that row;
+  resolve it by hand. A cluster node keeps
+  its name across a restart only when `[cluster].node_id` is pinned. An unpinned node gets a new
+  id on every start, so a fault that outlasts a restart opens a new alert beside the old one.
+- **`log_forwarder` on `GET /status`.** It is `null` when no forwarder is configured. Otherwise
+  `state` is `healthy`, `unconfirmed`, `degraded` or `not_installed`. Beside it are `installed`,
+  `start_failure`, `delivery_confirmed`, `send_failing`, `spool_read_faulted` and the counts:
+  `lost`, `queued`, `queue_dropped`, `unsent`, `undeliverable`, `spool_dropped`, `spool_skipped`
+  and `spool_read_errors`. The web console's status page has a row for the forwarder. Its health
+  indicator turns to warn when the state is `not_installed` or `degraded`.
+
+`degraded` means `send_failing` is true, the last spool read failed, or `lost` is above zero.
+`send_failing` is true after a send that failed. It is also true from a start that could not
+connect until the first send that works.
+`lost` never goes down while the forwarder runs, so a loss keeps the state `degraded` for that
+long. If the forwarder then stops, the state reads `not_installed`.
+
+**Over UDP the engine cannot see a lost record.** UDP is the default protocol. A UDP send to a
+collector that is down reports no failure, and the engine does not count a UDP send error its own
+host reports either. So a collector that is down looks the same as one that is up. The only
+losses the engine counts are queue and spool losses. `delivery_confirmed` is `false`, a
+forwarder with no fault seen reads `unconfirmed` and never `healthy`. In the `unconfirmed` and
+`degraded` states the console row says that delivery is not confirmed. The health indicator does not warn for that alone. Use `tcp` or
+`tls` where a silent loss must page.
+
+Neither the alert nor `log_forwarder` on `GET /status` carries a record, the collector's address
+or an error text. The status field holds counts, true-or-false flags and fixed words. The alert
+holds its key, its reason words and its `count`. The key carries the process suffix where one
+applies, and the alert item above says what the suffix holds. The count in the alert list is a
+different number: how many times the engine has raised that alert.
+
+`queued` is how many records sit on the in-memory hand-off queue right now. It does not count
+records waiting in the on-disk spool, and no field does. Every other count runs from the start of
+the process. While the state is `not_installed`, every count reads zero, whatever was counted
+before. Each engine process has
+its own forwarder and watches its own: every engine shard, and a cluster standby too.
+`GET /status` reports the process that answered.
+
 ### `[retention]`
 Enforced by the engine's retention/purge task ([pipeline/retention.py](../messagefoundry/pipeline/retention.py)).
 A purge **NULLs the PHI *body*** past its window while **keeping the message row** (counts,
@@ -885,9 +963,10 @@ opt-in on a PHI instance**: each *unset* window that carries an auto-bound —
 `[security].enforcement` dials, and the defaulted settings are named on stderr. A window set
 **explicitly to `0`** is not defaulted: that **refuses to start (exit 2)** under `enforce`, and warns
 under `warn`. This paragraph used to state the opposite split — refusal under `enforce`, auto-bound
-only on a non-enforcing instance — which the shipped gate in
-[`__main__.py`](../messagefoundry/__main__.py) refutes; an *unset* window has not refused since the
-auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
+only on a non-enforcing instance — which the shipped gate
+(`evaluate_retention_gate` in
+[`retention_classification.py`](../messagefoundry/config/retention_classification.py)) refutes; an
+*unset* window has not refused since the auto-bound moved to both dials. All three built-in environment names (`dev`, `staging`, `prod`)
 derive PHI. The audited opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
 suppresses the auto-bound as well as the refusal. **Thirty days is the engine's floor against an
 accidentally unbounded window, not your retention policy — set each window to the number your site
@@ -899,6 +978,15 @@ acknowledgement. Under `enforce`, a tier with neither **refuses to start (exit 2
 names the tier and its switch. Under `warn` it warns and starts. A start under an acknowledgement writes
 a WARNING-level `AUDIT:` line naming the tier. `allow_keeping_phi_indefinitely` does not count for
 these tiers, and one tier's switch does not cover another.
+
+`messagefoundry check` runs this gate as a required check, `retention`, through the function
+`serve` calls. So a refusal fails the check in the words `serve` would print. It reads the settings
+file `check` resolves and the environment `check` runs in. `check` has no `--env`, so settings that
+name no environment are still judged, and the line prints a placeholder where `serve` would print
+the name. A pass is about this gate alone; `serve` has other start gates.
+
+`supervise` does not pre-check this gate. On settings it refuses, each engine shard would refuse to
+start, and the supervisor would restart it until its crash-loop breaker trips. Run `check` first.
 
 | Tier | Applies when | Its acknowledgement |
 |---|---|---|
@@ -954,7 +1042,11 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > each of those windows to an explicit number of days.
 >
 > The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
-> an edit an enforcing engine would refuse. `messagefoundry check` does not run this gate.
+> an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a
+> required check, `retention-overrides`, so a graph an enforcing engine would refuse fails the check
+> in the same words. `supervise` reads it once before it starts an engine shard, and refuses to start
+> the fleet on a graph each engine shard would refuse. Neither writes the warning or the `AUDIT:`
+> line; those belong to the engine that loads the graph.
 
 > **Backend coverage.** The retention/purge pass is **backend-agnostic** and every PHI purge runs on
 > **all three** backends (SQLite, SQL Server, Postgres). `wal_checkpoint_seconds` and `vacuum_at` are
@@ -1431,7 +1523,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |

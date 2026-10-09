@@ -899,6 +899,20 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def log_forward_failed(self, name: str, *, reason: str, count: int = 0) -> None:
+        # BACKLOG #2612: the off-box forwarder is absent, losing records or not sending. The
+        # caller's `forwarder:<kind>` label, with its process suffix where one applies, stands in
+        # for "connection", as the sink label does for log_write_failed, so the throttle and the
+        # alert row are per kind and per process.
+        self._emit(
+            {
+                "type": "log_forward_failed",
+                "connection": name,
+                "detail": reason,
+                "count": count,
+            }
+        )
+
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         # The DB path stands in for "connection" so the realert throttle + subject keying work
         # uniformly; the event carries no message content (no PHI), only sizes.

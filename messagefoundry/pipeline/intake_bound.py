@@ -60,6 +60,7 @@ __all__ = [
     "depth_resume_at",
     "disk_resume_at",
     "intake_alert_subject",
+    "process_alert_subject",
 ]
 
 log = logging.getLogger(__name__)
@@ -108,7 +109,7 @@ def disk_resume_at(floor_bytes: int) -> int:
     return floor_bytes + floor_bytes // 10
 
 
-#: The longest subject :func:`intake_alert_subject` returns. Under the SQL Server store's 256-character
+#: The longest subject :func:`process_alert_subject` returns. Under the SQL Server store's 256-character
 #: ``alert_instance.connection`` column, with room to spare. ``[cluster].node_id`` has no length limit,
 #: so a node label too long to fit is shortened to a prefix plus a checksum of the whole label.
 INTAKE_SUBJECT_MAX_LENGTH = 200
@@ -131,9 +132,18 @@ def intake_alert_subject(reason: str, node: str | None = None) -> str:
 
     ``intake_paused`` is not connection-scoped, so no rule's ``control_action`` fires on it (BACKLOG
     #1898). The colon also keeps the subject out of the connection-name grammar, which guards only the
-    default target, never a ``control_target``. The result is at most
-    :data:`INTAKE_SUBJECT_MAX_LENGTH` characters, and the same inputs always give the same subject."""
-    base = f"intake:{reason}"
+    default target, never a ``control_target``. The length cap is :func:`process_alert_subject`'s."""
+    return process_alert_subject(f"intake:{reason}", node)
+
+
+def process_alert_subject(base: str, node: str | None = None) -> str:
+    """``base`` with this engine process appended: ``<base>@<node>``, or ``base`` alone for a lone
+    engine (``node`` None). For an alert each process on a shared store raises about itself, so two
+    processes never share one alert row. ``node`` is
+    :attr:`~messagefoundry.pipeline.engine.Engine.instance_identity`.
+
+    The result is at most :data:`INTAKE_SUBJECT_MAX_LENGTH` characters when ``base`` is short, as
+    every caller's is, and the same inputs always give the same subject."""
     if node is None:
         return base
     subject = f"{base}@{node}"
