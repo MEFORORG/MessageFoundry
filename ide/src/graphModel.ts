@@ -57,7 +57,10 @@ export interface Graph {
 export type Perspective = "elements" | "flow";
 export type GroupingMode = "none" | "type" | "partner";
 
-export type ElementKind = "inbound" | "router" | "handler" | "outbound";
+// The members live in a const so a webview page can be handed the same list its host is typed by
+// (ASVS 3.5.5, BACKLOG #1123). The type is derived from it, so the two cannot drift.
+export const ELEMENT_KINDS = ["inbound", "router", "handler", "outbound"] as const;
+export type ElementKind = (typeof ELEMENT_KINDS)[number];
 
 /** One renderable row. `id` is unique across the whole tree (flow paths repeat elements). */
 export interface VmNode {

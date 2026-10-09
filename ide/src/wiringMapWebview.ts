@@ -4,7 +4,9 @@
 // The Wiring Map webview's inline script, split out of wiringMap.ts so it can be loaded without
 // `vscode`. wiringMap.ts builds the page and embeds this; the unit suite evaluates the SAME source
 // in a jsdom page (webview-receivers.test.ts), so what the tests exercise is what ships.
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, guardScript } from "./webviewMessaging";
+import { ELEMENT_KINDS } from "./graphModel";
+import { MAP_PROVENANCES } from "./wiringMapModel";
+import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 /** The whole inline `<script>` body for one render, guard included. `token` is this render's
  *  channel token, minted by the caller with the nonce (webviewMessaging.ts). */
@@ -12,7 +14,10 @@ export function wiringMapScript(token: string): string {
   return `
     const vscode = acquireVsCodeApi();${SCRIPT_STARTED_MARK}${guardScript(token)}${SHAPE_HELPERS}
     const SVGNS = 'http://www.w3.org/2000/svg';
-    const KINDS = ['inbound', 'router', 'handler', 'outbound'];
+    // The host's own lists (graphModel.ts, wiringMapModel.ts), which its types are derived from.
+    // KINDS is also the column order.
+    const KINDS = ${embedJson(ELEMENT_KINDS)};
+    const PROVENANCES = ${embedJson(MAP_PROVENANCES)};
     const HEADERS = ['INBOUND', 'ROUTERS', 'HANDLERS', 'OUTBOUND'];
     // Vertical layout: the four pipeline stages stack as top→bottom bands (inbound at the top,
     // outbound at the bottom); nodes within a band spread horizontally by their model row. HSTEP is
@@ -192,22 +197,23 @@ export function wiringMapScript(token: string): string {
     });
 
     // The one message the host posts: WiringMapPayload (wiringMapModel.ts). map and focus are
-    // required and may be null; a node's port, open and stub are optional.
-    function mfElementRef(r) { return mfObj(r) && mfStr(r.kind) && mfStr(r.name); }
+    // required and may be null; a node's port, open and stub may be absent and are never null.
+    // kind and provenance are closed sets, and both reach a class attribute, so membership matters.
+    function mfElementRef(r) { return mfObj(r) && mfOneOf(r.kind, KINDS) && mfStr(r.name); }
     function mfMapNode(nd) {
-      return mfObj(nd) && mfStr(nd.kind) && mfStr(nd.name) && mfInt(nd.row) && mfBool(nd.dynamic) &&
+      return mfObj(nd) && mfOneOf(nd.kind, KINDS) && mfStr(nd.name) && mfInt(nd.row) && mfBool(nd.dynamic) &&
         mfOpt(nd.port, mfStr) && mfOpt(nd.stub, mfBool) &&
         mfOpt(nd.open, (o) => mfObj(o) && mfStr(o.file) && mfInt(o.line));
     }
     function mfMapEdge(e) {
-      return mfObj(e) && mfStr(e.fromKind) && mfStr(e.from) && mfStr(e.toKind) && mfStr(e.to) &&
-        mfStr(e.provenance);
+      return mfObj(e) && mfOneOf(e.fromKind, KINDS) && mfStr(e.from) && mfOneOf(e.toKind, KINDS) &&
+        mfStr(e.to) && mfOneOf(e.provenance, PROVENANCES);
     }
     const SHAPES = {
-      map: (m) => mfArrOf(m.names, mfElementRef) && (m.focus === null || mfElementRef(m.focus)) &&
-        (m.map === null || (mfObj(m.map) && mfBool(m.map.truncated) && mfBool(m.map.focusMissing) &&
-          Array.isArray(m.map.columns) && m.map.columns.length === 4 &&
-          mfArrOf(m.map.columns, (c) => mfArrOf(c, mfMapNode)) && mfArrOf(m.map.edges, mfMapEdge))),
+      map: (m) => mfArrOf(m.names, mfElementRef) && mfNullable(m.focus, mfElementRef) &&
+        mfNullable(m.map, (w) => mfObj(w) && mfBool(w.truncated) && mfBool(w.focusMissing) &&
+          Array.isArray(w.columns) && w.columns.length === 4 &&
+          mfArrOf(w.columns, (c) => mfArrOf(c, mfMapNode)) && mfArrOf(w.edges, mfMapEdge)),
     };
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (ev) => {

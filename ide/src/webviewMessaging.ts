@@ -250,8 +250,25 @@ export const SHAPE_HELPERS = `
       for (let i = 0; i < x.length; i++) { if (f(x[i]) !== true) { return false; } }
       return true;
     }
-    // An OPTIONAL field: absent (or null) passes, present must match.
-    function mfOpt(x, f) { return x === undefined || x === null || f(x) === true; }
+    // Absent and null are declared separately, and neither is implied: null is a value, not an
+    // absence. A plain check is "neither". mfOpt is absent-ok, mfNullable is null-ok, and a field
+    // that is both says so: mfOpt(x, (v) => mfNullable(v, f)). A receiver takes its choice from the
+    // host's type for the field and from what the sender really sends.
+    function mfOpt(x, f) { return x === undefined || f(x) === true; }
+    function mfNullable(x, f) { return x === null || f(x) === true; }
+    // A field the host types as a closed set of strings: the set is its TYPE, so a string outside
+    // it is the wrong type, not an out-of-range value. indexOf, not "in": a set is an array handed
+    // to the page from the const the host's type is derived from, and "in" would match a key of
+    // Object.prototype.
+    function mfOneOf(x, set) { return typeof x === 'string' && set.indexOf(x) !== -1; }
+    // The kind of a value, for a refusal a panel shows. Never the value itself. A number that is not
+    // an int says which way, or "must be a whole number, got number" would name no difference.
+    function mfKind(v) {
+      if (v === null) { return 'null'; }
+      if (Array.isArray(v)) { return 'list'; }
+      if (typeof v !== 'number') { return typeof v; }
+      return Number.isInteger(v) ? (mfInt(v) ? 'number' : 'a number too large') : 'a fraction';
+    }
     function mfShapeOk(d, key, shapes, panel) {
       const k = d[key];
       const check = typeof k === 'string' && Object.prototype.hasOwnProperty.call(shapes, k) ? shapes[k] : null;

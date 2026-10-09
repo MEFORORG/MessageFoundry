@@ -181,8 +181,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
     function refuse(problem) {
       $('save').disabled = true;
       $('form').style.display = 'none';
-      refusal = 'These settings cannot be shown. The engine sent a state this form cannot read: ' + problem +
-        '. Save is off until a readable state arrives.';
+      refusal = 'These settings cannot be shown. The state sent to this form is malformed: ' + problem +
+        '. Save is off until a well-formed state arrives.';
       show(refusal);
     }
 
@@ -216,14 +216,6 @@ export function securityEditorScript(token: string, fields: unknown): string {
       string: { ok: mfStr, want: 'text' },
       tristate: { ok: (x) => x === null || mfBool(x), want: 'true, false or null' },
     };
-    // The kind of a value, for the refusal. Never the value itself. A number that is not an int says
-    // which way, or "must be a whole number, got number" would name no difference.
-    function kindOf(v) {
-      if (v === null) { return 'null'; }
-      if (Array.isArray(v)) { return 'list'; }
-      if (typeof v !== 'number') { return typeof v; }
-      return Number.isInteger(v) ? (mfInt(v) ? 'number' : 'a number too large') : 'a fraction';
-    }
 
     // What is wrong with the first switch in o (state.values or state.defaults) that is missing or
     // has the wrong type, or null when every FIELDS switch is there with its type.
@@ -240,14 +232,14 @@ export function securityEditorScript(token: string, fields: unknown): string {
         // Own-property lookup, so a FIELDS type with no entry here fails closed and does not throw.
         const t = Object.prototype.hasOwnProperty.call(TYPE_OK, f.type) ? TYPE_OK[f.type] : null;
         if (!t) { return name + ' has a type this form does not know'; }
-        if (t.ok(v) !== true) { return name + ' must be ' + t.want + ', got ' + kindOf(v); }
+        if (t.ok(v) !== true) { return name + ' must be ' + t.want + ', got ' + mfKind(v); }
       }
       return null;
     }
 
     // What is wrong with a 'state' message, or null. The state is ShowResult, the JSON "security
-    // show" prints. The two objects the form renders from are required, with every switch; the two
-    // fields it does not read are typed only when present.
+    // show" prints. All four of its fields are required: the two objects the form renders from, with
+    // every switch, and the two it does not read (set, loosenings), which the command always prints.
     function stateProblem(d) {
       const s = d.state;
       if (!mfObj(s)) { return 'state is missing or is not an object'; }
@@ -256,9 +248,9 @@ export function securityEditorScript(token: string, fields: unknown): string {
         const problem = switchProblem(s[where], where);
         if (problem !== null) { return problem; }
       }
-      if (!mfOpt(s.set, (x) => mfArrOf(x, mfStr))) { return 'set must be a list of text'; }
-      if (!mfOpt(s.loosenings, (ls) => mfArrOf(ls, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk)))) {
-        return 'loosenings must be a list of switch and risk entries';
+      if (!mfArrOf(s.set, mfStr)) { return 'set is missing or is not a list of text'; }
+      if (!mfArrOf(s.loosenings, (l) => mfObj(l) && mfStr(l.switch) && mfStr(l.risk))) {
+        return 'loosenings is missing or is not a list of switch and risk entries';
       }
       return null;
     }
