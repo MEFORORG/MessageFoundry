@@ -1348,6 +1348,12 @@ class RegistryRunner:
         # OPERATOR paused must stay paused across a reload. Without this discriminator a re-deployed lane
         # rebuilds its connector and respawns its worker, then sits paused forever.
         self._gate_parked: set[str] = set()
+        # Outbounds that left the passive DR park with no build that succeeded since: the build
+        # failed, or a #122 halt held the reload that would have run it (vault BACKLOG #3263).
+        # Each stays parked, so no held row is charged an attempt (ADR 0048), until a reload or an
+        # operator start builds it. The value says whether a build of it has failed since it left
+        # the park (outbound_dr_failed). See _leaves_passive_park and _holds_dr_failed_lane.
+        self._dr_unbuilt: dict[str, bool] = {}
         # Two workers per inbound connection (staged pipeline, ADR 0001 Step B): a ROUTER worker drains
         # the ingress stage (Router → routed-stage rows) and a TRANSFORM worker drains the routed stage
         # (handler transform → outbound rows). Both run independently of whether the source is actively
@@ -2512,10 +2518,11 @@ class RegistryRunner:
     def inbound_filtered(self, name: str) -> str | None:
         """The reason the DR run-profile parked this INBOUND (its resolved priority tier is below
         ``[dr].priority_threshold``, or the box is a passive standby, vault BACKLOG #3140), else
-        ``None`` (#61, ADR 0048). A filtered connection is **not**
+        ``None`` (#61, ADR 0048). Being filtered is **not** being
         failed (ADR 0031) - it was deliberately not started; the two are surfaced as the distinct
         ``status:"filtered"`` vs ``status:"failed"`` so an operator can tell a parked DR feed from a
-        broken one."""
+        broken one. A feed a passive standby parks can hold a failed record as well, for a CA
+        its start-time check refused, and then reads ``failed`` (vault BACKLOG #3263)."""
         return self._filtered.get(("inbound", name))
 
     def outbound_filtered(self, name: str) -> str | None:
@@ -2764,7 +2771,11 @@ class RegistryRunner:
         self._dr_standby = state.standby
         self._rewrite_inbound_parks(state.parked)
 
-    async def park_intake(self, standby: Priority) -> None:
+    def listening_inbounds(self) -> frozenset[str]:
+        """The inbounds whose listener is bound now."""
+        return frozenset(self._sources)
+
+    async def park_intake(self, standby: Priority, *, keep: frozenset[str] = frozenset()) -> None:
         """Make this box a passive standby for intake and unbind every inbound, in one span of the
         reload lock, for ``POST /dr/release`` (vault BACKLOG #3140). The DR threshold is kept, so
         the outbounds the profile parks hold their rows through the drain. Run again after the
@@ -2773,13 +2784,17 @@ class RegistryRunner:
 
         Each inbound it stops gets a marker, even one with ``auto_start = false``, and even when
         a later stop raises. So if the release fails, :meth:`restore_dr_intake` judges every one
-        of them against the profile."""
+        of them against the profile.
+
+        ``keep`` names inbounds to leave bound. A failed activation passes the ones that were
+        listening before it began, which an operator had started (vault BACKLOG #3263)."""
         async with self._reload_lock:
             self.set_dr_threshold(self._dr_threshold, standby=standby)
-            stopping = frozenset(self._sources)
+            stopping = frozenset(self._sources) - keep
             try:
                 for name in list(self.registry.inbound):
-                    await self._stop_inbound_unsafe(name)
+                    if name not in keep:
+                        await self._stop_inbound_unsafe(name)
             finally:
                 self._rewrite_inbound_parks(stopping)
 
@@ -3109,15 +3124,28 @@ class RegistryRunner:
         operator at all — an alert rule's ``control_action`` can auto-fire ``restart_outbound``
         (#144) on ``connection_stopped``, the very signal a log-failure halt raises.
 
+        **A restart that does not resume the lane leaves the engine's park as it found it.** The
+        stop half makes any pause the operator's (:meth:`_stop_outbound_unsafe`), and a reload
+        resumes only an ENGINE park. So a lane the engine had parked gets that park back whenever
+        it is still paused on the way out: the gate refused, the start raised (such as
+        ``NotDeployedError``), or the call was cancelled. Otherwise the reload that builds or
+        re-deploys it left it paused, and a held failed lane stopped paging. A lane the operator
+        had stopped stays theirs, so no reload undoes the stop (vault BACKLOG #3263). Only the
+        ``_gate_parked`` marker is put back: a calendar park the stop half drops is not.
+
         Raises :class:`DrParkedError` for a lane the DR run-profile parks, before either half, so
         neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
-            self._stop_outbound_unsafe(name)
-            if not self._outbound_start_permitted(name):
-                return
-            await self._start_outbound_unsafe(name)
+            engine_parked = name in self._gate_parked
+            try:
+                self._stop_outbound_unsafe(name)
+                if self._outbound_start_permitted(name):
+                    await self._start_outbound_unsafe(name)
+            finally:
+                if engine_parked and name in self._outbound_paused:
+                    self._gate_parked.add(name)
 
     def _stop_outbound_unsafe(self, name: str) -> None:
         """stop_outbound body without the reload lock (callers hold it). Sync + returns fast: it flags
@@ -3205,17 +3233,144 @@ class RegistryRunner:
     def _refuse_dr_parked(self, name: str) -> None:
         """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``. Asked by every
         door that would change a parked lane's run state; the error's docstring says why."""
-        reason = self._filtered.get(("outbound", name))
-        if reason is None and self._dr_passive and self._deployed(name, "outbound"):
-            reason = _DR_PASSIVE_REASON  # the door holds on a passive box without its marker
-        if reason is not None:
-            # Read from the marker, not the box's state now: an activation's reload has not yet
-            # re-judged a lane that still holds the passive park (vault BACKLOG #3262).
-            raise DrParkedError(name, passive=reason.startswith(_DR_PASSIVE_REASON))
+        passive = self._passive_parked(name)
+        if passive or self._dr_parked(name):
+            raise DrParkedError(name, passive=passive)
+        if self._dr_passive and self._deployed(name, "outbound"):
+            raise DrParkedError(name, passive=True)  # the door holds without its marker
 
     def _dr_parked(self, name: str) -> bool:
         """Whether the DR run-profile parks outbound ``name`` this run (its ``filtered`` marker)."""
         return ("outbound", name) in self._filtered
+
+    def _passive_parked(self, name: str) -> bool:
+        """Whether outbound ``name`` holds the PASSIVE standby's park, as against the active
+        profile's park of a lane below the threshold. Read from the marker, not the box's state
+        now: an activation's reload has not yet judged again a lane that still holds the passive
+        park (vault BACKLOG #3262)."""
+        return self._filtered.get(("outbound", name), "").startswith(_DR_PASSIVE_REASON)
+
+    def _leaves_passive_park(self, name: str, oc: OutboundConnection) -> bool:
+        """Whether a reload now would build outbound ``name`` for the first time since the passive
+        standby parked it, or again after that build failed: the box is no longer passive, the
+        lane is at or above the threshold, and it has no connector (vault BACKLOG #3263). An
+        activation's reload is the first such reload.
+
+        Such a lane takes the checks a start gives it, isolated the same way
+        (:meth:`_ensure_destination_built`): its CA, its build and its ``validate_startup``. So a
+        fault one of those finds fails that lane and the activation goes on. The reload's CA
+        pre-check leaves it out (:meth:`_reload_anchor_candidates`), because a refusal there
+        refuses the whole reload, which for an activation is the whole takeover. Every engine
+        shard takes this path, as every engine shard builds every lane at a start (ADR 0073).
+
+        This does not isolate every outbound fault. The reload runs :meth:`build_check` first,
+        over every connector, and a fault it finds still refuses the activation: at least a
+        connector that does not build, a CA file that is missing or does not parse, and an
+        ``env()`` value that does not resolve. So the fault the build step here can isolate is
+        one the build check does not reproduce."""
+        return (
+            (self._passive_parked(name) or name in self._dr_unbuilt)
+            and not self._dr_passive
+            and name not in self._destinations
+            and not self._below_dr_threshold(oc.priority)
+        )
+
+    def _holds_dr_failed_lane(self, name: str) -> bool:
+        """Whether the engine holds outbound ``name`` parked because its build failed as it left
+        the DR park (vault BACKLOG #3263). Such a lane keeps its rows PENDING: none is claimed with
+        no connector, charged an attempt or dead-lettered for a fault found at the takeover (ADR
+        0048). The scheduler and an alert rule's restart leave it alone. A reload, or an operator
+        start, builds it again, and resumes it only once the build succeeds. Its buildup and stall
+        checks still page, as on any failed lane (ADR 0031): :meth:`_page_dr_failed_lanes` runs
+        them, since its park keeps them off the delivery path. An operator stop makes the pause
+        the operator's, and then they are silent as on any paused lane. A lane a #122 halt kept
+        from being built is not failed, and is silent as every lane the halt holds is."""
+        return (
+            self.outbound_dr_failed(name)
+            and name in self._gate_parked
+            and ("outbound", name) not in self._filtered
+        )
+
+    def outbound_dr_failed(self, name: str) -> bool:
+        """Whether outbound ``name``'s build failed as it left the DR park and has not succeeded
+        since (vault BACKLOG #3263). An alert rule's restart reads it and leaves the lane alone.
+        A lane a #122 halt kept unbuilt has had no build to fail, even when the passive start's
+        CA check recorded it failed. So the rule's restart, the halt's own recovery, still
+        reaches it, and builds it before it resumes it."""
+        return self._dr_unbuilt.get(name, False)
+
+    def _pages_suppressed(self, name: str) -> bool:
+        """Whether outbound ``name``'s buildup, saturation and stall pages are off: it is paused,
+        so its queue grows by design. A lane :meth:`_holds_dr_failed_lane` holds is down by a
+        fault, not by design, and still pages (vault BACKLOG #3263)."""
+        return name in self._outbound_paused and not self._holds_dr_failed_lane(name)
+
+    async def _page_dr_failed_lanes(self) -> None:
+        """Run the buildup and stall checks of each lane :meth:`_holds_dr_failed_lane` holds and
+        this engine shard owns (vault BACKLOG #3263). The in-flight watch calls it on its own
+        clock, since a parked lane never reaches the delivery path that runs them."""
+        if not self._dr_unbuilt:
+            return
+        for name in sorted(self._dr_unbuilt):
+            if self._holds_dr_failed_lane(name) and self._owns_destination(name):
+                await self._delivery_failure_alert_checks(name)
+
+    async def _preflight_passive_lanes(self) -> None:
+        """On a passive standby, read the CA of each lane an activation would start, and record a
+        refused one as that lane's failure (vault BACKLOG #3263). :meth:`start` runs it. The
+        lane stays parked, and its status reads ``failed`` in place of ``filtered``, so a broken
+        critical feed shows at boot and not first at the disaster.
+
+        It reads files and writes audit rows, and nothing else: no connector is built, nothing
+        is bound, and no partner is dialled. It therefore cannot find a port in use, and it does
+        not run ``validate_startup``, which writes a probe file into a File outbound's directory
+        and lists a remote one over a session to the partner. The activation runs that check
+        (:meth:`_leaves_passive_park`).
+
+        The lanes are the ones a reload here would read (:meth:`_reload_anchor_candidates`),
+        less the outbounds another engine shard owns (ADR 0073). A lane whose settings do not
+        resolve, such as an ``env()`` value this instance lacks, is recorded failed as a start
+        records it, and the rest are still read. It marks no lane for
+        :meth:`_keeps_anchor_failure`, so a reload on a passive box reads the file again and
+        refuses on one still refused. A reload that commits clears the record, including for a
+        lane it did not read: at least a poller whose window has closed.
+
+        It builds no connector, so it misses what only a build finds: at least a CA file that
+        is readable and does not parse."""
+        if self._lane_anchor_check is None:
+            return
+        for conn in self._reload_anchor_candidates(self.registry, self.registry, ()):
+            direction: Direction = "outbound" if isinstance(conn, OutboundConnection) else "inbound"
+            name = conn.name
+            if direction == "outbound" and not self._owns_destination(name):
+                continue
+            try:
+                settings = self._anchor_lane_settings(conn)
+            except Exception as exc:  # noqa: BLE001 - isolated per lane, as a start's build is
+                self._record_failed(name, exc, kind=direction)
+                continue
+            try:
+                await self._check_lane_anchor(direction, name, settings, fails_lane=False)
+            except Exception as exc:
+                # Broad on purpose, as a start's lane isolation is: this check must not stop a
+                # start. A refusal names the CA's path and digest, so it goes to the server log
+                # only, as in _check_lane_anchor. The status and the alert carry the fixed line.
+                refused = isinstance(exc, (TrustAnchorError, ValueError))
+                log.warning(
+                    "%s connection %r: trust anchor %s on a passive DR standby: %s",
+                    direction,
+                    name,
+                    "refused" if refused else "could not be checked",
+                    exc,
+                    exc_info=not refused,
+                )
+                fixed = TrustAnchorError(
+                    f"{direction} connection '{name}': its tls_ca_file "
+                    f"{'was refused' if refused else 'could not be checked'} on this passive DR "
+                    "standby, and POST /dr/activate needs it. Fix the file, then reload; the "
+                    "server log and the auth.trust_anchor audit rows say why"
+                )
+                self._record_failed(name, fixed, kind=direction)
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -3382,15 +3537,7 @@ class RegistryRunner:
         ):
             return False
         try:
-            settings = (
-                _dest_config(
-                    new, self._env_values, self._trust_anchor_policy, self._egress
-                ).settings
-                if isinstance(new, OutboundConnection)
-                else _source_config(
-                    new, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
-                ).settings
-            )
+            settings = self._anchor_lane_settings(new)
         except Exception:  # noqa: BLE001 - an unresolvable value is a change; the build reports it
             return False
         return _anchor_key(settings) == key
@@ -3409,27 +3556,57 @@ class RegistryRunner:
     def _reload_anchor_lanes(
         self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
     ) -> list[tuple[Direction, str, Mapping[str, Any]]]:
-        """The lanes whose CA a reload to ``new`` reads: the ones it builds or keeps running, with
-        settings resolved. It mirrors the gates of :meth:`_reconcile_outbounds` and of
+        """:meth:`_reload_anchor_candidates` with each lane's settings resolved."""
+        return [
+            (
+                "outbound" if isinstance(conn, OutboundConnection) else "inbound",
+                conn.name,
+                self._anchor_lane_settings(conn),
+            )
+            for conn in self._reload_anchor_candidates(old, new, old_inbound_names)
+        ]
+
+    def _anchor_lane_settings(
+        self, conn: InboundConnection | OutboundConnection
+    ) -> Mapping[str, Any]:
+        """A lane's settings as its build resolves them, which is what its CA check reads."""
+        if isinstance(conn, OutboundConnection):
+            return _dest_config(
+                conn, self._env_values, self._trust_anchor_policy, self._egress
+            ).settings
+        return _source_config(
+            conn, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
+        ).settings
+
+    def _reload_anchor_candidates(
+        self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
+    ) -> list[InboundConnection | OutboundConnection]:
+        """The lanes whose CA a reload to ``new`` reads: the ones it builds or keeps running. It mirrors the gates of :meth:`_reconcile_outbounds` and of
         :meth:`reload`'s listener restart, read without their side effects. Left out: a lane not
         deployed, an ``auto_start=False`` lane that is not running, a lane below a DR threshold (on
         a passive standby, the one its activation applies), an
         ``Ftp`` poller outside its schedule window, and a lane :meth:`_keeps_anchor_failure` keeps
-        failed. Each of those is checked when it is built. On a passive standby no outbound is
-        built, and the ones read are those its activation builds. It is stricter than the reconcile in one
-        place: a lane a #122 halt keeps parked is still checked, since asking the halt gate here
-        would run its probe, which has side effects."""
-        lanes: list[tuple[Direction, str, Mapping[str, Any]]] = []
+        failed. Each of those is checked when it is built. So is an outbound that has left the
+        passive standby's park and has no connector yet (:meth:`_leaves_passive_park`), so its
+        refusal fails that lane and not the activation. On a passive standby no outbound is
+        built, and the ones read are those its activation builds. It is stricter than the
+        reconcile in one place: a lane a #122 halt keeps parked is still checked, since asking the
+        halt gate here would run its probe, which has side effects. The exception is a lane that
+        has left the passive park, which is left out under a halt too, and is checked when a
+        reload or a start builds it once the halt lifts (vault BACKLOG #3263)."""
+        lanes: list[InboundConnection | OutboundConnection] = []
         for name, oc in new.outbound.items():
             if (
                 not oc.deployed
                 or (not oc.auto_start and not self._outbound_lane_live(name))
                 or self._below_dr_threshold(oc.priority)
-                or self._keeps_anchor_failure("outbound", name, old, oc)
+                or self._leaves_passive_park(name, oc)
+                # A passive standby builds no lane, so it keeps no failure unread: its reload
+                # reads the CA again, and the park's clearing of the record is then earned.
+                or (not self._dr_passive and self._keeps_anchor_failure("outbound", name, old, oc))
             ):
                 continue
-            dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
-            lanes.append(("outbound", name, dest.settings))
+            lanes.append(oc)
         for ic in new.inbound.values():
             if (
                 ic.spec.type is not ConnectorType.REMOTEFILE
@@ -3441,10 +3618,7 @@ class RegistryRunner:
                 or self._keeps_anchor_failure("inbound", ic.name, old, ic, bound=old_inbound_names)
             ):
                 continue
-            cfg = _source_config(
-                ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
-            )
-            lanes.append(("inbound", ic.name, cfg.settings))
+            lanes.append(ic)
         return lanes
 
     async def _check_reload_lane_anchors(
@@ -3487,9 +3661,12 @@ class RegistryRunner:
         secrets of a connection the graph says is not deployed.)
 
         A build failure is ISOLATED, not raised (ADR 0031, exactly like the start-time path): the lane is
-        recorded failed + alerted and the resume still proceeds, so rows are retried via the
-        connector-None path and a later fix + reload/restart self-heals — rather than 500ing the control
-        route and leaving the operator with no status to read."""
+        recorded failed + alerted, rather than 500ing the control route and leaving the operator with
+        no status to read. What happens next is the caller's. An operator start resumes the lane, so
+        rows are retried via the connector-None path and a later fix + reload/restart self-heals,
+        EXCEPT for a lane that has left the DR park unbuilt (vault BACKLOG #3263): that one stays
+        parked with its rows held (:meth:`_start_outbound_unsafe`). A reload that builds such a
+        lane leaves it parked the same way (:meth:`_reconcile_outbounds`)."""
         if name in self._destinations or ("outbound", name) in self._filtered:
             return
         oc = self.registry.outbound.get(name)
@@ -3510,6 +3687,11 @@ class RegistryRunner:
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
             # refusal the engine start path gives it, isolated the same way (this method never raises).
             await connector.validate_startup()
+        except asyncio.CancelledError:
+            # A reload awaits this for a lane leaving the passive park, and a reload can be
+            # cancelled (vault BACKLOG #3263). The built connector is closed, not dropped.
+            await self._aclose_quietly(connector, name)
+            raise
         except Exception as exc:
             await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)
@@ -3521,6 +3703,7 @@ class RegistryRunner:
             return
         self._destinations[name] = connector
         self._failed.pop(("outbound", name), None)
+        self._dr_unbuilt.pop(name, None)
 
     async def _aclose_quietly(self, connector: DestinationConnector | None, name: str) -> None:
         """Release whatever a BUILT-but-rejected connector allocated (a File alternate-credential worker
@@ -3552,7 +3735,23 @@ class RegistryRunner:
         # DR-parked (#61, ADR 0048): there is no connector to build, so resuming would charge every
         # held row a failed attempt until a finite max_attempts dead-lettered it (vault BACKLOG #3067).
         self._refuse_dr_parked(name)
+        if self._dr_unbuilt.get(name) is False:
+            # The first build since the lane left the DR park, which a #122 halt held off. The
+            # passive start's record goes, so a fault still there is recorded in this build's own
+            # words (vault BACKLOG #3263).
+            self._failed.pop(("outbound", name), None)
         await self._ensure_destination_built(name)
+        if name in self._dr_unbuilt and name not in self._destinations:
+            # The build failed on a lane held since it left the DR park (vault BACKLOG #3263).
+            # Resuming it would charge each held row an attempt with no connector. The park
+            # stays the engine's, so the reload that builds it resumes it; a restart's stop had
+            # made the pause the operator's.
+            self._dr_unbuilt[name] = True
+            if name in self._outbound_paused:
+                self._gate_parked.add(name)
+            else:
+                self._park_outbound_lane(name)
+            return
         self._outbound_paused.discard(name)
         self._schedule_parked.discard(name)
         # The OPERATOR now owns this lane's UP state — the engine park (if any) is spent, and a reload
@@ -3646,10 +3845,10 @@ class RegistryRunner:
             or not self._auto_start_enabled(name, "outbound")
         ):
             return
-        if self._holds_anchor_failure(name):
+        if self._holds_anchor_failure(name) or self.outbound_dr_failed(name):
             log.info(
-                "schedule: outbound connection %r no longer has a schedule, but its tls_ca_file was "
-                "refused; start the connection once the file is fixed",
+                "schedule: outbound connection %r no longer has a schedule, but it failed to "
+                "start; start the connection once the cause is fixed",
                 name,
             )
             return
@@ -3727,6 +3926,13 @@ class RegistryRunner:
         # the calendar drives nothing. An operator start of an INBOUND clears its marker, and from then
         # the calendar owns it again; a reload re-evaluates the profile for both directions.
         if (kind, name) in self._filtered:
+            return
+        # An outbound whose build failed as it left the DR park is held for a reload or an
+        # operator start, which build it first (vault BACKLOG #3263). A window open would only
+        # read its CA again each tick. Neither branch has anything to do: the lane is not running.
+        # A lane a #122 halt kept unbuilt has not failed, and its window open builds it first
+        # (_start_outbound_unsafe), so the calendar still brings it back.
+        if kind == "outbound" and self.outbound_dr_failed(name):
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
@@ -4783,6 +4989,10 @@ class RegistryRunner:
                 # StageDispatchers replace them below.
                 for name in self.registry.inbound:
                     self._ensure_inbound_workers(name)
+                if self._dr_passive:
+                    # Show a broken feed of the activation set now, not first at the disaster
+                    # (vault BACKLOG #3263). It builds and binds nothing, and never raises.
+                    await self._preflight_passive_lanes()
                 # ADR 0066 pooled mode: replace the per-lane router/transform/delivery workers with one
                 # StageDispatcher per stage. INSIDE the try so a fail-closed RCSI verify unwinds the
                 # partial start via the except below (teardown + re-raise). The engine already ran
@@ -5372,6 +5582,7 @@ class RegistryRunner:
         self._outbound_quiesced.clear()
         self._outbound_resume.clear()
         self._gate_parked.clear()
+        self._dr_unbuilt.clear()
         self._schedule_parked.clear()
         # start() re-arms every lane from scratch, so no STOP outlives a full teardown.
         self._stop_held.clear()
@@ -5970,6 +6181,7 @@ class RegistryRunner:
                 if stale is not None:
                     await stale.aclose()
                 self._failed.pop(("outbound", name), None)
+                self._dr_unbuilt.pop(name, None)
                 # Not deployed outranks a DR park, so a door refuses it as not deployed.
                 self._filtered.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
@@ -5987,6 +6199,7 @@ class RegistryRunner:
                 if stale is not None:
                     await stale.aclose()
                 self._failed.pop(("outbound", name), None)
+                self._dr_unbuilt.pop(name, None)
                 self._park_outbound_lane(name)
                 # The DR park is recorded here too, as at start (_start_outbound), so the doors
                 # refuse a start the profile would not allow (vault BACKLOG #3067).
@@ -6090,6 +6303,30 @@ class RegistryRunner:
                 if not unpark_permitted:
                     if name not in self._outbound_paused:
                         self._pause_delivery_lanes([name])
+                    # The halt holds the lane, and its DR marker is still judged again (vault
+                    # BACKLOG #3263). An activation under a halt used to leave the passive
+                    # standby's marker on a lane the profile now runs. The halt's recovery is
+                    # to start the connection, and that door then answered "activate DR first"
+                    # on a box that was already active. A lane this reload adds below the
+                    # threshold gets its marker here too, so that door refuses it. A no-op
+                    # with no DR profile.
+                    if self._passive_parked(name) and self._leaves_passive_park(name, oc):
+                        # The lane leaves the passive park unbuilt, and is marked so, or the
+                        # marker change below would leave it no record of that. The reload or
+                        # the start that builds it then takes the isolated first build, and a
+                        # start whose build fails holds it rather than resume it with no
+                        # connector. No build has run, so none has failed. A failed record the
+                        # passive start wrote stays, so the lane still reads failed, in words
+                        # that no longer ask for the activation that has run.
+                        self._dr_unbuilt[name] = False
+                        if ("outbound", name) in self._failed:
+                            self._failed[("outbound", name)] = (
+                                f"outbound connection '{name}' failed its check at the passive "
+                                "start, and the log halt held the activation's build of it. Repair "
+                                "the log and the cause, then reload or start the connection; the "
+                                "server log says why"
+                            )
+                    self._dr_filters_out(name, oc.priority, kind="outbound")
                     continue
             if (
                 name in self._gate_parked
@@ -6104,6 +6341,48 @@ class RegistryRunner:
                 # got the reload lock. The scheduler starts the lane when its window opens.
                 self._gate_parked.discard(name)
                 self._schedule_parked.add(name)
+            if self._leaves_passive_park(name, oc):
+                # The lane leaves the passive standby's park, or its build failed when it did
+                # (vault BACKLOG #3263). So it is built as a start builds it: CA check, build and
+                # validate_startup, with a fault isolated to this lane (ADR 0031). BEFORE the
+                # unpark, as _start_outbound_unsafe orders it: the build awaits, and a lane
+                # unparked first claimed a held row with no connector and charged it an attempt.
+                if self._passive_parked(name) or not self._dr_unbuilt.get(name, False):
+                    # The first build since the lane left the park, at this activation. The
+                    # failed record a passive start or an earlier activation may have left is
+                    # dropped, so a fault still there is recorded and alerted as this build's
+                    # own. A lane whose build already failed since this activation keeps its
+                    # record, and a CA still refused is not alerted again
+                    # (_ensure_destination_built). Marked before the await, which a cancelled
+                    # reload can end there: the passive marker is gone, and this mark sends the
+                    # next reload down this path again. A build that succeeds drops it.
+                    self._filtered.pop(("outbound", name), None)
+                    self._failed.pop(("outbound", name), None)
+                    self._dr_unbuilt[name] = False
+                await self._ensure_destination_built(name)
+                if self._dr_passive:
+                    # The box went passive while the build awaited: a failed activation hands
+                    # the threshold back without the reload lock. The lane stays parked, under
+                    # the passive marker again.
+                    self._dr_unbuilt.pop(name, None)
+                    self._dr_filters_out(name, oc.priority, kind="outbound")
+                elif name in self._destinations:
+                    self._unpark_outbound_lane(name)
+                else:
+                    # The build failed, and the lane stays parked with its rows held: it reads
+                    # failed, and none of them is claimed with no connector, charged an attempt
+                    # or dead-lettered for a fault found at the takeover (ADR 0048). Its mark
+                    # keeps the scheduler and an alert rule's restart off it. The next reload,
+                    # or an operator start, builds it again and resumes it once that succeeds.
+                    self._dr_unbuilt[name] = True
+                    if name in self._schedule_parked:
+                        # A closed window passed the park to the calendar above, and the
+                        # calendar leaves this lane alone. The engine holds it, so it pages.
+                        self._schedule_parked.discard(name)
+                        self._gate_parked.add(name)
+                if worker is None or worker.done():
+                    self._spawn_worker(name)
+                continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector, and
@@ -6116,6 +6395,7 @@ class RegistryRunner:
                 if stale is not None:
                     await stale.aclose()
                 self._failed.pop(("outbound", name), None)
+                self._dr_unbuilt.pop(name, None)
                 if worker is None or worker.done():
                     self._spawn_worker(name)
                 continue
@@ -6199,6 +6479,8 @@ class RegistryRunner:
                 if old_conn is not None:
                     await old_conn.aclose()
             # else: unchanged & live → leave the worker/connector as-is.
+        # A lane the new graph dropped has no spec to build again from.
+        self._dr_unbuilt = {n: f for n, f in self._dr_unbuilt.items() if n in new.outbound}
         # Outbounds removed by ``new`` keep their worker so already-queued rows finish draining.
         if not self._dr_passive and not self._delivery_halted:
             # One the passive park held goes back to draining (vault BACKLOG #3262). It was
@@ -9426,7 +9708,7 @@ class RegistryRunner:
         # rows retained) — never false-page on it. Scoped to _outbound_paused membership + the OUTBOUND
         # stage, and it LIFTS immediately on start_outbound, so a genuinely backed-up RESUMED lane still
         # trips buildup. (INGRESS/ROUTED lanes never appear in _outbound_paused; the stage guard is belt.)
-        if stage == Stage.OUTBOUND.value and name in self._outbound_paused:
+        if stage == Stage.OUTBOUND.value and self._pages_suppressed(name):
             return
         # #93 (ADR 0014 amendment): the saturation (rising-backlog derivative) check rides the SAME
         # per-lane tick as buildup and shares the paused guard above, but is INDEPENDENT of the buildup
@@ -9498,7 +9780,7 @@ class RegistryRunner:
         must never raise (contract), but we guard so an alerting bug can't kill the worker."""
         # A deliberately-paused outbound's backlog grows by design — never false-page it (the shared
         # buildup caller already guards this, but re-guard so a direct call is safe too).
-        if stage == Stage.OUTBOUND.value and name in self._outbound_paused:
+        if stage == Stage.OUTBOUND.value and self._pages_suppressed(name):
             return
         sustain = self._saturation_default.sustain_samples
         if sustain is None:
@@ -9570,7 +9852,7 @@ class RegistryRunner:
         never raise (contract), but we guard so an alerting bug can't kill the worker."""
         # Connection controls: suppress the stall page on a deliberately operator-paused outbound (its
         # oldest message ages by design); lifts immediately on start_outbound (stall is OUTBOUND-only).
-        if name in self._outbound_paused:
+        if self._pages_suppressed(name):
             return
         threshold = self._stall.get(name) or self._stall_default
         if threshold.max_oldest_seconds is None:
@@ -9729,6 +10011,8 @@ class RegistryRunner:
                 await self._check_inflight_strands()
             except Exception:
                 log.exception("in-flight watch check failed; the next tick retries")
+            # Its own guard: it logs its own faults, so a strand-check failure must not skip it.
+            await self._page_dr_failed_lanes()
 
     async def _check_inflight_strands(self, now: float | None = None) -> None:
         """Page on a row held in flight past the lane's age threshold (BACKLOG #1611 part B, P3-03).

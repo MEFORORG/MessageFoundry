@@ -145,7 +145,8 @@ class DrCoordinator:
     flip the DR run-profile (``activate_profile`` re-applies the graph with the run-profile ON;
     ``deactivate_profile`` unbinds intake + drains, then turns it OFF, and returns the drain's
     outcome fields for the ``dr.release`` row), and optional callbacks for the seed marker's config
-    digest and for provenance fields on the ``dr.activate`` row. Single-writer: the API serializes
+    digest, for provenance fields on the ``dr.activate`` row, and for cleanup after a recorded
+    release. Single-writer: the API serializes
     activate/release behind ``[approvals]``-style RBAC; this object additionally guards against a
     concurrent activate/release with its own lock."""
 
@@ -162,6 +163,7 @@ class DrCoordinator:
         clock: Callable[[], float] = time.time,
         owned_lanes: Callable[[], OwnedLanes | None] | None = None,
         profile_provenance: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
+        after_release: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -173,6 +175,11 @@ class DrCoordinator:
         # the profile is applied; a fault is recorded on the row and never fails the activation.
         self._provenance = profile_provenance
         self._deactivate_profile = deactivate_profile
+        # Cleanup a completed hand-back still owes, such as closing the parked outbounds' sessions.
+        # Awaited once the box has handed back, after the attempt to write the dr.release row,
+        # whether or not that write lands. Its errors are logged, so nothing it does can fail the
+        # release or leave it half recorded (vault BACKLOG #3263).
+        self._after_release = after_release
         # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
         self._config_fingerprint_provider = config_fingerprint_provider
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
@@ -412,10 +419,16 @@ class DrCoordinator:
         async with self._lock:
             now = self._clock()
             if not self._active:
-                # Never success for a hand-back with no dr.release row: write the one a cut-short
-                # release owes first, or refuse (vault BACKLOG #2752).
-                if self._unrecorded_release is not None:
-                    await self._record_owed_release()
+                try:
+                    # Never success for a hand-back with no dr.release row: write the one a
+                    # cut-short release owes first, or refuse (vault BACKLOG #2752).
+                    if self._unrecorded_release is not None:
+                        await self._record_owed_release()
+                finally:
+                    # A release whose row or cleanup was cut short never ran the cleanup, or not
+                    # to its end. It is safe to repeat, so a retry finishes it, and does so
+                    # whether or not the owed row lands now (vault BACKLOG #3263).
+                    await self._run_after_release()
                 return self._last_release or DrResult(
                     action="release",
                     active=False,
@@ -457,7 +470,15 @@ class DrCoordinator:
                 self._last_release = self._release_result(detail)
                 # Owed from here: a write cut short is made good by the next activate or release.
                 self._unrecorded_release = (detail, actor, now)
-                await self._record_owed_release(late=False)
+                try:
+                    await self._record_owed_release(late=False)
+                finally:
+                    # The box has handed back, so it holds no partner session whether or not
+                    # the row was written (vault BACKLOG #3262). A refused write still refuses
+                    # the release, and the row stays owed. A cancellation of the cleanup is
+                    # in the record phase, so the arm below does not read it as a failed
+                    # release (vault BACKLOG #3263).
+                    await self._run_after_release()
             except asyncio.CancelledError:
                 # A cancellation is not an Exception, so the drain's arm above never sees one (vault
                 # BACKLOG #2752). The API runs a release so that a request deadline does not cancel it
@@ -483,6 +504,20 @@ class DrCoordinator:
                     await self._record_release_failed("interrupted", phase, hook_ran, actor, now)
                 raise
             return self._release_result(detail)
+
+    async def _run_after_release(self) -> None:
+        """Run the engine's cleanup for a hand-back that is complete. An error is logged and not
+        raised: the release stands, and a retried release or the next reload finishes it."""
+        if self._after_release is None:
+            return
+        try:
+            await self._after_release()
+        except Exception:
+            log.warning(
+                "DR: the release handed back, but its cleanup did not finish; a retried release "
+                "or the next reload closes any outbound session still open",
+                exc_info=True,
+            )
 
     def _release_result(self, detail: Mapping[str, object]) -> DrResult:
         """The :class:`DrResult` of a completed hand-back, read from its ``dr.release`` detail."""
