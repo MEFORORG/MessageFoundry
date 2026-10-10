@@ -36,9 +36,8 @@ stdlib uses that form for an HTTP/0.9 request on every CPython read so far. Up t
 a version it refuses; 3.14.8 writes those with a status line itself. The sink answers all of them
 with a status line and a header block, like any other; the handler's ``request_version`` says how.
 
-The stdlib's own error answers are plain text, :data:`ERROR_CONTENT_TYPE`, not its default HTML
-page. It writes every one of them through ``send_error``, which reads the handler's
-``error_content_type`` and ``error_message_format``.
+The stdlib's own error answers are ``text/plain``, not its default HTML page; the handler's
+``error_content_type`` says why that covers each one.
 """
 
 from __future__ import annotations
@@ -56,7 +55,6 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 __all__ = [
     "BASELINE_RESPONSE_HEADERS",
-    "ERROR_CONTENT_TYPE",
     "LOOPBACK",
     "REDACTED",
     "REDACTED_HEADERS",
@@ -86,9 +84,6 @@ BASELINE_RESPONSE_HEADERS: tuple[tuple[str, str], ...] = (
     ("X-Frame-Options", "DENY"),
     ("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'"),
 )
-
-#: The Content-Type of every error answer the stdlib handler writes itself, in place of its HTML.
-ERROR_CONTENT_TYPE = "text/plain; charset=utf-8"
 
 #: How long one socket read may wait, so a peer that declares more than it sends cannot hold a
 #: handler thread (or a stop) open.
@@ -211,7 +206,7 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
         # Every error answer the stdlib writes goes through send_error, which reads these two:
         # the 400, 431 and 505 from parse_request, and the 414 and 501 from handle_one_request.
         # Its defaults are an HTML page; plain text leaves a browser nothing to render.
-        error_content_type = ERROR_CONTENT_TYPE
+        error_content_type = "text/plain; charset=utf-8"
         error_message_format = "%(code)d %(message)s\n%(explain)s\n"
 
         def end_headers(self) -> None:

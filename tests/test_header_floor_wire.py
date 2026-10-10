@@ -203,7 +203,7 @@ def test_pyproject_pins_the_versions_this_suite_measured() -> None:
     range would let an install take a release nobody read; a pin that moved alone would leave the
     suite red on every leg with no hint why."""
     pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    deps = {Requirement(raw).name: Requirement(raw) for raw in pyproject["project"]["dependencies"]}
+    deps = {req.name: req for req in map(Requirement, pyproject["project"]["dependencies"])}
     for name, measured in (("uvicorn", _MEASURED_UVICORN), ("websockets", _MEASURED_WEBSOCKETS)):
         assert str(deps[name].specifier) == f"=={measured}", (name, str(deps[name].specifier))
 
@@ -1136,7 +1136,7 @@ def _serve_captured(
     (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
-    samples = Path(__file__).resolve().parents[1] / "samples" / "config"
+    samples = _ROOT / "samples" / "config"
     before = set(tmp_path.rglob("*"))
     rc = main([command, "--config", str(samples), "--env", "dev"])
     return rc, captured, set(tmp_path.rglob("*")) - before
