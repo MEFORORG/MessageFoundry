@@ -6,8 +6,8 @@
   handshake, uvicorn's `500`, its `403` for an app that closes before accepting, an app's own
   denial, and the `101`. It does so in one place,
   the `send_response` of the connection object the protocol hands each answer to. The legacy
-  websockets server stays covered as before. wsproto is still refused. uvicorn and
-  `websockets` are now pinned exactly; the entry on the pins names the versions.
+  websockets server stays covered as before. wsproto is still refused. The lock moves
+  uvicorn to 0.54.0. The entry on the uvicorn and `websockets` pins says how both are now held.
   The startup self-test drives whichever WebSocket class is served, and
   gains two drives: an app that closes before accepting, and an upgrade the websockets parser
   rejects. On this protocol the floor also does two things beyond adding headers, each a

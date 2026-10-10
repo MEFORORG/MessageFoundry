@@ -5394,7 +5394,9 @@ BACKLOG #1485.
 
 ### Dependency lockfile (DEP-1)
 
-`pyproject.toml` carries lower-bound (`>=`) ranges; the **pinned, hashed** resolution lives in
+`pyproject.toml` carries mostly lower-bound (`>=`) ranges. Some carry an upper bound too, and at
+least uvicorn and websockets are pinned exactly, because the protocol header floor was measured on
+one version of each (BACKLOG #1120). The **pinned, hashed** resolution lives in
 **`uv.lock`** (the source of truth) and its exported view **`requirements.lock`** (cross-platform,
 with per-package hashes), both committed. CI verifies they're in sync (`uv lock --check` + an export
 `diff`) and audits `requirements.lock`. Refresh after any dependency change:

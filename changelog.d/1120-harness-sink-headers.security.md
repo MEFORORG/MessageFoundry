@@ -9,5 +9,5 @@
   at all, in HTTP/0.9 form: at least an HTTP/0.9 request, its own `400` for a request line it
   cannot parse, and its `505` for a version it refuses. The sink now answers those with a status line and headers.
   The interim `100 Continue` carries the four headers too. No answer carries HSTS. The sink still
-  sends Python's `Server` line, which the engine listener does not. The status, body and what the
-  sink records are unchanged. (`BACKLOG #1120`)
+  sends Python's `Server` line, which the engine listener does not. The status, the sink's own
+  bodies and what the sink records are unchanged. (`BACKLOG #1120`)

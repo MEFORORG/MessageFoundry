@@ -206,9 +206,9 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
         # The stdlib writes its own error answers through send_error, which reads these two. Read
         # at CPython 3.14.6, that is at least parse_request's 400, 431 and 505 and
         # handle_one_request's 414 and 501. The stdlib default is an HTML page. Plain text leaves
-        # a browser nothing to render. The body carries the status and the stdlib's fixed
-        # explanation, never %(message)s: that can echo the request line, and send_error
-        # HTML-escapes it, which would read as entities in a text/plain body.
+        # a browser nothing to render. The body carries the status and the stdlib's explanation
+        # (its table text, or for a 431 the http.client error), never %(message)s. That can echo
+        # the request line, and send_error HTML-escapes it, so it would read as entities here.
         error_content_type = "text/plain; charset=utf-8"
         error_message_format = "%(code)d %(explain)s\n"
 

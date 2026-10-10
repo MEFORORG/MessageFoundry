@@ -41,6 +41,7 @@ import pytest
 import uvicorn
 import websockets as websockets_package
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
@@ -205,7 +206,9 @@ def test_pyproject_pins_the_versions_this_suite_measured() -> None:
     pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     deps = list(map(Requirement, pyproject["project"]["dependencies"]))
     for name, measured in (("uvicorn", _MEASURED_UVICORN), ("websockets", _MEASURED_WEBSOCKETS)):
-        (req,) = [r for r in deps if r.name == name]  # one entry, so no second spec beside it
+        same = [r for r in deps if canonicalize_name(r.name) == name]
+        assert len(same) == 1, f"{name} must have one entry, so no second spec sits beside it"
+        (req,) = same
         assert req.marker is None, f"{name} is pinned on some platforms only: {req}"
         assert str(req.specifier) == f"=={measured}", f"{name} is not pinned to {measured}: {req}"
 

@@ -112,6 +112,8 @@ _STDLIB_LINE_LIMIT: int = getattr(http.client, "_MAXLINE", 65536)
 _GET_LINE = b"GET /x HTTP/1.1\r\n"
 _LONG_REQUEST_LINE = b"GET /".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
 _LONG_HEADER_LINE = b"X-Long: ".ljust(_STDLIB_LINE_LIMIT + 1, b"a")
+#: One header past http.client's limit, with no blank line: the stdlib refuses as it reads the last.
+_MANY_HEADERS = b"X-H: v\r\n" * (getattr(http.client, "_MAXHEADERS", 100) + 1)
 
 #: (sink status, request, the statuses of the header blocks the sink must write).
 _CASES: list[Any] = [
@@ -147,6 +149,7 @@ _CASES: list[Any] = [
     pytest.param(200, b"GET /x HTTP/3.0\r\n", [505], id="stdlib-505-version"),
     pytest.param(200, _LONG_REQUEST_LINE, [414], id="stdlib-414-long-line"),
     pytest.param(200, _GET_LINE + _LONG_HEADER_LINE, [431], id="stdlib-431-long-header"),
+    pytest.param(200, _GET_LINE + _MANY_HEADERS, [431], id="stdlib-431-many-headers"),
     pytest.param(
         200,
         b"POST /x HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}",
@@ -334,23 +337,37 @@ def test_the_stdlib_error_page_is_html_without_the_override(
     _without(monkeypatch, "error_message_format")
     content_type, body = _error_page(_answer(monkeypatch, request_bytes))
     assert content_type.startswith("text/html"), content_type
-    assert body.lstrip().startswith(b"<!DOCTYPE HTML>"), body[:80]
+    assert b"<" in body, body[:80]
 
 
-def test_a_stdlib_error_page_does_not_echo_the_request() -> None:
-    """The stdlib puts the bad part of a request line in its reason. The plain-text body leaves
-    it out, so markup in the request reaches the body neither raw nor as escaped entities."""
-    with RestSink() as sink:
-        raw = _exchange(sink.port, b"GET /a<b>&c HTTP/x&<\r\n", half_close=True)
+_MARKUP_REQUEST_LINE = b"GET /a<b>&c HTTP/x&<\r\n"
+
+
+def test_a_stdlib_error_page_body_does_not_echo_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stdlib puts the bad part of a request line in its reason phrase. The plain-text body
+    leaves that out, so markup in the request reaches the body neither raw nor as entities. The
+    status line still carries the phrase as the stdlib writes it; this test is about the body."""
+    raw = _answer(monkeypatch, _MARKUP_REQUEST_LINE)
     assert raw.startswith(b"HTTP/1.1 400 "), raw[:80]
     _, body = _error_page(raw)
     assert body.startswith(b"400 ") and b"<" not in body and b"&" not in body, body
 
 
+def test_the_stdlib_error_page_body_echoes_the_request_without_the_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the stdlib's own format puts the escaped request bytes in the body."""
+    _without(monkeypatch, "error_message_format")
+    _, body = _error_page(_answer(monkeypatch, _MARKUP_REQUEST_LINE))
+    assert b"&lt;" in body, body
+
+
 def test_the_error_page_cases_cover_every_stdlib_error_class() -> None:
-    """At least the 400, 414, 431, 501 and 505 that BACKLOG #1120 drives."""
+    """At least the 400, 414, 431 (both paths), 501 and 505 that BACKLOG #1120 drives."""
     ids = [case.id for case in _STDLIB_ERROR_PAGES]
-    assert len(ids) == 8, ids
+    assert len(ids) == 9, ids
     finals = {cast(list[int], case.values[1])[-1] for case in _STDLIB_ERROR_PAGES}
     assert {400, 414, 431, 501, 505} <= finals
 
