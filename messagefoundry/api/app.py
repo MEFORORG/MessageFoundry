@@ -2057,7 +2057,8 @@ class ExportStopped(RuntimeError):
 
     The response has already started, so no status code can say so. Raising aborts the transfer,
     and the client sees an incomplete download rather than a short file that looks complete. The
-    server logs the raise with a traceback. Returning without the final body message would avoid
+    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
+    and uvicorn writes a traceback. Returning without the final body message would avoid
     that, but the ``@app.middleware("http")`` layers above would then finish the response cleanly,
     which is the short file this exists to prevent."""
 
@@ -5703,16 +5704,21 @@ def create_app(
         token = bearer_token(request) if auth is not None else None
         touch_every = auth.session_idle_seconds / 4 if auth is not None else 0.0
 
+        gate_scope = _scope(identity)
+
         async def _iter_ndjson() -> AsyncIterator[bytes]:
             streamed = 0
-            last_touch = time.monotonic()
+            # -inf, so the first row touches: the gate's touch was before selection, which can
+            # take a while on a content scan.
+            last_touch = float("-inf")
             for mid in selected:
                 # Re-resolve the caller before EVERY row (BACKLOG #1154, ASVS 8.3.2). The gate
                 # resolved it once, and an export can run to 100,000 bodies, so a session revoked or
                 # a permission withdrawn mid-export would otherwise not reach it. Not the step-up:
-                # that proved the person when the export started. The download is the caller's own
-                # act, so it moves the idle clock every quarter of the idle window; without that, an
-                # export longer than the idle timeout would end its own session partway.
+                # that proved the person when the export started. A flowing download is the
+                # caller's own act, so it moves the idle clock every quarter of the idle window. A
+                # client that stalls past the idle window leaves the session idle like any other,
+                # and the next row's re-check then ends both.
                 touch = time.monotonic() - last_touch >= touch_every
                 if touch:
                     last_touch = time.monotonic()
@@ -5727,31 +5733,37 @@ def create_app(
                         activity=touch,
                     )
                 )
-                if current is None:
+                # A changed channel scope stops the export too, rather than skipping and auditing
+                # every later out-of-scope row: one stop row, not a denial per row that would trip
+                # the access-denied burst signal against an operator who did nothing.
+                reason = (
+                    "standing_changed"
+                    if current is None
+                    else "scope_changed"
+                    if _scope(current) != gate_scope
+                    else None
+                )
+                if reason is not None:
                     # Counts only, never an id or a body.
                     _log.warning(
-                        "message export stopped after %d of %d rows: the caller's standing changed",
+                        "message export stopped after %d of %d rows: %s",
                         streamed,
                         len(selected),
+                        reason,
                     )
                     await engine.store.record_audit(
                         "messages_export.stopped",
                         actor=identity.username,
                         channel_id=channel_id,
                         detail=json.dumps(
-                            {
-                                "selected": len(selected),
-                                "streamed": streamed,
-                                "reason": "standing_changed",
-                            }
+                            {"selected": len(selected), "streamed": streamed, "reason": reason}
                         ),
                         client=client_ip(request),
                     )
                     raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
-                # Per-row channel scope on EVERY streamed body (load-bearing for the ids path), read
-                # from the identity resolved for THIS row, so a narrowed scope skips the rest. An
+                # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
                 # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                row = await read_scoped_message(engine, current, mid, request)
+                row = await read_scoped_message(engine, identity, mid, request)
                 if row is None:
                     continue
                 streamed += 1

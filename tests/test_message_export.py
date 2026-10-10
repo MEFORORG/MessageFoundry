@@ -502,11 +502,13 @@ async def test_an_export_with_nothing_withdrawn_streams_every_row(
     assert await _stop_rows(engine) == []
 
 
-async def test_a_scope_narrowed_mid_export_skips_the_rows_it_no_longer_covers(
+async def test_a_scope_narrowed_mid_export_stops_the_stream_once(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The scope is narrowed in the store directly, so no session is revoked and only the per-row
-    re-resolution can carry the change: row two, on the channel withdrawn, is skipped and audited."""
+    re-resolution can carry the change. The export stops with one ``scope_changed`` row rather than
+    skipping and auditing every later out-of-scope row, which would flood the audit chain and trip
+    the access-denied burst signal against the operator."""
     service = await _service(engine)
     uid = await _add_user(service, "op", [Role.OPERATOR.value])
     mid_a, mid_b = await _seed(engine)
@@ -514,18 +516,47 @@ async def test_a_scope_narrowed_mid_export_skips_the_rows_it_no_longer_covers(
     async def narrow() -> None:
         await service.store.set_user_channel_scope(uid, '["IB_A"]', source="manual")
 
-    async with _client(engine, service) as c:
+    async with _client(engine, service, raise_app_exceptions=False) as c:
         token = await _login(c, "op")
         _after_first_read(monkeypatch, engine, narrow)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
-    assert r.status_code == 200, r.text
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
-    denied = [
-        dict(a)["channel_id"]
-        for a in await engine.store.list_audit(limit=50)
-        if dict(a)["action"] == "auth.channel_denied"
+    assert await _stop_rows(engine) == [{"selected": 2, "streamed": 1, "reason": "scope_changed"}]
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
+    assert "auth.channel_denied" not in actions
+
+
+def _count_stream_touches(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> list[int]:
+    """Count ``touch_session`` calls made after the export's own audit row, i.e. by the stream and
+    not by sign-in or the gate. Returns a one-item list the caller reads after the request."""
+    counted = [0]
+    streaming = False
+    real_audit = engine.store.record_audit
+    real_touch = engine.store.touch_session
+
+    async def audit(action: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal streaming
+        if action == "messages_export":
+            streaming = True
+        return await real_audit(action, *args, **kwargs)
+
+    async def touch(*args: Any, **kwargs: Any) -> Any:
+        if streaming:
+            counted[0] += 1
+        return await real_touch(*args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", audit)
+    monkeypatch.setattr(engine.store, "touch_session", touch)
+    return counted
+
+
+async def _seed_many(engine: Engine, count: int) -> list[str]:
+    return [
+        await engine.store.enqueue_message(
+            channel_id="IB_A", raw=ADT_A, deliveries=[], message_type="ADT^A01", control_id=f"M{n}"
+        )
+        for n in range(count)
     ]
-    assert denied == ["IB_B"]
 
 
 async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_session_out(
@@ -537,12 +568,7 @@ async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_sessi
     monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 0.4))
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
-    ids = [
-        await engine.store.enqueue_message(
-            channel_id="IB_A", raw=ADT_A, deliveries=[], message_type="ADT^A01", control_id=f"M{n}"
-        )
-        for n in range(6)
-    ]
+    ids = await _seed_many(engine, 6)
     real = engine.store.get_message
 
     async def slow(message_id: str) -> Any:
@@ -557,3 +583,43 @@ async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_sessi
     assert [row["id"] for row in _ndjson(r.text)] == ids
     assert await _stop_rows(engine) == []
     assert await service.identity_for_token(token, activity=False) is not None
+
+
+async def test_fast_rows_share_one_idle_touch(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The touch is spaced by time, not paid per row: with a generous window, ten fast rows cost
+    the first row's touch and nothing more. A regression to a write per row reds this."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 3600.0))
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    ids = await _seed_many(engine, 10)
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        touches = _count_stream_touches(monkeypatch, engine)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
+    assert len(_ndjson(r.text)) == 10
+    assert touches[0] == 1, touches
+
+
+async def test_a_client_stalled_past_the_idle_window_ends_the_export(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stall longer than the idle window leaves the session idle like any other, so the next
+    row's re-check ends the export as a standing change. Pinned so the behaviour is a decision."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 0.4))
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    ids = await _seed_many(engine, 2)
+
+    async def stall() -> None:
+        await asyncio.sleep(0.6)
+
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, stall)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
+    assert [row["id"] for row in _ndjson(r.text)] == ids[:1]
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "standing_changed"}
+    ]
