@@ -550,14 +550,11 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 > corrections on this same claim each landed a new false statement.
 > `tests/test_claude_settings_contract.py` now asserts that every script under `scripts/hooks/` is
 > either wired, or wired by a tracked installer, or named with its reason on an explicit unwired
-> list -- so the next drift is a red test rather than a sentence somebody has to notice. **Owner
-> ruling 2026-08-25, relayed by the Liaison and not read first-hand here:** *"The blanket-git-stage
-> guard is a CONTROL. Strike the claim now, wire it after the splitter repair."* The commit that
-> relays it, `786ac8b49b`, reads that repair as the quote-state repair, BACKLOG #1341. Whether
-> that condition still stands, the condition a later Lander amendment added, and the owner answers
-> reported since are in
+> list -- so the next drift is a red test rather than a sentence somebody has to notice. What
+> wiring waits on is recorded once, with its sources, in
 > [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), *What wiring waits on*.
-> This row becomes *Deterministic gate* once the guard is wired, and not before.
+> That includes the owner ruling of 2026-08-25, which reached this repository relayed by the
+> Liaison. This row becomes *Deterministic gate* once the guard is wired, and not before.
 
 This document **owns and expands** the SDS §A.6 line — *"AI-assisted review as a compensating control"* — for the solo-maintainer **PO.2 / PW.7** deviation. The detailed record is Appendix A.6.
 

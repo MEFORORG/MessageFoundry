@@ -2,37 +2,49 @@
 
 `scripts/hooks/block-blanket-git-stage.ps1` refuses a git command that stages or commits a whole
 tree. This page lists the blanket forms it still allows, each measured against real git. For
-every form it says one of three things: the owner accepted it, a change closed it, or nobody has
-accepted it.
+every form it says one of three things: a per-form owner answer covers it, a change closed it, or
+no per-form answer covers it.
 
-At the measured commits no settings file ran the guard. Section 5 lists the forms the guard
-allows that none of the first three owner answers covers. Whether a settings file runs the guard
+At the measured commits no settings file in this repository ran the guard. The vault's rulings
+file of 2026-10-08 says the vault runs its own copy. Section 5 lists the forms the guard allows
+that none of the three per-form owner answers covers. Whether a settings file here runs the guard
 now is asserted in `tests/test_claude_settings_contract.py`, so read it there. Every "would"
 below describes what a session would meet once the guard runs.
 
 ## The owner answers
 
-The owner answered three times on these forms. Each answer was a choice in a dialog in the
-Special seat's session. **All three are reported by that seat. No other seat saw the dialogs.**
-The vault's rulings file of 2026-10-08 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`,
-entry #1339) records answer 1. The seat's comments on engine PR 2209 record answers 2 and 3.
+The owner answered at least four times on these forms. Each answer was a choice in a dialog in
+the Special seat's session. **All four are reported by that seat. No other seat saw the
+dialogs.** The vault's rulings file of 2026-10-08
+(`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, entry #1339) records answer 1. The seat's
+comments on engine PR 2209 record answers 2 and 3, and its comment on engine PR 2217 records
+answer 4.
 
 | Answer | Date | The option the owner chose | What it covers | Section |
 |---|---|---|---|---|
 | 1 | 2026-10-08 | "Accept, wire it (Recommended)" | six fail-opens | 1 |
 | 2 | 2026-10-08 | "Accept all five, wire it (Recommended)" | five groups, (a) to (e) | 2 |
 | 3 | 2026-10-09 | "Accept the four, wire it (Recommended)" | four forms the Lander's review found | 3 |
+| 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | anything the guard does not match | all |
 
 Only the option label is the owner's own choice. The item lines quoted in sections 1 to 3 are
-the Special seat's wording. For answer 1, the vault file says so: the seat worded the six items,
-and everything outside the quoted label is the seat's. For answers 2 and 3, the lines are the
+the Special seat's wording. For answer 1, the vault file says so: the seat worded the six items.
+Everything outside the quoted label is the seat's. For answers 2 and 3, the lines are the
 question text as the seat's PR 2209 comments give it.
 
-The dialogs showed one line per item, not the tables on this page. So this page calls a form
-accepted only when the line's own words describe it. A form the words do not describe is in
-section 5, even where it sat in an accepted group on this page before. Where a line says "a
-stage", this page reads it as `git add` or `git stage` only, so a commit form under such a line
-is in section 5 too.
+**Answers 1 to 3 are per form. Answer 4 is by mechanism.** Its question, as the seat's PR 2217
+comment gives it, asked: "Will you accept by mechanism instead? That is: the guard is a
+best-effort check against the common blanket-stage spellings; anything it does not match is a
+stated residual; the document lists the known ones as at least." So under answer 4, every
+allowed form on this page is a stated residual, section 5 included. This page still sorts each
+form by answers 1 to 3. A form in section 5 is a residual by mechanism, and no per-form answer
+names it.
+
+The dialogs for answers 1 to 3 showed one line per item, not the tables on this page. So this
+page puts a form under a per-form answer only when the line's own words describe it. A form the
+words do not describe is in section 5. That holds even where it sat in an accepted group on this
+page before. Where a line says "a stage", this page reads it as `git add` or `git stage` only. A
+commit form under such a line is in section 5 too.
 
 The PR 2209 record of answer 2 also says what that answer leaves out: "forms in
 docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md that fall in none of the five groups, and the three
@@ -42,21 +54,13 @@ form, and those forms are in section 5.2.
 Sorting a form under a line is the reading of the Builders who wrote this page. The owner may
 draw a line elsewhere.
 
-**A fourth answer came after this page was sorted.** The Special seat reports it in a comment on
-engine PR 2217, from a dialog of 2026-10-09 that no other seat saw. The question asked: "Will
-you accept by mechanism instead? That is: the guard is a best-effort check against the common
-blanket-stage spellings; anything it does not match is a stated residual; the document lists the
-known ones as at least." The owner chose "Accept by mechanism (Recommended)". This page was not
-re-sorted under that answer. Its sections sort each form by answers 1 to 3 only, so "NOT
-accepted" in section 5 means under none of those three.
-
 ## What wiring waits on
 
-Two conditions are on record. The first is an owner ruling. The second is not.
+At least these are on record. Only the first is an owner ruling.
 
 1. **Owner ruling 2026-08-25, relayed by the Liaison and not read first-hand here:** *"The
    blanket-git-stage guard is a CONTROL. Strike the claim now, wire it after the splitter
-   repair."* The commit message of `786ac8b49b` (PR 579) quotes the relay, and reads that repair
+   repair."* The commit message of `786ac8b49b` (PR 579) quotes the relay. It reads that repair
    as the quote-state repair, BACKLOG #1341. PR 579 landed the over-deny half of it. The rest
    needs a quote-state parser, and nobody built one. Ledger row #1341 records that the owner
    declined that parser family on 2026-08-25, for the sibling hooks. A Manager ruling of
@@ -68,6 +72,12 @@ Two conditions are on record. The first is an owner ruling. The second is not.
    it". The wording is the Lander's, not the owner's. The owner answers above are reported dialog
    choices. The vault file's #1339 entry leaves it to the Lander to ask the owner whether such a
    choice meets that condition. No record read for this page shows that question answered.
+3. **A hold, as the Special seat reports it on PR 2217.** It says the owner told it to "start no
+   new work", and that wiring waits until the owner lifts that. The option the owner chose in
+   answer 4 carries this text, which the seat wrote: "Recorded as your ruling. When you lift the
+   hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
+   return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser." Those
+   three are the rows of section 5.1.
 
 ## How this was measured
 
@@ -101,7 +111,7 @@ untracked file by pathspec, so the commit forms read "all tracked".
 The vault file says the dialog named exactly these six. Each heading quotes that file's wording
 of one item. All of them are still allowed.
 
-**1. "a stage after an unbalanced apostrophe or escaped quote".** At least:
+**1. "a stage after an unbalanced apostrophe or escaped quote is allowed".** At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -117,7 +127,7 @@ The control `# plain`, newline, `git add -A` is denied, so the apostrophe is the
 commit of the same shape, `# that's it`, newline, `git commit -am wip`, is in section 5.2,
 because the line says "a stage".
 
-**2. "git run through a wrapper or a full path (cmd /c, env, a path to git.exe)".** At least:
+**2. "git run through a wrapper or a full path is allowed (cmd /c, env, a path to git.exe)".** At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -144,7 +154,7 @@ that neither text names (`command`, `exec`, `sh -c`, `iex`,
 `Start-Process`) are sorted here under "and similar". `cmd /c "git add -A"` under bash staged
 nothing.
 
-**3. "a shell glob or a magic pathspec beyond the common ones (git add \*, :^x)".** At least:
+**3. "a shell glob or a magic pathspec beyond the common ones is allowed (git add \*, :^x)".** At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -165,7 +175,7 @@ nothing.
 `git commit -m wip *` under bash committed nothing: bash expanded `*` to include an untracked
 file, and git refused the pathspec.
 
-**4. "--pathspec-from-file".** At least:
+**4. "--pathspec-from-file is allowed".** At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -249,10 +259,8 @@ repository root, `git add ..` stages nothing: git answers `'..' is outside repos
 
 **(c) "quoting forms such as git commit -m wip '.' or "git" add -A".** The guard blanks quoted
 text before it reads a commit, so a quoted pathspec looks the same as a quoted message. A quoted
-or escaped command word hides the word. Closing these needs quote state. Ledger row #1341 records
-that the owner declined the quote-state parser family on 2026-08-25, for the sibling hooks. A
-Manager ruling of 2026-09-21 extended that decline to this script, as ledger row #1339 records.
-At least:
+or escaped command word hides the word. Closing these needs quote state, which nobody built.
+*What wiring waits on*, item 1, gives the record of its decline. At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -427,7 +435,7 @@ How each was closed:
 - **Commit pathspec.** A new rule reads the arguments after the word `commit`, with quoted text
   blanked. A dot inside a quoted message is not a pathspec. Neither is a dot in a trailing
   comment or inside round brackets. Those two exceptions let whole-tree commits through.
-  They are in sections 2(d), 3 and 5.2, and the ones in 5.2 are not accepted.
+  They are in sections 2(d), 3 and 5.2. No per-form answer covers the ones in 5.2.
 - **Dot family.** The whole-tree pathspec now matches any path built only from single dots and
   separators.
 - **Quoted flag and glued redirect.** The `add` rules accept a quote around a flag. All the
@@ -459,11 +467,11 @@ command that was denied at the first measured commit is allowed now.
   command is allowed today, as fail-open 1 of section 1 (measured in the second pass). The
   sibling guard, `scripts/hooks/block-unbounded-fs-scan.ps1`, does not take `<<<` for a heredoc.
 
-## 5. NOT accepted: allowed, and under none of answers 1 to 3
+## 5. Under no per-form answer: residuals by mechanism only
 
 Each form below is still allowed, and git stages or commits a whole tree with it. No line in
-answers 1 to 3 describes it. The fourth answer, above, was not applied here. This list is for the
-owner. At least:
+answers 1 to 3 describes it. Under answer 4 each is a stated residual by mechanism, and this list
+is how the owner sees them. At least:
 
 **5.1 Forms under no answer and next to none.** All were first measured in the second pass.
 

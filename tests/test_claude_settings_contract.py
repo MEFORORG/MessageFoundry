@@ -230,13 +230,10 @@ _INSTALLERS = (
 # Keep it SHORT. If it grows, that is the signal, not the workaround.
 _KNOWN_UNWIRED: dict[str, str] = {
     "block-blanket-git-stage.ps1": (
-        "BACKLOG #1339. Present and fully tested, wired nowhere. Owner ruling 2026-08-25, relayed "
-        "via the Liaison and not read first-hand here: 'The blanket-git-stage guard is a CONTROL. "
-        "Strike the claim now, wire it after the splitter repair.' The commit that relays it, "
-        "786ac8b49b, reads that repair as the quote-state repair, BACKLOG #1341. Whether that "
-        "condition still stands, the condition a later Lander amendment added, and the owner "
-        "answers reported since are in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md, 'What wiring "
-        "waits on'."
+        "BACKLOG #1339. Present and fully tested, wired in no settings file in this repository. "
+        "What wiring waits on, including the owner ruling of 2026-08-25 relayed by the Liaison, "
+        "is recorded once, with its sources, in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md, "
+        "'What wiring waits on'."
     ),
     "lane-level.ps1": "Not a PreToolUse guard; invoked directly by coordination scripts.",
     "steer-inject.ps1": "Opt-in steering channel, armed per-session rather than by a matcher.",

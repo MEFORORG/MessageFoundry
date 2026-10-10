@@ -223,8 +223,9 @@ you try to write inside the primary checkout, so write inside your own worktree,
 ### Stage explicit paths, though nothing enforces that today
 
 Nothing blocks `git add -A`, `git add .`, or `git commit -a`. The blanket-stage guard is written and
-fully tested, and it is wired in no settings file. `tests/test_claude_settings_contract.py` records
-that under `_KNOWN_UNWIRED` as BACKLOG #1339. What wiring waits on is in
+fully tested, and no settings file in this repository wires it.
+`tests/test_claude_settings_contract.py` records that under `_KNOWN_UNWIRED` as BACKLOG #1339.
+What wiring waits on is in
 [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), *What wiring waits on*.
 Treat this as a rule with no enforcement behind it.
 
