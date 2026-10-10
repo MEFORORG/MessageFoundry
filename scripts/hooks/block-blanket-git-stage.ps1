@@ -17,7 +17,13 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
 # Shell arithmetic, where '<<' is a shift and not a heredoc. Used by Hide-HeredocBodies -Narrow.
-$ARITHMETIC = '\(\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)\)|\$\[[^\]]*\]'
+# '((...))' is matched to any depth with a balancing group, and '$[...]' is the older spelling.
+# A line with many unclosed '((' makes this quadratic, so the match carries a time limit; on a
+# timeout the narrow reading keeps the line as it is, which costs only the deny it would add.
+$ARITHMETIC = [regex]::new(
+    '\(\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)\)|\$\[[^\]]*\]',
+    [System.Text.RegularExpressions.RegexOptions]::None,
+    [timespan]::FromMilliseconds(500))
 
 # ---------------------------------------------------------------------------------------------
 # WHY THIS FILE HAS FUNCTIONS NOW, AND WHY THEY ARE LOCAL (BACKLOG #1341)
@@ -53,10 +59,12 @@ $ARITHMETIC = '\(\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)\)|\$\[[^\]]*\]'
 # are read there as program position. Handles <<WORD, <<-WORD, <<'WORD' and <<"WORD".
 # -Narrow is the second, added reading; the views below say what it fixes.
 function Hide-HeredocBodies([string]$Text, [switch]$Narrow) {
-    # bash ends an unquoted heredoc word only at a blank or a metacharacter. The first reading
-    # stops it at the first character outside [A-Za-z0-9_], and that is one of its mistakes.
-    $word = if ($Narrow) { '[^\s;&|<>()''"]+' } else { '[A-Za-z_][A-Za-z0-9_]*' }
-    $opener = '<<-?\s*(?:''([^'']+)''|"([^"]+)"|(' + $word + '))'
+    # bash reads a heredoc word up to the first blank or metacharacter, with quoted parts and
+    # backslash escapes inside it, and then removes the quotes and backslashes to get the
+    # delimiter. The first reading stops at the first character outside [A-Za-z0-9_], or takes a
+    # quoted part alone, and those are its mistakes.
+    $opener = if ($Narrow) { '<<-?\s*((?:''[^'']*''|"[^"]*"|\\.|[^\s;&|<>()''"\\])+)' }
+              else { '<<-?\s*(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))' }
     $lines = $Text -split "`n", 0
     $out = New-Object 'System.Collections.Generic.List[string]'
     $terminator = $null
@@ -68,11 +76,16 @@ function Hide-HeredocBodies([string]$Text, [switch]$Narrow) {
             continue
         }
         $out.Add($line)
-        # Only the opener SEARCH skips arithmetic; the line itself is kept whole. '((...))' is
-        # matched to any depth with a balancing group, and '$[...]' is the older spelling.
-        $probe = if ($Narrow) { $line -creplace $ARITHMETIC, '' } else { $line }
+        # Only the opener SEARCH skips arithmetic; the line itself is kept whole.
+        $probe = $line
+        if ($Narrow) {
+            try { $probe = $ARITHMETIC.Replace($line, '') }
+            catch [System.Text.RegularExpressions.RegexMatchTimeoutException] { $probe = $line }
+        }
         $m = [regex]::Match($probe, $opener)
-        if ($m.Success) {
+        if ($m.Success -and $Narrow) {
+            $terminator = $m.Groups[1].Value -creplace '[''"\\]', ''
+        } elseif ($m.Success) {
             $terminator = @($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) |
                 Where-Object { $_ } | Select-Object -First 1
         }
@@ -195,60 +208,85 @@ $reason = $null
 # TWO MORE ADDED VIEWS CLOSE THREE PLAIN READING MISTAKES (BACKLOG #1339). Like the joined view,
 # each is added beside the views it is built from and never replaces one, so neither can remove a
 # deny the guard made before:
-#   * the NARROW heredoc reading (Hide-HeredocBodies -Narrow) reads an unquoted tag the way bash
-#     does, to the first blank or metacharacter, so '<<EOF-1' and '<<E.O' are read whole. It also
-#     does not take a shift inside shell arithmetic ('$((1<<n))', '(( x = 1<<n ))', '$[1<<n]') for
-#     a heredoc. The first reading took each for an opener whose terminator never comes, and so
-#     blanked every later line;
+#   * the NARROW heredoc reading (Hide-HeredocBodies -Narrow) reads a tag the way bash does, to
+#     the first blank or metacharacter and with its quotes removed, so '<<EOF-1', '<<E.O' and
+#     "<<'EOF'-1" are read whole. It also does not take a shift inside shell arithmetic
+#     ('$((1<<n))', '(( x = 1<<n ))', '$[1<<n]') for a heredoc. The first reading took each for
+#     an opener whose terminator never comes, and so blanked every later line;
 #   * the CARRIAGE-RETURN view splits a line at a bare carriage return. PowerShell ends a line
 #     there and bash does not, so the tool name picks it, and an unknown tool gets it too. A
 #     carriage return inside a quoted span or a heredoc body is already blank in the scan view.
 #     It is made BEFORE the continuation join, so a backtick before the carriage return joins.
 # Each is built only when the command holds the text it reads, so most commands pay for neither.
-$bases = New-Object 'System.Collections.Generic.List[string[]]'
-$bases.Add(@($scan, $cmd))
-if ($cmd.Contains('<<')) {
-    $narrow = Hide-QuotedSpans (Hide-HeredocBodies $cmd -Narrow)
-    if ($narrow -cne $scan) { $bases.Add(@($narrow, $cmd)) }
-}
-if ($tool -ne 'Bash' -and $cmd.Contains("`r")) {
-    foreach ($base in @($bases)) {
-        $split = Edit-BothViews $base[0] $base[1] '\r(?!\n)' "`n"
-        if ($split[0] -cne $base[0]) { $bases.Add($split) }
-    }
-}
+#
+# THE ORIGINAL VIEWS ARE JUDGED FIRST, AND THE ADDED ONES ONLY IF THOSE ALLOW. A reading that is
+# slow on some input could otherwise push the hook past its timeout, and a hook that times out
+# lets the command run -- a deny turned into an allow. Measured: a 30000-bracket payload holding a
+# real 'git add -A' took 19.7 s when every view was built first. In this order the original
+# verdict is reached before any added reading runs, so a slow added reading can cost only the deny
+# it would have added.
 $views = New-Object 'System.Collections.Generic.List[string[]]'
-foreach ($base in $bases) {
-    $views.Add($base)
-    $joined = $base
+function Add-ViewAndItsJoin([string[]]$Base) {
+    $views.Add($Base)
+    $joined = $Base
     if ($tool -ne 'PowerShell') {
         $joined = Edit-BothViews $joined[0] $joined[1] '(?<=(?<!\\)(?:\\\\)*)\\\r?\n' ''
     }
     if ($tool -ne 'Bash') {
         $joined = Edit-BothViews $joined[0] $joined[1] '(?<=(?<!`)(?:``)*)`\r?\n' ' '
     }
-    if ($joined[0] -cne $base[0]) { $views.Add($joined) }
+    if ($joined[0] -cne $Base[0]) { $views.Add($joined) }
 }
+Add-ViewAndItsJoin @($scan, $cmd)
 
-# Each bound is (view index, start, length).
+# LIMB 2's long-flag ladder, built once here rather than per segment. LIMB 2, in the loop below,
+# says why it is a ladder.
+$blanketWords = @('all', 'update', 'no-ignore-removal')
+$longNames = @(
+    $blanketWords | ForEach-Object { $w = $_; 1..$w.Length | ForEach-Object { $w.Substring(0, $_) } }
+) | Sort-Object -Property Length -Descending   # longest first: `--all` binds as `all`, not `a`+`ll`
+$longFlag = "--(?:$($longNames -join '|'))"
+
+# Each bound is (view index, start, length). Views are cut into bounds as they are added.
 $bounds = New-Object 'System.Collections.Generic.List[int[]]'
-for ($v = 0; $v -lt $views.Count; $v++) {
-    $cursor = 0
-    foreach ($m in [regex]::Matches($views[$v][0], '(\|\||&&|[;|&\n])')) {
-        $bounds.Add(@($v, $cursor, ($m.Index - $cursor)))
-        $cursor = $m.Index + $m.Length
-    }
-    $bounds.Add(@($v, $cursor, ($views[$v][0].Length - $cursor)))
-}
-
+$cut = 0
+$addedBuilt = $false
 # Most views share most segments. The verdict on a segment is fixed by its two strings, so a pair
-# already judged is skipped; that can never remove a deny.
+# already judged is skipped; that can never remove a deny. The key carries the first string's
+# length, so no two different pairs share one.
 $judged = New-Object 'System.Collections.Generic.HashSet[string]'
-foreach ($b in $bounds) {
+$next = 0
+while ($true) {
+    for (; $cut -lt $views.Count; $cut++) {
+        $cursor = 0
+        foreach ($m in [regex]::Matches($views[$cut][0], '(\|\||&&|[;|&\n])')) {
+            $bounds.Add(@($cut, $cursor, ($m.Index - $cursor)))
+            $cursor = $m.Index + $m.Length
+        }
+        $bounds.Add(@($cut, $cursor, ($views[$cut][0].Length - $cursor)))
+    }
+    if ($next -ge $bounds.Count) {
+        if ($addedBuilt) { break }
+        $addedBuilt = $true
+        $bases = New-Object 'System.Collections.Generic.List[string[]]'
+        $bases.Add(@($scan, $cmd))
+        if ($cmd.Contains('<<')) {
+            $narrow = Hide-QuotedSpans (Hide-HeredocBodies $cmd -Narrow)
+            if ($narrow -cne $scan) { $bases.Add(@($narrow, $cmd)); Add-ViewAndItsJoin @($narrow, $cmd) }
+        }
+        if ($tool -ne 'Bash' -and $cmd.Contains("`r")) {
+            foreach ($base in @($bases)) {
+                $split = Edit-BothViews $base[0] $base[1] '\r(?!\n)' "`n"
+                if ($split[0] -cne $base[0]) { Add-ViewAndItsJoin $split }
+            }
+        }
+        continue
+    }
+    $b = $bounds[$next]
+    $next++
     if ($b[2] -le 0) { continue }
     $s = $views[$b[0]][0].Substring($b[1], $b[2]).Trim()
     $rawSeg = $views[$b[0]][1].Substring($b[1], $b[2]).Trim()
-    if (-not $judged.Add("$s`0$rawSeg")) { continue }
     # The PROGRAM NAME is matched case-INSENSITIVELY, and only it. Windows resolves git, Git and
     # GIT to the same git.exe, so 'Git add -A' staged the tree while 'git add -A' was denied. The
     # subcommand and flag tests below stay -cmatch on purpose: git rejects 'git ADD', and '-A' and
@@ -271,6 +309,7 @@ foreach ($b in $bounds) {
     # because closing it needs a wrapper allowlist -- the construct BACKLOG #1229 measured as
     # fail-open on the sibling gate.
     if ($s -inotmatch '^git(\.exe)?(\s|$)') { continue }
+    if (-not $judged.Add("$($s.Length):$s$rawSeg")) { continue }
 
     $tokens = @($s -split '\s+' | Where-Object { $_ })
 
@@ -303,12 +342,8 @@ foreach ($b in $bounds) {
     # WHY A LADDER AND NOT TWO SPELLINGS: git's parse-options binds a long option by any
     # UNAMBIGUOUS ABBREVIATION, so `--a`, `--al`, `--up`, `--upd` and `--updat` all stage the tree.
     # Generating an ambiguous rung costs nothing -- git refuses it, and a command git refuses is
-    # not a command to protect.
-    $blanketWords = @('all', 'update', 'no-ignore-removal')
-    $longNames = @(
-        $blanketWords | ForEach-Object { $w = $_; 1..$w.Length | ForEach-Object { $w.Substring(0, $_) } }
-    ) | Sort-Object -Property Length -Descending   # longest first: `--all` binds as `all`, not `a`+`ll`
-    $longFlag = "--(?:$($longNames -join '|'))"
+    # not a command to protect. $longFlag is built once, above the loop.
+    #
     # A short-option CLUSTER, the same construction the commit branch below already used. The
     # trigger set is EXACTLY {A, u} and CASE-SENSITIVE, and the case is the whole bound:
     #   -A  --all      stages everything          MUST trigger

@@ -544,8 +544,10 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 > **The row says *Best-effort guard*, not *Deterministic gate*.** This note used to say the row
 > would become *Deterministic gate* once the guard was wired. That would now overclaim. The guard
 > checks the common blanket-stage spellings, it fails open, and it lets through at least the forms
-> listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md). The owner
-> accepted that by mechanism on 2026-10-09, as that page records. **A control counted as a gate
+> listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md). On
+> 2026-10-09 the owner chose "Accept by mechanism (Recommended)" in a dialog that only the Special
+> seat saw and reports. Whether that choice meets the Lander's condition that the fail-opens be
+> accepted in writing is still open; that page says so. **A control counted as a gate
 > while it lets known forms through would rest on a false premise -- the defect SDS-3.7 names.**
 >
 > **What keeps the wiring true is an instrument, not this paragraph.**

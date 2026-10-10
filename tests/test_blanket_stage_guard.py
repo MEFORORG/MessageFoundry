@@ -70,6 +70,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -802,6 +803,9 @@ _MECHANISM_ONLY = pytest.mark.xfail(
 )
 
 MECHANISM_ONLY_RESIDUALS = [
+    # next to no per-form answer: a '<<' inside a trailing shell comment is still read as a
+    # heredoc opener, in both readings, and blanks the lines after it
+    ("Bash", "echo $((1<<n)) # <<EOF-2\ngit add -A"),
     # next to a per-form line whose words do not fit
     ("Bash", ">/dev/null git add -A"),
     ("PowerShell", "<# note #> git add -A"),
@@ -861,6 +865,10 @@ FIXED_READING_MISTAKES = [
     ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A", "cat <<EOF-1\ngit add -A\nEOF-1"),
     ("Bash", "cat <<E.O\nx\nE.O\ngit add -A", "cat <<E.O\ngit add -A\nE.O"),
     ("Bash", "cat <<EOF+1\nx\nEOF+1\ngit add -A", "cat <<EOF+1\ngit add -A\nEOF+1"),
+    # a tag that is partly quoted or escaped: bash removes the quotes to get the delimiter
+    ("Bash", "cat <<'EOF'-1\nx\nEOF-1\ngit add -A", "cat <<'EOF'-1\ngit add -A\nEOF-1"),
+    ("Bash", 'cat <<"EOF"x\nx\nEOFx\ngit add -A', 'cat <<"EOF"x\ngit add -A\nEOFx'),
+    ("Bash", f"cat <<E{_BS}OF\nx\nEOF\ngit add -A", f"cat <<E{_BS}OF\ngit add -A\nEOF"),
     ("Bash", "echo $((1<<n))\ngit add -A", "echo $((1<<n))\ngit add a.txt"),
     ("Bash", "(( x = 1<<n ))\ngit add -A", "(( x = 1<<n ))\ngit add a.txt"),
     ("Bash", "echo $(( (1+(2)) << n ))\ngit add -A", "echo $(( (1+(2)) << n ))\ngit add a.txt"),
@@ -967,6 +975,9 @@ def test_the_batch_driver_agrees_with_a_real_invocation() -> None:
         ("Bash", f"git add -{_BS}\nA"),
         ("PowerShell", f"git add {_BT}\n-A"),
         ("PowerShell", f"git add src{_BS}\ngit diff --stat ."),
+        ("PowerShell", "Write-Host hi\rgit add -A"),
+        ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A"),
+        ("Bash", "echo $((1<<n))\ngit add -A"),
     ]:
         assert verdict(*row) == run_guard(bash(row[1], tool=row[0])), row
 
@@ -999,6 +1010,17 @@ def test_a_run_of_slashes_does_not_hang_the_hook() -> None:
     """Driven as its OWN process, so the timeout in run_guard is what fails it. The old dot-family
     pattern took minutes on this payload and never reached the real stage after the `;`."""
     assert_denied(run_guard(bash("git add ." + "/" * 40 + "x; git add -A")))
+
+
+def test_a_slow_added_reading_cannot_delay_the_original_deny() -> None:
+    """The settings file gives the hook 15 seconds, and a hook that runs longer lets the command
+    run. Many unclosed brackets made the arithmetic skip slow: with every view built first, this
+    payload took 19.7 s and so turned a deny into an allow. The original views are now judged
+    first, so the real stage at the front is denied before any added reading runs."""
+    command = "git add -A; echo '" + "(" * 30000 + "' ; echo '<<'"
+    started = time.monotonic()
+    assert_denied(run_guard(bash(command)))
+    assert time.monotonic() - started < 15
 
 
 @pytest.mark.parametrize("continuation", [_BS, _BT])

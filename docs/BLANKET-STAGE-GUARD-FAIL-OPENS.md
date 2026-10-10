@@ -88,9 +88,19 @@ is a Lander's condition. **Where each stands is this page's reading, not an owne
    hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
    return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser."
    *Where it stands:* the Special seat reports that the owner then chose "Lift for #1339 only
-   (Recommended)" on 2026-10-09. In the seat's words, that lift dispatches one wiring Builder
-   once engine PR 2217 merges. PR 2217 merged on 2026-10-10 (UTC) as `9afa08f5cf`. None of the
-   three mistakes needed a parser, and section 4a records their fix.
+   (Recommended)", at 00:24:30Z on 2026-10-10 (UTC). No engine record holds that choice: the
+   seat reported it in its brief for the wiring change, and a maintainer-internal vault record
+   holds it too. The brief's account of that lift, in the seat's words, is that one wiring
+   Builder is dispatched once engine PR 2217 merges. PR 2217 merged at 02:27:30Z on 2026-10-10
+   (UTC), as `9afa08f5cf`. None of the three mistakes needed a parser, and section 4a records
+   their fix.
+
+**Why the guard is wired while items 1 and 2 stay open.** The owner made two choices that the
+wiring rests on. In answer 4 the owner chose an option whose text, written by the seat, says
+"When you lift the hold, one Builder wires the guard." The owner then chose the lift in item 3.
+Those two choices are the authority this page cites for wiring. Whether they also discharge the
+relayed 2026-08-25 condition in item 1, and the Lander's condition in item 2, is not settled by
+any record read here. That is for the owner, and for the Lander to put to the owner.
 
 
 ## How this was measured
@@ -500,6 +510,9 @@ bash from Git for Windows.
 | `cat <<EOF-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard read a heredoc word as letters, digits and underscores, so it waited for a line `EOF` that never comes. |
 | `cat <<E.O`, newline, `x`, newline, `E.O`, newline, `git add -A` | bash | staged all five | The same, with a dot in the word. |
 | `cat <<EOF+1`, newline, `x`, newline, `EOF+1`, newline, `git add -A` | bash | staged all five | The same, with a plus sign. First measured for this change. |
+| `cat <<'EOF'-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard took the quoted part alone as the word. bash removes the quotes and keeps the rest. First measured for this change. |
+| `cat <<"EOF"x`, newline, `x`, newline, `EOFx`, newline, `git add -A` | bash | staged all five | The same, with double quotes. First measured for this change. |
+| `cat <<E\OF`, newline, `x`, newline, `EOF`, newline, `git add -A` | bash | staged all five | The guard stopped the word at the backslash. bash removes it. First measured for this change. |
 | `echo $((1<<n))`, newline, `git add -A` | bash | staged all five | The guard read the shift `<<n` as the start of a heredoc. |
 | `(( x = 1<<n ))`, newline, `git add -A` | bash | staged all five | The same, in an arithmetic command. First measured for this change. |
 | `echo $(( (1+(2)) << n ))`, newline, `git add -A` | bash | staged all five | The same, with brackets nested inside. First measured for this change. |
@@ -511,12 +524,16 @@ How each was closed. Neither is a quote-state parser or a program-position test:
   tool name picks it: `PowerShell` and an unknown tool get it, and `Bash` does not, because bash
   does not end a line there. `Write-Host hi`, bare carriage return, `git add -A` under bash is
   still allowed, and it staged nothing.
-- **Heredoc word and arithmetic.** The guard also reads heredocs a second way. It reads an
-  unquoted word the way bash does, up to the first blank or one of `;`, `&`, `|`, `<`, `>`, `(`
-  and `)`. It skips a `<<` inside `((` and `))` on the same line, or inside `$[` and `]`.
+- **Heredoc word and arithmetic.** The guard also reads heredocs a second way. It reads the
+  word the way bash does, up to the first blank or one of `;`, `&`, `|`, `<`, `>`, `(` and `)`,
+  and then removes its quotes and backslashes. It skips a `<<` inside `((` and `))` on the same
+  line, or inside `$[` and `]`.
 
-Both readings are added beside the old ones and never replace them, so neither can turn a deny
-into an allow.
+Both readings are added beside the old ones and never replace them. The guard judges the old
+readings first and builds the new ones only when the old ones allow. So a slow new reading cannot
+push the hook past its timeout before the old verdict is reached, and neither can turn a deny into
+an allow. Before that order was set, a payload of 30,000 brackets holding a real `git add -A` took
+19.7 seconds, past the 15-second timeout, and would have run.
 
 ## 5. Known residuals that no per-form answer names
 
@@ -525,7 +542,11 @@ answers 1 to 3 describes it. Under answer 4 each is a stated residual, like ever
 form on this page, and none of them blocks wiring. This list is how the owner sees them. At least:
 
 **5.1 Forms next to no per-form answer.** The four rows that stood here are closed; see section
-4a.
+4a. At least this one is still open, first measured for the wiring change:
+
+| Command | Shell | What git did | Why the guard allows it |
+|---|---|---|---|
+| `echo $((1<<n)) # <<EOF-2`, newline, `git add -A` | bash | staged all five | Both heredoc readings take the `<<EOF-2` inside a trailing comment as an opener, and blank every later line. |
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.

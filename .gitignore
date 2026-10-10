@@ -170,8 +170,9 @@ scripts/security/scan-tokens.local.txt
 #
 # WHY settings.json IS TRACKED. It carries ENFORCED controls -- the deny-list covering `.env`,
 # `secrets/**`, keys and the local `*.db` store -- and settings are enforced by the client where
-# CLAUDE.md is only context, so section 5's prose is not a substitute for it. It also wires the
-# PreToolUse guards, `block-blanket-git-stage.ps1` among them (BACKLOG #1339); which scripts it
+# CLAUDE.md is only context, so section 5's prose is not a substitute for it. It also wires some
+# PreToolUse guards, `block-blanket-git-stage.ps1` among them (BACKLOG #1339); others, such as the
+# worktree and collision gates, are wired at user level by installers. Which scripts this file
 # wires is asserted in tests/test_claude_settings_contract.py, not here. Untracked, it hit the
 # exact CLAUDE.md failure described above:
 # measured 2026-08-13, of 62 local checkouts carrying CLAUDE.md only 12 had `.claude/settings.json`,

@@ -71,8 +71,8 @@ blanket `git add -A`/`.`/`-u` and `git commit -a`, so two sessions in one tree c
 files into one commit.
 
 **It is wired now, and it is a best-effort check** (BACKLOG #1339). The tracked
-`.claude/settings.json` runs it on every Bash and PowerShell tool call, so a fresh clone and every
-`git worktree add` carry it. Two earlier versions of this paragraph were wrong in turn. One implied the
+`.claude/settings.json` runs it on every Bash and PowerShell tool call, so a fresh clone carries it,
+and so does a worktree whose branch includes that change. Two earlier versions of this paragraph were wrong in turn. One implied the
 guard travelled while its settings file was untracked (BACKLOG #327). The next said it did not travel,
 yet once the file was tracked no matcher in it named the script until #1339. It is a local Claude Code
 session control, fail-open by design. It checks the common blanket spellings and lets through at least
