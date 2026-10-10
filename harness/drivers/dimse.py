@@ -15,6 +15,7 @@ harness discovery never fails without them; without them every payload reports a
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 from io import BytesIO
 from typing import Any
@@ -31,6 +32,13 @@ ENGINE_AE_TITLE = "MEFOR_HARNESS"
 #: The calling AE this driver presents. The harness graph sets no calling-AE allowlist.
 CALLING_AE_TITLE = "HARNESS_SCU"
 
+#: The most bytes the driver reads from the engine on one association (ASVS 5.1.1, BACKLOG #1127):
+#: the accept, the C-STORE response and the release together. Those are a few hundred bytes, so
+#: 1 MiB is ample, the figure the fuzzer allows an ACK. pynetdicom reads any PDU length a peer
+#: announces, so the cap is charged in the socket, before each read, and a PDU that would pass it
+#: is never read. The engine may still have stored the object; the driver records no reply.
+MAX_ASSOCIATION_READ_BYTES = 1 << 20
+
 
 def dicom_extra_missing() -> str | None:
     """None when pydicom and pynetdicom both import, else why not (a reason to report, not a pass)."""
@@ -39,6 +47,57 @@ def dicom_extra_missing() -> str | None:
         import pynetdicom  # noqa: F401
     except ImportError as exc:
         return f"the [dicom] extra (pydicom + pynetdicom) is not installed: {exc}"
+    return None
+
+
+class _ReadCapExceeded(OSError):
+    """Raised inside pynetdicom's reader thread, which reads it as a closed connection and aborts."""
+
+
+@functools.cache
+def _capped_ae_class() -> type[Any]:
+    """pynetdicom's ``AE``, with every association's socket charged against
+    :data:`MAX_ASSOCIATION_READ_BYTES`. Built on first use, so the ``[dicom]`` extra stays lazy.
+
+    It overrides ``AE._create_socket``, a private hook read against pynetdicom 3.0.4, the locked
+    release. ``tests/test_harness_dimse.py`` fires the cap against a peer that announces an
+    oversized PDU, so a pynetdicom that stopped calling the hook fails there."""
+    from pynetdicom import AE
+    from pynetdicom.transport import AssociationSocket
+
+    class _CappedSocket(AssociationSocket):
+        received = 0
+        refused = False
+
+        def recv(self, nr_bytes: int) -> bytearray:
+            # nr_bytes is what the peer announced, so the charge comes before any of it is read.
+            if self.received + nr_bytes > MAX_ASSOCIATION_READ_BYTES:
+                self.refused = True
+                raise _ReadCapExceeded(f"over the {MAX_ASSOCIATION_READ_BYTES}-byte read cap")
+            data = super().recv(nr_bytes)
+            self.received += len(data)
+            return data
+
+    class _CappedAE(AE):
+        capped_socket: _CappedSocket | None = None
+
+        def _create_socket(self, assoc: Any, address: Any, tls_args: Any) -> _CappedSocket:
+            sock = _CappedSocket(assoc, address=address)
+            sock.tls_args = tls_args
+            self.capped_socket = sock
+            return sock
+
+    return _CappedAE
+
+
+def _refused(ae: Any) -> Injection | None:
+    """The refusal to record when ``ae``'s association passed the read cap, else None."""
+    sock = ae.capped_socket
+    if sock is not None and sock.refused:
+        return Injection(
+            error=f"reply refused: the engine sent over {MAX_ASSOCIATION_READ_BYTES} bytes "
+            "on the association"
+        )
     return None
 
 
@@ -75,9 +134,10 @@ class DimseDriver(Driver):
         if missing:
             return [Injection(error=missing) for _ in payloads]
         from pydicom import dcmread
-        from pynetdicom import AE
 
         from messagefoundry.parsing.dicom._deps import parse_error_types
+
+        capped_ae = _capped_ae_class()
 
         unreadable = parse_error_types()
         outcomes: list[Injection] = []
@@ -92,7 +152,7 @@ class DimseDriver(Driver):
                     Injection(error=f"not a DICOM Part-10 object ({type(exc).__name__})")
                 )
                 continue
-            outcomes.append(self._store(AE, dataset, sop_class, transfer_syntax))
+            outcomes.append(self._store(capped_ae, dataset, sop_class, transfer_syntax))
         return outcomes
 
     def _store(
@@ -112,7 +172,7 @@ class DimseDriver(Driver):
         ) as exc:  # ValueError: an AE title or context pynetdicom refuses
             return Injection(error=f"association to {self.host}:{self.port} failed: {exc}")
         if not assoc.is_established:
-            return Injection(
+            return _refused(ae) or Injection(
                 error=f"no association with {self.host}:{self.port} "
                 f"(called AE {self.called_ae_title!r}): refused, aborted or unreachable"
             )
@@ -122,6 +182,8 @@ class DimseDriver(Driver):
             return Injection(error=f"C-STORE could not be sent: {type(exc).__name__}: {exc}")
         finally:
             assoc.release()
+        if refused := _refused(ae):
+            return refused
         code = getattr(status, "Status", None)
         if code is None:
             return Injection(error="no C-STORE response status (aborted or timed out)")

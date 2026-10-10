@@ -59,9 +59,12 @@ from pathlib import Path
 
 import pytest
 
+import harness.drivers.dimse as dimse_driver
 import harness.drivers.http as http_driver
 import harness.fuzz.transport as fuzz_transport
 import harness.load.coord as harness_coord
+import harness.load.failover as rig_failover
+import harness.load.rigadmin as rig_admin
 import harness.load.shardcert_ladder as harness_ladder
 import harness.sinks.email as email_sink
 import messagefoundry.transports  # noqa: F401 - import runs every register_source(...)
@@ -271,6 +274,75 @@ HARNESS_FOREIGN_FILE_READS: dict[str, str] = {
     "harness/load/coord.py": "FileDropCoord",
 }
 
+#: The load rig's reads of the engine API and the DIMSE driver's reads of the engine's SCP -> the
+#: name each file must load to read under its cap (BACKLOG #1127). Kept by hand: they read with no
+#: frame reader, so the client walk cannot see them. ``shardcert`` reads through the failover
+#: helper. The connscale, estate and ingress-probe runners poll through ``EngineNode``, so the
+#: ``failover`` entry covers them.
+HARNESS_RIG_API_READS: dict[str, str] = {
+    "harness/load/rigadmin.py": "MAX_API_REPLY_BYTES",
+    "harness/load/failover.py": "MAX_STATUS_REPLY_BYTES",
+    "harness/load/shardcert.py": "_get_status_json",
+    "harness/drivers/dimse.py": "MAX_ASSOCIATION_READ_BYTES",
+}
+
+_HTTP_CLIENT_MODULES = frozenset({"httpx", "urllib.request"})
+
+
+def harness_http_clients(src: Path, root: Path) -> list[str]:
+    """Repo-relative path of every file in ``src`` that imports ``httpx`` or ``urllib.request``,
+    at any depth: each may read an engine API answer, so each is scanned for unbounded reads."""
+    found: list[str] = []
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+                if isinstance(node, ast.ImportFrom)
+                else []
+            )
+            if any(n in _HTTP_CLIENT_MODULES for n in names):
+                found.append(path.relative_to(root).as_posix())
+                break
+    return found
+
+
+#: ``httpx`` request methods that read the whole answer unless streamed.
+_UNSTREAMED_HTTP_CALLS = frozenset({"get", "post", "put", "patch", "delete", "head", "request"})
+
+
+def unbounded_api_reads(tree: ast.AST) -> list[str]:
+    """Every call in ``tree`` that reads an HTTP answer with no bound: a request method called on a
+    name or attribute ending in ``client`` (``client.get(...)`` or ``self._client.get(...)``
+    buffers the answer whole), a response's ``.json()``, and each :func:`whole_read`. A tripwire
+    on the shapes the rig used, not proof."""
+    bad: list[str] = []
+    calls = sorted(
+        (c for c in ast.walk(tree) if isinstance(c, ast.Call)),
+        key=lambda c: (c.lineno, c.col_offset),
+    )
+    for call in calls:
+        func = call.func
+        name = _call_name(call)
+        receiver = func.value if isinstance(func, ast.Attribute) else None
+        receiver_name = (
+            receiver.id
+            if isinstance(receiver, ast.Name)
+            else receiver.attr
+            if isinstance(receiver, ast.Attribute)
+            else ""
+        )
+        on_client = receiver_name.lower().endswith("client")
+        if (on_client and name in _UNSTREAMED_HTTP_CALLS) or (
+            name == "json" and isinstance(func, ast.Attribute) and not call.args
+        ):
+            bad.append(f"{call.lineno} (reads an answer whole: {name})")
+        elif whole := whole_read(call):
+            bad.append(f"{call.lineno} (reads an answer whole: {whole})")
+    return bad
+
 
 #: The fewest calls the whole-read walk must see in each file of :data:`HARNESS_FOREIGN_FILE_READS`
 #: before its "reads nothing whole" verdict means anything.
@@ -368,8 +440,8 @@ def unbounded_sinks(sinks: Iterable[str], root: Path, sinks_dir: Path) -> list[s
     """Sinks that bound at none of :data:`_SINK_CAPS`, themselves or through one hop, or that read a
     file whole. A tripwire, not proof that the cap is enforced: naming the constant is what it checks.
     Each refusal is exercised by the sink's own behaviour tests (``tests/test_harness_*.py``). Flags
-    (``read_text``, ``read_bytes``, or a ``.read()`` method call with no size) in their own
-    module. A bare ``read()`` is not a file: the stream sinks name their ``recv_chunks`` reader so."""
+    each :func:`whole_read` in their own module. A bare ``read()`` is not a file: the stream sinks
+    name their ``recv_chunks`` reader so."""
     bad: list[str] = []
     for rel in sinks:
         path = root / rel
@@ -377,15 +449,56 @@ def unbounded_sinks(sinks: Iterable[str], root: Path, sinks_dir: Path) -> list[s
             bad.append(f"{rel} (bounds at none of {sorted(_SINK_CAPS)})")
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for call in (c for c in ast.walk(tree) if isinstance(c, ast.Call)):
-            name = _call_name(call)
-            sizeless = not call.args and not call.keywords and isinstance(call.func, ast.Attribute)
-            if name in _WHOLE_FILE_READS or (name == "read" and sizeless):
+            if name := whole_read(call):
                 bad.append(f"{rel}:{call.lineno} (reads a file whole: {name})")
     return bad
 
 
 _WATCHER_CALLS = frozenset({"QFileSystemWatcher"})
-_WHOLE_FILE_READS = frozenset({"read_text", "read_bytes"})
+#: Calls that read to the end whatever their arguments. ``readlines`` takes only a hint, and one
+#: line can still be any length, so it is flagged with or without one.
+_WHOLE_FILE_READS = frozenset({"read_text", "read_bytes", "readlines"})
+
+
+#: What the standard library's readers call their size argument: ``io`` uses ``size``,
+#: ``http.client`` uses ``amt``, and some file-likes take ``n``.
+_SIZE_KEYWORDS = frozenset({"size", "amt", "n"})
+
+
+def _unbounded_size(node: ast.expr | None) -> bool:
+    """``read``'s size argument means "to the end": absent, ``None``, or a negative literal, which
+    ``ast.parse`` writes as a minus sign on a constant."""
+    if node is None or (isinstance(node, ast.Constant) and node.value is None):
+        return True
+    return (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, int)
+    )
+
+
+def whole_read(call: ast.Call, *, bare_read: bool = False) -> str | None:
+    """The method name when ``call`` reads a file or stream whole, else None: a call in
+    :data:`_WHOLE_FILE_READS`, or ``read()``, ``read(-1)``, ``read(None)`` or ``read(size=-1)``.
+
+    A ``read`` counts only as a method call unless ``bare_read`` is set: the stream sinks name
+    their own reader function ``read``, and it is no file. A size held in a variable is taken as a
+    bound; this is a tripwire on the shapes that are unbounded on their face (BACKLOG #1127)."""
+    name = _call_name(call)
+    if name in _WHOLE_FILE_READS:
+        return name
+    if name != "read" or not (bare_read or isinstance(call.func, ast.Attribute)):
+        return None
+    if call.args:
+        size: ast.expr | None = call.args[0]
+    elif call.keywords:
+        size = next((k.value for k in call.keywords if k.arg in _SIZE_KEYWORDS), None)
+        if size is None:
+            return None  # keywords, none of them a size: not a file read's shape
+    else:
+        size = None
+    return name if _unbounded_size(size) else None
 
 
 def harness_file_watchers(src: Path, root: Path) -> list[str]:
@@ -410,8 +523,7 @@ def uncapped_watchers(
     watchers: Iterable[str], root: Path, cap_name: str = "DEFAULT_MAX_MESSAGE_BYTES"
 ) -> list[str]:
     """Watchers that do not cap at ``cap_name`` (imported from ``messagefoundry.parsing.peek`` and
-    used in the unit), or that read a file whole: ``read_text``, ``read_bytes``, or a ``read()`` with
-    no size."""
+    used in the unit), or that read a file whole: any :func:`whole_read`, a bare ``read()`` included."""
     bad: list[str] = []
     for key in watchers:
         file, unit = key.split("::")
@@ -421,8 +533,7 @@ def uncapped_watchers(
         tree = ast.parse(path.read_text(encoding="utf-8"))
         node = next(n for n in tree.body if getattr(n, "name", None) == unit)
         for call in (c for c in ast.walk(node) if isinstance(c, ast.Call)):
-            name = _call_name(call)
-            if name in _WHOLE_FILE_READS or (name == "read" and not call.args):
+            if name := whole_read(call, bare_read=True):
                 bad.append(f"{key}:{call.lineno} (reads a file whole: {name})")
     return bad
 
@@ -614,6 +725,7 @@ def test_no_upload_row_or_source_exclusion_names_a_surface_the_code_lacks() -> N
         | set(HARNESS_FILE_LOADERS)
         | {key.split("::")[0] for key in harness_clients(harness_frame_readers(_HARNESS, _ROOT))}
         | set(HARNESS_FOREIGN_FILE_READS)
+        | set(HARNESS_RIG_API_READS)
     )
     stale = stale_keys(set(_UPLOAD_ROWS), allowed) | stale_keys(_EXCLUDED_SOURCES, _SOURCE_VALUES)
     assert not stale, f"5.1.1 rows or exclusions naming nothing the code registers: {sorted(stale)}"
@@ -698,6 +810,7 @@ def test_every_harness_receiver_is_named_in_the_harness_row_and_bounded() -> Non
         | client_files
         | set(HARNESS_HAND_KEPT_CLIENTS)
         | set(HARNESS_FOREIGN_FILE_READS)
+        | set(HARNESS_RIG_API_READS)
     )
     assert named == surfaces, f"harness rows differ from the code: {sorted(named ^ surfaces)}"
     bad = unbounded_decoders(receivers, _ROOT)
@@ -765,12 +878,7 @@ def test_every_harness_file_loader_keys_a_row_and_is_capped() -> None:
         (rel, c) for rel, tree in trees.items() for c in ast.walk(tree) if isinstance(c, ast.Call)
     ]
     assert len(calls) >= 1, "instrument found no calls at all in the loaders"
-    whole = [
-        f"{rel}:{c.lineno}"
-        for rel, c in calls
-        if _call_name(c) in _WHOLE_FILE_READS
-        or (_call_name(c) == "read" and not c.args and isinstance(c.func, ast.Attribute))
-    ]
+    whole = [f"{rel}:{c.lineno}" for rel, c in calls if whole_read(c)]
     assert not whole, f"a loader reads a file whole: {whole}"
     for rel, unit in HARNESS_FILE_LOADERS.items():
         names = {getattr(n, "name", None) for n in trees[rel].body}
@@ -831,6 +939,7 @@ def test_every_harness_client_is_named_in_the_client_row_and_capped() -> None:
     for needle in (
         f"DEFAULT_MAX_FRAME_BYTES` = {_size(DEFAULT_MAX_FRAME_BYTES)}",
         f"_MAX_REPLY_BYTES` = {_size(fuzz_transport._MAX_REPLY_BYTES)}",
+        f"_MAX_EXCHANGE_BYTES` = {_size(fuzz_transport._MAX_EXCHANGE_BYTES)}",
         f"DEFAULT_MAX_MESSAGE_BYTES` = {_size(DEFAULT_MAX_MESSAGE_BYTES)}",
         f"DEFAULT_MAX_INTERCHANGE_BYTES` = {_size(DEFAULT_MAX_INTERCHANGE_BYTES)}",
         f"MAX_REPLY_BYTES` = {_size(http_driver.MAX_REPLY_BYTES)}",
@@ -865,14 +974,7 @@ def test_every_foreign_file_read_is_bounded_and_keys_a_row() -> None:
     # Floor under the census taken when this landed (coord.py 28 calls, failover.py 256,
     # shardcert_ladder.py 463), so a walk that sees nothing cannot pass the absence check below.
     assert len(calls) >= len(trees) * _MIN_FOREIGN_READ_FILE_CALLS, "the call walk found too little"
-    whole = [
-        f"{rel}:{c.lineno}"
-        for rel, c in calls
-        if (
-            _call_name(c) in _WHOLE_FILE_READS
-            or (_call_name(c) == "read" and not c.args and isinstance(c.func, ast.Attribute))
-        )
-    ]
+    whole = [f"{rel}:{c.lineno}" for rel, c in calls if whole_read(c)]
     assert not whole, f"reads a file whole: {whole}"
     log_row = _harness_row_for("harness/load/shardcert_ladder.py")
     assert "`harness/load/failover.py`" in log_row.split("|")[1]
@@ -881,6 +983,92 @@ def test_every_foreign_file_read_is_bounded_and_keys_a_row() -> None:
     assert has_figure(
         coord_row, f"MAX_COORD_MESSAGE_BYTES` = {_size(harness_coord.MAX_COORD_MESSAGE_BYTES)}"
     )
+
+
+def test_every_rig_api_read_is_capped_and_keys_a_row() -> None:
+    """The load rig read the engine's API answers, and the DIMSE driver the engine's C-STORE
+    responses, with no byte cap until BACKLOG #1127. Each file must load the name that bounds it,
+    read no answer whole, and be named in the rig row with each figure."""
+    assert rig_admin.MAX_API_REPLY_BYTES == APICLIENT_MAX_RESPONSE_BYTES
+    assert rig_failover.MAX_STATUS_REPLY_BYTES == 1 << 20
+    assert dimse_driver.MAX_ASSOCIATION_READ_BYTES == 1 << 20
+    for rel, bound in HARNESS_RIG_API_READS.items():
+        tree = ast.parse((_ROOT / rel).read_text(encoding="utf-8"))
+        loads = {
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+        }
+        assert bound in loads, f"{rel} no longer reads through {bound}"
+        assert sum(isinstance(c, ast.Call) for c in ast.walk(tree)) >= _MIN_FOREIGN_READ_FILE_CALLS
+        bad = unbounded_api_reads(tree)
+        assert not bad, f"{rel}: {bad}"
+    # Every other harness file that imports an HTTP client makes none of those reads either: the
+    # connscale, estate and ingress-probe runners poll through the capped helpers above.
+    http_clients = harness_http_clients(_HARNESS, _ROOT)
+    for known in ("harness/load/rigadmin.py", "harness/load/failover.py"):
+        assert known in http_clients, f"the import walk no longer sees {known}: {http_clients}"
+    for rel in http_clients:
+        bad = unbounded_api_reads(ast.parse((_ROOT / rel).read_text(encoding="utf-8")))
+        assert not bad, f"{rel}: {bad}"
+    row = _harness_row_for("harness/load/rigadmin.py")
+    first_cell = row.split("|")[1]
+    for rel in HARNESS_RIG_API_READS:
+        assert f"`{rel}`" in first_cell, f"{rel} is not named in the rig row"
+    for needle in (
+        f"MAX_API_REPLY_BYTES` = {_size(rig_admin.MAX_API_REPLY_BYTES)}",
+        f"MAX_STATUS_REPLY_BYTES` = {_size(rig_failover.MAX_STATUS_REPLY_BYTES)}",
+        f"MAX_ASSOCIATION_READ_BYTES` = {_size(dimse_driver.MAX_ASSOCIATION_READ_BYTES)}",
+    ):
+        assert has_figure(row, needle), f"rig row lost or changed `{needle}`"
+    assert "Not settled" not in _BLOCK, "the rig's API reads are settled; the bullet must stay gone"
+
+
+def test_self_test_whole_reads_are_flagged_and_bounded_reads_are_not(tmp_path: Path) -> None:
+    """Positive control for the whole-read check every harness file axis shares. ``readlines`` and
+    ``read(-1)`` read to the end as surely as ``read()``; PR 1968's check missed both."""
+    calls = [
+        c
+        for c in ast.walk(
+            ast.parse(
+                "fh.read()\nfh.read(-1)\nfh.read(None)\nfh.read(size=-1)\nfh.readlines()\n"
+                "fh.readlines(4096)\np.read_text()\np.read_bytes()\n"
+                "fh.read(CAP)\nfh.read(4096)\nfh.read(CAP + 1)\nfh.read(size=CAP)\nread()\n"
+                "fh.read(timeout=5)\nfh.readline(CAP)\n"
+            )
+        )
+        if isinstance(c, ast.Call)
+    ]
+    flagged = sorted(c.lineno for c in calls if whole_read(c))
+    assert flagged == [1, 2, 3, 4, 5, 6, 7, 8]
+    bare = next(c for c in calls if c.lineno == 13)
+    assert whole_read(bare) is None and whole_read(bare, bare_read=True) == "read"
+    # Through a real axis: a planted sink that bounds at a cap but reads lines whole is caught.
+    sinks = tmp_path / "harness" / "sinks"
+    sinks.mkdir(parents=True)
+    (sinks / "planted.py").write_text(
+        "from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES\n"
+        "def scan(fh):\n    cap = DEFAULT_MAX_MESSAGE_BYTES\n    return fh.readlines(), fh.read(-1)\n",
+        encoding="utf-8",
+    )
+    assert unbounded_sinks(["harness/sinks/planted.py"], tmp_path, sinks) == [
+        "harness/sinks/planted.py:4 (reads a file whole: readlines)",
+        "harness/sinks/planted.py:4 (reads a file whole: read)",
+    ]
+
+
+def test_self_test_an_unbounded_api_read_is_flagged() -> None:
+    tree = ast.parse(
+        "async def a(client):\n    r = await client.get(url)\n    return r.json()\n"
+        "def b(reply):\n    return reply.read()\n"
+        "async def c(client):\n    async with client.stream('GET', url) as r:\n        pass\n"
+        "def d(cfg):\n    return cfg.get('x'), json.loads(raw), reply.read(CAP)\n"
+        "def e(self):\n    return self._client.post(url)\n"
+    )
+    assert unbounded_api_reads(tree) == [
+        "2 (reads an answer whole: get)",
+        "3 (reads an answer whole: json)",
+        "5 (reads an answer whole: read)",
+        "12 (reads an answer whole: post)",
+    ]
 
 
 def test_self_test_a_harness_client_is_found_and_an_uncapped_one_flagged(tmp_path: Path) -> None:
@@ -1134,10 +1322,14 @@ QUOTED_CONSTANTS: dict[str, int] = {
     "MAX_OUTBOX_PAYLOAD_CHARS": harness_database.MAX_OUTBOX_PAYLOAD_CHARS,
     "DEFAULT_MAX_LOAD_FILE_BYTES": compare.DEFAULT_MAX_LOAD_FILE_BYTES,
     "_MAX_REPLY_BYTES": fuzz_transport._MAX_REPLY_BYTES,
+    "_MAX_EXCHANGE_BYTES": fuzz_transport._MAX_EXCHANGE_BYTES,
     "MAX_REPLY_BYTES": http_driver.MAX_REPLY_BYTES,
     "MAX_RESPONSE_BYTES": APICLIENT_MAX_RESPONSE_BYTES,
     "MAX_NODE_LOG_BYTES": harness_ladder.MAX_NODE_LOG_BYTES,
     "MAX_COORD_MESSAGE_BYTES": harness_coord.MAX_COORD_MESSAGE_BYTES,
+    "MAX_API_REPLY_BYTES": rig_admin.MAX_API_REPLY_BYTES,
+    "MAX_STATUS_REPLY_BYTES": rig_failover.MAX_STATUS_REPLY_BYTES,
+    "MAX_ASSOCIATION_READ_BYTES": dimse_driver.MAX_ASSOCIATION_READ_BYTES,
 }
 
 _QUOTED = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)` = (\d+(?:,\d{3})*(?: [KMG]iB)?)")

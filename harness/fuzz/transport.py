@@ -37,6 +37,10 @@ MALFORMED = "malformed"
 
 #: The ceiling on one reply frame. An ACK is a few hundred bytes; a reply past this is itself a defect.
 _MAX_REPLY_BYTES = 1024 * 1024
+#: The ceiling on everything one case reads back, frames and stray bytes alike (BACKLOG #1127). A
+#: case gets one ACK per message it carries, so 16 replies at the frame ceiling is far past any real
+#: answer. Without it, an engine that kept writing would never hit the per-read timeout.
+_MAX_EXCHANGE_BYTES = 16 * _MAX_REPLY_BYTES
 
 #: Start block, end block and trailing CR: what MLLP adds around each payload.
 _FRAME_OVERHEAD = 3
@@ -104,6 +108,9 @@ def _read_replies(sock: socket.socket) -> Exchange:
     try:
         while chunk := sock.recv(65536):
             received += len(chunk)
+            if received > _MAX_EXCHANGE_BYTES:
+                detail = f"the engine sent over {_MAX_EXCHANGE_BYTES} reply bytes for one case"
+                return Exchange(MALFORMED, tuple(replies), detail)
             replies.extend(decoder.feed(chunk))
     except MLLPFrameError as exc:
         return Exchange(MALFORMED, tuple(replies), f"reply framing: {exc}")

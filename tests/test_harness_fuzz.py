@@ -478,6 +478,25 @@ def test_a_cut_off_or_unframed_reply_is_not_a_clean_close(sent: bytes, detail: s
         assert _read_replies(ours).outcome == REPLY
 
 
+def test_replies_past_the_exchange_ceiling_stop_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every reply frame was capped but the list of them was not, and an engine that kept writing
+    never hit the per-read timeout (BACKLOG #1127). The case's total read is capped now."""
+    import harness.fuzz.transport as transport
+
+    assert transport._MAX_EXCHANGE_BYTES == 16 * transport._MAX_REPLY_BYTES
+    ack = frame(b"MSH|^~\\&|E|F\rMSA|AA|1\r")
+    monkeypatch.setattr(transport, "_MAX_EXCHANGE_BYTES", 3 * len(ack))
+    for count, outcome in ((3, REPLY), (4, MALFORMED)):
+        ours, theirs = socket.socketpair()
+        with ours, theirs:
+            theirs.sendall(ack * count)
+            theirs.close()
+            ours.settimeout(5.0)
+            exchange = _read_replies(ours)
+        assert exchange.outcome == outcome, (count, exchange)
+    assert "reply bytes for one case" in exchange.detail
+
+
 def test_queryable_matches_the_api_control_id_filter() -> None:
     """``queryable`` copies ControlIdFilter by hand (the API module is not a harness import); this
     holds the copy to the original over the shapes the mutations produce."""

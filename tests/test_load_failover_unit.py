@@ -10,10 +10,13 @@ per-node env, and the report builder's SLO verdicts under synthetic inputs.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
+import harness.load.failover as failover
 from harness.load.failover import (
     FailoverError,
     FailoverPorts,
@@ -459,3 +462,27 @@ def test_report_json_and_console_smoke() -> None:
     text = rep.render_console()
     assert "Failover-load report" in text
     assert "RESULT: PASS" in text
+
+
+# --- the rig's status reads of the engine API (ASVS 5.1.1, BACKLOG #1127) ----
+
+
+def _status_read(body: bytes) -> tuple[int | None, dict[str, object] | None]:
+    """``_get_status_json`` against an engine that answers 200 with ``body``."""
+
+    async def run() -> tuple[int | None, dict[str, object] | None]:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await failover._get_status_json(client, "https://node.invalid/stats", None)
+
+    return asyncio.run(run())
+
+
+def test_a_status_answer_past_the_cap_is_no_answer_and_one_at_it_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(failover, "MAX_STATUS_REPLY_BYTES", 64)
+    assert _status_read(b'{"role": "primary"}') == (200, {"role": "primary"})
+    assert _status_read(b"x" * 65) == (None, None)
+    # At the cap but not JSON: the status stands, the body does not.
+    assert _status_read(b"x" * 64) == (200, None)

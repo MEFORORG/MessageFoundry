@@ -203,6 +203,8 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # listener failed to start. For 3.1 and later, the cap moves that stop to install time, where it is a
 # reviewed step. A 3.0.x patch above 3.0.4 would still be allowed, unread. None exists today. Only the
 # startup guard stands in front of one, and it checks the routing alone.
+# The harness DIMSE driver (harness/drivers/dimse.py) also overrides a private hook, AE._create_socket, to
+# cap what it reads from the engine; its read-cap test in tests/test_harness_dimse.py fails if the hook moves.
 # TO RAISE IT: re-read _admitting_server_class against the new release's pynetdicom/transport.py. Measure
 # again whatever dicom.py and tests/test_dicom_scp_admission.py record as measured at 3.0.4. Then, in one PR:
 # - lift the cap here, its entry in .github/dependabot.yml and the versions in that test file;

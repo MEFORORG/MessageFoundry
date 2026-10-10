@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 import os
 import sys
 import tempfile
@@ -61,8 +63,15 @@ from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context, harness_tls_material
 
+log = logging.getLogger(__name__)
+
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
+
+#: The most bytes the rig reads of one ``/health``, ``/cluster/status`` or ``/stats`` answer, the
+#: only API routes it polls over ``httpx`` (ASVS 5.1.1, BACKLOG #1127). Each is a role or a few
+#: counters, well under a KiB, so 1 MiB leaves room and still stops a node that streams without end.
+MAX_STATUS_REPLY_BYTES = 1 << 20
 
 
 class FailoverError(RuntimeError):
@@ -339,17 +348,32 @@ async def _get_status_json(
 ) -> tuple[int | None, dict[str, Any] | None]:
     """GET ``url``, with ``token`` as the bearer when given. Returns ``(status, JSON object)``:
     the status is ``None`` when the node did not answer, and the object is ``None`` unless the
-    answer was a JSON object."""
+    answer was a JSON object.
+
+    The answer is read under :data:`MAX_STATUS_REPLY_BYTES` (ASVS 5.1.1, BACKLOG #1127). A longer
+    one is refused, logged by path and limit, and returned as no answer, the same as a node that is
+    down: the read stops one network chunk past the cap and keeps none of it."""
     headers = {"Authorization": f"Bearer {token}"} if token else None
     try:
-        resp = await client.get(url, headers=headers)
+        async with client.stream("GET", url, headers=headers) as resp:
+            raw = bytearray()
+            async for chunk in resp.aiter_bytes():
+                raw += chunk
+                if len(raw) > MAX_STATUS_REPLY_BYTES:
+                    log.warning(
+                        "engine answer to GET %s is over the %d-byte limit; treated as no answer",
+                        httpx.URL(url).path,
+                        MAX_STATUS_REPLY_BYTES,
+                    )
+                    return None, None
+            status = resp.status_code
     except httpx.HTTPError:
         return None, None
     try:
-        body = resp.json()
-    except ValueError:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):  # json's nesting limit raises RecursionError
         body = None
-    return resp.status_code, body if isinstance(body, dict) else None
+    return status, body if isinstance(body, dict) else None
 
 
 # --- run configuration -------------------------------------------------------

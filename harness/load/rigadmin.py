@@ -57,7 +57,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -72,7 +72,9 @@ __all__ = [
     "RIG_SESSION",
     "SERVE_ENV",
     "RigAdmin",
+    "MAX_API_REPLY_BYTES",
     "RigAdminError",
+    "RigReplyRefused",
     "RigSession",
     "RigSignInRefused",
     "RigUnreachable",
@@ -133,6 +135,14 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _HTTP_TIMEOUT_S = 10.0
 _PROVISION_TIMEOUT_S = 180.0
 
+#: The most bytes the rig keeps of one engine API answer (ASVS 5.1.1, BACKLOG #1127). It is the API
+#: client's ``MAX_RESPONSE_BYTES`` (``messagefoundry/apiclient/client.py``), because ``get`` reads any
+#: route, a message body included, and must not refuse an answer the client would take. Duplicated
+#: so this module still imports only the standard library; a test holds the two equal.
+MAX_API_REPLY_BYTES = 128 * 1024 * 1024
+#: The answer is read in pieces this size, so a short answer never costs a buffer of the full cap.
+_READ_CHUNK_BYTES = 64 * 1024
+
 
 class RigAdminError(RuntimeError):
     """The rig could not provision its Administrator or sign in."""
@@ -144,6 +154,10 @@ class RigUnreachable(RigAdminError):
 
 class RigSignInRefused(RigAdminError):
     """The engine answered and refused the rig credential."""
+
+
+class RigReplyRefused(RigAdminError):
+    """The engine answered with more than :data:`MAX_API_REPLY_BYTES`; none of the answer is kept."""
 
 
 class RigSession:
@@ -356,6 +370,20 @@ def _context(cacert: str | None) -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cacert)
 
 
+def _read_bounded(read: Callable[[int], bytes]) -> bytes:
+    """The whole answer ``read`` yields, refused once it passes :data:`MAX_API_REPLY_BYTES`.
+
+    It reads at most one piece past the cap, and never cuts an answer short: callers parse it."""
+    raw = bytearray()
+    while chunk := read(_READ_CHUNK_BYTES):
+        raw += chunk
+        if len(raw) > MAX_API_REPLY_BYTES:
+            raise RigReplyRefused(
+                f"the engine's answer is over the {MAX_API_REPLY_BYTES}-byte limit; none of it is kept"
+            )
+    return bytes(raw)
+
+
 def _call(
     method: str,
     url: str,
@@ -376,9 +404,9 @@ def _call(
         with urllib.request.urlopen(
             request, context=_context(cacert), timeout=_HTTP_TIMEOUT_S
         ) as reply:
-            return int(reply.status), reply.read()
+            return int(reply.status), _read_bounded(reply.read)
     except urllib.error.HTTPError as exc:
-        return int(exc.code), exc.read()
+        return int(exc.code), _read_bounded(exc.read)
     except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
         # The reason only: an exception's text can carry the address, and callers log this.
         raise RigUnreachable(f"the engine did not answer ({type(exc).__name__})") from None
@@ -392,12 +420,16 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
     """
     admin = admin or rig_admin()
     base = _checked_base(base_url)
-    status, raw = _call(
-        "POST",
-        f"{base}/auth/login",
-        cacert=cacert,
-        body={"username": admin.username, "password": admin.password},
-    )
+    try:
+        status, raw = _call(
+            "POST",
+            f"{base}/auth/login",
+            cacert=cacert,
+            body={"username": admin.username, "password": admin.password},
+        )
+    except RigReplyRefused as exc:
+        # An answer too large to read is not a session, and every caller handles a refused sign-in.
+        raise RigSignInRefused(str(exc)) from None
     if status != 200:
         raise RigSignInRefused(
             f"the engine refused the rig Administrator's sign-in (HTTP {status}). If this store "

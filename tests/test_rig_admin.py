@@ -21,13 +21,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import http.server
 import io
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +189,57 @@ def test_an_engine_that_does_not_answer_is_unreachable_and_not_a_refusal() -> No
         rigadmin.sign_in(f"http://127.0.0.1:{port}", RigAdmin("rig-operator", "ef" * 24))
     assert not isinstance(unreachable.value, rigadmin.RigSignInRefused)
     assert str(port) not in str(unreachable.value), "the address must stay out of the message"
+
+
+@contextlib.contextmanager
+def _engine_answering(status: int, size: int) -> Iterator[str]:
+    """A loopback HTTP server that answers every request with ``status`` and ``size`` bytes."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _answer(self) -> None:
+            self.send_response(status)
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            self.wfile.write(b"x" * size)
+
+        do_GET = do_POST = _answer
+
+        def log_message(self, *args: object) -> None:  # keep the test output quiet
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("status", [200, 401])
+def test_an_answer_past_the_reply_cap_is_refused_and_one_at_it_is_read_whole(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """ASVS 5.1.1 (BACKLOG #1127): the rig reads each engine answer under ``MAX_API_REPLY_BYTES``,
+    on the success path and the HTTP-error path alike, and never cuts one short."""
+    monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 100_000)
+    with _engine_answering(status, 100_000) as base:
+        assert rigadmin._call("GET", f"{base}/stats", cacert=None) == (status, b"x" * 100_000)
+    with _engine_answering(status, 100_001) as base, pytest.raises(rigadmin.RigReplyRefused):
+        rigadmin._call("GET", f"{base}/stats", cacert=None)
+
+
+def test_a_sign_in_answer_past_the_reply_cap_is_a_refused_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callers polling a node handle a refused sign-in; an over-cap answer must not escape them."""
+    monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 1_000)
+    with (
+        _engine_answering(200, 5_000) as base,
+        pytest.raises(rigadmin.RigSignInRefused, match="limit"),
+    ):
+        rigadmin.sign_in(base, RigAdmin("rig-operator", "ab" * 24))
 
 
 # --- the one session per process ---------------------------------------------
