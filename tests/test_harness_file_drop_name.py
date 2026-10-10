@@ -89,6 +89,15 @@ def test_drop_name_keeps_a_name_exactly_at_the_byte_cap() -> None:
         ".. ",
         "...",
         "x.",
+        # Windows device and stream names, refused even when the caller skipped drop_name.
+        "CON",
+        "con.hl7",
+        "COM1.hl7",
+        "NUL .hl7",
+        "CONIN$",
+        "x.hl7:stream",
+        "C:x.hl7",
+        "x*.hl7",
     ],
 )
 def test_drop_atomic_refuses_a_name_that_is_not_one_file_name(tmp_path: Path, name: str) -> None:
@@ -142,3 +151,17 @@ def test_a_second_drop_of_the_same_reduced_name_does_not_clobber(tmp_path: Path)
     second = drop_atomic(tmp_path, drop_name("../x"), b"2")
     assert first != second and first.parent == second.parent == tmp_path
     assert (first.read_bytes(), second.read_bytes()) == (b"1", b"2")
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CONSOLE.hl7", "COM10.hl7", "nul-x.hl7", "AUXILIARY.hl7", "file with spaces.hl7", "a.b.hl7"],
+)
+def test_drop_atomic_accepts_an_ordinary_name_beside_a_reserved_one(
+    tmp_path: Path, name: str
+) -> None:
+    # The device and stream refusal must not refuse everything: names that only look like a device,
+    # or carry spaces and inner dots, are ordinary file names and land in the directory.
+    target = drop_atomic(tmp_path, name, b"data")
+    assert target == tmp_path / name
+    assert target.read_bytes() == b"data"
