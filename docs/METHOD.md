@@ -224,9 +224,8 @@ you try to write inside the primary checkout, so write inside your own worktree,
 
 Nothing blocks `git add -A`, `git add .`, or `git commit -a`. The blanket-stage guard is written and
 fully tested, and it is wired in no settings file. `tests/test_claude_settings_contract.py` records
-that under `_KNOWN_UNWIRED` as BACKLOG #1339. Wiring waits on the owner's answer on the blanket
-stages the guard still allows, which
-[`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md) lists in its section 5.
+that under `_KNOWN_UNWIRED` as BACKLOG #1339. What wiring waits on is in
+[`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), *What wiring waits on*.
 Treat this as a rule with no enforcement behind it.
 
 ### Required contexts refuse the merge, not you

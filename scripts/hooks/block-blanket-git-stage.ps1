@@ -213,9 +213,12 @@ foreach ($b in $bounds) {
     # '-a' are different flags.
     #
     # '^' pins this to the front of a SEGMENT. That now IS program position for the cases this
-    # guard covers, because the splitter above no longer breaks at a separator character inside
-    # a quoted span or a heredoc body. It still breaks at a NEWLINE inside a quoted span, which
-    # Hide-QuotedSpans keeps; the page lists what that lets through. A command reached through
+    # guard covers, because the splitter above no longer breaks at ';', '|' or '&' inside a
+    # quoted span or a heredoc body. It still breaks at a NEWLINE inside either one, because
+    # both Hide- passes keep line breaks. A heredoc body's lines are blank, so that costs
+    # nothing there. In a quoted span that runs over a line break, the text after the closing
+    # quote lands in a segment that does not start with git; the page lists what that lets
+    # through. A command reached through
     # a dispatching wrapper ('cmd /c "git add -A"') is still
     # not covered -- that is BACKLOG #1305's axis, on a different file, and deliberately not
     # widened here: doing so needs a wrapper allowlist, which is the construct #1229 proved

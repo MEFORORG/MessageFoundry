@@ -717,8 +717,9 @@ ADDED_NOT_REPLACED = [
 # XPASS, and nobody can write today's ALLOW down as a requirement.
 #
 # WHY EACH IS STILL OPEN DIFFERS BY ROW, so read the page before assuming a row cannot be closed.
-# Many need a quote-state parser or a program-position test, which are declined (BACKLOG #1341,
-# #1229), or the working directory, which the guard cannot see. Some were closed by a wider
+# Many need a quote-state parser, whose family the owner declined on 2026-08-25 (ledger #1341; a
+# Manager ruling of 2026-09-21 extended it to this script), or a program-position test, which was
+# built and reverted on measurement (#1229), or the working directory, which the guard cannot see. Some were closed by a wider
 # reading that was then withdrawn. And some are plain reading mistakes that look closable and have
 # not been tried: the bare carriage return, the heredoc word with a dash, the arithmetic shift.
 #
@@ -777,16 +778,15 @@ ACCEPTED_FAIL_OPENS = [
     ("Bash", "git add $(echo a.txt | cat) ."),
     # answer 3, form 4: a stage on a line after a bash here-string, which the heredoc reader blanks
     ("Bash", "cat <<<x\ngit add -A"),
-    ("Bash", "cat <<<x\ngit commit -m wip ."),
-    ("Bash", 'read -r a b <<< "$line"\ngit commit -am wip'),
 ]
 
-# NOT ACCEPTED BY ANY OWNER ANSWER. No line in the three answers describes these rows. The page
-# lists them in section 5, with the nearest accepted line for each.
+# NOT ACCEPTED BY ANSWERS 1 TO 3. No line in those three answers describes these rows. The page
+# lists them in section 5, with the nearest accepted line for each. A fourth answer, reported
+# after the page was sorted, is not applied to these tables; the page says what it reads.
 _NOT_ACCEPTED = pytest.mark.xfail(
     strict=True,
-    reason="BACKLOG #1339: measured to stage the whole tree and allowed; under no owner answer, "
-    "listed in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5",
+    reason="BACKLOG #1339: measured to stage the whole tree and allowed; under none of owner "
+    "answers 1 to 3, listed in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5",
 )
 
 NOT_ACCEPTED_FAIL_OPENS = [
@@ -807,6 +807,9 @@ NOT_ACCEPTED_FAIL_OPENS = [
     ("Bash", "git commit -m `echo wip | cat` ."),
     ("Bash", "git commit -m $(true && echo wip) ."),
     ("Bash", "git commit -m $(cat <<'EOF'\nsubject\nEOF\n) ."),
+    # a commit under a line that says "a stage": answer 3, form 4's shape
+    ("Bash", "cat <<<x\ngit commit -m wip ."),
+    ("Bash", 'read -r a b <<< "$line"\ngit commit -am wip'),
     # a pathspec or flag after a message that spans lines
     ("Bash", 'git commit -m "subject\n\nbody" .'),
     ("PowerShell", "git commit -m 'subject\nbody' -a"),

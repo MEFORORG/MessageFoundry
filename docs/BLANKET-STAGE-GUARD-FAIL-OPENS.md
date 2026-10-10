@@ -6,16 +6,16 @@ every form it says one of three things: the owner accepted it, a change closed i
 accepted it.
 
 At the measured commits no settings file ran the guard. Section 5 lists the forms the guard
-allows that no owner answer covers. Those forms are what stood between the guard and its wiring
-at the second measured commit. Whether a settings file runs the guard now is asserted in
-`tests/test_claude_settings_contract.py`, so read it there. Every "would" below describes what a
-session would meet once the guard runs.
+allows that none of the first three owner answers covers. Whether a settings file runs the guard
+now is asserted in `tests/test_claude_settings_contract.py`, so read it there. Every "would"
+below describes what a session would meet once the guard runs.
 
-## The three owner answers
+## The owner answers
 
-The owner answered three times. Each answer was a choice in a dialog in the Special seat's
-session. **All three are reported by that seat. No other seat saw the dialogs.** Answers 2 and 3
-are also recorded as comments on engine PR 2209.
+The owner answered three times on these forms. Each answer was a choice in a dialog in the
+Special seat's session. **All three are reported by that seat. No other seat saw the dialogs.**
+The vault's rulings file of 2026-10-08 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`,
+entry #1339) records answer 1. The seat's comments on engine PR 2209 record answers 2 and 3.
 
 | Answer | Date | The option the owner chose | What it covers | Section |
 |---|---|---|---|---|
@@ -23,19 +23,51 @@ are also recorded as comments on engine PR 2209.
 | 2 | 2026-10-08 | "Accept all five, wire it (Recommended)" | five groups, (a) to (e) | 2 |
 | 3 | 2026-10-09 | "Accept the four, wire it (Recommended)" | four forms the Lander's review found | 3 |
 
-Each dialog showed the owner one line per item. Those lines are quoted in the sections below. The
-dialogs did not show the tables on this page. So this page calls a form accepted only when the
-line's own words describe it. A form the words do not describe is in section 5, even where it
-sat in an accepted group on this page before.
+Only the option label is the owner's own choice. The item lines quoted in sections 1 to 3 are
+the Special seat's wording. For answer 1, the vault file says so: the seat worded the six items,
+and everything outside the quoted label is the seat's. For answers 2 and 3, the lines are the
+question text as the seat's PR 2209 comments give it.
 
-The PR 2209 record of answer 2 also says what that answer leaves out: the critic notes in the
-PR 2209 description. The forms those notes name are in section 5.
+The dialogs showed one line per item, not the tables on this page. So this page calls a form
+accepted only when the line's own words describe it. A form the words do not describe is in
+section 5, even where it sat in an accepted group on this page before. Where a line says "a
+stage", this page reads it as `git add` or `git stage` only, so a commit form under such a line
+is in section 5 too.
 
-Sorting a form under a line is this page's reading. The owner may draw a line elsewhere.
+The PR 2209 record of answer 2 also says what that answer leaves out: "forms in
+docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md that fall in none of the five groups, and the three
+unrepaired critic notes in the PR body." Three of the critic notes in the PR 2209 body name a
+form, and those forms are in section 5.2.
 
-One word is read widely on purpose. Where a line says "a stage", this page takes it to mean
-a stage or a commit that sweeps the tree. The guard treats both as a blanket stage, and its
-deny message uses the one name for both.
+Sorting a form under a line is the reading of the Builders who wrote this page. The owner may
+draw a line elsewhere.
+
+**A fourth answer came after this page was sorted.** The Special seat reports it in a comment on
+engine PR 2217, from a dialog of 2026-10-09 that no other seat saw. The question asked: "Will
+you accept by mechanism instead? That is: the guard is a best-effort check against the common
+blanket-stage spellings; anything it does not match is a stated residual; the document lists the
+known ones as at least." The owner chose "Accept by mechanism (Recommended)". This page was not
+re-sorted under that answer. Its sections sort each form by answers 1 to 3 only, so "NOT
+accepted" in section 5 means under none of those three.
+
+## What wiring waits on
+
+Two conditions are on record. The first is an owner ruling. The second is not.
+
+1. **Owner ruling 2026-08-25, relayed by the Liaison and not read first-hand here:** *"The
+   blanket-git-stage guard is a CONTROL. Strike the claim now, wire it after the splitter
+   repair."* The commit message of `786ac8b49b` (PR 579) quotes the relay, and reads that repair
+   as the quote-state repair, BACKLOG #1341. PR 579 landed the over-deny half of it. The rest
+   needs a quote-state parser, and nobody built one. Ledger row #1341 records that the owner
+   declined that parser family on 2026-08-25, for the sibling hooks. A Manager ruling of
+   2026-09-21 extended the decline to this script, as ledger row #1339 records. No record read
+   for this page shows the owner asked whether the splitter condition still stands. The vault
+   file's #1339 entry says the 2026-10-08 dialog did not put it.
+2. **A Lander amendment of 2026-09-22 on ledger row #1339, under that Manager ruling:** the
+   guard's known fail-opens "must be accepted IN WRITING by the owner before anything wires
+   it". The wording is the Lander's, not the owner's. The owner answers above are reported dialog
+   choices. The vault file's #1339 entry leaves it to the Lander to ask the owner whether such a
+   choice meets that condition. No record read for this page shows that question answered.
 
 ## How this was measured
 
@@ -66,7 +98,8 @@ untracked file by pathspec, so the commit forms read "all tracked".
 
 ## 1. Accepted by answer 1: six fail-opens
 
-The dialog named exactly these six. All of them are still allowed.
+The vault file says the dialog named exactly these six. Each heading quotes that file's wording
+of one item. All of them are still allowed.
 
 **1. "a stage after an unbalanced apostrophe or escaped quote".** At least:
 
@@ -74,14 +107,15 @@ The dialog named exactly these six. All of them are still allowed.
 |---|---|---|
 | `# it's fine`, newline, `git add -A` | bash, PowerShell | staged all five |
 | `# don't forget`, newline, `git add .` | bash, PowerShell | staged all five |
-| `# that's it`, newline, `git commit -am wip` | bash, PowerShell | committed all tracked |
 | `# can't skip`, newline, `git stage -A` | bash | staged all five |
 | `echo "a \" b" ; git add .` | bash | staged all five |
 | `echo "a \" b"`, newline, `git add -A` | bash | staged all five |
 | `echo it\'s fine && git add -A` | bash | staged all five |
 | ``echo "a `" b" && git add -A`` | PowerShell | staged all five |
 
-The control `# plain`, newline, `git add -A` is denied, so the apostrophe is the cause.
+The control `# plain`, newline, `git add -A` is denied, so the apostrophe is the cause. The
+commit of the same shape, `# that's it`, newline, `git commit -am wip`, is in section 5.2,
+because the line says "a stage".
 
 **2. "git run through a wrapper or a full path (cmd /c, env, a path to git.exe)".** At least:
 
@@ -103,9 +137,10 @@ The control `# plain`, newline, `git add -A` is denied, so the apostrophe is the
 | `iex 'git add -A'` | PowerShell | staged all five |
 | `Start-Process git -ArgumentList 'add','-A' -Wait -NoNewWindow` | PowerShell | staged all five |
 
-The line names three examples: `cmd /c`, `env`, and a path to `git.exe`. The option the owner
-chose in answer 2 adds: "I also read eval, xargs, bash -c and similar as git through a wrapper,
-which you already accepted." The rows that neither text names (`command`, `exec`, `sh -c`, `iex`,
+The vault file's wording names three examples: `cmd /c`, `env`, and a path to `git.exe`. The
+option the owner chose in answer 2 carries this text, which the Special seat wrote: "I also read
+eval, xargs, bash -c and similar as git through a wrapper, which you already accepted." The rows
+that neither text names (`command`, `exec`, `sh -c`, `iex`,
 `Start-Process`) are sorted here under "and similar". `cmd /c "git add -A"` under bash staged
 nothing.
 
@@ -175,7 +210,8 @@ session would never reach it.
 
 ## 2. Accepted by answer 2: five groups
 
-The dialog listed five groups. Each heading below quotes the dialog's line for its group. All of
+The dialog listed five groups. Each heading below quotes the group's line as the Special seat's
+PR 2209 comment gives the question. All of
 these forms are still allowed. `tests/test_blanket_stage_guard.py` pins a sample of them as strict
 expected failures, so a later repair shows up as a test change.
 
@@ -213,8 +249,10 @@ repository root, `git add ..` stages nothing: git answers `'..' is outside repos
 
 **(c) "quoting forms such as git commit -m wip '.' or "git" add -A".** The guard blanks quoted
 text before it reads a commit, so a quoted pathspec looks the same as a quoted message. A quoted
-or escaped command word hides the word. Closing these needs quote state, which the owner declined
-under BACKLOG #1341. At least:
+or escaped command word hides the word. Closing these needs quote state. Ledger row #1341 records
+that the owner declined the quote-state parser family on 2026-08-25, for the sibling hooks. A
+Manager ruling of 2026-09-21 extended that decline to this script, as ledger row #1339 records.
+At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -289,7 +327,8 @@ It was built for PR 2209 and withdrawn; see the end of section 4.
 
 ## 3. Accepted by answer 3: four forms the Lander's review found
 
-The Lander's review of PR 2209 named four forms. Each heading below quotes the dialog's line.
+The Lander's review of PR 2209 named four forms. Each heading below quotes the form's line as
+the Special seat's PR 2209 comment gives the question.
 All were measured in the second pass, and all are still allowed. Form 4 was already on this
 page after PR 2209, in group E, with one row.
 
@@ -349,14 +388,11 @@ it as the start of a heredoc and blanks every later line. At least:
 | `cat <<< x`, newline, `git add -A` | bash | staged all five |
 | `cat <<<'x y'`, newline, `git add -A` | bash | staged all five |
 | `cat <<<"$HOME"`, newline, `git add -A` | bash | staged all five |
-| `cat <<<x`, newline, `git commit -m wip .` | bash | committed all tracked |
-| `cat <<<x`, newline, `git commit -am wip` | bash | committed all tracked |
 | `git commit -m wip <<<x`, newline, `git add -A` | bash | staged all five |
 | `read -r a b <<< "$line"`, newline, `git add -A` | bash | staged all five |
-| `read -r a b <<< "$line"`, newline, `git commit -am wip` | bash | committed all tracked |
 
-The last two rows are ordinary bash: a here-string feeds `read`, and a stage follows on a later
-line.
+The last row is ordinary bash: a here-string feeds `read`, and a stage follows on a later line.
+Three commits of the same shape are in section 5.2, because the line says "a stage".
 
 Two controls are denied: `cat <<<x; git add -A`, where the stage is on the same line, and
 `cat <<<$HOME`, newline, `git add -A`, where no plain word follows the `<<<`. A PowerShell
@@ -423,10 +459,11 @@ command that was denied at the first measured commit is allowed now.
   command is allowed today, as fail-open 1 of section 1 (measured in the second pass). The
   sibling guard, `scripts/hooks/block-unbounded-fs-scan.ps1`, does not take `<<<` for a heredoc.
 
-## 5. NOT accepted: allowed, and under no owner answer
+## 5. NOT accepted: allowed, and under none of answers 1 to 3
 
-Each form below is still allowed, and git stages or commits a whole tree with it. No line in the
-three answers describes it. This list is for the owner. At least:
+Each form below is still allowed, and git stages or commits a whole tree with it. No line in
+answers 1 to 3 describes it. The fourth answer, above, was not applied here. This list is for the
+owner. At least:
 
 **5.1 Forms under no answer and next to none.** All were first measured in the second pass.
 
@@ -452,6 +489,8 @@ accepted line. This page does not sort them under it, because the words differ.
 |---|---|---|---|---|
 | `>/dev/null git add -A`, `2>&1 git add -A`, `<<<x git add -A` | bash | staged all five | 2(a). The line says "a word" and names keywords and an assignment; these are redirects. | PR 2209, in group A |
 | `<# note #> git add -A` | PowerShell | staged all five | 2(a). The line says "a word"; this is a comment. | second pass |
+| `# that's it`, newline, `git commit -am wip` | bash, PowerShell | committed all tracked | 1, item 1. The line says "a stage"; this is a commit. | PR 2209, under item 1 |
+| `cat <<<x`, newline, `git commit -m wip .`; `cat <<<x`, newline, `git commit -am wip`; `read -r a b <<< "$line"`, newline, `git commit -am wip` | bash | committed all tracked | 3, form 4. The line says "a stage"; these are commits. | second pass |
 | `git add sub/..`, `git add sub/../.`, `git add ./sub/..` | bash, PowerShell | staged all five | 2(b). The line says "from a subfolder"; these run from the root. | PR 2209, in group B |
 | `(git add -A)` | PowerShell | staged all five | 2(e). The line names a subshell, a brace group and `$(...)`; PowerShell's round brackets are none of these. | PR 2209, in group E |
 | `git add "-\`, newline, `A"` | bash | staged all five | 2(c). A critic note from PR 2209, which the record of answer 2 leaves out. | second pass |
@@ -476,16 +515,15 @@ accepted line. This page does not sort them under it, because the words differ.
 | `git commit -m @'`, newline, `x`, newline, `'@ -a` | PowerShell | committed all tracked | The same. | second pass |
 | `git -c alias.aa='add -A' aa` | bash, PowerShell | staged all five | 2(d). Git supplies the command, not the shell. | PR 2209, in group D |
 | `git -c alias.aa=add aa .` | bash, PowerShell | staged all five | The same. | PR 2209, in group D |
-| `git ls-files -m \| git update-index --stdin` | bash | staged all tracked | 2(d). The staging is done by `git update-index`. | PR 2209, in group D |
-| `git diff \| git apply --cached` | bash, PowerShell | staged all tracked | The same, with `git apply`. The guard has rules for `add`, `stage` and `commit` only. | second pass |
+| `git ls-files -m \| git update-index --stdin` | bash | staged all tracked | 2(d). The line says the shell supplies a path; here `git update-index` stages a list it reads on stdin. | PR 2209, in group D |
+| `git diff \| git apply --cached` | bash, PowerShell | staged all tracked | 2(d). No path is supplied at all; `git apply --cached` stages a patch. The guard has rules for `add`, `stage` and `commit` only. | second pass |
 | `git add <the repository root as an absolute path>` | bash, PowerShell | staged all five | 2(d). The line says the shell supplies the path; here it is typed. Git gets the same argument as from `"$PWD"`. | second pass |
 | `git commit -m wip <the repository root as an absolute path>` | bash | committed all tracked | The same. | second pass |
 
 Notes on these rows:
 
-- **The rows marked "PR 2209"** sat in a group on this page when the owner gave answer 2. The
-  dialog's line for that group does not describe them. Whether answer 2 covers them is the
-  owner's to say.
+- **The rows marked "PR 2209"** sat under an accepted line on this page before. The line's
+  words do not describe them. Whether that answer covers them is the owner's to say.
 - **A message that spans lines** is the most ordinary form on this page. The guard splits a
   command at every newline, also inside a quoted message. The pathspec or flag after the message
   then lands in a piece that does not start with `git`.
