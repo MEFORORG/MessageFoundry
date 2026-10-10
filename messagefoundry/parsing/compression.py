@@ -8,10 +8,10 @@ drops. This module is the primitive: a Handler calls it on demand against a
 body, and the File connector uses the single-stream ``gzip`` pair for its ``compress=``/``decompress=``
 option (:mod:`messagefoundry.transports.file`).
 
-It is **pure** — stdlib (:mod:`gzip`, :mod:`zlib`, :mod:`zipfile`, :mod:`io`) plus two siblings under
-``parsing/`` (:mod:`messagefoundry.parsing.sniff`, for the archive-member admission checks, and
-:mod:`messagefoundry.parsing._bounded_inflate`, the inflate loop it shares with the DICOM deflate
-guard), **no engine imports** — so it sits under the ``parsing/`` carve-out (a client may import it,
+It is **pure** — stdlib (:mod:`gzip`, :mod:`zlib`, :mod:`zipfile`, :mod:`io`, :mod:`re`) plus two
+siblings under ``parsing/`` (:mod:`messagefoundry.parsing.sniff`, for the archive-member admission
+checks, and :mod:`messagefoundry.parsing._bounded_inflate`, the inflate loop it shares with the DICOM
+deflate guard), **no engine imports** — so it sits under the ``parsing/`` carve-out (a client may import it,
 mirroring :mod:`messagefoundry.parsing.binary` / :mod:`messagefoundry.parsing.x12`). Both sibling
 imports are deliberate rather than copies: the extension-keyed check and the declared-type check must
 not be able to drift apart, and neither may two copies of one inflate loop (BACKLOG #1977).
@@ -42,13 +42,16 @@ Two invariants shape the surface:
   precondition is absent, which is a different construct from a stricter default and the reason this
   is not merely ``= 64 * 1024 * 1024``. The in-tree precedent is
   :func:`messagefoundry.parsing.dicom._inflate.bounded_inflate_or_error`, which takes its bound the
-  same way. ``max_entries`` on :func:`zip_decompress` keeps its default because it already ships ON.
+  same way. ``max_entries`` on :func:`zip_decompress` keeps its default because it already ships ON,
+  and ``max_members`` on :func:`gzip_decompress` (BACKLOG #1129) has one for the same reason: a
+  default that refuses is not the permissive value the rule exists to remove.
 """
 
 from __future__ import annotations
 
 import gzip
 import io
+import re
 import zipfile
 import zlib
 from collections.abc import Mapping
@@ -92,6 +95,12 @@ class CompressionError(ValueError):
 _CHUNK = CHUNK
 # zlib window-bits selectors: 15 = zlib-wrapped DEFLATE ("deflate"); 31 = 16+15 = gzip.
 _ZLIB_WBITS = 15
+_GZIP_WBITS = 31
+# Every RFC 1952 member starts with these two bytes (ID1, ID2).
+_GZIP_MAGIC = b"\x1f\x8b"
+# NUL bytes after a member are padding, the stdlib gzip reader's rule. A regex finds the first
+# byte that is not padding without copying the input.
+_NOT_GZIP_PADDING = re.compile(rb"[^\x00]")
 # The ZIP end-of-central-directory record (APPNOTE 4.3.16): a fixed 22-byte record whose last two
 # bytes declare the length of the archive comment that follows it. The comment ends the archive.
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
@@ -114,6 +123,12 @@ def _check_ceiling(max_output_bytes: int | None) -> int | None:
     return max_output_bytes
 
 
+def _check_count(name: str, value: int) -> None:
+    # A bool is an int to isinstance, and max_members=False would refuse every member.
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CompressionError(f"{name} must be a non-negative int, got {value!r}")
+
+
 def gzip_compress(data: bytes, *, level: int = 6) -> bytes:
     """Compress ``data`` to a single-member gzip stream, **deterministically**.
 
@@ -123,30 +138,53 @@ def gzip_compress(data: bytes, *, level: int = 6) -> bytes:
     return gzip.compress(data, compresslevel=level, mtime=0)
 
 
-def gzip_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
+def gzip_decompress(data: bytes, *, max_output_bytes: int | None, max_members: int = 1024) -> bytes:
     """Decompress a gzip stream, refusing a **decompression bomb** at ``max_output_bytes``.
 
     ``max_output_bytes`` is **required** (BACKLOG #1237) — pass an explicit ``None`` to mean "no
-    ceiling". See the module docstring for why it has no default.
+    ceiling". See the module docstring for why it has no default. It caps the **total** output across
+    every member, and is enforced incrementally, so a bomb stops after producing at most the ceiling.
 
-    Enforced incrementally via :meth:`gzip.GzipFile.read`, which only inflates enough to satisfy each
-    read, so a bomb is stopped after producing at most the ceiling (never fully expanded). Multi-member
-    gzip is handled by :class:`gzip.GzipFile`. A corrupt / truncated stream or an over-ceiling size
-    raises :class:`CompressionError`."""
+    ``max_members`` caps how many RFC 1952 members the stream may hold (BACKLOG #1129). It defaults
+    ON, like ``zip_decompress``'s ``max_entries``. A gzip stream may be several members back to back,
+    and readers join them. A member can inflate to nothing, so a stream of many empty members passes
+    any byte ceiling while each member still costs a header parse and a new decompressor. Gzip has
+    no directory, so the count cannot be read up front, as ``max_entries`` is. It is checked as each
+    member starts instead: the member past the cap is refused before any of its bytes inflate.
+
+    NUL bytes between or after members are padding and are skipped, which is the stdlib ``gzip``
+    rule. Any other bytes after a member must start another member. Headers are checked more strictly
+    than stdlib ``gzip`` checks them: a reserved flag bit set, or a header CRC that does not match, is
+    refused, as RFC 1952 requires. Stdlib ``gzip`` ignores both. An empty input decompresses to
+    ``b""``. A corrupt or truncated stream, an over-ceiling size or too many members raises
+    :class:`CompressionError`."""
     _check_ceiling(max_output_bytes)
-    try:
-        with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as gz:
-            if max_output_bytes is None:
-                return gz.read()
-            # Read one byte past the ceiling: if we get it, the stream exceeds the cap. GzipFile.read(n)
-            # only decompresses enough to satisfy n, so the bomb is never fully expanded in memory.
-            out = gz.read(max_output_bytes + 1)
-            if len(out) > max_output_bytes:
-                raise _over_ceiling("gzip", max_output_bytes)
-            return out
-    except (OSError, EOFError, zlib.error) as exc:
-        # EOFError = truncated; OSError/BadGzipFile = corrupt header/trailer; zlib.error = bad DEFLATE.
-        raise CompressionError(f"corrupt or truncated gzip stream: {exc}") from exc
+    _check_count("max_members", max_members)
+    # The members are walked by offset into one view, so no member copies the rest of the input.
+    # A bytes view exports nothing a caller could need to resize; any other input is copied once.
+    view = memoryview(data if isinstance(data, bytes) else bytes(data))
+    parts: list[bytes] = []
+    total = 0
+    position = 0
+    while position < len(view):
+        if view[position : position + 2] != _GZIP_MAGIC:
+            raise CompressionError(f"corrupt gzip stream: no gzip member starts at byte {position}")
+        if len(parts) >= max_members:
+            raise CompressionError(f"gzip stream is over the {max_members}-member cap")
+        result = _inflate_zlib(
+            view[position:],
+            None if max_output_bytes is None else max_output_bytes - total,
+            trailing="stop",
+            wbits=_GZIP_WBITS,
+            label="gzip",
+            produced_before=total,
+        )
+        parts.append(result.output)
+        total += result.produced
+        after = _NOT_GZIP_PADDING.search(view, position + result.end)
+        position = after.start() if after else len(view)
+    # One member, the common case, joins without a copy.
+    return b"".join(parts)
 
 
 def deflate_compress(data: bytes, *, level: int = 6) -> bytes:
@@ -197,29 +235,36 @@ def deflate_decompress_with_tail(
 
 
 def _inflate_zlib(
-    data: bytes, max_output_bytes: int | None, *, trailing: TrailingRule
+    data: bytes | memoryview,
+    max_output_bytes: int | None,
+    *,
+    trailing: TrailingRule,
+    wbits: int = _ZLIB_WBITS,
+    label: str = "deflate",
+    produced_before: int = 0,
 ) -> InflateResult:
     """The codec's rules over the shared loop (BACKLOG #1977): its one error type, and a truncated
-    stream is an error. ``trailing`` is the only thing the two public callers set differently. Wrong
-    for gzip, which has members and NUL padding, so this is zlib-wrapped only."""
+    stream is an error. It inflates ONE stream: a zlib stream, or one gzip member, since a gzip
+    stream's members and NUL padding are walked by :func:`gzip_decompress`. ``produced_before`` is
+    the output earlier members already produced, so a ceiling error names the caller's ceiling."""
     _check_ceiling(max_output_bytes)
     try:
         result = bounded_inflate(
             data,
-            zlib.decompressobj(wbits=_ZLIB_WBITS),
+            zlib.decompressobj(wbits=wbits),
             max_output_bytes=max_output_bytes,
             trailing=trailing,
             keep_output=True,
             exact_ceiling=True,
         )
     except InflateCeilingExceeded as exc:
-        raise _over_ceiling("deflate", exc.ceiling) from None
+        raise _over_ceiling(label, exc.ceiling + produced_before) from None
     except InflateTrailingData:
-        raise CompressionError("trailing data after the end of the deflate stream") from None
+        raise CompressionError(f"trailing data after the end of the {label} stream") from None
     except zlib.error as exc:
-        raise CompressionError(f"corrupt or truncated deflate stream: {exc}") from exc
+        raise CompressionError(f"corrupt or truncated {label} stream: {exc}") from exc
     if not result.eof:
-        raise CompressionError("truncated deflate stream (input ended mid-stream)")
+        raise CompressionError(f"truncated {label} stream (input ended mid-stream)")
     return result
 
 
@@ -326,8 +371,7 @@ def zip_decompress(
     A comment shorter than its record declares is refused as truncated. Bytes hidden between two
     members are not checked."""
     _check_ceiling(max_output_bytes)
-    if not isinstance(max_entries, int) or max_entries < 0:
-        raise CompressionError(f"max_entries must be a non-negative int, got {max_entries!r}")
+    _check_count("max_entries", max_entries)
     result: dict[str, bytes] = {}
     total = 0
     position = 0

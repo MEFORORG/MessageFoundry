@@ -10,9 +10,11 @@ incremental decompression-bomb ceiling on every decompressor, corrupt/truncated 
 from __future__ import annotations
 
 import gzip
+import inspect
 import io
 import os
 import random
+import re
 import struct
 import threading
 import time
@@ -20,13 +22,14 @@ import warnings
 import zipfile
 import zlib
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, NoReturn
 
 import pytest
 
 from messagefoundry.parsing import compression
-from messagefoundry.parsing._bounded_inflate import InflateResult
+from messagefoundry.parsing._bounded_inflate import InflateResult, bounded_inflate
 from messagefoundry.parsing.compression import (
     CompressionError,
     deflate_compress,
@@ -78,7 +81,7 @@ def test_gzip_decompress_at_ceiling_ok() -> None:
 
 
 def test_gzip_multi_member() -> None:
-    # Concatenated gzip members decode to the concatenation (GzipFile handles multi-member).
+    # Concatenated gzip members decode to the concatenation, one member at a time.
     concat = gzip_compress(b"AAA") + gzip_compress(b"BBB")
     assert gzip_decompress(concat, max_output_bytes=None) == b"AAABBB"
 
@@ -92,6 +95,113 @@ def test_gzip_decompress_rejects_truncated() -> None:
     blob = gzip_compress(_BODY)
     with pytest.raises(CompressionError):
         gzip_decompress(blob[: len(blob) // 2], max_output_bytes=None)
+
+
+# --- #1129: the gzip member bound ---------------------------------------------
+
+_GZIP_MEMBER_CAP = 1024  # the shipped default, pinned against the signature below
+_EMPTY_MEMBER = gzip_compress(b"")
+
+
+def test_gzip_member_cap_default_is_on() -> None:  # #1129
+    param = inspect.signature(gzip_decompress).parameters["max_members"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default == _GZIP_MEMBER_CAP
+    # The operator page states the figure, so it must move with the code.
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "CONNECTIONS.md").read_text("utf-8")
+    # A digit boundary, so a wrong larger figure such as 10240 does not pass as 1024.
+    assert re.search(rf"`max_members`, default {_GZIP_MEMBER_CAP}(?!\d)", doc)
+
+
+@pytest.mark.timeout(30)
+def test_gzip_empty_member_bomb_is_refused_by_count() -> None:  # #1129
+    # Every member inflates to nothing, so no byte ceiling can see this stream. The File connector
+    # admits a 16 MiB drop, which holds about 800,000 such members, each one a header parse and a
+    # new decompressor. The member cap refuses it, and the error names the cap and no content.
+    bomb = _EMPTY_MEMBER * (16 * 1024 * 1024 // len(_EMPTY_MEMBER))
+    with pytest.raises(CompressionError, match=f"over the {_GZIP_MEMBER_CAP}-member cap"):
+        gzip_decompress(bomb, max_output_bytes=64 * 1024 * 1024)
+
+
+def test_gzip_member_cap_boundary() -> None:  # #1129
+    # A legitimate multi-member stream at the cap passes; one more member is refused.
+    members = [gzip_compress(b"seg%d|" % i) for i in range(_GZIP_MEMBER_CAP + 1)]
+    at_cap = b"".join(members[:_GZIP_MEMBER_CAP])
+    expected = b"".join(b"seg%d|" % i for i in range(_GZIP_MEMBER_CAP))
+    assert gzip_decompress(at_cap, max_output_bytes=1024 * 1024) == expected
+    with pytest.raises(CompressionError, match="member cap"):
+        gzip_decompress(b"".join(members), max_output_bytes=1024 * 1024)
+
+
+def test_gzip_member_cap_is_the_callers_to_set() -> None:  # #1129
+    two = gzip_compress(b"AAA") + gzip_compress(b"BBB")
+    with pytest.raises(CompressionError, match="over the 1-member cap"):
+        gzip_decompress(two, max_output_bytes=None, max_members=1)
+    # Zero members allowed: an empty input is still fine, and any member is refused.
+    assert gzip_decompress(b"", max_output_bytes=None, max_members=0) == b""
+    with pytest.raises(CompressionError, match="over the 0-member cap"):
+        gzip_decompress(gzip_compress(b"x"), max_output_bytes=None, max_members=0)
+    # A larger cap admits more members than the default.
+    many = _EMPTY_MEMBER * (_GZIP_MEMBER_CAP + 5)
+    assert gzip_decompress(many, max_output_bytes=0, max_members=_GZIP_MEMBER_CAP + 5) == b""
+
+
+def test_gzip_member_past_the_cap_never_reaches_zlib(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1129: the count is checked as each member starts, so the member past the cap is refused
+    # before the inflate loop is run on it, let alone fed any of its bytes.
+    calls: list[int] = []
+    real = bounded_inflate
+
+    def counting(*args: Any, **kwargs: Any) -> InflateResult:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(compression, "bounded_inflate", counting)
+    with pytest.raises(CompressionError, match="over the 3-member cap"):
+        gzip_decompress(_EMPTY_MEMBER * 10, max_output_bytes=None, max_members=3)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, "3", None, True, False])
+def test_gzip_member_cap_rejects_bad_values(bad: object) -> None:  # #1129
+    with pytest.raises(CompressionError, match="max_members"):
+        gzip_decompress(_EMPTY_MEMBER, max_output_bytes=None, max_members=bad)  # type: ignore[arg-type]
+
+
+def test_gzip_padding_and_framing_follow_the_stdlib_rule() -> None:  # #1129
+    # NUL padding between or after members is skipped, as stdlib gzip skips it, and is not a member.
+    padded = gzip_compress(b"A") + b"\x00" * 7 + gzip_compress(b"B") + b"\x00" * 3
+    assert gzip.decompress(padded) == b"AB"
+    assert gzip_decompress(padded, max_output_bytes=None, max_members=2) == b"AB"
+    # NUL bytes before the first member, or half a member magic after the last, are corrupt.
+    for bad in (b"\x00\x00" + _EMPTY_MEMBER, _EMPTY_MEMBER + b"\x1f"):
+        with pytest.raises(gzip.BadGzipFile):
+            gzip.decompress(bad)
+        with pytest.raises(CompressionError, match="corrupt"):
+            gzip_decompress(bad, max_output_bytes=None)
+
+
+def test_gzip_header_reserved_flag_is_refused() -> None:  # #1129
+    # RFC 1952, section on FLG: a reserved bit must be an error. Stdlib gzip ignores it; this refuses it.
+    member = bytearray(gzip_compress(b"hello"))
+    member[3] |= 0x20
+    assert gzip.decompress(bytes(member)) == b"hello"
+    with pytest.raises(CompressionError, match="corrupt"):
+        gzip_decompress(bytes(member), max_output_bytes=None)
+
+
+def test_gzip_ceiling_spans_members() -> None:  # #1129
+    # The byte ceiling is the total across members, and its error names the caller's ceiling.
+    stream = gzip_compress(b"x" * 600) + gzip_compress(b"y" * 600)
+    assert gzip_decompress(stream, max_output_bytes=1200) == b"x" * 600 + b"y" * 600
+    with pytest.raises(CompressionError, match="beyond the 1000-byte ceiling"):
+        gzip_decompress(stream, max_output_bytes=1000)
+
+
+def test_gzip_accepts_a_bytearray() -> None:  # #1129
+    blob = bytearray(gzip_compress(b"A") + gzip_compress(b"B"))
+    assert gzip_decompress(blob, max_output_bytes=None) == b"AB"  # type: ignore[arg-type]
+    blob.extend(b"!")  # nothing still holds an export on the caller's buffer
 
 
 # --- deflate -----------------------------------------------------------------
@@ -631,8 +741,8 @@ def test_deflate_feeds_each_input_byte_a_bounded_number_of_times(
 
 @pytest.mark.timeout(30)
 def test_gzip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
-    # GzipFile runs its own loop. Pin that it ends on the same shape: a non-NUL byte is refused as
-    # a bad next member, and NUL padding is accepted, which is the stdlib gzip rule.
+    # The gzip path walks members with the shared loop. Pin that it ends on this shape: a non-NUL
+    # byte is refused as a bad next member, and NUL padding is accepted, the stdlib gzip rule.
     member = gzip_compress(_MULTI_ROUND)
     with pytest.raises(CompressionError, match="corrupt"):
         _returns_within(lambda: gzip_decompress(member + b"X", max_output_bytes=_CAP))
