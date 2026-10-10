@@ -211,8 +211,11 @@ Claude Code, and you should read it before you trust it. It is the only tracked 
   which the maintainer runs from a plain terminal — so it is live on a configured box and absent on
   a fresh clone.
   [`scripts/hooks/block-blanket-git-stage.ps1`](scripts/hooks/block-blanket-git-stage.ps1) is
-  **present and fully tested but wired nowhere at all**, and must not be counted as a control until
-  it is (BACKLOG #1339). `tests/test_claude_settings_contract.py` asserts that every script under
+  wired by this file, for the Bash and PowerShell tools (BACKLOG #1339). It is a **best-effort**
+  check of the common blanket-stage spellings, so do not count it as coverage: the forms it lets
+  through are listed in
+  [`docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md`](docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md).
+  `tests/test_claude_settings_contract.py` asserts that every script under
   `scripts/hooks/` is either wired or named, with its reason, on an explicit unwired list — so this
   paragraph cannot drift from the code without a red test.
 - **Hooks need PowerShell 7 (`pwsh`).** A hook that cannot start is **non-blocking** — the action

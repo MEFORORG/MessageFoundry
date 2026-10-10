@@ -335,11 +335,12 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 > 3. **The `"if"` key appears in 0 of 9 settings files** on this machine and is not a key this
 >    schema carries.
 >
-> **The PreToolUse block is removed rather than corrected, because it documented wiring that does
-> not exist.** `block-blanket-git-stage.ps1` is present and fully tested but is referenced by **no
-> matcher in any settings file in this repository** — see the note under the guardrail tables below.
+> **The PreToolUse block is removed rather than corrected, because it documented wiring that did
+> not exist.** `block-blanket-git-stage.ps1` was then referenced by **no matcher in any settings
+> file in this repository**. BACKLOG #1339 has since wired it — see the note under the guardrail
+> tables below.
 
-> **Transferable principle — fail-OPEN by design.** The git-staging guard is written to block *blanket* staging (`git add -A`/`.`) so that each commit is curated; if the guard itself errors it lets the command **through** (fail-open) rather than wedging the workflow — a deliberate tradeoff for a *workflow* guard. (Contrast the engine's *fail-closed* bind guard for a *security* boundary.) In MEFOR no human curates a commit: commits are the committing session's own judgment ([`../CLAUDE.md`](../CLAUDE.md) section 5), and the note above says this guard is wired to no matcher. *CORRECTED 2026-10-02 by owner ruling; this read "so the human curates each commit".*
+> **Transferable principle — fail-OPEN by design.** The git-staging guard is written to block *blanket* staging (`git add -A`/`.`) so that each commit is curated; if the guard itself errors it lets the command **through** (fail-open) rather than wedging the workflow — a deliberate tradeoff for a *workflow* guard. (Contrast the engine's *fail-closed* bind guard for a *security* boundary.) In MEFOR no human curates a commit: commits are the committing session's own judgment ([`../CLAUDE.md`](../CLAUDE.md) section 5), and the guard is a best-effort check of the common spellings, so a command it allows is not thereby curated. *CORRECTED 2026-10-02 by owner ruling; this read "so the human curates each commit".*
 
 **The blocking security CI** ([`.github/workflows/security.yml`](../.github/workflows/security.yml)) — **bandit** (SAST), **pip-audit** (SCA, hash-locked), **gitleaks** (secret scan), **semgrep** (project rules, [`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml)), **crypto-inventory**, and **forbidden-content** — is **BLOCKING**: bandit/gitleaks/semgrep/pip-audit started from a clean baseline so a regression turns CI **red**, and crypto-inventory/forbidden-content fail the build on any inventory drift or forbidden-string hit. The CycloneDX **SBOM** job is **advisory** (`continue-on-error: true` — it fails only if the bill of materials cannot render), not a blocking gate. Separately, the session that writes a change runs the **`code-review`** pass on its own diff (§6.6). It is an **advisory** AI review, **never** a deterministic CI gate (§7). The **`/security-review`** skill is available too, and that process does not require it. *CORRECTED 2026-10-02; see §6.6.*
 
@@ -527,37 +528,32 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 | Claude Code primitive | Control it implements | Guardrail type | Live MEFOR file |
 |---|---|---|---|
 | `.claude/settings.json` deny-list | No secrets/keys/`*.db`/`.env` to the assistant | **Deterministic gate** | [`.claude/settings.json`](../.claude/settings.json) |
-| PreToolUse hook | Block blanket git staging (fail-open) | **PRESENT, NOT WIRED** -- see the note below this table | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) |
+| PreToolUse hook | Block blanket git staging (fail-open) | **Best-effort guard** -- wired, with stated residuals; see the note below this table | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) |
 | SessionStart hook | Inject worktree/branch context | **Context** | [`scripts/worktree/session-context.ps1`](../scripts/worktree/session-context.ps1) |
 | Blocking security CI | SAST/SCA/secret-scan/forbidden-content | **Deterministic gate** | [`.github/workflows/security.yml`](../.github/workflows/security.yml) |
 | `messagefoundry check` | Validate + dryrun, exit-coded | **Deterministic gate** | [`messagefoundry/checks.py`](../messagefoundry/checks.py) |
 | `CLAUDE.md` | Standing contract / invariants | **Context** | [`../CLAUDE.md`](../CLAUDE.md) |
 | Plan mode, `/code-review`, `/security-review` | Plan approval (in MEFOR the Manager's plan and the owner's go — §6.2), diff review | **Advisory** (the owner rules on what is routed to them — §6.6) | — (Claude Code feature) |
 
-> **NOTE ON THE PreToolUse ROW -- THE FILE EXISTS AND THE CONTROL DOES NOT RUN (BACKLOG #1339).**
-> `block-blanket-git-stage.ps1` is written, reviewable and thoroughly tested, and is referenced by
-> **no PreToolUse matcher in any settings file** -- measured zero across every settings file on a
-> fully configured machine, against a positive control (`collision_gate` and `worktree_gate`, wired
-> at user level by [`install-coordination.ps1`](../scripts/coord/install-coordination.ps1) and
-> [`install-gate.ps1`](../scripts/worktree/install-gate.ps1), return non-zero by the same probe).
-> That zero was measured when BACKLOG #1339 was filed, on 2026-08-23. The vault's rulings file of
-> 2026-10-08 says the vault's tracked settings now wire an older copy of the guard. No settings
-> file in this repository wires it.
+> **NOTE ON THE PreToolUse ROW -- WIRED, AND A BEST-EFFORT CHECK (BACKLOG #1339).**
+> [`.claude/settings.json`](../.claude/settings.json) runs `block-blanket-git-stage.ps1` on every
+> Bash and PowerShell tool call. Until BACKLOG #1339 wired it, this row read *PRESENT, NOT WIRED*:
+> no PreToolUse matcher in any settings file referenced it, measured on 2026-08-23. The vault's
+> rulings file of 2026-10-08 says the vault's tracked settings wire an older copy.
 >
-> **The gap is not "does not reach a fresh clone" -- that was BACKLOG #327 and its fix shipped**
-> when `.claude/settings.json` became tracked. This is the different finding underneath it: nobody
-> ever added the matcher. **A control described in a table as built, that runs in no session, is a
-> compensating control resting on a false premise -- the defect SDS-3.7 names.**
+> **The row says *Best-effort guard*, not *Deterministic gate*.** This note used to say the row
+> would become *Deterministic gate* once the guard was wired. That would now overclaim. The guard
+> checks the common blanket-stage spellings, it fails open, and it lets through at least the forms
+> listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md). The owner
+> accepted that by mechanism on 2026-10-09, as that page records. **A control counted as a gate
+> while it lets known forms through would rest on a false premise -- the defect SDS-3.7 names.**
 >
-> **What stops this recurring is an instrument, not this paragraph.** Three earlier prose
-> corrections on this same claim each landed a new false statement.
-> `tests/test_claude_settings_contract.py` now asserts that every script under `scripts/hooks/` is
+> **What keeps the wiring true is an instrument, not this paragraph.**
+> `tests/test_claude_settings_contract.py` asserts that every script under `scripts/hooks/` is
 > either wired, or wired by a tracked installer, or named with its reason on an explicit unwired
-> list -- so the next drift is a red test rather than a sentence somebody has to notice. What
-> wiring waits on is recorded once, with its sources, in
-> [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), *What wiring waits on*.
-> That includes the owner ruling of 2026-08-25, which reached this repository relayed by the
-> Liaison. This row becomes *Deterministic gate* once the guard is wired, and not before.
+> list. What wiring waited on, including the owner ruling of 2026-08-25 that reached this
+> repository relayed by the Liaison, is recorded once in that page, *What wiring waited on, and
+> where each stands*.
 
 This document **owns and expands** the SDS §A.6 line — *"AI-assisted review as a compensating control"* — for the solo-maintainer **PO.2 / PW.7** deviation. The detailed record is Appendix A.6.
 
@@ -588,7 +584,7 @@ The repo's tiered-honesty taxonomy, applied to the **dev-process tooling itself*
 
 **Built (in code today):**
 
-- **NOT a live control:** [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) is written and fully tested but is wired by **no** PreToolUse matcher in any settings file in this repository (BACKLOG #1339). It is listed here so it is not counted twice: the file exists, the control does not run.
+- **A best-effort guard, not coverage:** [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) is wired for Bash and PowerShell tool calls by [`.claude/settings.json`](../.claude/settings.json) (BACKLOG #1339). It fails open and lets through at least the forms listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), so do not count it as a gate.
 - [`.claude/settings.json`](../.claude/settings.json) secrets/keys/`*.db` **path-based** deny-list + destructive-command denies.
 - Blocking security CI: bandit, semgrep ([`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml)), pip-audit, gitleaks, crypto-inventory, forbidden-content ([`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)). The CycloneDX **SBOM** job is **advisory** (`continue-on-error`), not blocking.
 - **Dependency-CVE fast response (SSDF RV.2 evidence):** dependency-vulnerability metrics ([`vuln-metrics.yml`](../.github/workflows/vuln-metrics.yml)), scoped Dependabot auto-merge + supply-chain cooldown ([`dependabot-auto-merge.yml`](../.github/workflows/dependabot-auto-merge.yml)), auto lock-resync ([`dependabot-lock-resync.yml`](../.github/workflows/dependabot-lock-resync.yml)), and the adopter vulnerable-pin CI tripwire. The **`CI gate` roll-up** required check gates the conditional/matrix legs in [`ci.yml`](../.github/workflows/ci.yml). *(This is the **audit/known-CVE** posture. The distinct hallucinated/typosquatted **new-dependency-introduction** check is now built alongside it — [`new_dependency_check.py`](../scripts/security/new_dependency_check.py), a step in the same required `pip-audit` job — with a documented residual; see below.)*
@@ -675,7 +671,7 @@ MEFOR is an open-source HL7 v2.x integration engine (Python; FastAPI; SQLite/WAL
 | Guardrail | File | Tag |
 |---|---|---|
 | Secrets/keys/`*.db` deny-list + destructive-cmd denies; SessionStart hook | [`.claude/settings.json`](../.claude/settings.json) | Built |
-| Blanket-git-stage guard (fail-open) | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) | **Written, NOT wired** (BACKLOG #1339) |
+| Blanket-git-stage guard (fail-open) | [`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) | Built, wired; best-effort, with stated residuals (BACKLOG #1339) |
 | Worktree context + isolation | [`scripts/worktree/session-context.ps1`](../scripts/worktree/session-context.ps1), [`new.ps1`/`remove.ps1`](../scripts/worktree/) | Built |
 | Exit-coded validate + dryrun gate | [`messagefoundry/checks.py`](../messagefoundry/checks.py) | Built |
 | Blocking SAST/SCA/secret-scan/crypto-inventory/forbidden-content (+ advisory SBOM) | [`.github/workflows/security.yml`](../.github/workflows/security.yml) | Built |

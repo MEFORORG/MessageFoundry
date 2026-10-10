@@ -1138,6 +1138,57 @@ def test_a_known_over_deny_is_still_refused_and_should_not_be(tool: str, command
     assert_allowed(verdict(tool, command))
 
 
+# ------------------------------------------------------------------------------------ the wiring
+
+# WIRING IS A PROPERTY OF settings.json, NOT OF THE SCRIPT (BACKLOG #1339). The settings walk comes
+# from the contract module rather than a second copy here, the same way
+# tests/test_unbounded_fs_scan_guard.py reads it for its sibling guard.
+
+
+def test_the_guard_is_wired_for_the_shell_tools() -> None:
+    from tests.test_claude_settings_contract import _load, _matchers_wiring, matcher_selects
+
+    matchers = _matchers_wiring(_load(), GUARD.name)
+    assert matchers, f"{GUARD.name} is referenced by no handler in .claude/settings.json"
+    for tool in ("Bash", "PowerShell"):
+        assert any(matcher_selects(m, tool) for m in matchers), (
+            f"no matcher wiring {GUARD.name} selects the {tool} tool, so the guard never runs on it"
+        )
+
+
+def _wired_command_line() -> list[str]:
+    """The exact argv the settings file runs for this guard, with the project placeholder bound."""
+    from tests.test_claude_settings_contract import _PLACEHOLDER, _ROOT, _hook_handlers, _load
+
+    argvs = [
+        [handler["command"], *handler.get("args", [])]
+        for _event, handler in _hook_handlers(_load())
+        if any(GUARD.name in str(a) for a in handler.get("args", []))
+    ]
+    assert len(argvs) == 1, f"expected one handler running {GUARD.name}, found {len(argvs)}"
+    return [str(a).replace(_PLACEHOLDER, _ROOT.as_posix()) for a in argvs[0]]
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_the_wired_command_line_denies_a_blanket_stage_and_allows_its_control(tool: str) -> None:
+    """Run the handler's own command line, not `run_guard`'s, so a wrong path or flag shows here."""
+    argv = _wired_command_line()
+
+    def decide(command: str) -> dict[str, Any] | None:
+        proc = subprocess.run(
+            argv,
+            input=json.dumps(bash(command, tool=tool)),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"wired hook exited {proc.returncode}: {proc.stderr}"
+        return json.loads(proc.stdout) if proc.stdout.strip() else None
+
+    assert_denied(decide("git add -A"))
+    assert_allowed(decide("git status --short"))
+
+
 # --------------------------------------------------------------------------------- still fail-open
 
 

@@ -66,10 +66,10 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
 # `git worktree add`, which deliver tracked files only. Before that, this repo's own #327 note
 # recorded `block-blanket-git-stage.ps1` as one that "does not actually travel".
 #
-# #327's CAUSE WAS REMOVED AND ITS SYMPTOM WAS NOT, so do not read this rule as covering that
-# guard. Tracking the file fixed "does not reach a fresh clone"; the script is still referenced by
-# NO matcher in it, so tracking carries it as a FILE and not as a wired control. Measured and
-# asserted in tests/test_claude_settings_contract.py, BACKLOG #1339.
+# Tracking the file fixed "does not reach a fresh clone"; it did not wire the guard, which stayed
+# referenced by no matcher until BACKLOG #1339 wired it. So do not read this rule as what makes
+# the guard a control: whether a matcher names it is asserted in
+# tests/test_claude_settings_contract.py, not here.
 #
 # This is an exact SET, not a floor. Adding a second negation to the block -- `.claude/rules/`,
 # `.claude/skills/`, an agent definition, anything -- fails here until someone writes it down, and

@@ -70,11 +70,14 @@ Rule 2 is the sole exception, and that exception is the source of the ultracode 
 blanket `git add -A`/`.`/`-u` and `git commit -a`, so two sessions in one tree can't sweep each other's
 files into one commit.
 
-**It does not travel, and this paragraph used to imply it did** (BACKLOG #327). The script is tracked,
-but the `PreToolUse` matcher that invokes it is project-scope `.claude/settings.json` — untracked, under
-`.gitignore`'s `/.claude/` rule — so a fresh clone and every `git worktree add` come up without it. It is
-a local Claude Code session control, fail-open by design: real and useful inside a configured session,
-and not repo-wide coverage. The publishing boundary it was cited alongside is asserted independently, by
+**It is wired now, and it is a best-effort check** (BACKLOG #1339). The tracked
+`.claude/settings.json` runs it on every Bash and PowerShell tool call, so a fresh clone and every
+`git worktree add` carry it. Two earlier versions of this paragraph were wrong in turn. One implied the
+guard travelled while its settings file was untracked (BACKLOG #327). The next said it did not travel,
+yet once the file was tracked no matcher in it named the script until #1339. It is a local Claude Code
+session control, fail-open by design. It checks the common blanket spellings and lets through at least
+the forms in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), so it is not
+repo-wide coverage. The publishing boundary it was cited alongside is asserted independently, by
 [`tests/test_private_paths_stay_ignored.py`](../tests/test_private_paths_stay_ignored.py) in CI.
 
 *(The link to that settings file was removed rather than repaired — it named a path no reader outside the
@@ -231,7 +234,7 @@ reading the emitted decision — not by reading source alone.
 | Rule 4 — `EnterWorktree` | — | **INERT BY DESIGN** — now opt-in behind `-EnterWorktreeGate`; was inert by accident (absent from the installed script *and* unmatched in all 5 config dirs) |
 | Deny receipts (`worktree-gate.log`) | user | **NEW** — every deny logs rule/tool/cwd/detail; never the raw command |
 | Installed-vs-source parity check | local test | **NEW** — `tests/test_gate_installed_parity.py`; skips on CI, red on a stale box |
-| Blanket-stage guard | project | **LIVE but leaky** — 7 of 8 trivial rephrasings bypass it |
+| Blanket-stage guard | project | **LIVE, best-effort** — wired by `.claude/settings.json` since BACKLOG #1339; the forms it still lets through are in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md). This row read "LIVE but leaky" while no matcher in this repository named the script |
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
 | Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
 | `session-context.ps1` banner | user | **NOT WIRED ANYWHERE** — MISSING in all 5 config roots, and project settings carry no hook rows at all (measured 2026-08-17, `install-coordination.ps1 -Status` plus an independent read of each `settings.json`). The scope column said `project`; the installer wires this row at USER scope. This row previously read "LIVE where the branch carries the file", which is the dangerous direction of doc drift — see [`SESSION-MAIL.md`](SESSION-MAIL.md) |

@@ -8,10 +8,11 @@ carries the deny-list, and whatever matchers the file wires, to a fresh clone an
 ways it silently stops working are invisible to review:
 
 CORRECTED, AND THE SENTENCE WAS IN THIS FILE (BACKLOG #1339). This paragraph used to say tracking
-the file carries "the deny-list and the `block-blanket-git-stage` guard". It carries the deny-list.
-It carried nothing about that guard, because no matcher in it names the script -- so the module
-whose job is to catch a control that reads as enforced and is not was itself asserting one. The
-third check below is what makes that statement checkable instead of merely rewritten; three earlier
+the file carries "the deny-list and the `block-blanket-git-stage` guard". It carried the deny-list.
+It carried nothing about that guard, because no matcher in it named the script -- so the module
+whose job is to catch a control that reads as enforced and is not was itself asserting one. A
+matcher names the script now. The third check below is what makes either statement checkable
+instead of merely rewritten; three earlier
 prose corrections on this claim each landed a new false statement, which is why the fix had to be
 an instrument.
 
@@ -207,9 +208,10 @@ def _spawn_tools_the_matcher_misses(settings: dict[str, Any]) -> list[str]:
 
 # THE HOLE THIS CLOSES (BACKLOG #1339). Every check above walks `hooks.<event>[].hooks[]` -- that
 # is, over REFERENCED scripts. A script referenced by NO handler yields an empty reference list, so
-# every assertion passes VACUOUSLY over it. `block-blanket-git-stage.ps1` was referenced by nothing,
-# on any settings file, while at least eight tracked sites described it as a live control -- and
-# nothing here could see that, because the thing to see was an ABSENCE.
+# every assertion passes VACUOUSLY over it. `block-blanket-git-stage.ps1` was referenced by nothing
+# in this repository's settings file, while at least eight tracked sites described it as a live
+# control -- and nothing here could see that, because the thing to see was an ABSENCE. It is wired
+# now, so this check keeps it wired.
 #
 # WHY THIS IS THREE STATES AND NOT TWO, WHICH IS THE WHOLE DESIGN. A wired/unwired instrument would
 # be WRONG and would assert the exact falsehood this test exists to stop. Several scripts are wired
@@ -229,12 +231,6 @@ _INSTALLERS = (
 # dumping ground and an entry nobody can justify is how this decays back into a false record.
 # Keep it SHORT. If it grows, that is the signal, not the workaround.
 _KNOWN_UNWIRED: dict[str, str] = {
-    "block-blanket-git-stage.ps1": (
-        "BACKLOG #1339. Present and fully tested, wired in no settings file in this repository. "
-        "What wiring waits on, including the owner ruling of 2026-08-25 relayed by the Liaison, "
-        "is recorded once, with its sources, in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md, "
-        "'What wiring waits on'."
-    ),
     "lane-level.ps1": "Not a PreToolUse guard; invoked directly by coordination scripts.",
     "steer-inject.ps1": "Opt-in steering channel, armed per-session rather than by a matcher.",
     "steer-send.ps1": "The sending half of the same opt-in channel; never a hook handler.",
@@ -460,7 +456,7 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
         ),
         (
             # A settings document that wires NOTHING, checked against a root with no installers.
-            # Every real hook script is then unaccounted for except the four on _KNOWN_UNWIRED, so
+            # Every real hook script is then unaccounted for except the three on _KNOWN_UNWIRED, so
             # the detector must return a non-empty list. If it returns nothing here, it cannot see
             # an unwired script at all and the assertion above is passing for the wrong reason --
             # which is exactly the vacuity BACKLOG #1339 is about.

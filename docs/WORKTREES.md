@@ -1014,19 +1014,19 @@ atomic exclusive-create as `claim.ps1`. It **retries and never steals**: on time
 names the holder, because breaking a lock you cannot prove is abandoned re-opens the very race it exists
 to close — and on this host there is no reliable liveness signal to prove it with.
 
-**Cross-session staging guard.** A `PreToolUse` hook (same `settings.json`,
-[../scripts/hooks/block-blanket-git-stage.ps1](../scripts/hooks/block-blanket-git-stage.ps1)) refuses
-blanket `git add -A`/`.`/`-u`/`--all` and `git commit -a`/`-am`/`--all` in **every** session, so even two
-chats in the *same* tree can't sweep each other's files into one commit — stage explicit paths instead.
-Review or disable it via `/hooks`.
+**Cross-session staging guard.** A `PreToolUse` hook in the tracked `.claude/settings.json`
+([../scripts/hooks/block-blanket-git-stage.ps1](../scripts/hooks/block-blanket-git-stage.ps1)) refuses
+the common spellings of blanket `git add -A`/`.`/`-u`/`--all` and `git commit -a`/`-am`/`--all` on
+Bash and PowerShell tool calls (BACKLOG #1339). It is a best-effort check, not a wall: it fails open,
+and [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md) lists at least the forms it
+lets through. So stage explicit paths whether or not it fires. Review or disable it via `/hooks`.
 
 Because new worktrees branch off `origin/main`, the hook + script reach a new worktree only once
-they're committed to `main` (and fetched). Note that `/.claude/` is **git-ignored** (`.gitignore`), so
-*no* project-level `.claude/settings.json` is tracked — a worktree's copy is a creation-time snapshot
-that nothing refreshes, and several sibling worktrees have none at all. That is why the coordination
-hooks are wired at **user** level by
-[../scripts/coord/install-coordination.ps1](../scripts/coord/install-coordination.ps1): git cannot
-deliver a project-level hook to a worktree.
+they're committed to `main` (and fetched). `.claude/settings.json` is tracked (`.gitignore` re-includes
+it), so a worktree gets the copy on its own branch, and a worktree cut before a change to that file
+keeps the old copy until it merges `main`. The coordination hooks are wired at **user** level by
+[../scripts/coord/install-coordination.ps1](../scripts/coord/install-coordination.ps1), so they run
+in every session whatever its branch carries.
 
 **A change to these scripts reaches a session by one of TWO rules, and they are not the same rule.**
 Getting this wrong produces a confident, wrong answer to "can I use it yet", so state which one applies:
@@ -1210,11 +1210,11 @@ Re-read `--help` before trusting this table against a newer CLI. It measures one
 contract.
 
 **No hook guards this, and that is a decision.** The obvious guard is a `PreToolUse` matcher on
-`Bash` that refuses the bad shape. This repo already has one Bash guard written and tested that way,
-[`../scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1), and
-it is referenced by **no** matcher in any settings file on this machine — measured 2026-08-23 at 0 of
-110, while several tracked pages described it as a live control. A second unwired guard would add
-another control that reads as running and never runs. A static scan of tracked files is no better: it
+`Bash` that refuses the bad shape. This repo has one Bash guard built that way,
+[`../scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1). It
+sat referenced by **no** matcher in any settings file on this machine — measured 2026-08-23 at 0 of
+110 — while several tracked pages described it as a live control, until BACKLOG #1339 wired it. A
+guard written without a decision to wire it risks the same gap. A static scan of tracked files is no better: it
 answers "does a committed script contain the bad shape" when the question is "did a session just type
 it", and no tracked file has ever contained one. So this stays a rule you read, not a gate.
 
