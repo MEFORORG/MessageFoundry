@@ -298,6 +298,53 @@ def test_an_answer_the_stdlib_would_write_bare_has_a_status_line(
     assert _answer(monkeypatch, request_bytes).startswith(expected)
 
 
+#: The cases above whose final answer is an error page the stdlib writes through send_error, by id.
+#: The sink's own refusals are not here: they go through _serve and carry no body.
+_STDLIB_ERROR_PAGES = [
+    pytest.param(case.values[1], case.values[2], id=case.id)
+    for case in _CASES
+    if case.id.startswith(("stdlib-", "http-0.9-")) and case.values[2][-1] >= 400
+]
+
+
+def _error_page(raw: bytes) -> tuple[str, bytes]:
+    """(Content-Type, body) of the one answer in ``raw``."""
+    ((_, headers),) = _blocks(raw)
+    _, _, body = raw.partition(b"\r\n\r\n")
+    return dict(headers).get("content-type", ""), body
+
+
+@pytest.mark.parametrize(("request_bytes", "statuses"), _STDLIB_ERROR_PAGES)
+def test_a_stdlib_error_page_is_plain_text(
+    request_bytes: bytes, statuses: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stdlib's own error answers are text/plain, so nothing in them is rendered as HTML."""
+    content_type, body = _error_page(_answer(monkeypatch, request_bytes))
+    assert content_type == "text/plain; charset=utf-8", content_type
+    assert body.startswith(f"{statuses[-1]} ".encode()), body[:80]
+    assert b"<" not in body, body[:80]
+
+
+@pytest.mark.parametrize(("request_bytes", "statuses"), _STDLIB_ERROR_PAGES)
+def test_the_stdlib_error_page_is_html_without_the_override(
+    request_bytes: bytes, statuses: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: with the two overrides removed, the same request gets the stdlib's HTML page."""
+    _without(monkeypatch, "error_content_type")
+    _without(monkeypatch, "error_message_format")
+    content_type, body = _error_page(_answer(monkeypatch, request_bytes))
+    assert content_type.startswith("text/html"), content_type
+    assert body.lstrip().startswith(b"<!DOCTYPE HTML>"), body[:80]
+
+
+def test_the_error_page_cases_cover_every_stdlib_error_class() -> None:
+    """At least the 400, 414 and 501 the brief names, and the 431 and 505 beside them."""
+    ids = [case.id for case in _STDLIB_ERROR_PAGES]
+    assert len(ids) == 8, ids
+    finals = {cast(list[int], case.values[1])[-1] for case in _STDLIB_ERROR_PAGES}
+    assert {400, 414, 431, 501, 505} <= finals
+
+
 def test_the_sink_baseline_is_the_engine_listeners() -> None:
     """The sink's copy and the listener's are separate constants across a dependency boundary. This
     is the one place a divergence turns red."""
