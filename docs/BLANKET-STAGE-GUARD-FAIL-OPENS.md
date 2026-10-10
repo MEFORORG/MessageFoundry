@@ -6,26 +6,28 @@ every form it says one of three things: a per-form owner answer covers it, a cha
 no per-form answer covers it.
 
 At the measured commits no settings file in this repository ran the guard. The vault's rulings
-file of 2026-10-08 says the vault runs its own copy. Section 5 lists the forms the guard allows
-that none of the three per-form owner answers covers. Whether a settings file here runs the guard
-now is asserted in `tests/test_claude_settings_contract.py`, so read it there. Every "would"
-below describes what a session would meet once the guard runs.
+file of 2026-10-08 says the vault runs an older copy, which it measured to behave differently.
+This page measures the engine copy only. Section 5 lists the forms the guard allows that none of
+answers 1 to 3 covers. Whether a settings file here runs the guard now is asserted in
+`tests/test_claude_settings_contract.py`, so read it there. Every "would" below describes what a
+session would meet once the engine copy runs.
 
 ## The owner answers
 
 The owner answered at least four times on these forms. Each answer was a choice in a dialog in
-the Special seat's session. **All four are reported by that seat. No other seat saw the
+the Special seat's session. **These four are reported by that seat. No other seat saw the
 dialogs.** The vault's rulings file of 2026-10-08
 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, entry #1339) records answer 1. The seat's
 comments on engine PR 2209 record answers 2 and 3, and its comment on engine PR 2217 records
-answer 4.
+answer 4. The vault file also records an earlier answer that day, "Retire it, unwired
+(Recommended)". It says that answer is withdrawn, because its question rested on a false premise.
 
 | Answer | Date | The option the owner chose | What it covers | Section |
 |---|---|---|---|---|
 | 1 | 2026-10-08 | "Accept, wire it (Recommended)" | six fail-opens | 1 |
 | 2 | 2026-10-08 | "Accept all five, wire it (Recommended)" | five groups, (a) to (e) | 2 |
 | 3 | 2026-10-09 | "Accept the four, wire it (Recommended)" | four forms the Lander's review found | 3 |
-| 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | anything the guard does not match | all |
+| 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | anything the guard does not match | every allowed form |
 
 Only the option label is the owner's own choice. The item lines quoted in sections 1 to 3 are
 the Special seat's wording. For answer 1, the vault file says so: the seat worded the six items.
@@ -56,7 +58,8 @@ draw a line elsewhere.
 
 ## What wiring waits on
 
-At least these are on record. Only the first is an owner ruling.
+At least these are on record. Items 1 and 3 come from the owner, as relayed or reported. Item 2
+is a Lander's condition.
 
 1. **Owner ruling 2026-08-25, relayed by the Liaison and not read first-hand here:** *"The
    blanket-git-stage guard is a CONTROL. Strike the claim now, wire it after the splitter
@@ -76,8 +79,8 @@ At least these are on record. Only the first is an owner ruling.
    new work", and that wiring waits until the owner lifts that. The option the owner chose in
    answer 4 carries this text, which the seat wrote: "Recorded as your ruling. When you lift the
    hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
-   return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser." Those
-   three are the rows of section 5.1.
+   return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser." Section
+   5.1 holds those three mistakes, in four rows.
 
 ## How this was measured
 
@@ -473,7 +476,7 @@ Each form below is still allowed, and git stages or commits a whole tree with it
 answers 1 to 3 describes it. Under answer 4 each is a stated residual by mechanism, and this list
 is how the owner sees them. At least:
 
-**5.1 Forms under no answer and next to none.** All were first measured in the second pass.
+**5.1 Forms next to no per-form answer.** All were first measured in the second pass.
 
 | Command | Shell | What git did | Why the guard allows it |
 |---|---|---|---|

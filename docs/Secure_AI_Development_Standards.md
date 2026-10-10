@@ -337,7 +337,7 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 >
 > **The PreToolUse block is removed rather than corrected, because it documented wiring that does
 > not exist.** `block-blanket-git-stage.ps1` is present and fully tested but is referenced by **no
-> matcher in any settings file** — see the note under the guardrail tables below.
+> matcher in any settings file in this repository** — see the note under the guardrail tables below.
 
 > **Transferable principle — fail-OPEN by design.** The git-staging guard is written to block *blanket* staging (`git add -A`/`.`) so that each commit is curated; if the guard itself errors it lets the command **through** (fail-open) rather than wedging the workflow — a deliberate tradeoff for a *workflow* guard. (Contrast the engine's *fail-closed* bind guard for a *security* boundary.) In MEFOR no human curates a commit: commits are the committing session's own judgment ([`../CLAUDE.md`](../CLAUDE.md) section 5), and the note above says this guard is wired to no matcher. *CORRECTED 2026-10-02 by owner ruling; this read "so the human curates each commit".*
 
@@ -540,6 +540,9 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 > fully configured machine, against a positive control (`collision_gate` and `worktree_gate`, wired
 > at user level by [`install-coordination.ps1`](../scripts/coord/install-coordination.ps1) and
 > [`install-gate.ps1`](../scripts/worktree/install-gate.ps1), return non-zero by the same probe).
+> That zero was measured when BACKLOG #1339 was filed, on 2026-08-23. The vault's rulings file of
+> 2026-10-08 says the vault's tracked settings now wire an older copy of the guard. No settings
+> file in this repository wires it.
 >
 > **The gap is not "does not reach a fresh clone" -- that was BACKLOG #327 and its fix shipped**
 > when `.claude/settings.json` became tracked. This is the different finding underneath it: nobody
@@ -585,7 +588,7 @@ The repo's tiered-honesty taxonomy, applied to the **dev-process tooling itself*
 
 **Built (in code today):**
 
-- **NOT a live control:** [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) is written and fully tested but is wired by **no** PreToolUse matcher in any settings file (BACKLOG #1339). It is listed here so it is not counted twice: the file exists, the control does not run.
+- **NOT a live control:** [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) is written and fully tested but is wired by **no** PreToolUse matcher in any settings file in this repository (BACKLOG #1339). It is listed here so it is not counted twice: the file exists, the control does not run.
 - [`.claude/settings.json`](../.claude/settings.json) secrets/keys/`*.db` **path-based** deny-list + destructive-command denies.
 - Blocking security CI: bandit, semgrep ([`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml)), pip-audit, gitleaks, crypto-inventory, forbidden-content ([`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)). The CycloneDX **SBOM** job is **advisory** (`continue-on-error`), not blocking.
 - **Dependency-CVE fast response (SSDF RV.2 evidence):** dependency-vulnerability metrics ([`vuln-metrics.yml`](../.github/workflows/vuln-metrics.yml)), scoped Dependabot auto-merge + supply-chain cooldown ([`dependabot-auto-merge.yml`](../.github/workflows/dependabot-auto-merge.yml)), auto lock-resync ([`dependabot-lock-resync.yml`](../.github/workflows/dependabot-lock-resync.yml)), and the adopter vulnerable-pin CI tripwire. The **`CI gate` roll-up** required check gates the conditional/matrix legs in [`ci.yml`](../.github/workflows/ci.yml). *(This is the **audit/known-CVE** posture. The distinct hallucinated/typosquatted **new-dependency-introduction** check is now built alongside it — [`new_dependency_check.py`](../scripts/security/new_dependency_check.py), a step in the same required `pip-audit` job — with a documented residual; see below.)*

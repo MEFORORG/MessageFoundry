@@ -414,8 +414,8 @@ def test_a_scoped_path_is_not_a_whole_tree_pathspec(command: str) -> None:
 #
 # WHY THE REPAIR IS NOT IN THIS COMMIT. It is a quote-state parser change on a fail-open security
 # gate, and the owner declined that shape across the sibling family (#1066/#1070/#1086/#1305/#1336)
-# on 2026-08-25. The measurement is in the PR body; the short version is that the two limbs are not
-# separable. Honouring backslash escapes ALONE flips `echo "C:\temp\" ; git add -A` -- an ordinary
+# on 2026-08-25. The page's "What wiring waits on" says how that decline reached this script.
+# The measurement is in the PR body; the short version is that the two limbs are not separable. Honouring backslash escapes ALONE flips `echo "C:\temp\" ; git add -A` -- an ordinary
 # Windows path, measured to stage the whole tree under pwsh -- from DENY to ALLOW, because bash and
 # PowerShell disagree about what a backslash is. One scanner cannot be right for both shells at
 # once, which is the reason the family was declined rather than an argument for trying again.
@@ -724,8 +724,9 @@ ADDED_NOT_REPLACED = [
 # not been tried: the bare carriage return, the heredoc word with a dash, the arithmetic shift.
 #
 # WHICH TABLE A ROW SITS IN RECORDS WHICH PER-FORM OWNER ANSWER COVERS IT. Do not move a row INTO
-# the accepted table without an owner answer to cite. A move OUT of it, on a corrected reading of
-# an answer's words, only narrows the claim, so it needs no answer; say why beside the row.
+# the accepted table without a per-form owner answer (1 to 3) to cite. A move OUT of it, on a
+# corrected reading of an answer's words, only narrows the claim. It needs no answer; say why
+# beside the row.
 # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the answers, the full tables and what git did for
 # each form. The answers are reported by the Special seat; no other seat saw the dialogs. A later
 # answer accepts by mechanism, and the page says what that covers. AT LEAST these.
@@ -793,7 +794,7 @@ _NOT_ACCEPTED = pytest.mark.xfail(
 )
 
 NOT_ACCEPTED_FAIL_OPENS = [
-    # under no answer and next to none: reading mistakes in the script
+    # next to no per-form answer: reading mistakes in the script
     ("PowerShell", "Write-Host hi\rgit add -A"),
     ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A"),
     ("Bash", "echo $((1<<n))\ngit add -A"),
@@ -993,7 +994,7 @@ def test_the_nearest_form_to_a_fail_open_is_denied(tool: str, command: str) -> N
 
 
 def test_no_row_is_both_accepted_and_not_accepted() -> None:
-    """The two tables are a record of who accepted what, so a row in both says nothing."""
+    """The two tables record which per-form answer covers a row, so a row in both says nothing."""
     assert not set(ACCEPTED_FAIL_OPENS) & set(NOT_ACCEPTED_FAIL_OPENS)
 
 
