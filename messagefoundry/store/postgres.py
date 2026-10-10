@@ -9571,9 +9571,13 @@ def _pg_cutoff_case(
 
 def _security_events_where_pg(username: str, until: float | None) -> tuple[str, list[Any]]:
     """The ``$N`` ``WHERE`` text and values for one user's security-event page and its total
-    (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule."""
+    (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule, including
+    the lower bound at the account's ``created_at`` (BACKLOG #1152)."""
     params: list[Any] = [username]
-    clause = " WHERE actor = $1 AND action LIKE 'auth.%'"
+    clause = (
+        " WHERE actor = $1 AND action LIKE 'auth.%'"
+        " AND ts >= (SELECT created_at FROM users WHERE username = $1)"
+    )
     if until is not None:
         params.append(until)
         clause += " AND ts <= $2"

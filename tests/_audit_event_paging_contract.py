@@ -87,6 +87,16 @@ async def check_audit_paging(store: Any, tag: str) -> None:
 async def check_security_events_paging(store: Any, tag: str) -> None:
     """``security_events_for_user`` with ``offset`` against ``count_security_events_for_user``."""
     who = f"s2438-{tag}"
+    # BACKLOG #1152: the feed starts at the account's created_at, and a name no account holds has
+    # no feed. A failed sign-in is recorded under the name tried, so these two rows stand for one
+    # written before the account existed and one under a name no account holds. Neither may show.
+    await store.record_audit("auth.login_failed", actor=who, detail='{"n": "before"}', now=1.0)
+    await store.create_user(
+        user_id=f"u-{who}", username=who, auth_provider="local", password_generated=False, now=2.0
+    )
+    await store.record_audit("auth.login_failed", actor=f"{who}-nobody", detail=None)
+    assert await store.count_security_events_for_user(f"{who}-nobody") == 0
+    assert list(await store.security_events_for_user(f"{who}-nobody")) == []
     for i in range(5):
         await store.record_audit("auth.login_success", actor=who, detail=f'{{"n": {i}}}')
     # Neither is in the self view: another action family, and another actor.

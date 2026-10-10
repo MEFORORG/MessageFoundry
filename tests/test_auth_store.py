@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._directory_identity_store_contract import (
     BOUND_GUID,
     CASE_GUID,
@@ -81,9 +81,17 @@ async def test_role_assignment_replace_and_resolution() -> None:
 
 async def test_security_events_for_user_scopes_to_actor() -> None:
     # The /me/security-events source: only the target actor's auth.* audit rows, newest-first,
-    # honoring limit; other actors' rows and non-auth.* rows are excluded.
+    # honoring limit; other actors' rows and non-auth.* rows are excluded. The feed starts at the
+    # account's created_at (BACKLOG #1152), so alice's account exists before her rows.
     store = await _store()
     try:
+        await store.create_user(
+            user_id="u-alice",
+            username="alice",
+            auth_provider="local",
+            password_generated=False,
+            now=1.0,
+        )
         await store.record_audit("auth.login_success", actor="alice", detail="1")
         await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
         await store.record_audit("message_view", actor="alice", detail="x")  # not auth.*
@@ -92,6 +100,31 @@ async def test_security_events_for_user_scopes_to_actor() -> None:
         assert [r["action"] for r in rows] == ["auth.password_changed", "auth.login_success"]
         assert len(await store.security_events_for_user("alice", limit=1)) == 1
         assert await store.security_events_for_user("carol") == []  # no events → empty feed
+    finally:
+        await store.close()
+
+
+async def test_security_events_include_the_row_written_with_the_account() -> None:
+    """BACKLOG #1152: the feed's lower bound is inclusive. A directory account's birth row, such as
+    ``auth.ad_notify_email_not_adopted``, is appended by ``create_user`` with the account's own
+    ``created_at`` as its ``ts``, and the holder must still see it. A row written before the
+    account existed stays out."""
+    store = await _store()
+    try:
+        await store.record_audit("auth.login_failed", actor="dana", detail="early", now=5.0)
+        await store.create_user(
+            user_id="u-dana",
+            username="dana",
+            auth_provider="ad",
+            password_generated=False,
+            now=10.0,
+            audits=[AuditAppend(action="auth.ad_notify_email_not_adopted", actor="dana")],
+        )
+        rows = await store.security_events_for_user("dana")
+        assert [(r["action"], float(r["ts"])) for r in rows] == [
+            ("auth.ad_notify_email_not_adopted", 10.0)
+        ]
+        assert await store.count_security_events_for_user("dana") == 1
     finally:
         await store.close()
 

@@ -224,6 +224,58 @@ async def test_security_events_feed_is_scoped_to_caller(engine: Engine) -> None:
     assert "auth.login_failed" in bob_actions  # bob sees his own failure
 
 
+async def _feed(c: httpx.AsyncClient, token: str) -> list[str]:
+    r = await c.get("/me/security-events", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == len(r.json()["events"])  # the count bound matches the page's
+    # Only the two sign-in outcomes: a sign-in also writes rows these tests are not about.
+    return [
+        e["action"]
+        for e in r.json()["events"]
+        if e["action"] in ("auth.login_success", "auth.login_failed")
+    ]
+
+
+async def test_security_events_feed_starts_when_the_account_was_created(engine: Engine) -> None:
+    """BACKLOG #1152 (finding D-2 of the 2026-10-02 review): a failed sign-in is recorded under the
+    name that was tried, account or not. Before the feed was bounded by ``users.created_at``, an
+    account created later under that name read the earlier failure as its own."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        assert (await _login(c, "newcomer", "wrong")).status_code == 401
+        # The control: the row exists, under the name, before any account holds it.
+        early = await engine.store.list_audit(actor="newcomer", action="auth.login_failed")
+        assert len(early) == 1
+        await _add(service, "newcomer", Role.VIEWER)
+        token = (await _login(c, "newcomer")).json()["token"]
+        assert await _feed(c, token) == ["auth.login_success"]
+        # The bound is a lower one only: a failure after the account exists still shows.
+        await _login(c, "newcomer", "wrong")
+        assert await _feed(c, token) == ["auth.login_failed", "auth.login_success"]
+
+
+async def test_security_events_feed_is_not_inherited_by_a_recreated_username(
+    engine: Engine,
+) -> None:
+    """BACKLOG #1152: an account deleted and created again under the same name starts with an empty
+    feed. Before the bound, the new holder read the departed account's sign-in history."""
+    service = await _service(engine)
+    await _add(service, "recycled", Role.VIEWER)
+    async with _client(engine, service) as c:
+        await _login(c, "recycled", "wrong")
+        first = (await _login(c, "recycled")).json()["token"]
+        assert await _feed(c, first) == ["auth.login_success", "auth.login_failed"]
+        old = await service.store.get_user_by_username("recycled")
+        assert old is not None
+        await service.delete_user(old.id, actor="test")
+        await _add(service, "recycled", Role.VIEWER)
+        second = (await _login(c, "recycled")).json()["token"]
+        assert await _feed(c, second) == ["auth.login_success"]
+    # The control: the departed account's rows are still on the trail, under the same name.
+    rows = await engine.store.list_audit(actor="recycled", action="auth.login_success")
+    assert len(rows) == 2
+
+
 async def test_mfa_enroll_confirm_and_step_up_gate(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
