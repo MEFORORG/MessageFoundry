@@ -175,10 +175,12 @@ $reason = $null
 # unknown tool gets both, which can only add a deny. Each lookbehind skips an ESCAPED escape
 # character, which continues nothing.
 #
-# TWO WIDER READINGS WERE BUILT HERE AND WITHDRAWN, each on a measured false deny. Starting a
-# segment after an opening bracket refused prose that a slipped quote state exposes. Joining
-# the lines of a quoted span let one stray apostrophe glue later lines onto git's arguments.
-# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the forms both would have closed.
+# THREE WIDER READINGS WERE BUILT FOR THIS FILE AND WITHDRAWN. Two went on a measured false deny.
+# Starting a segment after an opening bracket refused prose that a slipped quote state exposes.
+# Joining the lines of a quoted span let one stray apostrophe glue later lines onto git's
+# arguments. The third went on a measured fail-open: Hide-HeredocBodies stopped taking a bash
+# here-string ('<<<word') for a heredoc, and one command that was denied before became allowed.
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the forms all three would have closed.
 $views = New-Object 'System.Collections.Generic.List[string[]]'
 $views.Add(@($scan, $cmd))
 $joined = @($scan, $cmd)
@@ -211,9 +213,14 @@ foreach ($b in $bounds) {
     # '-a' are different flags.
     #
     # '^' pins this to the front of a SEGMENT. That now IS program position for the cases this
-    # guard covers, because the splitter above no longer breaks inside quoted spans or heredoc
-    # bodies. A command reached through a dispatching wrapper ('cmd /c "git add -A"') is still
-    # not covered -- that is BACKLOG #1305's axis, on a different file, and deliberately not
+    # guard covers, because the splitter above no longer breaks at ';', '|' or '&' inside a
+    # quoted span or a heredoc body. It still breaks at a LINE FEED inside either one, because
+    # both Hide- passes keep line feeds; a carriage return inside a quoted span is blanked.
+    # When a quoted span, or a heredoc inside '$(...)', runs over a line feed, the text after
+    # it lands in a segment that does not start with git. So a pathspec or flag there is not
+    # read. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5.2 lists the measured forms.
+    # A command reached through a dispatching wrapper ('cmd /c "git add -A"') is still not
+    # covered -- that is BACKLOG #1305's axis, on a different file, and deliberately not
     # widened here: doing so needs a wrapper allowlist, which is the construct #1229 proved
     # fails open.
     # `git.exe` is the SAME executable spelled with its extension, and it was one of the seven
