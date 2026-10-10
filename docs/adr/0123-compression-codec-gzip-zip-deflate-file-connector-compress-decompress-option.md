@@ -106,6 +106,13 @@ after fully expanding in memory. Exceeding it raises `CompressionError`; a trunc
 raises `CompressionError` (never a bare `zlib.error`/`EOFError`/`BadZipFile`). Codec error messages name
 the **codec and the byte ceiling only** — never any decompressed content.
 
+> **Amendment 2026-10-09 (BACKLOG #1129): gzip no longer reads through `gzip.GzipFile`.**
+> `gzip_decompress` walks the stream one RFC 1952 member at a time through the shared bounded
+> inflate loop, and caps the member count at `max_members`, default 1024. Members that inflate to
+> nothing pass any byte ceiling, so the count is its own limit. The member walk also refuses a
+> header with a reserved flag bit set or a wrong header CRC, as RFC 1952 requires. Stdlib `gzip`
+> ignores both.
+
 The **connector** restricts itself to **single-stream gzip** (`compress="gzip"` / `decompress="gzip"`);
 multi-entry zip and raw deflate are left to a Handler-composed codec call, where the author controls
 entry selection and re-assembly.
