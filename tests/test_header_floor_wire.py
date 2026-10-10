@@ -207,7 +207,7 @@ def test_pyproject_pins_the_versions_this_suite_measured() -> None:
     deps = list(map(Requirement, pyproject["project"]["dependencies"]))
     for name, measured in (("uvicorn", _MEASURED_UVICORN), ("websockets", _MEASURED_WEBSOCKETS)):
         same = [r for r in deps if canonicalize_name(r.name) == name]
-        assert len(same) == 1, f"{name} must have one entry, so no second spec sits beside it"
+        assert len(same) == 1, f"{name} has {len(same)} entries in [project].dependencies, not one"
         (req,) = same
         assert req.marker is None, f"{name} is pinned on some platforms only: {req}"
         assert str(req.specifier) == f"=={measured}", f"{name} is not pinned to {measured}: {req}"

@@ -70,7 +70,8 @@ updates:
     # Lift a cap and delete its entry in the SAME PR.
     # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
     # routine one (`update-types` is the version-only knob and cannot express a range). A ruff
-    # 0.15.x or uvicorn 0.54.x advisory fix still flows. Detection is untouched — security.yml's
+    # 0.15.x advisory fix still flows; a uvicorn 0.54.x one opens a PR that stays red until the
+    # wire suite is re-measured (the uvicorn note below). Detection is untouched — security.yml's
     # REQUIRED `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a
     # withheld fix reds a merge-blocking gate within ~24h and a human lifts the cap. Note the
     # ceiling is the pyproject CAP, not this entry: a human would have to lift it either way.

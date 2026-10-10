@@ -3,4 +3,5 @@
   malformed request line, `414`, `431`, `501` and `505`. It writes them through `send_error`,
   which defaults to an HTML page. The sink now sends them as `text/plain; charset=utf-8`. The
   body is the status and Python's explanation. It leaves out the reason phrase, which can echo
-  the request line. The status line still carries that phrase, as Python writes it. The baseline headers on those answers are unchanged. (`BACKLOG #1120`)
+  the request line. The status line still carries that phrase, as Python writes it. The
+  baseline headers on those answers are unchanged. (`BACKLOG #1120`)
