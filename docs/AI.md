@@ -193,6 +193,13 @@ those can positively confirm a policy it uses a fail-closed built-in default (`m
 which **disables** assistance rather than re-enabling BYO — a central *off* must not be bypassable by
 taking the engine offline (SEC-022).
 
+The cached policy is stamped with when the engine gave it. Offline, a cached answer that **disables**
+assistance stands however old it is. A cached answer that **enables** it stands for 12 hours, the
+default absolute session lifetime. After that the IDE uses `mode: unverified` and disables assistance;
+it does not fall back to the local CLI (BACKLOG #1154). A cache written before the stamp existed is
+treated as expired. Inside the 12 hours, a withdrawn `ai:assist` grant still does not reach an IDE
+that cannot reach the engine.
+
 Then it applies the effective policy:
 
 | Effective state | Behavior |
