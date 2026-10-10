@@ -48,8 +48,7 @@ export interface AiPolicyWire {
 // globalState key holding the last authoritative (engine) policy, so a previously-seen central
 // "off" / ai:assist deny is not overridable simply by taking the engine offline (SEC-022). It is
 // stamped with when the engine answered, so a cached answer that ENABLES assistance expires
-// (BACKLOG #1154; see cachedPolicyOffline). The fail-closed UNVERIFIED_POLICY lives in
-// aiPolicyModel, beside the rule that uses it.
+// (BACKLOG #1154; see cachedPolicyOffline).
 const LAST_POLICY_KEY = "messagefoundry.lastAiPolicy";
 
 /**
@@ -166,10 +165,13 @@ export async function resolveAiPolicy(
   }
   const cached = ctx.globalState.get<CachedAiPolicy>(LAST_POLICY_KEY) ?? null;
   let cli: AiPolicy | null = null;
-  try {
-    cli = fromWire(await io.getCliPolicy());
-  } catch {
-    // CLI unavailable too (no Python / no workspace / untrusted) — leave cli null.
+  // pickOfflinePolicy never reads the CLI's answer while a cache exists, so do not spawn it.
+  if (cached === null) {
+    try {
+      cli = fromWire(await io.getCliPolicy());
+    } catch {
+      // CLI unavailable too (no Python / no workspace / untrusted) — leave cli null.
+    }
   }
   return pickOfflinePolicy(cached, cli, now());
 }

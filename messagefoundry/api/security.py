@@ -1826,8 +1826,9 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
         return None  # a not-yet-rotated account is locked out of the WS too (mirrors require())
     # ASVS 6.3.3: an MFA-pending session does not stream either. No exempt set here — every WS route
     # is a data feed, none is part of the enroll/verify escape path. Audited for the same reason as
-    # require(): the refusal sits above the permission loop, so nothing else would record it. An
-    # open socket asks the same question again before every frame, through recheck_standing.
+    # require(): the refusal sits above the permission loop, so nothing else would record it. The
+    # /ws/stats route asks it again before every frame, through recheck_standing; a new WS route
+    # gets that only if it calls recheck_standing too.
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
         return None
@@ -1872,7 +1873,9 @@ async def recheck_standing(
     change, a met second factor, a notification address on file, and each of ``permissions``. It
     does not ask for a fresh step-up. A step-up proves the person at the start of an act, and the
     act has started. It moves no idle clock, because a running response is not user activity. It
-    writes no audit row; the caller records the stop.
+    writes no audit row; the caller records the stop. :func:`require`, :func:`authorize_ws` and the
+    console's ``authorize_ui_ws`` ask the same list with audit rows between the steps, so a new
+    standing rule goes in all four.
 
     Returns the CURRENT identity, so the caller filters each frame or row by today's channel scope
     rather than the one captured at the gate."""

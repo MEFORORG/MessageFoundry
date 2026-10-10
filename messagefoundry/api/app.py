@@ -2056,7 +2056,10 @@ class ExportStopped(RuntimeError):
     """A running bulk export lost its caller's standing, so the stream aborts (BACKLOG #1154).
 
     The response has already started, so no status code can say so. Raising aborts the transfer,
-    and the client sees an incomplete download rather than a short file that looks complete."""
+    and the client sees an incomplete download rather than a short file that looks complete. The
+    server logs the raise with a traceback. Returning without the final body message would avoid
+    that, but the ``@app.middleware("http")`` layers above would then finish the response cleanly,
+    which is the short file this exists to prevent."""
 
 
 def _export_ndjson_line(row: Row) -> bytes:
@@ -5714,9 +5717,25 @@ def create_app(
                     )
                 )
                 if current is None:
-                    await _stop_export(streamed)
-                    # Raised, not returned: a clean end would hand the client a file that looks
-                    # complete. The raise aborts the transfer, so the client sees it fail.
+                    # Counts only, never an id or a body.
+                    _log.warning(
+                        "message export stopped after %d of %d rows: the caller's standing changed",
+                        streamed,
+                        len(selected),
+                    )
+                    await engine.store.record_audit(
+                        "messages_export.stopped",
+                        actor=identity.username,
+                        channel_id=channel_id,
+                        detail=json.dumps(
+                            {
+                                "selected": len(selected),
+                                "streamed": streamed,
+                                "reason": "standing_changed",
+                            }
+                        ),
+                        client=client_ip(request),
+                    )
                     raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
                 # Per-row channel scope on EVERY streamed body (load-bearing for the ids path), read
                 # from the identity resolved for THIS row, so a narrowed scope skips the rest. An
@@ -5726,23 +5745,6 @@ def create_app(
                     continue
                 streamed += 1
                 yield _export_ndjson_line(row)
-
-        async def _stop_export(streamed: int) -> None:
-            """Record why a running export stopped. Counts only, never an id or a body."""
-            _log.warning(
-                "message export stopped after %d of %d rows: the caller's standing changed",
-                streamed,
-                len(selected),
-            )
-            await engine.store.record_audit(
-                "messages_export.stopped",
-                actor=identity.username,
-                channel_id=channel_id,
-                detail=json.dumps(
-                    {"selected": len(selected), "streamed": streamed, "reason": "standing_changed"}
-                ),
-                client=client_ip(request),
-            )
 
         return StreamingResponse(
             _iter_ndjson(),
@@ -8578,14 +8580,11 @@ def create_app(
         # in the serve_ui path. Absent → counts-only push (see the send loop below).
         ui_connections_render = getattr(state, "ui_connections_render", None)
 
+        # A nested function rather than an inline call: scripts/security/route_gates.py reads a
+        # Permission in the handshake body as a gate argument, and lets a nested re-check repeat it.
         async def _reauthorize() -> Identity | None:
-            """Resolve the open socket's caller again, or ``None`` to close (BACKLOG #1154).
-
-            Asked before EVERY frame, so a revoked session, a withdrawn ``monitoring:read``, a pending
-            password change or a second factor now owed stops the feed before the next frame, and a
-            narrowed channel scope shapes that frame. It asked every 3 s before, so up to three frames
-            went out on the old identity. The cost is one session read per socket per second, under
-            the 64-socket cap. When no auth is enforced (embedding/dev), the handshake identity stands."""
+            """The caller as it stands now, or ``None`` to close. With no auth enforced
+            (embedding/dev), the handshake identity stands."""
             if auth is None:
                 return handshake_identity
             return await recheck_standing(auth, token, Permission.MONITORING_READ)
@@ -8595,7 +8594,8 @@ def create_app(
             while True:
                 # Re-resolved before EVERY frame, the first included: a token revoked between the
                 # handshake and accept() gets no frame at all (SEC-018), and no frame goes out on an
-                # identity older than this loop's turn (BACKLOG #1154, ASVS 8.3.2).
+                # identity older than this loop's turn (BACKLOG #1154, ASVS 8.3.2). A refusal closes
+                # the feed, and a narrowed channel scope shapes this frame.
                 current = await _reauthorize()
                 if current is None:
                     await websocket.close(code=1008)

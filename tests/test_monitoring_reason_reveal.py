@@ -552,6 +552,7 @@ async def test_a_narrowed_scope_shapes_the_very_next_stats_frame(
     from tests.test_ws_stats_revalidation import (
         _HARNESS_TIMEOUT,
         _wait_for_first_frame,
+        _wait_for_frames,
         _WSHarness,
     )
 
@@ -575,10 +576,8 @@ async def test_a_narrowed_scope_shapes_the_very_next_stats_frame(
         user = await service.store.get_user_by_username("op")
         assert user is not None
         await service.store.set_user_channel_scope(user.id, '["IB_MINE"]', source="manual")
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 10.0
-        while len(renders) < 2 and not task.done() and loop.time() < deadline:
-            await asyncio.sleep(0.01)
+        # Each frame is rendered before it is sent, so two frames mean two renders.
+        await _wait_for_frames(harness, task, 2)
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

@@ -71,12 +71,11 @@ export function cachedPolicyOffline(cached: CachedAiPolicy, nowMs: number): AiPo
   if (!assistantState(policy).enabled) {
     return policy;
   }
-  const age = typeof cachedAt === "number" ? nowMs - cachedAt : Number.NaN;
-  // NaN fails both comparisons, so a missing or non-numeric stamp is too old.
-  if (age >= 0 && age <= CACHED_PERMIT_MAX_AGE_MS) {
-    return policy;
+  if (typeof cachedAt !== "number") {
+    return UNVERIFIED_POLICY;
   }
-  return UNVERIFIED_POLICY;
+  const age = nowMs - cachedAt;
+  return age >= 0 && age <= CACHED_PERMIT_MAX_AGE_MS ? policy : UNVERIFIED_POLICY;
 }
 
 /**

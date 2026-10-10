@@ -157,18 +157,23 @@ async def _wait_for_first_frame(harness: _WSHarness, task: asyncio.Task[None]) -
     from a slow one, and "timed out waiting for a frame" is the least useful description of a
     traceback.
     """
+    await _wait_for_frames(harness, task, 1)
+
+
+async def _wait_for_frames(harness: _WSHarness, task: asyncio.Task[None], count: int) -> None:
+    """:func:`_wait_for_first_frame` for ``count`` frames, with the same dead-task surfacing."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _FIRST_FRAME_TIMEOUT
-    while not harness.frames:
+    while len(harness.frames) < count:
         if task.done():
             task.result()  # re-raise the real failure if the route blew up
             raise AssertionError(
-                f"the /ws/stats task finished before sending any frame "
+                f"the /ws/stats task finished after {len(harness.frames)} of {count} frames "
                 f"(close_code={harness.close_code})"
             )
         if loop.time() >= deadline:
             raise AssertionError(
-                f"no stats frame within {_FIRST_FRAME_TIMEOUT}s "
+                f"fewer than {count} stats frames within {_FIRST_FRAME_TIMEOUT}s "
                 f"(close_code={harness.close_code}, frames={harness.frames})"
             )
         await asyncio.sleep(0.01)
@@ -300,11 +305,7 @@ async def test_a_live_session_keeps_streaming_frame_after_frame(
     harness = _WSHarness(app, token)
     task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
     try:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _FIRST_FRAME_TIMEOUT
-        while len(harness.frames) < 3 and not task.done() and loop.time() < deadline:
-            await asyncio.sleep(0.01)
-        assert len(harness.frames) >= 3, (harness.frames, harness.close_code)
+        await _wait_for_frames(harness, task, 3)
         assert harness.close_code is None
     finally:
         task.cancel()

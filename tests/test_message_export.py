@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api.app import ExportStopped
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS
@@ -72,8 +73,14 @@ async def _service(engine: Engine, *, bound: bool = False) -> AuthService:
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+def _client(
+    engine: Engine, service: AuthService, *, raise_app_exceptions: bool = True
+) -> httpx.AsyncClient:
+    # raise_app_exceptions=False hands back what streamed before the app raised, as a real client
+    # sees a broken download, rather than re-raising the app's exception into the test.
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), raise_app_exceptions=raise_app_exceptions
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -400,7 +407,9 @@ async def test_export_takes_the_needle_in_a_post_body(engine: Engine) -> None:
 # --- BACKLOG #1154 (ASVS 8.3.2): the caller is re-resolved before every streamed row ----------
 
 
-def _after_first_read(engine: Engine, act: Callable[[], Awaitable[None]]) -> None:
+def _after_first_read(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, act: Callable[[], Awaitable[None]]
+) -> None:
     """Run ``act`` once, right after the export stream has read its FIRST row.
 
     ``httpx.ASGITransport`` runs the whole response before it returns, so a change "mid-export"
@@ -417,18 +426,20 @@ def _after_first_read(engine: Engine, act: Callable[[], Awaitable[None]]) -> Non
             await act()
         return row
 
-    engine.store.get_message = wrapped  # type: ignore[method-assign]
+    monkeypatch.setattr(engine.store, "get_message", wrapped)
 
 
-def _client_tolerating_aborts(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    """A client that hands back what was streamed before the app raised, as a real client would
-    see a broken download, rather than re-raising the app's exception into the test."""
-    app = create_app(engine, auth=service)
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
+async def _stop_rows(engine: Engine) -> list[dict[str, object]]:
+    return [
+        json.loads(dict(a)["detail"])
+        for a in await engine.store.list_audit(limit=50)
+        if dict(a)["action"] == "messages_export.stopped"
+    ]
 
 
-async def test_a_session_revoked_mid_export_stops_the_stream(engine: Engine) -> None:
+async def test_a_session_revoked_mid_export_stops_the_stream(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A revocation that lands after row one stops the export before row two, and records why.
     Before BACKLOG #1154 the stream tested every row against the identity the gate resolved, so it
     ran to the end of the selection."""
@@ -439,23 +450,41 @@ async def test_a_session_revoked_mid_export_stops_the_stream(engine: Engine) -> 
     async def revoke() -> None:
         await service.revoke_sessions_for_user(uid, actor="admin")
 
-    async with _client_tolerating_aborts(engine, service) as c:
+    async with _client(engine, service, raise_app_exceptions=False) as c:
         token = await _login(c, "op")
-        _after_first_read(engine, revoke)
+        _after_first_read(monkeypatch, engine, revoke)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
     assert r.status_code == 200  # the response had started; the abort is in the body
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
-    stops = [
-        json.loads(dict(a)["detail"])
-        for a in await engine.store.list_audit(limit=50)
-        if dict(a)["action"] == "messages_export.stopped"
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "standing_changed"}
     ]
-    assert stops == [{"selected": 2, "streamed": 1, "reason": "standing_changed"}]
 
 
-async def test_an_export_with_nothing_withdrawn_streams_every_row(engine: Engine) -> None:
+async def test_the_stop_reaches_the_server_as_an_abort(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop must leave the whole app as a raise. If a middleware swallowed it, the server would
+    finish the response cleanly and the client would get a short file that looks complete."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def revoke() -> None:
+        await service.revoke_sessions_for_user(uid, actor="admin")
+
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, revoke)
+        with pytest.raises(ExportStopped):
+            await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+
+
+async def test_an_export_with_nothing_withdrawn_streams_every_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The control: the same mid-stream hook with a harmless act streams both rows and records no
-    stop, so a re-check that refused every caller cannot pass the test above."""
+    stop, so a re-check that refused every caller cannot pass the tests above."""
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     mid_a, mid_b = await _seed(engine)
@@ -463,18 +492,17 @@ async def test_an_export_with_nothing_withdrawn_streams_every_row(engine: Engine
     async def nothing() -> None:
         return None
 
-    async with _client_tolerating_aborts(engine, service) as c:
+    async with _client(engine, service) as c:
         token = await _login(c, "op")
-        _after_first_read(engine, nothing)
+        _after_first_read(monkeypatch, engine, nothing)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
     assert r.status_code == 200, r.text
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a, mid_b]
-    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
-    assert "messages_export.stopped" not in actions
+    assert await _stop_rows(engine) == []
 
 
 async def test_a_scope_narrowed_mid_export_skips_the_rows_it_no_longer_covers(
-    engine: Engine,
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The scope is narrowed in the store directly, so no session is revoked and only the per-row
     re-resolution can carry the change: row two, on the channel withdrawn, is skipped and audited."""
@@ -487,7 +515,7 @@ async def test_a_scope_narrowed_mid_export_skips_the_rows_it_no_longer_covers(
 
     async with _client(engine, service) as c:
         token = await _login(c, "op")
-        _after_first_read(engine, narrow)
+        _after_first_read(monkeypatch, engine, narrow)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
     assert r.status_code == 200, r.text
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
