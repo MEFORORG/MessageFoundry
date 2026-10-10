@@ -46,7 +46,12 @@ from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import DrParkedError, RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.file import FileDestination
-from tests.test_connection_scheduler import _DeadLogGuard, _LogPageSink, _wait_until
+from tests.test_connection_scheduler import (
+    _WAIT_BOUND_SECONDS,
+    _DeadLogGuard,
+    _LogPageSink,
+    _wait_until,
+)
 from tests.test_dr_running_config_dir import _free_ports
 from tests.test_outbound_ca_anchors import _ca, _CountingSink, _ftps_poller_registry, _sha
 from tests.test_trust_anchors import _block, _path_ok
@@ -332,9 +337,21 @@ async def test_an_activation_charges_no_attempt_to_a_row_held_on_a_lane_it_is_bu
         )
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
-        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
-        (row,) = await store.outbox_for(row_id)
-        # One attempt, the delivery itself. The control is the unpark-first order, which gave 2.
+
+        # Wait for the row to settle, not for a file: the File outbound writes a ``.part`` temp
+        # before it publishes, and the row reads ``inflight`` until the delivery returns. A
+        # snapshot taken then read ('inflight', 1, None) on a slow runner. The wait stops at the
+        # first sign of a charge too, so a charged row fails the assert below, not the deadline.
+        async def _settled() -> dict[str, Any]:
+            while True:
+                (row,) = await store.outbox_for(row_id)
+                if row["status"] == "done" or row["attempts"] > 1 or row["last_error"]:
+                    return row
+                await asyncio.sleep(0.02)
+
+        row = await asyncio.wait_for(_settled(), _WAIT_BOUND_SECONDS)
+        # attempts counts claims, so 1 is the delivery itself and nothing was charged before it.
+        # The control is the unpark-first order, which gave 2 with ``outbound reloading``.
         assert (row["status"], row["attempts"], row["last_error"]) == ("done", 1, None)
     finally:
         await runner.stop()
