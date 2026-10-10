@@ -248,8 +248,9 @@ and **CI / supply-chain** ([`.github/workflows/`](../.github/workflows/)).
 
 ## Dependencies
 
-Declared in [`pyproject.toml`](../pyproject.toml) (the source of truth) as `>=` minimums; the pinned,
-hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`** (DEP-1, see
+Declared in [`pyproject.toml`](../pyproject.toml) (the source of truth) mostly as `>=` minimums.
+Some also carry an upper bound, and at least uvicorn and websockets are pinned exactly (BACKLOG
+#1120). The pinned, hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`** (DEP-1, see
 [SECURITY.md](SECURITY.md#dependency-lockfile-dep-1)). Requires **Python 3.14+**.
 
 **Runtime**

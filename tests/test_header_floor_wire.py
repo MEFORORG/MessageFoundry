@@ -30,6 +30,7 @@ import asyncio
 import logging
 import socket
 import sys
+import tomllib
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -39,6 +40,8 @@ from typing import Any
 import pytest
 import uvicorn
 import websockets as websockets_package
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
@@ -68,6 +71,8 @@ _MEASURED_UVICORN = "0.54.0"
 #: The websockets library writes both WebSocket protocols' own handshake rejections, so it is
 #: pinned too.
 _MEASURED_WEBSOCKETS = "17.2"
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 _HANDSHAKE = (
     "GET {path} HTTP/1.1\r\n"
@@ -192,6 +197,20 @@ def test_the_suite_is_measuring_the_uvicorn_it_was_written_against() -> None:
         "responses uvicorn writes itself may have changed: re-read its protocol modules for every "
         "response it emits below the ASGI app, extend the families here, then move the pin."
     )
+
+
+def test_pyproject_pins_the_versions_this_suite_measured() -> None:
+    """The base dependencies pin uvicorn and websockets exactly, to the versions measured here, on
+    every platform. The installed-version test above cannot see a range that still resolves to the
+    measured version in the lock, though a fresh install could take a release nobody read."""
+    pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = list(map(Requirement, pyproject["project"]["dependencies"]))
+    for name, measured in (("uvicorn", _MEASURED_UVICORN), ("websockets", _MEASURED_WEBSOCKETS)):
+        same = [r for r in deps if canonicalize_name(r.name) == name]
+        assert len(same) == 1, f"{name} has {len(same)} entries in [project].dependencies, not one"
+        (req,) = same
+        assert req.marker is None, f"{name} is pinned on some platforms only: {req}"
+        assert str(req.specifier) == f"=={measured}", f"{name} is not pinned to {measured}: {req}"
 
 
 async def test_a_refused_handshake_on_the_wire_carries_the_floor(engine: Engine) -> None:
@@ -1122,7 +1141,7 @@ def _serve_captured(
     (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
-    samples = Path(__file__).resolve().parents[1] / "samples" / "config"
+    samples = _ROOT / "samples" / "config"
     before = set(tmp_path.rglob("*"))
     rc = main([command, "--config", str(samples), "--env", "dev"])
     return rc, captured, set(tmp_path.rglob("*")) - before

@@ -1446,10 +1446,10 @@ requires-dist = [
     { name = "tomlkit", specifier = ">=0.12" },
     { name = "truststore", specifier = ">=0.10" },
     { name = "tzdata", specifier = ">=2024.1" },
-    { name = "uvicorn", specifier = ">=0.29,<0.55" },
+    { name = "uvicorn", specifier = "==0.54.0" },
     { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'", specifier = ">=0.22.1" },
     { name = "webauthn", marker = "extra == 'webauthn'", specifier = ">=3.0.0,<4" },
-    { name = "websockets", specifier = ">=16.0,<18" },
+    { name = "websockets", specifier = "==17.2" },
     { name = "xmlschema", marker = "extra == 'xml'", specifier = ">=4.0.0" },
 ]
 provides-extras = ["dev", "dicom", "fhir", "fuzz", "harness", "otel", "postgres", "sftp", "sqlserver", "vault", "webauthn", "x12", "xml"]
