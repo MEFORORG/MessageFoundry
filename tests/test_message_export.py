@@ -12,8 +12,9 @@ and the 400 on an empty selection. The route loops get_message per id — NO sto
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -394,3 +395,105 @@ async def test_export_takes_the_needle_in_a_post_body(engine: Engine) -> None:
     audits = [dict(a) for a in await engine.store.list_audit(limit=50)]
     detail = next(a["detail"] for a in audits if a["action"] == "messages_export")
     assert "JANE" not in detail  # the needle value is still never recorded
+
+
+# --- BACKLOG #1154 (ASVS 8.3.2): the caller is re-resolved before every streamed row ----------
+
+
+def _after_first_read(engine: Engine, act: Callable[[], Awaitable[None]]) -> None:
+    """Run ``act`` once, right after the export stream has read its FIRST row.
+
+    ``httpx.ASGITransport`` runs the whole response before it returns, so a change "mid-export"
+    has to be made from inside the stream. Wrapping the store read does that at a fixed point:
+    row one has been read under the old standing, and row two has not been asked for yet."""
+    real = engine.store.get_message
+    fired = False
+
+    async def wrapped(message_id: str) -> Any:
+        nonlocal fired
+        row = await real(message_id)
+        if not fired:
+            fired = True
+            await act()
+        return row
+
+    engine.store.get_message = wrapped  # type: ignore[method-assign]
+
+
+def _client_tolerating_aborts(engine: Engine, service: AuthService) -> httpx.AsyncClient:
+    """A client that hands back what was streamed before the app raised, as a real client would
+    see a broken download, rather than re-raising the app's exception into the test."""
+    app = create_app(engine, auth=service)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+async def test_a_session_revoked_mid_export_stops_the_stream(engine: Engine) -> None:
+    """A revocation that lands after row one stops the export before row two, and records why.
+    Before BACKLOG #1154 the stream tested every row against the identity the gate resolved, so it
+    ran to the end of the selection."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def revoke() -> None:
+        await service.revoke_sessions_for_user(uid, actor="admin")
+
+    async with _client_tolerating_aborts(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(engine, revoke)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200  # the response had started; the abort is in the body
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    stops = [
+        json.loads(dict(a)["detail"])
+        for a in await engine.store.list_audit(limit=50)
+        if dict(a)["action"] == "messages_export.stopped"
+    ]
+    assert stops == [{"selected": 2, "streamed": 1, "reason": "standing_changed"}]
+
+
+async def test_an_export_with_nothing_withdrawn_streams_every_row(engine: Engine) -> None:
+    """The control: the same mid-stream hook with a harmless act streams both rows and records no
+    stop, so a re-check that refused every caller cannot pass the test above."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def nothing() -> None:
+        return None
+
+    async with _client_tolerating_aborts(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(engine, nothing)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200, r.text
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a, mid_b]
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
+    assert "messages_export.stopped" not in actions
+
+
+async def test_a_scope_narrowed_mid_export_skips_the_rows_it_no_longer_covers(
+    engine: Engine,
+) -> None:
+    """The scope is narrowed in the store directly, so no session is revoked and only the per-row
+    re-resolution can carry the change: row two, on the channel withdrawn, is skipped and audited."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def narrow() -> None:
+        await service.store.set_user_channel_scope(uid, '["IB_A"]', source="manual")
+
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(engine, narrow)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200, r.text
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    denied = [
+        dict(a)["channel_id"]
+        for a in await engine.store.list_audit(limit=50)
+        if dict(a)["action"] == "auth.channel_denied"
+    ]
+    assert denied == ["IB_B"]

@@ -931,7 +931,11 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 upload cap = 25 MiB", s.store.max_upload_bytes, 25 * mib),
         ("15.1.3 preset-layer cap = 8", api_app._MAX_PRESET_LAYERS, 8),
         ("15.1.3 concurrent /ws/stats cap = 64", api_app._MAX_WS_CONNECTIONS, 64),
-        ("15.1.3 /ws/stats revalidation = 3.0 s", api_app._WS_REVALIDATE_SECONDS, 3.0),
+        # BACKLOG #1154 replaced the 3.0 s revalidation with a re-check before every frame, so the
+        # bound this row pins is now the frame interval. COUPLED edit, like the rows above: the
+        # vault's THREAT-MODEL.md 15.1.3 /ws/stats row may still state the 3.0 s revalidation, and
+        # nothing here fails on that stale text.
+        ("15.1.3 /ws/stats frame interval = 1.0 s", api_app._WS_FRAME_SECONDS, 1.0),
         ("15.1.3 connection-test probe = 35.0 s", api_app._CONNECTION_TEST_TIMEOUT, 35.0),
         (
             "15.1.3 argon2 concurrency clamp",

@@ -229,9 +229,9 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
         "BASELINE_SECURITY_HEADERS itself; tests/test_api_security_header_floor.py covers it.",
     ),
     Site(_APP, "create_app.ws_stats", "ws-close"): (
-        2,
-        "Both are AFTER accept, so each is a WebSocket frame, not an HTTP response. The route's "
-        "pre-accept refusals go through refuse_websocket.",
+        1,
+        "The per-frame re-check's close (BACKLOG #1154). It is AFTER accept, so it is a WebSocket "
+        "frame, not an HTTP response. The route's pre-accept refusals go through refuse_websocket.",
     ),
     Site("messagefoundry/api/client_networks.py", "ClientNetworkMiddleware.__call__", "ws-close"): (
         1,
@@ -339,7 +339,7 @@ def test_a_planted_emitter_of_every_shape_turns_the_gate_red(kind: str) -> None:
 
 
 def test_a_second_emitter_in_a_registered_function_is_still_drift() -> None:
-    """The count matters: a new pre-accept close beside ws_stats's two post-accept ones must not
+    """The count matters: a new pre-accept close beside ws_stats's post-accept one must not
     hide inside an entry that already names the function."""
     extra = Counter({Site(_APP, "create_app.ws_stats", "ws-close"): 1})
     assert _drift(scan_tree() + extra)

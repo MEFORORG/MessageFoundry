@@ -2,15 +2,16 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """SEC-018 — /ws/stats must stop streaming promptly after a session is revoked/downgraded.
 
-The feed authorizes once at handshake then revalidates the session on an elapsed-time cadence
-(``_WS_REVALIDATE_SECONDS``) AND once before the first post-accept send. These tests drive the real
-ASGI ``/ws/stats`` route through a tiny in-memory websocket harness on the test's own event loop (so
-the engine/store stay loop-consistent), monkeypatch the cadence small for determinism, and assert a
-1008 close lands within ~the new cadence rather than waiting a full window."""
+The feed authorizes at handshake, then re-resolves the caller before EVERY frame, the first
+included (BACKLOG #1154; it used to re-check every 3 s). These tests drive the real ASGI
+``/ws/stats`` route through a tiny in-memory websocket harness on the test's own event loop (so the
+engine/store stay loop-consistent), monkeypatch the frame interval small for speed, and assert a
+1008 close lands at the next frame."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -176,7 +177,7 @@ async def _wait_for_first_frame(harness: _WSHarness, task: asyncio.Task[None]) -
 async def test_revoked_session_is_closed_promptly(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(app_module, "_WS_REVALIDATE_SECONDS", 0.1)
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.1)
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
@@ -192,7 +193,7 @@ async def test_revoked_session_is_closed_promptly(
 
 
 async def test_disabled_account_is_closed(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(app_module, "_WS_REVALIDATE_SECONDS", 0.1)
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.1)
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
@@ -202,7 +203,7 @@ async def test_disabled_account_is_closed(engine: Engine, monkeypatch: pytest.Mo
     # Wait for a frame first, so "mid-stream" is a fact rather than an aspiration. With the old fixed
     # sleep this test still PASSED on a slow box while exercising the wrong path — the account was
     # disabled before the first send, so the close came from the pre-first-send re-check instead of the
-    # mid-stream revalidation. Same 1008 either way, so nothing failed and the coverage quietly moved.
+    # mid-stream re-check. Same 1008 either way, so nothing failed and the coverage quietly moved.
     await _wait_for_first_frame(harness, task)
     # disable the account mid-stream → identity_for_token returns None → the feed must close
     await engine.store.set_user_disabled(uid, disabled=True)
@@ -232,7 +233,7 @@ async def test_a_slow_first_stats_build_does_not_break_the_precondition(
         return await real_stats()
 
     monkeypatch.setattr(engine.store, "stats", slow_stats)
-    monkeypatch.setattr(app_module, "_WS_REVALIDATE_SECONDS", 0.1)
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.1)
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
@@ -250,14 +251,62 @@ async def test_revoke_before_first_send_yields_no_frames(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A token revoked between handshake-authorize and the pre-first-send re-check must get NO frame.
-    monkeypatch.setattr(app_module, "_WS_REVALIDATE_SECONDS", 0.1)
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.1)
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
-    # Revoke BEFORE running so the pre-first-send revalidation closes it with zero frames.
+    # Revoke BEFORE running so the pre-first-send re-check closes it with zero frames.
     await service.revoke_sessions_for_user(uid, actor="admin")
     await harness.run(timeout=5.0)
     assert harness.frames == []
     assert harness.close_code == 1008
+
+
+async def test_no_frame_follows_a_revocation(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1154 (ASVS 8.3.2): the caller is re-resolved before EVERY frame, so a revocation
+    lands before the next frame rather than within a 3 s window.
+
+    The revocation happens while the route sleeps between frames: the frame interval is long, and
+    the first frame is the last await before that sleep. So exactly one frame must have gone out.
+    Under the old cadence (a re-check every 3 s, a frame every second) two more would follow."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 1.0)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    await _wait_for_first_frame(harness, task)
+    await service.revoke_sessions_for_user(uid, actor="admin")
+    await task
+    assert harness.close_code == 1008
+    assert len(harness.frames) == 1, harness.frames
+
+
+async def test_a_live_session_keeps_streaming_frame_after_frame(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: with nothing withdrawn, the per-frame re-check passes and
+    the feed keeps sending. A re-check that refused every caller would pass the revocation test."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _FIRST_FRAME_TIMEOUT
+        while len(harness.frames) < 3 and not task.done() and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(harness.frames) >= 3, (harness.frames, harness.close_code)
+        assert harness.close_code is None
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
