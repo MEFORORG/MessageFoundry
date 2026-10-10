@@ -1,16 +1,18 @@
 # What the blanket-stage guard still lets through
 
 `scripts/hooks/block-blanket-git-stage.ps1` refuses a git command that stages or commits a whole
-tree. This page lists the blanket forms it still allows, each measured against real git. For
-every form it says one of three things: a per-form owner answer covers it, a change closed it, or
-no per-form answer covers it.
+tree. **It is a best-effort check of the common blanket-stage spellings.** Every blanket form it
+does not match is a stated residual. This page lists the known residuals, each measured against
+real git. Every list here is "at least": each measuring pass has found new shapes.
 
-At the measured commits no settings file in this repository ran the guard. The vault's rulings
-file of 2026-10-08 says the vault runs an older copy, which it measured to behave differently.
-This page measures the engine copy only. Section 5 lists the forms the guard allows that none of
-answers 1 to 3 covers. Whether a settings file here runs the guard now is asserted in
-`tests/test_claude_settings_contract.py`, so read it there. Every "would" below describes what a
-session would meet once the engine copy runs.
+That framing comes from the owner's fourth answer, "Accept by mechanism (Recommended)"; see *The
+owner answers*. The rest of this paragraph is the page's wording. The guard narrows how often a
+session sweeps another session's files into its commit. It does not make that impossible, and no
+reader should rely on it as if it did.
+
+This page measures the engine copy only. The vault's rulings file of 2026-10-08 says the vault
+runs an older copy, which it measured to behave differently. Whether a settings file here runs the
+guard is asserted in `tests/test_claude_settings_contract.py`, so read it there.
 
 ## The owner answers
 
@@ -27,26 +29,27 @@ answer 4. The vault file also records an earlier answer that day, "Retire it, un
 | 1 | 2026-10-08 | "Accept, wire it (Recommended)" | six fail-opens | 1 |
 | 2 | 2026-10-08 | "Accept all five, wire it (Recommended)" | five groups, (a) to (e) | 2 |
 | 3 | 2026-10-09 | "Accept the four, wire it (Recommended)" | four forms the Lander's review found | 3 |
-| 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | anything the guard does not match | every allowed form |
+| 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | every form the guard does not match | every allowed form |
 
-Only the option label is the owner's own choice. The item lines quoted in sections 1 to 3 are
-the Special seat's wording. For answer 1, the vault file says so: the seat worded the six items.
-Everything outside the quoted label is the seat's. For answers 2 and 3, the lines are the
-question text as the seat's PR 2209 comments give it.
+The owner's act is the choice of an option, and the quoted label is the option the owner chose.
+The questions, the option labels and the option text are the Special seat's wording. The item
+lines quoted in sections 1 to 3 are the seat's too. For answer 1, the vault file says so: the seat
+worded the six items. For answers 2 and 3, the lines are the question text as the seat's PR 2209
+comments give it.
 
-**Answers 1 to 3 are per form. Answer 4 is by mechanism.** Its question, as the seat's PR 2217
-comment gives it, asked: "Will you accept by mechanism instead? That is: the guard is a
-best-effort check against the common blanket-stage spellings; anything it does not match is a
-stated residual; the document lists the known ones as at least." So under answer 4, every
-allowed form on this page is a stated residual, section 5 included. This page still sorts each
-form by answers 1 to 3. A form in section 5 is a residual by mechanism, and no per-form answer
-names it.
+**Answer 4 governs this page.** Its question, as the seat's PR 2217 comment gives it, asked: "Will
+you accept by mechanism instead? That is: the guard is a best-effort check against the common
+blanket-stage spellings; anything it does not match is a stated residual; the document lists the
+known ones as at least." So every form on this page that the guard allows is a stated residual.
+That includes section 5, which no per-form answer names.
 
-The dialogs for answers 1 to 3 showed one line per item, not the tables on this page. So this
-page puts a form under a per-form answer only when the line's own words describe it. A form the
-words do not describe is in section 5. That holds even where it sat in an accepted group on this
-page before. Where a line says "a stage", this page reads it as `git add` or `git stage` only. A
-commit form under such a line is in section 5 too.
+**Answers 1 to 3 are per form, and this page still sorts by them.** The sort says which per-form
+answer, if any, names a form. It does not decide whether a form is accepted; answer 4 does that.
+The dialogs for answers 1 to 3 showed one line per item, not the tables on this page. So this page
+puts a form under a per-form answer only when the line's own words describe it. A form the words
+do not describe is in section 5. That holds even where it sat in an accepted group on this page
+before. Where a line says "a stage", this page reads it as `git add` or `git stage` only. A commit
+form under such a line is in section 5 too.
 
 The PR 2209 record of answer 2 also says what that answer leaves out: "forms in
 docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md that fall in none of the five groups, and the three
@@ -56,10 +59,10 @@ form, and those forms are in section 5.2.
 Sorting a form under a line is the reading of the Builders who wrote this page. The owner may
 draw a line elsewhere.
 
-## What wiring waits on
+## What wiring waited on, and where each stands
 
 At least these are on record. Items 1 and 3 come from the owner, as relayed or reported. Item 2
-is a Lander's condition.
+is a Lander's condition. **Where each stands is this page's reading, not an owner ruling.**
 
 1. **Owner ruling 2026-08-25, relayed by the Liaison and not read first-hand here:** *"The
    blanket-git-stage guard is a CONTROL. Strike the claim now, wire it after the splitter
@@ -67,32 +70,44 @@ is a Lander's condition.
    as the quote-state repair, BACKLOG #1341. PR 579 landed the over-deny half of it. The rest
    needs a quote-state parser, and nobody built one. Ledger row #1341 records that the owner
    declined that parser family on 2026-08-25, for the sibling hooks. A Manager ruling of
-   2026-09-21 extended the decline to this script, as ledger row #1339 records. No record read
-   for this page shows the owner asked whether the splitter condition still stands. The vault
-   file's #1339 entry says the 2026-10-08 dialog did not put it.
+   2026-09-21 extended the decline to this script, as ledger row #1339 records.
+   *Where it stands:* the splitter repair is still not built. No record read for this page shows
+   that the owner was asked whether this condition still stands. The vault file's #1339 entry
+   says the 2026-10-08 dialog did not put it. The wiring rests on answer 4 and on item 3. This
+   page does not say that either one discharges this condition. That is the owner's to say.
 2. **A Lander amendment of 2026-09-22 on ledger row #1339, under that Manager ruling:** the
    guard's known fail-opens "must be accepted IN WRITING by the owner before anything wires
-   it". The wording is the Lander's, not the owner's. The owner answers above are reported dialog
-   choices. The vault file's #1339 entry leaves it to the Lander to ask the owner whether such a
-   choice meets that condition. No record read for this page shows that question answered.
+   it". The wording is the Lander's, not the owner's.
+   *Where it stands:* answer 4 accepts every form the guard does not match, and it is a reported
+   dialog choice. The vault file's #1339 entry leaves it to the Lander to ask the owner whether
+   such a choice meets this condition. No record read for this page shows that question
+   answered.
 3. **A hold, as the Special seat reports it on PR 2217.** It says the owner told it to "start no
    new work", and that wiring waits until the owner lifts that. The option the owner chose in
    answer 4 carries this text, which the seat wrote: "Recorded as your ruling. When you lift the
    hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
-   return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser." Section
-   4a records their fix.
+   return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser."
+   *Where it stands:* the Special seat reports that the owner then chose "Lift for #1339 only
+   (Recommended)" on 2026-10-09. In the seat's words, that lift dispatches one wiring Builder
+   once engine PR 2217 merges. PR 2217 merged on 2026-10-10 (UTC) as `9afa08f5cf`. None of the
+   three mistakes needed a parser, and section 4a records their fix.
+
 
 ## How this was measured
 
-Two passes, with the same tools and the same method.
+Three passes, with the same tools and the same method.
 
 - **First pass:** engine commit `773e43c3fadb51222ead5f69520c222ffab25e9c` (2026-10-08), for
   engine PR 2209. At least 430 payloads. The "allowed before" readings in section 4 are of the
   guard at that commit.
 - **Second pass:** engine commit `61361fff906067c9da0c0fa7d3457b7f229447b7` (2026-10-09), which
   holds PR 2209. At least 190 commands, each run in a repository. Also 18 payloads sent straight
-  to the hook, 14 of which it cannot read. Section 3, section 5.1 and every row marked "second
-  pass" come from this pass. So do the rows added to sections 1 and 2.
+  to the hook, 14 of which it cannot read. Section 3 and every row marked "second pass" come from
+  this pass. So do the rows added to sections 1 and 2, and the rows section 4a moved from 5.1.
+- **Third pass:** engine commit `9afa08f5cffefce5eb523dc8a4dac55878e00f9c` (2026-10-10), for the
+  wiring change. Each row in section 4a, its
+  scoped control and its neighbour were run again, before and after the fix. Section 4a marks
+  the rows this pass found.
 - **Tools:** git 2.55.0.windows.5, PowerShell 7.6.6, and GNU bash 5.3.15 from Git for Windows.
 - **Guard verdict:** each command went to the guard as a real `PreToolUse` payload on stdin, as a
   `Bash` tool call or a `PowerShell` tool call.
@@ -263,7 +278,7 @@ repository root, `git add ..` stages nothing: git answers `'..' is outside repos
 **(c) "quoting forms such as git commit -m wip '.' or "git" add -A".** The guard blanks quoted
 text before it reads a commit, so a quoted pathspec looks the same as a quoted message. A quoted
 or escaped command word hides the word. Closing these needs quote state, which nobody built.
-*What wiring waits on*, item 1, gives the record of its decline. At least:
+*What wiring waited on, and where each stands*, item 1, gives the record of its decline. At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -503,11 +518,11 @@ How each was closed. Neither is a quote-state parser or a program-position test:
 Both readings are added beside the old ones and never replace them, so neither can turn a deny
 into an allow.
 
-## 5. Under no per-form answer: residuals by mechanism only
+## 5. Known residuals that no per-form answer names
 
 Each form below is still allowed, and git stages or commits a whole tree with it. No line in
-answers 1 to 3 describes it. Under answer 4 each is a stated residual by mechanism, and this list
-is how the owner sees them. At least:
+answers 1 to 3 describes it. Under answer 4 each is a stated residual, like every other allowed
+form on this page, and none of them blocks wiring. This list is how the owner sees them. At least:
 
 **5.1 Forms next to no per-form answer.** The four rows that stood here are closed; see section
 4a.

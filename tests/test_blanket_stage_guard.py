@@ -417,8 +417,9 @@ def test_a_scoped_path_is_not_a_whole_tree_pathspec(command: str) -> None:
 #
 # WHY THE REPAIR IS NOT IN THIS COMMIT. It is a quote-state parser change on a fail-open security
 # gate, and the owner declined that shape across the sibling family (#1066/#1070/#1086/#1305/#1336)
-# on 2026-08-25. The page's "What wiring waits on" says how that decline reached this script.
-# The measurement is in the PR body; the short version is that the two limbs are not separable. Honouring backslash escapes ALONE flips `echo "C:\temp\" ; git add -A` -- an ordinary
+# on 2026-08-25. The page's "What wiring waited on" section says how that decline reached this
+# script. The measurement is in the PR body; the short version is that the two limbs are not
+# separable. Honouring backslash escapes ALONE flips `echo "C:\temp\" ; git add -A` -- an ordinary
 # Windows path, measured to stage the whole tree under pwsh -- from DENY to ALLOW, because bash and
 # PowerShell disagree about what a backslash is. One scanner cannot be right for both shells at
 # once, which is the reason the family was declined rather than an argument for trying again.
@@ -714,33 +715,36 @@ ADDED_NOT_REPLACED = [
     ("Bash", "git add ." + "/" * 40 + "x; git add -A"),
 ]
 
-# THE MEASURED FAIL-OPENS THAT ARE STILL OPEN, IN TWO TABLES. Each row stages or commits the whole
-# tree in a real shell and is ALLOWED. They are pinned the same way as the quote class above, and
-# for the same reason: the assertion demands the DENY, `strict` turns a repair into a visible
-# XPASS, and nobody can write today's ALLOW down as a requirement.
+# THE KNOWN RESIDUALS, IN TWO TABLES. Each row stages or commits the whole tree in a real shell
+# and is ALLOWED. The guard is a best-effort check of the common spellings, and the owner's
+# 2026-10-09 answer, "Accept by mechanism (Recommended)", makes every form it does not match a
+# stated residual. The rows are pinned the same way as the quote class above, and for the same
+# reason: the assertion demands the DENY, `strict` turns a repair into a visible XPASS, and nobody
+# can write today's ALLOW down as a requirement.
 #
 # WHY EACH IS STILL OPEN DIFFERS BY ROW, so read the page before assuming a row cannot be closed.
-# Many need a quote-state parser. Nobody built one, and the page's "What wiring waits on" gives
-# the record of its decline. Others need a program-position test, built and reverted under #1229.
-# Others need the working directory, which the guard cannot see. Some were closed by a wider
-# reading that was then withdrawn. Three were plain reading mistakes, and FIXED_READING_MISTAKES
-# below drives their fix.
+# Many need a quote-state parser. Nobody built one, and the page's "What wiring waited on"
+# section gives the record of its decline. Others need a program-position test, built and
+# reverted under #1229. Others need the working directory, which the guard cannot see. Some were
+# closed by a wider reading that was then withdrawn. Three were plain reading mistakes, and
+# FIXED_READING_MISTAKES below drives their fix.
 #
-# WHICH TABLE A ROW SITS IN RECORDS WHICH PER-FORM OWNER ANSWER COVERS IT. Do not move a row INTO
-# the accepted table without a per-form owner answer (1 to 3) to cite. A move OUT of it, on a
-# corrected reading of an answer's words, only narrows the claim. It needs no answer; say why
-# beside the row.
+# WHICH TABLE A ROW SITS IN RECORDS WHETHER A PER-FORM OWNER ANSWER NAMES IT. It does not decide
+# whether the row is accepted; the mechanism answer does that for both tables. Do not move a row
+# INTO the per-form table without a per-form owner answer (1 to 3) whose words describe it. A move
+# OUT of it, on a corrected reading of an answer's words, only narrows the claim. It needs no
+# answer; say why beside the row.
 # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the answers, the full tables and what git did for
-# each form. The answers are reported by the Special seat; no other seat saw the dialogs. A later
-# answer accepts by mechanism, and the page says what that covers. AT LEAST these.
-_ACCEPTED = pytest.mark.xfail(
+# each form. The answers are reported by the Special seat; no other seat saw the dialogs. AT LEAST
+# these.
+_PER_FORM = pytest.mark.xfail(
     strict=True,
-    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; a fail-open "
-    "a per-form owner answer covers, as docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md sections 2 and 3 "
-    "report",
+    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; a stated "
+    "residual that a per-form owner answer also names, as docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md "
+    "sections 2 and 3 report",
 )
 
-ACCEPTED_FAIL_OPENS = [
+PER_FORM_RESIDUALS = [
     # answer 2 (a), a word before git: needs a program-position test
     ("Bash", "if true; then git add -A; fi"),
     ("Bash", "for i in 1; do git add -A; done"),
@@ -788,16 +792,17 @@ ACCEPTED_FAIL_OPENS = [
 ]
 
 # UNDER NO PER-FORM ANSWER. No line in owner answers 1 to 3 describes these rows. The page lists
-# them in section 5, with the nearest accepted line for each. Answer 4 accepts them only by
-# mechanism, as stated residuals; the page says so.
-_NOT_ACCEPTED = pytest.mark.xfail(
+# them in section 5, with the nearest per-form line for each. They are stated residuals under the
+# mechanism answer, and they do not block wiring.
+_MECHANISM_ONLY = pytest.mark.xfail(
     strict=True,
-    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; under none of "
-    "the per-form owner answers, listed in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5",
+    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; a stated "
+    "residual that no per-form owner answer names, listed in "
+    "docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5",
 )
 
-NOT_ACCEPTED_FAIL_OPENS = [
-    # next to an accepted line whose words do not fit
+MECHANISM_ONLY_RESIDUALS = [
+    # next to a per-form line whose words do not fit
     ("Bash", ">/dev/null git add -A"),
     ("PowerShell", "<# note #> git add -A"),
     ("Bash", "git add sub/.."),
@@ -811,7 +816,7 @@ NOT_ACCEPTED_FAIL_OPENS = [
     ("Bash", "git commit -m $(true && echo wip) ."),
     ("Bash", "git commit -m $(cat <<'EOF'\nsubject\nEOF\n) ."),
     # a commit under a line that says "a stage": answer 3, form 4's shape. Moved out of the
-    # accepted table on 2026-10-09 because the line's words name a stage, not a commit.
+    # per-form table on 2026-10-09 because the line's words name a stage, not a commit.
     ("Bash", "cat <<<x\ngit commit -m wip ."),
     ("Bash", 'read -r a b <<< "$line"\ngit commit -am wip'),
     # a pathspec or flag after a message that spans lines
@@ -843,7 +848,7 @@ STILL_OPEN_CONTROLS = [
 ]
 
 # THE THREE PLAIN READING MISTAKES, FIXED (BACKLOG #1339). Each was in the page's section 5.1 and
-# in NOT_ACCEPTED_FAIL_OPENS above. Each fix is an ADDED view, so it can only add a deny:
+# in MECHANISM_ONLY_RESIDUALS above. Each fix is an ADDED view, so it can only add a deny:
 #   * a bare carriage return ends a PowerShell line, and the guard split at a line feed only;
 #   * a heredoc tag holding '-', '.' or other punctuation was cut short, so the guard waited for a
 #     line that never came and blanked the real stage after the heredoc;
@@ -916,8 +921,8 @@ _BATCHED: list[tuple[str, str]] = sorted(
     | {(tool, scoped) for tool, _, scoped in BLANKET_AND_SCOPED_CONTROL}
     | set(MUST_STAY_ALLOWED)
     | set(ADDED_NOT_REPLACED)
-    | set(ACCEPTED_FAIL_OPENS)
-    | set(NOT_ACCEPTED_FAIL_OPENS)
+    | set(PER_FORM_RESIDUALS)
+    | set(MECHANISM_ONLY_RESIDUALS)
     | set(STILL_OPEN_CONTROLS)
     | {(tool, blanket) for tool, blanket, _ in FIXED_READING_MISTAKES}
     | {(tool, scoped) for tool, _, scoped in FIXED_READING_MISTAKES}
@@ -1006,14 +1011,14 @@ def test_an_unknown_tool_gets_both_continuation_characters(continuation: str) ->
 
 
 @pytest.mark.parametrize(
-    ("tool", "command"), [pytest.param(*r, marks=_ACCEPTED) for r in ACCEPTED_FAIL_OPENS]
+    ("tool", "command"), [pytest.param(*r, marks=_PER_FORM) for r in PER_FORM_RESIDUALS]
 )
-def test_an_accepted_fail_open_is_still_allowed(tool: str, command: str) -> None:
+def test_a_residual_a_per_form_answer_names_is_still_allowed(tool: str, command: str) -> None:
     assert_denied(verdict(tool, command))
 
 
 @pytest.mark.parametrize(
-    ("tool", "command"), [pytest.param(*r, marks=_NOT_ACCEPTED) for r in NOT_ACCEPTED_FAIL_OPENS]
+    ("tool", "command"), [pytest.param(*r, marks=_MECHANISM_ONLY) for r in MECHANISM_ONLY_RESIDUALS]
 )
 def test_a_fail_open_no_per_form_answer_covers_is_still_allowed(tool: str, command: str) -> None:
     assert_denied(verdict(tool, command))
@@ -1121,9 +1126,9 @@ def test_a_fixed_reading_mistake_neighbour_really_stages_nothing(
     assert _staged_in_a_throwaway_repo(tool, command, tmp_path / "n", bash_path) == set()
 
 
-def test_no_row_is_both_accepted_and_not_accepted() -> None:
+def test_no_row_is_in_both_residual_tables() -> None:
     """The two tables record which per-form answer covers a row, so a row in both says nothing."""
-    assert not set(ACCEPTED_FAIL_OPENS) & set(NOT_ACCEPTED_FAIL_OPENS)
+    assert not set(PER_FORM_RESIDUALS) & set(MECHANISM_ONLY_RESIDUALS)
 
 
 @pytest.mark.parametrize(
