@@ -1860,7 +1860,7 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
 
 
 async def recheck_standing(
-    auth: AuthService, token: str | None, *permissions: Permission
+    auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
 ) -> Identity | None:
     """Resolve the caller again, mid-response, or ``None`` once it may no longer have the data.
 
@@ -1872,14 +1872,16 @@ async def recheck_standing(
     It asks what the gate asked about the account's standing: a live session, no pending password
     change, a met second factor, a notification address on file, and each of ``permissions``. It
     does not ask for a fresh step-up. A step-up proves the person at the start of an act, and the
-    act has started. It moves no idle clock, because a running response is not user activity. It
-    writes no audit row; the caller records the stop. :func:`require`, :func:`authorize_ws` and the
+    act has started. It moves no idle clock unless ``activity`` is True: a live feed is passive,
+    but a download the caller asked for is that caller's act, and the export passes True now and
+    then so a long download does not idle its own session out. It writes no audit row; the caller
+    records the stop. :func:`require`, :func:`authorize_ws` and the
     console's ``authorize_ui_ws`` ask the same list with audit rows between the steps, so a new
     standing rule goes in all four.
 
     Returns the CURRENT identity, so the caller filters each frame or row by today's channel scope
     rather than the one captured at the gate."""
-    identity = await auth.identity_for_token(token, activity=False)
+    identity = await auth.identity_for_token(token, activity=activity)
     if identity is None or identity.must_change_password or identity.must_set_notify_email:
         return None
     if not all(identity.has(permission) for permission in permissions):

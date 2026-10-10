@@ -275,19 +275,29 @@ async def test_no_frame_follows_a_revocation(
     """BACKLOG #1154 (ASVS 8.3.2): the caller is re-resolved before EVERY frame, so a revocation
     lands before the next frame rather than within a 3 s window.
 
-    The revocation happens while the route sleeps between frames: the frame interval is long, and
-    the first frame is the last await before that sleep. So exactly one frame must have gone out.
-    Under the old cadence (a re-check every 3 s, a frame every second) two more would follow."""
-    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 1.0)
+    The revocation runs inside the first frame's ``store.stats()`` call, which comes after that
+    frame's re-check and before its send. So the first frame still goes out on the identity
+    resolved for it, and the second frame's re-check must refuse: exactly one frame, on any
+    machine speed. Under the old cadence (a re-check every 3 s, a frame every second) two more
+    would follow."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
     service = await _service(engine)
     uid = await _add(service, "op", Role.OPERATOR)
     token = await _login_token(service, "op")
+    real_stats = engine.store.stats
+    calls = 0
+
+    async def stats_then_revoke() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await service.revoke_sessions_for_user(uid, actor="admin")
+        return await real_stats()
+
+    monkeypatch.setattr(engine.store, "stats", stats_then_revoke)
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
-    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
-    await _wait_for_first_frame(harness, task)
-    await service.revoke_sessions_for_user(uid, actor="admin")
-    await task
+    await harness.run(timeout=_HARNESS_TIMEOUT)
     assert harness.close_code == 1008
     assert len(harness.frames) == 1, harness.frames
 

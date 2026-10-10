@@ -11,6 +11,7 @@ and the 400 on an empty selection. The route loops get_message per id — NO sto
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -525,3 +526,34 @@ async def test_a_scope_narrowed_mid_export_skips_the_rows_it_no_longer_covers(
         if dict(a)["action"] == "auth.channel_denied"
     ]
     assert denied == ["IB_B"]
+
+
+async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_session_out(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-row re-check must not turn a long download into an idle session. The idle window is
+    shrunk to 0.4 s and each row takes 0.15 s, so six rows outlast it. The export moves the idle
+    clock every quarter window, so every row streams and the session stays live afterwards."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 0.4))
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    ids = [
+        await engine.store.enqueue_message(
+            channel_id="IB_A", raw=ADT_A, deliveries=[], message_type="ADT^A01", control_id=f"M{n}"
+        )
+        for n in range(6)
+    ]
+    real = engine.store.get_message
+
+    async def slow(message_id: str) -> Any:
+        await asyncio.sleep(0.15)
+        return await real(message_id)
+
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        monkeypatch.setattr(engine.store, "get_message", slow)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
+    assert r.status_code == 200, r.text
+    assert [row["id"] for row in _ndjson(r.text)] == ids
+    assert await _stop_rows(engine) == []
+    assert await service.identity_for_token(token, activity=False) is not None

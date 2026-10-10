@@ -5701,19 +5701,30 @@ def create_app(
         # the caller from this token before every row (BACKLOG #1154).
         auth = get_auth(request)
         token = bearer_token(request) if auth is not None else None
+        touch_every = auth.session_idle_seconds / 4 if auth is not None else 0.0
 
         async def _iter_ndjson() -> AsyncIterator[bytes]:
             streamed = 0
+            last_touch = time.monotonic()
             for mid in selected:
                 # Re-resolve the caller before EVERY row (BACKLOG #1154, ASVS 8.3.2). The gate
                 # resolved it once, and an export can run to 100,000 bodies, so a session revoked or
                 # a permission withdrawn mid-export would otherwise not reach it. Not the step-up:
-                # that proved the person when the export started.
+                # that proved the person when the export started. The download is the caller's own
+                # act, so it moves the idle clock every quarter of the idle window; without that, an
+                # export longer than the idle timeout would end its own session partway.
+                touch = time.monotonic() - last_touch >= touch_every
+                if touch:
+                    last_touch = time.monotonic()
                 current = (
                     identity
                     if auth is None
                     else await recheck_standing(
-                        auth, token, Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW
+                        auth,
+                        token,
+                        Permission.MESSAGES_EXPORT,
+                        Permission.MESSAGES_VIEW_RAW,
+                        activity=touch,
                     )
                 )
                 if current is None:
