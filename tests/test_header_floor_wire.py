@@ -36,6 +36,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import httptools
 import pytest
 import uvicorn
 import websockets as websockets_package
@@ -58,6 +59,7 @@ from messagefoundry.api.protocol_headers import (
     ProtocolFloorUnavailable,
     floored_http_protocol_class,
     floored_ws_protocol_class,
+    http_parser_in_force,
 )
 from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 from messagefoundry.config.settings import EgressSettings
@@ -1140,11 +1142,70 @@ def test_serve_hands_uvicorn_the_floored_protocols(
     assert created, "serve created nothing, so the refusal's empty set would prove nothing"
 
 
+def test_serve_pins_httptools_where_auto_would_pick_h11(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1125: ``serve`` names its parser, so an install where ``http="auto"`` resolves to
+    h11 still serves llhttp, and the startup read-out names the parser actually served."""
+    monkeypatch.setattr("uvicorn.protocols.http.auto.AutoHTTPProtocol", H11Protocol)
+
+    # On the named logger itself: serve's configure_logging replaces the root handlers caplog uses.
+    # Serve's handlers redact the same record object after this one stores it, so reading it at the
+    # end checks the line an operator reads (an all-caps word pair once came out "[redacted]").
+    class _Keep(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(logging.INFO)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    handler = _Keep()
+    main_logger = logging.getLogger("messagefoundry.__main__")
+    main_logger.addHandler(handler)
+    try:
+        rc, captured, _ = _serve_captured(tmp_path, monkeypatch)
+    finally:
+        main_logger.removeHandler(handler)
+    assert rc == 0
+    assert issubclass(captured["http"], HttpToolsProtocol)
+    assert not issubclass(captured["http"], H11Protocol)
+    readouts = [
+        r.getMessage()
+        for r in handler.records
+        if r.getMessage().startswith("HTTP request parser in force on the API:")
+    ]
+    assert readouts == [
+        f"HTTP request parser in force on the API: httptools {httptools.__version__} (llhttp)"
+    ], readouts
+
+
+def test_serve_refuses_to_start_without_the_pinned_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No quiet fall back to h11: a missing httptools stops serve before any side effect."""
+    monkeypatch.setitem(sys.modules, "uvicorn.protocols.http.httptools_impl", None)
+    rc, captured, created = _serve_captured(tmp_path, monkeypatch)
+    assert rc == 2
+    assert captured == {}, "uvicorn.run was reached"
+    assert created == set(), f"serve refused only after a side effect: {created}"
+    err = capsys.readouterr().err
+    assert "pinned HTTP parser (BACKLOG #1125)" in err and "refusing to start." in err, err
+
+
+def test_the_parser_readout_names_the_class_chain() -> None:
+    assert http_parser_in_force(floored_http_protocol_class()).startswith("httptools ")
+    shimmed = client_cert_http_protocol_class(base=floored_http_protocol_class())
+    assert http_parser_in_force(shimmed).startswith("httptools ")
+    assert http_parser_in_force(floored_http_protocol_class(base=H11Protocol)).startswith("h11 ")
+    assert http_parser_in_force(asyncio.Protocol) == "unrecognised (asyncio.protocols.Protocol)"
+
+
 def test_serve_refuses_to_start_when_uvicorn_lacks_a_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
-        "uvicorn.protocols.http.auto.AutoHTTPProtocol",
+        "uvicorn.protocols.http.httptools_impl.HttpToolsProtocol",
         _fake_http(monkeypatch, "send_400_response"),
     )
     rc, captured, created = _serve_captured(tmp_path, monkeypatch)
@@ -1166,7 +1227,7 @@ def test_supervise_refuses_the_fleet_before_spawning_or_renewing(
 
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
     monkeypatch.setattr(
-        "uvicorn.protocols.http.auto.AutoHTTPProtocol",
+        "uvicorn.protocols.http.httptools_impl.HttpToolsProtocol",
         _fake_http(monkeypatch, "send_400_response"),
     )
     rc, _, created = _serve_captured(tmp_path, monkeypatch, command="supervise")

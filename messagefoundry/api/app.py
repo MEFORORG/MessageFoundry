@@ -3074,9 +3074,10 @@ def create_app(
         length = request.headers.get("content-length")
         transfer_encoding = request.headers.get("transfer-encoding", "").lower()
         # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
-        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector. Our single h11
-        # parser doesn't desync on the default loopback bind, but reject it outright so a future front
-        # proxy can never disagree with us about where the message ends (ASVS 4.2.1).
+        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector (ASVS 4.2.1). Under
+        # serve the pinned llhttp parser refuses the pair with its own 400 before this runs (BACKLOG
+        # #1125, protocol_headers.pinned_http_protocol_base). This check covers any other server that
+        # hosts the app: h11, for one, frames the pair by Transfer-Encoding and passes it on.
         if length is not None and "chunked" in transfer_encoding:
             _log.warning(
                 "rejected request with both Content-Length and Transfer-Encoding on %s from %s",

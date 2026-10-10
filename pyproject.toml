@@ -110,7 +110,7 @@ dependencies = [
     # reload, no env_file and log_config=None, so none of the four is ever imported. The three the
     # engine does use are declared below with the extra's own markers.
     "uvicorn>=0.29,<0.55",
-    # The HTTP protocol ``http="auto"`` picks when installed. protocol_headers.py floors both it and h11.
+    # The API's HTTP parser (llhttp). serve pins it and refuses to start without it (BACKLOG #1125).
     "httptools>=0.8.0",
     # The library behind both WebSocket protocols protocol_headers.py floors: the sans-I/O one
     # ``ws="auto"`` resolves to from uvicorn 0.50, and the legacy server before it. /ws/stats runs on
