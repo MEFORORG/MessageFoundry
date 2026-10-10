@@ -1328,7 +1328,7 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
   above are refused with the generic `refused` code, and nothing is written.
 - **Also under the flag**, a move or delete that breaks the structure rule below is refused
   (Manager decision 2026-10-07, after adversarial review, part of the R1 fix). G.7, "What still
-  differs at `main`", names the one case the code still accepts.
+  differs at `main`", records the one case the code accepted and the tests that now pin it.
 - Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
   analyst build always sets the flag and offers no way to turn it off.
 
@@ -1385,6 +1385,44 @@ invariant rather than a property of the moved row):
    guard, a filter or a raise would run on every message. A typed row never moves below a typed
    `return` or `raise` in its suite, where it would never run. A row never moves past the fan-out
    `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07, after review).
+   Every typed-only edit keeps each row able to run, whichever verb places it: a move, an
+   `insert_row`, or a raise, filter or send `template` (Manager decision 2026-10-08, after review).
+   A row never runs below a statement that never falls through. One predicate,
+   `_is_terminal` in `messagefoundry/lens.py`, decides that for every edit (Manager decision
+   2026-10-08, after review). Its docstring lists at least the shapes it counts; a shape it cannot
+   decide falls through, which keeps the rule permissive. The rule refuses an edit only when it
+   makes reachability worse: a row that ran before and never runs after, or a row the edit wrote
+   that never runs (same decision). Each row is compared with itself. The lens reads which row is
+   which from the edit, never from the row's text: a line the edit carried over is the same row, a
+   moved or rewritten row is itself in its new place, and any other row is one the edit wrote
+   (repair of 2026-10-08, after the Lander's fourth review of PR 2201). So an edit to a row
+   already dead, or to a row with a twin of the same text anywhere in the handler, is accepted, and
+   a row may move out of a dead block. A dead `pass` seed does not count.
+
+   A row has one of four levels, and a `with` is what separates them, because a context manager
+   may swallow an exception and let control fall through:
+
+   - it runs;
+   - it might not run: it sits below a `with` whose body ends after an earlier statement, which
+     may raise;
+   - it is counted as never running: it sits below a `with` whose first body statement is a
+     `return`, `break` or `continue`, or another such `with`. Working out the returned value, or
+     entering an inner manager, could still raise, so the row could run;
+   - it surely never runs. For a `with`, that needs one context manager, with no `as` target or
+     a plain name. Its first body statement must be a `break`, a `continue`, or a `return` of
+     nothing or a constant. Any other target can raise inside the `with` when it is bound: a
+     tuple unpacks, and an attribute or an item is set. A returned name can raise too, when it
+     is unbound (repair of 2026-10-09, after the Lander's fifth review).
+
+   A row inside a block takes the block's level, and two suites are deader than their block: a
+   `try`'s `else` runs only when the body reaches its end, and the `else` of a `while True:`
+   never runs. A row the edit kept, moved or rewrote is refused when its level gets worse by any
+   step. Only a row that surely never ran is exempt, wherever a move puts it. A row the edit
+   wrote is refused at the last two levels. A row written where it might not run is accepted,
+   since it is as live as the rows already there (repair of 2026-10-08). The Manager holding the
+   PR confirmed the levels on 2026-10-09. A kept row is refused when its level gets worse. A
+   written row is accepted at "might not run" and refused at "counted dead" and "surely dead".
+   The default mode applies none of this rule (Manager decision 2026-10-08; AC-G7).
 
 A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
 block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
@@ -1498,17 +1536,66 @@ corrects that table's row 5. `set_params` on action, lookup and diagnostic rows 
 `dynamic` value (AC-M5).
 
 **What still differs at `main`.** Each row of that table was re-measured on 2026-10-08 against
-`rewrite_source` at `main` (`8e5f429732`). One difference remains beyond the recorded limits:
+`rewrite_source` at `main` (`8e5f429732`). One difference remained beyond the recorded limits. It
+is closed for the cases its tests pin:
 
-- **A row moved below a typed `return` or `raise` is accepted, in both modes.** G.6 rule 8 refuses
-  it, so the rule is stricter and governs. Take a handler whose `if` guard ends in `return
-  Send("OB", msg)` and whose body ends in `return Send("OB2", msg)`. A `move_row` that swaps a
-  `msg.set(...)` row below the last `return`, or drops a row after either `return`, is accepted
-  with `typed_only=True`. So is a swap below a closing `raise ValueError("x")`. The row would then
-  never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or `raise` on its
-  own suite path. Apart from the fan-out `return sends`, which
-  `test_finding_9_the_scaffold_itself_still_holds` guards, nothing checks what lands after one. No
-  test on `main` pins this case.
+- **Closed 2026-10-08 for the pinned cases: a row moved below a typed `return` or `raise` was
+  accepted, in both modes.** G.6 rule 8 refuses it, so the rule is stricter and governs. Take a
+  handler whose `if` guard ends in `return Send("OB", msg)` and whose body ends in `return
+  Send("OB2", msg)`. A `move_row` that swapped a `msg.set(...)` row below the last `return`, or
+  dropped a row after either `return`, was accepted with `typed_only=True`. So was a swap below a
+  closing `raise ValueError("x")`. The row would then never run. `_refuse_shifted_code` in `messagefoundry/lens.py` keeps a `return` or
+  `raise` on its own suite path. Apart from the fan-out `return sends`, which
+  `test_finding_9_the_scaffold_itself_still_holds` guards, nothing checked what lands after one.
+  `_refuse_rows_that_never_run` in `messagefoundry/lens.py` now refuses it in typed-only mode, for
+  any edit, under rule 8 as amended on 2026-10-08. The default mode still accepts it, as G.6 scopes
+  the rule. `tests/test_lens_typed_only_repair.py` pins at least these cases:
+  - the moves above, and a `return` moved up past a row;
+  - a row moved below an `if` and `else` whose arms both end;
+  - an insert after the last `return`, after a `with` that returns, and a filter, raise or send
+    template above a row;
+  - `test_rule_8_never_falls_through`, which pins at least one case of each shape `_is_terminal`
+    decides, and a falls-through case for most;
+  - an edit to a dead row, and an edit, delete or move of a live row with a dead twin, accepted;
+  - below a `with` that may swallow an exception: an insert, accepted, and a row moved from there
+    to below a `return`, refused;
+  - a live row inserted below a dead row of the same text, the first of two dead rows of the same
+    text deleted, and a dead row edited to the text of the dead row below it, all accepted;
+  - a dead row moved to another dead place, and a block moved with a dead row inside it, both
+    accepted;
+  - `test_rule_8_identity_of_a_move_and_of_a_rewritten_row`, which reads the row identity
+    directly in a handler whose rows all have the same text.
+
+  So in typed-only mode a typed `return` or `raise` cannot move up past a row that would then never
+  run. At least these limits remain:
+  - a shape `_is_terminal` does not decide is judged to fall through, so a row placed after it is
+    not caught. Examples are a `with` whose body ends in `raise`, which a context manager may
+    swallow, a `match` that is exhaustive but has no irrefutable last case, and a call that never
+    returns;
+  - a `with` whose first body statement is a `return` counts as never falling through. Working out
+    the returned value could raise, and the context manager could swallow that, so a row below it
+    could run. An insert there is refused all the same. A row already there is not exempt, so it
+    cannot move below a `return`;
+  - only a `with` separates the levels. A `return` of a constant is taken not to raise, and a
+    `try` whose handlers all end is taken to end;
+  - the lens does not know which context managers swallow exceptions, so it treats every one as
+    if it might. Take `with LOCK:` whose body is a statement and then `return Send(...)`, where
+    `LOCK` swallows nothing. A row below it never runs. The lens rates that place "might not
+    run", so an inserted row or a send template there is accepted and never runs. That is the
+    levels rule working as stated, and it is a recorded limit;
+  - a check that runs out of stack on deeply nested blocks refuses the edit in typed-only mode.
+    The rule 8 walk takes a long `elif` chain in a loop, and a 300-arm chain is pinned. Past
+    about 490 arms `parse_source` itself raises RecursionError, in both modes, as on `main`;
+  - a `return` moved below another `return` of the same text is refused as itself, because it ran
+    and would not. Moving the rows between them up gives the same text and is accepted;
+  - row identity is exact for a `set_params`, a delete, a move and an insert at its anchor row.
+    Where the lens picks the place itself, as for a send added to the fan-out, a new line beside
+    lines of the same text may be taken for one of them. Those lines sit in one suite. The lens
+    works identity out from the edit after the op has run; the ops do not yet report the lines
+    they wrote, and `_move_site` reads a move the way `_apply_move_row` does, so the two must
+    change together;
+  - a send cannot be added in typed-only mode to a handler that ends in `raise`, because the
+    fan-out's `return sends` would land below it and never run.
 
 The recorded limits, which are not reconciled:
 
@@ -1526,7 +1613,7 @@ Three rows of the table are not open differences:
   show it.
 - Row 5, `occurrence=OCC`, was never a difference: G.7 refuses it too.
 
-Row 2 is the open difference above, and row 3 is the second recorded limit.
+Row 2 is the closed difference above, and row 3 is the second recorded limit.
 
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
 reaches module state by a route the source does not spell out can still defeat it. These remain, at
@@ -1581,13 +1668,14 @@ change landed in PR 2155.
   structure rule of G.6, THEN THE SYSTEM SHALL refuse it with the generic `refused` code and write
   nothing. R1 payloads 1 and 2 (G.5) are refusal tests, and so is a row using `occurrence=i`
   moved out of its For Each loop (G.6 rule 6). The R1 fix's tests landed in PR 2155, in
-  `tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py`. G.7, "What
-  still differs at `main`", names a structure-rule case the code still accepts.
+  `tests/test_lens_no_code_injection.py` and `tests/test_lens_typed_only_repair.py`. The same holds
+  for an edit that leaves a row unable to run (G.6 rule 8), in at least the cases G.7, "What still
+  differs at `main`", lists, and with the limits it records.
 - [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
   `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
   mode. Among those, a raw `test` SHALL be one condition on one line, with no `yield` and no `await`
   outside an `async def` element. THE SYSTEM SHALL accept every typed `template` edit in either mode,
-  subject to G.7.
+  subject to G.7 and, in typed-only mode, to G.6 rule 8.
 - [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite`
   call.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`

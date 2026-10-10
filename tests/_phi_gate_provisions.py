@@ -109,6 +109,14 @@ RETENTION_WINDOWS_ENV: dict[str, str] = {
 }
 
 
+def setenv_declared_egress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Satisfy the open-egress gate alone, the way :data:`PHI_GATE_PROVISIONS_ENV` does. For a
+    ``supervise`` fixture that provisions nothing else: the supervisor runs that gate before it
+    installs its log forwarder (BACKLOG #2356)."""
+    name = "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND"
+    monkeypatch.setenv(name, PHI_GATE_PROVISIONS_ENV[name])
+
+
 def setenv_retention_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set :data:`RETENTION_WINDOWS_ENV` on the environment for one test."""
     for name, value in RETENTION_WINDOWS_ENV.items():
@@ -216,18 +224,26 @@ def make_syslog_ca_and_crl(dir_path: Path) -> str:
 _SYSLOG_CLIENT_PEM = "syslog_client.pem"
 
 
-def verified_log_forwarding_env(bundle: str) -> dict[str, str]:
-    """The environment that satisfies the #1966 gate, given a CA+CRL bundle path."""
+def verified_log_forwarding_env(bundle: str, host: str | None = None) -> dict[str, str]:
+    """The environment that satisfies the #1966 gate and lists its collector in
+    ``[egress].allowed_syslog``, given a CA+CRL bundle path. ``host`` replaces the collector, for
+    a test that needs an IP-literal one."""
+    if host is None:
+        host = VERIFIED_LOG_FORWARDING_HOST
     return {
-        "MEFOR_LOGGING_FORWARD_HOST": VERIFIED_LOG_FORWARDING_HOST,
+        "MEFOR_LOGGING_FORWARD_HOST": host,
         "MEFOR_LOGGING_FORWARD_PROTOCOL": "tls",
         "MEFOR_LOGGING_FORWARD_TLS_CA_FILE": bundle,
         "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE": bundle,
         "MEFOR_LOGGING_FORWARD_TLS_CLIENT_CERT": str(Path(bundle).with_name(_SYSLOG_CLIENT_PEM)),
+        # BACKLOG #2356: the collector is an egress destination, refused at start unless listed.
+        "MEFOR_EGRESS_ALLOWED_SYSLOG": host,
     }
 
 
-def setenv_verified_log_forwarding(monkeypatch: pytest.MonkeyPatch, bundle: str) -> None:
+def setenv_verified_log_forwarding(
+    monkeypatch: pytest.MonkeyPatch, bundle: str, host: str | None = None
+) -> None:
     """Set :func:`verified_log_forwarding_env` on the environment for one test."""
-    for name, value in verified_log_forwarding_env(bundle).items():
+    for name, value in verified_log_forwarding_env(bundle, host).items():
         monkeypatch.setenv(name, value)

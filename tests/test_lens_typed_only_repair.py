@@ -10,14 +10,17 @@ findings are numbered as the review numbers them; S-4 is spike S-4's review of t
 from __future__ import annotations
 
 import ast
+import itertools
 from typing import Any
 
 import pytest
 
+from messagefoundry import lens
 from messagefoundry.lens import LensRewriteError, rewrite_source
 
 TYPED_ONLY = "typed-only mode"
 REFUSED = "not a value a Steps edit may write"
+NEVER_RUNS = "never runs"
 
 
 def _edit(op: str, line: int, **extra: Any) -> dict[str, Any]:
@@ -507,10 +510,17 @@ def test_r2_findings_1_and_6_typed_only_keeps_guards_and_code_blocks(edit: dict[
     _refused(_GUARD, edit, typed_only=True)
 
 
-def test_r2_finding_1_control_a_raise_still_reorders_inside_its_guard() -> None:
+def test_r2_finding_1_a_raise_reordered_up_its_guard_strands_the_row_it_passes() -> None:
+    # Once a control; G.6 rule 8 now refuses it in typed-only mode (Manager decision 2026-10-08).
     edit = _edit("move_row", 6, direction="up")
+    assert rewrite_source(_GUARD, edit) != _GUARD
+    _refused(_GUARD, edit, match=NEVER_RUNS, typed_only=True)
+
+
+def test_r2_finding_1_control_a_row_still_moves_in_above_a_guarded_raise() -> None:
+    edit = _edit("move_row", 3, to_line_start=6, to_position="before")
     out = rewrite_source(_GUARD, edit, typed_only=True)
-    assert out.index('raise ValueError("bad")') < out.index('msg.set("B", "2")')
+    assert '        msg.set("A", "1")\n        raise ValueError("bad")\n' in out
 
 
 _COMP = """\
@@ -1601,3 +1611,672 @@ def test_r15_the_handler_s_own_one_based_loop_still_admits_its_index() -> None:
         params={"path": "OBX-3", "value": "x", "occurrence": {"expr": "i"}},
     )
     assert "occurrence=i" in rewrite_source(src, edit)
+
+
+# --- G.6 rule 8: a row that never runs (Lander review of PR 2201) ------------------------------
+
+_TERMINAL = """\
+@handler("H")
+def h(msg):
+    if msg.field("PID-3"):
+        msg.set("A", "1")
+        return Send("OB", msg)
+    msg.set("B", "2")
+    return Send("OB2", msg)
+"""
+
+_RAISE = """\
+@handler("H")
+def h(msg):
+    msg.set("B", "2")
+    raise ValueError("x")
+"""
+
+_EITHER = """\
+@handler("H")
+def h(msg):
+    msg.set("B", "2")
+    if msg.field("PID-3"):
+        return Send("OB", msg)
+    else:
+        raise ValueError("x")
+"""
+
+_SET_PID8 = {"action": "set_field", "params": {"path": "PID-8", "value": "M"}}
+
+
+@pytest.mark.parametrize(
+    ("src", "edit"),
+    [
+        (_TERMINAL, _edit("move_row", 6, direction="down")),  # swapped below the last return
+        (
+            _TERMINAL,
+            _edit("move_row", 6, to_line_start=5, to_position="after"),
+        ),  # after the guard's
+        (_TERMINAL, _edit("move_row", 4, to_line_start=7, to_position="after")),  # after the last
+        (_TERMINAL, _edit("move_row", 7, direction="up")),  # the return lifted above a row
+        (_RAISE, _edit("move_row", 3, direction="down")),  # swapped below a raise
+        (_EITHER, _edit("move_row", 3, to_line_start=7, to_position="after")),  # finding 1
+        # Finding 2: an insert or template that strands a row, or lands where it never runs.
+        (_TERMINAL, _edit("insert_row", 7, position="after", **_SET_PID8)),
+        (_TERMINAL, _edit("template", 6, position="before", template="filter")),
+        (_TERMINAL, _edit("template", 6, position="before", template="raise", message="x")),
+        (_TERMINAL, _edit("template", 6, position="before", template="send", destination="OB3")),
+    ],
+    ids=[
+        "swap-return",
+        "drop-guard-return",
+        "drop-last-return",
+        "return-up",
+        "swap-raise",
+        "below-if-else",
+        "insert-after-return",
+        "filter",
+        "raise",
+        "send",
+    ],
+)
+def test_rule_8_typed_only_refuses_a_row_that_never_runs(src: str, edit: dict[str, Any]) -> None:
+    # G.6 scopes the rule to typed-only mode, so the default mode accepts the edit (decision D1).
+    assert rewrite_source(src, edit) != src
+    _refused(src, edit, match=NEVER_RUNS, typed_only=True)
+
+
+_GUARD_ONLY = _TERMINAL.replace('        return Send("OB", msg)\n', "        pass\n")
+
+
+@pytest.mark.parametrize(
+    ("src", "edit", "expect"),
+    [
+        # A guarded return's block moves past a row; nothing lands below a terminal.
+        (_TERMINAL, _edit("move_row", 3, direction="down"), '    msg.set("B", "2")\n    if msg'),
+        # Into the guard, above its return.
+        (
+            _TERMINAL,
+            _edit("move_row", 6, to_line_start=5, to_position="before"),
+            '        msg.set("B", "2")\n        return Send("OB", msg)\n',
+        ),
+        # An insert above the last return.
+        (
+            _TERMINAL,
+            _edit("insert_row", 7, position="before", **_SET_PID8),
+            '    msg.set("PID-8", "M")\n    return Send("OB2", msg)\n',
+        ),
+        # A filter above the generator's ``pass`` seed: a dead ``pass`` strands no row.
+        (
+            _GUARD_ONLY,
+            _edit("template", 5, position="before", template="filter"),
+            "        return []\n        pass\n",
+        ),
+    ],
+    ids=["guard-block-down", "into-guard", "insert-above-return", "filter-above-pass"],
+)
+def test_rule_8_control_typed_only_accepts_an_edit_that_strands_nothing(
+    src: str, edit: dict[str, Any], expect: str
+) -> None:
+    assert expect in rewrite_source(src, edit, typed_only=True)
+
+
+_DEAD_BLOCK = (
+    _TERMINAL + '    if msg.field("PID-9"):\n        msg.set("C", "3")\n        msg.set("D", "4")\n'
+)
+
+
+def test_rule_8_a_row_moved_out_of_a_dead_block_is_accepted() -> None:
+    # Finding 4: the row starts inside a block below the last return, and moves where it runs.
+    edit = _edit("move_row", 9, to_line_start=6, to_position="before")
+    out = rewrite_source(_DEAD_BLOCK, edit, typed_only=True)
+    assert out.index('msg.set("C", "3")') < out.index('msg.set("B", "2")')
+
+
+def test_rule_8_code_already_dead_does_not_block_another_edit() -> None:
+    edit = _edit("move_row", 6, to_line_start=5, to_position="before")
+    out = rewrite_source(_DEAD_BLOCK, edit, typed_only=True)
+    assert '        msg.set("B", "2")\n        return Send("OB", msg)\n' in out
+
+
+def _handler(body: str) -> Any:
+    return ast.parse(f"def h(msg):\n{body}").body[0]
+
+
+def _never_run(before: Any, after: Any, same: dict[int, int], refusal: LensRewriteError) -> None:
+    lens._refuse_rows_that_never_run(
+        lens._reachability(before), lens._reachability(after), same, refusal
+    )
+
+
+def _level(body: str) -> int:
+    """How surely the ``f()`` row of ``body`` never runs, as ``lens._reachability`` sees it."""
+    key = ast.dump(ast.parse("f()").body[0])
+    (level,) = (lvl for stmt, lvl in lens._reachability(_handler(body)) if ast.dump(stmt) == key)
+    return level
+
+
+def test_rule_8_a_dead_copy_cannot_stand_in_for_a_live_row() -> None:
+    # Review 2 finding 3, at the function level: the same text is dead once before and once after,
+    # but the row that ran is the one now dead. ``same`` names each row, so text cannot stand in.
+    before = _handler(
+        '    if msg.field("A"):\n        msg.set("X", "1")\n    return Send("OB", msg)\n'
+        '    msg.set("X", "1")\n'
+    )
+    after = _handler(
+        '    if msg.field("A"):\n        return Send("OB", msg)\n        msg.set("X", "1")\n'
+        '    msg.set("X", "1")\n'
+    )
+    # Statements in source order. Before: if, X, return, X. After: if, return, X, X.
+    same = {0: 0, 1: 2, 2: 1, 3: 3}
+    with pytest.raises(LensRewriteError, match="stranded"):
+        _never_run(before, after, same, LensRewriteError("stranded"))
+    # Control: every row is itself and nothing moved, so the dead row below the return is no bar.
+    _never_run(before, before, {i: i for i in range(4)}, LensRewriteError("stranded"))
+
+
+@pytest.mark.parametrize(
+    ("body", "dead"),
+    [
+        ("    for x in y:\n        continue\n        f()\n", True),
+        ("    for x in y:\n        break\n        f()\n", True),
+        ("    while True:\n        g()\n    f()\n", True),
+        ("    while True:\n        if g():\n            break\n    f()\n", False),
+        ("    while True:\n        for x in y:\n            break\n    f()\n", True),
+        ("    for x in y:\n        return 1\n    f()\n", False),  # the loop may not run
+        ("    for x in y:\n        g()\n    else:\n        return 1\n    f()\n", True),
+        ("    for x in y:\n        break\n    else:\n        return 1\n    f()\n", False),
+        ("    while g():\n        h()\n    else:\n        raise E\n    f()\n", True),
+        ("    with c:\n        return 1\n    f()\n", True),  # a context manager cannot swallow it
+        ("    with c:\n        raise E\n    f()\n", False),  # but it may swallow an exception
+        ("    try:\n        return 1\n    except E:\n        raise\n    f()\n", True),
+        ("    try:\n        return 1\n    except E:\n        g()\n    f()\n", False),
+        (
+            "    try:\n        g()\n    except E:\n        return 2\n    else:\n        return 1\n    f()\n",
+            True,
+        ),
+        ("    try:\n        g()\n    finally:\n        return 1\n    f()\n", True),
+        (
+            "    match x:\n        case 1:\n            return 1\n        case _:\n            return 2\n    f()\n",
+            True,
+        ),
+        (
+            "    match x:\n        case 1:\n            return 1\n        case 2:\n            return 2\n    f()\n",
+            False,
+        ),
+        (
+            "    match x:\n        case 1:\n            return 1\n        case y:\n            g()\n    f()\n",
+            False,
+        ),
+        ("    if a:\n        return 1\n    f()\n", False),  # no else
+        (
+            "    if a:\n        return 1\n    elif b:\n        raise E\n    else:\n        return 2\n    f()\n",
+            True,
+        ),
+    ],
+    ids=[
+        "continue",
+        "break",
+        "while-true",
+        "while-true-break",
+        "inner-break",
+        "for",
+        "for-else",
+        "for-else-break",
+        "while-else",
+        "with-return",
+        "with-raise",
+        "try",
+        "try-handler-falls",
+        "try-else",
+        "try-finally",
+        "match-wildcard",
+        "match-refutable",
+        "match-arm-falls",
+        "if-no-else",
+        "if-elif-else",
+    ],
+)
+def test_rule_8_never_falls_through(body: str, dead: bool) -> None:
+    # Findings 1 and 5, decisions D3 and D7: ``f()`` is dead exactly when control cannot reach it.
+    assert _level(body) == (lens._DEAD if dead else lens._LIVE)
+
+
+@pytest.mark.parametrize(
+    ("body", "level"),
+    [
+        # Review 4: an earlier body statement may raise and the manager may swallow it.
+        ("    with c:\n        g()\n        return 1\n    f()\n", lens._MAYBE_DEAD),
+        (
+            "    with c:\n        if a:\n            return 1\n        else:\n            return 2\n    f()\n",
+            lens._MAYBE_DEAD,
+        ),
+        # Review of 19e20ebbd6: these could still raise inside the ``with``, so they only count.
+        ("    with c:\n        with d:\n            return 1\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c, d:\n        return 1\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c:\n        return g()\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c:\n        return x\n    f()\n", lens._COUNTED_DEAD),
+        ("    with c:\n        return None\n    f()\n", lens._DEAD),
+        ("    with c:\n        g()\n        return 1\n    return 2\n    f()\n", lens._DEAD),
+        # A suite can be deader than its block: a ``try``'s ``else``, and a ``while True``'s.
+        (
+            "    try:\n        return 1\n    except E:\n        g()\n    else:\n        f()\n",
+            lens._DEAD,
+        ),
+        ("    try:\n        return 1\n    except E:\n        f()\n", lens._LIVE),
+        ("    try:\n        return 1\n    finally:\n        f()\n", lens._LIVE),
+        (
+            "    try:\n        g()\n    except E:\n        return 1\n    else:\n        f()\n",
+            lens._LIVE,
+        ),
+        ("    while True:\n        g()\n    else:\n        f()\n", lens._DEAD),
+        ("    while g():\n        h()\n    else:\n        f()\n", lens._LIVE),
+        ("    if a:\n        return 1\n    else:\n        f()\n", lens._LIVE),
+    ],
+    ids=[
+        "with-statement-then-return",
+        "with-if-else",
+        "with-with-return",
+        "with-two-managers",
+        "with-return-call",
+        "with-return-name",
+        "with-return-none",
+        "return-below-with",
+        "try-else-below-return",
+        "try-handler",
+        "try-finally",
+        "try-else-live",
+        "while-true-else",
+        "while-else",
+        "if-else",
+    ],
+)
+def test_rule_8_levels_of_a_with_and_of_a_suite(body: str, level: int) -> None:
+    assert _level(body) == level
+
+
+_LIVE_TWIN = """\
+@handler("H")
+def h(msg):
+    msg.set("A", "1")
+    msg.set("B", "2")
+    return Send("OB", msg)
+    msg.set("A", "1")
+"""
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        # Decision D8: an edit to a dead row strands nothing, so it is accepted.
+        _edit("set_params", 6, params={"value": "9"}),
+        # An edit, delete or move of a live row with a dead twin of the same text.
+        _edit("set_params", 3, params={"value": "9"}),
+        _edit("delete_row", 3),
+        _edit("move_row", 3, direction="down"),
+    ],
+    ids=["set-dead-row", "set-live-twin", "delete-live-twin", "move-live-twin"],
+)
+def test_rule_8_an_edit_that_strands_nothing_new_is_accepted(edit: dict[str, Any]) -> None:
+    assert rewrite_source(_LIVE_TWIN, edit, typed_only=True) != _LIVE_TWIN
+
+
+def test_rule_8_a_row_moved_into_the_dead_twin_s_place_is_refused() -> None:
+    # The live twin dropped after the return lands dead, even though the same text was dead before.
+    edit = _edit("move_row", 3, to_line_start=6, to_position="after")
+    _refused(_LIVE_TWIN, edit, match=NEVER_RUNS, typed_only=True)
+
+
+_WITH = """@handler("H")
+def h(msg):
+    with lock:
+        return Send("OB", msg)
+    msg.set("C", "3")
+"""
+
+
+@pytest.mark.parametrize(
+    "body", ['return Send("OB", msg)', "pass"], ids=["returns", "falls-through"]
+)
+def test_rule_8_an_insert_after_a_with_follows_its_body(body: str) -> None:
+    # D7: a ``with`` whose body returns never falls through, so a row inserted after it never
+    # runs; one whose body falls through is the control.
+    src = _WITH.replace('return Send("OB", msg)', body)
+    edit = _edit("insert_row", 5, position="before", **_SET_PID8)
+    if body == "pass":
+        assert '    msg.set("PID-8", "M")\n' in rewrite_source(src, edit, typed_only=True)
+    else:
+        _refused(src, edit, match=NEVER_RUNS, typed_only=True)
+
+
+# --- Lander review 4 of PR 2201: row identity, and a ``with`` that may swallow -----------------
+
+_SWALLOW = """@handler("H")
+def h(msg):
+    with suppress(KeyError):
+        msg.set("A", "1")
+        return Send("OB", msg)
+    if msg.field("PID-3"):
+        return []
+    msg.set("B", "2")
+"""
+
+
+def test_rule_8_a_row_below_a_swallowing_with_cannot_move_below_a_return() -> None:
+    # Blocking finding 1. The row may run, when the ``with`` swallows a KeyError; below the
+    # guard's ``return []`` it never does. Head 94ac5aab36 judged it already dead and accepted.
+    edit = _edit("move_row", 8, to_line_start=7, to_position="after")
+    assert rewrite_source(_SWALLOW, edit) != _SWALLOW  # the default mode applies no rule 8
+    _refused(_SWALLOW, edit, match=NEVER_RUNS, typed_only=True)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '        return Send(ROUTES[msg.field("MSH-4")], msg)\n',
+        "        with lookup(msg) as dest:\n            return Send(dest, msg)\n",
+    ],
+    ids=["return-of-a-lookup", "inner-with"],
+)
+def test_rule_8_a_row_below_a_with_that_returns_at_once_is_not_exempt(body: str) -> None:
+    # Review of 19e20ebbd6: working out the returned value, or entering the inner manager, may
+    # raise KeyError, and ``suppress`` swallows it. So the rows below may run, and are not exempt:
+    # one may not move below the guard's return. A row may still not be written there (D7).
+    src = _SWALLOW.replace('        msg.set("A", "1")\n        return Send("OB", msg)\n', body)
+    last = len(src.splitlines())
+    move = _edit("move_row", last, to_line_start=last - 1, to_position="after")
+    assert rewrite_source(src, move) != src
+    _refused(src, move, match=NEVER_RUNS, typed_only=True)
+    _refused(src, _edit("insert_row", last, **_SET_PID8), match=NEVER_RUNS, typed_only=True)
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_rule_8_an_insert_below_a_swallowing_with_is_accepted(position: str) -> None:
+    # Blocking finding 2, case 3: the tail may run, so a row written there is as live as its
+    # neighbours. Head 94ac5aab36 refused it.
+    edit = _edit("insert_row", 8, position=position, **_SET_PID8)
+    out = rewrite_source(_SWALLOW, edit, typed_only=True)
+    assert out == rewrite_source(_SWALLOW, edit)
+    assert '    msg.set("PID-8", "M")\n' in out
+
+
+def test_rule_8_a_kept_row_may_not_run_less_surely_than_it_did() -> None:
+    # The four levels, at the function level. ``f()`` is the last statement of each body and the
+    # only row whose level differs, so each verdict below is about ``f()`` alone.
+    bodies = [
+        "    g()\n    f()\n",  # runs
+        "    with c:\n        g()\n        return 1\n    f()\n",  # might not run
+        "    with c:\n        return g()\n    f()\n",  # counted as never running
+        "    return 1\n    f()\n",  # surely never runs
+    ]
+    funcs = [_handler(body) for body in bodies]
+    last = [len(lens._reachability(func)) - 1 for func in funcs]
+    assert [_level(body) for body in bodies] == [0, 1, 2, 3]
+    stranded = LensRewriteError("stranded")
+    for was, now in itertools.product(range(4), repeat=2):
+        # A kept row: refused exactly when its level got worse, by any step.
+        kept = {last[now]: last[was]}
+        if now > was:
+            with pytest.raises(LensRewriteError, match="stranded"):
+                _never_run(funcs[was], funcs[now], kept, stranded)
+        else:
+            _never_run(funcs[was], funcs[now], kept, stranded)
+    for now in range(4):
+        # A row the edit wrote: refused where it never runs, accepted where it might.
+        if now >= lens._COUNTED_DEAD:
+            with pytest.raises(LensRewriteError, match="stranded"):
+                _never_run(funcs[0], funcs[now], {}, stranded)
+        else:
+            _never_run(funcs[0], funcs[now], {}, stranded)
+
+
+_DEAD_ABOVE = """@handler("H")
+def h(msg):
+    if msg.field("PID-3"):
+        return []
+        msg.set("PID-8", "M")
+    msg.set("B", "2")
+    if msg.field("PID-5"):
+        return []
+"""
+
+_TWO_DEAD = """@handler("H")
+def h(msg):
+    return Send("OB", msg)
+    msg.set("A", "1")
+    return Send("OB", msg)
+    msg.set("A", "1")
+"""
+
+_DEAD_PAIR = """@handler("H")
+def h(msg):
+    return Send("OB", msg)
+    msg.set("A", "1")
+    msg.set("A", "9")
+"""
+
+
+@pytest.mark.parametrize(
+    ("src", "edit", "expect"),
+    [
+        # Case 1: a live row written below a dead row of the same text.
+        (
+            _DEAD_ABOVE,
+            _edit("insert_row", 6, position="before", **_SET_PID8),
+            '        msg.set("PID-8", "M")\n    msg.set("PID-8", "M")\n    msg.set("B", "2")\n',
+        ),
+        # Case 2: the first of two dead rows of the same text is deleted.
+        (
+            _TWO_DEAD,
+            _edit("delete_row", 4),
+            '    return Send("OB", msg)\n    return Send("OB", msg)\n    msg.set("A", "1")\n',
+        ),
+        # Case 4: a dead row is edited to the text of the dead row below it.
+        (
+            _DEAD_PAIR,
+            _edit("set_params", 4, params={"value": "9"}),
+            '    msg.set("A", "9")\n    msg.set("A", "9")\n',
+        ),
+    ],
+    ids=["insert-below-dead-twin", "delete-first-dead-twin", "set-dead-row-to-its-twin"],
+)
+def test_rule_8_a_twin_that_is_not_the_row_does_not_refuse_the_edit(
+    src: str, edit: dict[str, Any], expect: str
+) -> None:
+    # Blocking finding 2: each row is compared with itself, wherever a row of the same text sits.
+    # Head 94ac5aab36 aligned rows by text and refused all three.
+    out = rewrite_source(src, edit, typed_only=True)
+    assert expect in out
+    assert out == rewrite_source(src, edit)  # and it is the edit the default mode makes
+
+
+def test_rule_8_a_return_dropped_below_its_twin_is_refused_as_itself() -> None:
+    # Exact identity cuts both ways: the first ``return`` ran and would not, so the move is
+    # refused, although moving the row between them up instead gives the same text (G.7 limit).
+    src = _TWO_DEAD.replace("def h(msg):\n", 'def h(msg):\n    msg.set("B", "2")\n')
+    _refused(
+        src, _edit("move_row", 4, to_line_start=6, to_position="after"), NEVER_RUNS, typed_only=True
+    )
+
+
+def test_rule_8_identity_of_a_move_and_of_a_rewritten_row() -> None:
+    # What ``_refuse_rows_that_never_run`` is given, read directly: which row each statement was.
+    # Every row of ``twins`` has the same text, so text could not tell them apart.
+    def identity(src: str, edit: dict[str, Any]) -> dict[int, int]:
+        out = rewrite_source(src, edit)
+        before, after = (
+            next(n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef))
+            for text in (src, out)
+        )
+        carried = lens._carried_lines(src, out, before, after, edit)
+        return lens._row_identity(
+            carried,
+            lens._reachability(before),
+            lens._reachability(after),
+            pair_rest=edit["op"] in ("set_params", "move_row"),
+        )
+
+    twins = '@handler("H")\ndef h(msg):\n' + '    msg.set("A", "1")\n' * 4
+    # Row 1 dropped after row 3, and row 3 moved to before row 1: each is itself where it lands.
+    drop = _edit("move_row", 4, to_line_start=6, to_position="after")
+    assert identity(twins, drop) == {0: 0, 1: 2, 2: 3, 3: 1}
+    lift = _edit("move_row", 6, to_line_start=4, to_position="before")
+    assert identity(twins, lift) == {0: 0, 1: 3, 2: 1, 3: 2}
+    assert identity(twins, _edit("move_row", 5, direction="up")) == {0: 0, 1: 2, 2: 1, 3: 3}
+    # An insert before row 2, then after it: the new statement has no entry.
+    insert = _edit(
+        "insert_row", 5, position="before", action="set_field", params={"path": "A", "value": "1"}
+    )
+    assert identity(twins, insert) == {0: 0, 1: 1, 3: 2, 4: 3}
+    assert identity(twins, {**insert, "position": "after"}) == {0: 0, 1: 1, 2: 2, 4: 3}
+    assert identity(twins, _edit("delete_row", 4)) == {0: 0, 1: 2, 2: 3}
+    rewritten = _edit("set_params", 4, params={"value": "9"})
+    assert identity(twins, rewritten) == {i: i for i in range(4)}
+    # A row moved to another depth is re-indented, and is still itself.
+    out_of_guard = _edit("move_row", 4, to_line_start=3, to_position="before")
+    assert identity(_TERMINAL, out_of_guard) == {0: 1, 1: 0, 2: 2, 3: 3, 4: 4}
+    # A moved block takes its rows with it.
+    block_down = _edit("move_row", 3, direction="down")
+    assert identity(_TERMINAL, block_down) == {0: 3, 1: 0, 2: 1, 3: 2, 4: 4}
+    # The last row moved up past a blank line: the handler then ends one line sooner (review of
+    # 19e20ebbd6, which paired these rows by their text).
+    row = '    msg.set("A", "1")\n'
+    gap = '@handler("H")\ndef h(msg):\n' + row * 2 + "\n" + row
+    assert identity(gap, _edit("move_row", 6, direction="up")) == {0: 0, 1: 2, 2: 1}
+    assert identity(gap.rstrip("\n"), _edit("move_row", 6, direction="up")) == {0: 0, 1: 2, 2: 1}
+    # A fresh fan-out writes at three places, and injects an import above the handler.
+    send = _edit("insert_send", 3, destination="OB", position="after")
+    assert identity(gap, send) == {1: 0, 3: 1, 4: 2}
+    assert rewrite_source(gap, send, typed_only=True) == rewrite_source(gap, send)
+
+
+def test_rule_8_a_row_that_never_ran_may_move_where_it_never_runs() -> None:
+    # Only a row that certainly never ran is exempt: it moves within the dead code below the last
+    # return, and a block moves with a dead row inside it. Nothing is stranded that ran.
+    dead_move = _edit("move_row", 9, direction="down")
+    out = rewrite_source(_DEAD_BLOCK, dead_move, typed_only=True)
+    assert out == rewrite_source(_DEAD_BLOCK, dead_move) != _DEAD_BLOCK
+    inner_dead = _TERMINAL.replace(
+        '        return Send("OB", msg)\n',
+        '        return Send("OB", msg)\n        msg.set("D", "4")\n',
+    )
+    out = rewrite_source(inner_dead, _edit("move_row", 3, direction="down"), typed_only=True)
+    assert out.index('msg.set("B", "2")') < out.index('msg.set("D", "4")')
+
+
+# --- Lander review 5 of PR 2201: a ``with`` target that can raise, and a deep chain -------------
+
+_TARGET = """@handler("H")
+def h(msg):
+    with {items}:
+        return None
+    if msg.field("PID-3"):
+        return []
+    msg.set("B", "2")
+"""
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        "suppress(Exception) as (a, b)",
+        "suppress(Exception) as msg.x",
+        "suppress(Exception) as d[k()]",
+        "suppress(Exception), lock as (a, b)",
+        "suppress(Exception) as [a, *b]",
+    ],
+    ids=["tuple", "attribute", "subscript", "second-item", "starred-list"],
+)
+def test_rule_8_a_with_target_that_can_raise_is_not_surely_dead(items: str) -> None:
+    # Binding the target runs inside the ``with``: unpacking, ``__setattr__`` or ``__setitem__``
+    # may raise, and the manager may swallow it. So the row below may run and is not exempt.
+    src = _TARGET.format(items=items)
+    body = src.split("def h(msg):\n")[1].replace('msg.set("B", "2")', "f()")
+    assert _level(body) == lens._COUNTED_DEAD
+    move = _edit("move_row", 7, to_line_start=6, to_position="after")
+    assert rewrite_source(src, move) != src  # the default mode applies no rule 8
+    _refused(src, move, match=NEVER_RUNS, typed_only=True)
+
+
+@pytest.mark.parametrize(
+    "items", ["lock", "lock as held", "open(p) as fh"], ids=["none", "name", "call-name"]
+)
+def test_rule_8_control_a_with_of_no_target_or_a_name_is_still_surely_dead(items: str) -> None:
+    # Control: binding a plain name cannot raise, so the row below surely never ran and is
+    # exempt, as before. It may move within the dead code.
+    src = _TARGET.format(items=items)
+    body = src.split("def h(msg):\n")[1].replace('msg.set("B", "2")', "f()")
+    assert _level(body) == lens._DEAD
+    move = _edit("move_row", 7, to_line_start=6, to_position="after")
+    assert rewrite_source(src, move, typed_only=True) == rewrite_source(src, move) != src
+
+
+def _chain(arms: int) -> str:
+    """A handler that is one ``if`` of ``arms`` arms, each ending in a return, then one row."""
+    lines = ['@handler("H")', "def h(msg):"]
+    for i in range(arms):
+        lines.append(f'    {"if" if i == 0 else "elif"} msg.field("PID-3") == "{i}":')
+        lines.append(f'        msg.set("A", "{i}")')
+        lines.append("        return []")
+    lines.append('    msg.set("B", "2")')
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("arms", [3, 300], ids=["short", "long"])
+def test_typed_only_edit_on_a_long_elif_chain_never_crashes(arms: int) -> None:
+    # An ``elif`` chain nests one ``if`` per arm. The rule 8 walk took a call per arm that ends,
+    # and at 300 arms it raised RecursionError in typed-only mode only. Every edit here is one
+    # both modes accept, and the short chain is the control.
+    src = _chain(arms)
+    last = len(src.splitlines())
+    edits = [
+        _edit("set_params", last, params={"value": "9"}),
+        _edit("insert_row", last, position="before", **_SET_PID8),
+        _edit("insert_row", 4, position="before", **_SET_PID8),
+        _edit("delete_row", 4),
+        _edit("move_row", last, to_line_start=3, to_position="before"),
+    ]
+    for edit in edits:
+        out = rewrite_source(src, edit, typed_only=True)
+        assert out == rewrite_source(src, edit) != src
+    # Below an arm's return a row never runs, and the long chain refuses that as the short does.
+    _refused(src, _edit("insert_row", 5, **_SET_PID8), match=NEVER_RUNS, typed_only=True)
+
+
+def test_a_typed_only_check_that_runs_out_of_stack_refuses_the_edit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The backstop for nesting no loop removes: the check gives up, and the edit is refused.
+    def too_deep(*_: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    edit = _edit("set_params", 6, params={"value": "9"})
+    expected = rewrite_source(_TERMINAL, edit, typed_only=True)
+    monkeypatch.setattr(lens, "_reachability", too_deep)
+    assert rewrite_source(_TERMINAL, edit) == expected  # the default mode runs no such check
+    _refused(_TERMINAL, edit, match="nested too deeply", typed_only=True)
+
+
+def test_rule_8_a_with_that_returns_a_name_is_not_surely_dead() -> None:
+    # Code review of 8fca7d6aee: ``y`` is unbound unless PID-3 is set, so ``return y`` raises
+    # UnboundLocalError, ``suppress`` swallows it, and the last row runs. It is not exempt.
+    src = _TARGET.format(items="suppress(Exception)").replace("return None", "return y")
+    src = src.replace(
+        "def h(msg):\n", 'def h(msg):\n    if msg.field("PID-3"):\n        y = None\n'
+    )
+    last = len(src.splitlines())
+    move = _edit("move_row", last, to_line_start=last - 1, to_position="after")
+    assert rewrite_source(src, move) != src
+    _refused(src, move, match=NEVER_RUNS, typed_only=True)
+
+
+def test_typed_only_accepts_an_edit_below_a_loop_that_holds_a_long_elif_chain() -> None:
+    # Code review of 8fca7d6aee: the search for a ``break`` took two calls per arm, so typed-only
+    # mode refused as "nested too deeply" an edit the default mode makes.
+    arms = "".join(
+        f"        {'if' if i == 0 else 'elif'} pending(msg) == {i}:\n            continue\n"
+        for i in range(600)
+    )
+    src = (
+        '@handler("H")\ndef h(msg):\n    msg.set("A", "1")\n    while pending(msg):\n'
+        + arms
+        + '    msg.set("B", "2")\n    msg.set("C", "3")\n'
+    )
+    edit = _edit("set_params", len(src.splitlines()), params={"value": "9"})
+    assert rewrite_source(src, edit, typed_only=True) == rewrite_source(src, edit) != src

@@ -150,6 +150,12 @@ _ARMS: list[tuple[str, Callable[[Path, Path], list[str]]]] = [
         ],
     ),
     (
+        # Exits 0: a file that will not load makes the report partial, and the reason says why
+        # (vault BACKLOG #2600).
+        "security-show",
+        lambda cfg, tmp: ["security", "show", "--service-config", str(cfg), "--json"],
+    ),
+    (
         "alert-add",
         lambda cfg, tmp: [
             "alert",
@@ -171,6 +177,10 @@ _STARTING_FILE = {"alert-remove": '[[alerts.rules]]\nevent_type = "connection_st
 
 #: The arms whose load is the post-write check of an edit, which must also roll the edit back.
 _EDIT_ARMS = {"security-set", "alert-add", "alert-remove"}
+
+#: The arms a load failure does not fail. ``support-bundle`` reports it as a warning, and
+#: ``security show`` as a partial report with its reason.
+_EXIT_0_ARMS = {"support-bundle", "security-show"}
 
 #: How ``settings_error_detail`` names the failing section. Pydantic's own text puts the location on
 #: a line of its own, and a bare ``store`` would also match a temporary path.
@@ -226,11 +236,7 @@ def test_an_arm_renders_a_load_failure_without_its_input(
     assert _CANARY not in out, f"{arm} printed the input of a settings load failure: {out!r}"
     # Useful, not just quiet: the section and the reason are still named.
     assert _FIELD in out and _MESSAGE in out, out
-    if arm == "support-bundle":
-        # A broken settings file does not block the bundle; it is reported as a warning.
-        assert code == 0
-    else:
-        assert code != 0
+    assert (code == 0) is (arm in _EXIT_0_ARMS), (arm, code)
     if arm in _EDIT_ARMS:
         # The post-write check refused, not an earlier read (`security set` also loads the file to
         # report loosenings), and the edit was rolled back.
@@ -256,7 +262,7 @@ def test_a_real_store_failure_names_the_field_and_never_the_env_secret(
     assert _CANARY not in out, f"{arm} printed an env-supplied secret: {out!r}"
     assert _FIELD in out and "server, database, username" in out, out
     assert "input_value" not in out and "errors.pydantic.dev" not in out, out
-    if arm != "support-bundle":
+    if arm not in _EXIT_0_ARMS:
         assert code != 0
     if arm in _EDIT_ARMS:
         assert "the edit was not saved" in out, out

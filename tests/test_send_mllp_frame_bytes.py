@@ -278,6 +278,16 @@ def test_an_ack_over_the_frame_cap_is_refused_not_buffered(
     assert "MSH" not in captured.err
 
 
+#: The --timeout the test passes.
+_TIMEOUT = 1.0
+#: The sender must give up within this. A hosted Windows runner once took 4.44 s against an older
+#: 4 s bound. It stays below the script's own 10 s default, so a sender that drops --timeout fails.
+_GAVE_UP_WITHIN = 8 * _TIMEOUT
+#: How long the peer trickles before it hangs up. A wait reset per read is still waiting then, so
+#: it sees a close instead of a TimeoutError.
+_TRICKLE_SECONDS = 2 * _GAVE_UP_WITHIN
+
+
 def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_path: Path) -> None:
     # Each byte arrives inside --timeout, so only a deadline for the whole reply ends the wait.
     path = tmp_path / "clean.hl7"
@@ -294,20 +304,26 @@ def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_p
                 if not chunk:
                     return
                 received += chunk
+            stop_at = time.monotonic() + _TRICKLE_SECONDS
             try:
                 conn.sendall(bytes([SB]))
                 while not done.wait(0.2):
+                    if time.monotonic() >= stop_at:
+                        return
                     conn.sendall(b"x")
             except OSError:
                 return
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
+    module = _load()  # outside the timed window: loading the script is not the deadline
     started = time.monotonic()
     try:
         with pytest.raises(TimeoutError):
-            _load().main([str(path), "--port", _port(listener), "--timeout", "1"])
+            module.main([str(path), "--port", _port(listener), "--timeout", str(_TIMEOUT)])
     finally:
         done.set()
-    assert time.monotonic() - started < 4
+    elapsed = time.monotonic() - started
+    # The deadline follows --timeout from both sides. The 0.1 s allows for timer granularity.
+    assert _TIMEOUT - 0.1 <= elapsed < _GAVE_UP_WITHIN, elapsed
     thread.join(5)

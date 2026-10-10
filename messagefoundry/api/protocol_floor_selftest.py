@@ -75,7 +75,7 @@ __all__ = ["selftest_protocol_floor"]
 _log = logging.getLogger(__name__)
 
 #: Loop turns one drive may take before its response counts as missing. Each turn is a zero-timeout
-#: pass, so this bounds work, never time. Measured at uvicorn 0.54.0 and websockets 17.1: the six
+#: pass, so this bounds work, never time. Measured at uvicorn 0.54.0 and websockets 17.2: the six
 #: drives take 3 turns between them on the sans-I/O protocol and 9 on the legacy server.
 _MAX_TURNS = 200
 

@@ -132,7 +132,20 @@ def test_shard_db_composes_under_project_root(tmp_path: object) -> None:
     # supervise applies serve's at-rest gate before it starts any shard (BACKLOG #1916), so the
     # fleet needs the key its shards would need. This test is about path anchoring, not that gate.
     monkey.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    # It applies serve's forwarding gates too (BACKLOG #2356), and refuses a fleet whose engine
+    # shards would each refuse for want of a collector. Logging setup is stubbed: nothing is
+    # forwarded.
+    from tests._phi_gate_provisions import (
+        make_syslog_ca_and_crl,
+        setenv_declared_egress,
+        setenv_verified_log_forwarding,
+    )
+
     try:
+        setenv_verified_log_forwarding(monkey, make_syslog_ca_and_crl(Path(str(tmp_path))))
+        # And the open-egress gate, which it runs before it installs that forwarder.
+        setenv_declared_egress(monkey)
+        monkey.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
         args = argparse.Namespace(
             config="config",  # relative — must resolve under R
             db="mefor.db",  # relative — must resolve under R
