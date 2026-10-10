@@ -919,13 +919,17 @@ class _FtpClient(_RemoteClient):
             return out
         except (ftplib.error_perm, ftplib.error_proto):
             pass
+        # NLST may answer with bare names or with names prefixed by the directory asked for. Only
+        # that exact prefix is removed; anything else reaches the guard as the server sent it.
+        # Reject, never rewrite (ASVS 5.3.2): a basename fold would read ../x/a.hl7 as a.hl7.
+        prefix = posixpath.join(remote_dir, "")
         for name in ftp.nlst(remote_dir):
-            base = posixpath.basename(name)
+            base = name.removeprefix(prefix)
             if base in (".", ".."):
                 continue
             # A name the listing guard refuses gets no remote operation here: SIZE would act on a
-            # server-chosen name the guard has not judged (ASVS 5.3.2). It still lists, unsized, so
-            # the poll loop's own _is_contained_name refusal counts and logs it.
+            # server-chosen name the guard has not judged. It still lists, unsized, so the poll
+            # loop's own _is_contained_name refusal counts and logs it.
             if not _is_contained_name(base):
                 out.append(_Listed(base, 0, None))
                 continue

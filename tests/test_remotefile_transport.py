@@ -2238,9 +2238,8 @@ class _NlstOnlyFtp:
 
 
 def test_nlst_fallback_never_sizes_a_name_the_listing_guard_refuses() -> None:  # #1130
-    # NLST folds each entry with posixpath.basename, which does not split on a backslash, so a
-    # server-chosen ..\..\x.hl7 survives the fold. SIZE on it would be a remote operation on a name
-    # the guard has not judged. The entry still lists, so the poll loop's refusal counts and logs it.
+    # SIZE on a server-chosen name the guard has not judged would be a remote operation on it. A
+    # refused entry still lists, unsized, so the poll loop's refusal counts and logs it.
     ftp = _NlstOnlyFtp([r"..\..\x.hl7", "C:evil.hl7", "good.hl7"])
     listed = _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
     assert ftp.sized == ["/in/good.hl7"]
@@ -2249,6 +2248,59 @@ def test_nlst_fallback_never_sizes_a_name_the_listing_guard_refuses() -> None:  
         ("C:evil.hl7", 0),
         ("good.hl7", 7),
     ]
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [("a.hl7", "a.hl7"), ("/in/a.hl7", "a.hl7"), ("file with spaces.hl7", "file with spaces.hl7")],
+)
+def test_nlst_accepts_a_bare_name_or_one_under_the_exact_directory(
+    entry: str, expected: str
+) -> None:  # #1130
+    ftp = _NlstOnlyFtp([entry])
+    listed = _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert [(e.name, e.size) for e in listed] == [(expected, 7)]
+    assert ftp.sized == [f"/in/{expected}"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "../x/a.hl7",  # a basename fold would have read this as a.hl7
+        "/other/a.hl7",  # another directory
+        "/in/sub/a.hl7",  # a subdirectory of the one asked for
+        "/inbox/a.hl7",  # a sibling whose name starts with the directory's
+        "/in//a.hl7",  # the prefix, then an absolute remainder
+        "in/a.hl7",  # the directory without its leading slash: not the exact prefix
+    ],
+)
+def test_nlst_never_rewrites_any_other_entry(entry: str) -> None:  # #1130
+    # Reject, never rewrite: the entry reaches the listing exactly as the server sent it, or as the
+    # remainder after the exact `remote_dir/` prefix, unsized, and the poll loop's guard refuses it.
+    ftp = _NlstOnlyFtp([entry])
+    listed = _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert ftp.sized == []
+    assert [e.size for e in listed] == [0]
+    assert listed[0].name in (entry, entry.removeprefix("/in/"))
+    assert _is_contained_name(listed[0].name) is False
+
+
+async def test_a_folded_nlst_entry_is_refused_by_the_poll_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # End to end over the NLST arm: ../x/a.hl7 is never read as a.hl7, so a real a.hl7 beside it
+    # is not the one retrieved for it.
+    client = _HostileListingClient(
+        [e.name for e in _FtpClient._list(_NlstOnlyFtp(["../x/a.hl7"]), "/in")]  # type: ignore[arg-type]
+    )
+    client.files["/in/a.hl7"] = rb"MSH|^~\&|A"
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    await src._poll_once()
+    assert h.bodies == []
+    assert client.ops == []
 
 
 # --- the key names ARE the control -------------------------------------------------------------
