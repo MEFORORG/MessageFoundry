@@ -32,7 +32,6 @@ metrics-exposition scoping), not a live exposure.
 
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -55,6 +54,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
+from tests._doc_blockquote import blockquote_lines, plant_in_blockquote, route_tokens, unwrap
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -287,42 +287,13 @@ def _doc_text() -> str:
     return _DOC.read_text(encoding="utf-8")
 
 
-def _scope_blockquote_lines(text: str) -> list[str]:
-    """The RAW lines of the DLQ-SCOPE blockquote: from its marker to the first non-blockquote line."""
-    lines = text.splitlines()
-    start = next((i for i, line in enumerate(lines) if _SCOPE_MARKER in line), None)
-    assert start is not None, f"docs/SECURITY.md no longer contains {_SCOPE_MARKER!r}"
-    out: list[str] = []
-    for line in lines[start:]:
-        if not line.startswith(">"):
-            break
-        out.append(line)
-    return out
-
-
 def _scope_blockquote(text: str) -> str:
-    """The DLQ-SCOPE blockquote as one unwrapped string, so a claim split across a line break still
-    reads as one sentence."""
-    return " ".join(line.lstrip("> ").rstrip() for line in _scope_blockquote_lines(text))
+    """The DLQ-SCOPE blockquote as one unwrapped string."""
+    return unwrap(blockquote_lines(text, _SCOPE_MARKER))
 
 
 def _plant_in_blockquote(text: str, old: str, new: str) -> str:
-    """Substitute INSIDE the DLQ-SCOPE blockquote only.
-
-    A whole-document ``replace`` was the first attempt and it graded the wrong thing: several of
-    these route tokens are backticked elsewhere in ``docs/SECURITY.md``, so the mutation landed in
-    an unrelated section, the document changed, and the planted-omission test passed without ever
-    touching the block under grade.
-    """
-    block = "\n".join(_scope_blockquote_lines(text))
-    assert old in block, f"the DLQ-SCOPE blockquote does not contain {old!r}"
-    return text.replace(block, block.replace(old, new, 1), 1)
-
-
-def _route_tokens(block: str) -> set[str]:
-    """Backticked ``METHOD /path`` tokens in the block, matched EXACTLY. Substring matching would
-    read ``GET /metrics`` out of ``GET /metrics/history`` and grade the wrong sentence."""
-    return set(re.findall(r"`([A-Z]+ /[^`]*)`", block))
+    return plant_in_blockquote(text, _SCOPE_MARKER, old, new)
 
 
 def _monitoring_scope_problems(text: str) -> list[str]:
@@ -334,7 +305,7 @@ def _monitoring_scope_problems(text: str) -> list[str]:
     # split it across a line break, which is exactly how it survived one merge unnoticed.
     if _RETIRED_FALSEHOOD in text or _RETIRED_FALSEHOOD in block:
         problems.append(f"the retired falsehood is back: {_RETIRED_FALSEHOOD!r}")
-    tokens = _route_tokens(block)
+    tokens = route_tokens(block)
     for route in _NARROWED_READS:
         if route not in tokens:
             problems.append(f"{route} is narrowed for a scoped caller and the blockquote omits it")
