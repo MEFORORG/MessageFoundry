@@ -52,7 +52,7 @@ from tests.test_connection_scheduler import (
     _LogPageSink,
     _wait_until,
 )
-from tests.test_dr_running_config_dir import _free_ports
+from tests.test_dr_running_config_dir import _free_ports, _until
 from tests.test_outbound_ca_anchors import _ca, _CountingSink, _ftps_poller_registry, _sha
 from tests.test_trust_anchors import _block, _path_ok
 
@@ -121,6 +121,42 @@ def _swapped_ca(tmp_path: Path) -> tuple[Path, str]:
     pin = _sha(ca)
     ca.write_bytes(_block(b"substitute"))
     return ca, pin
+
+
+async def _delivered_on_first_claim(
+    store: MessageStore, row_id: str, directory: Path, lane: str = _OB_FILE
+) -> None:
+    """Wait for the row on ``lane`` to settle, then require it delivered on its first claim with
+    no error, and a published file in ``directory``.
+
+    A file in the directory does not mean the row is delivered. The File outbound writes a
+    ``.part`` temp first, and the row reads ``inflight`` until the delivery returns, so a wait on
+    the directory then a read of the row gave ('inflight', 1, None) on a slow runner. The store
+    adds one to ``attempts`` at each claim and takes it back when a claim is released unsent, so
+    1 here is the delivery itself. The wait stops early on any other ending, such as a second
+    attempt, an error or a dead row, so a charge fails the assert rather than the deadline."""
+    last: dict[str, Any] = {}
+
+    async def settled() -> bool:
+        nonlocal last
+        (last,) = [r for r in await store.outbox_for(row_id) if r["destination_name"] == lane]
+        return (
+            last["status"] not in ("pending", "inflight")
+            or last["attempts"] > 1
+            or bool(last["last_error"])
+        )
+
+    def state() -> tuple[object, ...]:
+        return (last.get("status"), last.get("attempts"), last.get("last_error"))
+
+    try:
+        await _until(settled, timeout=_WAIT_BOUND_SECONDS)
+    except AssertionError:
+        pytest.fail(f"the {lane} row did not settle; it last read {state()}")
+    assert state() == ("done", 1, None)
+    # A claim that finds the row's delivery already recorded marks it done without sending, so
+    # the published file is checked too. A ``.part`` temp is not one.
+    assert [p for p in directory.iterdir() if p.suffix != ".part"]
 
 
 # --- what a passive box learns at start ---------------------------------------------------
@@ -259,7 +295,9 @@ async def test_an_activation_fails_one_lane_on_a_refused_ca_and_starts_the_rest(
     runner = _runner(store, reg, dr_standby=Priority.CRITICAL)
     await runner.start()
     try:
-        await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)])
+        row_id = await store.enqueue_message(
+            channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)]
+        )
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
 
@@ -267,7 +305,7 @@ async def test_an_activation_fails_one_lane_on_a_refused_ca_and_starts_the_rest(
         assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
         assert _OB_CA not in runner._destinations
         assert runner.outbound_failed(_OB_FILE) is None and _OB_FILE in runner._destinations
-        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))  # the good lane delivers
+        await _delivered_on_first_claim(store, row_id, tmp_path / _OB_FILE)  # the good lane
         assert set(runner.filtered_outbound()) == set()
 
         # Released with the CA still refused: a reload on the passive box reads it again. Red
@@ -302,7 +340,7 @@ async def test_a_lane_that_fails_at_an_activation_keeps_its_rows_held(
         )
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
-        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))  # the control lane sent
+        await _delivered_on_first_claim(store, row_id, tmp_path / _OB_FILE)  # the control lane
         await asyncio.sleep(0.3)
         held = [r for r in await store.outbox_for(row_id) if r["destination_name"] == _OB_CA]
         assert [(r["status"], r["attempts"]) for r in held] == [("pending", 0)]
@@ -337,22 +375,9 @@ async def test_an_activation_charges_no_attempt_to_a_row_held_on_a_lane_it_is_bu
         )
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
-
-        # Wait for the row to settle, not for a file: the File outbound writes a ``.part`` temp
-        # before it publishes, and the row reads ``inflight`` until the delivery returns. A
-        # snapshot taken then read ('inflight', 1, None) on a slow runner. The wait stops at the
-        # first sign of a charge too, so a charged row fails the assert below, not the deadline.
-        async def _settled() -> dict[str, Any]:
-            while True:
-                (row,) = await store.outbox_for(row_id)
-                if row["status"] == "done" or row["attempts"] > 1 or row["last_error"]:
-                    return row
-                await asyncio.sleep(0.02)
-
-        row = await asyncio.wait_for(_settled(), _WAIT_BOUND_SECONDS)
-        # attempts counts claims, so 1 is the delivery itself and nothing was charged before it.
-        # The control is the unpark-first order, which gave 2 with ``outbound reloading``.
-        assert (row["status"], row["attempts"], row["last_error"]) == ("done", 1, None)
+        # The control is the unpark-first order. Its row stops the wait at
+        # ('pending', 1, 'outbound reloading'), the charged attempt.
+        await _delivered_on_first_claim(store, row_id, tmp_path / _OB_FILE)
     finally:
         await runner.stop()
 
@@ -385,13 +410,15 @@ async def test_an_activation_on_an_engine_shard_that_does_not_own_a_lane_fails_t
     monkeypatch.setattr(runner, "_owns_destination", lambda name: name != _OB_CA)
     await runner.start()
     try:
-        await store.enqueue_message(channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)])
+        row_id = await store.enqueue_message(
+            channel_id=_IB, raw=_ADT, deliveries=[(_OB_FILE, _ADT)]
+        )
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
 
         assert runner.inbound_running(_IB)
         assert "its tls_ca_file was refused" in (runner.outbound_failed(_OB_CA) or "")
-        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+        await _delivered_on_first_claim(store, row_id, tmp_path / _OB_FILE)
     finally:
         await runner.stop()
 
@@ -423,7 +450,7 @@ async def _after_a_failed_activation(
     store: MessageStore, tmp_path: Path, *, ca_schedule: Schedule | None = None, **kw: Any
 ) -> AsyncIterator[tuple[RegistryRunner, Path, str]]:
     """A passive box with a row held on each outbound, activated with the CA lane refused. The
-    File lane has delivered its row when this yields."""
+    File lane has delivered its row on its first claim when this yields."""
     ca, pin = _swapped_ca(tmp_path)
     reg = _graph(tmp_path, ca, pin, ca_schedule=ca_schedule)
     runner = _runner(store, reg, dr_standby=Priority.CRITICAL, **kw)
@@ -434,7 +461,7 @@ async def _after_a_failed_activation(
         )
         runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
         await runner.reload()
-        await _wait_until(lambda: any((tmp_path / _OB_FILE).iterdir()))
+        await _delivered_on_first_claim(store, row_id, tmp_path / _OB_FILE)
         assert _OB_CA not in runner._destinations
         yield runner, ca, row_id
     finally:
