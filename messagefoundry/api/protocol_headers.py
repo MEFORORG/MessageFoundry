@@ -109,10 +109,11 @@ response would change its status, which the floor must never do. The overrides t
 ``tests/test_header_floor_wire.py`` injects failures into those steps.
 
 **This leans on uvicorn and websockets INTERNALS.** None of the hooks above is public API.
-``pyproject.toml`` bounds uvicorn below the next minor and websockets below the next major.
+``pyproject.toml`` pins uvicorn and websockets to exact versions.
 ``tests/test_header_floor_wire.py`` fails unless the installed versions are the ones it measured,
 ``_MEASURED_UVICORN`` and ``_MEASURED_WEBSOCKETS``, and drives every family on the wire against a
-control. The two startup checks are what hold between those. An upgrade that removes a hook, or
+control; a test holds those two equal to the pins. The two startup checks cover an install that
+does not honour the pins. An upgrade that removes a hook, or
 leaves one in place that no longer adds the headers to the families the self-test drives, stops the
 engine instead of shipping those responses without them.
 """

@@ -115,10 +115,11 @@ updates:
     # security.yml runs pip-audit over ci/locks/release-tools.lock. Lift this entry in the same PR
     # that moves the pyproject spec to a validated 7.4.
     #
-    # `uvicorn` is the same WIDENED-CAP case, and `websockets` is a major cap beside it (BACKLOG
-    # #1120). Why each cap exists, and where it sits, is beside it in pyproject.toml; read it there.
-    # pyproject.toml declares plain `uvicorn`, not `uvicorn[standard]`, so the bare name here matches
-    # it as written. Move each entry in the same PR that moves its cap.
+    # `uvicorn` and `websockets` are exact `==` pins in the base dependencies (BACKLOG #1120). Each
+    # entry starts at the pin's next minor, per THE RULE below, so the patch track stays open. Why
+    # each pin exists is beside it in pyproject.toml; read it there. pyproject.toml declares plain
+    # `uvicorn`, not `uvicorn[standard]`, so the bare name here matches it as written. Move each
+    # entry in the same PR that moves its pin.
     #
     # `pydicom`, `webauthn` and `pynetdicom` are the same WIDENED-CAP case (BACKLOG #2505). A major
     # cap needs its entry as much as a minor one: `python-deps-major` is one batch on `*`, so a
@@ -144,7 +145,7 @@ updates:
       - dependency-name: "uvicorn"
         versions: [">=0.55.0"]
       - dependency-name: "websockets"
-        versions: [">=18.0.0"]
+        versions: [">=17.3.0"]
       # Why: the comment above the [dicom] extra in pyproject.toml.
       - dependency-name: "pydicom"
         versions: [">=3.1.0"]

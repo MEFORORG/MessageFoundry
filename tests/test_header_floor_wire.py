@@ -30,6 +30,7 @@ import asyncio
 import logging
 import socket
 import sys
+import tomllib
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -39,6 +40,7 @@ from typing import Any
 import pytest
 import uvicorn
 import websockets as websockets_package
+from packaging.requirements import Requirement
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
@@ -68,6 +70,8 @@ _MEASURED_UVICORN = "0.54.0"
 #: The websockets library writes both WebSocket protocols' own handshake rejections, so it is
 #: pinned too.
 _MEASURED_WEBSOCKETS = "17.2"
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 _HANDSHAKE = (
     "GET {path} HTTP/1.1\r\n"
@@ -192,6 +196,16 @@ def test_the_suite_is_measuring_the_uvicorn_it_was_written_against() -> None:
         "responses uvicorn writes itself may have changed: re-read its protocol modules for every "
         "response it emits below the ASGI app, extend the families here, then move the pin."
     )
+
+
+def test_pyproject_pins_the_versions_this_suite_measured() -> None:
+    """The base dependencies pin uvicorn and websockets exactly, to the versions measured here. A
+    range would let an install take a release nobody read; a pin that moved alone would leave the
+    suite red on every leg with no hint why."""
+    pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = {Requirement(raw).name: Requirement(raw) for raw in pyproject["project"]["dependencies"]}
+    for name, measured in (("uvicorn", _MEASURED_UVICORN), ("websockets", _MEASURED_WEBSOCKETS)):
+        assert str(deps[name].specifier) == f"=={measured}", (name, str(deps[name].specifier))
 
 
 async def test_a_refused_handshake_on_the_wire_carries_the_floor(engine: Engine) -> None:
