@@ -195,10 +195,11 @@ taking the engine offline (SEC-022).
 
 The cached policy is stamped with when the engine gave it. Offline, a cached answer that **disables**
 assistance stands however old it is. A cached answer that **enables** it stands for 12 hours, the
-default absolute session lifetime. After that the IDE uses `mode: unverified` and disables assistance;
-it does not fall back to the local CLI (BACKLOG #1154). A cache written before the stamp existed is
-treated as expired. Inside the 12 hours, a withdrawn `ai:assist` grant still does not reach an IDE
-that cannot reach the engine.
+same number as the default absolute session lifetime. After that the IDE uses `mode: unverified`
+and disables assistance; it does not fall back to the local CLI (BACKLOG #1154). A cache written
+before the stamp existed is treated as expired. The bound applies only while the engine is
+unreachable, and it does not make the IDE sign in again. Inside the 12 hours, a withdrawn
+`ai:assist` grant still does not reach an IDE that cannot reach the engine.
 
 Then it applies the effective policy:
 

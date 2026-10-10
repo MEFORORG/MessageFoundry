@@ -3669,9 +3669,11 @@ The dual-control release re-checks the requester's standing too.
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235) describes that
 check and its directory gap.
 
-Two long responses ask again while they run (BACKLOG #1154). Each asks what its gate asked about the
-account: a live session, the route's permissions, no pending password change, a met second factor
-and a notification address on file. Neither asks for a fresh step-up.
+Two long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
+the route's permissions, no pending password change, a met second factor and a notification address
+on file. Neither asks again for a fresh step-up, the client-network check or the new-address check;
+those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
+on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
   with 1008 before the next frame. Each frame's connections table uses the identity resolved for
@@ -3680,7 +3682,8 @@ and a notification address on file. Neither asks for a fresh step-up.
   asks before every row. A refusal records `messages_export.stopped`, with the selected and streamed
   counts, then aborts the transfer, so the client sees a failed download rather than a short file.
   A narrowed channel scope skips each later row it no longer covers, audited as
-  `auth.channel_denied`.
+  `auth.channel_denied`. The export moves the session's idle clock every quarter of the idle
+  window, so a download longer than the idle timeout does not end its own session.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
