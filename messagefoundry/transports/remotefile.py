@@ -923,9 +923,15 @@ class _FtpClient(_RemoteClient):
             base = posixpath.basename(name)
             if base in (".", ".."):
                 continue
+            # A name the listing guard refuses gets no remote operation here: SIZE would act on a
+            # server-chosen name the guard has not judged (ASVS 5.3.2). It still lists, unsized, so
+            # the poll loop's own _is_contained_name refusal counts and logs it.
+            if not _is_contained_name(base):
+                out.append(_Listed(base, 0, None))
+                continue
             # A directory or an un-sizable entry lists as 0 (the oversize check skips it).
-            size = _ftp_size(ftp, posixpath.join(remote_dir, base)) or 0
-            out.append(_Listed(base, int(size), None))
+            size = _ftp_size(ftp, posixpath.join(remote_dir, base))
+            out.append(_Listed(base, size or 0, None))
         return out
 
     def list_names(self, remote_dir: str) -> set[str]:
