@@ -32,10 +32,12 @@ export interface CachedAiPolicy extends AiPolicy {
 
 /**
  * How long a cached answer that ENABLES assistance is trusted once the engine is unreachable: 12
- * hours, the engine's default `[auth].session_absolute_hours`. A session that read the answer is
- * ended by then under the default, so past it the IDE would have had to sign in again to hear the
- * engine confirm the grant. This is a bound, not a fix: inside it, a withdrawn grant still does
- * not reach an offline IDE. A cached answer that DISABLES assistance has no age limit.
+ * hours, the engine's default `[auth].session_absolute_hours`, so a permit read under a session
+ * is trusted offline no longer than that session could have lived. The bound applies only while
+ * the engine is unreachable. It forces no sign-in: a reachable engine answering a tokenless read
+ * says "unknown", `byo` treats that as allowed, and the answer is cached afresh. This is a bound,
+ * not a fix: inside it, a withdrawn grant still does not reach an offline IDE. A cached answer
+ * that DISABLES assistance has no age limit.
  */
 export const CACHED_PERMIT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
