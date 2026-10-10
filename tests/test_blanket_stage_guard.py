@@ -75,6 +75,9 @@ from typing import Any
 
 import pytest
 
+# A bash that can see this process's files, or a loud failure: never the WSL launcher.
+from tests._bash_resolver import probe_env, require_bash
+
 # The deny ENVELOPE is one contract shared by every PreToolUse hook here, so its assertion has one
 # home; tests/test_worktree_gate_git.py imports it from the same place.
 from tests.test_worktree_gate import assert_denied
@@ -720,8 +723,8 @@ ADDED_NOT_REPLACED = [
 # Many need a quote-state parser. Nobody built one, and the page's "What wiring waits on" gives
 # the record of its decline. Others need a program-position test, built and reverted under #1229.
 # Others need the working directory, which the guard cannot see. Some were closed by a wider
-# reading that was then withdrawn. And some are plain reading mistakes that look closable and have
-# not been tried: the bare carriage return, the heredoc word with a dash, the arithmetic shift.
+# reading that was then withdrawn. Three were plain reading mistakes, and FIXED_READING_MISTAKES
+# below drives their fix.
 #
 # WHICH TABLE A ROW SITS IN RECORDS WHICH PER-FORM OWNER ANSWER COVERS IT. Do not move a row INTO
 # the accepted table without a per-form owner answer (1 to 3) to cite. A move OUT of it, on a
@@ -794,10 +797,6 @@ _NOT_ACCEPTED = pytest.mark.xfail(
 )
 
 NOT_ACCEPTED_FAIL_OPENS = [
-    # next to no per-form answer: reading mistakes in the script
-    ("PowerShell", "Write-Host hi\rgit add -A"),
-    ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A"),
-    ("Bash", "echo $((1<<n))\ngit add -A"),
     # next to an accepted line whose words do not fit
     ("Bash", ">/dev/null git add -A"),
     ("PowerShell", "<# note #> git add -A"),
@@ -841,6 +840,35 @@ STILL_OPEN_CONTROLS = [
     ("Bash", "cat <<EOF\nx\nEOF\ngit add -A"),
     ("Bash", "echo $((1 << 2))\ngit add -A"),
     ("PowerShell", '$m = @"\nx\n"@\ngit add -A'),
+]
+
+# THE THREE PLAIN READING MISTAKES, FIXED (BACKLOG #1339). Each was in the page's section 5.1 and
+# in NOT_ACCEPTED_FAIL_OPENS above. Each fix is an ADDED view, so it can only add a deny:
+#   * a bare carriage return ends a PowerShell line, and the guard split at a line feed only;
+#   * a heredoc tag holding '-', '.' or other punctuation was cut short, so the guard waited for a
+#     line that never came and blanked the real stage after the heredoc;
+#   * a shift inside shell arithmetic was read as a heredoc opener, with the same result.
+# Each row is (tool, the blanket form that must now deny, a scoped form of the same shape that
+# must still allow). `test_a_fixed_reading_mistake_really_stages` runs both halves in a real
+# shell, so each row is a measured stage and not a shape that only looks like one.
+FIXED_READING_MISTAKES = [
+    ("PowerShell", "Write-Host hi\rgit add -A", "Write-Host hi\rgit add a.txt"),
+    ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A", "cat <<EOF-1\ngit add -A\nEOF-1"),
+    ("Bash", "cat <<E.O\nx\nE.O\ngit add -A", "cat <<E.O\ngit add -A\nE.O"),
+    ("Bash", "cat <<EOF+1\nx\nEOF+1\ngit add -A", "cat <<EOF+1\ngit add -A\nEOF+1"),
+    ("Bash", "echo $((1<<n))\ngit add -A", "echo $((1<<n))\ngit add a.txt"),
+    ("Bash", "(( x = 1<<n ))\ngit add -A", "(( x = 1<<n ))\ngit add a.txt"),
+    ("Bash", "echo $(( (1+(2)) << n ))\ngit add -A", "echo $(( (1+(2)) << n ))\ngit add a.txt"),
+    ("Bash", "echo $[1<<n]\ngit add -A", "echo $[1<<n]\ngit add a.txt"),
+]
+
+# THE TOOL NAME IS WHAT PICKS THE CARRIAGE-RETURN SPLIT. bash does not end a line at a bare
+# carriage return, so under the Bash tool this is one command whose program is `Write-Host`, and
+# it staged nothing when measured. The heredoc row is ordinary bash: the arithmetic comes first on
+# the line, and the real heredoc after it still hides its body.
+FIXED_READING_MISTAKES_ALLOW = [
+    ("Bash", "Write-Host hi\rgit add -A"),
+    ("Bash", "echo $((1<<n)) ; cat <<EOF\ngit add -A\nEOF"),
 ]
 
 # HARMLESS COMMANDS THE GUARD REFUSES, PINNED THE SAME WAY. The assertion demands the ALLOW each is
@@ -891,6 +919,9 @@ _BATCHED: list[tuple[str, str]] = sorted(
     | set(ACCEPTED_FAIL_OPENS)
     | set(NOT_ACCEPTED_FAIL_OPENS)
     | set(STILL_OPEN_CONTROLS)
+    | {(tool, blanket) for tool, blanket, _ in FIXED_READING_MISTAKES}
+    | {(tool, scoped) for tool, _, scoped in FIXED_READING_MISTAKES}
+    | set(FIXED_READING_MISTAKES_ALLOW)
     | set(KNOWN_OVER_DENY)
 )
 
@@ -991,6 +1022,103 @@ def test_a_fail_open_no_per_form_answer_covers_is_still_allowed(tool: str, comma
 @pytest.mark.parametrize(("tool", "command"), STILL_OPEN_CONTROLS)
 def test_the_nearest_form_to_a_fail_open_is_denied(tool: str, command: str) -> None:
     assert_denied(verdict(tool, command))
+
+
+@pytest.mark.parametrize(("tool", "blanket", "scoped"), FIXED_READING_MISTAKES)
+def test_a_fixed_reading_mistake_denies_and_its_scoped_control_allows(
+    tool: str, blanket: str, scoped: str
+) -> None:
+    assert_denied(verdict(tool, blanket))
+    assert_allowed(verdict(tool, scoped))
+
+
+@pytest.mark.parametrize(("tool", "command"), FIXED_READING_MISTAKES_ALLOW)
+def test_a_fixed_reading_mistake_does_not_deny_its_neighbour(tool: str, command: str) -> None:
+    assert_allowed(verdict(tool, command))
+
+
+_TRACKED = ("a.txt", "sub/b.txt", "sub/deep/c.txt")
+_ALL_FIVE = {*_TRACKED, "new.txt", "sub/new2.txt"}
+
+
+@pytest.fixture(scope="module")
+def bash_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Resolved once: each probe starts bash at least twice."""
+    return require_bash(tmp_path_factory.mktemp("resolve-bash"))
+
+
+def _staged_in_a_throwaway_repo(tool: str, command: str, root: Path, shell: str) -> set[str]:
+    """Run COMMAND under the shell TOOL names, in a fresh repository, and return what git staged.
+
+    The repository is the page's measuring repository: three modified tracked files at three
+    depths and two untracked files. Inherited GIT_* variables are dropped and the user and system
+    config switched off, so nothing outside the temp directory can change what git does.
+    """
+    root.mkdir(parents=True)
+    repo = root / "repo"
+    (repo / "sub" / "deep").mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@example.invalid",
+    )
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=repo, env=env, capture_output=True, text=True, check=True
+        ).stdout
+
+    git("init", "-q")
+    for name in _TRACKED:
+        (repo / name).write_text("1\n", encoding="utf-8")
+    git("add", "--", *_TRACKED)
+    git("commit", "-q", "-m", "init")
+    for name in _TRACKED:
+        (repo / name).write_text("2\n", encoding="utf-8")
+    (repo / "new.txt").write_text("n\n", encoding="utf-8")
+    (repo / "sub" / "new2.txt").write_text("n\n", encoding="utf-8")
+
+    if tool == "Bash":
+        argv = [shell, "-c", command]
+        env = probe_env(Path(shell), env)
+    else:
+        # Written as bytes, outside the repository, so a carriage return reaches PowerShell as is.
+        script = root / "command.ps1"
+        script.write_bytes(command.encode("utf-8"))
+        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
+    subprocess.run(argv, cwd=repo, env=env, capture_output=True, timeout=120)
+    return set(git("diff", "--cached", "--name-only").split())
+
+
+@pytest.mark.parametrize("tool", sorted({tool for tool, _, _ in FIXED_READING_MISTAKES}))
+def test_the_real_shell_control_is_denied_and_stages_all_five(
+    tool: str, tmp_path: Path, bash_path: str
+) -> None:
+    """The control beside every row below: `git add -A` under the same shell. The guard denies it
+    and git stages all five, so the measuring repository can tell a whole-tree stage apart."""
+    assert_denied(run_guard(bash("git add -A", tool=tool)))
+    assert _staged_in_a_throwaway_repo(tool, "git add -A", tmp_path / "c", bash_path) == _ALL_FIVE
+
+
+@pytest.mark.parametrize(("tool", "blanket", "scoped"), FIXED_READING_MISTAKES)
+def test_a_fixed_reading_mistake_really_stages(
+    tool: str, blanket: str, scoped: str, tmp_path: Path, bash_path: str
+) -> None:
+    """Each fixed row is a real stage of the whole tree. The scoped half stages at most `a.txt`, so
+    its ALLOW above is not a hole."""
+    assert _staged_in_a_throwaway_repo(tool, blanket, tmp_path / "b", bash_path) == _ALL_FIVE
+    assert _staged_in_a_throwaway_repo(tool, scoped, tmp_path / "s", bash_path) <= {"a.txt"}
+
+
+@pytest.mark.parametrize(("tool", "command"), FIXED_READING_MISTAKES_ALLOW)
+def test_a_fixed_reading_mistake_neighbour_really_stages_nothing(
+    tool: str, command: str, tmp_path: Path, bash_path: str
+) -> None:
+    assert _staged_in_a_throwaway_repo(tool, command, tmp_path / "n", bash_path) == set()
 
 
 def test_no_row_is_both_accepted_and_not_accepted() -> None:

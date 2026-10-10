@@ -80,7 +80,7 @@ is a Lander's condition.
    answer 4 carries this text, which the seat wrote: "Recorded as your ruling. When you lift the
    hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
    return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser." Section
-   5.1 holds those three mistakes, in four rows.
+   4a records their fix.
 
 ## How this was measured
 
@@ -470,28 +470,47 @@ command that was denied at the first measured commit is allowed now.
   command is allowed today, as fail-open 1 of section 1 (measured in the second pass). The
   sibling guard, `scripts/hooks/block-unbounded-fs-scan.ps1`, does not take `<<<` for a heredoc.
 
+## 4a. Closed by the wiring change: three reading mistakes
+
+Each of these staged the whole tree, and each is now denied. The rows not marked as first measured
+for this change were in section 5.1.
+`tests/test_blanket_stage_guard.py` runs each in a throwaway repository under its shell, beside a
+`git add -A` control that the guard denies and that stages all five, and drives a scoped form of
+the same shape that must stay allowed. Measured with git 2.55.0.windows.5, PowerShell 7 and the
+bash from Git for Windows.
+
+| Command | Shell | What git did | The mistake |
+|---|---|---|---|
+| `Write-Host hi`, bare carriage return, `git add -A` | PowerShell | staged all five | PowerShell ends a line at a bare carriage return. The guard split lines at a line feed only. |
+| `cat <<EOF-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard read a heredoc word as letters, digits and underscores, so it waited for a line `EOF` that never comes. |
+| `cat <<E.O`, newline, `x`, newline, `E.O`, newline, `git add -A` | bash | staged all five | The same, with a dot in the word. |
+| `cat <<EOF+1`, newline, `x`, newline, `EOF+1`, newline, `git add -A` | bash | staged all five | The same, with a plus sign. First measured for this change. |
+| `echo $((1<<n))`, newline, `git add -A` | bash | staged all five | The guard read the shift `<<n` as the start of a heredoc. |
+| `(( x = 1<<n ))`, newline, `git add -A` | bash | staged all five | The same, in an arithmetic command. First measured for this change. |
+| `echo $(( (1+(2)) << n ))`, newline, `git add -A` | bash | staged all five | The same, with brackets nested inside. First measured for this change. |
+| `echo $[1<<n]`, newline, `git add -A` | bash | staged all five | The same, in bash's older spelling of arithmetic. First measured for this change. |
+
+How each was closed. Neither is a quote-state parser or a program-position test:
+
+- **Carriage return.** The guard also reads the command split at each bare carriage return. The
+  tool name picks it: `PowerShell` and an unknown tool get it, and `Bash` does not, because bash
+  does not end a line there. `Write-Host hi`, bare carriage return, `git add -A` under bash is
+  still allowed, and it staged nothing.
+- **Heredoc word and arithmetic.** The guard also reads heredocs a second way. It reads an
+  unquoted word the way bash does, up to the first blank or one of `;`, `&`, `|`, `<`, `>`, `(`
+  and `)`. It skips a `<<` inside `((` and `))` on the same line, or inside `$[` and `]`.
+
+Both readings are added beside the old ones and never replace them, so neither can turn a deny
+into an allow.
+
 ## 5. Under no per-form answer: residuals by mechanism only
 
 Each form below is still allowed, and git stages or commits a whole tree with it. No line in
 answers 1 to 3 describes it. Under answer 4 each is a stated residual by mechanism, and this list
 is how the owner sees them. At least:
 
-**5.1 Forms next to no per-form answer.** All were first measured in the second pass.
-
-| Command | Shell | What git did | Why the guard allows it |
-|---|---|---|---|
-| `Write-Host hi`, bare carriage return, `git add -A` | PowerShell | staged all five | PowerShell ends a line at a bare carriage return. The guard splits lines at a line feed only. |
-| `cat <<EOF-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard reads a heredoc word as letters, digits and underscores, so it waits for a line `EOF` that never comes. |
-| `cat <<E.O`, newline, `x`, newline, `E.O`, newline, `git add -A` | bash | staged all five | The same, with a dot in the word. |
-| `echo $((1<<n))`, newline, `git add -A` | bash | staged all five | The guard reads the shift `<<n` as the start of a heredoc. |
-
-Controls from the same runs: `cat <<EOF`, newline, `x`, newline, `EOF`, newline, `git add -A` is
-denied, and so is `echo $((1 << 2))`, newline, `git add -A`. The bare carriage return row stages
-nothing under bash, which does not end a line there.
-
-These rows are reading mistakes in the script, not limits of the method. Each looks closable
-without a quote-state parser or a program-position test: a split at a carriage return for the
-PowerShell tool, and a narrower heredoc opener. Neither was built or measured here.
+**5.1 Forms next to no per-form answer.** The four rows that stood here are closed; see section
+4a.
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.

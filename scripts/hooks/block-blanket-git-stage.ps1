@@ -16,6 +16,9 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 
+# Shell arithmetic, where '<<' is a shift and not a heredoc. Used by Hide-HeredocBodies -Narrow.
+$ARITHMETIC = '\(\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)\)|\$\[[^\]]*\]'
+
 # ---------------------------------------------------------------------------------------------
 # WHY THIS FILE HAS FUNCTIONS NOW, AND WHY THEY ARE LOCAL (BACKLOG #1341)
 #
@@ -48,7 +51,12 @@ $ErrorActionPreference = 'SilentlyContinue'
 # Blank the BODY of every heredoc, preserving line structure. A heredoc body is data being
 # written to a file, not a command, but its lines sit at the front of a newline-split segment and
 # are read there as program position. Handles <<WORD, <<-WORD, <<'WORD' and <<"WORD".
-function Hide-HeredocBodies([string]$Text) {
+# -Narrow is the second, added reading; the views below say what it fixes.
+function Hide-HeredocBodies([string]$Text, [switch]$Narrow) {
+    # bash ends an unquoted heredoc word only at a blank or a metacharacter. The first reading
+    # stops it at the first character outside [A-Za-z0-9_], and that is one of its mistakes.
+    $word = if ($Narrow) { '[^\s;&|<>()''"]+' } else { '[A-Za-z_][A-Za-z0-9_]*' }
+    $opener = '<<-?\s*(?:''([^'']+)''|"([^"]+)"|(' + $word + '))'
     $lines = $Text -split "`n", 0
     $out = New-Object 'System.Collections.Generic.List[string]'
     $terminator = $null
@@ -60,7 +68,10 @@ function Hide-HeredocBodies([string]$Text) {
             continue
         }
         $out.Add($line)
-        $m = [regex]::Match($line, '<<-?\s*(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
+        # Only the opener SEARCH skips arithmetic; the line itself is kept whole. '((...))' is
+        # matched to any depth with a balancing group, and '$[...]' is the older spelling.
+        $probe = if ($Narrow) { $line -creplace $ARITHMETIC, '' } else { $line }
+        $m = [regex]::Match($probe, $opener)
         if ($m.Success) {
             $terminator = @($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) |
                 Where-Object { $_ } | Select-Object -First 1
@@ -115,9 +126,10 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
     return $null
 }
 
-# Remove or blank every match of $Pattern in BOTH views at once, so the two stay the same length
-# as each other. Used only to build the second, joined view -- see the views below.
-function Join-ContinuedLines([string]$Scan, [string]$Raw, [string]$Pattern, [bool]$Delete) {
+# Replace every match of $Pattern, found in the scan view, at the same offsets in BOTH views, so
+# the two stay the same length as each other. Each matched character becomes $Fill; an empty
+# $Fill deletes the match. Used only to build the added views -- see the views below.
+function Edit-BothViews([string]$Scan, [string]$Raw, [string]$Pattern, [string]$Fill) {
     $s = New-Object System.Text.StringBuilder $Scan
     $r = New-Object System.Text.StringBuilder $Raw
     $found = [regex]::Matches($Scan, $Pattern)
@@ -126,10 +138,8 @@ function Join-ContinuedLines([string]$Scan, [string]$Raw, [string]$Pattern, [boo
         $len = $found[$n].Length
         [void]$s.Remove($at, $len)
         [void]$r.Remove($at, $len)
-        if (-not $Delete) {
-            [void]$s.Insert($at, ' ' * $len)
-            [void]$r.Insert($at, ' ' * $len)
-        }
+        [void]$s.Insert($at, $Fill * $len)
+        [void]$r.Insert($at, $Fill * $len)
     }
     return @($s.ToString(), $r.ToString())
 }
@@ -181,16 +191,44 @@ $reason = $null
 # arguments. The third went on a measured fail-open: Hide-HeredocBodies stopped taking a bash
 # here-string ('<<<word') for a heredoc, and one command that was denied before became allowed.
 # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the forms all three would have closed.
+#
+# TWO MORE ADDED VIEWS CLOSE THREE PLAIN READING MISTAKES (BACKLOG #1339). Like the joined view,
+# each is added beside the views it is built from and never replaces one, so neither can remove a
+# deny the guard made before:
+#   * the NARROW heredoc reading (Hide-HeredocBodies -Narrow) reads an unquoted tag the way bash
+#     does, to the first blank or metacharacter, so '<<EOF-1' and '<<E.O' are read whole. It also
+#     does not take a shift inside shell arithmetic ('$((1<<n))', '(( x = 1<<n ))', '$[1<<n]') for
+#     a heredoc. The first reading took each for an opener whose terminator never comes, and so
+#     blanked every later line;
+#   * the CARRIAGE-RETURN view splits a line at a bare carriage return. PowerShell ends a line
+#     there and bash does not, so the tool name picks it, and an unknown tool gets it too. A
+#     carriage return inside a quoted span or a heredoc body is already blank in the scan view.
+#     It is made BEFORE the continuation join, so a backtick before the carriage return joins.
+# Each is built only when the command holds the text it reads, so most commands pay for neither.
+$bases = New-Object 'System.Collections.Generic.List[string[]]'
+$bases.Add(@($scan, $cmd))
+if ($cmd.Contains('<<')) {
+    $narrow = Hide-QuotedSpans (Hide-HeredocBodies $cmd -Narrow)
+    if ($narrow -cne $scan) { $bases.Add(@($narrow, $cmd)) }
+}
+if ($tool -ne 'Bash' -and $cmd.Contains("`r")) {
+    foreach ($base in @($bases)) {
+        $split = Edit-BothViews $base[0] $base[1] '\r(?!\n)' "`n"
+        if ($split[0] -cne $base[0]) { $bases.Add($split) }
+    }
+}
 $views = New-Object 'System.Collections.Generic.List[string[]]'
-$views.Add(@($scan, $cmd))
-$joined = @($scan, $cmd)
-if ($tool -ne 'PowerShell') {
-    $joined = Join-ContinuedLines $joined[0] $joined[1] '(?<=(?<!\\)(?:\\\\)*)\\\r?\n' $true
+foreach ($base in $bases) {
+    $views.Add($base)
+    $joined = $base
+    if ($tool -ne 'PowerShell') {
+        $joined = Edit-BothViews $joined[0] $joined[1] '(?<=(?<!\\)(?:\\\\)*)\\\r?\n' ''
+    }
+    if ($tool -ne 'Bash') {
+        $joined = Edit-BothViews $joined[0] $joined[1] '(?<=(?<!`)(?:``)*)`\r?\n' ' '
+    }
+    if ($joined[0] -cne $base[0]) { $views.Add($joined) }
 }
-if ($tool -ne 'Bash') {
-    $joined = Join-ContinuedLines $joined[0] $joined[1] '(?<=(?<!`)(?:``)*)`\r?\n' $false
-}
-if ($joined[0] -cne $scan) { $views.Add($joined) }
 
 # Each bound is (view index, start, length).
 $bounds = New-Object 'System.Collections.Generic.List[int[]]'
@@ -203,10 +241,14 @@ for ($v = 0; $v -lt $views.Count; $v++) {
     $bounds.Add(@($v, $cursor, ($views[$v][0].Length - $cursor)))
 }
 
+# Most views share most segments. The verdict on a segment is fixed by its two strings, so a pair
+# already judged is skipped; that can never remove a deny.
+$judged = New-Object 'System.Collections.Generic.HashSet[string]'
 foreach ($b in $bounds) {
     if ($b[2] -le 0) { continue }
     $s = $views[$b[0]][0].Substring($b[1], $b[2]).Trim()
     $rawSeg = $views[$b[0]][1].Substring($b[1], $b[2]).Trim()
+    if (-not $judged.Add("$s`0$rawSeg")) { continue }
     # The PROGRAM NAME is matched case-INSENSITIVELY, and only it. Windows resolves git, Git and
     # GIT to the same git.exe, so 'Git add -A' staged the tree while 'git add -A' was denied. The
     # subcommand and flag tests below stay -cmatch on purpose: git rejects 'git ADD', and '-A' and
@@ -218,7 +260,7 @@ foreach ($b in $bounds) {
     # both Hide- passes keep line feeds; a carriage return inside a quoted span is blanked.
     # When a quoted span, or a heredoc inside '$(...)', runs over a line feed, the text after
     # it lands in a segment that does not start with git. So a pathspec or flag there is not
-    # read. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5.2 lists the measured forms.
+    # read. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5 lists the measured forms.
     # A command reached through a dispatching wrapper ('cmd /c "git add -A"') is still not
     # covered -- that is BACKLOG #1305's axis, on a different file, and deliberately not
     # widened here: doing so needs a wrapper allowlist, which is the construct #1229 proved
