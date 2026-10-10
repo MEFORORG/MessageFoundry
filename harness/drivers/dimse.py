@@ -179,14 +179,18 @@ class DimseDriver(Driver):
         try:
             status = assoc.send_c_store(dataset)
         except (ValueError, RuntimeError, OSError) as exc:
-            return Injection(error=f"C-STORE could not be sent: {type(exc).__name__}: {exc}")
+            # The cap can abort the association before the send; say so rather than "not sent".
+            return _refused(ae) or Injection(
+                error=f"C-STORE could not be sent: {type(exc).__name__}: {exc}"
+            )
         finally:
             assoc.release()
-        if refused := _refused(ae):
-            return refused
         code = getattr(status, "Status", None)
         if code is None:
-            return Injection(error="no C-STORE response status (aborted or timed out)")
+            return _refused(ae) or Injection(
+                error="no C-STORE response status (aborted or timed out)"
+            )
+        # A status read inside the cap stands, even if the release then passed it.
         return Injection(reply=f"{int(code):04X}".encode("ascii"))
 
 

@@ -230,16 +230,41 @@ def test_an_answer_past_the_reply_cap_is_refused_and_one_at_it_is_read_whole(
         rigadmin._call("GET", f"{base}/stats", cacert=None)
 
 
-def test_a_sign_in_answer_past_the_reply_cap_is_a_refused_sign_in(
+def test_a_sign_in_answer_past_the_reply_cap_reads_as_no_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Callers polling a node handle a refused sign-in; an over-cap answer must not escape them."""
+    """A node polled for its status treats an over-cap answer as no answer and asks again; its
+    sign-in must read the same way, not as a refused credential that ends the run."""
     monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 1_000)
     with (
         _engine_answering(200, 5_000) as base,
-        pytest.raises(rigadmin.RigSignInRefused, match="limit"),
+        pytest.raises(rigadmin.RigUnreachable, match="limit") as caught,
     ):
         rigadmin.sign_in(base, RigAdmin("rig-operator", "ab" * 24))
+    assert isinstance(caught.value, rigadmin.RigReplyRefused)
+
+
+@pytest.mark.parametrize("status", [200, 401])
+def test_an_answer_that_ends_before_its_stated_length_is_no_answer(status: int) -> None:
+    """A sized read returns what it got where a whole read raised ``IncompleteRead``, so a cut-off
+    answer must still be refused rather than parsed as whole."""
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        server.settimeout(10.0)
+
+        def short_answer() -> None:
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(
+                    f"HTTP/1.1 {status} X\r\nContent-Length: 5000\r\n\r\n".encode() + b"x" * 1200
+                )
+
+        peer = threading.Thread(target=short_answer, daemon=True)
+        peer.start()
+        base = f"http://127.0.0.1:{server.getsockname()[1]}"
+        with pytest.raises(rigadmin.RigUnreachable, match="stated length"):
+            rigadmin._call("GET", f"{base}/stats", cacert=None)
+        peer.join(10.0)
 
 
 # --- the one session per process ---------------------------------------------

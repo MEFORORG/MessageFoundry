@@ -352,12 +352,17 @@ async def _get_status_json(
 
     The answer is read under :data:`MAX_STATUS_REPLY_BYTES` (ASVS 5.1.1, BACKLOG #1127). A longer
     one is refused, logged by path and limit, and returned as no answer, the same as a node that is
-    down: the read stops one network chunk past the cap and keeps none of it."""
-    headers = {"Authorization": f"Bearer {token}"} if token else None
+    down: the read stops one network chunk past the cap and keeps none of it. The poll asks for no
+    content coding and reads the bytes as sent (``aiter_raw``), because ``aiter_bytes`` would inflate
+    a whole compressed chunk before the cap saw it. A compressed answer then fails to parse, and its
+    body is ``None``."""
+    headers = {"Accept-Encoding": "identity"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         async with client.stream("GET", url, headers=headers) as resp:
             raw = bytearray()
-            async for chunk in resp.aiter_bytes():
+            async for chunk in resp.aiter_raw():
                 raw += chunk
                 if len(raw) > MAX_STATUS_REPLY_BYTES:
                     log.warning(

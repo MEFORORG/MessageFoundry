@@ -314,10 +314,12 @@ _UNSTREAMED_HTTP_CALLS = frozenset({"get", "post", "put", "patch", "delete", "he
 
 
 def unbounded_api_reads(tree: ast.AST) -> list[str]:
-    """Every call in ``tree`` that reads an HTTP answer with no bound: a request method called on a
-    name or attribute ending in ``client`` (``client.get(...)`` or ``self._client.get(...)``
-    buffers the answer whole), a response's ``.json()``, and each :func:`whole_read`. A tripwire
-    on the shapes the rig used, not proof."""
+    """Every call in ``tree`` that reads an HTTP answer with no bound: a request method called on
+    the ``httpx`` module or on a name or attribute ending in ``client`` (``client.get(...)`` or
+    ``self._client.get(...)`` buffers the answer whole), such a client's ``send`` without
+    ``stream=True``, a response's ``.json()`` or ``.aread()``, and each :func:`whole_read`. A
+    tripwire on the shapes it names, not proof: an answer's ``.content`` or ``.text`` is not
+    seen."""
     bad: list[str] = []
     calls = sorted(
         (c for c in ast.walk(tree) if isinstance(c, ast.Call)),
@@ -334,9 +336,15 @@ def unbounded_api_reads(tree: ast.AST) -> list[str]:
             if isinstance(receiver, ast.Attribute)
             else ""
         )
-        on_client = receiver_name.lower().endswith("client")
-        if (on_client and name in _UNSTREAMED_HTTP_CALLS) or (
-            name == "json" and isinstance(func, ast.Attribute) and not call.args
+        on_client = receiver_name == "httpx" or receiver_name.lower().endswith("client")
+        streamed = any(
+            k.arg == "stream" and isinstance(k.value, ast.Constant) and k.value.value is True
+            for k in call.keywords
+        )
+        if (
+            (on_client and name in _UNSTREAMED_HTTP_CALLS)
+            or (on_client and name == "send" and not streamed)
+            or (name in {"json", "aread"} and isinstance(func, ast.Attribute) and not call.args)
         ):
             bad.append(f"{call.lineno} (reads an answer whole: {name})")
         elif whole := whole_read(call):
@@ -480,15 +488,18 @@ def _unbounded_size(node: ast.expr | None) -> bool:
 
 def whole_read(call: ast.Call, *, bare_read: bool = False) -> str | None:
     """The method name when ``call`` reads a file or stream whole, else None: a call in
-    :data:`_WHOLE_FILE_READS`, or ``read()``, ``read(-1)``, ``read(None)`` or ``read(size=-1)``.
+    :data:`_WHOLE_FILE_READS`, or ``read()``, ``read(-1)``, ``read(None)`` or ``read(size=-1)``,
+    and ``readline`` in the same shapes, since one line with no newline is the whole file.
 
     A ``read`` counts only as a method call unless ``bare_read`` is set: the stream sinks name
-    their own reader function ``read``, and it is no file. A size held in a variable is taken as a
-    bound; this is a tripwire on the shapes that are unbounded on their face (BACKLOG #1127)."""
+    their own reader function ``read``, and it is no file. A ``readline`` counts only as a method
+    call. A size held in a variable is taken as a bound; this is a tripwire on the shapes that are
+    unbounded on their face (BACKLOG #1127). Iterating a file line by line is not seen."""
     name = _call_name(call)
     if name in _WHOLE_FILE_READS:
         return name
-    if name != "read" or not (bare_read or isinstance(call.func, ast.Attribute)):
+    method = isinstance(call.func, ast.Attribute)
+    if not ((name == "read" and (bare_read or method)) or (name == "readline" and method)):
         return None
     if call.args:
         size: ast.expr | None = call.args[0]
@@ -1032,13 +1043,14 @@ def test_self_test_whole_reads_are_flagged_and_bounded_reads_are_not(tmp_path: P
                 "fh.read()\nfh.read(-1)\nfh.read(None)\nfh.read(size=-1)\nfh.readlines()\n"
                 "fh.readlines(4096)\np.read_text()\np.read_bytes()\n"
                 "fh.read(CAP)\nfh.read(4096)\nfh.read(CAP + 1)\nfh.read(size=CAP)\nread()\n"
-                "fh.read(timeout=5)\nfh.readline(CAP)\n"
+                "fh.read(timeout=5)\nfh.readline(CAP)\nfh.readline()\nfh.readline(-1)\n"
+                "readline()\n"
             )
         )
         if isinstance(c, ast.Call)
     ]
     flagged = sorted(c.lineno for c in calls if whole_read(c))
-    assert flagged == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert flagged == [1, 2, 3, 4, 5, 6, 7, 8, 16, 17]
     bare = next(c for c in calls if c.lineno == 13)
     assert whole_read(bare) is None and whole_read(bare, bare_read=True) == "read"
     # Through a real axis: a planted sink that bounds at a cap but reads lines whole is caught.
@@ -1062,12 +1074,17 @@ def test_self_test_an_unbounded_api_read_is_flagged() -> None:
         "async def c(client):\n    async with client.stream('GET', url) as r:\n        pass\n"
         "def d(cfg):\n    return cfg.get('x'), json.loads(raw), reply.read(CAP)\n"
         "def e(self):\n    return self._client.post(url)\n"
+        "async def f(client, req):\n    r = await client.send(req)\n    return await r.aread()\n"
+        "async def g(client, req):\n    return httpx.get(url), await client.send(req, stream=True)\n"
     )
     assert unbounded_api_reads(tree) == [
         "2 (reads an answer whole: get)",
         "3 (reads an answer whole: json)",
         "5 (reads an answer whole: read)",
         "12 (reads an answer whole: post)",
+        "14 (reads an answer whole: send)",
+        "15 (reads an answer whole: aread)",
+        "17 (reads an answer whole: get)",
     ]
 
 

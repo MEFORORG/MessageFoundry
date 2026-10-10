@@ -471,7 +471,13 @@ def _status_read(body: bytes) -> tuple[int | None, dict[str, object] | None]:
     """``_get_status_json`` against an engine that answers 200 with ``body``."""
 
     async def run() -> tuple[int | None, dict[str, object] | None]:
-        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
+        # A stream, not content=: content= is read up front, and the helper reads the raw stream.
+        def answer(request: httpx.Request) -> httpx.Response:
+            # No content coding, so no compressed chunk is inflated past the cap.
+            assert request.headers["accept-encoding"] == "identity"
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        transport = httpx.MockTransport(answer)
         async with httpx.AsyncClient(transport=transport) as client:
             return await failover._get_status_json(client, "https://node.invalid/stats", None)
 
