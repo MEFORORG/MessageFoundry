@@ -194,7 +194,9 @@ class ProtocolFloorUnavailable(RuntimeError):
 
     ``serve`` refuses to start on this. The message names the hook and the installed versions, and
     :attr:`hook` holds the hook alone. A refusal from the startup self-test names no single hook, so
-    there it holds ``"startup self-test"`` and the message says what the test found."""
+    there it holds ``"startup self-test"`` and the message says what the test found. A missing
+    pinned HTTP parser (:func:`pinned_http_protocol_base`) raises it too, so ``serve`` refuses on
+    the same path; there :attr:`hook` holds ``"httptools"``, which names a module, not a hook."""
 
     hook: str = ""
 
@@ -556,9 +558,10 @@ def pinned_http_protocol_base() -> type[asyncio.Protocol]:
         from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
     except ImportError as exc:
         refused = ProtocolFloorUnavailable(
-            f"the API's pinned HTTP parser (BACKLOG #1125) is unavailable: httptools did not import "
-            f"({type(exc).__name__}). Install the httptools the lock pins; serve does not fall back "
-            "to h11, which frames some ambiguous requests differently"
+            "the API's pinned HTTP parser (BACKLOG #1125) is unavailable: uvicorn's httptools "
+            f"protocol did not import ({type(exc).__name__}, module {exc.name!r}). Install the "
+            "httptools and uvicorn the lock pins; serve does not fall back to h11, which frames "
+            "some ambiguous requests differently"
         )
         refused.hook = "httptools"
         raise refused from exc

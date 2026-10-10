@@ -88,7 +88,8 @@ def test_the_real_classes_pass(http_base: type[Any], ws_base: type[Any]) -> None
 
 
 def test_the_classes_serve_resolves_pass() -> None:
-    """What ``http="auto"`` and ``ws="auto"`` resolve to, which is what ``serve`` builds."""
+    """The pinned HTTP protocol (BACKLOG #1125) and what ``ws="auto"`` resolves to: what ``serve``
+    builds."""
     selftest_protocol_floor(floored_http_protocol_class(), floored_ws_protocol_class())
 
 

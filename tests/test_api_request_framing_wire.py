@@ -15,7 +15,8 @@ desync, where the server would answer bytes the sender meant as body.
 ambiguous shapes sent through uvicorn's h11 protocol, the one ``http="auto"`` falls back to, are
 answered twice where llhttp refuses them. That is the gap the pin closes.
 
-Measured on uvicorn 0.54.0 and httptools 0.8.0; ``tests/test_header_floor_wire.py`` pins uvicorn.
+Measured on uvicorn 0.54.0 and httptools 0.8.0. This suite pins httptools, and
+``tests/test_header_floor_wire.py`` pins uvicorn.
 """
 
 from __future__ import annotations
@@ -25,9 +26,9 @@ import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import httptools
 import pytest
 from uvicorn.protocols.http.h11_impl import H11Protocol
-from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 
 from messagefoundry.api import create_app
 from messagefoundry.api.protocol_headers import floored_http_protocol_class
@@ -35,6 +36,8 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from tests.test_header_floor_wire import _served
 
+#: The httptools this suite was measured against. See its test before moving it.
+_MEASURED_HTTPTOOLS = "0.8.0"
 #: The request each probe smuggles behind its first. ``/health`` answers it tokenless with a 200.
 _SMUGGLED = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
 _POST = b"POST /health HTTP/1.1\r\nHost: localhost\r\n"
@@ -122,22 +125,32 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _answers(port: int, request: bytes) -> tuple[list[int], bytes]:
-    """Send ``request`` then the smuggled one; return every status answered, and the raw bytes."""
+    """Send ``request`` then the smuggled one; return every status answered, and the raw bytes.
+
+    A refusal closes the server side while the smuggled bytes may still be in flight, and some
+    stacks answer that with a reset. Reading stops there and keeps what already arrived, so a reset
+    is scored on the answers it left, not raised as an error."""
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    raw = b""
     try:
         writer.write(request + _SMUGGLED)
         await writer.drain()
-        raw = await asyncio.wait_for(reader.read(), 10.0)
+        while chunk := await asyncio.wait_for(reader.read(65536), 10.0):
+            raw += chunk
+    except ConnectionResetError:
+        pass
     finally:
         writer.close()
     return [int(s) for s in re.findall(rb"HTTP/1\.[01] (\d{3}) ", raw)], raw
 
 
-def test_serve_builds_its_protocol_on_the_pinned_parser() -> None:
-    """The suite drives the class ``serve`` builds; this ties that class to llhttp."""
-    served = floored_http_protocol_class()
-    assert issubclass(served, HttpToolsProtocol)
-    assert not issubclass(served, H11Protocol)
+def test_the_suite_is_measuring_the_httptools_it_was_written_against() -> None:
+    """llhttp, vendored in httptools, decides which shapes are refused. A new release turns this
+    red until the shapes above are re-driven and the pin moves."""
+    assert httptools.__version__ == _MEASURED_HTTPTOOLS, (
+        f"httptools is {httptools.__version__}, and this suite measured {_MEASURED_HTTPTOOLS}. "
+        "Re-run the framing shapes against it, then move the pin."
+    )
 
 
 async def test_the_api_refuses_ambiguous_request_framing(engine: Engine) -> None:

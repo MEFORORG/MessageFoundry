@@ -1084,8 +1084,8 @@ def test_an_assignment_moved_into_a_nested_function_still_counts() -> None:
 
 
 def test_the_installed_uvicorn_passes_the_check() -> None:
-    """The control that matters for serve: the protocols the lock installs, and the ones
-    ``http="auto"`` and ``ws="auto"`` resolve to, all build."""
+    """The control that matters for serve: the protocols the lock installs, the pinned HTTP one
+    (``base=None``, BACKLOG #1125) and what ``ws="auto"`` resolves to, all build."""
     for base in (HttpToolsProtocol, H11Protocol, None):
         assert floored_http_protocol_class(base=base) is not None
     for ws_base in (WebSocketsSansIOProtocol, WebSocketProtocol, None):
