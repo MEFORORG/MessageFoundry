@@ -199,13 +199,15 @@ def test_the_suite_is_measuring_the_uvicorn_it_was_written_against() -> None:
 
 
 def test_pyproject_pins_the_versions_this_suite_measured() -> None:
-    """The base dependencies pin uvicorn and websockets exactly, to the versions measured here. A
-    range would let an install take a release nobody read; a pin that moved alone would leave the
-    suite red on every leg with no hint why."""
+    """The base dependencies pin uvicorn and websockets exactly, to the versions measured here, on
+    every platform. The installed-version test above cannot see a range that still resolves to the
+    measured version in the lock, though a fresh install could take a release nobody read."""
     pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    deps = {req.name: req for req in map(Requirement, pyproject["project"]["dependencies"])}
+    deps = list(map(Requirement, pyproject["project"]["dependencies"]))
     for name, measured in (("uvicorn", _MEASURED_UVICORN), ("websockets", _MEASURED_WEBSOCKETS)):
-        assert str(deps[name].specifier) == f"=={measured}", (name, str(deps[name].specifier))
+        (req,) = [r for r in deps if r.name == name]  # one entry, so no second spec beside it
+        assert req.marker is None, f"{name} is pinned on some platforms only: {req}"
+        assert str(req.specifier) == f"=={measured}", f"{name} is not pinned to {measured}: {req}"
 
 
 async def test_a_refused_handshake_on_the_wire_carries_the_floor(engine: Engine) -> None:

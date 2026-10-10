@@ -337,8 +337,18 @@ def test_the_stdlib_error_page_is_html_without_the_override(
     assert body.lstrip().startswith(b"<!DOCTYPE HTML>"), body[:80]
 
 
+def test_a_stdlib_error_page_does_not_echo_the_request() -> None:
+    """The stdlib puts the bad part of a request line in its reason. The plain-text body leaves
+    it out, so markup in the request reaches the body neither raw nor as escaped entities."""
+    with RestSink() as sink:
+        raw = _exchange(sink.port, b"GET /a<b>&c HTTP/x&<\r\n", half_close=True)
+    assert raw.startswith(b"HTTP/1.1 400 "), raw[:80]
+    _, body = _error_page(raw)
+    assert body.startswith(b"400 ") and b"<" not in body and b"&" not in body, body
+
+
 def test_the_error_page_cases_cover_every_stdlib_error_class() -> None:
-    """At least the 400, 414 and 501 the brief names, and the 431 and 505 beside them."""
+    """At least the 400, 414, 431, 501 and 505 that BACKLOG #1120 drives."""
     ids = [case.id for case in _STDLIB_ERROR_PAGES]
     assert len(ids) == 8, ids
     finals = {cast(list[int], case.values[1])[-1] for case in _STDLIB_ERROR_PAGES}

@@ -36,8 +36,8 @@ stdlib uses that form for an HTTP/0.9 request on every CPython read so far. Up t
 a version it refuses; 3.14.8 writes those with a status line itself. The sink answers all of them
 with a status line and a header block, like any other; the handler's ``request_version`` says how.
 
-The stdlib's own error answers are ``text/plain``, not its default HTML page; the handler's
-``error_content_type`` says why that covers each one.
+The stdlib's own error answers are ``text/plain``, not its default HTML page. The comment on the
+handler's ``error_content_type`` names the paths that were read.
 """
 
 from __future__ import annotations
@@ -203,11 +203,14 @@ def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002  (stdlib name)
             return  # silenced: a request line can carry a message-derived path
 
-        # Every error answer the stdlib writes goes through send_error, which reads these two:
-        # the 400, 431 and 505 from parse_request, and the 414 and 501 from handle_one_request.
-        # Its defaults are an HTML page; plain text leaves a browser nothing to render.
+        # The stdlib writes its own error answers through send_error, which reads these two. Read
+        # at CPython 3.14.6, that is at least parse_request's 400, 431 and 505 and
+        # handle_one_request's 414 and 501. The stdlib default is an HTML page. Plain text leaves
+        # a browser nothing to render. The body carries the status and the stdlib's fixed
+        # explanation, never %(message)s: that can echo the request line, and send_error
+        # HTML-escapes it, which would read as entities in a text/plain body.
         error_content_type = "text/plain; charset=utf-8"
-        error_message_format = "%(code)d %(message)s\n%(explain)s\n"
+        error_message_format = "%(code)d %(explain)s\n"
 
         def end_headers(self) -> None:
             # The one place the baseline is added. The stdlib ends every header block it writes

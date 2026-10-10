@@ -5,8 +5,8 @@
 :mod:`messagefoundry.api.protocol_headers` checks the SHAPE of the server classes it overrides: a
 method is there, an attribute is assigned. A shape can hold while the behaviour moves, and the wire
 suite drives only the uvicorn and websockets versions ``pyproject.toml`` pins. An install that does
-not honour the pins can carry others. This module closes that gap by measuring behaviour on whatever
-is installed. It hands the floored classes
+not honour the pins can carry others. This module narrows that gap by measuring behaviour on
+whatever is installed, for the families listed below. It hands the floored classes
 the bytes that make the server answer on its own, reads what the server wrote, and refuses the start
 when a header is missing.
 

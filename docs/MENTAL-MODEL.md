@@ -546,7 +546,7 @@ Version floors carry security rationale, not just compatibility — e.g. cryptog
 
 ### How they’re pinned and kept current
 
-Dependencies are declared in two tiers. pyproject.toml states loose \>= minimums — the contract of lowest acceptable versions, each with a security floor. requirements.lock is the fully-pinned, hash-locked lockfile exported from uv.lock (via the uv tool); installs require those hashes, so every deployment gets the exact, tamper-checked tree.
+Dependencies are declared in two tiers. pyproject.toml states loose \>= minimums — the contract of lowest acceptable versions, each with a security floor. uvicorn and websockets are the exception: the protocol header floor pins each to the one version it was measured on. requirements.lock is the fully-pinned, hash-locked lockfile exported from uv.lock (via the uv tool); installs require those hashes, so every deployment gets the exact, tamper-checked tree.
 
 - **Change deps only in** pyproject.toml**, then re-lock** (uv lock + uv export) — never an ad-hoc pip install.
 

@@ -116,10 +116,13 @@ updates:
     # that moves the pyproject spec to a validated 7.4.
     #
     # `uvicorn` and `websockets` are exact `==` pins in the base dependencies (BACKLOG #1120). Each
-    # entry starts at the pin's next minor, per THE RULE below, so the patch track stays open. Why
-    # each pin exists is beside it in pyproject.toml; read it there. pyproject.toml declares plain
-    # `uvicorn`, not `uvicorn[standard]`, so the bare name here matches it as written. Move each
-    # entry in the same PR that moves its pin.
+    # entry starts at the pin's next minor, per THE RULE below. A patch release still gets a PR,
+    # and tests/test_header_floor_wire.py reds it until someone re-reads the server and moves
+    # the measured version with the pin. That was true under the old ranges too. The entries also
+    # withhold the security track from the next minor on; pip-audit still sees an advisory. Why
+    # each pin exists is beside it in pyproject.toml. pyproject.toml declares plain `uvicorn`,
+    # not `uvicorn[standard]`, so the bare name here matches it as written. Move each entry in the
+    # same PR that moves its pin.
     #
     # `pydicom`, `webauthn` and `pynetdicom` are the same WIDENED-CAP case (BACKLOG #2505). A major
     # cap needs its entry as much as a minor one: `python-deps-major` is one batch on `*`, so a
