@@ -317,6 +317,7 @@ from messagefoundry.config.secretprovider import (
 )
 from messagefoundry.config.settings import (
     AiSettings,
+    AlertRule,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -4017,7 +4018,20 @@ def create_app(
         comment-preserving, validate-before-persist writer (``connections_edit``) and reflects it on the
         live registry **without a reload** (a cosmetic-field replace — no connector rebuild, no delivery
         change). A **code-first** connection has no TOML home and is refused **409** (the scope fork).
-        Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path."""
+        Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path.
+
+        A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
+        other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
+        engine looks the name up, so a 200 against a 409 cannot tell it which names are
+        TOML-managed. Unlike :func:`_guarded_direction` it needs no runner: with none, an in-scope
+        name reaches the engine, which answers for the connections file alone."""
+        rr = engine.registry_runner
+        if identity.allowed_channels is not None and (
+            req.direction != "inbound"
+            or not identity.can_access_channel(name)
+            or (rr is not None and name not in rr.registry.inbound)
+        ):
+            await _deny_connection(engine, identity, name, client_ip(request))
         try:
             fingerprint = await engine.set_connection_flag(
                 name, direction=req.direction, flagged=req.flagged
@@ -7547,14 +7561,29 @@ def create_app(
     @app.get("/alerts/rules", response_model=AlertsConfig)
     async def alerts_rules(
         request: Request,
+        # Named `_user`, though read below: the console calls this handler by keyword across the
+        # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
         """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine/DB
         access. No secrets: the webhook URL, SMTP password and username are never returned —
-        transports are reported present-or-not. Gated by monitoring:read like /stats."""
+        transports are reported present-or-not. Gated by monitoring:read like /stats.
+
+        A channel-scoped caller sees only the rules that name no connection outside its scope
+        (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
+        is unset or in its scope. Scope membership is exact text, so any other glob, such as
+        ``IB_ACME_*``, is withheld."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
+
+        def visible(rule: AlertRule) -> bool:
+            return (rule.connection == "*" or _user.can_access_channel(rule.connection)) and (
+                rule.control_target is None or _user.can_access_channel(rule.control_target)
+            )
+
+        rules = [r for r in alerts.rules if visible(r)]
+
         return AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
             webhook_timeout=alerts.webhook_timeout,
@@ -7588,7 +7617,7 @@ def create_app(
                     schedule_configured=r.schedule
                     is not None,  # #81 — schedule-gated (present-or-not)
                 )
-                for r in alerts.rules
+                for r in rules
             ],
         )
 

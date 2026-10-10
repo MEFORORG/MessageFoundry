@@ -351,12 +351,18 @@ _LOOKUP_ROUTES = (
 
 
 async def _probe(
-    c: httpx.AsyncClient, engine: Engine, h: dict[str, str], method: str, path: str
+    c: httpx.AsyncClient,
+    engine: Engine,
+    h: dict[str, str],
+    method: str,
+    path: str,
+    *,
+    json: object = None,
 ) -> tuple[int, object, list[tuple[str, str | None]]]:
     """One request's status, JSON body, and the audit rows it wrote as (action, channel_id)."""
     latest = await engine.store.list_audit(limit=1)  # newest first
     last_id = latest[0]["id"] if latest else 0
-    r = await c.request(method, path, headers=h)
+    r = await c.request(method, path, headers=h, json=json)
     # One request writes a few rows at most, so the newest 50 hold all of them.
     rows = [r2 for r2 in await engine.store.list_audit(limit=50) if r2["id"] > last_id]
     return r.status_code, r.json(), [(row["action"], row["channel_id"]) for row in rows]

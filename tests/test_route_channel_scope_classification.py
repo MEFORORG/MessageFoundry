@@ -58,7 +58,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AlertRule, AlertsSettings, AuthSettings
 from messagefoundry.pipeline import Engine
 from scripts.security.route_gates import route_rows
 from tests._admin_account import create_local_user_chosen
@@ -67,7 +67,6 @@ from tests._admin_account import create_local_user_chosen
 # probe stand on one seeded estate: inbounds IB_A and IB_B, and the shared outbound OB_X.
 from tests.test_monitoring_scope_doc_drift import (  # noqa: F401
     PW,
-    _client,
     _login,
     engine,
 )
@@ -101,7 +100,7 @@ ROUTES: dict[str, tuple[str, str]] = {
     "GET /me/security-events": (
         NOT_CHANNEL_BEARING,
         "the caller's own authentication events; a channel named there is one the caller itself "
-        "asked for (the username keying is a separate #1152 limb, not a channel-scope one)",
+        "asked for (the username keying is bounded by the account's created_at, #1152)",
     ),
     "DELETE /me/sessions/{session_id}": (NOT_CHANNEL_BEARING, "the caller's own session"),
     "DELETE /me/sessions": (NOT_CHANNEL_BEARING, "the caller's own sessions"),
@@ -153,8 +152,8 @@ ROUTES: dict[str, tuple[str, str]] = {
     "POST /connections/{name}/stop": (SCOPED, "scope checked before the name is looked up"),
     "POST /connections/{name}/restart": (SCOPED, "scope checked before the name is looked up"),
     "POST /connections/{name}/flag": (
-        KNOWN_UNSCOPED_1152,
-        "#1152: the connection-flag object check is not built",
+        SCOPED,
+        "a scoped caller flags only an inbound in its scope; scope checked before the name",
     ),
     "GET /connections/{name}/metadata": (SCOPED, "403 outside the caller's scope"),
     "POST /connections/{name}/test": (SCOPED, "403 outside the caller's scope"),
@@ -170,7 +169,7 @@ ROUTES: dict[str, tuple[str, str]] = {
     "POST /alerts/{alert_id}/suspend": (SCOPED, "the instance is read through the caller's scope"),
     "POST /alerts/{alert_id}/resume": (SCOPED, "the instance is read through the caller's scope"),
     "POST /alerts/test-email": (NOT_CHANNEL_BEARING, "sends a fixed test notice"),
-    "GET /alerts/rules": (KNOWN_UNSCOPED_1152, "#1152: every rule's connection, unfiltered"),
+    "GET /alerts/rules": (SCOPED, "only rules naming no connection outside the caller's scope"),
     # --- dead letters and approvals -------------------------------------------------------------
     "GET /dead-letters": (SCOPED, "narrowed to the caller's channels"),
     "POST /dead-letters/replay": (SCOPED, "the requested channel is checked against the scope"),
@@ -398,8 +397,22 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
     await service.initialize()
     await _probe_user(service, "scoped", ["IB_A"])
     await _probe_user(service, "wide", [ALL_CHANNELS])
+    # Alert rules naming the out-of-scope estate, so GET /alerts/rules has something to withhold:
+    # one by its match, one by the connection its control action targets.
+    alerts = AlertsSettings(
+        rules=[
+            AlertRule(connection=_OUT_CHANNEL),
+            AlertRule(
+                event_type="connection_stopped",
+                connection=_IN_CHANNEL,
+                control_action="restart_outbound",
+                control_target=_SHARED_OUT,
+            ),
+        ]
+    )
+    app = create_app(engine, auth=service, alerts_settings=alerts)
 
-    async with _client(engine, service) as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         s = await _login(c, "scoped")
         w = await _login(c, "wide")
         presets: dict[str, str] = {}
