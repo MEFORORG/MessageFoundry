@@ -919,12 +919,15 @@ class _FtpClient(_RemoteClient):
             return out
         except (ftplib.error_perm, ftplib.error_proto):
             pass
-        # NLST may answer with bare names or with names prefixed by the directory asked for. Only
-        # that exact prefix is removed; anything else reaches the guard as the server sent it.
-        # Reject, never rewrite (ASVS 5.3.2): a basename fold would read ../x/a.hl7 as a.hl7.
-        prefix = posixpath.join(remote_dir, "")
+        # NLST answers with at least bare names or names prefixed by the directory asked for, as the
+        # client spelled it or with its trailing slashes collapsed. Only one of those exact prefixes
+        # is removed; any other shape (a resolved absolute path, a relative one) reaches the guard
+        # as sent and is refused, an interop cost taken on purpose. Reject, never rewrite (ASVS
+        # 5.3.2): a basename fold would read ../x/a.hl7 as a.hl7.
+        spellings = {remote_dir + "/", remote_dir.rstrip("/") + "/"} if remote_dir else set()
+        prefixes = sorted(spellings, key=len, reverse=True)  # longest first: "/in//" before "/in/"
         for name in ftp.nlst(remote_dir):
-            base = name.removeprefix(prefix)
+            base = next((name[len(p) :] for p in prefixes if name.startswith(p)), name)
             if base in (".", ".."):
                 continue
             # A name the listing guard refuses gets no remote operation here: SIZE would act on a
@@ -957,6 +960,9 @@ class _FtpClient(_RemoteClient):
             }
         except (ftplib.error_perm, ftplib.error_proto):
             pass
+        # The basename fold is kept here on purpose, unlike in _list: these names are only compared,
+        # to keep a publish from taking a name already present, so folding can only make a name
+        # look taken. No path is built from them.
         names = {posixpath.basename(name) for name in ftp.nlst(remote_dir)}
         return names - {".", ".."}
 

@@ -784,10 +784,10 @@ SITES: dict[str, Site] = {
         called=True,
     ),
     "messagefoundry/transports/remotefile.py::_FtpClient._list": Site(
-        2,
+        1,
         GUARDED,
-        "An NLST entry loses only the exact `remote_dir/` prefix (the first join builds it) and is "
-        "never folded, so `../x/a.hl7` reaches the guard as sent. It is sized only when the guard "
+        "An NLST entry loses only an exact `remote_dir/` prefix (as spelled, or with trailing "
+        "slashes collapsed) and is never folded, so `../x/a.hl7` reaches the guard as sent. It is sized only when the guard "
         "accepts it (BACKLOG #1130); a refused one still lists, unsized, for the poll loop to "
         "refuse and log.",
         "messagefoundry/transports/remotefile.py::_is_contained_name",

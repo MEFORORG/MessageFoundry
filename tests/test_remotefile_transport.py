@@ -2251,38 +2251,45 @@ def test_nlst_fallback_never_sizes_a_name_the_listing_guard_refuses() -> None:  
 
 
 @pytest.mark.parametrize(
-    ("entry", "expected"),
-    [("a.hl7", "a.hl7"), ("/in/a.hl7", "a.hl7"), ("file with spaces.hl7", "file with spaces.hl7")],
+    ("remote_dir", "entry", "expected"),
+    [
+        ("/in", "a.hl7", "a.hl7"),
+        ("/in", "/in/a.hl7", "a.hl7"),
+        ("/in", "file with spaces.hl7", "file with spaces.hl7"),
+        ("/in/", "/in/a.hl7", "a.hl7"),  # trailing slash collapsed
+        ("/in/", "/in//a.hl7", "a.hl7"),  # trailing slash as the client spelled it
+        ("/", "/a.hl7", "a.hl7"),  # the root
+        ("in", "in/a.hl7", "a.hl7"),  # a relative directory, echoed as given
+    ],
 )
 def test_nlst_accepts_a_bare_name_or_one_under_the_exact_directory(
-    entry: str, expected: str
+    remote_dir: str, entry: str, expected: str
 ) -> None:  # #1130
     ftp = _NlstOnlyFtp([entry])
-    listed = _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    listed = _FtpClient._list(ftp, remote_dir)  # type: ignore[arg-type]
     assert [(e.name, e.size) for e in listed] == [(expected, 7)]
-    assert ftp.sized == [f"/in/{expected}"]
+    assert ftp.sized == [posixpath.join(remote_dir, expected)]
 
 
 @pytest.mark.parametrize(
-    "entry",
+    ("entry", "listed_as"),
     [
-        "../x/a.hl7",  # a basename fold would have read this as a.hl7
-        "/other/a.hl7",  # another directory
-        "/in/sub/a.hl7",  # a subdirectory of the one asked for
-        "/inbox/a.hl7",  # a sibling whose name starts with the directory's
-        "/in//a.hl7",  # the prefix, then an absolute remainder
-        "in/a.hl7",  # the directory without its leading slash: not the exact prefix
+        ("../x/a.hl7", "../x/a.hl7"),  # a basename fold would have read this as a.hl7
+        ("/other/a.hl7", "/other/a.hl7"),  # another directory
+        ("/in/sub/a.hl7", "sub/a.hl7"),  # a subdirectory of the one asked for
+        ("/inbox/a.hl7", "/inbox/a.hl7"),  # a sibling whose name starts with the directory's
+        ("/in//a.hl7", "/a.hl7"),  # the prefix, then an absolute remainder
+        ("in/a.hl7", "in/a.hl7"),  # the directory without its leading slash: not the exact prefix
     ],
 )
-def test_nlst_never_rewrites_any_other_entry(entry: str) -> None:  # #1130
-    # Reject, never rewrite: the entry reaches the listing exactly as the server sent it, or as the
-    # remainder after the exact `remote_dir/` prefix, unsized, and the poll loop's guard refuses it.
+def test_nlst_never_rewrites_any_other_entry(entry: str, listed_as: str) -> None:  # #1130
+    # Reject, never rewrite: the entry lists as the server sent it, less only the exact `/in/`
+    # prefix, unsized, and the poll loop's guard refuses it.
     ftp = _NlstOnlyFtp([entry])
     listed = _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
     assert ftp.sized == []
-    assert [e.size for e in listed] == [0]
-    assert listed[0].name in (entry, entry.removeprefix("/in/"))
-    assert _is_contained_name(listed[0].name) is False
+    assert [(e.name, e.size) for e in listed] == [(listed_as, 0)]
+    assert _is_contained_name(listed_as) is False
 
 
 async def test_a_folded_nlst_entry_is_refused_by_the_poll_loop(
