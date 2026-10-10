@@ -12,7 +12,14 @@
 //     answer must not overwrite a cached deny; that is mergeAuthoritativePolicy's job.
 import * as vscode from "vscode";
 import { peekToken } from "./auth";
-import { type AiPolicy, evaluatedPermission, mergeAuthoritativePolicy } from "./aiPolicyModel";
+import {
+  type AiPolicy,
+  type CachedAiPolicy,
+  UNVERIFIED_POLICY,
+  cachedPolicyOffline,
+  evaluatedPermission,
+  mergeAuthoritativePolicy,
+} from "./aiPolicyModel";
 import { engineUrl, runJson, workspaceDir } from "./cli";
 import { getJson } from "./engineClient";
 import { ASSIST_GATE_PLAN } from "./engineStatusModel";
@@ -39,20 +46,11 @@ export interface AiPolicyWire {
 }
 
 // globalState key holding the last authoritative (engine) policy, so a previously-seen central
-// "off" / ai:assist deny is not overridable simply by taking the engine offline (SEC-022).
+// "off" / ai:assist deny is not overridable simply by taking the engine offline (SEC-022). It is
+// stamped with when the engine answered, so a cached answer that ENABLES assistance expires
+// (BACKLOG #1154; see cachedPolicyOffline). The fail-closed UNVERIFIED_POLICY lives in
+// aiPolicyModel, beside the rule that uses it.
 const LAST_POLICY_KEY = "messagefoundry.lastAiPolicy";
-
-// Fail-closed fallback used when the engine is unreachable, no cached authoritative policy exists,
-// AND the local CLI can't positively confirm a policy: assistance is DISABLED rather than silently
-// re-enabling BYO. The "unverified" mode is mapped to {enabled:false} by assistantState (SEC-022,
-// CWE-636 — an org-set central "off" must not fail open just because the engine is unreachable).
-const UNVERIFIED_POLICY: AiPolicy = {
-  mode: "unverified",
-  dataScope: "code_only",
-  environment: null,
-  assistPermitted: null,
-  reason: null,
-};
 
 /**
  * Wire → resolved policy. `AiPolicyWire` is a claim about a response, not a guarantee: `JSON.parse`
@@ -72,14 +70,22 @@ function fromWire(w: AiPolicyWire): AiPolicy {
 
 /**
  * Pick the policy when the authoritative engine is unreachable. Pure + testable. Order:
- *   (a) the last cached authoritative (engine) policy, if any — so a previously-seen central "off" /
- *       ai:assist deny survives going offline; else
+ *   (a) the last cached authoritative (engine) policy, if any, as {@link cachedPolicyOffline} lets it
+ *       stand — so a previously-seen central "off" / ai:assist deny survives going offline, and a
+ *       cached answer that enables assistance stops doing so once it is too old (BACKLOG #1154); else
  *   (b) the local CLI's policy, if it positively returned one (it may itself carry mode "off"); else
  *   (c) the fail-closed UNVERIFIED policy (assistance disabled) — NEVER silently re-enable BYO.
+ *
+ * An expired cache does NOT fall through to (b). An IDE that holds a cache has heard from the
+ * engine, which is the authority; a local file must not outrank it once its answer expires.
  */
-export function pickOfflinePolicy(cached: AiPolicy | null, cli: AiPolicy | null): AiPolicy {
+export function pickOfflinePolicy(
+  cached: CachedAiPolicy | null,
+  cli: AiPolicy | null,
+  nowMs: number = Date.now(),
+): AiPolicy {
   if (cached) {
-    return cached;
+    return cachedPolicyOffline(cached, nowMs);
   }
   if (cli) {
     return cli;
@@ -97,6 +103,8 @@ export interface AiPolicyIo {
   readToken: (ctx: vscode.ExtensionContext, url: string) => Promise<string | undefined>;
   getPolicy: (url: string, route: string, token: string | undefined) => Promise<AiPolicyWire>;
   getCliPolicy: () => Promise<AiPolicyWire>;
+  /** The clock the cache is stamped and aged by, in epoch milliseconds. Defaults to `Date.now`. */
+  now?: () => number;
 }
 
 /**
@@ -130,6 +138,7 @@ export async function resolveAiPolicy(
   ctx: vscode.ExtensionContext,
   io: AiPolicyIo = DEFAULT_AI_POLICY_IO,
 ): Promise<AiPolicy> {
+  const now = io.now ?? Date.now;
   try {
     const url = io.url();
     const plan = ASSIST_GATE_PLAN[0];
@@ -145,22 +154,24 @@ export async function resolveAiPolicy(
     // deny — a degraded read UPGRADING assistance a central policy had switched off. The merge keeps
     // the deny and nothing else; see mergeAuthoritativePolicy for why it is one-way.
     const merged = mergeAuthoritativePolicy(
-      ctx.globalState.get<AiPolicy>(LAST_POLICY_KEY) ?? null,
+      ctx.globalState.get<CachedAiPolicy>(LAST_POLICY_KEY) ?? null,
       fresh,
     );
-    await ctx.globalState.update(LAST_POLICY_KEY, merged); // remember the authoritative answer
+    // Remember the authoritative answer, stamped with when it was given (BACKLOG #1154).
+    const stamped: CachedAiPolicy = { ...merged, cachedAt: now() };
+    await ctx.globalState.update(LAST_POLICY_KEY, stamped);
     return merged;
   } catch {
     // Engine unreachable or errored — fall back to the cached authoritative / CLI / fail-closed view.
   }
-  const cached = ctx.globalState.get<AiPolicy>(LAST_POLICY_KEY) ?? null;
+  const cached = ctx.globalState.get<CachedAiPolicy>(LAST_POLICY_KEY) ?? null;
   let cli: AiPolicy | null = null;
   try {
     cli = fromWire(await io.getCliPolicy());
   } catch {
     // CLI unavailable too (no Python / no workspace / untrusted) — leave cli null.
   }
-  return pickOfflinePolicy(cached, cli);
+  return pickOfflinePolicy(cached, cli, now());
 }
 
 /** Fetch the current policy and surface it to the user (command: messagefoundry.showAiPolicy). */

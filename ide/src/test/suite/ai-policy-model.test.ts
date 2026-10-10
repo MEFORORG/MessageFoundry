@@ -2,7 +2,13 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
 
-import { assistantState, mergeAuthoritativePolicy, type AiPolicy } from "../../aiPolicyModel";
+import {
+  CACHED_PERMIT_MAX_AGE_MS,
+  assistantState,
+  cachedPolicyOffline,
+  mergeAuthoritativePolicy,
+  type AiPolicy,
+} from "../../aiPolicyModel";
 
 // BACKLOG #330, defect 1 — the authoritative-merge guard, and its coupling to the gate it feeds.
 //
@@ -124,5 +130,59 @@ suite("mergeAuthoritativePolicy (BACKLOG #330 — a degraded read must not upgra
     });
     assert.strictEqual(merged.assistPermitted, null);
     assert.ok("assistPermitted" in merged, "the key is present, not dropped");
+  });
+});
+
+// BACKLOG #1154 (ASVS 8.3.2) — the age bound on a cached answer, asserted node-side for the reason
+// the header gives. The rule is asymmetric like the merge: a cached ENABLE expires, a cached
+// DISABLE never does. Each pole needs its own test, or a rule that expired everything (or nothing)
+// would pass.
+suite("cachedPolicyOffline (BACKLOG #1154 — a cached permit expires, a cached deny does not)", () => {
+  const NOW = 1_800_000_000_000;
+  const FRESH = NOW - 60_000; // a minute old
+  const STALE = NOW - CACHED_PERMIT_MAX_AGE_MS - 1;
+
+  test("C1: a fresh cached permit still enables assistance offline", () => {
+    const p = cachedPolicyOffline({ ...policy({ assistPermitted: true }), cachedAt: FRESH }, NOW);
+    assert.strictEqual(p.mode, "byo");
+    assert.strictEqual(assistantState(p).enabled, true);
+    assert.ok(!("cachedAt" in p), "the stamp does not leak into the returned policy");
+  });
+
+  test("C2: a cached permit past the bound fails closed", () => {
+    const p = cachedPolicyOffline({ ...policy({ assistPermitted: true }), cachedAt: STALE }, NOW);
+    assert.strictEqual(p.mode, "unverified");
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("C3: the bound is inclusive at exactly the limit, and exclusive one millisecond past it", () => {
+    const at = { ...policy({ assistPermitted: true }), cachedAt: NOW - CACHED_PERMIT_MAX_AGE_MS };
+    assert.strictEqual(assistantState(cachedPolicyOffline(at, NOW)).enabled, true);
+    assert.strictEqual(assistantState(cachedPolicyOffline(at, NOW + 1)).enabled, false);
+  });
+
+  test("C4: an unknown permit (null) under byo expires like a permit, since it enables", () => {
+    const p = cachedPolicyOffline({ ...policy({ assistPermitted: null }), cachedAt: STALE }, NOW);
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("C5: a cache with no stamp (written before the bound) cannot vouch for a permit", () => {
+    const p = cachedPolicyOffline(policy({ assistPermitted: true }), NOW);
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("C6: a stamp from the future (a clock stepped back) cannot vouch for a permit", () => {
+    const p = cachedPolicyOffline({ ...policy({ assistPermitted: true }), cachedAt: NOW + 1 }, NOW);
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("C7: a cached deny survives any age — the SEC-022 rule is unchanged", () => {
+    for (const cachedAt of [FRESH, STALE, undefined]) {
+      const deny = cachedPolicyOffline({ ...policy({ assistPermitted: false }), cachedAt }, NOW);
+      assert.strictEqual(deny.assistPermitted, false);
+      assert.strictEqual(deny.mode, "byo", "the deny itself is returned, with its own message");
+      const off = cachedPolicyOffline({ ...policy({ mode: "off" }), cachedAt }, NOW);
+      assert.strictEqual(off.mode, "off");
+    }
   });
 });
