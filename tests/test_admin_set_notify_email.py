@@ -62,8 +62,10 @@ def _seed(
     admin_email: str | None = None,
     admin_disabled: bool = False,
     viewer: bool = False,
+    key: str | None = None,
 ) -> None:
-    """A keyless store holding one Administrator, provisioned the way the command does it.
+    """A store holding one Administrator, provisioned the way the command does it; keyless unless
+    ``key`` is given.
 
     Built through ``provision_first_administrator`` rather than ``initialize()``, so no bootstrap
     account is minted and the Administrator here is the only one. ``viewer`` adds a second, enabled,
@@ -71,7 +73,11 @@ def _seed(
     """
 
     async def run() -> None:
-        store = await MessageStore.open(db)
+        if key is None:
+            store = await MessageStore.open(db)
+        else:
+            cipher = make_cipher(key)
+            store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
             service = AuthService(store, AuthSettings())
             outcome = await service.provision_first_administrator(
@@ -157,25 +163,29 @@ async def _start(app: object) -> None:
         pass
 
 
-def test_the_setter_unstrands_an_administrator_provisioned_without_an_address(
+def test_the_setter_unstrands_an_administrator_with_no_address(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """THE WAVE'S ACCEPTANCE CHECK, end to end through the real lifespan.
 
-    Provision with no ``--email``; the next start is refused. Run the setter; the next start passes.
-    The refusal half is the control: without it, a passing second start is equally consistent with
-    an app that starts whatever the store holds.
+    An enabled Administrator with no address; the next start is refused. Run the setter; the next
+    start passes. The refusal half is the control: without it, a passing second start is equally
+    consistent with an app that starts whatever the store holds.
+
+    ``provision-admin`` can no longer leave this state, since BACKLOG #1138 made ``--email``
+    required, so the Administrator is written through the service, as a store an earlier build
+    wrote would hold it. The old no-address invocation is pinned as refused here too.
     """
     monkeypatch.chdir(tmp_path)
     key = generate_key()
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
-    _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = tmp_path / "strand.db"
-    assert main(["provision-admin", "--username", _ADMIN, "--db", str(db)]) == 0
-    warned = capsys.readouterr().out
-    assert "WARNING: no notification address" in warned
-    # The warning points at the exit that works, not at a re-run provision-admin refuses.
-    assert _CMD in warned
+    with pytest.raises(SystemExit) as no_email:
+        main(["provision-admin", "--username", _ADMIN, "--db", str(db)])
+    assert no_email.value.code == 2
+    assert not db.exists()
+    capsys.readouterr()
+    _seed(db, key=key)
 
     with pytest.raises(RuntimeError) as refused:
         asyncio.run(_start(_shipped_posture_app(db, key)))

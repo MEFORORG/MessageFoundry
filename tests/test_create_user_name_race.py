@@ -413,7 +413,18 @@ def test_the_cli_reports_a_lost_race_as_the_refusal_not_as_a_bad_store(
         await original(self, **kwargs)
 
     monkeypatch.setattr(MessageStore, "create_user", racing)
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
     assert "was created while this command ran" in error
@@ -429,7 +440,18 @@ def test_the_cli_reports_an_unnamed_integrity_refusal_as_a_refused_write(
         raise sqlite3.IntegrityError("some other constraint")
 
     monkeypatch.setattr(MessageStore, "create_user", refused)
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
     assert error.startswith("the store refused one of this command's writes")
@@ -449,7 +471,18 @@ def test_the_cli_reports_a_server_backends_integrity_refusal_as_a_refused_write(
         raise UniqueViolationError("duplicate key value violates unique constraint")
 
     monkeypatch.setattr(MessageStore, "create_user", refused)
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
     assert error.startswith("the store refused one of this command's writes")
@@ -500,7 +533,15 @@ def test_the_cli_refused_write_names_the_class_and_never_the_driver_text(
         raise raised
 
     monkeypatch.setattr(MessageStore, "create_user", refused)
-    argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--db",
+        str(db),
+    ]
     rc = main(argv + (["--json"] if as_json else []))
     captured = capsys.readouterr()
     assert rc == 1

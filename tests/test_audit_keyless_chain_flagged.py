@@ -99,7 +99,18 @@ def test_provision_admin_refuses_with_no_key_in_the_shell(
     the key belongs in THIS shell, and create nothing -- a store left behind would be keyless."""
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "provision.db"
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     assert rc != 0
     error = json.loads(capsys.readouterr().out)["error"]
     assert "MEFOR_STORE_ENCRYPTION_KEY" in error
@@ -117,7 +128,21 @@ def test_provision_admin_honours_the_same_audited_opt_out_serve_does(
     monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT", "true")
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "optout.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 0
+    )
     assert "KEYLESS" in capsys.readouterr().err
 
 
@@ -131,7 +156,21 @@ def test_the_documented_order_with_the_key_in_the_shell_keys_the_chain_from_row_
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "keyed.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 0
+    )
 
     async def check() -> None:
         cipher = make_cipher(key)
@@ -350,7 +389,18 @@ def test_provision_admin_refuses_a_configured_key_the_provider_did_not_resolve(
     monkeypatch.setenv(variable, value)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "mismatch.db"
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     out = capsys.readouterr().out
     assert rc == 2, out  # BACKLOG #1916: every keyless refusal is "could not start"
     error = json.loads(out)["error"]
@@ -400,7 +450,18 @@ def test_provision_admin_with_a_vault_provider_is_not_refused_as_keyless(
     monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "vault")
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "vault.db"
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc != 0, error
     assert "no store key is set in this shell" not in error, "a Vault key is a configured key"
