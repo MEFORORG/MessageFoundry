@@ -36,7 +36,14 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
-from messagefoundry.store import FailOutcome, MessageStatus, MessageStore, OutboxItem, OutboxStatus
+from messagefoundry.store import (
+    FailOutcome,
+    MessageStatus,
+    MessageStore,
+    OutboxItem,
+    OutboxStatus,
+    Stage,
+)
 from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
 from tests._refusal_log_capture import TOKEN, assert_no_token, until
 
@@ -462,11 +469,32 @@ async def test_a_stop_that_dead_letters_at_the_cap_says_so(
         await store.dead_letter_now(item.id, "clear the lane for the next case")
 
 
+async def _ingest_row(store: MessageStore, stage: str) -> tuple[str, OutboxItem]:
+    """A real claimed ingress row, or a real claimed routed row, as each STOP arm meets it."""
+    mid = await store.enqueue_ingress(channel_id="c1", raw=_adt(1), now=100.0)
+    row = await store.claim_next_fifo("c1", now=1e12, stage=Stage.INGRESS.value)
+    assert row is not None and row.stage == Stage.INGRESS.value
+    if stage == "transform":
+        assert await store.route_handoff(
+            ingress_id=row.id,
+            message_id=mid,
+            channel_id="c1",
+            handlers=[("h", _adt(1))],
+            disposition=MessageStatus.ROUTED,
+            now=101.0,
+        )
+        row = await store.claim_next_fifo("c1", now=1e12, stage=Stage.ROUTED.value)
+        assert row is not None and row.stage == Stage.ROUTED.value
+    return mid, row
+
+
 @pytest.mark.parametrize("stage", ["router", "transform"])
-async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_so(
+async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
     store: MessageStore, caplog: pytest.LogCaptureFixture, stage: str
 ) -> None:
-    # Item 5, the router and transform STOP arms, which use the finite delivery defaults.
+    # Item 5, the router and transform STOP arms, which take the cap from the delivery defaults.
+    # Their dead row is an ingress or routed row, which the outbound-only dead-letter queue never
+    # lists, so the line names the message and the per-message replay, which does re-queue it.
     caplog.set_level(logging.WARNING, logger=LOGGER)
     runner = RegistryRunner(
         Registry(),
@@ -475,8 +503,7 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_so(
         delivery_defaults=RetryPolicy(max_attempts=1, **FAST),
         internal_error_default=InternalErrorPolicy.STOP,
     )
-    await _enqueue(store, 1)
-    item = await _claim(store)
+    mid, item = await _ingest_row(store, stage)
     apply = (
         runner._apply_router_internal_error
         if stage == "router"
@@ -486,7 +513,17 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_so(
     assert outcome is wiring_runner._ItemOutcome.STOPPED
     assert await _status(store, item.id) == OutboxStatus.DEAD.value
     (said,) = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
-    assert f"{stage} worker 'c1': row {item.id}" in said.getMessage()
+    text = said.getMessage()
+    assert f"{stage} worker 'c1': row {item.id} (message {mid})" in text
+    assert "replay it from the dead-letter queue" not in text
+    assert "not in the dead-letter queue" in text and "replaying the message" in text
+    # What the line tells the operator holds: the view does not list it, the message reads ERROR,
+    # and the per-message replay re-queues the dead row.
+    assert await store.count_dead(allowed_channels=None) == 0
+    (msg,) = await store.list_messages(channel_id="c1", allowed_channels=None)
+    assert msg["id"] == mid and msg["status"] == MessageStatus.ERROR.value
+    assert await store.replay(mid) == 1
+    assert await _status(store, item.id) == OutboxStatus.PENDING.value
 
 
 async def test_a_store_read_fault_on_a_vanished_row_does_not_claim_a_dead_letter(

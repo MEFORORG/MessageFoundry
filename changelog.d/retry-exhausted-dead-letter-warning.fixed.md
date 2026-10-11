@@ -3,8 +3,8 @@
   store with no log line. That held on the single-row path and the batch path. The delivery worker
   now writes one WARNING after that dead-letter, the same content-free line a permanent refusal
   writes. It names the connection, the outbox row, the exception class and its code, and the
-  attempt count. The single-row line also names the message id, and the batch line names the batch
-  size and its head row. No line carries the message or the error's text. The store reports
+  attempt count. The single-row line also names the message id. The batch line names how many rows
+  were dead-lettered and the first member still present, which the decision came from. No line carries the message or the error's text. The store reports
   the dead-letter itself, so a final write the HA epoch fence re-pended is not reported as one. The
   line has its own throttle key per connection and code, so it never merges with a permanent
   refusal's count; both share the cap of 100 lines a minute. `max_attempts = None` still retries

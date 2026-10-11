@@ -173,8 +173,13 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     on, so a code bug can't wedge the whole lane. ``STOP``: halt the connection's delivery worker and
     raise a ``connection_stopped`` alert, leaving the message queued for replay — for operators who
     would rather a lane freeze (and page someone) than auto-dead-letter on an unexpected error. A
-    row already at a finite ``max_attempts`` is dead-lettered (replayable) instead, which bounds a
-    stop and re-arm loop on a row that always crashes; a WARNING says so (vault BACKLOG #3211).
+    row already at a finite ``max_attempts`` is dead-lettered instead, which bounds a stop and
+    re-arm loop on a row that always crashes, and a WARNING names the row and its message (vault
+    BACKLOG #3211). The router and transform stages take that cap from the ``[delivery]`` defaults.
+    An outbound row lands in the dead-letter queue. A router or transform row does not, because
+    that view and its bulk replay cover outbound rows only: its message shows as ERROR, and the
+    per-message replay re-queues it (``POST /messages/{id}/replay``, or Replay on the message in the
+    web console). No CLI command replays a message.
     Partner rejections (``NegativeAckError``) and transport failures are unaffected — this governs
     only the engine-internal-error case.
     """
