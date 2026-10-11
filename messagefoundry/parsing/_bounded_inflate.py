@@ -2,21 +2,23 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """One bounded-inflate loop, shared by the compression codec and the DICOM deflate guard (BACKLOG #1977).
 
-Two callers drive a :func:`zlib.decompressobj` against a byte ceiling:
-:func:`messagefoundry.parsing.compression.deflate_decompress` (zlib-wrapped, keeps the output) and
-:func:`messagefoundry.parsing.dicom._inflate.bounded_inflate_or_error` (raw DEFLATE, discards it).
-They used to carry two copies of this loop, so a fix could reach one and not the other. The end-of-
-stream hang (BACKLOG #1964) was fixed in one copy first for exactly that reason.
+At least these callers drive a :func:`zlib.decompressobj` against a byte ceiling:
+:func:`messagefoundry.parsing.compression.deflate_decompress` (zlib-wrapped, keeps the output),
+:func:`messagefoundry.parsing.compression.gzip_decompress` (one gzip member per call, keeps the
+output; BACKLOG #1129) and :func:`messagefoundry.parsing.dicom._inflate.bounded_inflate_or_error`
+(raw DEFLATE, discards it). They used to carry copies of this loop, so a fix could reach one and
+not the other. The end-of-stream hang (BACKLOG #1964) was fixed in one copy first for exactly that
+reason.
 
-The loop keeps these guarantees for both callers:
+The loop keeps these guarantees for every caller:
 
 * It stops at the end of the stream. After the end, zlib keeps trailing input in ``unconsumed_tail``
   and never uses it, so a loop that watches only the pending input spins forever.
 * It feeds the input one :data:`CHUNK` window at a time. ``unconsumed_tail`` is a copy of the input
   not yet used, so handing zlib the whole remainder copies it every round, which is quadratic. The
   loop slices the input as given. A ``bytes`` input copies each window once, which leaves no export
-  on a caller's ``bytearray`` behind a raised error; that is what the codec passes. A ``memoryview``
-  input slices without copying; that is what the DICOM guard passes.
+  on a caller's ``bytearray`` behind a raised error; the codec's deflate path passes that. A
+  ``memoryview`` input slices without copying; the DICOM guard and the codec's gzip path pass that.
 * The ceiling fires as soon as the output passes it. With ``exact_ceiling=True`` the loop asks zlib
   for at most one byte past the ceiling, so a bomb stops having produced at most
   ``max_output_bytes + 1`` bytes. With ``exact_ceiling=False`` it asks for a whole window each round,
@@ -32,7 +34,8 @@ What follows the end of the stream is the caller's rule, :data:`TrailingRule`:
   it, because pydicom and pynetdicom pad an odd-length deflated Data Set with one NUL, and
   ``dcmread``'s one-shot inflate also stops at the end of the first stream. The DICOM guard ignores
   the rest. :func:`messagefoundry.parsing.compression.deflate_decompress_with_tail` hands it back
-  (BACKLOG #1978).
+  (BACKLOG #1978). :func:`messagefoundry.parsing.compression.gzip_decompress` starts its next member
+  there, after any NUL padding.
 
 Either way, :attr:`InflateResult.end` says where the stream ended in the input, so the rest is
 ``data[end:]``.

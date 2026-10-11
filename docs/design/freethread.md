@@ -115,6 +115,8 @@ ABI-independent and works on any interpreter (no compiled extension, so no `cp31
 * `uvicorn[standard]`'s optional `httptools`/`uvloop` are compiled; if either lacks a `cp314t` wheel
   the standard extra may fall back to the pure-Python asyncio loop + h11 parser (functional, slightly
   slower). Confirm in the smoke leg; uvloop in particular has historically lagged on new ABIs.
+  *Since BACKLOG #1125, `serve` pins httptools and refuses to start without it, so a missing
+  httptools wheel stops the engine instead of falling back to h11. The uvloop fallback is unchanged.*
 * `[sftp]` (paramiko) drags `pynacl`/`bcrypt` (compiled) — **not yet verified** for `cp314t`. Flag, do
   not assume.
 * "Wheel exists" ≠ "thread-safe under parallelism" (caveat §1.2). The wheels unblock *installation*

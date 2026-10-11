@@ -4897,9 +4897,22 @@ def _connection_event_where(
 def _security_events_where(username: str, until: float | None) -> tuple[str, list[Any]]:
     """The ``?`` ``WHERE`` text and values for one user's security-event page and its total (BACKLOG
     #2438): the ``auth.*`` actions recorded under their own name, at or before ``until`` when a
-    pager pins one. SQLite and SQL Server share it, so the page and its total count one set."""
-    params: list[Any] = [username]
-    clause = " WHERE actor = ? AND action LIKE 'auth.%'"
+    pager pins one. SQLite and SQL Server share it, so the page and its total count one set.
+
+    The rows start at the account's own ``created_at`` (BACKLOG #1152). ``actor`` is a reusable
+    username, and a failed sign-in is recorded under the name that was tried, whether or not an
+    account holds it. Without the bound, on a first deployment an account would read rows written
+    before it existed: a failed sign-in against its name, or a deleted account's history under the
+    same name. With no account by that name the subquery is NULL and no row matches. The bound is
+    inclusive because a directory account's birth row is written with ``created_at`` as its own
+    ``ts``. It is a read filter, so the hash-chained ``audit_log`` is untouched. It does not cover a row that keeps its ``created_at``
+    while its name or holder changes: a directory rename onto the name, or a ``provision-admin``
+    repair of an existing row. Rows under the name from before either change still show."""
+    params: list[Any] = [username, username]
+    clause = (
+        " WHERE actor = ? AND action LIKE 'auth.%'"
+        " AND ts >= (SELECT created_at FROM users WHERE username = ?)"
+    )
     if until is not None:
         clause += " AND ts <= ?"
         params.append(until)

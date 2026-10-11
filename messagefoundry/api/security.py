@@ -1826,9 +1826,9 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
         return None  # a not-yet-rotated account is locked out of the WS too (mirrors require())
     # ASVS 6.3.3: an MFA-pending session does not stream either. No exempt set here — every WS route
     # is a data feed, none is part of the enroll/verify escape path. Audited for the same reason as
-    # require(): the refusal sits above the permission loop, so nothing else would record it.
-    # RESIDUAL: checked once at handshake. A role change that newly puts a live session in scope does
-    # not tear down an established socket; the connection's own revalidation is the backstop.
+    # require(): the refusal sits above the permission loop, so nothing else would record it. The
+    # /ws/stats route asks it again before every frame, through recheck_standing; a new WS route
+    # gets that only if it calls recheck_standing too.
     if not await auth.mfa_satisfied(ws_token(websocket)):
         await auth.audit_mfa_denied(identity, websocket.url.path, client=client_ip(websocket))
         return None
@@ -1856,4 +1856,37 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
         await auth.audit_permission_granted(
             identity, audited, websocket.url.path, client=client_ip(websocket)
         )
+    return identity
+
+
+async def recheck_standing(
+    auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
+) -> Identity | None:
+    """Resolve the caller again, mid-response, or ``None`` once it may no longer have the data.
+
+    For a response that outlives its gate: the ``/ws/stats`` feed asks before every frame, and the
+    bulk message export asks before every row (BACKLOG #1154, ASVS 8.3.2). The gate resolved the
+    identity once. Without this, a session revoked, a role withdrawn or a channel scope narrowed
+    after that point would not reach a response already running.
+
+    It asks what the gate asked about the account's standing: a live session, no pending password
+    change, a met second factor, a notification address on file, and each of ``permissions``. It
+    does not ask for a fresh step-up. A step-up proves the person at the start of an act, and the
+    act has started. It moves no idle clock unless ``activity`` is True: a live feed is passive,
+    but a download the caller asked for is that caller's act, and the export passes True now and
+    then so a long download does not idle its own session out. It writes no audit row; the caller
+    records the stop. :func:`require`, :func:`authorize_ws` and the
+    console's ``authorize_ui_ws`` ask the same list with audit rows between the steps, so a new
+    standing rule goes in all four.
+
+    Returns the CURRENT identity, so the caller can act on today's channel scope rather than the
+    one captured at the gate: ``/ws/stats`` renders each frame with it, and the export stops when it
+    no longer covers the scope the export started with."""
+    identity = await auth.identity_for_token(token, activity=activity)
+    if identity is None or identity.must_change_password or identity.must_set_notify_email:
+        return None
+    if not all(identity.has(permission) for permission in permissions):
+        return None
+    if not await auth.mfa_satisfied(token):
+        return None
     return identity

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import ftplib
 import ipaddress
 import logging
 import posixpath
@@ -2215,6 +2216,98 @@ async def test_a_safe_entry_beside_a_hostile_one_still_flows(
     await _settle(src)
     await src._poll_once()
     assert h.bodies == [rb"MSH|^~\&|A"]
+
+
+class _NlstOnlyFtp:
+    """An ``ftplib.FTP`` stand-in that refuses MLSD, so ``_FtpClient._list`` takes its NLST + SIZE
+    fallback, and records every path it was asked to size."""
+
+    def __init__(self, names: list[str]) -> None:
+        self._names = names
+        self.sized: list[str] = []
+
+    def mlsd(self, path: str) -> Any:
+        raise ftplib.error_perm("500 MLSD not understood")
+
+    def nlst(self, path: str) -> list[str]:
+        return list(self._names)
+
+    def size(self, path: str) -> int:
+        self.sized.append(path)
+        return 7
+
+
+def test_nlst_fallback_never_sizes_a_name_the_listing_guard_refuses() -> None:  # #1130
+    # SIZE on a server-chosen name the guard has not judged would be a remote operation on it. A
+    # refused entry still lists, unsized, so the poll loop's refusal counts and logs it.
+    ftp = _NlstOnlyFtp([r"..\..\x.hl7", "C:evil.hl7", "good.hl7"])
+    listed = _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert ftp.sized == ["/in/good.hl7"]
+    assert [(e.name, e.size) for e in listed] == [
+        (r"..\..\x.hl7", 0),
+        ("C:evil.hl7", 0),
+        ("good.hl7", 7),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("remote_dir", "entry", "expected"),
+    [
+        ("/in", "a.hl7", "a.hl7"),
+        ("/in", "/in/a.hl7", "a.hl7"),
+        ("/in", "file with spaces.hl7", "file with spaces.hl7"),
+        ("/in/", "/in/a.hl7", "a.hl7"),  # trailing slash collapsed
+        ("/in/", "/in//a.hl7", "a.hl7"),  # trailing slash as the client spelled it
+        ("/", "/a.hl7", "a.hl7"),  # the root
+        ("in", "in/a.hl7", "a.hl7"),  # a relative directory, echoed as given
+    ],
+)
+def test_nlst_accepts_a_bare_name_or_one_under_the_exact_directory(
+    remote_dir: str, entry: str, expected: str
+) -> None:  # #1130
+    ftp = _NlstOnlyFtp([entry])
+    listed = _FtpClient._list(ftp, remote_dir)  # type: ignore[arg-type]
+    assert [(e.name, e.size) for e in listed] == [(expected, 7)]
+    assert ftp.sized == [posixpath.join(remote_dir, expected)]
+
+
+@pytest.mark.parametrize(
+    ("entry", "listed_as"),
+    [
+        ("../x/a.hl7", "../x/a.hl7"),  # a basename fold would have read this as a.hl7
+        ("/other/a.hl7", "/other/a.hl7"),  # another directory
+        ("/in/sub/a.hl7", "sub/a.hl7"),  # a subdirectory of the one asked for
+        ("/inbox/a.hl7", "/inbox/a.hl7"),  # a sibling whose name starts with the directory's
+        ("/in//a.hl7", "/a.hl7"),  # the prefix, then an absolute remainder
+        ("in/a.hl7", "in/a.hl7"),  # the directory without its leading slash: not the exact prefix
+    ],
+)
+def test_nlst_never_rewrites_any_other_entry(entry: str, listed_as: str) -> None:  # #1130
+    # Reject, never rewrite: the entry lists as the server sent it, less only the exact `/in/`
+    # prefix, unsized, and the poll loop's guard refuses it.
+    ftp = _NlstOnlyFtp([entry])
+    listed = _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert ftp.sized == []
+    assert [(e.name, e.size) for e in listed] == [(listed_as, 0)]
+    assert _is_contained_name(listed_as) is False
+
+
+async def test_a_folded_nlst_entry_is_refused_by_the_poll_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # End to end over the NLST arm: ../x/a.hl7 is never read as a.hl7, so a real a.hl7 beside it
+    # is not the one retrieved for it.
+    client = _HostileListingClient(
+        [e.name for e in _FtpClient._list(_NlstOnlyFtp(["../x/a.hl7"]), "/in")]  # type: ignore[arg-type]
+    )
+    client.files["/in/a.hl7"] = rb"MSH|^~\&|A"
+    src = _src(monkeypatch, client)
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    await src._poll_once()
+    assert h.bodies == []
+    assert client.ops == []
 
 
 # --- the key names ARE the control -------------------------------------------------------------

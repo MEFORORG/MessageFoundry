@@ -1240,7 +1240,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/channels` | `monitoring:read` | `require` |
 | `GET` | `/connections` | `monitoring:read` | `require` — `error` gated on `messages:view_summary` and masked; the `reveal=<connection name>` act also needs `messages:view_summary` (BACKLOG #2443) |
 | `GET` | `/connections/{name}/metadata` | `monitoring:read` | `require` — per-channel for inbound; a shared outbound is barred to scoped users; credentials scrubbed unconditionally; `error` gated on `messages:view_summary` and masked; the `reveal=true` act also needs `messages:view_summary` (BACKLOG #2443) |
-| `GET` | `/events` | `monitoring:read` | `require` |
+| `GET` | `/events` | `monitoring:read` | `require` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/connections/{name}/events` | `monitoring:read` | `require` |
 | `GET` | `/stats` | `monitoring:read` | `require` |
 | `GET` | `/metrics` | `monitoring:read` | `require` |
@@ -1248,20 +1248,20 @@ tuple: they act only on the caller's own account.
 | `GET` | `/graph/edges` | `monitoring:read` | `require` |
 | `GET` | `/alerts/rules` | `monitoring:read` | `require` |
 | `GET` | `/config/provenance` | `monitoring:read` | `require` |
-| `GET` | `/status` | `monitoring:read` | `require` |
+| `GET` | `/status` | `monitoring:read` | `require` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/cluster/status` | `monitoring:read` | `require` |
 | `GET` | `/cluster/nodes` | `monitoring:read` | `require` |
 | `GET` | `/dr/status` | `monitoring:read` | `require` |
 | `GET` | `/service/status` | `monitoring:read` | `require` |
 | `GET` | `/logging/level` | `monitoring:diagnose` | `require` |
 | `PATCH` | `/logging/level` | `monitoring:diagnose` | `require_paced` (BACKLOG #287) |
-| `POST` | `/statistics/reset` | `monitoring:diagnose` | `require_paced` |
+| `POST` | `/statistics/reset` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/status/integrity-check` | `monitoring:diagnose` | `require_paced` |
 | `GET` | `/alerts/active` | `monitoring:diagnose` | `require` |
-| `POST` | `/alerts/{alert_id}/ack` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_paced` |
+| `POST` | `/alerts/{alert_id}/ack` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `POST` | `/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `POST` | `/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `POST` | `/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/alerts/test-email` | `service:configure` | `require_paced` (BACKLOG #287) — operator test-send through the configured `[alerts]` email transport (BACKLOG #118); fires a live outbound SMTP dial, so it is admin-gated rather than `monitoring:diagnose`; sends a synthetic PHI-free event and returns no addresses; audited `alert_test_email` |
 | `WS` | `/ws/stats` | `monitoring:read` | `authorize_ui_ws` first, when the web console is mounted: a same-origin browser, by session cookie. If that yields no identity, `authorize_ws`: `Origin` validated against `[api].ws_allowed_origins`, then the Authorization header only, no `?token=` fallback. Both run **before** `accept()`; the WebSocket note under the gate table has the detail |
 | `GET` | `/service/identity` | `monitoring:read` | `require_service_cert` — **mTLS client certificate only**; PHI-fenced at app construction; writes a `service_cert_auth` audit row |
@@ -1313,7 +1313,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/search/presets` | `messages:read` | `require` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
 | `POST` | `/search/presets` | `messages:read` | `require_step_up` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
 | `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require_paced` | paced since BACKLOG #287; **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1). A preset id belonging to another user is a miss, not a 403 -- ownership is part of the lookup |
-| `GET` | `/search/layered` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` |
+| `GET` | `/search/layered` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing`; data rule: *Single-route data rules* below (BACKLOG #1151) |
 
 #### Uploaded files (PHI at rest)
 
@@ -1775,9 +1775,59 @@ the same permission set on the same method reds CI until it is listed here.
 > With the engine not started there is no graph and no name exists. Every route still checks the
 > scope first, so a name outside it gets the 403. A name inside it gets 503 from the first three
 > routes and 404 from the control routes, with no denial row. Names still show elsewhere. At
-> least the Prometheus exposition above and `GET /alerts/rules` list them, and
-> `POST /connections/{name}/flag` has no per-channel check.
+> least the Prometheus exposition above lists them.
+> `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
+> an inbound in its own scope, and every other target gets that 403, before the engine looks the
+> name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
+> reaches the engine, which answers 409 for a name with no `connections.toml` entry.
+> `GET /alerts/rules` shows a scoped caller
+> only the rules that name no connection outside its scope: `connection` is `*` or a name in its
+> scope, and `control_target` is unset or in it.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
+> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules.
+
+> **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
+> own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
+> non-administrator without the all-channels grant, including one with no channel at all. An
+> administrator is always all-channels, as the DLQ-SCOPE blockquote says, whatever scope is stored.
+>
+> - `GET /search/layered` reads each preset it layers by the caller's own `user_id`. Another user's
+>   preset id answers 404, the same answer an unknown id gets. The search it then runs is narrowed
+>   to the caller's channel scope.
+> - `POST /statistics/reset` with `all` set answers 403 to every scoped caller, whatever its scope,
+>   because a reset of every counter spans every channel. A targeted reset checks each target's
+>   `channel_id` against the scope. One target outside it refuses the whole request with 403, and
+>   nothing resets. A destination target is one inbound's edge into an outbound, so it passes when
+>   that inbound is in scope, and it resets only that edge. Both refusals are audited
+>   `auth.channel_denied`.
+> - `GET /status` narrows one field by scope. `channels_failed_names` lists only the failed inbounds
+>   in the caller's scope. At least `channels_failed`, `channels_total`, `outbox_by_status`, the
+>   `kpis` block and the `db` message and event counts are not narrowed. So a scoped caller can see
+>   a failure count higher than the names it is shown. Two other fields, `db.audit` and
+>   `logs.size_bytes`, follow a permission rule rather than a scope rule. The `## Audit` section
+>   near the end states it, under *Closed on the same channel*.
+> - `POST /alerts/{alert_id}/ack`, `POST /alerts/{alert_id}/resolve`,
+>   `POST /alerts/{alert_id}/suspend` and `POST /alerts/{alert_id}/resume` first read the alert
+>   through the caller's scope. An alert whose `connection` value is not in the scope answers 404,
+>   the same answer an unknown id gets. That includes an alert on a shared outbound an in-scope
+>   inbound feeds. Only a scope that lists the outbound by name reaches it. The handler stops before
+>   any state change and writes no audit row, not even `auth.channel_denied`. Only the gate's
+>   admission row, `auth.permission_granted`, is written.
+> - `GET /events` with a `connection=` filter outside the scope answers 403 and is audited
+>   `auth.channel_denied`. Without the filter it returns only the caller's own connections, as the
+>   monitoring paragraph above says.
+>
+> The console reaches the same rules, because its routes call these handlers in-process. That
+> covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
+> `/ui/alerts/{alert_id}/*` writes, `/ui/status` and `/ui/nav-status`. The console's preset
+> list, save and delete call the `/search/presets` handlers, so they carry those rows' owner rule.
+> One console difference: `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404
+> and redirects, so another user's preset id looks like one already deleted.
+>
+> `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
+> all-channels caller as the control. It reds if a bullet loses its route, a named fact, or its
+> route-map pointer, or names a route nothing executes. It does not execute this console paragraph,
+> the outbound-by-name case, or the administrator case; those are read from the code.
 
 > **Every route of the default JSON API has a channel-scope class, and a new one fails the build
 > until it gets one (BACKLOG #2627).** `tests/test_route_channel_scope_classification.py` holds the
@@ -3669,14 +3719,32 @@ The dual-control release re-checks the requester's standing too.
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235) describes that
 check and its directory gap.
 
+Two long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
+the route's permissions, no pending password change, a met second factor and a notification address
+on file. Neither asks again for a fresh step-up, the client-network check or the new-address check;
+those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
+on that session, for example) ends it as a revocation would.
+
+- The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
+  with 1008 before the next frame. Each frame's connections table uses the identity resolved for
+  that frame, so a narrowed channel scope shapes the next frame.
+- The bulk message export (`GET` or `POST /messages/export`, streamed as newline-delimited JSON)
+  asks before every row. It stops on a refusal. It also stops when the caller's channel scope no
+  longer covers the scope the export started with. A widened scope does not stop it. A stop
+  records `messages_export.stopped` with the selected and streamed counts and a reason. Then it
+  aborts the transfer, so the client sees a failed download rather than a short file.
+- While rows flow, the export moves the session's idle clock at most every quarter of the idle
+  window. So a long download does not end its own session. One stall can, though. If the client
+  stops reading or a store read is slow, the session sits idle. A single stall of about three
+  quarters of the idle window can be enough. The next row's check then ends the session and the
+  export.
+
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
 
 | Path | What it re-checks, and when | How long a withdrawn grant could last |
 |---|---|---|
-| The `/ws/stats` live feed | The engine re-checks the session and `monitoring:read` every 3 s, while it sends a frame each second. Each frame's connections table uses the identity from the last re-check. The engine checks second-factor status at the handshake only. | Up to three more frames after a revocation or a narrowed scope. A change that newly requires a second factor, but revokes no session, would not reach an open socket. Under the shipped `require_mfa` defaults every open socket already holds a verified session. So this arises only where an operator has turned `require_mfa` off or narrowed `require_mfa_scope`. |
-| The bulk message export (`GET` or `POST /messages/export`, streamed as newline-delimited JSON) | The engine resolves the identity once, when the export starts. It tests each row's channel against that copy. | To the end of that export, up to 100,000 message bodies. |
-| The IDE extension's AI policy, in `byo` mode | The IDE asks the engine when it holds a live session. Withdrawing `ai:assist` revokes that session. The engine then answers with the grant unknown, and `byo` mode treats unknown as allowed. When the engine is unreachable, the extension reuses its last cached answer, with no age limit. | Until the IDE signs in again, or for as long as the engine stays unreachable. In `managed_endpoint` mode the engine checks `ai:assist` on each chat request. |
+| The IDE extension's AI policy, in `byo` mode | The IDE asks the engine when it holds a live session. Withdrawing `ai:assist` revokes that session. The engine then answers with the grant unknown, and `byo` mode treats unknown as allowed. When the engine is unreachable, the extension reuses its last cached answer. An answer that disables assistance stands at any age. One that enables it stands for 12 hours from the engine's answer, then the extension disables assistance (BACKLOG #1154). | Until the IDE signs in again. While the engine is unreachable, up to 12 hours. In `managed_endpoint` mode the engine checks `ai:assist` on each chat request. |
 | An engine-side edit that narrows an AD account's grant | An edit to the AD group-to-role or group-to-scope map revokes every unrevoked session of each enabled directory account. That includes sessions the clock already calls expired, and the audit row's `sessions_revoked` counts them all. At the next login the engine re-derives roles from the groups. It re-derives scope by the rule under *Per-channel scoping* above. | A per-user scope an admin narrowed on a user in a scope-mapped group: the next login restores the group scope. A scope-map row removed so that no mapped group matches: the map edit revokes the session, and the next login applies that rule. A service-certificate identity mapped to an AD account has no session to revoke. A narrowed role or scope map reaches its next request, because the engine keeps only the stored roles and channels the current groups still map to. A scope an administrator set stays as stored when none of the groups is in the scope map (BACKLOG #2316). |
 | A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent. It revokes after one pass when the directory groups would withdraw or narrow the channel scope, and leaves the scope for the next login to write. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. | A role change, or a withdrawn or narrowed scope: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, all of these last until the absolute session cap, 12 hours by default. A widened scope waits for the next login, within that cap. The live session then holds less than the directory grants, not more. |
 
@@ -5395,8 +5463,9 @@ BACKLOG #1485.
 ### Dependency lockfile (DEP-1)
 
 `pyproject.toml` carries mostly lower-bound (`>=`) ranges. Some carry an upper bound too. At least
-uvicorn and websockets are pinned exactly. The protocol header floor was measured on one version of
-each (BACKLOG #1120). The **pinned, hashed** resolution lives in
+uvicorn and websockets are pinned exactly, because the protocol header floor depends on the
+versions it was measured on. The comment beside each pin in `pyproject.toml` gives the full reason
+(BACKLOG #1120). The **pinned, hashed** resolution lives in
 **`uv.lock`** (the source of truth) and its exported view **`requirements.lock`** (cross-platform,
 with per-package hashes), both committed. CI verifies they're in sync (`uv lock --check` + an export
 `diff`) and audits `requirements.lock`. Refresh after any dependency change:
