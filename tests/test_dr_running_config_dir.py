@@ -729,7 +729,9 @@ async def test_a_refused_activation_puts_the_threshold_back(
         await coord.activate(actor="alice")
 
     assert caught.value.kind == "profile"
-    assert "could not bind the priority feeds" in str(caught.value)
+    # The preflight refused it before any bind, so the reason says so (vault BACKLOG #3094).
+    assert "stopped at its trust-anchor preflight" in str(caught.value)
+    assert "not readable" in str(caught.value)
     assert coord.active is False and engine.dr_active is False
     assert rr.dr_threshold is None and rr.dr_standby is Priority.CRITICAL
     assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
@@ -1047,6 +1049,8 @@ def _spy_hook(coord: Any, monkeypatch: pytest.MonkeyPatch, hooks: list[str]) -> 
 
     async def ran(command: str, *, phase: str, actor: str, now: float) -> bool:
         hooks.append(phase)
+        # What the real hook runner records once the hook's process starts.
+        coord._attempt.hook_ran = True
         return True
 
     monkeypatch.setattr(coord, "_run_vip_hook", ran)
@@ -1073,6 +1077,10 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
 
     assert caught.value.kind == "profile"
     assert "did not answer within 0.5s" in str(caught.value)
+    # Round 3, item 5. Red at aaab583091: the reason said the engine could not bind the priority
+    # feeds, though the preflight stopped it before any bind.
+    assert "trust-anchor preflight" in str(caught.value)
+    assert "could not bind" not in str(caught.value)
     assert coord.active is False and engine.dr_active is False
     assert rr.dr_threshold is None and rr.dr_standby is Priority.CRITICAL
     assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
@@ -1085,8 +1093,9 @@ async def test_an_unexpected_error_before_the_hook_is_an_audited_abort(
 ) -> None:
     """Item 6. Red at origin/main 1d55295f66: an error outside the abort paths, here from the
     marker's digest provider, escaped the coordinator raw. The route then answered a bare 500, and
-    no dr_activation_aborted row said the activation had stopped. Kind "error" answers 503, so it
-    reads as a fault to retry, and the traceback is logged."""
+    no dr_activation_aborted row said the activation had stopped. Kind "error" answers 503, and the
+    traceback is logged. Round 3, item 5: such an error can be deterministic, so the message sends
+    the operator to the log rather than straight to a retry. Red at aaab583091."""
     engine = box.engine
     await engine.reload_detail(box.tiered)
     coord = engine.dr_coordinator
@@ -1107,6 +1116,7 @@ async def test_an_unexpected_error_before_the_hook_is_an_audited_abort(
     assert caught.value.kind == "error"
     assert "store step" in str(caught.value)
     assert "the digest provider failed" in str(caught.value)
+    assert "check the engine log" in str(caught.value)
     assert hooks == []  # the VIP never moved for it
     assert coord.active is False and engine.dr_active is False
     (row,) = await _rows(engine.store, "dr_activation_aborted")
@@ -1117,7 +1127,7 @@ async def test_an_unexpected_error_before_the_hook_is_an_audited_abort(
     client, _app = await _admin_client(engine, deadline=30.0)
     async with client:
         r = await client.post("/dr/activate", json={})
-    assert r.status_code == 503, r.text  # a fault to retry, not a refused request
+    assert r.status_code == 503, r.text  # a fault, not a refused request
     assert "store step" in r.json()["detail"]
 
 
@@ -1139,6 +1149,143 @@ async def test_a_takeover_hook_that_fails_names_the_seed_marker_it_followed(
     assert [row["seed_segment"]] == await _marker_hashes(engine)
     # It ran, and failed. A hook that fails or is killed may still have moved the address.
     assert row["vip_hook_ran"] is True
+    # Round 3, item 2. Red at aaab583091: the reason still said the VIP was not acquired, with no
+    # load-balancer note, though the row said the hook ran.
+    for text in (str(row["reason"]), str(caught.value)):
+        assert "VIP not acquired" not in text
+        assert "VIP may have moved" in text
+
+
+async def test_a_takeover_hook_that_never_started_reads_as_not_run(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 1. Red at aaab583091: ``vip_hook_ran`` was set from the setting before the
+    hook's process was created, so a hook the engine could not start read as run, and the reason
+    gave no hint that it never started."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    coord._settings = coord.settings.model_copy(update={"takeover_hook": "exit 0"})
+
+    async def cannot_start(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("the shell could not start")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", cannot_start)
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+
+    assert caught.value.kind == "vip"
+    assert "the shell could not start" in str(caught.value)  # control: the start failed
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["vip_hook_ran"] is False
+    assert "VIP not acquired" in str(row["reason"])
+    assert "VIP may have moved" not in str(row["reason"])
+
+
+async def test_a_preflight_cancelled_with_no_hook_makes_no_claim_about_the_vip(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 3. With no hook configured, a cancellation inside the trust-anchor preflight
+    comes before the reload, so nothing bound a listener and nothing moved the VIP. Red at
+    aaab583091: the row said the reload may have bound a listener."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    entered = asyncio.Event()
+
+    async def hang(registry: object) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine, "preflight_registry", hang)
+    task = asyncio.create_task(coord.activate(actor="alice"))
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert coord.active is False and engine.dr_active is False
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["kind"] == "interrupted" and row["vip_hook_ran"] is False
+    assert "profile step" in str(row["reason"])  # control: it was cut off in step 4
+    assert "VIP" not in str(row["reason"])
+    assert "reload" not in str(row["reason"])
+
+
+async def test_a_reload_cancelled_with_no_hook_still_says_a_listener_may_have_bound(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above. Once the reload has started it may have bound a listener
+    before it rolled back, so the row still says the VIP may have moved."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    coord = engine.dr_coordinator
+    assert coord is not None
+    entered = asyncio.Event()
+
+    async def hung_reload(registry: object = None) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(rr, "reload", hung_reload)
+    task = asyncio.create_task(coord.activate(actor="alice"))
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["kind"] == "interrupted" and row["vip_hook_ran"] is False
+    assert "reload may have bound a listener" in str(row["reason"])
+    assert "VIP may have moved" in str(row["reason"])
+
+
+async def test_a_retry_is_refused_while_a_timed_out_preflight_read_is_still_stuck(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 4. A timed-out preflight leaves its read blocked in a default-executor
+    thread, which no cancel can stop. Red at aaab583091: each retry started another such thread,
+    so retries against a dead share could use up the executor. A retry while the first read is
+    still stuck is now an audited abort that starts no read. Once the read returns, a retry
+    proceeds."""
+    engine = box.engine
+    coord = _short_engine_takeover(engine)
+    await engine.reload_detail(box.tiered)
+    share = threading.Event()
+    reads: list[str] = []
+    read_returned = asyncio.Event()
+
+    async def stuck_read(registry: object) -> None:
+        reads.append(threading.current_thread().name)
+        await asyncio.to_thread(share.wait, 30)
+        read_returned.set()
+
+    monkeypatch.setattr(engine, "preflight_registry", stuck_read)
+    try:
+        with pytest.raises(DrActivationError) as first:
+            await asyncio.wait_for(coord.activate(actor="alice"), 60)
+        assert "did not answer within 0.5s" in str(first.value)
+
+        with pytest.raises(DrActivationError) as second:
+            await asyncio.wait_for(coord.activate(actor="alice"), 60)
+        assert second.value.kind == "profile"
+        assert "still reading" in str(second.value)
+        assert len(reads) == 1  # the refusal started no read, so no second thread
+        rows = await _rows(engine.store, "dr_activation_aborted")
+        assert len(rows) == 2
+        assert sum("still reading" in str(r["reason"]) for r in rows) == 1
+        assert coord.active is False and engine.dr_active is False
+    finally:
+        share.set()
+
+    await asyncio.wait_for(read_returned.wait(), 30)
+    result = await asyncio.wait_for(coord.activate(actor="alice"), 60)
+    assert result.active is True
+    assert len(reads) == 2  # the retry ran its own preflight
 
 
 async def test_a_step_4_abort_after_the_hook_names_the_hook_and_its_seed_marker(

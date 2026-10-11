@@ -119,6 +119,12 @@ class DrActivationError(RuntimeError):
         self.kind = kind
 
 
+class DrPreflightBusyError(RuntimeError):
+    """A DR activation's trust-anchor preflight was refused because an earlier one that timed out
+    is still reading. The engine starts no new read while one is stuck on a share that does not
+    answer, so retries cannot use up the default executor's threads (vault BACKLOG #3094)."""
+
+
 @dataclass(frozen=True)
 class DrResult:
     """The PHI-free outcome of an activate/release — returned for the API response + tests. Paths,
@@ -150,10 +156,18 @@ class _ActivationProgress:
     #: The row hash of the dr_seed marker this attempt wrote, once written. An abort after it names
     #: it, so a retry's second marker is not read as the same attempt (vault BACKLOG #3094).
     seed_segment: str | None = None
-    #: Whether the takeover hook was started, whatever it then did. The same meaning as
-    #: ``vip_hook_ran`` on the release rows: a hook that failed or was killed may still have moved
-    #: the address.
+    #: Whether the takeover hook's process started, whatever it then did. The moment is when the
+    #: process has been let run: on Windows once it is resumed into its job, elsewhere once it is
+    #: created (:func:`_run_command` calls ``on_start`` there). A hook that could not be started
+    #: reads false. One that started and then failed or was killed reads true, because it may still
+    #: have moved the address. A cancellation that lands while the process is being created can
+    #: leave it false for a hook that is then killed; the interrupted row still says it may have run.
     hook_ran: bool = False
+    #: Whether step 4's engine callback is inside its trust-anchor preflight, as it reports through
+    #: :meth:`DrCoordinator.note_profile_preflight`. It stays true when the preflight refuses or is
+    #: cut off, so the rows then say that nothing was bound. A callback that reports nothing leaves
+    #: it false, and the rows claim the more cautious case: that the reload may have bound.
+    in_preflight: bool = False
 
     def abort_fields(self) -> dict[str, object]:
         """The fields an abort row carries about this attempt (vault BACKLOG #3094, item 11)."""
@@ -245,6 +259,15 @@ class DrCoordinator:
     def settings(self) -> DrSettings:
         return self._settings
 
+    def note_profile_preflight(self, running: bool) -> None:
+        """Record whether the ``activate_profile`` callback is inside its trust-anchor preflight.
+
+        The engine sets it as its preflight starts and clears it once the preflight passes. A row
+        for an attempt stopped in the preflight then makes no claim that a listener was bound, and
+        says the preflight stopped it (vault BACKLOG #3094). A no-op outside an activation."""
+        if self._attempt is not None:
+            self._attempt.in_preflight = running
+
     # --- activate ------------------------------------------------------------
 
     async def activate(
@@ -305,8 +328,9 @@ class DrCoordinator:
                 # An error no abort path caught, such as one from the seed marker's digest
                 # provider. It used to escape with no abort row, and the route answered a bare
                 # 500 (vault BACKLOG #3094, item 6). Every step after the hook has its own arm, so
-                # this one runs before the hook. Kind "error" answers 503, to be retried. Once
-                # the profile is applied the box is active and only its row is owed, so the error
+                # this one runs before the hook. Kind "error" answers 503. Such an error can recur
+                # on every retry, so the message sends the operator to the log first. Once the
+                # profile is applied the box is active and only its row is owed, so the error
                 # stands.
                 if progress.profile_applied:
                     raise
@@ -318,7 +342,8 @@ class DrCoordinator:
                 )
                 await self._record_aborted(
                     "error",
-                    f"activation failed during the {progress.step} step: {safe_exc(exc)}",
+                    f"activation failed during the {progress.step} step: {safe_exc(exc)}. The box "
+                    "stays passive; check the engine log for the cause before retrying",
                     actor,
                     now,
                 )
@@ -398,8 +423,8 @@ class DrCoordinator:
         # non-LB topology; an ADR-0047 LB deployment omits it (the passive LB moves the VIP once the
         # listeners bind in step 4). A hook failure/timeout ABORTS before any listener serves the VIP.
         progress.step = "vip"
-        # Set before the hook starts, so the abort a failed or killed hook writes says it ran.
-        progress.hook_ran = bool(self._settings.takeover_hook)
+        # _run_vip_hook marks the attempt once the hook's process starts, so the abort a failed or
+        # killed hook writes says it ran.
         await self._run_vip_hook(
             self._settings.takeover_hook, phase="takeover", actor=actor, now=now
         )
@@ -416,10 +441,14 @@ class DrCoordinator:
             await self._activate_profile()
         except Exception as exc:
             self._active = False
+            # A preflight that refused, timed out, or found an earlier one still reading bound
+            # nothing, so its reason must not say a bind failed (vault BACKLOG #3094).
             reason = (
-                "DR run-profile activation failed (the engine could not bind the priority "
-                f"feeds): {safe_exc(exc)}"
-            )
+                "DR activation stopped at its trust-anchor preflight, before any listener was bound"
+                if progress.in_preflight
+                else "DR run-profile activation failed (the engine could not bind the priority "
+                "feeds)"
+            ) + f": {safe_exc(exc)}"
             if progress.hook_ran:
                 reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
@@ -645,8 +674,8 @@ class DrCoordinator:
 
         Once the run-profile is applied the box IS active, and what is owed is the ``dr.activate``
         row. Before that, the box stays passive and a ``dr_activation_aborted`` row of kind
-        ``interrupted`` names the step reached; from the VIP step on, the takeover hook may have
-        run, so the row says the address may have moved."""
+        ``interrupted`` names the step reached. Once the takeover hook may have run, or step 4's
+        reload may have bound a listener, the row says the address may have moved."""
         if progress.profile_applied:
             try:
                 await self._record_owed_activation()
@@ -658,15 +687,15 @@ class DrCoordinator:
                 )
             return
         reason = f"activation interrupted during the {progress.step} step; the box stays passive"
-        if progress.step == "vip" or progress.hook_ran:
-            reason += _vip_note(
-                "The takeover hook ran"
-                if progress.step == "profile"
-                else "The takeover hook may have run"
-            )
-        elif progress.step == "profile":
-            # No hook is configured. The reload may still have bound a listener before it rolled
-            # back, and a load balancer moves the VIP to a node that answers (ADR 0047).
+        if progress.hook_ran:
+            reason += _vip_note("The takeover hook ran")
+        elif progress.step == "vip":
+            # Cut off while the hook's process was being created, so it may have started.
+            reason += _vip_note("The takeover hook may have run")
+        elif progress.step == "profile" and not progress.in_preflight:
+            # No hook ran. The reload may still have bound a listener before it rolled back, and a
+            # load balancer moves the VIP to a node that answers (ADR 0047). Cut off inside the
+            # preflight, no reload ran, so there is nothing to say (vault BACKLOG #3094).
             reason += _vip_note("The reload may have bound a listener before it rolled back")
         await self._write_aborted_row("interrupted", reason, actor, now)
 
@@ -1184,16 +1213,26 @@ class DrCoordinator:
         ("VIP acquired"/"VIP released"); any non-zero or a timeout is a failure. On the **takeover** phase
         a failure ABORTS activation (acquire-VIP-or-abort) + records ``dr_activation_aborted``; on the
         **release** phase a failure is logged but does not block the hand-back (the passive LB still moves
-        the VIP when intake unbinds — the hook is belt-and-braces). Returns whether the hook ran. ``""`` =
-        no hook (rely on the passive ADR-0047 LB)."""
+        the VIP when intake unbinds — the hook is belt-and-braces). Returns whether the hook's process
+        started. A takeover records that on the running attempt at the moment
+        :attr:`_ActivationProgress.hook_ran` names (vault BACKLOG #3094). ``""`` = no hook (rely on
+        the passive ADR-0047 LB)."""
         if not command:
             return False
+        started = False
+
+        def mark_started() -> None:
+            nonlocal started
+            started = True
+            if phase == "takeover" and self._attempt is not None:
+                self._attempt.hook_ran = True
+
         try:
             # Only a takeover hook is killed when it overruns: an aborted activation must not be
             # left taking the address. A release hook is left to finish late, as before, since
             # killing it partway could strand the address on this box (vault BACKLOG #2622).
             ok = await asyncio.wait_for(
-                _run_command(command, stop_kills=phase == "takeover"),
+                _run_command(command, stop_kills=phase == "takeover", on_start=mark_started),
                 timeout=self._settings.takeover_timeout_seconds,
             )
         except TimeoutError:
@@ -1208,10 +1247,14 @@ class DrCoordinator:
             reason = "" if ok else f"VIP {phase} hook exited non-zero"
         if not ok:
             if phase == "takeover":
+                # A hook that ran and then failed or was killed may have moved the address before
+                # it stopped, so only one that never started says the VIP was not acquired (vault
+                # BACKLOG #3094).
                 await self._record_aborted(
                     "vip",
-                    f"{reason} — VIP not acquired; aborting activation, binding no priority listener, "
-                    "staying passive (acquire-VIP-or-abort, ADR 0048)",
+                    f"{reason}{'' if started else ' — VIP not acquired'}; aborting activation, "
+                    "binding no priority listener, staying passive (acquire-VIP-or-abort, ADR 0048)"
+                    + (_vip_note("The takeover hook ran") if started else ""),
                     actor,
                     now,
                 )
@@ -1220,7 +1263,7 @@ class DrCoordinator:
                 log.warning(
                     "DR release: %s — continuing hand-back (passive LB moves the VIP)", reason
                 )
-        return True
+        return started
 
     async def _record_aborted(
         self,
@@ -1276,14 +1319,17 @@ class DrCoordinator:
             log.warning("DR: %s alert failed", event, exc_info=True)
 
 
-async def _run_command(command: str, *, stop_kills: bool = True) -> bool:
+async def _run_command(
+    command: str, *, stop_kills: bool = True, on_start: Callable[[], None] | None = None
+) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
     backup destination / other operator-configured paths are trusted).
 
     Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
-    variables, without the engine's own (vault BACKLOG #2587).
+    variables, without the engine's own (vault BACKLOG #2587). ``on_start`` is called once the
+    hook's process has been let run, and never for one that was not (vault BACKLOG #3094).
 
     **Stopping it stops the whole hook, when** ``stop_kills`` (vault BACKLOG #2622). The caller
     bounds this with ``wait_for``, which stops it by cancelling it. Cancelling only the wait would
@@ -1317,6 +1363,10 @@ async def _run_command(command: str, *, stop_kills: bool = True) -> bool:
     try:
         if stop_kills:
             job = proctree.resume_into_job(proc.pid, who="DR takeover hook")
+        # The hook now runs: on Windows a hook this may kill was suspended until the resume above,
+        # and one that could not be resumed was never let run.
+        if on_start is not None:
+            on_start()
         await proc.wait()
     except GeneratorExit:
         if stop_kills:

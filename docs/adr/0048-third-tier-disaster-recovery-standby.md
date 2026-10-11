@@ -431,11 +431,14 @@ in-flight rows stranded.
 > - The settings and registry preflights share one bound, `[dr].takeover_timeout_seconds`, for the
 >   two together. They run under the coordinator's lock, so an anchor on a share that stopped
 >   answering used to hold every later activate and release too. One that does not answer in time
->   is an abort like any refusal. The bound stops the wait, not the read: the thread reading the
->   share stays blocked until the share answers.
+>   is an abort like any refusal. Its reason says the preflight stopped it, not that a bind
+>   failed. The bound stops the wait, not the read: the thread reading the share stays blocked until
+>   the share answers. The preflight that timed out is left to finish, so its audit rows can land
+>   after the abort's. While its read is blocked, the next activation's preflight is refused as an
+>   abort and starts no thread. So retries against a dead share cannot use up the default executor.
 > - The reload after them is not bounded. Cancelling it partway rolls back a takeover the VIP has
->   already moved for, and a lane's first build is isolated to that lane, as the #3263 amendment
->   says. So the reload's own reads still have no bound: at least each outbound and FTPS poller CA
+>   already moved for. A lane's first build is isolated to that lane, as the #3263 amendment says.
+>   So the reload's own reads still have no bound: at least each outbound and FTPS poller CA
 >   it checks, and a `validate_startup` probe. A bound on each anchor read, in
 >   `messagefoundry/auth/trust_anchors.py`, would cover those too. It is not built.
 > - The preflights do not move before the hook. Running them there as well would write their audit
@@ -443,17 +446,21 @@ in-flight rows stranded.
 >   The deeper fix splits the reload into a prepare step before the hook and an apply step after
 >   it. It is not built.
 > - Every abort row of an activation names the `dr_seed` marker that attempt wrote, as
->   `seed_segment`. It also records `vip_hook_ran`, which says the takeover hook was started, as it
->   does on the release rows. A hook that failed or was killed may still have moved the address.
->   The marker stays, as audit rows do, and a retry writes its own, so each attempt's fork point is
->   recorded. When the hook ran before a step 4 abort, the reason says the VIP may have moved to
->   this box. An interrupted reload with no hook says the same, because the reload may have bound
->   a listener first. The engine does not run the release hook to undo the takeover. That could
+>   `seed_segment`. It also records `vip_hook_ran`, which says the takeover hook's process started.
+>   On Windows that is once the hook is resumed into its job. A hook that could not be started
+>   reads false. One that started and then failed or was killed reads true, because it may still
+>   have moved the address. The marker stays, as audit rows do, and a retry writes its own, so each
+>   attempt's fork point is recorded. When the hook ran before an abort, at step 3 or step 4, the
+>   reason says the VIP may have moved to this box. An interrupted reload with no hook says the
+>   same, because the reload may have bound a listener first. An activation cut off in the
+>   preflight with no hook says nothing about the VIP, because no reload ran. The engine does not
+>   run the release hook to undo the takeover. That could
 >   hand the address to a primary that is down, so the runbook leaves it to the operator.
 > - An error that no abort path catches is now an audited abort of kind `error`, which the route
 >   answers with `503`. This holds only while the profile is not yet applied, and every step after
 >   the hook has its own arm. An error from the seed marker's digest provider is one example. Such an
->   error used to escape with no abort row, and the route answered a bare `500`. If the audit store
+>   error used to escape with no abort row, and the route answered a bare `500`. It can recur on
+>   every retry, so its reason sends the operator to the engine log first. If the audit store
 >   refuses every write, the abort row cannot be written either, and only the log records it.
 > - `engine.stop()` still neither waits for nor cancels an activation. The managed lifespan drains
 >   the long operations first. That cancels a running activation, and its own arm records it (vault
