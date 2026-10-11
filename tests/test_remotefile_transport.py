@@ -54,6 +54,7 @@ from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES, render_filena
 from messagefoundry.transports.remotefile import (
     _APPROVED_SFTP_CIPHERS,
     _APPROVED_SFTP_MACS,
+    OTHER_FORM_WARNING_SECONDS,
     RETRIEVE_CHUNK_BYTES,
     RemoteFileDestination,
     RemoteFileSource,
@@ -61,6 +62,7 @@ from messagefoundry.transports.remotefile import (
     _FtpClient,
     _ftps_ssl_context,
     _is_contained_name,
+    _is_other_listing_form,
     _RemoteClient,
     _RemoteError,
     _RemoteOversize,
@@ -2310,6 +2312,45 @@ async def test_a_folded_nlst_entry_is_refused_by_the_poll_loop(
     assert client.ops == []
 
 
+class _NlstRefusingFtp(_NlstOnlyFtp):
+    """An NLST-only server that answers ``NLST`` with one permanent reply (BACKLOG #1130)."""
+
+    def __init__(self, reply: str) -> None:
+        super().__init__([])
+        self._reply = reply
+
+    def nlst(self, path: str) -> list[str]:
+        raise ftplib.error_perm(self._reply)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    ["550 No files found", "550 No files found.", "550-no files found", "550 NO FILES FOUND"],
+)
+def test_an_nlst_empty_directory_refusal_lists_nothing(reply: str) -> None:  # #1130
+    # Some NLST-only servers refuse NLST on an empty directory. That is an empty poll, not a
+    # permanent failure, on the poll listing and on the publish listing alike.
+    assert _FtpClient._list(_NlstRefusingFtp(reply), "/in") == []  # type: ignore[arg-type]
+    assert _FtpClient._names(_NlstRefusingFtp(reply), "/in") == set()  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "550 No such file or directory",  # also answers a directory that is not there
+        "550 Permission denied",
+        "530 Not logged in",
+        "553 No files found",  # the text alone is not enough: the code must be 550
+        "550 Files found: none of them yours",
+    ],
+)
+def test_any_other_nlst_refusal_still_fails(reply: str) -> None:  # #1130
+    with pytest.raises(ftplib.error_perm):
+        _FtpClient._list(_NlstRefusingFtp(reply), "/in")  # type: ignore[arg-type]
+    with pytest.raises(ftplib.error_perm):
+        _FtpClient._names(_NlstRefusingFtp(reply), "/in")  # type: ignore[arg-type]
+
+
 # --- the key names ARE the control -------------------------------------------------------------
 #
 # This pair exists because the shipped control was INERT and every test in this file stayed green.
@@ -2465,6 +2506,105 @@ async def test_remote_source_unsafe_name_refusal_still_logs_no_name_at_all(
     assert "MRN123456789" not in sink.text
     assert SAFE_NAME_LABEL.search(sink.text) is None  # no label either — the name is not touched
     assert IDENTIFIER_SHAPE.search(sink.text) is None
+
+
+_TRAVERSAL_LINE = "refused as an unsafe path component"
+_OTHER_FORM_LINE = "the server's listing form looks unsupported"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["/data/in/a.hl7", "in/a.hl7", "sub/a.hl7", "./a.hl7", "//srv/in/a.hl7"],
+)
+def test_a_path_with_no_traversal_shape_is_another_listing_form(name: str) -> None:  # #1130
+    assert _is_contained_name(name) is False
+    assert _is_other_listing_form(name) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../x/a.hl7",
+        "/in/../a.hl7",
+        "/in/a..b.hl7",  # doubt goes to the traversal side
+        r"in\a.hl7",
+        "in/sub\\a.hl7",
+        "C:/in/a.hl7",
+        "/in/a.hl7:stream",
+        "/in/a\nb.hl7",
+        "/",
+        "C:evil.hl7",  # no slash: a single name the guard refused for another reason
+        "a.hl7",
+    ],
+)
+def test_a_traversal_shape_or_a_bare_name_is_not_another_listing_form(name: str) -> None:  # #1130
+    assert _is_other_listing_form(name) is False
+
+
+async def test_another_listing_form_logs_its_own_warning_without_a_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # A server whose NLST names entries as resolved absolute paths gets them refused. The operator
+    # sees one name-free WARNING with the connection and the count, not the traversal one.
+    names = ["/data/in/MRN123456789_ADT.hl7", "/data/in/MRN987654321_ORU.hl7"]
+    client = _HostileListingClient(names)
+    src = _src(monkeypatch, client)
+    src._connection = "inbound:IB_ACME_ADT"
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _OTHER_FORM_LINE in sink.text
+    assert "inbound:IB_ACME_ADT" in sink.text
+    assert "2 listing entries" in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+    assert "MRN" not in sink.text
+    assert SAFE_NAME_LABEL.search(sink.text) is None
+    assert client.ops == []
+
+
+async def test_another_listing_form_warning_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # The clock is moved by back-dating the last WARNING, not by patching time.monotonic, which
+    # the event loop reads too.
+    client = _HostileListingClient(["/data/in/a.hl7"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+
+    async def warnings() -> int:
+        with filtered_sink(_REMOTE_LOGGER) as sink:
+            await src._poll_once()
+        return sink.text.count(_OTHER_FORM_LINE)
+
+    def back_date(seconds: float) -> None:
+        assert src._other_form_warned_at is not None
+        src._other_form_warned_at -= seconds
+
+    assert await warnings() == 1
+    back_date(OTHER_FORM_WARNING_SECONDS - 60)
+    assert await warnings() == 0  # inside the window: DEBUG only
+    back_date(60)
+    assert await warnings() == 1  # the window has passed
+    # A poll with none clears the clock, so a recurrence warns at once.
+    client._names = []
+    assert await warnings() == 0
+    assert src._other_form_warned_at is None
+    client._names = ["/data/in/a.hl7"]
+    assert await warnings() == 1
+
+
+async def test_a_traversal_name_beside_another_form_still_logs_the_traversal_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    client = _HostileListingClient(["../../drops/MRN123456789_ADT.hl7", "/data/in/a.hl7"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert sink.text.count(_TRAVERSAL_LINE) == 1
+    assert "1 listing entry named a path" in sink.text
+    assert "MRN" not in sink.text
+    assert client.ops == []
 
 
 def test_sftp_real_handshake_still_needs_an_etm_mac_beside_gcm(

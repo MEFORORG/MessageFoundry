@@ -594,7 +594,7 @@ def test_ftp_refusal_stays_permanent_when_the_confirming_listing_fails(
     confirms nothing, so the ``553`` keeps its permanent class rather than becoming a retry."""
     ftp = _ScriptedFtp({"/in/.t.part": b"new"})
     ftp.rnto_reply = "553 Requested action not taken"
-    ftp.list_reply = "550 No files found"
+    ftp.list_reply = "550 Permission denied"
     ftp.listings_before_failure = 1
     with pytest.raises(_RemoteError) as caught:
         _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7"])
@@ -619,7 +619,7 @@ def test_ftp_publish_listing_failure_is_transient(monkeypatch: pytest.MonkeyPatc
     """A listing refused on the publish connection retries, as every send-path listing does (the
     #1936 rule), rather than dead-lettering a message whose temp is already written."""
     ftp = _ScriptedFtp({"/in/.t.part": b"new"})
-    ftp.list_reply = "550 No files found"
+    ftp.list_reply = "550 Permission denied"
     with pytest.raises(_RemoteError) as caught:
         _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7"])
     assert caught.value.permanent is False
