@@ -70,6 +70,7 @@ section reference.
 | Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
+| | `[store].secure_delete` | `true` (*conditional* — a loosening only on a file-backed SQLite store; `false` leaves a purged body's bytes in the file) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].ad_connect_timeout`, `ad_receive_timeout` | `10` s / `10` s (*conditional* — a loosening only once `ad_enabled`; a timeout above `10` s is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
@@ -106,7 +107,7 @@ section reference.
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
-`[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
+`[store].allow_unmarked_ciphertext`, `[store].secure_delete`, `[auth].ad_session_recheck_seconds`,
 `[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
 `[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
 `[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
@@ -565,6 +566,21 @@ This section is kept rather than deleted, because the claim it used to make is t
   (owner ruling 2026-09-23), alerting under its own subject `upload-cipher`. With this on, it is served as plaintext instead. Under
   `cipher_provider = "vault_transit"` uploads pass through either way; [PHI.md](PHI.md) §3 says why.
 - **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
+
+### `[store].secure_delete = false` — a purged body's bytes stay in the SQLite file
+- **What you lose:** SQLite stops overwriting what a delete frees. A retention purge blanks a body,
+  and a consumed queue row is deleted, but the old bytes stay in the file's free space. Anyone who can
+  read the file can carve them out until SQLite reuses the page or a `VACUUM` rebuilds the file. On a
+  keyed store a sealed body stays sealed, so reading it also needs the key (vault BACKLOG #2619).
+- **When acceptable:** a throughput measurement, or a store whose file nobody but the engine's own
+  account can read and that is never copied off the machine. The cost of leaving it on is extra write
+  I/O for each page a delete frees; `docs/CONFIGURATION.md` gives one measurement.
+- **Compensating controls:** the store file's ACL; `[store].encryption_key`, which keeps a sealed
+  body sealed in free space too; a scheduled `[retention].vacuum_at`, which rebuilds the file.
+- **Reported only on a file-backed SQLite store.** The server backends ignore the switch, and an
+  in-memory store has no file, so `security_loosenings()` names neither.
+- **Reversible:** yes, from the next open. Pages freed while it was off keep their bytes until SQLite
+  reuses them or a `VACUUM` runs.
 
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
 - **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past

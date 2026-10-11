@@ -625,8 +625,9 @@ class StoreSettings(_Section):
     # PRAGMA secure_delete on the writer connection (vault BACKLOG #2619). ON zeroes the bytes of a
     # deleted row or a purged body, so a retention purge or a consumed queue row leaves no copy in the
     # file's free space. Default ON. The cost is extra write I/O for each page a delete frees; turning
-    # it off is a throughput choice that leaves purged bytes readable in the file. SQLite only: the
-    # server backends ignore it, and how a server database reuses freed space is the DBA's.
+    # it off is a throughput choice that leaves purged bytes readable in the file, and a LOOSENING
+    # that security_loosenings() names on a file-backed store. SQLite only: the server backends
+    # ignore it, and how a server database reuses freed space is the DBA's.
     secure_delete: bool = True
     # App-side group-commit (ADR 0055, SQLite only). When > 0, the SQLite store runs a dedicated
     # committer coroutine that COALESCES the grouped stage-handoff mutations (enqueue_ingress,
@@ -8489,7 +8490,8 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
-    ``[store].allow_unmarked_ciphertext`` (#1169),
+    ``[store].allow_unmarked_ciphertext`` (#1169), ``[store].secure_delete`` on a file-backed
+    SQLite store (vault BACKLOG #2619),
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
@@ -8842,6 +8844,23 @@ def security_loosenings(
                 "anyone who can write [store].uploads_dir, with no store access at all, can drop a "
                 "sidecar with a chosen uploader and have it listed, browsed and resent "
                 "(no effect without a store key)",
+            )
+        )
+    # Vault BACKLOG #2619. Off, SQLite leaves what a delete frees in the file as it was, so a purge
+    # blanks a body without removing it. Only a file-backed SQLite store has such a file: the server
+    # backends ignore the switch, and an in-memory store leaves nothing behind.
+    if (
+        not store.secure_delete
+        and store.backend is StoreBackend.SQLITE
+        and store.path != ":memory:"
+    ):
+        out.append(
+            (
+                "secure_delete",
+                "a deleted row or a retention-purged body is NOT overwritten in the SQLite file -- "
+                "its old bytes stay in the file's free space, readable by anyone who can read the "
+                "file (and, for a sealed body, holds the key), until SQLite reuses the page or a "
+                "VACUUM rebuilds the file",
             )
         )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the

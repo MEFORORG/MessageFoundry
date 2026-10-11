@@ -43,6 +43,7 @@ from messagefoundry.config.settings import (
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
+    StoreBackend,
     StoreSettings,
     _trust_every_peer_entries,
     load_settings,
@@ -2738,10 +2739,8 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "encrypt",  # the keyless-PHI serve gate refuses it in its own right
         "trust_server_certificate",  # gated by weakened_tls_escape_permitted (the ADR 0092 clamp)
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
-        # Vault BACKLOG #2619. Ships ON; off, a SQLite purge leaves the old bytes in the file's free
-        # space. That IS a loosening, so reporting it in security_loosenings() is OWED, not decided
-        # against: it waits on that registry's own edit and its SECURITY-LOOSENING.md entry.
-        "secure_delete",
+        # secure_delete left this set when vault BACKLOG #2619 began naming it; the loop below now
+        # pins that it is reported, and its own tests pin the file-backed condition.
     }
     exempt_auth = {
         # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three
@@ -2820,6 +2819,36 @@ def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -
         and isinstance(info.default, bool)
         and field not in _names(**{section: model(**{field: not info.default})})
     ]
+
+
+@pytest.mark.parametrize(
+    ("store", "named"),
+    [
+        (StoreSettings(secure_delete=False), True),
+        (StoreSettings(secure_delete=False, path=":memory:"), False),
+        (
+            StoreSettings(
+                backend=StoreBackend.SQLSERVER,
+                server="s",
+                database="d",
+                username="u",
+                secure_delete=False,
+            ),
+            False,
+        ),
+        (StoreSettings(), False),
+    ],
+)
+def test_secure_delete_off_is_named_on_a_file_backed_sqlite_store(
+    store: StoreSettings, named: bool
+) -> None:
+    """Vault BACKLOG #2619: off, a purge leaves the old bytes in the SQLite file. An in-memory store
+    has no file to keep them in, and a server backend ignores the switch, so neither is named, and
+    the shipped value is not either. The first case is the control that the entry exists."""
+    pairs = dict(_pairs(store=store))
+    assert ("secure_delete" in pairs) is named
+    if named:
+        assert "NOT overwritten in the SQLite file" in pairs["secure_delete"]
 
 
 @pytest.mark.parametrize(
