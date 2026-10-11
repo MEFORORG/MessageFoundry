@@ -46,16 +46,23 @@ sub-key row and inherits its accumulated count. What the engine cannot see is a 
 rolled back outside it -- a VM snapshot, a DBA restore of a server database, a staging copy given the
 production key: that copy carries its salt and its row. ADR 0196 records it as an accepted limit.
 
-**Out of scope: ``vault_transit``.** That cipher draws no local nonce and builds no local ``AESGCM``.
-:func:`bounded_cipher` returns ``None`` for it and for the identity cipher, and every entry point here
-degrades to a no-op. So nothing counts, alarms or refuses on that path. Its bound is a DOCUMENTED
-OPERATOR PRECONDITION, not a counted one: the operator must rotate the Transit data key before any one
-key version seals 2**32 values, and the engine does not check that they do. It is weaker than this
+**Out of scope: the ``vault_transit`` store cipher.** It draws no local nonce and builds no local
+``AESGCM``. :func:`bounded_cipher` returns ``None`` for it and for the identity cipher, and every
+entry point here degrades to a no-op. So nothing counts, alarms or refuses on the store cipher's
+path. Its bound is a DOCUMENTED OPERATOR PRECONDITION, not a counted one: the operator must rotate
+the Transit data key before any one key version seals 2**32 values, and the engine does not check
+that they do. It is weaker than this
 module's bound, and the owner ruled on 2026-09-28 that it does not meet ASVS 11.5.2 ruling R3, which
 needs an engine-recorded attestation. ADR 0138's 2026-09-28 amendment states the precondition and why
 (BACKLOG #1173). That attestation is :mod:`messagefoundry.store.transit_attestation` (BACKLOG #2337,
 ADR 0138's 2026-10-07 amendment): a CLI-written, audited store row naming the Transit key, without which
 ``serve`` refuses under enforce. It records who vouched for the rotation; it still counts nothing.
+
+**DR archives under ``vault_transit`` DO draw local nonces** whenever a key resolves for the backup.
+``pipeline/dr_backup.py`` then seals them under that DEK in process and charges the DEK's own
+``cipher_meta`` row. Nothing enforces that row's ceiling in this mode. ADR 0196's 2026-10-10
+amendment traces the path by symbol (BACKLOG #2187; a seat decision under owner delegation
+2026-10-08, not an owner ruling).
 """
 
 from __future__ import annotations
@@ -99,10 +106,10 @@ EnsureSalt = Callable[[str], Awaitable[str]]
 def bounded_cipher(cipher: Cipher | None) -> AesGcmCipher | None:
     """The cipher whose invocations the store must account for, or ``None``.
 
-    Only the in-process AES-GCM keyring draws local nonces under a local key, so only it has a birthday
-    budget this store can bound. The identity cipher encrypts nothing; ``TransitCipher`` encrypts inside
-    the vault, and its bound is the operator's rotation of the Transit key, which nothing here counts
-    (the module docstring's ``vault_transit`` paragraph)."""
+    Of the store ciphers, only the in-process AES-GCM keyring draws local nonces under a local key, so
+    only it has a birthday budget this store can bound. The identity cipher encrypts nothing;
+    ``TransitCipher`` encrypts inside the vault, and its bound is the operator's rotation of the
+    Transit key, which nothing here counts (the module docstring's ``vault_transit`` paragraphs)."""
     return cipher if isinstance(cipher, AesGcmCipher) else None
 
 
@@ -195,8 +202,8 @@ async def bind_store_salt(cipher: Cipher | None, ensure: EnsureSalt) -> None:
     Runs at open, BEFORE the first checkpoint and before anything seals, so the first reserved block
     and the first value both land under this store's own sub-key. A store with no salt row is a new
     store or a restored one, and the salt minted here makes its data key new. No-op for the identity
-    cipher and ``vault_transit``, which have no local key, and for the frozen v1 writer, which has no
-    salt field.
+    cipher and the ``vault_transit`` store cipher, which seal under no local key, and for the frozen v1
+    writer, which has no salt field.
 
     Unlike the checkpoint, a failure here RAISES: the open cannot pick the key it seals under without
     it, and a guessed salt would split one store's values across keys no row accounts for."""

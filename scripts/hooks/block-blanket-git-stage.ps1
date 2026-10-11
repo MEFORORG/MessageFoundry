@@ -4,6 +4,7 @@
 # tree can't sweep each other's files into one commit. Reads the tool-call JSON on stdin; if the
 # command does a broad stage (git add -A/--all/-u/. or git commit -a/-am/--all, or git commit
 # with a whole-tree pathspec) it returns a PreToolUse "deny" decision asking for explicit paths.
+# A command longer than $MAX_COMMAND_LENGTH is denied unread; the cap, below, says why.
 # Anything else passes silently (exit 0). What it is measured to let through is listed once, in
 # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md.
 # Fail-OPEN on any error: a guardrail must never wedge all git work.
@@ -15,6 +16,20 @@
 # ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
 
 $ErrorActionPreference = 'SilentlyContinue'
+
+# Shell arithmetic, where '<<' is a shift and not a heredoc. Used by Hide-HeredocBodies -Narrow.
+# '((...))' is matched to any depth with a balancing group, and '$[...]' is the older spelling.
+# A line with many unclosed '((' makes this quadratic, so the match carries a time limit. The
+# limit is per line, and a command can hold many such lines, so Hide-HeredocBodies also stops
+# using the pattern once it has spent $ARITHMETIC_BUDGET on it, across all lines. A line that
+# could hold arithmetic and was not cleared of it, on a timeout or once the budget is spent, is
+# not searched for an opener at all. Read as it is, its shift would open a heredoc that never ends
+# and blank every later line; skipped, it blanks nothing, which can only add a deny.
+$ARITHMETIC_BUDGET = [timespan]::FromMilliseconds(500)
+$ARITHMETIC = [regex]::new(
+    '\(\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)\)|\$\[[^\]]*\]',
+    [System.Text.RegularExpressions.RegexOptions]::None,
+    [timespan]::FromMilliseconds(500))
 
 # ---------------------------------------------------------------------------------------------
 # WHY THIS FILE HAS FUNCTIONS NOW, AND WHY THEY ARE LOCAL (BACKLOG #1341)
@@ -48,10 +63,23 @@ $ErrorActionPreference = 'SilentlyContinue'
 # Blank the BODY of every heredoc, preserving line structure. A heredoc body is data being
 # written to a file, not a command, but its lines sit at the front of a newline-split segment and
 # are read there as program position. Handles <<WORD, <<-WORD, <<'WORD' and <<"WORD".
-function Hide-HeredocBodies([string]$Text) {
+# -Narrow is the second, added reading; the views below say what it fixes.
+function Hide-HeredocBodies([string]$Text, [switch]$Narrow) {
+    # bash reads a heredoc word up to the first blank or metacharacter, with quoted parts and
+    # backslash escapes inside it, and then removes the quotes and backslashes to get the
+    # delimiter. The first reading stops at the first character outside [A-Za-z0-9_], or takes a
+    # quoted part alone, and those are its mistakes.
+    $opener = if ($Narrow) { '<<-?\s*((?:''[^'']*''|"[^"]*"|\\.|[^\s;&|<>()''"\\])+)' }
+              else { '<<-?\s*(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))' }
+    # Every opener holds '<<', so a line without it is skipped before the patterns run; that
+    # saves most of the time on a command of many lines. The narrow reading looks for '<' alone,
+    # because removing arithmetic can bring two '<' together.
+    $mark = if ($Narrow) { '<' } else { '<<' }
+    if (-not $Text.Contains($mark)) { return $Text }
     $lines = $Text -split "`n", 0
     $out = New-Object 'System.Collections.Generic.List[string]'
     $terminator = $null
+    $arithmeticSpent = New-Object System.Diagnostics.Stopwatch
     foreach ($line in $lines) {
         if ($null -ne $terminator) {
             # Inside a body: blank it. The terminator line itself is kept so the shape stays legible.
@@ -60,10 +88,26 @@ function Hide-HeredocBodies([string]$Text) {
             continue
         }
         $out.Add($line)
-        $m = [regex]::Match($line, '<<-?\s*(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
-        if ($m.Success) {
-            $terminator = @($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) |
-                Where-Object { $_ } | Select-Object -First 1
+        if (-not $line.Contains($mark)) { continue }
+        # Only the opener SEARCH skips arithmetic; the line itself is kept whole.
+        $probe = $line
+        if ($Narrow -and ($line.Contains('((') -or $line.Contains('$['))) {
+            $probe = $null
+            if ($arithmeticSpent.Elapsed -lt $ARITHMETIC_BUDGET) {
+                $arithmeticSpent.Start()
+                try { $probe = $ARITHMETIC.Replace($line, '') }
+                catch [System.Text.RegularExpressions.RegexMatchTimeoutException] { $probe = $null }
+                $arithmeticSpent.Stop()
+            }
+            if ($null -eq $probe) { continue }
+        }
+        $m = [regex]::Match($probe, $opener)
+        if ($m.Success -and $Narrow) {
+            $terminator = $m.Groups[1].Value -creplace '[''"\\]', ''
+        } elseif ($m.Success) {
+            # Exactly one of the three groups takes part, and each holds at least one character,
+            # so joining them gives that one. A pipeline here cost more than the rest of the line.
+            $terminator = $m.Groups[1].Value + $m.Groups[2].Value + $m.Groups[3].Value
         }
     }
     return ($out -join "`n")
@@ -115,29 +159,100 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
     return $null
 }
 
-# Remove or blank every match of $Pattern in BOTH views at once, so the two stay the same length
-# as each other. Used only to build the second, joined view -- see the views below.
-function Join-ContinuedLines([string]$Scan, [string]$Raw, [string]$Pattern, [bool]$Delete) {
-    $s = New-Object System.Text.StringBuilder $Scan
-    $r = New-Object System.Text.StringBuilder $Raw
-    $found = [regex]::Matches($Scan, $Pattern)
-    for ($n = $found.Count - 1; $n -ge 0; $n--) {
-        $at = $found[$n].Index
-        $len = $found[$n].Length
-        [void]$s.Remove($at, $len)
-        [void]$r.Remove($at, $len)
-        if (-not $Delete) {
-            [void]$s.Insert($at, ' ' * $len)
-            [void]$r.Insert($at, ' ' * $len)
+# Drop each bracketed span '(...)' to one space, and everything from the first '(' that never
+# closes. A stray ')' is kept. The first version deleted the innermost '(...)' over and over, one
+# pass per nesting level, so deep nesting kept the hook past its timeout. Two later versions
+# walked the brackets in a PowerShell loop, which was slow per bracket and quadratic in one spot.
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a has the measurements.
+#
+# Both steps below are single .NET regex calls, and neither can backtrack: every loop sits inside
+# an atomic group. $BRACKET_PREFIX reads text, stray ')' and whole balanced spans from the start,
+# and stops at the first '(' that never closes. Only that one '(' scans to the end and fails, so
+# the call is linear. Everything from that '(' on is dropped. In what is left every '(' closes,
+# so $BRACKET_SPAN never fails partway, and it replaces each outermost span with one space. The
+# balancing group 'd' counts the depth inside a span, the same way $ARITHMETIC above does.
+# That is the old loop's result on a segment, which never holds a line feed: the splitter cuts
+# at every one. tests/test_blanket_stage_guard.py compares the two on seeded random strings.
+$BRACKET_SPAN_BODY = '\((?>(?:[^()]+|\((?<d>)|\)(?<-d>))*)(?(d)(?!))\)'
+$BRACKET_PREFIX = [regex]::new("\A(?>(?:[^()]+|\)|$BRACKET_SPAN_BODY)*)")
+$BRACKET_SPAN = [regex]::new($BRACKET_SPAN_BODY)
+function Remove-BracketedText([string]$Text) {
+    if ($Text.IndexOf([char]'(') -lt 0) { return $Text }
+    $Text = $Text.Substring(0, $BRACKET_PREFIX.Match($Text).Length)
+    return $BRACKET_SPAN.Replace($Text, ' ')
+}
+
+# Does a whole-tree pathspec follow the word 'commit'? Two linear searches in place of one
+# pattern, '(^|\s)commit\s(?:.*\s)?(?:<pathspec>)<end>', that backtracked quadratically on repeated
+# 'commit' words; the page's section 4a has the measurement. On text with no line feed, which is
+# every segment, they answer the same; across a line feed they do not, because '.*' stops there
+# and these searches do not. The FIRST 'commit' leaves the most
+# text after it, so if any 'commit' is followed by the pathspec, the first one is. The second
+# search starts AT the blank that ends 'commit ', the blank the old pattern allowed before the
+# pathspec. tests/test_blanket_stage_guard.py compares the two on seeded random strings.
+function Test-CommitPathspec([string]$Text, [string]$PathSpec, [string]$End) {
+    $word = [regex]::Match($Text, '(^|\s)commit\s')
+    if (-not $word.Success) { return $false }
+    return ($Text.Substring($word.Index + $word.Length - 1) -cmatch "\s(?:$PathSpec)$End")
+}
+
+# Replace every match of $Pattern, found in the scan view, at the same offsets in BOTH views, so
+# the two stay the same length as each other. Each matched character becomes $Fill; an empty
+# $Fill deletes the match. Used only to build the added views -- see the views below.
+# The views are rebuilt front to back from the text between matches. Inserting the fill in place
+# moved the tail of the string once per match, so many backtick continuations took quadratic time.
+function Edit-BothViews([string]$Scan, [string]$Raw, [string]$Pattern, [string]$Fill) {
+    $s = New-Object System.Text.StringBuilder
+    $r = New-Object System.Text.StringBuilder
+    $pos = 0
+    foreach ($m in [regex]::Matches($Scan, $Pattern)) {
+        $gap = $m.Index - $pos
+        [void]$s.Append($Scan.Substring($pos, $gap)).Append($Fill * $m.Length)
+        [void]$r.Append($Raw.Substring($pos, $gap)).Append($Fill * $m.Length)
+        $pos = $m.Index + $m.Length
+    }
+    [void]$s.Append($Scan.Substring($pos))
+    [void]$r.Append($Raw.Substring($pos))
+    return @($s.ToString(), $r.ToString())
+}
+
+function Write-Deny([string]$Message) {
+    $payload = [pscustomobject]@{
+        hookSpecificOutput = [pscustomobject]@{
+            hookEventName            = 'PreToolUse'
+            permissionDecision       = 'deny'
+            permissionDecisionReason = $Message
         }
     }
-    return @($s.ToString(), $r.ToString())
+    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+    exit 0
+}
+
+# THE LENGTH CAP IS WHAT BOUNDS THIS HOOK'S RUN TIME. .claude/settings.json gives the hook a
+# timeout, and a hook that runs past it lets the command run, so every slow path is a way past the
+# guard. Each repair of a slow path has so far opened another, and nothing proves none is left. So
+# a command longer than the cap is refused unread, and the reason says what to do instead.
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a says how the cap was chosen, gives the
+# measurements, and lists the false denies it costs. The cap is a seat decision under the owner's
+# 2026-10-09 "Accept by mechanism" ruling, not an owner ruling.
+$MAX_COMMAND_LENGTH = 65536
+# JSON spells one character in at most six ('\u0000'), so a payload past this length cannot hold
+# a command under the cap beside fields of ordinary size. Reading stops there, so neither the read
+# nor the parse can run long on a huge payload.
+$MAX_PAYLOAD_LENGTH = 6 * $MAX_COMMAND_LENGTH + 65536
+function Write-TooLong([string]$Size) {
+    Write-Deny ("Command too long for the blanket-stage guard to check: $Size, and the limit is " +
+        "$MAX_COMMAND_LENGTH characters. Write it to a script file and run that instead. " +
+        "(MessageFoundry guard; disable via /hooks.)")
 }
 
 $cmd = $null
 $tool = $null
 try {
-    $raw = [Console]::In.ReadToEnd()
+    $buffer = New-Object char[] ($MAX_PAYLOAD_LENGTH + 1)
+    $read = [Console]::In.ReadBlock($buffer, 0, $buffer.Length)
+    if ($read -gt $MAX_PAYLOAD_LENGTH) { Write-TooLong "a tool call of more than $MAX_PAYLOAD_LENGTH characters" }
+    $raw = [string]::new($buffer, 0, $read)
     if (-not [string]::IsNullOrWhiteSpace($raw)) {
         $j = $raw | ConvertFrom-Json
         $cmd = [string]$j.tool_input.command
@@ -147,6 +262,7 @@ try {
     exit 0
 }
 if ([string]::IsNullOrWhiteSpace($cmd)) { exit 0 }
+if ($cmd.Length -gt $MAX_COMMAND_LENGTH) { Write-TooLong "$($cmd.Length) characters" }
 
 # Scan the BLANKED form. Quoted spans and heredoc bodies are data; everything outside them keeps
 # its exact offsets, so a real command is unchanged by this pass.
@@ -181,29 +297,95 @@ $reason = $null
 # arguments. The third went on a measured fail-open: Hide-HeredocBodies stopped taking a bash
 # here-string ('<<<word') for a heredoc, and one command that was denied before became allowed.
 # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the forms all three would have closed.
+#
+# TWO MORE ADDED VIEWS CLOSE THREE PLAIN READING MISTAKES (BACKLOG #1339). Like the joined view,
+# each is added beside the views it is built from and never replaces one, so neither can remove a
+# deny the guard made before:
+#   * the NARROW heredoc reading (Hide-HeredocBodies -Narrow) reads a tag the way bash does, to
+#     the first blank or metacharacter and with its quotes removed, so '<<EOF-1', '<<E.O' and
+#     "<<'EOF'-1" are read whole. It also does not take a shift inside shell arithmetic
+#     ('$((1<<n))', '(( x = 1<<n ))', '$[1<<n]') for a heredoc. The first reading took each for
+#     an opener whose terminator never comes, and so blanked every later line;
+#   * the CARRIAGE-RETURN view splits a line at a bare carriage return. PowerShell ends a line
+#     there and bash does not, so the tool name picks it, and an unknown tool gets it too. A
+#     carriage return inside a quoted span or a heredoc body is already blank in the scan view.
+#     It is made BEFORE the continuation join, so a backtick before the carriage return joins.
+# Each is built only when the command holds the text it reads, so most commands pay for neither.
+#
+# THE ORIGINAL VIEWS ARE JUDGED FIRST, AND THE ADDED ONES ONLY IF THOSE ALLOW. A reading that is
+# slow on some input could otherwise push the hook past its timeout, and a hook that times out
+# lets the command run -- a deny turned into an allow. Measured: a 30000-bracket payload holding a
+# real 'git add -A' took 19.7 s when every view was built first. In this order the original
+# verdict is reached before any added reading runs, so a slow added reading can cost only the deny
+# it would have added.
 $views = New-Object 'System.Collections.Generic.List[string[]]'
-$views.Add(@($scan, $cmd))
-$joined = @($scan, $cmd)
-if ($tool -ne 'PowerShell') {
-    $joined = Join-ContinuedLines $joined[0] $joined[1] '(?<=(?<!\\)(?:\\\\)*)\\\r?\n' $true
-}
-if ($tool -ne 'Bash') {
-    $joined = Join-ContinuedLines $joined[0] $joined[1] '(?<=(?<!`)(?:``)*)`\r?\n' $false
-}
-if ($joined[0] -cne $scan) { $views.Add($joined) }
-
-# Each bound is (view index, start, length).
-$bounds = New-Object 'System.Collections.Generic.List[int[]]'
-for ($v = 0; $v -lt $views.Count; $v++) {
-    $cursor = 0
-    foreach ($m in [regex]::Matches($views[$v][0], '(\|\||&&|[;|&\n])')) {
-        $bounds.Add(@($v, $cursor, ($m.Index - $cursor)))
-        $cursor = $m.Index + $m.Length
+function Add-ViewAndItsJoin([string[]]$Base) {
+    $views.Add($Base)
+    $joined = $Base
+    # The lookahead comes first so the lookbehind runs only at the end of a run of escapes. Run at
+    # every escape in a long run, the lookbehind took time quadratic in the run's length.
+    if ($tool -ne 'PowerShell') {
+        $joined = Edit-BothViews $joined[0] $joined[1] '(?=\\\r?\n)(?<=(?<!\\)(?:\\\\)*)\\\r?\n' ''
     }
-    $bounds.Add(@($v, $cursor, ($views[$v][0].Length - $cursor)))
+    if ($tool -ne 'Bash') {
+        $joined = Edit-BothViews $joined[0] $joined[1] '(?=`\r?\n)(?<=(?<!`)(?:``)*)`\r?\n' ' '
+    }
+    if ($joined[0] -cne $Base[0]) { $views.Add($joined) }
 }
+Add-ViewAndItsJoin @($scan, $cmd)
 
-foreach ($b in $bounds) {
+# LIMB 2's long-flag ladder, built once here rather than per segment. LIMB 2, in the loop below,
+# says why it is a ladder.
+$blanketWords = @('all', 'update', 'no-ignore-removal')
+$longNames = @(
+    $blanketWords | ForEach-Object { $w = $_; 1..$w.Length | ForEach-Object { $w.Substring(0, $_) } }
+) | Sort-Object -Property Length -Descending   # longest first: `--all` binds as `all`, not `a`+`ll`
+$longFlag = "--(?:$($longNames -join '|'))"
+
+# Each bound is (view index, start, length). Views are cut into bounds as they are added.
+#
+# The splitter cuts at '||', '&&', ';', '|', '&' and a line feed. Every one of those characters
+# is a separator, so a segment with any text in it is a run of other characters. $GIT_SEGMENT
+# finds only the runs whose trimmed text the program-name test in the loop accepts, in one .NET
+# call. That test still runs; the pattern saves a pass of the loop for every segment that is not
+# git, which on a command of many short segments was most of the hook's time. Both are built from
+# $GIT_PROGRAM, so widening the program name widens both, and a segment the test would accept is
+# never left uncut. Leading blanks are kept in the bound, as the old cut kept them; the loop trims.
+$GIT_PROGRAM = '(?i:git(?:\.exe)?)'
+$GIT_SEGMENT = [regex]::new("(?<![^;|&\n])[^\S\n]*$GIT_PROGRAM(?=\s|[;|&]|\z)[^;|&\n]*")
+$bounds = New-Object 'System.Collections.Generic.List[int[]]'
+$cut = 0
+$addedBuilt = $false
+# Most views share most segments. The verdict on a segment is fixed by its two strings, so a pair
+# already judged is skipped; that can never remove a deny. The key carries the first string's
+# length, so no two different pairs share one.
+$judged = New-Object 'System.Collections.Generic.HashSet[string]'
+$next = 0
+while ($true) {
+    for (; $cut -lt $views.Count; $cut++) {
+        foreach ($m in $GIT_SEGMENT.Matches($views[$cut][0])) {
+            $bounds.Add(@($cut, $m.Index, $m.Length))
+        }
+    }
+    if ($next -ge $bounds.Count) {
+        if ($addedBuilt) { break }
+        $addedBuilt = $true
+        $bases = New-Object 'System.Collections.Generic.List[string[]]'
+        $bases.Add(@($scan, $cmd))
+        if ($cmd.Contains('<<')) {
+            $narrow = Hide-QuotedSpans (Hide-HeredocBodies $cmd -Narrow)
+            if ($narrow -cne $scan) { $bases.Add(@($narrow, $cmd)); Add-ViewAndItsJoin @($narrow, $cmd) }
+        }
+        if ($tool -ne 'Bash' -and $cmd.Contains("`r")) {
+            foreach ($base in @($bases)) {
+                $split = Edit-BothViews $base[0] $base[1] '\r(?!\n)' "`n"
+                if ($split[0] -cne $base[0]) { Add-ViewAndItsJoin $split }
+            }
+        }
+        continue
+    }
+    $b = $bounds[$next]
+    $next++
     if ($b[2] -le 0) { continue }
     $s = $views[$b[0]][0].Substring($b[1], $b[2]).Trim()
     $rawSeg = $views[$b[0]][1].Substring($b[1], $b[2]).Trim()
@@ -218,7 +400,7 @@ foreach ($b in $bounds) {
     # both Hide- passes keep line feeds; a carriage return inside a quoted span is blanked.
     # When a quoted span, or a heredoc inside '$(...)', runs over a line feed, the text after
     # it lands in a segment that does not start with git. So a pathspec or flag there is not
-    # read. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5.2 lists the measured forms.
+    # read. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5 lists the measured forms.
     # A command reached through a dispatching wrapper ('cmd /c "git add -A"') is still not
     # covered -- that is BACKLOG #1305's axis, on a different file, and deliberately not
     # widened here: doing so needs a wrapper allowlist, which is the construct #1229 proved
@@ -228,9 +410,11 @@ foreach ($b in $bounds) {
     # git ('C:/.../git.exe add -A', 'env git add -A') is BACKLOG #1305's axis and is left alone,
     # because closing it needs a wrapper allowlist -- the construct BACKLOG #1229 measured as
     # fail-open on the sibling gate.
-    if ($s -inotmatch '^git(\.exe)?(\s|$)') { continue }
+    if ($s -cnotmatch "^$GIT_PROGRAM(\s|$)") { continue }
+    if (-not $judged.Add("$($s.Length):$s$rawSeg")) { continue }
 
-    $tokens = @($s -split '\s+' | Where-Object { $_ })
+    # $s is trimmed and starts with git, so the split yields no empty token to filter out.
+    $tokens = @($s -split '\s+')
 
     # THE ONE SUPPRESSION. A recognised read-only subcommand cannot stage, so 'git grep -n add'
     # and 'git log --all --grep commit' allow. Anything unrecognised -- including $null -- falls
@@ -261,12 +445,8 @@ foreach ($b in $bounds) {
     # WHY A LADDER AND NOT TWO SPELLINGS: git's parse-options binds a long option by any
     # UNAMBIGUOUS ABBREVIATION, so `--a`, `--al`, `--up`, `--upd` and `--updat` all stage the tree.
     # Generating an ambiguous rung costs nothing -- git refuses it, and a command git refuses is
-    # not a command to protect.
-    $blanketWords = @('all', 'update', 'no-ignore-removal')
-    $longNames = @(
-        $blanketWords | ForEach-Object { $w = $_; 1..$w.Length | ForEach-Object { $w.Substring(0, $_) } }
-    ) | Sort-Object -Property Length -Descending   # longest first: `--all` binds as `all`, not `a`+`ll`
-    $longFlag = "--(?:$($longNames -join '|'))"
+    # not a command to protect. $longFlag is built once, above the loop.
+    #
     # A short-option CLUSTER, the same construction the commit branch below already used. The
     # trigger set is EXACTLY {A, u} and CASE-SENSITIVE, and the case is the whole bound:
     #   -A  --all      stages everything          MUST trigger
@@ -275,7 +455,10 @@ foreach ($b in $bounds) {
     #                  here would deny commands git itself refuses: pure false-deny, zero gain.
     #   -U  --unified  IS a real flag and stages nothing. Matching it denies legitimate work.
     # `-a` and `-U` are pinned as ALLOW tests so the next reader cannot "simplify" this to (?i)[au].
-    $shortFlag = '-[A-Za-z]*[Au][A-Za-z]*'
+    # The cluster is written as a lookahead for the trigger letter, then the whole run. The plain
+    # form, '-[A-Za-z]*[Au][A-Za-z]*', tried every trigger letter in a long run against the rest of
+    # the run, which took time quadratic in the run's length. Both match the same tokens.
+    $shortFlag = '-(?=[A-Za-z]*[Au])[A-Za-z]*'
     $blanketFlag = "(?:$longFlag|$shortFlag)"
 
     # LIMB 3 -- a whole-tree PATHSPEC, kept a SEPARATE limb from the flags on purpose. A flag can be
@@ -317,7 +500,8 @@ foreach ($b in $bounds) {
     }
     # git commit with -a / -am / --all (auto-stages every tracked change). A single-dash flag
     # cluster containing 'a' catches -a, -am, -na, etc.; '--amend' (double dash) is left alone.
-    if ($s -cmatch '\bcommit\b' -and ($s -cmatch "(^|\s)--all$tokenEnd" -or $s -cmatch "(^|\s)-[A-Za-z]*a[A-Za-z]*$tokenEnd")) {
+    # The cluster is a lookahead and then the run, for the reason given at $shortFlag above.
+    if ($s -cmatch '\bcommit\b' -and ($s -cmatch "(^|\s)--all$tokenEnd" -or $s -cmatch "(^|\s)-(?=[A-Za-z]*a)[A-Za-z]*$tokenEnd")) {
         $reason = "git commit -a/-am/--all auto-stages every tracked change before committing."
         break
     }
@@ -338,13 +522,8 @@ foreach ($b in $bounds) {
     # 'commit' is matched as a whole word wherever the subcommand did not resolve to add or
     # stage, for the same reason the staging test above falls back to the bare word.
     if (-not $staging) {
-        $commitArgs = $s -creplace '(^|\s)#.*$', ''
-        do {
-            $before = $commitArgs
-            $commitArgs = $commitArgs -creplace '\([^()]*\)', ' '
-        } while ($commitArgs -cne $before)
-        $commitArgs = $commitArgs -creplace '\(.*$', ''
-        if ($commitArgs -cmatch "(^|\s)commit\s(?:.*\s)?(?:$dotFamily|:/)$tokenEnd") {
+        $commitArgs = Remove-BracketedText ($s -creplace '(^|\s)#.*$', '')
+        if (Test-CommitPathspec $commitArgs "$dotFamily|:/" $tokenEnd) {
             $reason = "git commit with a whole-tree pathspec (. ./ :/ :(top)) commits every tracked change under it, including files another session may be editing."
             break
         }
@@ -353,13 +532,4 @@ foreach ($b in $bounds) {
 
 if (-not $reason) { exit 0 }
 
-$msg = "Blocked blanket git staging: $reason Stage explicit paths instead: 'git add <path> ...' then 'git commit -m ...'. (MessageFoundry guard; disable via /hooks.)"
-$payload = [pscustomobject]@{
-    hookSpecificOutput = [pscustomobject]@{
-        hookEventName            = 'PreToolUse'
-        permissionDecision       = 'deny'
-        permissionDecisionReason = $msg
-    }
-}
-[Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
-exit 0
+Write-Deny "Blocked blanket git staging: $reason Stage explicit paths instead: 'git add <path> ...' then 'git commit -m ...'. (MessageFoundry guard; disable via /hooks.)"

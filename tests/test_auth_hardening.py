@@ -36,7 +36,7 @@ from messagefoundry.api.app import _session_reaper
 from messagefoundry.auth import Role, hash_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, LastAdministratorRefused
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
@@ -350,25 +350,14 @@ async def test_cannot_remove_last_administrator(engine: Engine) -> None:
         )
         h = _auth((await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"])
         my_id = (await c.get("/auth/me", headers=h)).json()["user_id"]
-        # stripping admin from the only administrator is refused
+        # stripping admin from the only administrator is refused. The route refuses a self-target
+        # first (BACKLOG #1149), so the last-administrator refusal is read off the service.
         assert (
             await c.put(f"/users/{my_id}/roles", headers=h, json={"roles": ["viewer"]})
         ).status_code == 400
-        # add a second admin, and the demotion is now allowed
-        assert (
-            await c.post(
-                "/users",
-                headers=h,
-                json={
-                    "username": "root2",
-                    "roles": ["administrator"],
-                    "email": "root2@example.org",
-                },
-            )
-        ).status_code == 201
-        assert (
-            await c.put(f"/users/{my_id}/roles", headers=h, json={"roles": ["viewer"]})
-        ).status_code == 200
+        with pytest.raises(LastAdministratorRefused):
+            await service.set_roles(my_id, ["viewer"], actor=admin.username)
+        # The second-administrator half is pinned in tests/test_last_admin_guard.py.
 
 
 # --- M6: changing a password needs the current one ---------------------------
