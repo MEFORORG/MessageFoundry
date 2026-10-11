@@ -1314,6 +1314,28 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `remotefile._ftp_connect_refusal`, and the 4xx rule in `remotefile._FtpClient._connect`. Why an
   unclear login refusal is read as a credential fault is in `remotefile._names_connection_limit`.
   A busy reply that also carries a credential word stops the lane too.
+- **An FTP server without `MLSD` must name `NLST` entries in one of two forms (BACKLOG #1130).** The
+  poller lists with `MLSD` and falls back to `NLST` when the server refuses it. It accepts an `NLST`
+  entry in only two forms:
+  - a bare name, such as `a.hl7`;
+  - `remote_dir` exactly as configured, then `/` and a bare name, such as `/in/a.hl7`. A trailing
+    slash on `remote_dir` may be kept or dropped.
+
+  Any other form is refused, which is deliberate. That covers at least a resolved absolute path
+  (`/srv/ftp/in/a.hl7` for `remote_dir = "in"`) and a path relative to the server's current
+  directory (`in/a.hl7` for `remote_dir = "/in"`). Rewriting a path to its last part would read
+  `../x/a.hl7` as `a.hl7`, so the poller refuses rather than rewrites. A refused entry stays on the
+  server and is never read. Entries in another form, with no `..`, `\`, `:` or control character,
+  log one WARNING that the server's listing form looks unsupported. It names the connection and a
+  count, never a file, and repeats at most every 15 minutes while the condition lasts. A name that
+  looks like traversal logs its own WARNING on every poll, also with no file name. Where a server's
+  `NLST` form is refused, set `remote_dir` to the spelling the server echoes back, or enable
+  `MLSD` on the server.
+- **An empty directory is not an error on an `NLST`-only FTP server (BACKLOG #1130).** Some such
+  servers answer `NLST` on an empty directory with `550 No files found`. The connector reads that
+  exact reply as an empty listing. Any other permanent reply still fails, including `550 No such
+  file or directory`, since that also answers a directory that is not there. A server that sends
+  `550 No files found` for a missing directory has that fault read as an empty poll too.
 - **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
   `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
   nothing else. A server missing either fails the handshake with a permanent `SFTP connection
