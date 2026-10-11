@@ -226,10 +226,10 @@ Restart-Service MessageFoundry   # the running engine keeps its old settings unt
 ```
 
 **`set AppEnvironmentExtra` replaces the service's whole list of extra variables.** Pass every
-variable the service needs in one call, or the ones you leave out are gone at the next start. Keep
-the store key out of that list with the DPAPI key file (see
-[Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)), so
-you never retype it on a command line.
+variable the service needs in one call, or the ones you leave out are gone at the next start.
+**The store key does not go in that list:** the engine refuses to start with it there, because any
+local user can read the list. Use the DPAPI key file (see
+[Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
 interpreter in isolated mode, which ignores every one of them
@@ -448,20 +448,10 @@ What counts as expected start-up code, and what each entry leaves open, is in
 ### Protect the store encryption key at rest (WP-11d)
 
 PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI.md](PHI.md) §3).
-The key is a base64 32-byte secret. Two ways to supply it:
+The key is a base64 32-byte secret. Two ways to supply it. **Under the Windows service, use the
+DPAPI key file.** The engine refuses to start when the store key is in the service's NSSM
+environment.
 
-- **Environment (cross-platform default).** Set `MEFOR_STORE_ENCRYPTION_KEY` in the service's
-  environment (`& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`,
-  the copy the installer checked). That `set` replaces the whole list, so add every other
-  variable the service needs to the same call; see [Start / stop / status](#start--stop--status). Simple,
-  but the plaintext key then sits in the service's NSSM settings, which NSSM keeps in the service's
-  registry key. Treat any secret placed there as readable by **any local user** of the host, not
-  only by an administrator. On a default Windows install that key grants local users read by
-  inheritance, and the installer does not change it. That was measured on one Windows 11 machine,
-  so check who can read that key on your own host. Prefer the DPAPI key file below for the store
-  key. It keeps that one key out of the list. It covers no other secret you put there, and that
-  includes a retired store key during a rotation.
-  **CORRECTED 2026-10-01:** this read "readable by any local administrator".
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
 
@@ -490,9 +480,29 @@ The key is a base64 32-byte secret. Two ways to supply it:
   stated once, in [PHI.md](PHI.md), "Key files". To rotate, `protect-key` the new key to a **new** path, point
   `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
-  the rotation, once nothing still needs its key.
+  the rotation, once nothing still needs its key. Set that retired key in the shell that runs
+  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. So the
+  service's first start after a rotation runs without the retired key, and the secret-rotation
+  watcher then keeps each secret's older date and logs a warning ([PHI.md](PHI.md) §3).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
+
+- **Environment (off Windows, or a `serve` you start from a shell).** Set
+  `MEFOR_STORE_ENCRYPTION_KEY` in the environment of the process that runs `serve`. **Not in the
+  Windows service's NSSM settings.** NSSM keeps the service's environment list
+  (`AppEnvironmentExtra` and `AppEnvironment`) in the service's registry key. Treat any secret
+  placed there as readable by **any local user** of the host, not only by an administrator. On a
+  default Windows install that key grants local users read by inheritance, and the installer does
+  not change it. That was measured on one Windows 11 machine, so check who can read that key on
+  your own host.
+  **CORRECTED 2026-10-01:** this read "readable by any local administrator".
+
+  **The engine refuses to start when the store key, or a retired one, is in that list**, or in
+  the service's own `Environment` registry value, whatever `[security].enforcement` says (vault
+  BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
+  that runs `messagefoundry rotate-key`, not in the service. Other engine secrets there are named,
+  not refused. What the engine reads, what it names and what it does not cover are in
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:

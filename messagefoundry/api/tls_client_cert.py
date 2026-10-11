@@ -129,22 +129,18 @@ def enriched_app_state(
     return {**app_state, MF_CLIENT_PEERCERT_STATE_KEY: peercert}
 
 
-def client_cert_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
+def client_cert_http_protocol_class(base: type[Any]) -> type[asyncio.Protocol]:
     """An HTTP-protocol subclass that stashes the verified peer cert into ``app_state`` post-handshake.
 
-    ``base`` defaults to uvicorn's resolved ``AutoHTTPProtocol`` (httptools when installed, else h11);
-    it is a parameter only so the override logic is unit-testable against a stub base without standing up
-    uvicorn's real protocol. Pass the result as uvicorn's ``http=`` protocol class. The subclass adds
-    nothing but the ``connection_made`` enrichment above — every other behaviour is inherited."""
-    if base is None:
-        # Imported lazily so importing this module does not pull uvicorn into non-serve contexts.
-        from uvicorn.protocols.http.auto import AutoHTTPProtocol
+    ``base`` is required: ``serve`` passes the floored class, which carries the pinned parser
+    (``protocol_headers.floored_http_protocol_class``, BACKLOG #1125), and a default here would be a
+    second place to pin it. Tests pass a stub base. Pass the result as uvicorn's ``http=`` protocol
+    class. The subclass adds nothing but the ``connection_made`` enrichment above — every other
+    behaviour is inherited."""
 
-        base = AutoHTTPProtocol
-
-    # Dynamic base class (uvicorn types AutoHTTPProtocol as a `type[asyncio.Protocol]` *value*, which
-    # mypy cannot use as a static base) — hence the localized ignore, not a blanket one.
-    class _ClientCertHTTPProtocol(base):  # type: ignore[misc,valid-type]
+    # Dynamic base class (a `type[Any]` *value*, which mypy cannot check as a static base) — hence
+    # the localized ignore, not a blanket one.
+    class _ClientCertHTTPProtocol(base):  # type: ignore[misc]
         def connection_made(self, transport: asyncio.BaseTransport) -> None:
             super().connection_made(transport)
             # self.app_state is uvicorn-internal (not on asyncio.Protocol); go through Any so the read +
