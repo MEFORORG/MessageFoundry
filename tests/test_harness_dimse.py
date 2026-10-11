@@ -12,6 +12,10 @@ Without the ``[dicom]`` extra this module is skipped with a reason, never passed
 
 from __future__ import annotations
 
+import contextlib
+import socket
+import struct
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -24,6 +28,7 @@ from harness import drivers, endpoints, sinks  # noqa: E402
 from harness.drivers import Injection  # noqa: E402
 from harness.drivers.dimse import (  # noqa: E402
     ENGINE_AE_TITLE,
+    MAX_ASSOCIATION_READ_BYTES,
     DimseDriver,
     dicom_extra_missing,
     status_of,
@@ -206,6 +211,35 @@ def test_the_sink_refuses_an_association_addressed_to_another_ae() -> None:
         )
         assert sink.records() == []
     assert out.error and "no association" in out.error
+    assert status_of(out) is None
+
+
+def test_the_driver_refuses_a_pdu_past_its_read_cap_without_reading_it() -> None:
+    """pynetdicom reads whatever PDU length a peer announces. A peer that announces one byte past
+    the driver's read cap gets a refusal, and none of that PDU is read (ASVS 5.1.1, BACKLOG #1127).
+    This is also the check that pynetdicom still calls the socket hook the cap rides on."""
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        server.settimeout(10.0)
+
+        def oversized_accept() -> None:
+            conn, _ = server.accept()
+            with conn:
+                conn.settimeout(10.0)
+                conn.recv(65536)  # the A-ASSOCIATE-RQ
+                # An A-ASSOCIATE-AC header announcing a body one byte past the cap, then some body.
+                conn.sendall(struct.pack(">BBL", 0x02, 0, MAX_ASSOCIATION_READ_BYTES + 1))
+                conn.sendall(b"\0" * 4096)
+                with contextlib.suppress(OSError):
+                    while conn.recv(4096):  # hold the connection until the driver drops it
+                        pass
+
+        peer = threading.Thread(target=oversized_accept, daemon=True)
+        peer.start()
+        (out,) = DimseDriver("127.0.0.1", server.getsockname()[1], timeout=5.0).inject(
+            make_datasets(1)[0]
+        )
+        peer.join(10.0)
+    assert out.error and out.error.startswith("reply refused"), out
     assert status_of(out) is None
 
 
