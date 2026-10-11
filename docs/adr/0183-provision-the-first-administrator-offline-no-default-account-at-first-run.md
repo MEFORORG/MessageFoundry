@@ -16,6 +16,10 @@
   address is refused unless `--email` is given (BACKLOG #2288).
 - **Amended 2026-10-10:** Amendment D below. `--email` is required on every run, by owner ruling
   (BACKLOG #1138). It reverses Option 5.
+- **Amended 2026-10-11:** open item (a) is decided: `provision-admin` and the #1236 recovery stay
+  separate (BACKLOG #2304). Seat decision under owner delegation 2026-10-08, not an owner ruling;
+  see the note under *To resolve on acceptance* and vault
+  `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -232,7 +236,7 @@ Amendment A. This note says nothing about the first item.*
 
 *Amended 2026-10-11 (BACKLOG #2304): the first item is decided, so its box is ticked. Amendment A's
 recommendation on item (a) is adopted: `provision-admin` and the #1236 lockout recovery stay separate
-commands, and the overlap is recorded there. No build follows. Seat decision under owner delegation
+commands. Amendment A's item (a) paragraph is the record of the overlap. No build follows. Seat decision under owner delegation
 2026-10-08, not an owner ruling; vault `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section
 "#2304 (batch 240)".*
 
