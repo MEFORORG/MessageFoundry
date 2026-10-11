@@ -443,11 +443,13 @@ in-flight rows stranded.
 >   The deeper fix splits the reload into a prepare step before the hook and an apply step after
 >   it. It is not built.
 > - Every abort row of an activation names the `dr_seed` marker that attempt wrote, as
->   `seed_segment`, and records `vip_hook_ran`. The marker stays, as audit rows do, and a retry
->   writes its own, so each attempt's fork point is recorded. When the hook ran before a step 4
->   abort, the reason says the VIP may have moved to this box. The engine does not run the release
->   hook to undo the takeover. That could hand the address to a primary that is down, so the
->   runbook leaves it to the operator.
+>   `seed_segment`. It also records `vip_hook_ran`, which says the takeover hook was started, as it
+>   does on the release rows. A hook that failed or was killed may still have moved the address.
+>   The marker stays, as audit rows do, and a retry writes its own, so each attempt's fork point is
+>   recorded. When the hook ran before a step 4 abort, the reason says the VIP may have moved to
+>   this box. An interrupted reload with no hook says the same, because the reload may have bound
+>   a listener first. The engine does not run the release hook to undo the takeover. That could
+>   hand the address to a primary that is down, so the runbook leaves it to the operator.
 > - An error that no abort path catches is now an audited abort of kind `error`, which the route
 >   answers with `503`. This holds only while the profile is not yet applied, and every step after
 >   the hook has its own arm. An error from the seed marker's digest provider is one example. Such an

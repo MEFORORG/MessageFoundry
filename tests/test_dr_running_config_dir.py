@@ -1035,8 +1035,15 @@ def _short_engine_takeover(engine: Engine, seconds: float = 0.5) -> Any:
     return coord
 
 
+async def _marker_hashes(engine: Engine) -> list[str]:
+    """The row hash of each dr_seed marker, oldest first."""
+    rows = await engine.store.list_audit(action="dr_seed")
+    return [str(r["row_hash"]) for r in reversed(rows)]
+
+
 def _spy_hook(coord: Any, monkeypatch: pytest.MonkeyPatch, hooks: list[str]) -> None:
-    """Record each hook phase, and answer as a hook that ran and exited 0."""
+    """Configure a takeover hook, record each hook phase, and answer as a hook that exited 0."""
+    coord._settings = coord.settings.model_copy(update={"takeover_hook": "the-hook"})
 
     async def ran(command: str, *, phase: str, actor: str, now: float) -> bool:
         hooks.append(phase)
@@ -1107,6 +1114,12 @@ async def test_an_unexpected_error_before_the_hook_is_an_audited_abort(
     (logged,) = [r for r in caplog.records if "unexpected error" in r.getMessage()]
     assert logged.exc_info is not None
 
+    client, _app = await _admin_client(engine, deadline=30.0)
+    async with client:
+        r = await client.post("/dr/activate", json={})
+    assert r.status_code == 503, r.text  # a fault to retry, not a refused request
+    assert "store step" in r.json()["detail"]
+
 
 async def test_a_takeover_hook_that_fails_names_the_seed_marker_it_followed(
     box: _Box,
@@ -1123,10 +1136,9 @@ async def test_a_takeover_hook_that_fails_names_the_seed_marker_it_followed(
 
     assert caught.value.kind == "vip"
     (row,) = await _rows(engine.store, "dr_activation_aborted")
-    (marker,) = await _rows(engine.store, "dr_seed")
-    assert marker  # control: step 2 wrote the marker before the hook ran
-    assert isinstance(row["seed_segment"], str) and row["seed_segment"]
-    assert row["vip_hook_ran"] is False  # it did not exit 0
+    assert [row["seed_segment"]] == await _marker_hashes(engine)
+    # It ran, and failed. A hook that fails or is killed may still have moved the address.
+    assert row["vip_hook_ran"] is True
 
 
 async def test_a_step_4_abort_after_the_hook_names_the_hook_and_its_seed_marker(
@@ -1156,7 +1168,7 @@ async def test_a_step_4_abort_after_the_hook_names_the_hook_and_its_seed_marker(
     (row,) = await _rows(engine.store, "dr_activation_aborted")
     assert row["vip_hook_ran"] is True
     first_segment = row["seed_segment"]
-    assert isinstance(first_segment, str) and first_segment
+    assert [first_segment] == await _marker_hashes(engine)
     assert "VIP may have moved" in str(row["reason"])
     assert "VIP may have moved" in str(caught.value)
 

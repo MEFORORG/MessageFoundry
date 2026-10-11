@@ -88,13 +88,12 @@ _ACTION_ABORTED = "dr_activation_aborted"
 _ACTION_RELEASE_FAILED = "dr_release_failed"
 
 
-def _vip_note(*, ran: bool) -> str:
-    """The note an abort after the takeover hook carries, since the box is then passive and may
-    hold the address. ``ran`` is whether the abort knows the hook ran, rather than that it may
-    have (vault BACKLOG #3094, item 11)."""
+def _vip_note(cause: str) -> str:
+    """The note an abort carries once something may have moved the address to this box, which is
+    passive again. ``cause`` names that something (vault BACKLOG #3094, item 11)."""
     return (
-        f". The takeover hook {'ran' if ran else 'may have run'}, so the VIP may have moved to "
-        "this box with no priority listener bound -- check the load balancer before retrying"
+        f". {cause}, so the VIP may have moved to this box with no priority listener bound -- "
+        "check the load balancer before retrying"
     )
 
 
@@ -151,7 +150,10 @@ class _ActivationProgress:
     #: The row hash of the dr_seed marker this attempt wrote, once written. An abort after it names
     #: it, so a retry's second marker is not read as the same attempt (vault BACKLOG #3094).
     seed_segment: str | None = None
-    hook_ran: bool = False  # the takeover hook ran to exit 0
+    #: Whether the takeover hook was started, whatever it then did. The same meaning as
+    #: ``vip_hook_ran`` on the release rows: a hook that failed or was killed may still have moved
+    #: the address.
+    hook_ran: bool = False
 
     def abort_fields(self) -> dict[str, object]:
         """The fields an abort row carries about this attempt (vault BACKLOG #3094, item 11)."""
@@ -390,13 +392,15 @@ class DrCoordinator:
                 actor,
                 now,
             )
-        progress.seed_segment = seed_segment = await self._record_seed_marker(seed, verify, now)
+        progress.seed_segment = await self._record_seed_marker(seed, verify, now)
 
         # (3) Acquire-VIP-or-abort (ADR 0048). The optional takeover_hook is belt-and-braces for a
         # non-LB topology; an ADR-0047 LB deployment omits it (the passive LB moves the VIP once the
         # listeners bind in step 4). A hook failure/timeout ABORTS before any listener serves the VIP.
         progress.step = "vip"
-        progress.hook_ran = hook_ran = await self._run_vip_hook(
+        # Set before the hook starts, so the abort a failed or killed hook writes says it ran.
+        progress.hook_ran = bool(self._settings.takeover_hook)
+        await self._run_vip_hook(
             self._settings.takeover_hook, phase="takeover", actor=actor, now=now
         )
 
@@ -416,8 +420,8 @@ class DrCoordinator:
                 "DR run-profile activation failed (the engine could not bind the priority "
                 f"feeds): {safe_exc(exc)}"
             )
-            if hook_ran:
-                reason += _vip_note(ran=True)
+            if progress.hook_ran:
+                reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
             # abort, so a retry's own marker reads as a second attempt (vault BACKLOG #3094, item
             # 11). The takeover is not undone: a release hook could hand the address to a primary
@@ -430,8 +434,8 @@ class DrCoordinator:
             "archive": _basename(seed),
             "verify": verify.status,
             "threshold": self._settings.priority_threshold.value,
-            "seed_segment": seed_segment,
-            "vip_hook_ran": hook_ran,
+            "seed_segment": progress.seed_segment,
+            "vip_hook_ran": progress.hook_ran,
         }
         self._unrecorded_activation = (detail, actor, now)
         # Provenance is read only once the profile is applied and the row is owed, so a cancellation
@@ -453,8 +457,8 @@ class DrCoordinator:
             threshold=self._settings.priority_threshold.value,
             archive=_basename(seed),
             verify_status=verify.status,
-            seed_segment=seed_segment,
-            vip_hook_ran=hook_ran,
+            seed_segment=progress.seed_segment,
+            vip_hook_ran=progress.hook_ran,
         )
 
     # --- release (fail-back) -------------------------------------------------
@@ -654,8 +658,16 @@ class DrCoordinator:
                 )
             return
         reason = f"activation interrupted during the {progress.step} step; the box stays passive"
-        if progress.step in ("vip", "profile"):
-            reason += _vip_note(ran=progress.hook_ran)
+        if progress.step == "vip" or progress.hook_ran:
+            reason += _vip_note(
+                "The takeover hook ran"
+                if progress.step == "profile"
+                else "The takeover hook may have run"
+            )
+        elif progress.step == "profile":
+            # No hook is configured. The reload may still have bound a listener before it rolled
+            # back, and a load balancer moves the VIP to a node that answers (ADR 0047).
+            reason += _vip_note("The reload may have bound a listener before it rolled back")
         await self._write_aborted_row("interrupted", reason, actor, now)
 
     async def _record_release_failed(
