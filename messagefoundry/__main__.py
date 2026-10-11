@@ -4516,6 +4516,13 @@ def _serve(args: argparse.Namespace) -> int:
     # serving lifespan, inside the loop uvicorn owns. Every other loop the CLI starts gets it from
     # `last_resort.run_guarded` (BACKLOG #1789), bar one: the protocol floor's self-test runs a
     # private loop with its own handler, which logs no exception text.
+    from messagefoundry.api.protocol_headers import http_parser_in_force
+
+    # BACKLOG #1125: read off the class uvicorn is about to get, so it names what is served. Worded
+    # to stay clear of the log redactor's name pattern (redaction._NAME_RUN).
+    logging.getLogger(__name__).info(
+        "HTTP request parser in force on the API: %s", http_parser_in_force(run_kwargs["http"])
+    )
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise

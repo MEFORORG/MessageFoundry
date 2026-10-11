@@ -123,7 +123,9 @@ updates:
     # `uvicorn` and `websockets` are exact `==` pins in the base dependencies (BACKLOG #1120). Each
     # entry starts at the pin's next minor, per THE RULE below. A patch release still gets a PR,
     # and tests/test_header_floor_wire.py reds it until someone re-reads the server and moves
-    # the measured version with the pin. That was true under the old ranges too. The entries also
+    # the measured version with the pin. That was true under the old ranges too. `httptools` is
+    # the same case (BACKLOG #1125): tests/test_api_request_framing_wire.py reds a patch release
+    # until someone re-runs its framing shapes and moves the measured version. The entries also
     # withhold the security track from the next minor on; pip-audit still sees an advisory. Why
     # each pin exists is beside it in pyproject.toml. pyproject.toml declares plain `uvicorn`,
     # not `uvicorn[standard]`, so the bare name here matches it as written. Move each entry in the
@@ -154,6 +156,8 @@ updates:
         versions: [">=0.55.0"]
       - dependency-name: "websockets"
         versions: [">=17.3.0"]
+      - dependency-name: "httptools"
+        versions: [">=0.9.0"]
       # Why: the comment above the [dicom] extra in pyproject.toml.
       - dependency-name: "pydicom"
         versions: [">=3.1.0"]
