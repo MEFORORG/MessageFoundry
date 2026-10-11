@@ -1110,6 +1110,10 @@ value passed into `mark_failed`, which changes the `Store` protocol, the same co
 the alternatives* gives for a per-claim token. The ruling chose a status term, so this is recorded,
 not built.
 
+*Amended 2026-10-11 (BACKLOG #2415): no build; if this is ever funded, file the per-claim token, not
+the attempts term. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
+`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section "#2415 (batch 240)".*
+
 **Tests.** `tests/test_mark_failed_status_term.py` adds the swept-PENDING retry, the batch with one
 swept member, items 1, 2 and 4 above, and a zero multiplier on a reset row. The DONE, DEAD and
 CANCELLED tests stay as the controls. Narrowing the term back to INFLIGHT turned ten of its 28 runs
