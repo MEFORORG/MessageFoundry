@@ -44,7 +44,7 @@ from messagefoundry.config.settings import (
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
-    _trust_every_peer_entries,
+    _classify_proxy_entries,
     load_settings,
     security_loosenings,
 )
@@ -1301,7 +1301,7 @@ async def test_near_off_values_admit_what_the_default_refuses(
     assert admitted(near_off, "admin") == 200
 
 
-# --- [api].trusted_proxies with a prefix of 0 (BACKLOG #1131) ----------------------------------
+# --- [api].trusted_proxies covering more than one address (BACKLOG #1131) ----------------------
 
 
 def _proxied(*entries: str) -> ApiSettings:
@@ -1316,25 +1316,60 @@ def test_a_trust_every_peer_proxy_entry_is_a_named_loosening(entry: str) -> None
     assert _names(api=api) == ["trusted_proxies"]
 
 
+@pytest.mark.parametrize("entry", ["10.0.0.1", "10.0.0.1/32", "::1", "::1/128", "fd00::1"])
+def test_a_single_host_proxy_entry_is_not_a_loosening(entry: str) -> None:
+    """The control for the range arm below: one address is the proxy itself, so nothing is named."""
+    assert _names(api=_proxied(entry)) == []
+
+
+_WHOLE_FAMILY = "which together cover every address of their family"
+_RANGE = "each a range of more than one address"
+
+
+def _proxy_risk(*entries: str) -> str:
+    return dict(_pairs(api=_proxied(*entries)))["trusted_proxies"]
+
+
 @pytest.mark.parametrize(
     "entry",
     [
-        "10.0.0.1",
+        "10.0.0.0/31",  # two addresses: the smallest IPv4 range
+        "fd00::/127",  # two addresses: the smallest IPv6 range
+        "10.0.0.0/30",  # a small pool
         "10.0.0.0/8",
-        "::1",
         "fd00::/8",
     ],
 )
-def test_a_bounded_proxy_entry_is_not_a_loosening(entry: str) -> None:
-    assert _names(api=_proxied(entry)) == []
+def test_a_multi_address_proxy_entry_is_a_named_loosening(entry: str) -> None:
+    """BACKLOG #1131: any host inside a trusted range may forge X-Forwarded-For, so every entry
+    covering more than one address is named, however small. It still loads (advisory only)."""
+    pairs = _pairs(api=_proxied("10.0.0.1", entry))
+    assert [name for name, _ in pairs] == ["trusted_proxies"]
+    risk = dict(pairs)["trusted_proxies"]
+    assert _RANGE in risk and _WHOLE_FAMILY not in risk
+    # The range is named; the single-host proxy entry beside it is not blamed.
+    assert entry in risk and "10.0.0.1" not in risk
+
+
+def test_multi_address_entries_are_read_strictly_and_named_once() -> None:
+    assert _classify_proxy_entries(
+        ["10.1.2.3/0", "10.0.0.1", "fd00::/127", "10.0.0.0/31", "fd00::/127"]
+    ) == ([], ["10.0.0.0/31", "fd00::/127"])
+
+
+def test_a_whole_family_and_a_range_in_another_family_each_get_their_wording() -> None:
+    risk = _proxy_risk("0.0.0.0/0", "fd00::/8")
+    whole, _, rest = risk.partition("; and ")
+    assert "0.0.0.0/0" in whole and _WHOLE_FAMILY in whole and "fd00::/8" not in whole
+    assert "fd00::/8" in rest and _RANGE in rest and "0.0.0.0/0" not in rest
 
 
 def test_the_trust_every_peer_check_skips_a_host_bits_entry() -> None:
     """A host-bits entry no longer loads (BACKLOG #2488), so this arm moved off ``ApiSettings``. The
     helper still reads entries as uvicorn does, where ``10.1.2.3/0`` is a literal that trusts no
     peer, so it must not be named as covering every address."""
-    assert _trust_every_peer_entries(["10.1.2.3/0"]) == []
-    assert _trust_every_peer_entries(["10.1.2.3/0", "0.0.0.0/0"]) == ["0.0.0.0/0"]
+    assert _classify_proxy_entries(["10.1.2.3/0"]) == ([], [])
+    assert _classify_proxy_entries(["10.1.2.3/0", "0.0.0.0/0"]) == (["0.0.0.0/0"], [])
 
 
 def _split(network: str, bits: int) -> list[str]:
@@ -1353,31 +1388,7 @@ def _split(network: str, bits: int) -> list[str]:
 )
 def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[str]) -> None:
     """Review round 1: two halves trust every peer as surely as one /0 does."""
-    risk = dict(
-        security_loosenings(
-            SecuritySettings(),
-            StoreSettings(),
-            AuthSettings(),
-            AlertsSettings(),
-            SecretRotationSettings(),
-            cleartext_hops=(),
-            expiry_relaxed_hops=(),
-            hostname_unchecked_hops=(),
-            query_credential_hops=(),
-            unverified_db_hops=(),
-            attested_hops=(),
-            revocation_attested_hops=(),
-            path_form_fhir_hops=(),
-            api=_proxied(*entries),
-            approvals=ApprovalsSettings(),
-            cert_monitor=CertMonitorSettings(),
-            backup=BackupSettings(),
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-            remote_debug=None,
-            startup=None,
-        )
-    ).get("trusted_proxies")
+    risk = _proxy_risk(*entries)
     assert risk is not None
     # Every range in the union is named, so a regression naming only one half reds here.
     for entry in entries:
@@ -1388,38 +1399,19 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
 
 
 def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
-    risk = dict(
-        security_loosenings(
-            SecuritySettings(),
-            StoreSettings(),
-            AuthSettings(),
-            AlertsSettings(),
-            SecretRotationSettings(),
-            cleartext_hops=(),
-            expiry_relaxed_hops=(),
-            hostname_unchecked_hops=(),
-            query_credential_hops=(),
-            unverified_db_hops=(),
-            attested_hops=(),
-            revocation_attested_hops=(),
-            path_form_fhir_hops=(),
-            api=_proxied("::/0", "::/0"),
-            approvals=ApprovalsSettings(),
-            cert_monitor=CertMonitorSettings(),
-            backup=BackupSettings(),
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-            remote_debug=None,
-            startup=None,
-        )
-    )["trusted_proxies"]
+    risk = _proxy_risk("::/0", "::/0")
     assert risk.count("::/0") == 1
 
 
-def test_ranges_that_leave_a_gap_are_not_a_loosening() -> None:
-    assert _names(api=_proxied(*_split("0.0.0.0/0", 2)[:3])) == []
+def test_ranges_that_leave_a_gap_get_the_range_wording_not_the_whole_family_one() -> None:
+    quarters = _split("0.0.0.0/0", 2)[:3]
+    risk = _proxy_risk(*quarters)
+    assert _RANGE in risk and _WHOLE_FAMILY not in risk
+    assert all(q in risk for q in quarters)
     # Two families never union into one.
-    assert _names(api=_proxied(_split("0.0.0.0/0", 1)[0], _split("::/0", 1)[1])) == []
+    halves = (_split("0.0.0.0/0", 1)[0], _split("::/0", 1)[1])
+    risk = _proxy_risk(*halves)
+    assert _RANGE in risk and _WHOLE_FAMILY not in risk
 
 
 def test_uvicorn_reads_a_prefix_zero_entry_the_way_the_registry_does() -> None:
@@ -1432,6 +1424,11 @@ def test_uvicorn_reads_a_prefix_zero_entry_the_way_the_registry_does() -> None:
     halves = _TrustedHosts(_split("0.0.0.0/0", 1))
     assert "10.9.9.9" in halves
     assert "203.0.113.9" in halves
+    # A /31 and a /127 trust BOTH their addresses, so neither is a single proxy host.
+    pair_v4 = _TrustedHosts(["10.0.0.0/31"])
+    assert "10.0.0.0" in pair_v4 and "10.0.0.1" in pair_v4
+    pair_v6 = _TrustedHosts(["fd00::/127"])
+    assert "fd00::" in pair_v6 and "fd00::1" in pair_v6
 
 
 # --- [api].plaintext_upstream_hop_acknowledged (BACKLOG #1179) --------------------------------

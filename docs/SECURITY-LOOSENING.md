@@ -88,7 +88,7 @@ section reference.
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
-| | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
+| | `[api].trusted_proxies` | `[]` (any entry covering more than one address is named, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
@@ -980,19 +980,28 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   approval queue, and reject a stale request rather than leave it pending.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
-### `[api].trusted_proxies` covering every address, such as `0.0.0.0/0` or `::/0` — every peer may set its own source address
+### `[api].trusted_proxies` covering more than one address, up to every address — a host that is not the proxy may set its own source address
 > **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit
-> trail either way. The load refuses `*` for this reason, but an entry of `0.0.0.0/0` or `::/0` loads and
-> does the same thing for its address family, so it is named instead. So are ranges whose union covers a
-> whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The check parses each
-> entry the way uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, would become a
-> literal in uvicorn that matches no peer, so the load refuses it ([BACKLOG #2488](BACKLOG.md)).
-- **What you lose:** uvicorn trusts `X-Forwarded-For` from every peer the entries cover, so any client can
-  declare its own source address. That poisons the audit source address, the per-address sign-in limit and
-  the new-client-IP step-up signal. With `[security].allowed_client_networks` set, the load already
-  refuses any range wider than one host.
-- **When acceptable:** never in production. List the reverse proxy's exact address instead.
-- **Compensating controls:** none replace it; fix the entry.
+> trail either way. **Any entry covering more than one address is named**, IPv4 or IPv6, however small:
+> a `/31` or `/127` holds two hosts, and a range of any size trusts every host inside it. A cutoff above
+> one address would leave some range silent. A bare address, `/32` or `/128` is the proxy itself and is
+> not named. The check is advisory: it refuses nothing.
+>
+> **Entries that cover every address get their own wording.** The load refuses `*`, but an entry of
+> `0.0.0.0/0` or `::/0` loads and does the same thing for its address family. So do ranges whose union
+> covers a whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The entry names
+> those as trusting every peer, and names any other range beside them with the range wording.
+>
+> The check parses each entry the way uvicorn does, strictly. An entry with host bits set, such as
+> `10.1.2.3/0`, would become a literal in uvicorn that matches no peer, so the load refuses it
+> ([BACKLOG #2488](BACKLOG.md)).
+- **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
+  hosts can declare its own source address. For a whole family, that is any client. That poisons the
+  audit source address, the per-address sign-in limit and the new-client-IP step-up signal. With
+  `[security].allowed_client_networks` set, the load already refuses any range wider than one host.
+- **When acceptable:** a range, only when every host in it is a proxy you run, such as a fixed pool of
+  load-balancer egress addresses. A whole family, never in production.
+- **Compensating controls:** none replace it. List each proxy's exact address, one entry per host.
 - **Reversible:** yes, immediately — list the proxy's own address and restart.
 
 ### `[api].plaintext_upstream_hop_acknowledged = true` — a plaintext proxy-to-engine hop, taken on by the site
@@ -1692,7 +1701,7 @@ chapter was not part of the verification above.
 | `[auth].totp_skew_steps` (TOTP acceptance window) | V6 Authentication (6.5.5) | **IA-2(8)** Access to Accounts — Replay Resistant | §164.312(d) Person or Entity Authentication |
 | `[auth].initial_password_expiry_hours` (life of an administrator-issued temporary password) | V6 Authentication (6.4.1, 6.4.5) | **IA-5(1)** Authenticator Management | §164.308(a)(5)(ii)(D) Password Management |
 | `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
-| `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
+| `[api].trusted_proxies` (forwarded header trusted from a multi-address range, up to every peer) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `[api].expose_docs` (API schema and interactive docs served with no sign-in) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |

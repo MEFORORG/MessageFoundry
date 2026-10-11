@@ -7720,14 +7720,24 @@ def _reconcile_effective_bind(settings: ServiceSettings) -> None:
 LOCKOUT_THRESHOLD_CEILING = 100
 
 
-def _trust_every_peer_entries(entries: Sequence[str]) -> list[str]:
-    """The ``[api].trusted_proxies`` ranges that, together, trust every peer of an address family,
-    read the way uvicorn reads them: a strict network parse, where a host-bits-set entry is not a
-    network. Collapsed per family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole.
-    Returns the multi-address entries of each such family (a single-host entry adds nothing)."""
+def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str]]:
+    """The ``[api].trusted_proxies`` entries that cover more than one address, as
+    ``(whole_family, ranges)``, in order and each named once (BACKLOG #1131).
+
+    ``whole_family`` holds the multi-address entries of a family whose entries, together, cover
+    every address of it. Collapsed per family, so the two ``/1`` halves of ``0.0.0.0/0`` count as
+    the whole. ``ranges`` holds every other multi-address entry. A single-host entry is in neither.
+
+    The cutoff is one address, not a size. Every host inside a trusted range may set its own
+    ``X-Forwarded-For``, so a ``/31``, a ``/127`` or a small pool trusts a host that is not the
+    proxy as surely as a ``/8`` does. Any cutoff above one would leave some range silent.
+
+    Each entry is read the way uvicorn reads it: a strict parse, where a host-bits-set entry is not
+    a network and is skipped. The load refuses such an entry (BACKLOG #2488), so on a loaded config
+    nothing is skipped."""
     v4: list[tuple[str, ipaddress.IPv4Network]] = []
     v6: list[tuple[str, ipaddress.IPv6Network]] = []
-    for entry in entries:
+    for entry in dict.fromkeys(entries):  # a repeated entry is named once, in order
         try:
             net = ipaddress.ip_network(entry)
         except ValueError:
@@ -7736,12 +7746,18 @@ def _trust_every_peer_entries(entries: Sequence[str]) -> list[str]:
             v4.append((entry, net))
         else:
             v6.append((entry, net))
-    named: list[str] = []
-    if any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v4)):
-        named += [entry for entry, net in v4 if net.num_addresses > 1]
-    if any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6)):
-        named += [entry for entry, net in v6 if net.num_addresses > 1]
-    return list(dict.fromkeys(named))  # a repeated entry is named once, in order
+    whole_family: list[str] = []
+    ranges: list[str] = []
+    # collapse_addresses takes one family at a time, so each is collapsed on its own.
+    families: list[tuple[Sequence[tuple[str, ipaddress.IPv4Network | ipaddress.IPv6Network]], bool]]
+    families = [
+        (v4, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v4))),
+        (v6, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6))),
+    ]
+    for family, covers_all in families:
+        multi = [entry for entry, net in family if net.num_addresses > 1]
+        (whole_family if covers_all else ranges).extend(multi)
+    return whole_family, ranges
 
 
 def _auth_default(field: str) -> Any:
@@ -8486,7 +8502,8 @@ def security_loosenings(
     AD timeout, step-up window, TOTP skew and temporary-password life
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
-    (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
+    (#2489), any ``[api].trusted_proxies`` entry covering more than one address, with its own
+    wording where the entries together cover every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302),
@@ -8926,21 +8943,34 @@ def security_loosenings(
     # such as "10.1.2.3/0" would be a literal that matches nothing there, and the validator now
     # refuses it at load (BACKLOG #2488), so it never reaches this check. Not gated on sign-in: a
     # forged source address poisons the audit trail either way.
+    # A range short of a whole family is named too, with its own wording: any host inside it may
+    # forge X-Forwarded-For, which poisons the same three signals for that range's hosts. Every
+    # entry covering more than one address counts, /31 and /127 included; the helper says why.
+    # It stays ADVISORY: the load refuses none of these (only allowed_client_networks refuses one).
     # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
     # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
     # but a refactor of the helper may raise one. The ranges are quoted on purpose: they are the
     # finding. ADR 0034's 2026-10-03 amendment, rule 3, says how to triage such an alert.
-    trust_all = _trust_every_peer_entries(api.trusted_proxies)
+    trust_all, ranges = _classify_proxy_entries(api.trusted_proxies)
+    forged = (
+        "can declare its own source address, poisoning the audit trail, the per-address sign-in "
+        "limit and the new-client-IP step-up signal"
+    )
+    proxy_risks: list[str] = []
     if trust_all:
-        out.append(
-            (
-                "trusted_proxies",
-                f"[api].trusted_proxies includes {', '.join(trust_all)}, which together cover every "
-                "address of their family, so X-Forwarded-For is trusted from EVERY such peer, as the "
-                "refused '*' would be -- any client can declare its own source address, poisoning "
-                "the audit trail, the per-address sign-in limit and the new-client-IP step-up signal",
-            )
+        proxy_risks.append(
+            f"[api].trusted_proxies includes {', '.join(trust_all)}, which together cover every "
+            "address of their family, so X-Forwarded-For is trusted from EVERY such peer, as the "
+            f"refused '*' would be -- any client {forged}"
         )
+    if ranges:
+        proxy_risks.append(
+            f"[api].trusted_proxies includes {', '.join(ranges)}, each a range of more than one "
+            "address rather than a single proxy host, so X-Forwarded-For is trusted from every "
+            f"host inside it -- each such host {forged} (list each proxy's exact address)"
+        )
+    if proxy_risks:
+        out.append(("trusted_proxies", "; and ".join(proxy_risks)))
     # Vault BACKLOG #2385: the [api] bools are under a completeness floor now, and this is the one
     # that was a deviation with no entry. create_app registers the documentation routes only when
     # it is on, and none of them asks for sign-in.
