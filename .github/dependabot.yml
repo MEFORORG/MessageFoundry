@@ -131,7 +131,7 @@ updates:
     # `pynetdicom<3.1` is a minor cap, like `pydicom<3.1`; it was `<4` until vault BACKLOG #2713.
     # pyproject.toml's [dicom] comment says why those two hold, and what raising the pynetdicom cap
     # requires. Its [webauthn] comment says why that one holds. `hvac<3` is a major cap of the same
-    # case (BACKLOG #2569; a seat decision under owner delegation 2026-10-08, not an owner ruling),
+    # case (vault BACKLOG #2569; a seat decision under owner delegation 2026-10-08, not an owner ruling),
     # and its [vault] comment says why it holds and what its entry costs. Lift each entry in the
     # same PR that lifts its cap.
     #
