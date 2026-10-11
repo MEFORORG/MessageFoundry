@@ -876,8 +876,9 @@ reading is attributed to that pull request and was not re-measured here.
 2. Where an operator writes the name, a config field, the name stays. Where the value adds nothing
    the operator needs, the log text carries a literal that the value selects instead. The
    `mfa_verify_min_elapsed_seconds` floor entry and its `_floor_verdict` are the worked example.
-3. Where the value IS the finding, it is quoted. The `trusted_proxies` loosening names the ranges
-   that trust every peer, because a posture review needs to see which. An alert there is a
+3. Where the value IS the finding, it is quoted. The `trusted_proxies` loosening names each entry
+   wider than one host, up to the ranges that trust every peer, because a posture review needs to
+   see which (widened by BACKLOG #1131). An alert there is a
    *Misclassified value* dismissal, as 122 was, and the discriminator below must hold first.
 4. Otherwise prefer a fix to a dismissal. Options considered 3 still holds: nothing is suppressed.
 
