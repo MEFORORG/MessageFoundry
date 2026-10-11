@@ -310,7 +310,7 @@ required:
 
 ```powershell
 # from an elevated shell
-scripts\service\install-service.ps1 -Environment prod -ServiceAccount "NT SERVICE\MessageFoundry"
+scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
 
 The installer is idempotent, auto-downloads a SHA-256-pinned NSSM, bakes absolute `serve` paths into

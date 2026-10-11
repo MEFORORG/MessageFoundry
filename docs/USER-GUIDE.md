@@ -173,10 +173,10 @@ The web console prompts for sign-in (authentication is on by default). Source: [
 For production on Windows, run the engine as a background service via **NSSM** — it starts on boot, restarts on crash, captures stdout/stderr to rotating logs, and stops with Ctrl+C so connections drain cleanly. From an **elevated** PowerShell:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config
 ```
 
-`-Environment` is **required** (it becomes `serve --env`, just like step 3). The script is idempotent (re-run to reconfigure), and defaults to service name `MessageFoundry`, config `<repo>\samples\config`, store + logs under `C:\ProgramData\MessageFoundry`, bind `127.0.0.1:8765`.
+`-Environment` is **required** (it becomes `serve --env`, just like step 3), and so is `-Config`, the config directory the service loads. The script is idempotent (re-run to reconfigure), and defaults to service name `MessageFoundry`, the engine installed under `C:\Program Files\MessageFoundry\engine`, store + logs under `C:\ProgramData\MessageFoundry`, bind `127.0.0.1:8765`. [SERVICE.md](SERVICE.md#install-the-engine-where-only-administrators-can-write) says how to build that install.
 
 The service runs the `nssm.exe` the installer keeps in `C:\Program Files\MessageFoundry\nssm` (the `-NssmDir` flag). Only administrators can write to that folder. The installer checks each copy against a pinned SHA-256 before it uses it (`Resolve-Nssm` in `install-service.ps1`). That covers a copy already in the folder, one from `-NssmPath`, one on `PATH`, and a download. [SERVICE.md](SERVICE.md#prerequisites) item 2 says what happens to a copy that fails. The installer never adds the folder to `PATH`, so a bare `nssm` typed in a shell does not run the checked copy.
 

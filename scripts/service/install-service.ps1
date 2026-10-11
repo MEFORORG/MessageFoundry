@@ -13,8 +13,8 @@
     Run from an elevated (Administrator) PowerShell prompt.
 
 .EXAMPLE
-    .\install-service.ps1 -Environment prod
-    .\install-service.ps1 -Environment prod -Port 9000 -LogLevel INFO -DataDir D:\MEFOR
+    .\install-service.ps1 -Environment prod -Config D:\hl7\config
+    .\install-service.ps1 -Environment prod -Config D:\hl7\config -Port 9000 -LogLevel INFO -DataDir D:\MEFOR
 #>
 [CmdletBinding()]
 param(
