@@ -1217,7 +1217,7 @@ def test_view_FAIL_lines_keep_the_INERT_and_BLIND_shapes_a_parser_reads(tmp_path
 
 @pytest.mark.parametrize(
     "mutation_path",
-    [".", "./", "scripts", "scripts/install.ps1", "scripts/absent.py", "tests/test_x.py"],
+    [".", "./", "scripts", "scripts/absent.py", "tests/test_x.py"],
 )
 def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view(
     tmp_path: Path, mutation_path: str
@@ -1363,6 +1363,43 @@ def test_absence_landing_in_operator_powershell_is_read_through_its_view(tmp_pat
     f = _absence_findings(
         root, *_PS_CERT, control=r"\$x = 1", mutation_path=_SERVICE_PS.replace("/", "\\")
     )
+    assert f.problems == [] and f.advisories == [], (f.problems, f.advisories)
+
+
+def test_absence_view_is_chosen_by_the_claims_path_even_when_the_file_is_absent(
+    tmp_path: Path,
+) -> None:
+    """A PowerShell path gets the PowerShell view, a TS or JS path gets none: both read their kind.
+
+    The file need not exist yet, so a claim about a new operator script is still asked of the view
+    that script will be read through, never of the Python tokenizer.
+    """
+    root = _absence_tree(tmp_path, {})
+    new_ps = "scripts/service/new.ps1"
+    f = _absence_findings(
+        root, r"(?i)Import-Certificate", "# Import-Certificate", "Control", new_ps
+    )
+    assert f.problems == [] and f.advisory_kinds == {"view-inert": 1}, f.advisories
+    f = _absence_findings(root, *_PS_CERT, mutation_path=new_ps)
+    assert f.problems == [] and f.advisories == [], f.advisories
+    for rel in ("messagefoundry_webconsole/static/app.js", "ide/src/x.ts"):
+        f = _absence_findings(root, *_SAMESITE, mutation_path=rel)
+        assert f.problems == [] and f.advisories == [], (rel, f.advisories)
+        f = _absence_findings(root, "x", "`${x}", mutation_path=rel)
+        assert f.problems == [] and f.advisories == [], (rel, f.advisories)
+
+
+def test_absence_landing_control_must_be_sighted_in_the_same_kind_of_view(tmp_path: Path) -> None:
+    """A string a PowerShell view keeps proves nothing about a Python view that blanks it."""
+    root = _absence_tree(
+        tmp_path,
+        {"scripts/tool.py": "x = 1\n", _SERVICE_PS: "$p = 'SameSite=None'\n"},
+    )
+    f = _absence_findings(
+        root, "clamd", "import clamd", control="SameSite=None", mutation_path="scripts/tool.py"
+    )
+    assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    f = _absence_findings(root, *_PS_CERT, control="SameSite=None", mutation_path=_SERVICE_PS)
     assert f.problems == [] and f.advisories == [], (f.problems, f.advisories)
 
 

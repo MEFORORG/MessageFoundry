@@ -1632,7 +1632,12 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     """
     raw_texts, pattern_texts, viewed = _absence_corpus(root)
     viewed_paths = {p for p in viewed if p is not None}
-    code_only_views = [t for t, p in zip(pattern_texts, viewed, strict=True) if p is not None]
+    # Grouped by view kind, so a control sighted in one kind of view never stands in for another.
+    # A PowerShell view keeps strings that the Python view blanks.
+    views_by_kind: dict[bool, list[str]] = {}
+    for text, seen_as in zip(pattern_texts, viewed, strict=True):
+        if seen_as is not None:
+            views_by_kind.setdefault(_is_powershell(PurePosixPath(seen_as)), []).append(text)
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
@@ -1642,11 +1647,15 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             mutation_rel = PurePosixPath(a.mutation_path.replace("\\", "/"))
             lands_in_view = mutation_rel.as_posix() in viewed_paths
             view_inert = False
-            if not raw_inert:
-                # A claim landing in a viewed file is read through that file's own view, by the
-                # corpus's rule. Every other claim is asked of the Python view.
-                landed = _pattern_view(mutation_rel, a.mutation) if lands_in_view else None
-                mutation_view, cut = landed or _code_only_view(a.mutation)
+            # The view is chosen by the claim's path, by the corpus's own rule, whether or not that
+            # file exists yet. A shipped root or no path at all is asked of the Python view, since
+            # such a claim covers every root. A TypeScript or JavaScript path is read raw, so it
+            # asks no view question at all.
+            asks_view = mutation_rel.suffix.lower() not in _SCRIPT_SUFFIXES
+            if not raw_inert and asks_view:
+                mutation_view, cut = _pattern_view(mutation_rel, a.mutation) or _code_only_view(
+                    a.mutation
+                )
                 if cut is not None and not a.mutation[cut:].strip():
                     # Every token was read before the stop, so the view is whole and the claim is
                     # decided, not UNDETERMINED (BACKLOG #2275).
@@ -1689,7 +1698,8 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             control_rx = re.compile(a.positive_control)
             seen_raw = any(control_rx.search(t) for t in raw_texts)
             if lands_in_view:
-                seen_view = any(control_rx.search(t) for t in code_only_views)
+                same_kind = views_by_kind.get(_is_powershell(mutation_rel), [])
+                seen_view = any(control_rx.search(t) for t in same_kind)
             else:
                 seen_view = seen_raw and any(control_rx.search(t) for t in pattern_texts)
             if not seen_raw or (lands_in_view and not seen_view):
@@ -1841,9 +1851,14 @@ def _powershell_code_only(text: str) -> str:
     ``<#`` opens a block comment only where it starts the remaining code on a line. That function
     drops what it removes; this one blanks it, so line structure holds as in :func:`_code_only`.
 
-    Known limits, both in the over-reporting direction. A trailing ``#`` comment after code is
-    kept, as the gate keeps it. Strings are NOT blanked, unlike the Python view, because these are
-    shipped operator scripts and a pattern that names a string argument must still fire on them.
+    Strings are NOT blanked, unlike the Python view, because these are shipped operator scripts and
+    a pattern that names a string argument must still fire on them.
+
+    Known limits. One over-reports: a trailing ``#`` comment after code is kept, as the gate keeps
+    it. At least three under-report, because the rule reads lines, not tokens: a ``#Requires``
+    directive is blanked as a comment; a here-string line that starts with ``#`` is blanked; and a
+    here-string line that starts with ``<#`` opens a block that hides every line up to the next
+    ``#>``. The gate names that last one as its own residual.
     """
     out: list[str] = []
     in_block = False
@@ -1875,16 +1890,19 @@ def _powershell_code_only(text: str) -> str:
     return "".join(out)
 
 
+def _is_powershell(rel: PurePosixPath) -> bool:
+    return rel.suffix.lower() in _POWERSHELL_SUFFIXES
+
+
 def _pattern_view(rel: PurePosixPath, text: str) -> tuple[str, int | None] | None:
     """The view the absence pattern reads ``text`` through at ``rel``, or ``None`` for raw.
 
     One rule, used for a corpus file and for a claim's mutation landing in one. The result has
     :func:`_code_only_view`'s shape: a PowerShell view never stops early, and a Python view may.
     """
-    suffix = rel.suffix.lower()
-    if suffix in _POWERSHELL_SUFFIXES:
+    if _is_powershell(rel):
         return _powershell_code_only(text), None
-    if suffix == ".py" and rel.parts and rel.parts[0] in _CODE_ONLY_ROOTS:
+    if rel.suffix.lower() == ".py" and rel.parts and rel.parts[0] in _CODE_ONLY_ROOTS:
         return _code_only_view(text)
     return None
 
@@ -1894,8 +1912,11 @@ def _pattern_view(rel: PurePosixPath, text: str) -> tuple[str, int | None] | Non
 #: a CI comment names GitHub's query API -- and a raw grep read those names as the thing itself, so
 #: claims about shipped code read FALSE on hits in a tool. Owner ruling R3 (2026-10-02) settled the
 #: scope: only the operator-run scripts are in it. Every ``.py`` under ``scripts/`` stays in the
-#: corpus anyway, because reading more than the scope over-reports a hit, which is the safe
-#: direction for an absence claim, and narrowing it is a separate decision. The in-scope PowerShell
+#: corpus anyway, and narrowing it is a separate decision. For the PATTERN that reading over-reports
+#: a hit, the safe direction. It is NOT safe for the positive control, which reads the same files
+#: raw: a control sighted only in out-of-scope tooling clears BLIND for an in-scope claim. The
+#: same holds for the TypeScript, JavaScript and PowerShell this corpus also reads raw for the
+#: controls (:func:`_absence_sources`). The in-scope PowerShell
 #: is read through :func:`_powershell_code_only` instead. A real call in a script still reads FALSE
 #: when the pattern names code. A
 #: pattern that names a string ARGUMENT cannot fire here, and that is this view's cost: for a claim
