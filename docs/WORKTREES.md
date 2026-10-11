@@ -1210,11 +1210,14 @@ Re-read `--help` before trusting this table against a newer CLI. It measures one
 contract.
 
 **No hook guards this, and that is a decision.** The obvious guard is a `PreToolUse` matcher on
-`Bash` that refuses the bad shape. This repo has one Bash guard built that way,
-[`../scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1). It
-sat referenced by **no** matcher in any settings file on this machine — measured 2026-08-23 at 0 of
-110 — while several tracked pages described it as a live control, until BACKLOG #1339 wired it. A
-guard written without a decision to wire it risks the same gap. A static scan of tracked files is no better: it
+`Bash` that refuses the bad shape. This repo has guards built that way: at least the three
+handlers on the `^(Bash|PowerShell)$` matcher in `.claude/settings.json`,
+[`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1),
+[`block-unbounded-fs-scan.ps1`](../scripts/hooks/block-unbounded-fs-scan.ps1) and
+[`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1). The last sat
+referenced by **no** matcher in any settings file on this machine — measured 2026-08-23 at 0 of
+110 — while several tracked pages described it as a live control, until BACKLOG #1339 wired it
+in this repository. A guard written without a decision to wire it risks the same gap. A static scan of tracked files is no better: it
 answers "does a committed script contain the bad shape" when the question is "did a session just type
 it", and no tracked file has ever contained one. So this stays a rule you read, not a gate.
 

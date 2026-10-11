@@ -794,7 +794,9 @@ PER_FORM_RESIDUALS = [
 
 # UNDER NO PER-FORM ANSWER. No line in owner answers 1 to 3 describes these rows. The page lists
 # them in section 5, with the nearest per-form line for each. They are stated residuals under the
-# mechanism answer, and they do not block wiring.
+# mechanism answer. The owner settled that they do not hold wiring back, in two answers of
+# 2026-10-10 that the Special seat reports: "Yes, wire now (Recommended)" and "Yes, it counts
+# (Recommended)". The page's "What wiring waited on" section quotes both.
 _MECHANISM_ONLY = pytest.mark.xfail(
     strict=True,
     reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; a stated "
@@ -803,9 +805,14 @@ _MECHANISM_ONLY = pytest.mark.xfail(
 )
 
 MECHANISM_ONLY_RESIDUALS = [
-    # next to no per-form answer: a '<<' inside a trailing shell comment is still read as a
-    # heredoc opener, in both readings, and blanks the lines after it
+    # next to no per-form answer: a '<<' the heredoc readers still take for an opener, so they
+    # blank the lines after it. In a trailing comment; in a tag with an escaped backslash, where
+    # the narrow reading drops both backslashes; after an array subscript inside '$[...]'; and in
+    # a quoted 'let' expression. STILL_OPEN_CONTROLS holds the nearest denied form of each.
     ("Bash", "echo $((1<<n)) # <<EOF-2\ngit add -A"),
+    ("Bash", f"cat <<E{_BS}{_BS}OF\nx\nE{_BS}OF\ngit add -A"),
+    ("Bash", "echo $[ a[1]<<n ]\ngit add -A"),
+    ("Bash", 'let "x=1<<n"\ngit add -A'),
     # next to a per-form line whose words do not fit
     ("Bash", ">/dev/null git add -A"),
     ("PowerShell", "<# note #> git add -A"),
@@ -849,6 +856,8 @@ STILL_OPEN_CONTROLS = [
     ("Bash", "cat <<EOF\nx\nEOF\ngit add -A"),
     ("Bash", "echo $((1 << 2))\ngit add -A"),
     ("PowerShell", '$m = @"\nx\n"@\ngit add -A'),
+    ("Bash", "echo $[1<<n]\ngit add -A"),
+    ("Bash", 'let "x=1<<n"; git add -A'),
 ]
 
 # THE THREE PLAIN READING MISTAKES, FIXED (BACKLOG #1339). Each was in the page's section 5.1 and
@@ -1109,14 +1118,17 @@ def _staged_in_a_throwaway_repo(tool: str, command: str, root: Path, shell: str)
     (repo / "new.txt").write_text("n\n", encoding="utf-8")
     (repo / "sub" / "new2.txt").write_text("n\n", encoding="utf-8")
 
+    # Each command is written as bytes to a script file outside the repository, so it reaches the
+    # shell as typed. `bash -c` on Windows does not: measured, the argument loses one of two
+    # backslashes on the way to Git for Windows' bash, which changes a heredoc tag.
     if tool == "Bash":
-        argv = [shell, "-c", command]
+        script = root / "command.sh"
+        argv = [shell, str(script)]
         env = probe_env(Path(shell), env)
     else:
-        # Written as bytes, outside the repository, so a carriage return reaches PowerShell as is.
         script = root / "command.ps1"
-        script.write_bytes(command.encode("utf-8"))
         argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
+    script.write_bytes(command.encode("utf-8"))
     subprocess.run(argv, cwd=repo, env=env, capture_output=True, timeout=120)
     return set(git("diff", "--cached", "--name-only").split())
 

@@ -16,13 +16,14 @@ guard is asserted in `tests/test_claude_settings_contract.py`, so read it there.
 
 ## The owner answers
 
-The owner answered at least four times on these forms. Each answer was a choice in a dialog in
-the Special seat's session. **These four are reported by that seat. No other seat saw the
+The owner answered at least six times on these forms and on wiring. Each answer was a choice in a
+dialog in the Special seat's session. **These six are reported by that seat. No other seat saw the
 dialogs.** The vault's rulings file of 2026-10-08
 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, entry #1339) records answer 1. The seat's
 comments on engine PR 2209 record answers 2 and 3, and its comment on engine PR 2217 records
-answer 4. The vault file also records an earlier answer that day, "Retire it, unwired
-(Recommended)". It says that answer is withdrawn, because its question rested on a false premise.
+answer 4. The seat reported answers 5 and 6 in its follow-up brief for the wiring change. The
+vault file also records an earlier answer on 2026-10-08, "Retire it, unwired (Recommended)". It
+says that answer is withdrawn, because its question rested on a false premise.
 
 | Answer | Date | The option the owner chose | What it covers | Section |
 |---|---|---|---|---|
@@ -30,6 +31,10 @@ answer 4. The vault file also records an earlier answer that day, "Retire it, un
 | 2 | 2026-10-08 | "Accept all five, wire it (Recommended)" | five groups, (a) to (e) | 2 |
 | 3 | 2026-10-09 | "Accept the four, wire it (Recommended)" | four forms the Lander's review found | 3 |
 | 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | every form the guard does not match | every allowed form |
+| 5 | 2026-10-10 | "Yes, wire now (Recommended)" | the 2026-08-25 splitter condition | *What wiring waited on*, item 1 |
+| 6 | 2026-10-10 | "Yes, it counts (Recommended)" | the Lander's written-acceptance condition | *What wiring waited on*, item 2 |
+
+Dates are US Central.
 
 The owner's act is the choice of an option, and the quoted label is the option the owner chose.
 The questions, the option labels and the option text are the Special seat's wording. The item
@@ -62,7 +67,8 @@ draw a line elsewhere.
 ## What wiring waited on, and where each stands
 
 At least these are on record. Items 1 and 3 come from the owner, as relayed or reported. Item 2
-is a Lander's condition. **Where each stands is this page's reading, not an owner ruling.**
+is a Lander's condition. **Each is now settled by an owner answer**, and the answer is quoted
+under the item. Everything outside the quotes is this page's wording.
 
 1. **Owner ruling 2026-08-25, relayed by the Liaison and not read first-hand here:** *"The
    blanket-git-stage guard is a CONTROL. Strike the claim now, wire it after the splitter
@@ -71,17 +77,19 @@ is a Lander's condition. **Where each stands is this page's reading, not an owne
    needs a quote-state parser, and nobody built one. Ledger row #1341 records that the owner
    declined that parser family on 2026-08-25, for the sibling hooks. A Manager ruling of
    2026-09-21 extended the decline to this script, as ledger row #1339 records.
-   *Where it stands:* the splitter repair is still not built. No record read for this page shows
-   that the owner was asked whether this condition still stands. The vault file's #1339 entry
-   says the 2026-10-08 dialog did not put it. The wiring rests on answer 4 and on item 3. This
-   page does not say that either one discharges this condition. That is the owner's to say.
+   *Where it stands: settled by answer 5.* The splitter repair is still not built, and it is no
+   longer a precondition. On 2026-10-10 (US Central) the Special seat asked whether the
+   2026-10-09 choices replace this condition. The owner chose "Yes, wire now (Recommended)". The
+   seat reports that option's text as: "The 2026-10-09 choices replace the 2026-08-25 condition.
+   The splitter repair is not a precondition."
 2. **A Lander amendment of 2026-09-22 on ledger row #1339, under that Manager ruling:** the
    guard's known fail-opens "must be accepted IN WRITING by the owner before anything wires
    it". The wording is the Lander's, not the owner's.
-   *Where it stands:* answer 4 accepts every form the guard does not match, and it is a reported
-   dialog choice. The vault file's #1339 entry leaves it to the Lander to ask the owner whether
-   such a choice meets this condition. No record read for this page shows that question
-   answered.
+   *Where it stands: settled by answer 6.* Answer 4 accepts every form the guard does not match,
+   and it is a reported dialog choice. The vault file's #1339 entry left it to the Lander to ask
+   the owner whether such a choice meets this condition. On 2026-10-10 (US Central) the Special
+   seat asked it. The owner chose "Yes, it counts (Recommended)". The seat reports that option's
+   text as: "Your dialog choice is your written acceptance. The condition is met."
 3. **A hold, as the Special seat reports it on PR 2217.** It says the owner told it to "start no
    new work", and that wiring waits until the owner lifts that. The option the owner chose in
    answer 4 carries this text, which the seat wrote: "Recorded as your ruling. When you lift the
@@ -95,12 +103,12 @@ is a Lander's condition. **Where each stands is this page's reading, not an owne
    (UTC), as `9afa08f5cf`. None of the three mistakes needed a parser, and section 4a records
    their fix.
 
-**Why the guard is wired while items 1 and 2 stay open.** The owner made two choices that the
-wiring rests on. In answer 4 the owner chose an option whose text, written by the seat, says
-"When you lift the hold, one Builder wires the guard." The owner then chose the lift in item 3.
-Those two choices are the authority this page cites for wiring. Whether they also discharge the
-relayed 2026-08-25 condition in item 1, and the Lander's condition in item 2, is not settled by
-any record read here. That is for the owner, and for the Lander to put to the owner.
+**What the wiring rests on.** Four owner choices, each reported by the Special seat:
+1. Answer 4, "Accept by mechanism (Recommended)". Its option text, written by the seat, says
+   "When you lift the hold, one Builder wires the guard."
+2. The lift in item 3, "Lift for #1339 only (Recommended)".
+3. Answer 5, "Yes, wire now (Recommended)", for item 1.
+4. Answer 6, "Yes, it counts (Recommended)", for item 2.
 
 
 ## How this was measured
@@ -539,14 +547,32 @@ an allow. Before that order was set, a payload of 30,000 brackets holding a real
 
 Each form below is still allowed, and git stages or commits a whole tree with it. No line in
 answers 1 to 3 describes it. Under answer 4 each is a stated residual, like every other allowed
-form on this page, and none of them blocks wiring. This list is how the owner sees them. At least:
+form on this page. Whether these residuals block wiring was settled by the owner, not by this
+page: answer 5, "Yes, wire now (Recommended)", and answer 6, "Yes, it counts (Recommended)". See
+*What wiring waited on*. This list is how the owner sees them. At least:
 
 **5.1 Forms next to no per-form answer.** The four rows that stood here are closed; see section
-4a. At least this one is still open, first measured for the wiring change:
+4a. At least these are still open, each first measured for the wiring change:
 
 | Command | Shell | What git did | Why the guard allows it |
 |---|---|---|---|
 | `echo $((1<<n)) # <<EOF-2`, newline, `git add -A` | bash | staged all five | Both heredoc readings take the `<<EOF-2` inside a trailing comment as an opener, and blank every later line. |
+| `cat <<E\\OF`, newline, `x`, newline, `E\OF`, newline, `git add -A` | bash | staged all five | bash's delimiter is `E\OF`. The narrow reading drops both backslashes and waits for `EOF`; the old one waits for `E`. |
+| `echo $[ a[1]<<n ]`, newline, `git add -A` | bash | staged all five | The `$[...]` skip ends at the first `]`, so the `<<n` after the subscript reads as an opener. |
+| `let "x=1<<n"`, newline, `git add -A` | bash | staged all five | The `<<n` inside the quoted `let` expression reads as an opener. |
+
+Controls from the same runs, each denied, and each staged all five: `cat <<EOF`, newline, `x`,
+newline, `EOF`, newline, `git add -A`; `echo $[1<<n]`, newline, `git add -A`; and
+`let "x=1<<n"; git add -A`, where the stage is on the same line. These were measured with bash
+reading the command from a script file. `bash -c` on Windows drops one of two backslashes from its
+argument, which changes the escaped-backslash row.
+
+**The hook's time limit is a residual too.** `.claude/settings.json` gives the hook 15 seconds,
+and a hook that runs longer lets the command run. The added readings are the slow part: the
+narrow heredoc reading walks the whole command a character at a time a second time. A 600 KB
+payload holding `<<` was measured at about 12.6 seconds, close to the limit. A longer one could
+pass it. The guard judges the old readings first, so a timeout can only cost the denies the added
+readings would make. It never loses a deny the guard at origin/main makes.
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.

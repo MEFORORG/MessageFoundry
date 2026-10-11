@@ -340,7 +340,9 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 > file in this repository**. BACKLOG #1339 has since wired it — see the note under the guardrail
 > tables below.
 
-> **Transferable principle — fail-OPEN by design.** The git-staging guard is written to block *blanket* staging (`git add -A`/`.`) so that each commit is curated; if the guard itself errors it lets the command **through** (fail-open) rather than wedging the workflow — a deliberate tradeoff for a *workflow* guard. (Contrast the engine's *fail-closed* bind guard for a *security* boundary.) In MEFOR no human curates a commit: commits are the committing session's own judgment ([`../CLAUDE.md`](../CLAUDE.md) section 5), and the guard is a best-effort check of the common spellings, so a command it allows is not thereby curated. *CORRECTED 2026-10-02 by owner ruling; this read "so the human curates each commit".*
+> **Transferable principle — fail-OPEN by design.** The git-staging guard is written to block *blanket* staging (`git add -A`/`.`) so that each commit is curated; if the guard itself errors it lets the command **through** (fail-open) rather than wedging the workflow — a deliberate tradeoff for a *workflow* guard. (Contrast the engine's *fail-closed* bind guard for a *security* boundary.) In MEFOR no human curates a commit: commits are the committing session's own judgment ([`../CLAUDE.md`](../CLAUDE.md) section 5). *CORRECTED 2026-10-02 by owner ruling; this read "so the human curates each commit".*
+
+> **The guard is best-effort.** It checks the common blanket-stage spellings, so a command it allows is not thereby curated. *Added for BACKLOG #1339, in a Builder's wording; this is not part of the 2026-10-02 ruling. It replaces a clause that stood before that marker and said the guard was wired to no matcher.*
 
 **The blocking security CI** ([`.github/workflows/security.yml`](../.github/workflows/security.yml)) — **bandit** (SAST), **pip-audit** (SCA, hash-locked), **gitleaks** (secret scan), **semgrep** (project rules, [`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml)), **crypto-inventory**, and **forbidden-content** — is **BLOCKING**: bandit/gitleaks/semgrep/pip-audit started from a clean baseline so a regression turns CI **red**, and crypto-inventory/forbidden-content fail the build on any inventory drift or forbidden-string hit. The CycloneDX **SBOM** job is **advisory** (`continue-on-error: true` — it fails only if the bill of materials cannot render), not a blocking gate. Separately, the session that writes a change runs the **`code-review`** pass on its own diff (§6.6). It is an **advisory** AI review, **never** a deterministic CI gate (§7). The **`/security-review`** skill is available too, and that process does not require it. *CORRECTED 2026-10-02; see §6.6.*
 
@@ -546,16 +548,17 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 > checks the common blanket-stage spellings, it fails open, and it lets through at least the forms
 > listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md). On
 > 2026-10-09 the owner chose "Accept by mechanism (Recommended)" in a dialog that only the Special
-> seat saw and reports. Whether that choice meets the Lander's condition that the fail-opens be
-> accepted in writing is still open; that page says so. **A control counted as a gate
+> seat saw and reports. On 2026-10-10, in the same seat's session, the owner answered that this
+> choice meets the Lander's condition that the fail-opens be accepted in writing: "Yes, it counts
+> (Recommended)". **A control counted as a gate
 > while it lets known forms through would rest on a false premise -- the defect SDS-3.7 names.**
 >
 > **What keeps the wiring true is an instrument, not this paragraph.**
 > `tests/test_claude_settings_contract.py` asserts that every script under `scripts/hooks/` is
 > either wired, or wired by a tracked installer, or named with its reason on an explicit unwired
 > list. What wiring waited on, including the owner ruling of 2026-08-25 that reached this
-> repository relayed by the Liaison, is recorded once in that page, *What wiring waited on, and
-> where each stands*.
+> repository relayed by the Liaison, and the owner answer of 2026-10-10 that replaced its
+> condition, is recorded once in that page, *What wiring waited on, and where each stands*.
 
 This document **owns and expands** the SDS §A.6 line — *"AI-assisted review as a compensating control"* — for the solo-maintainer **PO.2 / PW.7** deviation. The detailed record is Appendix A.6.
 
