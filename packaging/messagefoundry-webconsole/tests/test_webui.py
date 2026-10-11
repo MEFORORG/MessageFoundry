@@ -6951,6 +6951,33 @@ async def test_sessions_page_lists_and_flags_current(engine: Engine) -> None:
         assert "<div active=" not in r.text
 
 
+async def test_sessions_page_flags_current_in_constant_time(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 11.2.4 (BACKLOG #1167). RED when: the sessions page goes back to
+    `s.token_hash == current`. Every listed session is compared through the helper, and exactly one
+    (the cookie's own) matches."""
+    from messagefoundry.credential import constant_time_equal as real
+    from messagefoundry_webconsole.routes import account as account_routes
+
+    results: list[bool] = []
+
+    def spy(a: str | bytes, b: str | bytes) -> bool:
+        results.append(real(a, b))
+        return results[-1]
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    assert (await service.login("op", PW)).ok  # a second session, which must not match
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        monkeypatch.setattr(account_routes, "constant_time_equal", spy)
+        r = await c.get("/ui/account/sessions")
+        assert r.status_code == 200
+        assert r.text.count("(this session)") == 1
+    assert sorted(results) == [False, True]
+
+
 async def test_sessions_revoke_others(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
