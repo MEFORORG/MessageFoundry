@@ -237,8 +237,10 @@ Container-specific essentials (all detailed in [`../docker/README.md`](../docker
 - **Store volume must persist** (named volume / PVC, never the ephemeral layer) or the at-least-once
   invariant is void across a restart; enable the at-rest cipher (`MEFOR_STORE_ENCRYPTION_KEY` +
   `MEFOR_STORE_REQUIRE_ENCRYPTION=true`).
-- **Exposure:** Topology A (in-process TLS — the **recommended** of the two; TLS is **not** configured
-  out of the box, `[api].tls_cert_file` defaults unset) or Topology B (reverse-proxy / same-pod sidecar).
+- **Exposure:** Topology A (in-process TLS — the **recommended** of the two) or Topology B
+  (reverse-proxy / same-pod sidecar). The engine serves TLS out of the box, on a self-signed pair it
+  mints on first run (ADR 0172). `[api].tls_cert_file` defaults unset, and an off-loopback bind refuses
+  that placeholder by default, so Topology A needs an operator certificate.
   Reaching a published port means binding off-loopback in the container, so the bind guard requires TLS —
   exactly as on bare metal. Every listen type is guarded (MLLP, HTTP, the DICOM SCP, raw TCP/X12); raw
   TCP/X12 have no TLS to enable, so publishing those ports means firewalling/segmenting them instead.

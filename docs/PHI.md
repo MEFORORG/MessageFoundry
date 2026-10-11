@@ -1116,10 +1116,16 @@ add-new-then-remove-old CA/cert rotation for both backends — is in
 [`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md#5-db-tls-trust-import-the-db-ca--rotate-certificates).
 Never remediate a chain-build failure with `TrustServerCertificate=true`.
 
-**Phase 2 transport design `[ROADMAP]`.** In-process API/WebSocket TLS (P2-1), MLLP-over-TLS (P1-4),
-and a reverse-proxy / forwarded-header alternative are designed in
-[ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Proposed* — build gated on a
-scheduled off-loopback exposure).
+**Phase 2 transport `[BUILT]`.** In-process API/WebSocket TLS (P2-1), MLLP-over-TLS (P1-4), and a
+reverse-proxy / forwarded-header alternative are built under
+[ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Accepted*). The engine always
+serves TLS on the API hop
+([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+An operator `[api].tls_cert_file` wins. Without one, the engine mints a self-signed pair on first run
+and reuses it. The one exception is a declared `[api].tls_terminated_upstream` proxy with no operator
+certificate: the engine then speaks plaintext to the proxy, and `serve` refuses that hop unless
+`[api].plaintext_upstream_hop_acknowledged` is set. This paragraph read `[ROADMAP]`, designed and
+*Proposed* until 2026-10-10 (BACKLOG #1133).
 
 **Key-exchange parameters `[PARTIAL — the 1.2+ floor and the cipher validator are enforced; the group
 pin is INERT until Python 3.15]` (ASVS 11.6.2).** Every TLS context the engine
@@ -2281,7 +2287,7 @@ traceability:
 
 - **DB + `-wal`/`-shm` owner-only permissions on create** (`_secure_file`, §2) — **SQLite store only**; on SQL Server / Postgres the engine creates no database file and calls `_secure_file` never. Was P0-1.
 - **`dryrun`/`generate` redact bodies by default; `--show-phi` to opt in** (§7) — was P0-2.
-- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused (unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk)** (§10, [SECURITY.md](SECURITY.md)) — was P0-3.
+- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`) or a declared TLS-terminating proxy** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch: the loader refuses the removed `[auth].enabled` and `[security].require_sign_in` keys. Without either, the engine would serve TLS on its self-signed placeholder, so the risk is a certificate no trust store vouches for, not cleartext. `serve --allow-insecure-bind` accepts serving off-loopback on that placeholder only under `[security].enforcement = warn`; under the default `enforce` the flag is inert and `serve` refuses. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
 - **At-rest body encryption (AES-256-GCM) + required volume encryption** (§3) — was P1-1.
 - **Pluggable at-rest key sourcing — the KeyProvider seam** (`[store].key_provider`,
   [store/keyprovider.py](../messagefoundry/store/keyprovider.py); §3) — built-in `auto`/`env`/`dpapi`
@@ -2307,7 +2313,7 @@ separate follow-up.
 ### P2 — remote / Phase-2 (deferrable while strictly localhost; each flips to mandatory on remote exposure)
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
-| **P2-1** TLS on the engine API | Tokens + PHI cleartext over the network | §164.312(e) · SC-8 | M |
+| **P2-1** TLS on the engine API — **Built.** The engine always serves TLS on the API hop (ADR 0172), on an operator certificate or on a self-signed pair it mints. By default an off-loopback bind refuses that placeholder and needs an operator certificate or a declared proxy (§10). This row listed it as remaining until 2026-10-10 (BACKLOG #1133) | Tokens + PHI cleartext over the network | §164.312(e) · SC-8 | M |
 | **P2-2** MFA for console/API auth — ✅ **Built (WP-14 TOTP and WP-14b passkeys, local and directory accounts)** | Single-factor auth (mitigated: `[security].require_mfa` is an **access gate on every authorized route**, and its shipped `require_mfa_scope` is `every_local_account`, not the Administrator role alone. Directory accounts are not exempt; [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states which sessions owe a factor) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
 | **P2-3** Network-segmentation guidance + periodic integrity checks | Lateral movement; tamper detection | §164.312(c) · SC-7/SI-7 | S–M |
 | **P2-4** Strict-parse CPU/time budget on the hl7apy path | Malformed input pinning a worker — message size/segment caps are built, but the opt-in strict parse itself has no time bound | NIST SC-5 (DoS; not a §164.312 safeguard) | S |

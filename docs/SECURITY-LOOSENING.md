@@ -248,8 +248,12 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   `web_console_public_address`) a
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
-  than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (TLS or a
-  declared proxy) and `web_console_public_address`, and is refused even under `--allow-insecure-bind`.
+  than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (an
+  operator `[api].tls_cert_file` or a declared TLS-terminating proxy), and that refusal holds even under
+  `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` only behind a declared
+  terminator (`[api].tls_terminated_upstream`). With an operator certificate and no address it warns
+  and serves `/ui`: the origin checks then use the request Host, and passkeys fail closed until the
+  address is set.
 
 ### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
