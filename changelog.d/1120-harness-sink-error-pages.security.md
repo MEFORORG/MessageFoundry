@@ -4,4 +4,4 @@
   which defaults to an HTML page. The sink now sends them as `text/plain; charset=utf-8`. The
   body is the status and Python's explanation. It leaves out the reason phrase, which can echo
   the request line. The status line still carries that phrase, as Python writes it. Those
-  answers keep the baseline security headers that every sink answer now carries. (`BACKLOG #1120`)
+  answers also carry the baseline security headers, as every sink answer now does. (`BACKLOG #1120`)
