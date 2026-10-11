@@ -215,6 +215,21 @@ core closure. The same criterion applies.
 On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `QtGui`, `QtNetwork` and
 `QtWidgets`. All four ship in `pyside6-essentials`. That split decides the tables below.
 
+A test holds that list to the code: `test_the_harness_imports_exactly_the_qt_modules_the_page_lists`
+in `tests/test_risky_component_designation.py`. It walks every import statement under `harness/`.
+It fails when one names a Qt module that this list leaves out. It also fails when a listed module
+is no longer imported. It refuses `import PySide6` and `from PySide6 import`, since neither names a
+module it can read. A change that adds a module to this list turns the test green again. So whoever
+adds one must also change the sentence on `pyside6-essentials`, which the test holds to the count,
+and read the `pyside6-addons` row again.
+
+The test misses at least these:
+
+- an import built at run time
+- a Qt import in code outside `harness/`
+- a Qt module that a dependency or a Qt plugin loads
+- which wheel ships each module
+
 ### Designated
 
 | Component | Tier | Why | Native |
@@ -227,7 +242,7 @@ On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `Qt
 | Component | Why not |
 |---|---|
 | `pyside6` | a metadistribution: the `PySide6` package initialiser, two small version and configuration modules, and typing stubs. It parses no input, and it exists to pull in the other three. It ships no compiled file. The survey further down listed the pinned Linux x86_64 and Windows amd64 wheels and found none in either |
-| `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again |
+| `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again. The test named above fails on a static import of one under `harness/` until the module joins the list above |
 
 So 2 plus 2 is 4, and 35 plus 4 is 39.
 
