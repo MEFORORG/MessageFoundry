@@ -1111,7 +1111,8 @@ the alternatives* gives for a per-claim token. The ruling chose a status term, s
 not built.
 
 *Amended 2026-10-11 (BACKLOG #2415): no build; if this is ever funded, file the per-claim token, not
-the attempts term. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
+the attempts term. A search of the vault ledger at `origin/main` that day found no row for the token,
+though "Why this and not the alternatives" says to file it. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
 `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section "#2415 (batch 240)".*
 
 **Tests.** `tests/test_mark_failed_status_term.py` adds the swept-PENDING retry, the batch with one
