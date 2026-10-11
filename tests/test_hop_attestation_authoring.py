@@ -398,6 +398,7 @@ def _loosening_names(attested_hops: tuple[str, ...]) -> list[str]:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     ]
 

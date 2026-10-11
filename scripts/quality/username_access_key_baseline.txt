@@ -1,9 +1,9 @@
 # Judged username-as-access-key sites (BACKLOG #1226).
 #
 # A KEY IN THIS FILE RECORDS THAT A HUMAN HAS LOOKED AT THE SITE. It does NOT record that the site is
-# correct: one entry below is a CONFIRMED DEFECT that cannot be fixed inside this item. Treating the
-# baseline as an approval list would turn a screen the item explicitly designed to emit CANDIDATES
-# into the verdict-emitter it forbids.
+# correct: one entry below was a CONFIRMED DEFECT when it was added, and it stays keyed now that a
+# later item bounded it. Treating the baseline as an approval list would turn a screen the item
+# explicitly designed to emit CANDIDATES into the verdict-emitter it forbids.
 #
 # NO LINE NUMBERS, BY CONSTRUCTION. The key is `file::callee::slot`, because the same site is
 # `create_search_preset` or `upsert_search_preset` depending where you stand, at different lines
@@ -48,33 +48,23 @@ auth_routes.py::create_local_user::username
 # by a new `user_id` and carries the objectGUID the directory returned; the name scopes nothing.
 auth_routes.py::create_directory_account::arg0
 
-# ---- CONFIRMED INSTANCE, ROUTED ONWARD, NOT FIXED HERE -------------------------------------------
+# ---- BOUNDED: the username selects the rows, the account's lifetime limits them --------------------
 
 # `GET /me/security-events` -> AuthService.security_events_for(identity.username) ->
-# store.security_events_for_user(username), whose SQL is:
-#     SELECT ts, action, detail FROM audit_log WHERE actor = ? AND action LIKE 'auth.%'
+# store.security_events_for_user(username), whose SQL is (store._security_events_where):
+#     ... WHERE actor = ? AND action LIKE 'auth.%'
+#         AND ts >= (SELECT created_at FROM users WHERE username = ?)
 #
-# The username is not labelling a row here -- it IS the WHERE clause that decides which rows the
-# caller may see, which is this item's definition of the defect verbatim.
-#
-# The PRECEDING route handler in the same file, `my_sessions`, scopes on an immutable id --
-# `list_sessions(identity.user_id)`. That contrast is real but it is NOT evidence of an oversight:
-# the sessions table HAS a user id and `audit_log` does not. Measured on main: 9 `FROM audit_log`
-# sites in store.py, ZERO keyed on `user_id`, against a positive control of 1 keyed on `actor = ?`.
-# THE AUTHOR HAD NO IMMUTABLE KEY AVAILABLE AT THIS SITE.
-#
-# CONDITIONAL SEVERITY (CLAUDE.md section 0 -- zero deployments, nothing is exposed today): on a first
-# deployment, an operator who deleted a user and recreated the same username would hand the new
-# account holder the previous holder's sign-ins, lockouts and password changes.
-#
-# WHY IT IS NOT FIXED IN THIS ITEM, measured rather than assumed: `audit_log` has NO immutable key to
-# re-key onto. Its columns are id/ts/actor/action/channel_id/detail/client/row_hash -- `actor TEXT`
-# is the only identity, and a repo-wide grep for `user_id` against the audit store returns ZERO
-# against a positive control of 3 for `actor`. So the fix is a schema change to a table carrying a
-# `row_hash` TAMPER-EVIDENCE CHAIN, which is a different piece of work with different risks.
-#
-# Named as a subject, not a number, because no number is allocated for it: "the self-service
-# security-events view scopes on a reassignable username and audit_log has no immutable actor id".
+# The username still decides which rows the caller sees, so the key stays here: `audit_log` has no
+# immutable actor id to re-key onto, and adding one means a schema change to a table carrying a
+# `row_hash` tamper-evidence chain. The lower bound was the cheaper fix (finding D-2 of the
+# 2026-10-02 full review, BACKLOG #1152): the feed starts at the CURRENT account's `created_at`, so
+# a deleted account's history under the same name, and a failed sign-in recorded under a name
+# before any account held it, both fall outside it. With no account by that name the subquery is
+# NULL and no row matches. tests/test_api_auth.py drives both cases through the route.
+# Not covered: a directory rename onto the name, or a provision-admin repair of an existing
+# row, keeps `created_at`, so rows under the name from before stay inside the bound
+# (store._security_events_where says so).
 auth_routes.py::security_events_for::arg0
 # BACKLOG #2438: the same feed's total, for its pager. Same WHERE clause, so the same instance and
 # the same reason it stays: it counts exactly the rows the line above reads, no more.

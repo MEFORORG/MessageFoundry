@@ -43,8 +43,9 @@ from messagefoundry.config.settings import (
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
+    StoreBackend,
     StoreSettings,
-    _trust_every_peer_entries,
+    _classify_proxy_entries,
     load_settings,
     security_loosenings,
 )
@@ -108,6 +109,7 @@ def _pairs(
         audit_chain_unkeyed=None,
         remote_debug=None,
         startup=None,
+        service_env=None,
     )
 
 
@@ -164,6 +166,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "aad_bind" in named
@@ -200,6 +203,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -233,6 +237,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -327,6 +332,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "admin_new_ip_step_up" in named
@@ -487,6 +493,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     ).get(switch)
 
@@ -1301,7 +1308,7 @@ async def test_near_off_values_admit_what_the_default_refuses(
     assert admitted(near_off, "admin") == 200
 
 
-# --- [api].trusted_proxies with a prefix of 0 (BACKLOG #1131) ----------------------------------
+# --- [api].trusted_proxies covering more than one address (BACKLOG #1131) ----------------------
 
 
 def _proxied(*entries: str) -> ApiSettings:
@@ -1316,25 +1323,72 @@ def test_a_trust_every_peer_proxy_entry_is_a_named_loosening(entry: str) -> None
     assert _names(api=api) == ["trusted_proxies"]
 
 
+@pytest.mark.parametrize("entry", ["10.0.0.1", "10.0.0.1/32", "::1", "::1/128", "fd00::1"])
+def test_a_single_host_proxy_entry_is_not_a_loosening(entry: str) -> None:
+    """The control for the range arm below: one address is the proxy itself, so nothing is named."""
+    assert _names(api=_proxied(entry)) == []
+
+
+_WHOLE_FAMILY = "which together cover every address of their family"
+_RANGE = "each a range of more than one address"
+
+
+def _proxy_risk(*entries: str) -> str:
+    return dict(_pairs(api=_proxied(*entries)))["trusted_proxies"]
+
+
 @pytest.mark.parametrize(
     "entry",
     [
-        "10.0.0.1",
+        "10.0.0.0/31",  # two addresses: the smallest IPv4 range
+        "fd00::/127",  # two addresses: the smallest IPv6 range
+        "10.0.0.0/30",  # a small pool
         "10.0.0.0/8",
-        "::1",
         "fd00::/8",
     ],
 )
-def test_a_bounded_proxy_entry_is_not_a_loosening(entry: str) -> None:
-    assert _names(api=_proxied(entry)) == []
+def test_a_multi_address_proxy_entry_is_a_named_loosening(entry: str) -> None:
+    """BACKLOG #1131: any host inside a trusted range may forge X-Forwarded-For, so every entry
+    covering more than one address is named, however small. It still loads (advisory only)."""
+    pairs = _pairs(api=_proxied("10.0.0.1", entry))
+    assert [name for name, _ in pairs] == ["trusted_proxies"]
+    risk = dict(pairs)["trusted_proxies"]
+    assert _RANGE in risk and _WHOLE_FAMILY not in risk
+    # The range is named; the single-host proxy entry beside it is not blamed.
+    assert entry in risk and "10.0.0.1" not in risk
+
+
+def test_multi_address_entries_are_read_strictly_and_named_once() -> None:
+    assert _classify_proxy_entries(
+        ["10.1.2.3/0", "10.0.0.1", "fd00::/127", "10.0.0.0/31", "fd00::/127"]
+    ) == ([], ["10.0.0.0/31", "fd00::/127"])
+
+
+def test_a_whole_family_and_a_range_in_another_family_each_get_their_wording() -> None:
+    risk = _proxy_risk("0.0.0.0/0", "fd00::/8")
+    # The serve WARNING separates loosenings with "; ", so one risk must not contain it.
+    assert "; " not in risk
+    whole, _, rest = risk.partition(". Also, ")
+    assert "0.0.0.0/0" in whole and _WHOLE_FAMILY in whole and "fd00::/8" not in whole
+    assert "fd00::/8" in rest and _RANGE in rest and "0.0.0.0/0" not in rest
+
+
+def test_a_range_beside_a_whole_family_entry_of_the_same_family_gets_the_whole_family_wording() -> (
+    None
+):
+    """The family is trusted whole, so a range inside it is named with that wording, as the
+    SECURITY-LOOSENING.md section says, and no range clause is added."""
+    risk = _proxy_risk("0.0.0.0/0", "10.0.0.0/8")
+    assert _WHOLE_FAMILY in risk and _RANGE not in risk
+    assert "0.0.0.0/0" in risk and "10.0.0.0/8" in risk
 
 
 def test_the_trust_every_peer_check_skips_a_host_bits_entry() -> None:
     """A host-bits entry no longer loads (BACKLOG #2488), so this arm moved off ``ApiSettings``. The
     helper still reads entries as uvicorn does, where ``10.1.2.3/0`` is a literal that trusts no
     peer, so it must not be named as covering every address."""
-    assert _trust_every_peer_entries(["10.1.2.3/0"]) == []
-    assert _trust_every_peer_entries(["10.1.2.3/0", "0.0.0.0/0"]) == ["0.0.0.0/0"]
+    assert _classify_proxy_entries(["10.1.2.3/0"]) == ([], [])
+    assert _classify_proxy_entries(["10.1.2.3/0", "0.0.0.0/0"]) == (["0.0.0.0/0"], [])
 
 
 def _split(network: str, bits: int) -> list[str]:
@@ -1353,31 +1407,7 @@ def _split(network: str, bits: int) -> list[str]:
 )
 def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[str]) -> None:
     """Review round 1: two halves trust every peer as surely as one /0 does."""
-    risk = dict(
-        security_loosenings(
-            SecuritySettings(),
-            StoreSettings(),
-            AuthSettings(),
-            AlertsSettings(),
-            SecretRotationSettings(),
-            cleartext_hops=(),
-            expiry_relaxed_hops=(),
-            hostname_unchecked_hops=(),
-            query_credential_hops=(),
-            unverified_db_hops=(),
-            attested_hops=(),
-            revocation_attested_hops=(),
-            path_form_fhir_hops=(),
-            api=_proxied(*entries),
-            approvals=ApprovalsSettings(),
-            cert_monitor=CertMonitorSettings(),
-            backup=BackupSettings(),
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-            remote_debug=None,
-            startup=None,
-        )
-    ).get("trusted_proxies")
+    risk = _proxy_risk(*entries)
     assert risk is not None
     # Every range in the union is named, so a regression naming only one half reds here.
     for entry in entries:
@@ -1388,38 +1418,19 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
 
 
 def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
-    risk = dict(
-        security_loosenings(
-            SecuritySettings(),
-            StoreSettings(),
-            AuthSettings(),
-            AlertsSettings(),
-            SecretRotationSettings(),
-            cleartext_hops=(),
-            expiry_relaxed_hops=(),
-            hostname_unchecked_hops=(),
-            query_credential_hops=(),
-            unverified_db_hops=(),
-            attested_hops=(),
-            revocation_attested_hops=(),
-            path_form_fhir_hops=(),
-            api=_proxied("::/0", "::/0"),
-            approvals=ApprovalsSettings(),
-            cert_monitor=CertMonitorSettings(),
-            backup=BackupSettings(),
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-            remote_debug=None,
-            startup=None,
-        )
-    )["trusted_proxies"]
+    risk = _proxy_risk("::/0", "::/0")
     assert risk.count("::/0") == 1
 
 
-def test_ranges_that_leave_a_gap_are_not_a_loosening() -> None:
-    assert _names(api=_proxied(*_split("0.0.0.0/0", 2)[:3])) == []
+def test_ranges_that_leave_a_gap_get_the_range_wording_not_the_whole_family_one() -> None:
+    quarters = _split("0.0.0.0/0", 2)[:3]
+    risk = _proxy_risk(*quarters)
+    assert _RANGE in risk and _WHOLE_FAMILY not in risk
+    assert all(q in risk for q in quarters)
     # Two families never union into one.
-    assert _names(api=_proxied(_split("0.0.0.0/0", 1)[0], _split("::/0", 1)[1])) == []
+    halves = (_split("0.0.0.0/0", 1)[0], _split("::/0", 1)[1])
+    risk = _proxy_risk(*halves)
+    assert _RANGE in risk and _WHOLE_FAMILY not in risk
 
 
 def test_uvicorn_reads_a_prefix_zero_entry_the_way_the_registry_does() -> None:
@@ -1432,6 +1443,11 @@ def test_uvicorn_reads_a_prefix_zero_entry_the_way_the_registry_does() -> None:
     halves = _TrustedHosts(_split("0.0.0.0/0", 1))
     assert "10.9.9.9" in halves
     assert "203.0.113.9" in halves
+    # A /31 and a /127 trust BOTH their addresses, so neither is a single proxy host.
+    pair_v4 = _TrustedHosts(["10.0.0.0/31"])
+    assert "10.0.0.0" in pair_v4 and "10.0.0.1" in pair_v4
+    pair_v6 = _TrustedHosts(["fd00::/127"])
+    assert "fd00::" in pair_v6 and "fd00::1" in pair_v6
 
 
 # --- [api].plaintext_upstream_hop_acknowledged (BACKLOG #1179) --------------------------------
@@ -1478,6 +1494,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     risk = named["plaintext_upstream_hop_acknowledged"]
@@ -2230,6 +2247,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "cleartext_accepted" in named
@@ -2278,6 +2296,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "tls_allow_expired" in named
@@ -2317,6 +2336,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "generic_odbc_tls_unenforced" in named
@@ -2353,6 +2373,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "tls_revocation_attested" in named
@@ -2725,6 +2746,8 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "encrypt",  # the keyless-PHI serve gate refuses it in its own right
         "trust_server_certificate",  # gated by weakened_tls_escape_permitted (the ADR 0092 clamp)
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
+        # secure_delete left this set when vault BACKLOG #2619 began naming it; the loop below now
+        # pins that it is reported, and its own tests pin the file-backed condition.
     }
     exempt_auth = {
         # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three
@@ -2803,6 +2826,36 @@ def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -
         and isinstance(info.default, bool)
         and field not in _names(**{section: model(**{field: not info.default})})
     ]
+
+
+@pytest.mark.parametrize(
+    ("store", "named"),
+    [
+        (StoreSettings(secure_delete=False), True),
+        (StoreSettings(secure_delete=False, path=":memory:"), False),
+        (
+            StoreSettings(
+                backend=StoreBackend.SQLSERVER,
+                server="s",
+                database="d",
+                username="u",
+                secure_delete=False,
+            ),
+            False,
+        ),
+        (StoreSettings(), False),
+    ],
+)
+def test_secure_delete_off_is_named_on_a_file_backed_sqlite_store(
+    store: StoreSettings, named: bool
+) -> None:
+    """Vault BACKLOG #2619: off, a purge leaves the old bytes in the SQLite file. An in-memory store
+    has no file to keep them in, and a server backend ignores the switch, so neither is named, and
+    the shipped value is not either. The first case is the control that the entry exists."""
+    pairs = dict(_pairs(store=store))
+    assert ("secure_delete" in pairs) is named
+    if named:
+        assert "NOT overwritten in the SQLite file" in pairs["secure_delete"]
 
 
 @pytest.mark.parametrize(

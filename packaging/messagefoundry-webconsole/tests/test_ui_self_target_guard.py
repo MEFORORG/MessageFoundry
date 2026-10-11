@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Vault BACKLOG #3259 and #3260: the console's self-target refusals, by stored id, each audited.
 
-Six admin routes refuse the caller's own account: reset-password, reset-mfa, federated link and
-unlink, disable and delete. #3259 is the case-spelling bypass of four of those guards;
+At least nine admin routes refuse the caller's own account: reset-password, reset-mfa, federated
+link and unlink, disable, delete, and since BACKLOG #1149 revoke-sessions, roles and channel-scope.
+#3259 is the case-spelling bypass of four of the first six guards;
 ``api.auth_routes._refuse_if_self`` states why the console reaches it and the JSON plane does not.
 
 The default SQLite test store compares case-sensitively, where a naive test gets a 404 "no such
@@ -56,6 +57,23 @@ ROUTES = [
         "cannot disable your own account",
     ),
     ("delete", "/delete", None, {}, "cannot delete your own account"),
+    # BACKLOG #1149 (ASVS 7.5.2): each of these revokes the target's sessions on the login window.
+    ("revoke_sessions", "/revoke-sessions", None, {}, "use the self-service session controls"),
+    (
+        "set_roles",
+        "/roles",
+        None,
+        # Keeps Administrator, so only the self-guard stops the write and the session check bites.
+        {"roles": "administrator"},
+        "another administrator must change your own roles",
+    ),
+    (
+        "channel_scope",
+        "/channel-scope",
+        None,
+        {"scope_mode": "all"},
+        "another administrator must change your own channel scope",
+    ),
 ]
 
 
@@ -104,6 +122,8 @@ async def test_each_self_target_refusal_is_by_stored_id_and_audited(
     if grant_page is not None:
         await mint_bound_proof(c, base + grant_page)
     before = await engine.store.get_user(me)
+    roles_before = await engine.store.get_user_role_ids(me)
+    sessions_before = len(await engine.store.list_sessions(me))
 
     r = await c.post(base + suffix, data=form, headers=SAME_ORIGIN)
 
@@ -121,6 +141,37 @@ async def test_each_self_target_refusal_is_by_stored_id_and_audited(
     assert after is not None and before is not None
     assert (after.disabled, after.oidc_subject) == (before.disabled, before.oidc_subject)
     assert after.password_hash == before.password_hash, "a refused reset changed the credential"
+    assert (after.channel_scope, after.channel_scope_source) == (
+        before.channel_scope,
+        before.channel_scope_source,
+    )
+    assert await engine.store.get_user_role_ids(me) == roles_before
+    assert len(await engine.store.list_sessions(me)) == sessions_before, "a refusal ended sessions"
+
+
+#: BACKLOG #1149's control: (path after /ui/users/{id}, form) for the three routes it closed.
+SESSION_REVOKING = [
+    (suffix, form)
+    for op, suffix, _grant, form, _words in ROUTES
+    if op in ("revoke_sessions", "set_roles", "channel_scope")
+]
+
+
+@pytest.mark.parametrize(("suffix", "form"), SESSION_REVOKING)
+async def test_the_session_revoking_writes_still_reach_another_account(
+    engine: Engine,
+    root: tuple[httpx.AsyncClient, AuthService, str],
+    suffix: str,
+    form: dict[str, str],
+) -> None:
+    """The three routes BACKLOG #1149 closed to the caller still act on another account, on the
+    login window, and write no refusal row. Exact spelling: an upper-cased id would reach writes
+    keyed by that spelling, which this case-sensitive store matches to no row."""
+    c, service, _me = root
+    other = await provision(service, "viewer1", [Role.VIEWER.value])
+    r = await c.post(f"/ui/users/{other}{suffix}", data=form, headers=SAME_ORIGIN)
+    assert r.status_code == 303, (r.status_code, r.text[:300])
+    assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []
 
 
 @pytest.mark.parametrize("op", ["password_reset", "mfa_reset"])

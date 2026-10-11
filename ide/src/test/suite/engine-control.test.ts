@@ -6,6 +6,7 @@ import * as path from "path";
 
 import {
   HOLD_OPEN_SCRIPT,
+  PROBE_EMAIL,
   PROBE_USERNAME,
   buildAdminProbeInvocation,
   buildBootstrapPlan,
@@ -17,6 +18,7 @@ import {
   preflightArgs,
   runDirHasEngine,
   runStartPlan,
+  validateProvisionEmail,
   type AdminDetails,
   type AdminProbeResult,
   type StartPlanEffects,
@@ -230,10 +232,20 @@ const EXISTS: AdminProbeResult = { code: 1, stdout: ENGINE_ADMIN_EXISTS + "\n", 
 const NEEDS: AdminProbeResult = { code: 1, stdout: ENGINE_NO_TERMINAL + "\n", stderr: "" };
 
 suite("engine control — the provision-admin invocations carry no credential (Wave 5)", () => {
-  test("provisioning runs provision-admin with the username only — no password, no store override", () => {
-    const inv = buildProvisionInvocation({ python: "C:\\ws\\.venv\\Scripts\\python.exe", username: "alice" });
+  test("provisioning runs provision-admin with the username and address — no password, no store override", () => {
+    const inv = buildProvisionInvocation({
+      python: "C:\\ws\\.venv\\Scripts\\python.exe",
+      username: "alice",
+      email: "alice@example.test",
+    });
     assert.strictEqual(inv.command, "C:\\ws\\.venv\\Scripts\\python.exe");
-    assert.deepStrictEqual(inv.args, ["-m", "messagefoundry", "provision-admin", "--username=alice"]);
+    assert.deepStrictEqual(inv.args, [
+      "-m",
+      "messagefoundry",
+      "provision-admin",
+      "--username=alice",
+      "--email=alice@example.test",
+    ]);
     for (const a of inv.args) {
       assert.ok(!/password/i.test(a), `no password may ride in argv (${a})`);
       // The same resolution `serve` uses: same cwd, no store or service-config override.
@@ -242,23 +254,28 @@ suite("engine control — the provision-admin invocations carry no credential (W
   });
 
   test("a username that starts with a dash stays the value of --username, not a new flag", () => {
-    const inv = buildProvisionInvocation({ python: "python", username: "--json" });
-    assert.strictEqual(inv.args[inv.args.length - 1], "--username=--json");
+    const inv = buildProvisionInvocation({ python: "python", username: "--json", email: "--db" });
+    assert.ok(inv.args.includes("--username=--json"));
+    assert.strictEqual(inv.args[inv.args.length - 1], "--email=--db");
     assert.ok(!inv.args.includes("--json"), "the username must not become a flag of its own");
+    assert.ok(!inv.args.includes("--db"), "the address must not become a flag of its own");
   });
 
-  test("a notification address rides as --email=, and a blank one is left out", () => {
-    // The shipped posture refuses to start until some enabled Administrator has an address.
+  test("the notification address always rides as --email=, trimmed (BACKLOG #1138)", () => {
+    // provision-admin requires --email, so the argv never leaves it out; a blank one is the engine's to refuse.
     const withEmail = buildProvisionInvocation({ python: "python", username: "alice", email: " a@b.test " });
     assert.strictEqual(withEmail.args[withEmail.args.length - 1], "--email=a@b.test");
-    for (const blank of [undefined, "", "   "]) {
-      const inv = buildProvisionInvocation({ python: "python", username: "alice", email: blank });
-      assert.ok(!inv.args.some((a) => a.startsWith("--email")), `blank ${JSON.stringify(blank)}`);
+  });
+
+  test("the address prompt refuses a blank address and leaves the rest to the engine", () => {
+    for (const blank of ["", "   "]) {
+      assert.ok(validateProvisionEmail(blank), `blank ${JSON.stringify(blank)} must be refused`);
     }
+    assert.strictEqual(validateProvisionEmail("a@b.test"), undefined);
   });
 
   test("the provisioning terminal is held open after the command exits, with the same argv", () => {
-    const inner = buildProvisionInvocation({ python: "py", username: "alice" });
+    const inner = buildProvisionInvocation({ python: "py", username: "alice", email: "alice@example.test" });
     const held = buildHeldInvocation(inner);
     assert.strictEqual(held.command, "py");
     assert.deepStrictEqual(held.args, ["-c", HOLD_OPEN_SCRIPT, ...inner.args]);
@@ -281,6 +298,7 @@ suite("engine control — the provision-admin invocations carry no credential (W
       "messagefoundry",
       "provision-admin",
       `--username=${PROBE_USERNAME}`,
+      `--email=${PROBE_EMAIL}`,
       "--json",
     ]);
     assert.ok(inv.args.every((a) => !/password/i.test(a)));
