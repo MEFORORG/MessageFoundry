@@ -5171,15 +5171,18 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   admin, and a confidential-compute host where memory forensics is in scope (see
   [PHI.md §10](PHI.md#10-secure-deployment--operations-checklist)) — accepted via the same register
   entry rather than enforced by the engine.
-- **11.7.2 is a recorded partial.** A Router and a Handler receive the whole decrypted message.
+- **11.7.2 is a recorded partial.** A Router and a Handler receive the whole decrypted message, and
+  the engine never re-encrypts that body in memory.
   [ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)
-  records that the body in memory is never re-encrypted, and why 11.7.2 cannot pass. Re-encryption happens only on write, and only
-  with a key set; `[security].allow_unencrypted_phi` is the audited keyless opt-out.
-  [PHI.md §3](PHI.md#3-encryption-at-rest), *Data minimization during processing*, says what each
-  covers. **CORRECTED 2026-10-10 (BACKLOG #1174):** the 11.7.1 bullet above ended *"11.7.2's
+  records the decision. The store cipher re-encrypts PHI only as it writes it, and only with a key
+  set. [PHI.md §3, *Data minimization during processing*](PHI.md#data-minimization-during-processing-in-use-posture-asvs-1172)
+  says which columns that covers. Running keyless is an audited opt-out:
+  `[security].allow_unencrypted_phi`, plus a second flag under `enforcement = enforce`
+  ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)).
+  **CORRECTED 2026-10-10 (BACKLOG #1174):** the 11.7.1 bullet above ended *"11.7.2's
   encrypt-after-use guarantee is active only on a keyed instance (a key must be configured), which
   is already the case for any PHI-bearing deployment."* No such guarantee covers the body in memory,
-  and the opt-out means a PHI-bearing instance can run with no key.
+  and the opt-out lets an instance carry PHI with no key.
 
 ### On vault_transit, a recorded attestation stands in for the AES-GCM count (BACKLOG #2337)
 
