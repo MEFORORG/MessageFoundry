@@ -653,6 +653,12 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
 > 2026-09-28 amendment states the deployment precondition and cites the pages read.
 
+> **Corrected 2026-10-10 (BACKLOG #1173).** The note above calls the Transit bound a documented
+> operator precondition. That stopped being current when BACKLOG #2337 shipped
+> `enforce_transit_bound_attestation`, which `Engine.start` calls to check for a recorded operator
+> attestation. Point 4 of the 2026-09-28 amendment below, as corrected on 2026-10-10, says what it
+> checks. It counts no invocations, so the bound stays weaker than the counted one.
+
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
 
