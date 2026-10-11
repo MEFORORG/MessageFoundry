@@ -70,11 +70,15 @@ updates:
     # Lift a cap and delete its entry in the SAME PR.
     # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
     # routine one (`update-types` is the version-only knob and cannot express a range). A ruff
-    # 0.15.x advisory fix still flows; a uvicorn 0.54.x one opens a PR that stays red until the
-    # wire suite is re-measured (the uvicorn note below). Detection is untouched — security.yml's
-    # REQUIRED `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a
-    # withheld fix reds a merge-blocking gate within ~24h and a human lifts the cap. Note the
-    # ceiling is the pyproject CAP, not this entry: a human would have to lift it either way.
+    # 0.15.x advisory fix still flows. A uvicorn 0.54.x or websockets 17.2.x fix opens a PR, and
+    # that PR stays red until the wire suite is re-measured (the uvicorn note below). Security fixes
+    # share ONE `python-security` grouped PR, so that red bump holds back every security fix in it.
+    # Detection is untouched — security.yml's REQUIRED `pip-audit -r requirements.lock` covers both
+    # on every PR and on the daily cron, so a withheld fix reds a merge-blocking gate within ~24h.
+    # A human then lifts the cap. An exact pin moves only after a human re-measures it and updates
+    # `_MEASURED_UVICORN` or `_MEASURED_WEBSOCKETS` in tests/test_header_floor_wire.py with the pin.
+    # Note the ceiling is the pyproject cap or pin, not this entry: a human would have to move it
+    # either way.
     # NOT IGNORED, deliberately: the exact `==` pins in `[dependency-groups]`, and no blanket
     # `versioning-strategy: lockfile-only`. Both would freeze the hash-pinned CI toolchain, which ADR
     # 0034 §3 wants moving THROUGH this machinery — a pinned toolchain outside it rots into
