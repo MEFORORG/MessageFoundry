@@ -1879,8 +1879,9 @@ async def recheck_standing(
     console's ``authorize_ui_ws`` ask the same list with audit rows between the steps, so a new
     standing rule goes in all four.
 
-    Returns the CURRENT identity, so the caller filters each frame or row by today's channel scope
-    rather than the one captured at the gate."""
+    Returns the CURRENT identity, so the caller can act on today's channel scope rather than the
+    one captured at the gate: ``/ws/stats`` renders each frame with it, and the export stops when it
+    no longer covers the scope the export started with."""
     identity = await auth.identity_for_token(token, activity=activity)
     if identity is None or identity.must_change_password or identity.must_set_notify_email:
         return None

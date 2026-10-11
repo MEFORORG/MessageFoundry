@@ -5630,10 +5630,11 @@ def create_app(
         Selection is either an explicit ``ids`` set (the UI's *save-selected*) or the **basic**
         ``/messages/search`` filters (the UI's *save-all* — reusing ``search_messages`` for the id set);
         it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). The
-        caller is re-resolved before each row; once its session, permissions or second factor no longer
-        stand, the stream records ``messages_export.stopped`` and aborts (BACKLOG #1154). Each
-        streamed body is re-checked against that row's per-channel scope (load-bearing for the
-        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited (``auth.channel_denied``).
+        caller is re-resolved before each row. Once its standing fails, or its channel scope no longer
+        covers the scope it started with, the stream records ``messages_export.stopped`` and aborts
+        (BACKLOG #1154). Each streamed body is re-checked against the starting per-channel scope
+        (load-bearing for the attacker-suppliable ``ids`` path); an out-of-scope id is skipped +
+        audited (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
         a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
@@ -5704,12 +5705,19 @@ def create_app(
         token = bearer_token(request) if auth is not None else None
         touch_every = auth.session_idle_seconds / 4 if auth is not None else 0.0
 
-        gate_scope = _scope(identity)
+        gate_channels = identity.allowed_channels  # None = every channel
+
+        def _still_covers(current: Identity) -> bool:
+            """Whether ``current``'s channel scope still covers the scope the export started with.
+            A widened scope covers it; only a narrowed one stops the export."""
+            if current.allowed_channels is None:
+                return True
+            return gate_channels is not None and gate_channels <= current.allowed_channels
 
         async def _iter_ndjson() -> AsyncIterator[bytes]:
             streamed = 0
-            # -inf, so the first row touches: the gate's touch was before selection, which can
-            # take a while on a content scan.
+            # -inf, so the first row touches. It cannot rescue a selection that ran longer than the
+            # whole idle window: the re-check finds that session idle before it would touch it.
             last_touch = float("-inf")
             for mid in selected:
                 # Re-resolve the caller before EVERY row (BACKLOG #1154, ASVS 8.3.2). The gate
@@ -5717,8 +5725,8 @@ def create_app(
                 # a permission withdrawn mid-export would otherwise not reach it. Not the step-up:
                 # that proved the person when the export started. A flowing download is the
                 # caller's own act, so it moves the idle clock every quarter of the idle window. A
-                # client that stalls past the idle window leaves the session idle like any other,
-                # and the next row's re-check then ends both.
+                # stall past the idle window, of the client or of the store, leaves the session idle
+                # like any other, and the next row's re-check then ends both.
                 touch = time.monotonic() - last_touch >= touch_every
                 if touch:
                     last_touch = time.monotonic()
@@ -5733,16 +5741,14 @@ def create_app(
                         activity=touch,
                     )
                 )
-                # A changed channel scope stops the export too, rather than skipping and auditing
+                # A narrowed channel scope stops the export too, rather than skipping and auditing
                 # every later out-of-scope row: one stop row, not a denial per row that would trip
                 # the access-denied burst signal against an operator who did nothing.
-                reason = (
-                    "standing_changed"
-                    if current is None
-                    else "scope_changed"
-                    if _scope(current) != gate_scope
-                    else None
-                )
+                reason: str | None = None
+                if current is None:
+                    reason = "standing_changed"
+                elif not _still_covers(current):
+                    reason = "scope_changed"
                 if reason is not None:
                     # Counts only, never an id or a body.
                     _log.warning(

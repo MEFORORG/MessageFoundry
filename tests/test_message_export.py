@@ -526,6 +526,30 @@ async def test_a_scope_narrowed_mid_export_stops_the_stream_once(
     assert "auth.channel_denied" not in actions
 
 
+async def test_a_scope_widened_mid_export_does_not_stop_it(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other polarity: a grant that widens the scope still covers every row the export started
+    with, so it streams to the end and records no stop. Only a narrowed scope stops it."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value], scope=["IB_A"])
+    mid_a, _mid_b = await _seed(engine)
+    mid_a2 = await engine.store.enqueue_message(
+        channel_id="IB_A", raw=ADT_A, deliveries=[], message_type="ADT^A01", control_id="MSGA2"
+    )
+
+    async def widen() -> None:
+        await service.store.set_user_channel_scope(uid, '["IB_A", "IB_B"]', source="manual")
+
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, widen)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_a2]})
+    assert r.status_code == 200, r.text
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a, mid_a2]
+    assert await _stop_rows(engine) == []
+
+
 def _count_stream_touches(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> list[int]:
     """Count ``touch_session`` calls made after the export's own audit row, i.e. by the stream and
     not by sign-in or the gate. Returns a one-item list the caller reads after the request."""
@@ -563,16 +587,16 @@ async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_sessi
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The per-row re-check must not turn a long download into an idle session. The idle window is
-    shrunk to 0.4 s and each row takes 0.15 s, so six rows outlast it. The export moves the idle
+    shrunk to 2.0 s and each row takes 0.5 s, so six rows outlast it. The export moves the idle
     clock every quarter window, so every row streams and the session stays live afterwards."""
-    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 0.4))
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 2.0))
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     ids = await _seed_many(engine, 6)
     real = engine.store.get_message
 
     async def slow(message_id: str) -> Any:
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.5)
         return await real(message_id)
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
@@ -602,18 +626,19 @@ async def test_fast_rows_share_one_idle_touch(
     assert touches[0] == 1, touches
 
 
-async def test_a_client_stalled_past_the_idle_window_ends_the_export(
+async def test_a_stall_past_the_idle_window_ends_the_export(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A stall longer than the idle window leaves the session idle like any other, so the next
-    row's re-check ends the export as a standing change. Pinned so the behaviour is a decision."""
-    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 0.4))
+    """A stall longer than the idle window, of the client or (as here) of a store read, leaves the
+    session idle like any other, so the next row's re-check ends the export as a standing change.
+    Pinned so the behaviour is a decision."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 2.0))
     service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     ids = await _seed_many(engine, 2)
 
     async def stall() -> None:
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(3.0)
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
         token = await _login(c, "op")
