@@ -1405,10 +1405,10 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 
 $StdoutLog = Join-Path $LogDir "service.out.log"
 $StderrLog = Join-Path $LogDir "service.err.log"
-$AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
+$AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath) --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
 # Absolute, so the file the service reads does not depend on its working directory (vault BACKLOG
 # #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
-if ($ServiceConfig) { $AppParams += " --service-config `"$ServiceConfig`"" }
+if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }
 if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
 
 # --- install -----------------------------------------------------------------
@@ -1778,17 +1778,11 @@ if ($LockConfigDir) {
     $ValueFolder = Join-Path $ValuesAnchor "environments"
     $LockPaths = @($Config)
     if (Test-Path -LiteralPath $ValueFolder -PathType Container) { $LockPaths += $ValueFolder }
-    # The settings file's folder too, for the same refusal. In the default layout that is the folder
-    # above -Config, so locking it re-owns everything it holds.
-    if ($ServiceConfig) {
-        $SettingsFolder = Split-Path -Parent $ServiceConfig
-        if ($LockPaths -notcontains $SettingsFolder) { $LockPaths += $SettingsFolder }
-    }
     foreach ($LockPath in $LockPaths) {
         Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount
     }
-    foreach ($LockPath in ($LockPaths | Select-Object -Skip 1)) {
-        Write-Host "  Locked : '$LockPath' the same way (vault BACKLOG #2626)."
+    if ($LockPaths.Count -gt 1) {
+        Write-Host "  Values : '$ValueFolder' locked the same way (vault BACKLOG #2626)."
     }
     $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
                    else { "SYSTEM/Administrators (F)" }
@@ -1804,6 +1798,15 @@ if ($LockConfigDir) {
         "write/modify on the dir or any *.py in it, AND separately if the dir's owner is neither the " +
         "run-as account nor an administrator it can resolve. Re-run with -LockConfigDir (which sets " +
         "both), or point -Config at a dedicated admin-owned dir; see docs/SERVICE.md " +
+        "'Restrict the config directory'.")
+}
+# The settings file is not locked, because its folder can be anything: a drive root, a checkout,
+# the data directory. `serve` refuses a settings file or folder another account can write, so
+# the operator is told where it is (vault BACKLOG #2626).
+if ($ServiceConfig) {
+    Write-Warning ("The service reads its settings from '$ServiceConfig'. 'serve' refuses to " +
+        "start when an account other than administrators or the service account can write that " +
+        "file or its folder; this installer does not change either. See docs/SERVICE.md " +
         "'Restrict the config directory'.")
 }
 if ($ServiceAccount) {

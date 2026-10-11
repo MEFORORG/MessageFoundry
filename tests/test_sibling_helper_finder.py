@@ -21,6 +21,7 @@ import pytest
 
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.wiring import (
+    _CONFIG_SOURCE_LEAD,
     WiringError,
     _assert_safe_config_source,
     _enforce_windows_paths,
@@ -372,7 +373,7 @@ def test_dot_named_modules_are_outside_the_windows_trust_check(tmp_path: Path) -
     _enforce_windows_paths(
         config_source_trust_paths(tmp_path),
         probes,
-        lead="refusing to load config from",
+        lead=_CONFIG_SOURCE_LEAD,
         refuse=_refuse_unsafe_config_source,
         first_is_required=True,
     )

@@ -110,7 +110,7 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
     text = _text()
     params = text.index("$AppParams = ")
     service_config = text.index(
-        'if ($ServiceConfig) { $AppParams += " --service-config `"$ServiceConfig`"" }'
+        'if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }'
     )
     project_root = text.index(
         'if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }'
@@ -121,17 +121,19 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
     assert "$ProjectRoot = Resolve-AbsolutePath $ProjectRoot" in text
 
 
-def test_lock_config_dir_locks_the_value_and_settings_folders_too() -> None:
-    """``serve`` refuses a value file or settings file whose folder another account can write, so
-    ``-LockConfigDir`` locks both folders with the config directory."""
+def test_lock_config_dir_locks_the_value_folder_and_names_the_settings_file() -> None:
+    """``-LockConfigDir`` locks the value folder with the config directory. The settings file's
+    folder can be a drive root, a checkout or the data directory, so it is never locked; the
+    installer warns that ``serve`` checks it instead."""
     text = _text()
     block = text.index("if ($LockConfigDir) {")
     folder = text.index('$ValueFolder = Join-Path $ValuesAnchor "environments"')
     added = text.index("$LockPaths += $ValueFolder")
-    settings = text.index("$SettingsFolder = Split-Path -Parent $ServiceConfig")
-    settings_added = text.index("$LockPaths += $SettingsFolder")
     lock = text.index("Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount")
-    assert block < folder < added < settings < settings_added < lock
+    assert block < folder < added < lock
+    assert "$SettingsFolder" not in text
+    warning = text.index("Write-Warning (\"The service reads its settings from '$ServiceConfig'")
+    assert lock < warning
 
 
 def test_the_default_settings_file_is_the_one_serve_would_read(tmp_path: Path) -> None:

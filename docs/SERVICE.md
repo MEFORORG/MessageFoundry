@@ -112,7 +112,7 @@ Defaults:
 | Setting | Default |
 |---|---|
 | Service name | `MessageFoundry` |
-| Engine launcher (`-AppExe`) | `C:\Program Files\MessageFoundry\engine\Scripts\messagefoundry.exe`. It names the install; the service does not run it. The installer checks that it, the interpreter and the engine package are administrator-only |
+| Engine launcher (`-AppExe`) | `C:\Program Files\MessageFoundry\engine\Scripts\messagefoundry.exe`. It names the install; the service does not run it. The installer refuses the default root when another account can write the launcher, the venv's `python.exe` or the package's `__init__.py`, or a folder above them. It reads no other file, such as the base interpreter a venv's `python.exe` starts; `serve` reports the interpreter and package at start |
 | Interpreter the service runs (`-PythonExe`) | the `python.exe` beside the launcher, or one folder up |
 | Config dir (`-Config`) | *(required)* |
 | Working directory | the install root; the repository for a passed `-AppExe` |
@@ -126,9 +126,9 @@ Defaults:
 | Log level | `INFO` |
 
 **A registered `--project-root` wins over `[environments].base_dir` in the settings file.** The
-default install always registers one, and the installer does not read the settings. So if your
-settings file sets `base_dir`, pass the same folder as `-ProjectRoot`, or the service reads its
-value file from the folder above `-Config`.
+default install registers one unless `-Config` sits at a drive root, and the installer does not
+read the settings. So if your settings file sets `base_dir`, pass the same folder as
+`-ProjectRoot`, or the service reads its value file from the folder above `-Config`.
 
 Override any of them, e.g.:
 
@@ -637,8 +637,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     `supervise` makes the same check before it starts any engine shard. Every reload reads the
     value file again, so it checks it again first and refuses the reload the same way. The dev/test
     escape below downgrades these refusals too. `install-service.ps1 -LockConfigDir` locks the
-    value file's folder and the settings file's folder with the config directory. In the default
-    layout the settings file sits in the folder above `-Config`, so that whole folder is locked.
+    value file's folder with the config directory. It never locks the settings file's folder,
+    which can be a drive root or a checkout; it warns instead, and you restrict that folder.
   - **It also reads the interpreter and the engine package, and only reports them.** A start whose
     interpreter or `messagefoundry` package folder another account can write logs a WARNING,
     *"the engine runs code from writable-by-others path ..."*, and goes on. Refusing would end every

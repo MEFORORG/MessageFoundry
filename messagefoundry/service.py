@@ -357,7 +357,7 @@ def install_service(
     environment the service runs as (ADR 0017 — install-service.ps1 requires it), and ``config``
     the config directory it loads (the installer requires that too, vault BACKLOG #2626).
     ``service_config`` names the settings file, when given. Raises :class:`ValueError` for an
-    unsafe environment name or path (it runs elevated).
+    unsafe environment name, and on Windows for an unsafe path (it runs elevated).
 
     Returns :data:`~ServiceControlOutcome.UNSUPPORTED` off Windows,
     :data:`~ServiceControlOutcome.FAILED` when the elevated launch did not happen, and
