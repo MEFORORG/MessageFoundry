@@ -787,18 +787,21 @@ above.
    counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path
    counts nothing. In its place, `Engine.start` calls `enforce_transit_bound_attestation` in
    `store/transit_attestation.py`, which checks for a recorded operator attestation naming the
-   configured Transit data key (BACKLOG #2337). [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+   configured Transit data key (BACKLOG #2337). Without one, the engine refuses to start under
+   `[security].enforcement = enforce` and only logs a warning under `warn`. An attestation is still
+   weaker than the counted bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
    2026-10-07 amendment records how that gate works and the forgery it does not catch. Its
    2026-09-28 amendment states the rotation precondition the operator attests to.
 
 **What this statement does not cover.** How fast the operating system's generator runs is a property
-of Windows and Linux. Whether the Windows generator can block is not documented in any page read.
-The 2026-10-10 amendment below says what the platform pages state about blocking and failure.
+of Windows and Linux. The 2026-10-10 amendment below says what the platform pages state about
+blocking and failure, and where they say nothing.
 
-> **Corrected 2026-10-10 (BACKLOG #1173).** Point 2 and the paragraph above said the Node and
-> platform pages had not been read; they now point to the 2026-10-10 amendment, which reads them.
-> Point 4 called the Transit bound an operator precondition with no engine record. It now names the
-> shipped start gate. That gate still counts no invocations; it checks for a recorded attestation.
+> **Corrected 2026-10-10 (BACKLOG #1173).** Point 2 and the paragraph above each said a page had
+> not been read for this amendment. They now point to the 2026-10-10 amendment, which reads them.
+> Point 4 described the Transit bound as a precondition the operator documents. It now names the
+> shipped attestation check. That check counts no invocations, and the
+> bound stays weaker than the counted one.
 
 **What stops a weak generator coming back, and where it stops short.** Bandit B311 now runs in both the
 CI scan and the pre-commit hook, with each seeded non-security `random` use marked per line. B311 is a
@@ -817,7 +820,8 @@ source below was read on 2026-10-10.
 
 **The IDE extension stays in scope.** `ide/src/cspNonce.ts` `nonce` calls `randomBytes(18)` in its
 synchronous form, from extension-host code. Every webview the extension builds takes its CSP nonce
-from it. The 2026-09-28 library table lists only those nonces. `ide/src/webviewMessaging.ts`
+from it, at least for every webview that runs a script. The 2026-09-28 library table lists only
+those nonces. `ide/src/webviewMessaging.ts`
 `openChannel` also draws its channel token from `nonce`.
 
 **What each generator's documentation says about blocking and failure.**
@@ -825,9 +829,9 @@ from it. The 2026-09-28 library table lists only those nonces. `ide/src/webviewM
 | Generator | Who reaches it | Can it block? | Can it fail? |
 |---|---|---|---|
 | Node `crypto.randomBytes` | `cspNonce.ts` `nonce`, for CSP nonces and channel tokens | Yes, until enough entropy exists. The page names only the period just after boot for a long wait. | Yes. The synchronous form throws "if there is a problem generating the bytes". |
-| Python `os.urandom` on Linux | every row of the first table above, through `secrets` or directly | Yes, until the kernel's urandom pool is initialized. Python calls `getrandom()` in blocking mode. | The page names `NotImplementedError` when `/dev/urandom` is missing on the fallback path. |
+| Python `os.urandom` on Linux | every row of the 2026-09-28 amendment's first table, through `secrets` or directly | Yes, until the kernel's urandom pool is initialized. Python calls `getrandom()` in blocking mode. | The page names `NotImplementedError` when `/dev/urandom` is missing on the fallback path. |
 | Linux `getrandom(2)`, default flags | Python, as above | Before the urandom source is initialized. A read over 256 bytes also blocks until its bytes are generated. | After that, reads of up to 256 bytes "will always return as many bytes as requested". Larger reads may return fewer bytes or fail with `EINTR`. |
-| Python `os.urandom` on Windows | every row of the first table above | The page does not say. | The page does not say. |
+| Python `os.urandom` on Windows | every row of the 2026-09-28 amendment's first table | The page does not say. | The page does not say. |
 | Windows `BCryptGenRandom` | Python, as above | The page does not say. | Yes. It returns a status code, and the listed codes are "not limited to" an invalid handle or parameter. |
 | Windows `ProcessPrng` | No page read here shows Python or Node calling it. That does not rule out the extension host's crypto library. | The page does not say. | No. The page says it "Always returns TRUE". |
 
@@ -858,12 +862,11 @@ from it. The 2026-09-28 library table lists only those nonces. `ide/src/webviewM
 1. **No page read here names the rate of requests as a cause of blocking or failure.** The size of
    one request matters on Linux, as the table shows, and point 2 covers it. Node's page also warns
    that the asynchronous form loads libuv's threadpool. `cspNonce.ts` uses the synchronous form.
-2. **The Linux guarantee covers small reads, and the engine's fixed-size draws are small.** Each
-   fixed-size draw in the first table is 64 bytes or fewer. The generated policy password draws
-   bytes in step with the policy's minimum length. It passes 256 bytes only when that minimum is
-   above 341 characters. CPython's loop still completes a larger read.
-3. **A failure raises; it does not return weak bytes.** Node's synchronous form throws, and `nonce`
-   does not catch it. CPython raises when `BCryptGenRandom` reports a failure. Neither page says how
-   often that happens.
-4. **Windows blocking is not documented either way.** Neither Microsoft page says whether the call
-   can wait. This amendment claims nothing about it.
+2. **The Linux guarantee covers small reads, and the draws in that table are small.** Each
+   fixed-size draw in the 2026-09-28 amendment's first table is 64 bytes or fewer. That table is
+   not a full census. The generated policy password draws bytes in step with the policy's minimum
+   length. It draws more than 256 bytes only when that minimum is above 341 characters. CPython's
+   loop still completes a larger read.
+3. **A reported failure raises.** Node's synchronous form throws, and `nonce` does not catch it.
+   CPython raises when `BCryptGenRandom` reports a failure. No source read here says whether a
+   generator can return weak bytes without reporting a failure, or how often a failure happens.
