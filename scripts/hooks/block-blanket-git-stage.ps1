@@ -139,6 +139,30 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
     return $null
 }
 
+# Drop each bracketed span '(...)' to one space, and everything from the first '(' that never
+# closes. That is what the commit pathspec rule used to get by deleting the innermost '(...)' over
+# and over, but that took one pass over the text per nesting level. Measured: 40,000 nested
+# brackets before a real 'git add -A' took 21.3 s, past the hook's 15 s timeout, so the stage
+# would have run. This is one pass, pairing brackets with a stack, and it pairs them the same way.
+function Remove-BracketedText([string]$Text) {
+    $closeAt = New-Object 'int[]' $Text.Length
+    $open = New-Object 'System.Collections.Generic.Stack[int]'
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $closeAt[$i] = -1
+        if ($Text[$i] -ceq '(') { $open.Push($i) }
+        elseif ($Text[$i] -ceq ')' -and $open.Count -gt 0) { $closeAt[$open.Pop()] = $i }
+    }
+    $stop = $Text.Length
+    foreach ($at in $open) { if ($at -lt $stop) { $stop = $at } }
+    $sb = New-Object System.Text.StringBuilder
+    $i = 0
+    while ($i -lt $stop) {
+        if ($closeAt[$i] -ge 0) { [void]$sb.Append(' '); $i = $closeAt[$i] + 1 }
+        else { [void]$sb.Append($Text[$i]); $i++ }
+    }
+    return $sb.ToString()
+}
+
 # Replace every match of $Pattern, found in the scan view, at the same offsets in BOTH views, so
 # the two stay the same length as each other. Each matched character becomes $Fill; an empty
 # $Fill deletes the match. Used only to build the added views -- see the views below.
@@ -415,12 +439,7 @@ while ($true) {
     # 'commit' is matched as a whole word wherever the subcommand did not resolve to add or
     # stage, for the same reason the staging test above falls back to the bare word.
     if (-not $staging) {
-        $commitArgs = $s -creplace '(^|\s)#.*$', ''
-        do {
-            $before = $commitArgs
-            $commitArgs = $commitArgs -creplace '\([^()]*\)', ' '
-        } while ($commitArgs -cne $before)
-        $commitArgs = $commitArgs -creplace '\(.*$', ''
+        $commitArgs = Remove-BracketedText ($s -creplace '(^|\s)#.*$', '')
         if ($commitArgs -cmatch "(^|\s)commit\s(?:.*\s)?(?:$dotFamily|:/)$tokenEnd") {
             $reason = "git commit with a whole-tree pathspec (. ./ :/ :(top)) commits every tracked change under it, including files another session may be editing."
             break

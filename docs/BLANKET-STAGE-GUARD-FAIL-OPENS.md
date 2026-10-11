@@ -16,9 +16,9 @@ guard is asserted in `tests/test_claude_settings_contract.py`, so read it there.
 
 ## The owner answers
 
-The owner answered at least six times on these forms and on wiring. Each answer was a choice in a
-dialog in the Special seat's session. **These six are reported by that seat. No other seat saw the
-dialogs.** The vault's rulings file of 2026-10-08
+The owner answered at least six times on these forms and on wiring, and also lifted a hold; see
+*What wiring waited on*, item 3. Each was a choice in a dialog in the Special seat's session.
+**All seven are reported by that seat. No other seat saw the dialogs.** The vault's rulings file of 2026-10-08
 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, entry #1339) records answer 1. The seat's
 comments on engine PR 2209 record answers 2 and 3, and its comment on engine PR 2217 records
 answer 4. The seat reported answers 5 and 6 in its follow-up brief for the wiring change. The
@@ -31,6 +31,7 @@ says that answer is withdrawn, because its question rested on a false premise.
 | 2 | 2026-10-08 | "Accept all five, wire it (Recommended)" | five groups, (a) to (e) | 2 |
 | 3 | 2026-10-09 | "Accept the four, wire it (Recommended)" | four forms the Lander's review found | 3 |
 | 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | every form the guard does not match | every allowed form |
+| hold lift | 2026-10-09 | "Lift for #1339 only (Recommended)" | the hold on wiring | *What wiring waited on*, item 3 |
 | 5 | 2026-10-10 | "Yes, wire now (Recommended)" | the 2026-08-25 splitter condition | *What wiring waited on*, item 1 |
 | 6 | 2026-10-10 | "Yes, it counts (Recommended)" | the Lander's written-acceptance condition | *What wiring waited on*, item 2 |
 
@@ -96,7 +97,8 @@ under the item. Everything outside the quotes is this page's wording.
    hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
    return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser."
    *Where it stands:* the Special seat reports that the owner then chose "Lift for #1339 only
-   (Recommended)", at 00:24:30Z on 2026-10-10 (UTC). No engine record holds that choice: the
+   (Recommended)", at 00:24:30Z on 2026-10-10 (UTC), which is the evening of 2026-10-09 in US
+   Central. No engine record holds that choice: the
    seat reported it in its brief for the wiring change, and a maintainer-internal vault record
    holds it too. The brief's account of that lift, in the seat's words, is that one wiring
    Builder is dispatched once engine PR 2217 merges. PR 2217 merged at 02:27:30Z on 2026-10-10
@@ -539,9 +541,15 @@ How each was closed. Neither is a quote-state parser or a program-position test:
 
 Both readings are added beside the old ones and never replace them. The guard judges the old
 readings first and builds the new ones only when the old ones allow. So a slow new reading cannot
-push the hook past its timeout before the old verdict is reached, and neither can turn a deny into
-an allow. Before that order was set, a payload of 30,000 brackets holding a real `git add -A` took
-19.7 seconds, past the 15-second timeout, and would have run.
+push the hook past its timeout before the old verdict is reached. Before that order was set, a
+payload of 30,000 brackets holding a real `git add -A` took 19.7 seconds, past the 15-second
+timeout, and would have run.
+
+The old readings had a slow path of their own, and wiring the guard under a timeout made it
+matter. The commit pathspec rule dropped bracketed text one nesting level per pass. Measured:
+`git commit -m x`, then 40,000 nested brackets, then `&& git add -A` took 21.3 seconds, so the
+stage would have run. The rule now pairs the brackets in one pass and gives the same result, which
+a comparison on 20,000 random strings confirmed. The same payload now takes about 1.4 seconds.
 
 ## 5. Known residuals that no per-form answer names
 
@@ -571,8 +579,10 @@ argument, which changes the escaped-backslash row.
 and a hook that runs longer lets the command run. The added readings are the slow part: the
 narrow heredoc reading walks the whole command a character at a time a second time. A 600 KB
 payload holding `<<` was measured at about 12.6 seconds, close to the limit. A longer one could
-pass it. The guard judges the old readings first, so a timeout can only cost the denies the added
-readings would make. It never loses a deny the guard at origin/main makes.
+pass it. The guard judges the old readings first, so a timeout there costs only the denies the
+added readings would make. The old readings can be slow too: section 4a records one slow path
+found and closed. This page does not claim no other exists. A command long enough to keep the old
+readings past 15 seconds would run, whatever they would have decided.
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.

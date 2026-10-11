@@ -548,9 +548,10 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 > checks the common blanket-stage spellings, it fails open, and it lets through at least the forms
 > listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md). On
 > 2026-10-09 the owner chose "Accept by mechanism (Recommended)" in a dialog that only the Special
-> seat saw and reports. On 2026-10-10, in the same seat's session, the owner answered that this
-> choice meets the Lander's condition that the fail-opens be accepted in writing: "Yes, it counts
-> (Recommended)". **A control counted as a gate
+> seat saw and reports. On 2026-10-10 the same seat asked whether that choice meets the Lander's
+> condition that the fail-opens be accepted in writing. It reports that the owner chose "Yes, it
+> counts (Recommended)", and that the option's text read "Your dialog choice is your written
+> acceptance. The condition is met." **A control counted as a gate
 > while it lets known forms through would rest on a false premise -- the defect SDS-3.7 names.**
 >
 > **What keeps the wiring true is an instrument, not this paragraph.**

@@ -1032,6 +1032,17 @@ def test_a_slow_added_reading_cannot_delay_the_original_deny() -> None:
     assert time.monotonic() - started < 15
 
 
+def test_a_deeply_nested_commit_before_a_stage_is_judged_inside_the_time_limit() -> None:
+    """The ORIGINAL reading's own cost, which the test above does not reach. The commit pathspec
+    rule used to drop one nesting level of brackets per pass, so 40,000 nested brackets in a commit
+    segment took 21.3 s before the 'git add -A' after it was read. That is past the 15 s timeout,
+    and a timed-out hook lets the stage run."""
+    command = "git commit -m x " + "(" * 40000 + ")" * 40000 + " && git add -A"
+    started = time.monotonic()
+    assert_denied(run_guard(bash(command)))
+    assert time.monotonic() - started < 15
+
+
 @pytest.mark.parametrize("continuation", [_BS, _BT])
 def test_an_unknown_tool_gets_both_continuation_characters(continuation: str) -> None:
     """The tool name picks ONE character for a tool the guard knows. For any other name it must
