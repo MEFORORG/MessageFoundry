@@ -192,13 +192,21 @@ def test_an_engine_that_does_not_answer_is_unreachable_and_not_a_refusal() -> No
 
 
 @contextlib.contextmanager
-def _engine_answering(status: int, size: int) -> Iterator[str]:
-    """A loopback HTTP server that answers every request with ``status`` and ``size`` bytes."""
+def _engine_answering(status: int, size: int, *, states_length: bool = True) -> Iterator[str]:
+    """A loopback HTTP server that answers every request with ``status`` and ``size`` bytes.
+
+    With ``states_length`` false the answer has no ``Content-Length`` and ends when the server
+    closes, so the client can only count what arrives."""
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _answer(self) -> None:
+            # Read the request body first (BACKLOG #3394). A socket closed with received bytes
+            # still unread sends a reset instead of a normal close, and Windows then throws away
+            # the answer the client has not read: the sign-in POST read as ConnectionAbortedError.
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.send_response(status)
-            self.send_header("Content-Length", str(size))
+            if states_length:
+                self.send_header("Content-Length", str(size))
             self.end_headers()
             self.wfile.write(b"x" * size)
 
@@ -217,27 +225,33 @@ def _engine_answering(status: int, size: int) -> Iterator[str]:
         server.server_close()
 
 
+@pytest.mark.parametrize("states_length", [True, False], ids=["stated", "unstated"])
 @pytest.mark.parametrize("status", [200, 401])
 def test_an_answer_past_the_reply_cap_is_refused_and_one_at_it_is_read_whole(
-    monkeypatch: pytest.MonkeyPatch, status: int
+    monkeypatch: pytest.MonkeyPatch, status: int, states_length: bool
 ) -> None:
     """ASVS 5.1.1 (BACKLOG #1127): the rig reads each engine answer under ``MAX_API_REPLY_BYTES``,
-    on the success path and the HTTP-error path alike, and never cuts one short."""
+    on the success path and the HTTP-error path alike, and never cuts one short, whether or not
+    the answer states its length."""
     monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 100_000)
-    with _engine_answering(status, 100_000) as base:
+    with _engine_answering(status, 100_000, states_length=states_length) as base:
         assert rigadmin._call("GET", f"{base}/stats", cacert=None) == (status, b"x" * 100_000)
-    with _engine_answering(status, 100_001) as base, pytest.raises(rigadmin.RigReplyRefused):
+    with (
+        _engine_answering(status, 100_001, states_length=states_length) as base,
+        pytest.raises(rigadmin.RigReplyRefused),
+    ):
         rigadmin._call("GET", f"{base}/stats", cacert=None)
 
 
+@pytest.mark.parametrize("states_length", [True, False], ids=["stated", "unstated"])
 def test_a_sign_in_answer_past_the_reply_cap_reads_as_no_answer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, states_length: bool
 ) -> None:
     """A node polled for its status treats an over-cap answer as no answer and asks again; its
     sign-in must read the same way, not as a refused credential that ends the run."""
     monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 1_000)
     with (
-        _engine_answering(200, 5_000) as base,
+        _engine_answering(200, 5_000, states_length=states_length) as base,
         pytest.raises(rigadmin.RigUnreachable, match="limit") as caught,
     ):
         rigadmin.sign_in(base, RigAdmin("rig-operator", "ab" * 24))
