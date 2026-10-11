@@ -92,9 +92,9 @@
       replaces the statusLine verdict above it.
 
       Its own age and TTL. Each entry records when the Steward read it (`ts`) and how long the
-      Steward itself would serve it (`ttl`). The fallback serves an entry only while watch.py's
-      _is_fresh would: not future-dated, younger than its TTL, and with its stored projection not run
-      out. Otherwise it is UNKNOWN, never projected from. The statusLine's $MaxAgeMinutes does not
+      Steward itself would serve it (`ttl`, 300 s when absent or zero). The fallback serves an entry
+      only while watch.py's _is_fresh would: not future-dated, younger than its TTL, and with its
+      stored projection not run out. Otherwise it is UNKNOWN, never projected from. The statusLine's $MaxAgeMinutes does not
       apply to it. A desktop-sourced entry's data is older than its read time by `sample_age`, so the
       printed data age adds it.
 
@@ -102,10 +102,14 @@
       A claude-desktop session is named first by the desktop app's own record for this session id
       (claude-code-sessions/<accountUuid>/<orgUuid>/local_*.json). Without a record, a session with a
       pinned CLAUDE_CONFIG_DIR is named by that root's login record, after watch.py's self-check. An
-      SDK session is named by the login record. watch.py's last resort for an unpinned Desktop session
-      is the app's CURRENT account, a global signal that moves when the owner switches login, so the
-      fallback refuses there rather than guess. The key is `organizationUuid`, or `acct:<accountUuid>`
-      without one, and an entry that does not show the same org and account is refused.
+      SDK session is named by the login record, after the same self-check, which watch.py skips there.
+      watch.py's last resort for a Desktop session still without an org is the app's CURRENT account,
+      a global signal that moves when the owner switches login, so the fallback refuses there rather
+      than guess. The key is `organizationUuid`, or `acct:<accountUuid>` without one (SDK only), and
+      an entry that does not show every identity field this session has is refused.
+
+      Still a second copy of watch.py's rules, in another language. Nothing ties the two, so a change
+      to watch.py's _is_fresh, _desktop_pool or CACHE_VERSION must be carried here by hand.
 
       No grade. The Steward's `state` field is a severity label, not a stop order (korus
       roles/STEWARD.md 3b), and usage.ps1's thresholds were set for statusLine readings. The
@@ -226,10 +230,17 @@ function Get-CauseNote($Doc) {
 
 function Get-Entrypoint { Get-Folded $env:CLAUDE_CODE_ENTRYPOINT 40 }
 
+# watch.py's test, `entrypoint.startswith("claude-desktop")`: case-sensitive and a prefix.
+function Test-DesktopEntrypoint { return ((Get-Entrypoint) -clike "claude-desktop*") }
+
 # Only these clients are named; any other entrypoint, an unfamiliar one included, is not.
 function Test-NoStatusLineClient {
-    $ep = Get-Entrypoint
-    return ($ep -eq "claude-desktop" -or $ep -like "sdk-*")
+    return ((Test-DesktopEntrypoint) -or (Get-Entrypoint) -like "sdk-*")
+}
+
+# Numbers in prose are formatted invariantly, so a comma-decimal locale cannot print "1,5".
+function Format-Number([string]$Pattern, [double]$Value) {
+    return $Value.ToString($Pattern, [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 # THE STEWARD'S status.json, AS A LABELLED FALLBACK (BACKLOG #1459; seat decision under owner
@@ -285,30 +296,33 @@ function Get-StewardFallback {
     $org = $who.org
     $acct = $who.acct
     $key = if ($org) { $org } else { "acct:$acct" }
-    $pool = Get-Prefix $key 13
+    # watch.py's own label, "org <8>" or "account <8>", so a text search finds both banners.
+    $pool = if ($org) { "org " + (Get-Prefix $org 8) } else { "account " + (Get-Prefix $acct 8) }
 
     $entry = $null
     if ($doc.pools -is [System.Collections.IDictionary]) { $entry = $doc.pools[$key] }
     if ($entry -isnot [System.Collections.IDictionary]) {
         return Unknown "the Steward has no entry for pool $pool, named by $($who.how)"
     }
-    # The key matched; the entry must SHOW it agrees. Fail closed: an entry that names another account,
-    # or names none, is refused rather than read as this session's headroom.
-    if (($org -and (Get-Folded $entry.org 80) -ne $org) -or ($acct -and (Get-Folded $entry.account 80) -ne $acct)) {
+    # The key matched; the entry must SHOW it agrees, compared case-sensitively as watch.py's keys are.
+    # Fail closed: an entry that names another org or account, or names none where this session has
+    # one, is refused rather than read as this session's headroom.
+    if (($org -and (Get-Folded $entry.org 80) -cne $org) -or ($acct -and (Get-Folded $entry.account 80) -cne $acct)) {
         return Unknown "the entry under pool $pool does not name this session's account, so it was read and refused"
     }
 
-    # watch.py's _is_fresh, rule for rule, so this serves exactly what the Steward itself would serve.
+    # watch.py's _is_fresh: a missing or zero ttl means TTL_OK (`entry.get("ttl") or TTL_OK`), the age
+    # must be non-negative and under the TTL, and a stored projection must not have run out. Stricter
+    # in one direction only: a value Python would coerce from a string, or a NaN, is refused here.
     $ts = Get-Finite $entry.ts
     $ttl = Get-Finite $entry.ttl
     if ($null -eq $ts) { return Unknown "the entry for pool $pool carries no read time" }
-    if ($null -eq $ttl -or $ttl -le 0) {
-        return Unknown "the entry for pool $pool carries no TTL, so its freshness cannot be judged"
-    }
+    if ($null -eq $entry.ttl -or $ttl -eq 0) { $ttl = 300.0 }
+    if ($null -eq $ttl) { return Unknown "the entry for pool $pool carries a TTL that is not a number" }
     $ageSec = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 - $ts
     if ($ageSec -lt 0) { return Unknown "the entry for pool $pool is dated in the FUTURE -- a bad timestamp" }
-    $ageMin = "{0:0.0}" -f ($ageSec / 60)
-    $ttlMin = "{0:0.#}" -f ($ttl / 60)
+    $ageMin = Format-Number "0.0" ($ageSec / 60)
+    $ttlMin = Format-Number "0.#" ($ttl / 60)
     if ($ageSec -ge $ttl) {
         return Unknown ("the entry for pool $pool is $ageMin min old, past the Steward's own TTL of " +
             "$ttlMin min, so it is not projected from")
@@ -327,29 +341,33 @@ function Get-StewardFallback {
     $dataAge = $ageMin
     if ((Get-Folded $entry.source 20) -eq "desktop") {
         $sample = Get-Finite $entry.sample_age
-        $dataAge = if ($null -eq $sample -or $sample -lt 0) { "UNKNOWN" } else { "{0:0.0}" -f (($ageSec + $sample) / 60) }
+        $dataAge = if ($null -eq $sample -or $sample -lt 0) { "UNKNOWN" } else { Format-Number "0.0" (($ageSec + $sample) / 60) }
     }
 
-    $lines += "  fallback verdict: READ, not graded here -- pool $pool, named by $($who.how)"
+    $windows = @()
     foreach ($w in ([ordered]@{ "5-hour" = "5h"; "weekly" = "7d" }).GetEnumerator()) {
         $v = Get-Finite $entry.levels.($w.Key)
-        $label = "  steward {0,-3}" -f $w.Value
-        if ($null -eq $v) { $lines += "$label UNKNOWN -- the Steward's entry carries no $($w.Key) reading"; continue }
-        $lines += ("$label {0,5:0.0}% used   [data {1} min old; read {2} min ago by the Steward; its TTL is {3} min]" -f
-            $v, $dataAge, $ageMin, $ttlMin)
+        $label = "  steward " + $w.Value.PadRight(3)
+        if ($null -eq $v) { $windows += "$label UNKNOWN -- the Steward's entry carries no $($w.Key) reading"; continue }
+        $windows += ("$label " + (Format-Number "0.0" $v).PadLeft(5) + "% used   [data $dataAge min old; " +
+            "read $ageMin min ago by the Steward; its TTL is $ttlMin min]")
     }
-    return $lines
+    # watch.py _view refuses an entry with no percentages at all; a READ verdict over two UNKNOWN
+    # windows would be a verdict with no measurement under it.
+    if (-not ($windows -match "% used")) { return Unknown "the Steward's entry for pool $pool carries no percentages" }
+    return $lines + "  fallback verdict: READ, not graded here -- pool $pool, named by $($who.how)" + $windows
 }
 
 # WHICH POOL THE STEWARD WOULD NAME FOR THIS SESSION, in watch.py main()'s order. Returns @{org; acct;
 # how}, or @{why} when no pool can be named. The header says why each branch is what it is.
 function Resolve-StewardPool([string]$LoginPath, [string]$SessionsDir) {
-    if ((Get-Entrypoint) -eq "claude-desktop") {
+    $global = ", so only the desktop app's current account is left, which is a global signal and not this session's"
+    $desktop = Test-DesktopEntrypoint
+    if ($desktop) {
         $rec = Find-DesktopSessionRecord $SessionsDir
         if ($rec) { return $rec }
         if (-not $env:CLAUDE_CONFIG_DIR) {
-            return @{ why = ("the desktop app has no record of this session and no config root is pinned, " +
-                    "so only the app's current account is left, which is a global signal and not this session's") }
+            return @{ why = "the desktop app has no record of this session and no config root is pinned$global" }
         }
     }
     $login = Read-JsonDictionary $LoginPath
@@ -357,9 +375,14 @@ function Resolve-StewardPool([string]$LoginPath, [string]$SessionsDir) {
     $org = Get-Folded $login.oauthAccount.organizationUuid 80
     $acct = Get-Folded $login.oauthAccount.accountUuid 80
     if (-not $org -and -not $acct) { return @{ why = "the login record names no account, so no pool can be named" } }
+    # watch.py main() falls through to the app's current org whenever a Desktop session still has no
+    # org, so an account-only key is never the Steward's answer there.
+    if ($desktop -and -not $org) { return @{ why = "the login record names no organization$global" } }
     # watch.py's _cli_pool_selfcheck: a login record that disagrees with itself cannot name a pool.
+    # watch.py runs it on the pinned-Desktop branch only; this hook runs it on the SDK branch too,
+    # because a record that contradicts itself names no pool for any client.
     $billed = Get-Folded $login.cachedUsageUtilization.accountUuid 80
-    if ($acct -and $billed -and $acct -ne $billed) {
+    if ($acct -and $billed -and $acct -cne $billed) {
         return @{ why = ("the login record disagrees with itself (oauthAccount names account " +
                 (Get-Prefix $acct 8) + ", cachedUsageUtilization names " + (Get-Prefix $billed 8) +
                 "), so it cannot name this pool") }
@@ -455,10 +478,14 @@ $toolName = $null
 # The session id names the desktop app's record for this session; the Steward fallback reads it.
 $SessionId = $null
 if ($raw) {
+    # -AsHashtable: tool_input is the caller's JSON, and keys in it that differ only by case would make
+    # the plain parse throw and lose the session id with it.
     try {
-        $p = $raw | ConvertFrom-Json -ErrorAction Stop
-        if ($p.PSObject.Properties.Name -contains "tool_name") { $toolName = [string]$p.tool_name }
-        if ($p.PSObject.Properties.Name -contains "session_id") { $SessionId = [string]$p.session_id }
+        $p = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        if ($p -is [System.Collections.IDictionary]) {
+            if ($p.ContainsKey("tool_name")) { $toolName = [string]$p["tool_name"] }
+            if ($p.ContainsKey("session_id")) { $SessionId = [string]$p["session_id"] }
+        }
     }
     catch { }
 }

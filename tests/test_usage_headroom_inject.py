@@ -608,6 +608,7 @@ ORG = "11111111-aaaa-4bbb-8ccc-000000000001"
 ACCT = "22222222-aaaa-4bbb-8ccc-000000000002"
 OTHER = "33333333-aaaa-4bbb-8ccc-000000000003"
 DESKTOP = {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}
+SDK = {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}
 FALLBACK_LABEL = "This is NOT a statusLine reading"
 
 
@@ -763,7 +764,8 @@ _SELF_DISAGREEING = {
         pytest.param(ORG, {}, None, 2, "reads only version 3", id="schema-version"),
         pytest.param(ORG, {"kind": "unknown"}, None, 3, "not a reading", id="not-reading"),
         pytest.param(ORG, {"age_s": -600}, None, 3, "FUTURE", id="future-dated"),
-        pytest.param(ORG, {"ttl": 0}, None, 3, "carries no TTL", id="no-ttl"),
+        pytest.param(ORG, {"ttl": "soon"}, None, 3, "TTL that is not a number", id="bad-ttl"),
+        pytest.param(ORG, {"levels": {}}, None, 3, "carries no percentages", id="no-levels"),
     ],
 )
 def test_a_fallback_that_cannot_name_this_pool_is_refused(
@@ -811,6 +813,57 @@ def test_an_unpinned_desktop_session_with_no_record_is_refused(tmp_path: Path) -
     ctx = desktop_context(tmp_path, steward_files(tmp_path), env=DESKTOP)
     assert "fallback verdict: UNKNOWN" in ctx and "no config root is pinned" in ctx, ctx
     assert _PERCENTAGE.search(ctx) is None, ctx
+
+
+def test_a_desktop_login_record_with_no_org_is_refused(tmp_path: Path) -> None:
+    """watch.py falls through to the app's current org for a Desktop session with no org, so an
+    account-only key is never the Steward's answer there."""
+    login = {"oauthAccount": {"accountUuid": ACCT}}
+    pools = {f"acct:{ACCT}": steward_entry(org="")}
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, pools, login=login))
+    assert "names no organization" in ctx, ctx
+    assert _PERCENTAGE.search(ctx) is None, ctx
+
+    # Control: an SDK session runs watch.py's non-desktop branch, which does use the account key.
+    sdk = desktop_context(tmp_path, steward_files(tmp_path, pools, login=login), env=SDK)
+    assert "fallback verdict: READ" in sdk and "pool account 22222222" in sdk, sdk
+
+
+def test_a_missing_or_zero_ttl_means_the_stewards_default(tmp_path: Path) -> None:
+    """watch.py reads `entry.get("ttl") or TTL_OK`, so a missing or zero TTL is 300 seconds."""
+    entry = steward_entry(ttl=0)
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, {ORG: entry}))
+    assert "fallback verdict: READ" in ctx and "its TTL is 5 min" in ctx, ctx
+    del entry["ttl"]
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, {ORG: entry}))
+    assert "fallback verdict: READ" in ctx and "its TTL is 5 min" in ctx, ctx
+
+
+def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path) -> None:
+    """No -StateDir and no file parameters: the hook finds status.json, the login record and the
+    desktop record the way it does on a real box, through MEFOR_USAGE_DIR, CLAUDE_CONFIG_DIR and
+    APPDATA, all pointed at tmp_path so nothing real is read."""
+    usage = tmp_path / "usage"
+    usage.mkdir()
+    (usage / "usage-now.py").write_text("# stand-in: watch.py keeps DIR only beside it\n")
+    steward_files(usage, {OTHER: steward_entry(five=44.5, org=OTHER, account=APP_ACCT)})
+    (usage / "steward-status.json").rename(usage / "status.json")
+    root = tmp_path / "root"
+    root.mkdir()
+    (usage / "login.json").rename(root / ".claude.json")
+    appdata = tmp_path / "appdata"
+    desktop_record(appdata / "Claude", acct=APP_ACCT, org=OTHER)
+
+    env = {
+        **DESKTOP,
+        "MEFOR_USAGE_DIR": str(usage),
+        "CLAUDE_CONFIG_DIR": str(root),
+        "APPDATA": str(appdata),
+    }
+    payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
+    ctx = context_of(None, env_extra=env, payload=payload)
+    assert str(usage / "status.json") in ctx, ctx
+    assert "44.5%" in ctx and "named by the desktop app's record" in ctx, ctx
 
 
 def test_a_missing_window_is_unknown_and_never_a_zero(tmp_path: Path) -> None:
