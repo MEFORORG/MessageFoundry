@@ -1127,6 +1127,18 @@ def test_an_unapproved_ec_curve_is_refused(pki: dict[str, Any], tmp_path: Path) 
         DirectDestination(_dest(pki, signing_cert=str(cert_p), signing_key=str(key_p)))
 
 
+def test_the_partner_key_floor_matches_its_twin_in_xml_signature() -> None:
+    """``parsing/`` may not import ``transports/``, so the XML-DSig key floor copies this curve set
+    and RSA number rather than sharing them (BACKLOG #1166). This pins the copies, so the two cannot
+    drift apart. It lives here, not beside the XML tests, because those skip without the ``[xml]``
+    extra."""
+    from messagefoundry.parsing.xml import signature
+    from messagefoundry.transports import direct
+
+    assert signature._APPROVED_EC_CURVES == direct._APPROVED_EC_CURVES
+    assert signature._MIN_RSA_BITS == direct._MIN_RSA_BITS
+
+
 # --- recipient key type: RSA only, refused at construction (BACKLOG #1918) ---------------------------
 #
 # The pinned cryptography's PKCS7EnvelopeBuilder does RSA key transport and nothing else. An EC
