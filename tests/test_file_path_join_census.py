@@ -5,8 +5,9 @@ graded with a written reason and derived from the code, so a new site of those s
 build until graded.
 
 A file path should come from internally generated or trusted data, or a supplied name should pass a
-named guard before it is joined. This module lists every join it can see, with its command and its
-positive control, so that holds for each one and keeps holding (BACKLOG #1130).
+named guard before it is joined. This module grades each join it can see, with its command and its
+positive control, and fails when a join of those shapes appears, goes, or changes count in a graded
+function (BACKLOG #1130). It is a drift check, not a proof: see *Not derived* below.
 
 **The command.** :func:`derived_python_sites` walks the AST of every ``.py`` file under
 :data:`PY_ROOTS`. A site is any of these:
@@ -25,8 +26,8 @@ Sites are counted per enclosing function, keyed ``<file>::<qualname>``. :data:`S
 the derived map exactly, counts included, so a new join in a graded function fails too. Line numbers
 are not keys, so moving code does not churn the table. :func:`derived_ide_sites` counts
 ``path.join`` and ``path.resolve`` (``path.posix`` and ``path.win32`` too) and ``.joinPath`` per
-file under ``ide/src/`` (tests excluded, comments stripped), and :func:`derived_script_sites` counts ``Join-Path`` and ``[IO.Path]::Combine`` per
-operator-run script.
+file under ``ide/src/`` (tests excluded, comments stripped), and :func:`derived_script_sites`
+counts ``Join-Path`` and ``[IO.Path]::Combine`` per operator-run script.
 
 **The positive control.** :func:`test_the_walker_finds_every_shape_and_skips_arithmetic` plants each
 shape and some arithmetic in a source string. The planted-omission tests prove the comparison names
@@ -36,14 +37,15 @@ or narrowing the path words; :data:`SITES` itself is the current count.
 
 **What it walks.** The engine, the web console, the toolkit and the harness (:data:`PY_ROOTS`), the
 IDE extension, and the operator-run scripts (``scripts/service/`` less ``measure-store-access.ps1``,
-a CI measurement). ``tee/`` is not walked.
+a CI measurement). ``tee/``, the separately run relay, is left out by owner decision.
 
 **Grades.** Each site gets one:
 
-- ``internal``: every part is a code literal, an install or package location, a value the code
+- ``internal``: the name joined is a code literal, an install or package location, a value the code
   generates itself (a uuid, a token, a pid, a counter, a timestamp, a fixed enum), or a name read
-  back from listing a directory the code chose itself (an install, its own staging directory).
-- ``operator``: a part comes from the operator, through configuration, a CLI argument, an
+  back from listing a directory the code chose itself (an install, its own staging directory). The
+  directory it joins onto may be the code's own or one the operator configured.
+- ``operator``: the name joined comes from the operator, through configuration, a CLI argument, an
   environment variable, or a file in (or a listing of) the operator's own config directory or
   workspace. The operator can already name any path on the host, so the join grants nothing new.
 - ``guarded``: a part another party chooses (a partner server, a message, an archive, an export)
@@ -89,7 +91,7 @@ PY_ROOTS: tuple[str, ...] = (
     "harness",
 )
 
-#: The operator-run scripts (method section 2): ``scripts/service/`` less this one CI measurement.
+#: The operator-run scripts: ``scripts/service/`` less this one CI measurement.
 _SCRIPTS_DIR = _ROOT / "scripts" / "service"
 _SCRIPTS_EXCLUDED = frozenset({"measure-store-access.ps1"})
 
@@ -785,10 +787,9 @@ SITES: dict[str, Site] = {
         1,
         GUARDED,
         "An NLST entry loses only an exact `remote_dir/` prefix (as spelled, or with trailing "
-        "slashes collapsed) and is never folded, so `../x/a.hl7` reaches the guard as sent. It is "
-        "sized only when the guard "
-        "accepts it (BACKLOG #1130); a refused one still lists, unsized, for the poll loop to "
-        "refuse and log.",
+        "slashes collapsed) and is never folded, so `../x/a.hl7` reaches the guard as sent. "
+        "It is sized only when the guard accepts it (BACKLOG #1130); a refused one still lists, "
+        "unsized, for the poll loop to refuse and log.",
         "messagefoundry/transports/remotefile.py::_is_contained_name",
         called=True,
     ),
