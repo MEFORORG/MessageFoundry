@@ -1043,6 +1043,102 @@ def test_a_deeply_nested_commit_before_a_stage_is_judged_inside_the_time_limit()
     assert time.monotonic() - started < 15
 
 
+def test_the_commit_rule_itself_denies_past_deep_nesting_inside_the_time_limit() -> None:
+    """The same nesting, with the deny owed to the COMMIT rule and no other segment: the dot after
+    the brackets is the commit's pathspec. The control is the dot moved inside the brackets."""
+    nest = "(" * 40000 + ")" * 40000
+    started = time.monotonic()
+    assert_denied(run_guard(bash("git commit -m x " + nest + " .")))
+    assert time.monotonic() - started < 15
+    assert_allowed(run_guard(bash("git commit -m x " + "(" * 40000 + " ." + ")" * 40000)))
+
+
+def test_many_commit_words_before_a_stage_are_judged_inside_the_time_limit() -> None:
+    """The commit rule's pathspec pattern backtracked quadratically on repeated 'commit' words.
+    This exact payload took 32.8 s on the Lander's run, past the 15 s timeout, so the stage would
+    have run."""
+    command = "git x " + "commit " * 30000 + "&& git add -A"
+    started = time.monotonic()
+    assert_denied(run_guard(bash(command)))
+    assert time.monotonic() - started < 15
+
+
+# THE COMMIT RULE ACROSS BRACKETS. Each row is judged by the commit pathspec rule alone: no other
+# segment and no flag can deny it. Bracketed text is dropped to one space, a stray ')' is kept,
+# and everything from the first '(' that never closes is dropped.
+COMMIT_RULE_BRACKETS = [
+    # (command, the rule must deny)
+    ("git commit -m wip (a (b) c) .", True),  # nested, closed, dot after
+    ("git commit -m wip ((a)) :/", True),  # nested twice, ':/' after
+    ("git commit -m wip a) .", True),  # a stray ')' closes nothing and is kept
+    ("git commit -m wip (a) b) .", True),  # a closed span, then a stray ')'
+    ("git commit -m wip (a (b .) c)", False),  # the dot sits inside the nesting
+    ("git commit -m wip (a) (b .", False),  # an unclosed '(' after a closed span
+    ("git commit -m wip ((a) .", False),  # an unclosed '(' around a closed span
+    ("git commit -m wip a) b.py", False),  # a stray ')' and a scoped path
+]
+
+
+@pytest.mark.parametrize(("command", "denies"), COMMIT_RULE_BRACKETS)
+def test_the_commit_rule_reads_brackets_the_documented_way(command: str, denies: bool) -> None:
+    result = run_guard(bash(command))
+    if denies:
+        assert "whole-tree pathspec" in assert_denied(result)
+    else:
+        assert_allowed(result)
+
+
+# THE TWO REWRITTEN PIECES AGAINST WHAT THEY REPLACED. Each old form is kept here, inside the test,
+# as the reference: the regex loop that dropped the innermost '(...)' until none was left, and the
+# single pattern for a pathspec after 'commit'. The guard's own functions are lifted from the
+# script by name, so the test compares the code that runs. Strings are seeded, so a failure
+# replays. No string holds a line feed: a segment never does, because the splitter cuts at each.
+_EQUIVALENCE_DRIVER = r"""
+$src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
+foreach ($name in 'Remove-BracketedText', 'Test-CommitPathspec') {
+    $m = [regex]::Match($src, "(?s)function $name\b.*?\r?\n}\r?\n")
+    if (-not $m.Success) { throw "function $name not found" }
+    Invoke-Expression $m.Value
+}
+$dotFamily = [regex]::Match($src, "\`$dotFamily = '([^']*)'").Groups[1].Value
+$tokenEnd = [regex]::Match($src, "\`$tokenEnd = '([^']*)'").Groups[1].Value
+if (-not $dotFamily -or -not $tokenEnd) { throw 'pattern definitions not found' }
+function Old-Brackets([string]$t) {
+    do { $b = $t; $t = $t -creplace '\([^()]*\)', ' ' } while ($t -cne $b)
+    return ($t -creplace '\(.*$', '')
+}
+function Old-Commit([string]$t) { $t -cmatch "(^|\s)commit\s(?:.*\s)?(?:$dotFamily|:/)$tokenEnd" }
+$rng = [System.Random]::new(1339)
+$brackets = @('(', ')', 'a', ' ', '.', 'c')
+# Spaced words dominate, so strings often hold two 'commit' words with a pathspec between them.
+$words = @(' commit ', ' commit ', 'commit', ' . ', ' ./', ' :/ ', ' ', '.', '/', 'x', '<', '>',
+    '\', ' a.py', ' -m', "`t")
+$diff = 0
+for ($n = 0; $n -lt 20000; $n++) {
+    $t = -join (0..$rng.Next(0, 14) | ForEach-Object { $brackets[$rng.Next(0, $brackets.Count)] })
+    if ((Old-Brackets $t) -cne (Remove-BracketedText $t)) { $diff++ }
+    $c = -join (0..$rng.Next(0, 10) | ForEach-Object { $words[$rng.Next(0, $words.Count)] })
+    if ((Old-Commit $c) -ne (Test-CommitPathspec $c "$dotFamily|:/" $tokenEnd)) { $diff++ }
+}
+"$diff"
+"""
+
+
+def test_the_rewritten_commit_rule_answers_as_the_old_one_did() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = Path(tmp) / "equivalence.ps1"
+        driver.write_text(_EQUIVALENCE_DRIVER, encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env={**os.environ, "MEFOR_BLANKET_GUARD_UNDER_TEST": str(GUARD)},
+        )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0", f"{proc.stdout.strip()} differences; stderr: {proc.stderr}"
+
+
 @pytest.mark.parametrize("continuation", [_BS, _BT])
 def test_an_unknown_tool_gets_both_continuation_characters(continuation: str) -> None:
     """The tool name picks ONE character for a tool the guard knows. For any other name it must

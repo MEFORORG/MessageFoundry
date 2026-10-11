@@ -16,9 +16,10 @@ guard is asserted in `tests/test_claude_settings_contract.py`, so read it there.
 
 ## The owner answers
 
-The owner answered at least six times on these forms and on wiring, and also lifted a hold; see
-*What wiring waited on*, item 3. Each was a choice in a dialog in the Special seat's session.
-**All seven are reported by that seat. No other seat saw the dialogs.** The vault's rulings file of 2026-10-08
+The owner made at least seven choices on these forms and on wiring: six answers, and a hold lift
+(*What wiring waited on*, item 3). Each was a choice in a dialog in the Special seat's session.
+**These seven are reported by that seat. No other seat saw the dialogs.** The vault's rulings
+file of 2026-10-08
 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, entry #1339) records answer 1. The seat's
 comments on engine PR 2209 record answers 2 and 3, and its comment on engine PR 2217 records
 answer 4. The seat reported answers 5 and 6 in its follow-up brief for the wiring change. The
@@ -35,7 +36,7 @@ says that answer is withdrawn, because its question rested on a false premise.
 | 5 | 2026-10-10 | "Yes, wire now (Recommended)" | the 2026-08-25 splitter condition | *What wiring waited on*, item 1 |
 | 6 | 2026-10-10 | "Yes, it counts (Recommended)" | the Lander's written-acceptance condition | *What wiring waited on*, item 2 |
 
-Dates are US Central.
+Dates on this page are US Central. Where a time is given, UTC follows in brackets.
 
 The owner's act is the choice of an option, and the quoted label is the option the owner chose.
 The questions, the option labels and the option text are the Special seat's wording. The item
@@ -97,13 +98,12 @@ under the item. Everything outside the quotes is this page's wording.
    hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
    return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser."
    *Where it stands:* the Special seat reports that the owner then chose "Lift for #1339 only
-   (Recommended)", at 00:24:30Z on 2026-10-10 (UTC), which is the evening of 2026-10-09 in US
-   Central. No engine record holds that choice: the
-   seat reported it in its brief for the wiring change, and a maintainer-internal vault record
-   holds it too. The brief's account of that lift, in the seat's words, is that one wiring
-   Builder is dispatched once engine PR 2217 merges. PR 2217 merged at 02:27:30Z on 2026-10-10
-   (UTC), as `9afa08f5cf`. None of the three mistakes needed a parser, and section 4a records
-   their fix.
+   (Recommended)", on the evening of 2026-10-09 (00:24:30Z on 2026-10-10 UTC). No engine record
+   holds that choice: the seat reported it in its brief for the wiring change, and a
+   maintainer-internal vault record holds it too. The brief's account of that lift, in the seat's
+   words, is that one wiring Builder is dispatched once engine PR 2217 merges. PR 2217 merged
+   later that evening, as `9afa08f5cf` (02:27:30Z on 2026-10-10 UTC). None of the three mistakes
+   needed a parser, and section 4a records their fix.
 
 **What the wiring rests on.** Four owner choices, each reported by the Special seat:
 1. Answer 4, "Accept by mechanism (Recommended)". Its option text, written by the seat, says
@@ -124,7 +124,7 @@ Three passes, with the same tools and the same method.
   holds PR 2209. At least 190 commands, each run in a repository. Also 18 payloads sent straight
   to the hook, 14 of which it cannot read. Section 3 and every row marked "second pass" come from
   this pass. So do the rows added to sections 1 and 2, and the rows section 4a moved from 5.1.
-- **Third pass:** engine commit `9afa08f5cffefce5eb523dc8a4dac55878e00f9c` (2026-10-10), for the
+- **Third pass:** engine commit `9afa08f5cffefce5eb523dc8a4dac55878e00f9c` (2026-10-09), for the
   wiring change. Each row in section 4a, its
   scoped control and its neighbour were run again, before and after the fix. Section 4a marks
   the rows this pass found.
@@ -545,11 +545,20 @@ push the hook past its timeout before the old verdict is reached. Before that or
 payload of 30,000 brackets holding a real `git add -A` took 19.7 seconds, past the 15-second
 timeout, and would have run.
 
-The old readings had a slow path of their own, and wiring the guard under a timeout made it
-matter. The commit pathspec rule dropped bracketed text one nesting level per pass. Measured:
-`git commit -m x`, then 40,000 nested brackets, then `&& git add -A` took 21.3 seconds, so the
-stage would have run. The rule now pairs the brackets in one pass and gives the same result, which
-a comparison on 20,000 random strings confirmed. The same payload now takes about 1.4 seconds.
+The old readings had at least two slow paths of their own, both in the commit pathspec rule, and
+wiring the guard under a timeout made them matter. Each could keep the hook past 15 seconds, and
+the stage after it would then have run. Both are closed:
+
+| Payload | Before | After | The cause |
+|---|---|---|---|
+| `git commit -m x`, 40,000 nested brackets, `&& git add -A` | 21.3 s | about 1.8 s | Bracketed text was dropped one nesting level per pass. It is now one pass that pairs the brackets. |
+| `git x`, 30,000 copies of `commit `, `&& git add -A` | 32.8 s (the Lander's run; 26.6 s on mine) | about 2.5 s | The pathspec pattern after `commit` backtracked. It is now two linear searches. |
+
+Both rewrites give the same answers as the code they replaced, on a segment, which never holds a
+line feed. `tests/test_blanket_stage_guard.py` checks that on 20,000 seeded random strings for
+each, against the old code kept in the test, and pins both payloads under 15 seconds. A bracket-free
+command skips the bracket pass. A 600 KB commit message with no bracket took about 4.3 s before
+that change and about 2.8 s after.
 
 ## 5. Known residuals that no per-form answer names
 
@@ -580,7 +589,7 @@ and a hook that runs longer lets the command run. The added readings are the slo
 narrow heredoc reading walks the whole command a character at a time a second time. A 600 KB
 payload holding `<<` was measured at about 12.6 seconds, close to the limit. A longer one could
 pass it. The guard judges the old readings first, so a timeout there costs only the denies the
-added readings would make. The old readings can be slow too: section 4a records one slow path
+added readings would make. The old readings can be slow too: section 4a records two slow paths
 found and closed. This page does not claim no other exists. A command long enough to keep the old
 readings past 15 seconds would run, whatever they would have decided.
 

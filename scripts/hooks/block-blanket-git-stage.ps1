@@ -143,8 +143,13 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
 # closes. That is what the commit pathspec rule used to get by deleting the innermost '(...)' over
 # and over, but that took one pass over the text per nesting level. Measured: 40,000 nested
 # brackets before a real 'git add -A' took 21.3 s, past the hook's 15 s timeout, so the stage
-# would have run. This is one pass, pairing brackets with a stack, and it pairs them the same way.
+# would have run. This is one pass, pairing brackets with a stack. On a segment, which never holds
+# a line feed because the splitter cuts at every one, it gives the same result as the old loop;
+# tests/test_blanket_stage_guard.py compares the two on seeded random strings.
 function Remove-BracketedText([string]$Text) {
+    # Most commands hold no bracket, and the character loop below is slower than the old regex on
+    # long text without one.
+    if ($Text.IndexOf([char]'(') -lt 0) { return $Text }
     $closeAt = New-Object 'int[]' $Text.Length
     $open = New-Object 'System.Collections.Generic.Stack[int]'
     for ($i = 0; $i -lt $Text.Length; $i++) {
@@ -161,6 +166,19 @@ function Remove-BracketedText([string]$Text) {
         else { [void]$sb.Append($Text[$i]); $i++ }
     }
     return $sb.ToString()
+}
+
+# Does a whole-tree pathspec follow the word 'commit'? Two linear searches in place of one
+# pattern, '(^|\s)commit\s(?:.*\s)?(?:<pathspec>)<end>', that backtracked quadratically: measured,
+# 'git x ', 30,000 copies of 'commit ', then '&& git add -A' took 32.8 s, past the hook's 15 s
+# timeout, so the stage would have run. They answer the same. The FIRST 'commit' leaves the most
+# text after it, so if any 'commit' is followed by the pathspec, the first one is. The second
+# search starts AT the blank that ends 'commit ', the blank the old pattern allowed before the
+# pathspec. tests/test_blanket_stage_guard.py compares the two on seeded random strings.
+function Test-CommitPathspec([string]$Text, [string]$PathSpec, [string]$End) {
+    $word = [regex]::Match($Text, '(^|\s)commit\s')
+    if (-not $word.Success) { return $false }
+    return ($Text.Substring($word.Index + $word.Length - 1) -cmatch "\s(?:$PathSpec)$End")
 }
 
 # Replace every match of $Pattern, found in the scan view, at the same offsets in BOTH views, so
@@ -440,7 +458,7 @@ while ($true) {
     # stage, for the same reason the staging test above falls back to the bare word.
     if (-not $staging) {
         $commitArgs = Remove-BracketedText ($s -creplace '(^|\s)#.*$', '')
-        if ($commitArgs -cmatch "(^|\s)commit\s(?:.*\s)?(?:$dotFamily|:/)$tokenEnd") {
+        if (Test-CommitPathspec $commitArgs "$dotFamily|:/" $tokenEnd) {
             $reason = "git commit with a whole-tree pathspec (. ./ :/ :(top)) commits every tracked change under it, including files another session may be editing."
             break
         }
