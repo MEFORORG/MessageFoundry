@@ -101,23 +101,29 @@ dependencies = [
     # one to turn fastapi's built-in OpenTelemetry off (tests/test_api_fastapi_telemetry_off.py).
     "fastapi>=0.142.0",     # localhost engine API
     "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
-    # Ceiling: api/protocol_headers.py overrides uvicorn internals, and serve refuses to start if one
-    # moves. Raise it only after re-reading uvicorn's protocol modules (BACKLOG #1120). 0.54 is the
-    # newest release read and driven: tests/test_header_floor_wire.py holds the exact version. From
-    # 0.50, ``ws="auto"`` resolves to the sans-I/O WebSocket protocol, which the floor now covers.
+    # Pinned exactly: api/protocol_headers.py overrides uvicorn internals, and serve refuses to start
+    # if one moves. 0.54.0 is the release read and driven, and tests/test_header_floor_wire.py holds
+    # the same version. Move the pin only after re-reading uvicorn's protocol modules (BACKLOG #1120).
+    # From 0.50, ``ws="auto"`` resolves to the sans-I/O WebSocket protocol, which the floor covers.
     # Plain uvicorn, not uvicorn[standard]: that extra also pulls watchfiles (--reload), python-dotenv
     # (--env-file), PyYAML (a YAML log config) and colorama (Windows log colour). serve passes no
     # reload, no env_file and log_config=None, so none of the four is ever imported. The three the
     # engine does use are declared below with the extra's own markers.
-    "uvicorn>=0.29,<0.55",
-    # The HTTP protocol ``http="auto"`` picks when installed. protocol_headers.py floors both it and h11.
-    "httptools>=0.8.0",
+    "uvicorn==0.54.0",
+    # The API's HTTP parser (llhttp). serve pins it and refuses to start without it (BACKLOG #1125).
+    # Pinned exactly: llhttp, vendored in httptools, decides which ambiguous request framings are
+    # refused. 0.8.0 is the release measured, and tests/test_api_request_framing_wire.py holds the
+    # same version. Move the pin only after re-running that suite's framing shapes against a new
+    # release.
+    "httptools==0.8.0",
     # The library behind both WebSocket protocols protocol_headers.py floors: the sans-I/O one
     # ``ws="auto"`` resolves to from uvicorn 0.50, and the legacy server before it. /ws/stats runs on
     # it. Without a WebSocket library uvicorn serves no WebSocket route at all.
-    # Ceiling: the floor wraps ``ServerProtocol.send_response`` and the legacy ``write_http_response``,
-    # neither a public hook, so a new major is read before it is allowed (BACKLOG #1120).
-    "websockets>=16.0,<18",
+    # Pinned exactly: the floor wraps ``ServerProtocol.send_response`` and the legacy
+    # ``write_http_response``, neither a public hook. 17.2 is the release read and driven, and
+    # tests/test_header_floor_wire.py holds the same version. Read a new release before moving the
+    # pin (BACKLOG #1120).
+    "websockets==17.2",
     # The event loop uvicorn's ``loop="auto"`` picks; mllp.py's TLS stop path accounts for it. Same
     # marker as uvicorn[standard], because uvloop has no Windows, PyPy or Cygwin build.
     "uvloop>=0.22.1; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'",
@@ -203,6 +209,8 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # listener failed to start. For 3.1 and later, the cap moves that stop to install time, where it is a
 # reviewed step. A 3.0.x patch above 3.0.4 would still be allowed, unread. None exists today. Only the
 # startup guard stands in front of one, and it checks the routing alone.
+# The harness DIMSE driver (harness/drivers/dimse.py) also overrides a private hook, AE._create_socket, to
+# cap what it reads from the engine; its read-cap test in tests/test_harness_dimse.py fails if the hook moves.
 # TO RAISE IT: re-read _admitting_server_class against the new release's pynetdicom/transport.py. Measure
 # again whatever dicom.py and tests/test_dicom_scp_admission.py record as measured at 3.0.4. Then, in one PR:
 # - lift the cap here, its entry in .github/dependabot.yml and the versions in that test file;

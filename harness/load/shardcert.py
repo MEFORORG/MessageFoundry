@@ -61,7 +61,7 @@ from harness.load.coord import (
 from harness.load.corpus import SEQ_BASE_STRIDE, build_corpus
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import EMPTY_POOL_STATS, EnginePoller, PoolStats
-from harness.load.failover import EngineNode, _insecure_bind_args
+from harness.load.failover import EngineNode, _get_status_json, _insecure_bind_args
 from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -1148,8 +1148,9 @@ async def _await_health(url: str, *, timeout: float) -> bool:
     async with httpx.AsyncClient(timeout=2.0, verify=harness_ssl_context()) as client:
         while time.monotonic() < deadline:
             with contextlib.suppress(Exception):
-                r = await client.get(f"{url}/health")
-                if r.status_code == 200:
+                # Read under the failover rig's status-answer cap (ASVS 5.1.1, BACKLOG #1127).
+                status, _ = await _get_status_json(client, f"{url}/health", None)
+                if status == 200:
                     return True
             await asyncio.sleep(0.3)
     return False

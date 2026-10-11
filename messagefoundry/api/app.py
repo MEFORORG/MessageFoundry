@@ -225,6 +225,7 @@ from messagefoundry.api.security import (
     answers_before_body,
     authorize_ws,
     authorizes_in_body,
+    bearer_token,
     client_ip,
     deadline_utc,
     enforce_phi_read_hop,
@@ -234,6 +235,7 @@ from messagefoundry.api.security import (
     optional_identity,
     pending_credential_deadline,
     public_route,
+    recheck_standing,
     refuse_from_new_address,
     refuse_undeclared_route,
     require,
@@ -317,6 +319,7 @@ from messagefoundry.config.secretprovider import (
 )
 from messagefoundry.config.settings import (
     AiSettings,
+    AlertRule,
     AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
@@ -479,7 +482,7 @@ _UPLOAD_BODY_PATHS = frozenset({"/uploads", "/ui/uploaded-logs/upload"})
 _MAX_PRESET_LAYERS = 8
 _CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
-_WS_REVALIDATE_SECONDS = 3.0  # re-check the session on an open /ws/stats this often (API-WS)
+_WS_FRAME_SECONDS = 1.0  # one /ws/stats frame this often; the caller is re-resolved before each
 #: Path prefixes whose JSON responses are served ``Cache-Control: no-store`` (ASVS 14.2.2). These are
 #: the PHI-read route families — every route gated by ``require_phi_read`` and every step-up GET that
 #: charges the PHI-read hop/pacing budget lives under one of them, so a browser, a proxy or any other
@@ -829,9 +832,10 @@ async def _alert_control_action(
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
     Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
-    the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
-    is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
-    else happens. Any other error reaches the notifier, which logs it and never raises.
+    the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067), nor
+    an outbound whose build failed as it left that park (vault BACKLOG #3263); that is the rule
+    working as designed, not a failure, so it is logged once here at INFO and nothing else
+    happens. Any other error reaches the notifier, which logs it and never raises.
 
     ``default_target`` means the rule set no ``control_target``, so ``target`` is the event's own
     bare name, and the event does not say whether that name is an inbound or an outbound. The two
@@ -877,6 +881,16 @@ async def _alert_control_action(
             return
         await rr.restart_inbound(target)
     elif action == "restart_outbound":
+        if rr.outbound_dr_failed(target):
+            # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
+            # operator start builds it again; a rule firing on its own alert would only read the
+            # CA again, and could alert again and fire again.
+            _log.info(
+                "alert control_action restart_outbound for %r not run: it failed to start at the "
+                "DR activation; a reload or an operator start builds it again",
+                target,
+            )
+            return
         try:
             await rr.restart_outbound(target)
         except DrParkedError:
@@ -2050,6 +2064,17 @@ def _summary(row: Row) -> MessageSummary:
     )
 
 
+class ExportStopped(RuntimeError):
+    """A running bulk export lost its caller's standing, so the stream aborts (BACKLOG #1154).
+
+    The response has already started, so no status code can say so. Raising aborts the transfer,
+    and the client sees an incomplete download rather than a short file that looks complete. The
+    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
+    and uvicorn writes a traceback. Returning without the final body message would avoid
+    that, but the ``@app.middleware("http")`` layers above would then finish the response cleanly,
+    which is the short file this exists to prevent."""
+
+
 def _export_ndjson_line(row: Row) -> bytes:
     """One NDJSON line for the bulk body export (#124, ADR 0131): the message metadata + the **decrypted
     raw body** (the PHI egress). ``json.dumps`` escapes the CR-delimited HL7 / binary ``mfb64:`` markers
@@ -3074,9 +3099,10 @@ def create_app(
         length = request.headers.get("content-length")
         transfer_encoding = request.headers.get("transfer-encoding", "").lower()
         # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
-        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector. Our single h11
-        # parser doesn't desync on the default loopback bind, but reject it outright so a future front
-        # proxy can never disagree with us about where the message ends (ASVS 4.2.1).
+        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector (ASVS 4.2.1). Under
+        # serve the pinned llhttp parser refuses the pair with its own 400 before this runs (BACKLOG
+        # #1125, protocol_headers.pinned_http_protocol_base). This check covers any other server that
+        # hosts the app: h11, for one, frames the pair by Transfer-Encoding and passes it on.
         if length is not None and "chunked" in transfer_encoding:
             _log.warning(
                 "rejected request with both Content-Length and Transfer-Encoding on %s from %s",
@@ -3643,7 +3669,8 @@ def create_app(
                         backlog_seconds=None,
                         delivered_age_seconds=None,
                         # The failure reason (ADR 0031) or the DR-parked reason (#61) — whichever set
-                        # the status; ifail takes precedence (a failed connection is never also parked).
+                        # the status; ifail takes precedence. One connection can hold both: a passive DR
+                        # standby records a refused CA on a feed it parks (vault BACKLOG #3263).
                         error=ifail or ifiltered,
                         flagged=ic.flagged,  # #131: object-of-interest marker (display-only)
                         toml_managed=_is_toml_managed(ic.source_file),
@@ -3735,7 +3762,8 @@ def create_app(
             # a degraded or parked lane is never silently hidden from the dashboard. Both sources are the
             # OUTBOUND-scoped snapshots (see `Direction`): these are destination rows, so an inbound
             # namesake's failure or DR park must never reach them. The two reasons map to the distinct
-            # "failed" vs "filtered" status (a connection is never in both).
+            # "failed" vs "filtered" status. A lane can be in both on a passive DR standby (vault
+            # BACKLOG #3263), and failed wins, as the update order below gives it.
             standalone: dict[str, tuple[str, str | None]] = {
                 name: ("failed", reason) for name, reason in rr.degraded_outbound().items()
             }
@@ -4017,7 +4045,20 @@ def create_app(
         comment-preserving, validate-before-persist writer (``connections_edit``) and reflects it on the
         live registry **without a reload** (a cosmetic-field replace — no connector rebuild, no delivery
         change). A **code-first** connection has no TOML home and is refused **409** (the scope fork).
-        Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path."""
+        Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path.
+
+        A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
+        other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
+        engine looks the name up, so a 200 against a 409 cannot tell it which names are
+        TOML-managed. Unlike :func:`_guarded_direction` it needs no runner: with none, an in-scope
+        name reaches the engine, which answers for the connections file alone."""
+        rr = engine.registry_runner
+        if identity.allowed_channels is not None and (
+            req.direction != "inbound"
+            or not identity.can_access_channel(name)
+            or (rr is not None and name not in rr.registry.inbound)
+        ):
+            await _deny_connection(engine, identity, name, client_ip(request))
         try:
             fingerprint = await engine.set_connection_flag(
                 name, direction=req.direction, flagged=req.flagged
@@ -5616,9 +5657,13 @@ def create_app(
 
         Selection is either an explicit ``ids`` set (the UI's *save-selected*) or the **basic**
         ``/messages/search`` filters (the UI's *save-all* — reusing ``search_messages`` for the id set);
-        it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). Each
-        streamed body is re-checked against the caller's per-channel scope (load-bearing for the
-        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited (``auth.channel_denied``).
+        it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). The
+        caller is re-resolved before each row. Once its standing fails, or its channel scope no longer
+        covers the scope it started with, the stream records ``messages_export.stopped`` and aborts
+        (BACKLOG #1154). Each streamed body is re-checked against that row's per-channel scope, which
+        covers at least the starting one (load-bearing for the attacker-suppliable ``ids`` path); an
+        out-of-scope id is skipped +
+        audited (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
         a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
@@ -5683,13 +5728,78 @@ def create_app(
             client=client_ip(request),
         )
 
+        # Read once, here, because the gate already refused a repeated header: the stream re-resolves
+        # the caller from this token before every row (BACKLOG #1154).
+        auth = get_auth(request)
+        token = bearer_token(request) if auth is not None else None
+        touch_every = auth.session_idle_seconds / 4 if auth is not None else 0.0
+
+        def _still_covers(current: Identity) -> bool:
+            """Whether ``current``'s channel scope still covers the scope the export started with
+            (None = every channel). A widened scope covers it; only a narrowed one stops it."""
+            if current.allowed_channels is None:
+                return True
+            start = identity.allowed_channels
+            return start is not None and start <= current.allowed_channels
+
         async def _iter_ndjson() -> AsyncIterator[bytes]:
+            streamed = 0
+            # -inf, so the first row touches. It cannot rescue a selection that ran longer than the
+            # whole idle window: the re-check finds that session idle before it would touch it.
+            last_touch = float("-inf")
             for mid in selected:
+                # Re-resolve the caller before EVERY row (BACKLOG #1154, ASVS 8.3.2). The gate
+                # resolved it once, and an export can run to 100,000 bodies, so a session revoked or
+                # a permission withdrawn mid-export would otherwise not reach it. Not the step-up:
+                # that proved the person when the export started. A flowing download is the
+                # caller's own act, so it moves the idle clock at most every quarter of the idle
+                # window. One stall of the client or of the store can still idle the session: the
+                # touch runs only at a row's top, so a stall of about three quarters of the window
+                # is enough, and the next row's re-check then ends both.
+                touch = time.monotonic() - last_touch >= touch_every
+                if touch:
+                    last_touch = time.monotonic()
+                current = (
+                    identity
+                    if auth is None
+                    else await recheck_standing(
+                        auth,
+                        token,
+                        Permission.MESSAGES_EXPORT,
+                        Permission.MESSAGES_VIEW_RAW,
+                        activity=touch,
+                    )
+                )
+                # A narrowed channel scope stops the export too, rather than skipping and auditing
+                # every later out-of-scope row: one stop row, not a denial per row that would trip
+                # the access-denied burst signal against an operator who did nothing.
+                if current is None or not _still_covers(current):
+                    reason = "standing_changed" if current is None else "scope_changed"
+                    # Counts only, never an id or a body.
+                    _log.warning(
+                        "message export stopped after %d of %d rows: %s",
+                        streamed,
+                        len(selected),
+                        reason,
+                    )
+                    await engine.store.record_audit(
+                        "messages_export.stopped",
+                        actor=identity.username,
+                        channel_id=channel_id,
+                        detail=json.dumps(
+                            {"selected": len(selected), "streamed": streamed, "reason": reason}
+                        ),
+                        client=client_ip(request),
+                    )
+                    raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
                 # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
                 # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                row = await read_scoped_message(engine, identity, mid, request)
+                # Read with THIS row's identity: it covers the starting scope, and a channel granted
+                # mid-export is now the caller's to read.
+                row = await read_scoped_message(engine, current, mid, request)
                 if row is None:
                     continue
+                streamed += 1
                 yield _export_ndjson_line(row)
 
         return StreamingResponse(
@@ -7547,14 +7657,29 @@ def create_app(
     @app.get("/alerts/rules", response_model=AlertsConfig)
     async def alerts_rules(
         request: Request,
+        # Named `_user`, though read below: the console calls this handler by keyword across the
+        # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
         """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine/DB
         access. No secrets: the webhook URL, SMTP password and username are never returned —
-        transports are reported present-or-not. Gated by monitoring:read like /stats."""
+        transports are reported present-or-not. Gated by monitoring:read like /stats.
+
+        A channel-scoped caller sees only the rules that name no connection outside its scope
+        (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
+        is unset or in its scope. Scope membership is exact text, so any other glob, such as
+        ``IB_ACME_*``, is withheld."""
         alerts: AlertsSettings = (
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
+
+        def visible(rule: AlertRule) -> bool:
+            return (rule.connection == "*" or _user.can_access_channel(rule.connection)) and (
+                rule.control_target is None or _user.can_access_channel(rule.control_target)
+            )
+
+        rules = [r for r in alerts.rules if visible(r)]
+
         return AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
             webhook_timeout=alerts.webhook_timeout,
@@ -7588,7 +7713,7 @@ def create_app(
                     schedule_configured=r.schedule
                     is not None,  # #81 — schedule-gated (present-or-not)
                 )
-                for r in alerts.rules
+                for r in rules
             ],
         )
 
@@ -7659,8 +7784,10 @@ def create_app(
             total = len(in_deployed)
             running = sum(1 for name in in_deployed if rr.inbound_running(name))
             # ADR 0031 start failures ONLY. A DR-parked connection (ADR 0048 / #61) lives in the
-            # DISJOINT filtered set and is deliberately excluded: parking is a run-profile decision,
+            # separate filtered set and is deliberately excluded: parking is a run-profile decision,
             # not a fault, and folding it in here would paint every DR-profiled engine degraded.
+            # A parked feed whose CA a passive standby refused is in both, and counts as failed
+            # here (vault BACKLOG #3263).
             # INBOUND-scoped: an outbound namesake's build failure must not count its healthy
             # inbound twin as failed (see wiring_runner's `Direction`).
             failed_in = [name for name in in_deployed if rr.inbound_failed(name) is not None]
@@ -8473,15 +8600,15 @@ def create_app(
     @authorizes_in_body("the cookie gate, then the header gate, run before the socket is accepted")
     async def ws_stats(websocket: WebSocket) -> None:
         """Push queue-depth stats to the console roughly once a second until it disconnects — the
-        live monitor feed. The session is re-validated periodically so a revoked/expired/downgraded
-        token can't keep streaming forever, and concurrent sockets are capped (API-WS)."""
+        live monitor feed. The caller is re-resolved before every frame, so a revoked, expired or
+        downgraded session stops at the next frame, and concurrent sockets are capped (API-WS)."""
         # Browser (same-origin mf_session cookie) OR native (Authorization header) auth (ADR 0065). A
         # browser cannot set the WS Authorization header, so a same-origin browser handshake
         # authenticates via the cookie (the web console's authorize_ui_ws — CSWSH-guarded by a same-
         # origin Origin check + SameSite=Strict), installed as the app.state.ui_ws_authorize hook in
         # the serve_ui path (Option B Phase 0). Absent (JSON-only) → only the native header path runs.
         # A native client sends no Origin, so even with the hook present it falls through to the header
-        # path (authorize_ws) unchanged. `token` (cookie or header) backs the periodic revalidation.
+        # path (authorize_ws) unchanged. `token` (cookie or header) backs the per-frame re-check.
         identity: Identity | None = None
         token: str | None = None
         ui_ws_authorize = getattr(websocket.app.state, "ui_ws_authorize", None)
@@ -8526,42 +8653,33 @@ def create_app(
         # in the serve_ui path. Absent → counts-only push (see the send loop below).
         ui_connections_render = getattr(state, "ui_connections_render", None)
 
+        # A nested function rather than an inline call: scripts/security/route_gates.py reads a
+        # Permission in the handshake body as a gate argument, and lets a nested re-check repeat it.
         async def _reauthorize() -> Identity | None:
-            """Re-validate the open socket's session (revocation/expiry/disable/downgrade/password-
-            change) WITHOUT resetting the idle clock, and return the CURRENT identity (or None → close).
-
-            The enriched connections push is rendered with THIS identity, so a narrowed channel scope
-            takes effect within one revalidation window — not only when the socket eventually drops.
-            When no auth is enforced (embedding/dev), the handshake identity stands."""
+            """The caller as it stands now, or ``None`` to close. With no auth enforced
+            (embedding/dev), the handshake identity stands."""
             if auth is None:
                 return handshake_identity
-            # activity=False: this keepalive must not reset the session's idle clock.
-            current = await auth.identity_for_token(token, activity=False)
-            if (
-                current is None
-                or not current.has(Permission.MONITORING_READ)
-                or current.must_change_password
-            ):
-                return None
-            return current
+            return await recheck_standing(auth, token, Permission.MONITORING_READ)
 
         try:
             await websocket.accept()
-            # Re-check BEFORE the first push: a token revoked between the handshake authorize and
-            # accept() must not get even one frame (close the pre-first-send window — SEC-018).
-            current = await _reauthorize()
-            if current is None:
-                await websocket.close(code=1008)
-                return
-            last_revalidate = time.monotonic()
             while True:
+                # Re-resolved before EVERY frame, the first included: a token revoked between the
+                # handshake and accept() gets no frame at all (SEC-018), and no frame goes out on an
+                # identity older than this loop's turn (BACKLOG #1154, ASVS 8.3.2). A refusal closes
+                # the feed, and a narrowed channel scope shapes this frame.
+                current = await _reauthorize()
+                if current is None:
+                    await websocket.close(code=1008)
+                    return
                 # Enriched push for the browser dashboard (ADR 0065 M-ws follow-up): the queue-by-status
                 # counts PLUS the SERVER-RENDERED, already-escaped connections fragment, so the /ui table
                 # updates live over the socket (the client swaps it in and stops polling; the poll is the
                 # fallback if the socket drops). Rendering server-side reuses the same escaping as the
                 # poll path — no client-side table building, no XSS. connections_html is scoped to the
-                # CURRENT (revalidated) identity's per-channel RBAC — a narrowed scope is reflected within
-                # one revalidation window; a native client that only reads outbox_by_status ignores it.
+                # identity resolved for THIS frame; a native client that only reads outbox_by_status
+                # ignores it.
                 # The counts frame is built unconditionally; connections_html is attached only when the
                 # web console's render hook (app.state.ui_connections_render) is installed (serve_ui on,
                 # Option B Phase 0). Absent (JSON-only) → a counts-only push, native clients unaffected.
@@ -8579,16 +8697,7 @@ def create_app(
                     rows = await _dashboard_rows(engine_obj, current)
                     frame["connections_html"] = str(ui_connections_render(rows))
                 await websocket.send_json(frame)
-                await asyncio.sleep(1.0)
-                # Revalidate on an elapsed-time cadence (independent of the per-second send), so a
-                # revoked/downgraded token stops streaming (and a narrowed scope takes effect) within
-                # ~_WS_REVALIDATE_SECONDS.
-                if time.monotonic() - last_revalidate >= _WS_REVALIDATE_SECONDS:
-                    last_revalidate = time.monotonic()
-                    current = await _reauthorize()
-                    if current is None:
-                        await websocket.close(code=1008)
-                        return
+                await asyncio.sleep(_WS_FRAME_SECONDS)
         except WebSocketDisconnect:
             return
         finally:

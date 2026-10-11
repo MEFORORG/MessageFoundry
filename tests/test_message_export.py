@@ -11,14 +11,17 @@ and the 400 on an empty selection. The route loops get_message per id — NO sto
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api.app import ExportStopped
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS
@@ -71,8 +74,14 @@ async def _service(engine: Engine, *, bound: bool = False) -> AuthService:
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+def _client(
+    engine: Engine, service: AuthService, *, raise_app_exceptions: bool = True
+) -> httpx.AsyncClient:
+    # raise_app_exceptions=False hands back what streamed before the app raised, as a real client
+    # sees a broken download, rather than re-raising the app's exception into the test.
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), raise_app_exceptions=raise_app_exceptions
+    )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -394,3 +403,249 @@ async def test_export_takes_the_needle_in_a_post_body(engine: Engine) -> None:
     audits = [dict(a) for a in await engine.store.list_audit(limit=50)]
     detail = next(a["detail"] for a in audits if a["action"] == "messages_export")
     assert "JANE" not in detail  # the needle value is still never recorded
+
+
+# --- BACKLOG #1154 (ASVS 8.3.2): the caller is re-resolved before every streamed row ----------
+
+
+def _after_first_read(
+    monkeypatch: pytest.MonkeyPatch, engine: Engine, act: Callable[[], Awaitable[None]]
+) -> None:
+    """Run ``act`` once, right after the export stream has read its FIRST row.
+
+    ``httpx.ASGITransport`` runs the whole response before it returns, so a change "mid-export"
+    has to be made from inside the stream. Wrapping the store read does that at a fixed point:
+    row one has been read under the old standing, and row two has not been asked for yet."""
+    real = engine.store.get_message
+    fired = False
+
+    async def wrapped(message_id: str) -> Any:
+        nonlocal fired
+        row = await real(message_id)
+        if not fired:
+            fired = True
+            await act()
+        return row
+
+    monkeypatch.setattr(engine.store, "get_message", wrapped)
+
+
+async def _stop_rows(engine: Engine) -> list[dict[str, object]]:
+    return [
+        json.loads(dict(a)["detail"])
+        for a in await engine.store.list_audit(limit=50)
+        if dict(a)["action"] == "messages_export.stopped"
+    ]
+
+
+async def test_a_session_revoked_mid_export_stops_the_stream(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revocation that lands after row one stops the export before row two, and records why.
+    Before BACKLOG #1154 the stream tested every row against the identity the gate resolved, so it
+    ran to the end of the selection."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def revoke() -> None:
+        await service.revoke_sessions_for_user(uid, actor="admin")
+
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, revoke)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200  # the response had started; the abort is in the body
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "standing_changed"}
+    ]
+
+
+async def test_the_stop_reaches_the_server_as_an_abort(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop must leave the whole app as a raise. If a middleware swallowed it, the server would
+    finish the response cleanly and the client would get a short file that looks complete."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def revoke() -> None:
+        await service.revoke_sessions_for_user(uid, actor="admin")
+
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, revoke)
+        with pytest.raises(ExportStopped):
+            await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+
+
+async def test_an_export_with_nothing_withdrawn_streams_every_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: the same mid-stream hook with a harmless act streams both rows and records no
+    stop, so a re-check that refused every caller cannot pass the tests above."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def nothing() -> None:
+        return None
+
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, nothing)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200, r.text
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a, mid_b]
+    assert await _stop_rows(engine) == []
+
+
+async def test_a_scope_narrowed_mid_export_stops_the_stream_once(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scope is narrowed in the store directly, so no session is revoked and only the per-row
+    re-resolution can carry the change. The export stops with one ``scope_changed`` row rather than
+    skipping and auditing every later out-of-scope row, which would flood the audit chain and trip
+    the access-denied burst signal against the operator."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+
+    async def narrow() -> None:
+        await service.store.set_user_channel_scope(uid, '["IB_A"]', source="manual")
+
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, narrow)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    assert await _stop_rows(engine) == [{"selected": 2, "streamed": 1, "reason": "scope_changed"}]
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
+    assert "auth.channel_denied" not in actions
+
+
+async def test_a_scope_widened_mid_export_does_not_stop_it(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other polarity: a grant that widens the scope still covers every row the export started
+    with, so it streams to the end and records no stop. Only a narrowed scope stops it. A row in
+    the newly granted channel streams too, with no ``auth.channel_denied`` row: the caller holds
+    that channel now."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value], scope=["IB_A"])
+    mid_a, mid_b = await _seed(engine)
+
+    async def widen() -> None:
+        await service.store.set_user_channel_scope(uid, '["IB_A", "IB_B"]', source="manual")
+
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, widen)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200, r.text
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a, mid_b]
+    assert await _stop_rows(engine) == []
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
+    assert "auth.channel_denied" not in actions
+
+
+def _count_stream_touches(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> list[int]:
+    """Count ``touch_session`` calls made after the export's own audit row, i.e. by the stream and
+    not by sign-in or the gate. Returns a one-item list the caller reads after the request."""
+    counted = [0]
+    streaming = False
+    real_audit = engine.store.record_audit
+    real_touch = engine.store.touch_session
+
+    async def audit(action: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal streaming
+        if action == "messages_export":
+            streaming = True
+        return await real_audit(action, *args, **kwargs)
+
+    async def touch(*args: Any, **kwargs: Any) -> Any:
+        if streaming:
+            counted[0] += 1
+        return await real_touch(*args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", audit)
+    monkeypatch.setattr(engine.store, "touch_session", touch)
+    return counted
+
+
+async def _seed_many(engine: Engine, count: int) -> list[str]:
+    return [
+        await engine.store.enqueue_message(
+            channel_id="IB_A", raw=ADT_A, deliveries=[], message_type="ADT^A01", control_id=f"M{n}"
+        )
+        for n in range(count)
+    ]
+
+
+async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_session_out(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-row re-check must not turn a long download into an idle session. The idle window is
+    shrunk to 2.0 s and each row takes 0.5 s, so six rows outlast it. The export moves the idle
+    clock every quarter window, so every row streams and the session stays live afterwards."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 2.0))
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    ids = await _seed_many(engine, 6)
+    real = engine.store.get_message
+
+    async def slow(message_id: str) -> Any:
+        await asyncio.sleep(0.5)
+        return await real(message_id)
+
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        monkeypatch.setattr(engine.store, "get_message", slow)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
+    assert r.status_code == 200, r.text
+    assert [row["id"] for row in _ndjson(r.text)] == ids
+    assert await _stop_rows(engine) == []
+    assert await service.identity_for_token(token, activity=False) is not None
+
+
+async def test_fast_rows_share_one_idle_touch(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The touch is spaced by time, not paid per row: with a generous window, ten fast rows cost
+    the first row's touch and nothing more. A regression to a write per row reds this."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 3600.0))
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    ids = await _seed_many(engine, 10)
+    async with _client(engine, service) as c:
+        token = await _login(c, "op")
+        touches = _count_stream_touches(monkeypatch, engine)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
+    assert len(_ndjson(r.text)) == 10
+    assert touches[0] == 1, touches
+
+
+async def test_a_stall_past_the_idle_window_ends_the_export(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stall longer than the idle window, of the client or (as here) of a store read, leaves the
+    session idle like any other, so the next row's re-check ends the export as a standing change.
+    Pinned so the behaviour is a decision."""
+    monkeypatch.setattr(AuthService, "session_idle_seconds", property(lambda _self: 2.0))
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    ids = await _seed_many(engine, 2)
+
+    async def stall() -> None:
+        await asyncio.sleep(3.0)
+
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, stall)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
+    assert [row["id"] for row in _ndjson(r.text)] == ids[:1]
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "standing_changed"}
+    ]

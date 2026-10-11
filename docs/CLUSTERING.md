@@ -75,7 +75,7 @@ promotable = true
 ```
 
 > **Warm DR:** run a remote DR-site engine as a **non-promotable cluster member**
-> (`promotable = false`) — NOT as a `[dr].activate` box. Combining `[dr].activate` with `[cluster]` is
+> (`promotable = false`) — NOT as a `[dr]` box. Combining `[dr].enabled` with `[cluster]` is
 > refused at config load (the DR run-profile gates which connections start, not lease acquisition, so a
 > lease-contending DR box could win leadership and drive the primary store cross-WAN).
 

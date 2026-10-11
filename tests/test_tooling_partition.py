@@ -141,6 +141,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # test_the_tracked_tree_is_clean and test_list_reports_scope_and_exits_clean read the real
         # `git ls-files` scope -- which is the half that makes it engine-subject.
         "test_escape_sequence_check.py",
+        # AST-walks messagefoundry/**, messagefoundry_webconsole/**, messagefoundry_toolkit/** and
+        # harness/** for every path join and holds each site to its census (BACKLOG #1130). A new
+        # join arrives as an ENGINE diff, which does not trip the tooling path gate, so as tooling
+        # it would face nothing there.
+        "test_file_path_join_census.py",
         # AST-scans messagefoundry/**/*.py for every `raise ... from None` and holds each site to a
         # reviewed list (BACKLOG #1796). A new site arrives as an ENGINE diff,
         # which does not trip the tooling path gate, so as tooling it would face nothing there.

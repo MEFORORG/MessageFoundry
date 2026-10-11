@@ -335,6 +335,92 @@ in-flight rows stranded.
 > amendment says. A message it accepts is routed and transformed, and then held with the rest. An
 > operator start, stop or restart of an OUTBOUND on a passive box answers `409`.
 
+> **Amendment (vault BACKLOG #3263): what a passive box checks, and when a fault fails one lane.**
+> The two amendments above left a passive box blind to its own activation set, and left three
+> paths on which the engine and the DR coordinator disagreed. `tests/test_dr_passive_followups.py`
+> pins each rule below.
+>
+> **At start, a passive box reads the `tls_ca_file` of each outbound and each FTPS poller an
+> activation would start.** It does not read a listener's client-verification CA. A refused one
+> is recorded as that lane's failure. So is a lane whose settings do not resolve. Both need the
+> lane CA check the API's engine wires; an engine built without one checks nothing here. The lane stays
+> parked and reads `status: "failed"`, with a `connection_stopped` alert, so a broken critical
+> feed shows at boot. The check reads files and writes audit rows. It builds no connector, binds
+> nothing and dials no partner. An engine shard reports only the outbounds it owns. A reload
+> while passive reads the same files, as the #3262 amendment says, and one that commits clears
+> the record.
+>
+> **A passive box cannot find every fault. At least these two it leaves, by design.**
+>
+> - *A port in use.* Only a bind finds it, and a passive box must answer on nothing.
+> - *An outbound's `validate_startup`.* It is not free of side effects. For a File outbound it
+>   writes and removes a probe file in the delivery directory, under the alternate credential
+>   when one is set. For a RemoteFile outbound it lists the directory over a session to the
+>   partner. At least those two have side effects. The activation runs it.
+>
+> **At an activation, at least two outbound faults fail one lane, and the activation goes on.** A lane
+> the reload builds for the first time since the passive park takes the checks a start gives it,
+> isolated as [ADR 0031](0031-startup-connection-fault-isolation.md) isolates them: the lane CA
+> check (a pin, ACL or path refusal) and `validate_startup`. The build runs there too, but a
+> connector that does not build is first found by the reload's build check, which refuses the
+> whole activation, as the paragraph after next says. The reload's CA
+> pre-check used to read these lanes, and one refusal refused the whole takeover. The lane is
+> built before it is unparked, so no held row is claimed while it has no connector. Every engine
+> shard builds the lane this way, as every engine shard builds every lane at a start (ADR 0073).
+>
+> **A lane that fails there stays parked and reads `failed`.** Its held rows stay queued: none is
+> charged an attempt or dead-lettered for a fault found at the takeover. Fix the fault, then
+> reload or start the connection. Each builds the lane again and resumes it only once the build
+> succeeds. A build that fails again leaves the lane parked, with its rows still held. The
+> scheduler and an alert rule's restart leave the lane alone, so neither reads its CA again on
+> every tick or every alert. It still pages: its buildup and stall checks, and its saturation
+> check where that is turned on, run on the in-flight
+> watch's clock, as ADR 0031's paging does for any failed lane. An operator stop makes the pause
+> the operator's, and then it is silent, as any paused lane is.
+>
+> **Other faults still refuse the whole activation.** The reload runs its build check over every
+> connector first. At least these refuse there: an outbound CA file that is missing or does not
+> parse, a connector that does not build, and an `env()` value that does not resolve. The
+> start-time check above reports a
+> missing file and an unresolved value at boot. It builds nothing, so a file that is readable
+> and does not parse first shows at a reload or at the activation. An inbound is unchanged
+> too: a listener that cannot bind, or a poller whose CA is refused, aborts the activation, as
+> acquire-VIP-or-abort requires. An activation that fails some outbounds still answers success,
+> and its `dr.activate` row does not name them; the per-connection status and alerts do. The
+> first builds run one after another, so a `validate_startup` probe that hangs delays the lanes
+> behind it and the activation's answer.
+>
+> **A failed activation unbinds the listeners the attempt bound.** The box is passive again, so
+> the engine unbinds them and closes the outbound sessions the attempt opened. At least two
+> paths needed it: a reload that committed and was then cancelled, and an operator reload
+> already running when the threshold flipped. It is not a guarantee that nothing is bound. A
+> listener an operator had started before the attempt is left as it is. The engine reads which
+> those are when the attempt begins, so a listener an operator starts during the attempt is
+> unbound with the rest. An error in the unbind is logged,
+> and a second cancellation stops it; a reload then unbinds.
+>
+> **A release is complete once its `dr.release` row is written.** The engine turns the profile
+> off and returns with no await in between, and the coordinator records the hand-back. Closing
+> the parked outbounds' connectors comes after the attempt to write the row, as cleanup, and runs
+> whether or not the write lands, so a released box holds no partner session even when the audit
+> store refuses the row. The release then still answers with the refusal, and the row stays
+> owed. A cancellation or an error in the close there no longer leaves the engine passive beside a coordinator that reports the box active.
+> A retried release runs the cleanup again, and so does the next reload.
+>
+> **An activation under a log halt still judges each lane's DR marker.** The halt keeps the lane
+> down, and the marker now says what the profile says. So the halt's recovery, starting the
+> connection, works on the active box. It used to answer `409` and ask for an activation. A lane
+> the halt kept from its first build is marked as not yet built. Once the log is repaired, the
+> reload or the start that builds it takes the first build described above, isolated to that
+> lane, and a build that fails holds its rows as it does at the activation.
+>
+> **`[dr].enabled` with `[cluster].enabled` is refused at load**, as `[dr].activate` already was.
+> A cluster member that is a passive DR box could win the lease and serve nothing.
+>
+> **Left as it is, deliberately.** The ACTIVE profile's parks of feeds below the threshold are
+> enforced through their markers and not at the door. After an operator start the calendar owns
+> such an inbound again, as Decision 3 says, and a door refusal would take that from it.
+
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
 **Locked (owner posture, 2026-06-28): the DR store is COLD-seeded from #60's encrypted backups on activation —

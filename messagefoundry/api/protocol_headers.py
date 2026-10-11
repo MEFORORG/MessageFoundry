@@ -109,12 +109,13 @@ response would change its status, which the floor must never do. The overrides t
 ``tests/test_header_floor_wire.py`` injects failures into those steps.
 
 **This leans on uvicorn and websockets INTERNALS.** None of the hooks above is public API.
-``pyproject.toml`` bounds uvicorn below the next minor and websockets below the next major.
+``pyproject.toml`` pins uvicorn and websockets to exact versions.
 ``tests/test_header_floor_wire.py`` fails unless the installed versions are the ones it measured,
 ``_MEASURED_UVICORN`` and ``_MEASURED_WEBSOCKETS``, and drives every family on the wire against a
-control. The two startup checks are what hold between those. An upgrade that removes a hook, or
-leaves one in place that no longer adds the headers to the families the self-test drives, stops the
-engine instead of shipping those responses without them.
+control; a test holds those two equal to the pins. An install that does not honour the pins gets
+only the two startup checks. An upgrade that removes a hook, or leaves one in place that no longer
+adds the headers to the families the self-test drives, stops the engine instead of shipping those
+responses without them. A response family a newer server adds is not caught.
 """
 
 from __future__ import annotations
@@ -143,6 +144,8 @@ __all__ = [
     "floor_unavailable",
     "floored_http_protocol_class",
     "floored_ws_protocol_class",
+    "http_parser_in_force",
+    "pinned_http_protocol_base",
 ]
 
 _log = logging.getLogger(__name__)
@@ -192,7 +195,9 @@ class ProtocolFloorUnavailable(RuntimeError):
 
     ``serve`` refuses to start on this. The message names the hook and the installed versions, and
     :attr:`hook` holds the hook alone. A refusal from the startup self-test names no single hook, so
-    there it holds ``"startup self-test"`` and the message says what the test found."""
+    there it holds ``"startup self-test"`` and the message says what the test found. A missing
+    pinned HTTP parser (:func:`pinned_http_protocol_base`) raises it too, so ``serve`` refuses on
+    the same path; there :attr:`hook` holds ``"httptools"``, which names a module, not a hook."""
 
     hook: str = ""
 
@@ -204,8 +209,9 @@ def _refusal(base: type[Any], hook: str) -> ProtocolFloorUnavailable:
 
 
 def floor_unavailable(problem: str, hook: str) -> ProtocolFloorUnavailable:
-    """The one refusal both startup checks raise: the class build here, and the self-test in
-    :mod:`messagefoundry.api.protocol_floor_selftest`. ``problem`` completes "the protocol header
+    """The refusal both floor checks raise: the class build here, and the self-test in
+    :mod:`messagefoundry.api.protocol_floor_selftest`. A missing pinned parser raises the same type
+    from :func:`pinned_http_protocol_base`, with its own message. ``problem`` completes "the protocol header
     floor ...", and ``hook`` is what :attr:`ProtocolFloorUnavailable.hook` holds."""
     # Built here rather than in an __init__ override, so the exception keeps RuntimeError's own
     # (message,) args and pickles and copies like any other.
@@ -539,18 +545,55 @@ def _answer_a_parser_rejection(protocol: Any) -> None:
         _degraded("ws-sansio", "parser rejection answer", exc)
 
 
+def pinned_http_protocol_base() -> type[asyncio.Protocol]:
+    """The HTTP protocol ``serve`` pins: uvicorn's httptools one, which parses with llhttp.
+
+    BACKLOG #1125 (ASVS 4.2.1). ``http="auto"`` picks httptools when it imports and h11 when it does
+    not, on a bare ``ImportError`` nobody logs, and the two frame some ambiguous requests differently
+    (``_H11_ACCEPTS`` in ``tests/test_api_request_framing_wire.py``). So the parser is named here,
+    and a missing httptools refuses ``serve`` rather than quietly swapping the parser under it.
+
+    Raises :class:`ProtocolFloorUnavailable`, which ``serve`` refuses to start on, when httptools
+    does not import."""
+    try:
+        from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+    except ImportError as exc:
+        refused = ProtocolFloorUnavailable(
+            "the API's pinned HTTP parser (BACKLOG #1125) is unavailable: uvicorn's httptools "
+            f"protocol did not import ({type(exc).__name__}, module {exc.name!r}). Install the "
+            "httptools and uvicorn the lock pins; serve does not fall back to h11, which frames "
+            "some ambiguous requests differently"
+        )
+        refused.hook = "httptools"
+        raise refused from exc
+    return HttpToolsProtocol
+
+
+def http_parser_in_force(protocol_class: type[Any]) -> str:
+    """Name the parser ``protocol_class`` reads requests with, from its class chain.
+
+    The read-out ``serve`` logs at startup (BACKLOG #1125). It reads the class actually handed to
+    uvicorn, the floored one with any client-certificate shim on top, so it reports what is served
+    rather than what was asked for."""
+    for klass in protocol_class.__mro__:
+        if klass.__module__ == "uvicorn.protocols.http.httptools_impl":
+            return f"httptools {_installed('httptools')} (llhttp)"
+        if klass.__module__ == "uvicorn.protocols.http.h11_impl":
+            return f"h11 {_installed('h11')}"
+    return f"unrecognised ({protocol_class.__module__}.{protocol_class.__qualname__})"
+
+
 def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
     """uvicorn's HTTP protocol with the headers on its ``400`` and on each cycle's ``500``.
 
-    ``base`` defaults to uvicorn's resolved ``AutoHTTPProtocol`` (httptools when installed, else h11).
+    ``base`` defaults to :func:`pinned_http_protocol_base`, never to uvicorn's ``AutoHTTPProtocol``.
     Compose, never replace: ``client_cert_http_protocol_class(base=<this>)`` stacks the mTLS shim on
     top, since the two override different methods.
 
-    Raises :class:`ProtocolFloorUnavailable` when ``base`` lacks a hook; there is no fallback."""
+    Raises :class:`ProtocolFloorUnavailable` when ``base`` lacks a hook, or when the pinned base
+    does not import; there is no fallback."""
     if base is None:
-        from uvicorn.protocols.http.auto import AutoHTTPProtocol
-
-        base = AutoHTTPProtocol
+        base = pinned_http_protocol_base()
 
     _require_http_hooks(base)
     return _build_floored_http(base)

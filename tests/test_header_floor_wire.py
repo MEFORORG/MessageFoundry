@@ -30,15 +30,19 @@ import asyncio
 import logging
 import socket
 import sys
+import tomllib
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import httptools
 import pytest
 import uvicorn
 import websockets as websockets_package
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
@@ -58,6 +62,7 @@ from messagefoundry.api.protocol_headers import (
     ProtocolFloorUnavailable,
     floored_http_protocol_class,
     floored_ws_protocol_class,
+    http_parser_in_force,
 )
 from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 from messagefoundry.config.settings import EgressSettings
@@ -68,6 +73,8 @@ _MEASURED_UVICORN = "0.54.0"
 #: The websockets library writes both WebSocket protocols' own handshake rejections, so it is
 #: pinned too.
 _MEASURED_WEBSOCKETS = "17.2"
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 _HANDSHAKE = (
     "GET {path} HTTP/1.1\r\n"
@@ -192,6 +199,20 @@ def test_the_suite_is_measuring_the_uvicorn_it_was_written_against() -> None:
         "responses uvicorn writes itself may have changed: re-read its protocol modules for every "
         "response it emits below the ASGI app, extend the families here, then move the pin."
     )
+
+
+def test_pyproject_pins_the_versions_this_suite_measured() -> None:
+    """The base dependencies pin uvicorn and websockets exactly, to the versions measured here, on
+    every platform. The installed-version test above cannot see a range that still resolves to the
+    measured version in the lock, though a fresh install could take a release nobody read."""
+    pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = list(map(Requirement, pyproject["project"]["dependencies"]))
+    for name, measured in (("uvicorn", _MEASURED_UVICORN), ("websockets", _MEASURED_WEBSOCKETS)):
+        same = [r for r in deps if canonicalize_name(r.name) == name]
+        assert len(same) == 1, f"{name} has {len(same)} entries in [project].dependencies, not one"
+        (req,) = same
+        assert req.marker is None, f"{name} is pinned on some platforms only: {req}"
+        assert str(req.specifier) == f"=={measured}", f"{name} is not pinned to {measured}: {req}"
 
 
 async def test_a_refused_handshake_on_the_wire_carries_the_floor(engine: Engine) -> None:
@@ -1082,8 +1103,8 @@ def test_an_assignment_moved_into_a_nested_function_still_counts() -> None:
 
 
 def test_the_installed_uvicorn_passes_the_check() -> None:
-    """The control that matters for serve: the protocols the lock installs, and the ones
-    ``http="auto"`` and ``ws="auto"`` resolve to, all build."""
+    """The control that matters for serve: the protocols the lock installs, the pinned HTTP one
+    (``base=None``, BACKLOG #1125) and what ``ws="auto"`` resolves to, all build."""
     for base in (HttpToolsProtocol, H11Protocol, None):
         assert floored_http_protocol_class(base=base) is not None
     for ws_base in (WebSocketsSansIOProtocol, WebSocketProtocol, None):
@@ -1122,7 +1143,7 @@ def _serve_captured(
     (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
-    samples = Path(__file__).resolve().parents[1] / "samples" / "config"
+    samples = _ROOT / "samples" / "config"
     before = set(tmp_path.rglob("*"))
     rc = main([command, "--config", str(samples), "--env", "dev"])
     return rc, captured, set(tmp_path.rglob("*")) - before
@@ -1140,11 +1161,70 @@ def test_serve_hands_uvicorn_the_floored_protocols(
     assert created, "serve created nothing, so the refusal's empty set would prove nothing"
 
 
+def test_serve_pins_httptools_where_auto_would_pick_h11(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1125: ``serve`` names its parser, so an install where ``http="auto"`` resolves to
+    h11 still serves llhttp, and the startup read-out names the parser actually served."""
+    monkeypatch.setattr("uvicorn.protocols.http.auto.AutoHTTPProtocol", H11Protocol)
+
+    # On the named logger itself: serve's configure_logging replaces the root handlers caplog uses.
+    # Serve's handlers redact the same record object after this one stores it, so reading it at the
+    # end checks the line an operator reads (an all-caps word pair once came out "[redacted]").
+    class _Keep(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(logging.INFO)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    handler = _Keep()
+    main_logger = logging.getLogger("messagefoundry.__main__")
+    main_logger.addHandler(handler)
+    try:
+        rc, captured, _ = _serve_captured(tmp_path, monkeypatch)
+    finally:
+        main_logger.removeHandler(handler)
+    assert rc == 0
+    assert issubclass(captured["http"], HttpToolsProtocol)
+    assert not issubclass(captured["http"], H11Protocol)
+    readouts = [
+        r.getMessage()
+        for r in handler.records
+        if r.getMessage().startswith("HTTP request parser in force on the API:")
+    ]
+    assert readouts == [
+        f"HTTP request parser in force on the API: httptools {httptools.__version__} (llhttp)"
+    ], readouts
+
+
+def test_serve_refuses_to_start_without_the_pinned_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No quiet fall back to h11: a missing httptools stops serve before any side effect."""
+    monkeypatch.setitem(sys.modules, "uvicorn.protocols.http.httptools_impl", None)
+    rc, captured, created = _serve_captured(tmp_path, monkeypatch)
+    assert rc == 2
+    assert captured == {}, "uvicorn.run was reached"
+    assert created == set(), f"serve refused only after a side effect: {created}"
+    err = capsys.readouterr().err
+    assert "pinned HTTP parser (BACKLOG #1125)" in err and "refusing to start." in err, err
+
+
+def test_the_parser_readout_names_the_class_chain() -> None:
+    assert http_parser_in_force(floored_http_protocol_class()).startswith("httptools ")
+    shimmed = client_cert_http_protocol_class(base=floored_http_protocol_class())
+    assert http_parser_in_force(shimmed).startswith("httptools ")
+    assert http_parser_in_force(floored_http_protocol_class(base=H11Protocol)).startswith("h11 ")
+    assert http_parser_in_force(asyncio.Protocol) == "unrecognised (asyncio.protocols.Protocol)"
+
+
 def test_serve_refuses_to_start_when_uvicorn_lacks_a_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
-        "uvicorn.protocols.http.auto.AutoHTTPProtocol",
+        "uvicorn.protocols.http.httptools_impl.HttpToolsProtocol",
         _fake_http(monkeypatch, "send_400_response"),
     )
     rc, captured, created = _serve_captured(tmp_path, monkeypatch)
@@ -1166,7 +1246,7 @@ def test_supervise_refuses_the_fleet_before_spawning_or_renewing(
 
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
     monkeypatch.setattr(
-        "uvicorn.protocols.http.auto.AutoHTTPProtocol",
+        "uvicorn.protocols.http.httptools_impl.HttpToolsProtocol",
         _fake_http(monkeypatch, "send_400_response"),
     )
     rc, _, created = _serve_captured(tmp_path, monkeypatch, command="supervise")

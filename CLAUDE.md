@@ -657,7 +657,7 @@ gates a merge**, and no seat has to clear one.
 
 - **Format + lint with Ruff** (`ruff format`, `ruff check`) — **there is no Black**. Type-check
   with **mypy (strict)**. Test with **pytest**.
-- Dependencies live in [`pyproject.toml`](pyproject.toml) (`>=` minimums) and are pinned in a
+- Dependencies live in [`pyproject.toml`](pyproject.toml) (`>=` minimums, except packages pinned exactly where a measured guarantee depends on the version, at least uvicorn and websockets) and are pinned in a
   hash-locked `requirements.lock` (exported from `uv.lock`; CI checks it stays in sync and audits
   it — DEP-1). No ad-hoc installs — add deps to `pyproject.toml`, then re-run `uv lock`/`uv export`.
 

@@ -289,6 +289,9 @@ async def test_callback_maps_action_to_runner_restart() -> None:
         def inbound_filtered(self, name: str) -> str | None:
             return None
 
+        def outbound_dr_failed(self, name: str) -> bool:
+            return False
+
         async def restart_inbound(self, name: str) -> None:
             self.calls.append(("restart_inbound", name))
 
@@ -412,6 +415,9 @@ class _RecordingRunner:
 
     def inbound_filtered(self, name: str) -> str | None:
         return None
+
+    def outbound_dr_failed(self, name: str) -> bool:
+        return False
 
     async def restart_inbound(self, name: str) -> None:
         self.calls.append(("restart_inbound", name))
