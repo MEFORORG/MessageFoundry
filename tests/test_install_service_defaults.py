@@ -96,7 +96,7 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
 def test_lock_config_dir_locks_the_value_folder_too() -> None:
     text = _text()
     block = text.index("if ($LockConfigDir) {")
-    folder = text.index("Get-ValueFileFolder -ProjectRoot $ProjectRoot -AppDirectory $AppDirectory")
+    folder = text.index('$ValueFolder = Join-Path $ValuesAnchor "environments"')
     added = text.index("$LockPaths += $ValueFolder")
     lock = text.index("Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount")
     assert block < folder < added < lock
@@ -116,13 +116,10 @@ def test_the_default_settings_file_is_the_one_serve_would_read(tmp_path: Path) -
         f"    with = (Get-DefaultServiceConfig -Anchor {_psq(str(with_file))})\n"
         f"    without = (Get-DefaultServiceConfig -Anchor {_psq(str(without))})\n"
         f"    folder = (Get-DefaultServiceConfig -Anchor {_psq(str(folder_named_so))})\n"
-        f"    values_root = (Get-ValueFileFolder -ProjectRoot {_psq(str(with_file))} "
-        f"-AppDirectory {_psq(str(without))})\n"
-        f"    values_cwd = (Get-ValueFileFolder -ProjectRoot '' -AppDirectory {_psq(str(without))})\n"
         "  } | ConvertTo-Json -Compress\n"
     )
     got = json.loads(
-        _ok(_extract(_SCRIPT, ["Get-DefaultServiceConfig", "Get-ValueFileFolder"], body), tmp_path)
+        _ok(_extract(_SCRIPT, ["Get-DefaultServiceConfig"], body), tmp_path)
         .strip()
         .splitlines()[-1]
     )
@@ -130,6 +127,13 @@ def test_the_default_settings_file_is_the_one_serve_would_read(tmp_path: Path) -
         "with": str(with_file / "messagefoundry.toml"),
         "without": "",
         "folder": "",
-        "values_root": str(with_file / "environments"),
-        "values_cwd": str(without / "environments"),
     }
+
+
+def test_the_settings_file_and_the_value_folder_share_one_anchor() -> None:
+    """Both resolve under -ProjectRoot, else the working directory, as `serve` resolves them, and
+    the installer works that anchor out once."""
+    text = _text()
+    anchor = text.index("$ValuesAnchor = if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }")
+    assert anchor < text.index("Get-DefaultServiceConfig -Anchor $ValuesAnchor")
+    assert anchor < text.index('$ValueFolder = Join-Path $ValuesAnchor "environments"')

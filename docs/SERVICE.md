@@ -629,8 +629,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     service settings file it read (`--service-config`, else `.\messagefoundry.toml`) and the value
     file `environments\<env>.toml`. It refuses to start when another account can write either one
     (*"refusing to start from writable-by-others path ..."*), because each one steers the service.
-    The dev/test escape below downgrades this refusal too. `install-service.ps1 -LockConfigDir`
-    locks the value file's folder with the config directory.
+    `supervise` makes the same check before it starts any engine shard. Every reload reads the
+    value file again, so it checks it again first and refuses the reload the same way. The dev/test
+    escape below downgrades these refusals too. `install-service.ps1 -LockConfigDir` locks the
+    value file's folder with the config directory.
   - **It also reads the interpreter and the engine package, and only reports them.** A start whose
     interpreter or `messagefoundry` package folder another account can write logs a WARNING,
     *"the engine runs code from writable-by-others path ..."*, and goes on. Refusing would end every

@@ -1286,16 +1286,6 @@ function Get-DefaultServiceConfig {
     return ""
 }
 
-function Get-ValueFileFolder {
-    <#
-      The folder of the value file environments\<env>.toml the service reads: under -ProjectRoot,
-      or under the working directory when there is none. The default folder name only: a settings
-      file that renames [environments].dir moves it, and this does not read the settings.
-    #>
-    param([string]$ProjectRoot, [Parameter(Mandatory)][string]$AppDirectory)
-    return (Join-Path $(if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }) "environments")
-}
-
 # --- absolute paths, before anything consumes one (BACKLOG #1554) -----------------------------------
 # A service resolves a relative path against its own working directory, so every path baked into the
 # registration must be absolute. Only -Config was normalized, and it was normalized LATE - after
@@ -1334,10 +1324,11 @@ $Config = Resolve-AbsolutePath $Config
 $AppDirectory = if ($UsesDefaultInstall) { $DefaultInstallRoot } else { $RepoRoot }
 if ($ProjectRoot) { $ProjectRoot = Resolve-AbsolutePath $ProjectRoot }
 elseif ($UsesDefaultInstall) { $ProjectRoot = Split-Path -Parent $Config }
+# What `serve` resolves the value file and its default settings file under: -ProjectRoot, else
+# its working directory.
+$ValuesAnchor = if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }
 if ($ServiceConfig) { $ServiceConfig = Resolve-AbsolutePath $ServiceConfig }
-else {
-    $ServiceConfig = Get-DefaultServiceConfig -Anchor $(if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory })
-}
+else { $ServiceConfig = Get-DefaultServiceConfig -Anchor $ValuesAnchor }
 # Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
@@ -1763,7 +1754,9 @@ if ($ServiceAccount) {
 if ($LockConfigDir) {
     # The value file's folder too, when there is one: `serve` refuses a start whose value file, or
     # its folder, another account can write (vault BACKLOG #2626).
-    $ValueFolder = Get-ValueFileFolder -ProjectRoot $ProjectRoot -AppDirectory $AppDirectory
+    # The default folder name only: a settings file that renames [environments].dir moves the
+    # value file, and the installer does not read the settings.
+    $ValueFolder = Join-Path $ValuesAnchor "environments"
     $LockPaths = @($Config)
     if (Test-Path -LiteralPath $ValueFolder -PathType Container) { $LockPaths += $ValueFolder }
     foreach ($LockPath in $LockPaths) {
