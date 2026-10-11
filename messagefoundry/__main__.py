@@ -2491,6 +2491,30 @@ def _serve(args: argparse.Namespace) -> int:
         print(f"error: refusing to start: {startup_refused}.", file=sys.stderr)
         return 2
 
+    # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
+    # else the working directory (unchanged default). Resolved here, ahead of the trust check below
+    # and of the startup log that names it, because the standalone-repo / NSSM footgun is a
+    # silently-wrong path.
+    from messagefoundry.config.environments import resolve_values_base_dir
+
+    env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
+    env_file = env_base / settings.environments.dir / f"{env_name}.toml"
+
+    # Vault BACKLOG #2626 step 3: the settings file and the value file are read from outside the
+    # config tree, which every load checks. Whoever can write either one steers the service, so each
+    # gets the config-source check here, before anything acts on them. The settings file is the one
+    # load_settings read: --service-config, else ./messagefoundry.toml when it exists.
+    from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
+
+    settings_file = (
+        Path(service_config) if service_config is not None else cwd / _DEFAULT_SERVICE_TOML
+    )
+    try:
+        assert_trusted_start_paths([settings_file, env_file])
+    except WiringError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     # ADR 0118: [security].require_encryption_for_remote=false is the config-file twin of
     # --allow-insecure-bind (accept off-machine access on the API's self-signed placeholder, and on a
     # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind gate + the SAME
@@ -2705,6 +2729,18 @@ def _serve(args: argparse.Namespace) -> int:
     for _env_line in unread_env_warnings(settings):
         logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
 
+    # Vault BACKLOG #2626 step 3: the interpreter and the engine package, read by the same policy as
+    # the config tree and reported here, after configure_logging, so the lines reach the operator's
+    # handlers. Not a refusal; wiring.untrusted_install_paths says why.
+    from messagefoundry.config.wiring import untrusted_install_paths
+
+    for _install_line in untrusted_install_paths():
+        logging.getLogger(__name__).warning(
+            "%s. Install the engine where only administrators can write (docs/SERVICE.md, "
+            "'Install the engine where only administrators can write')",
+            _install_line,
+        )
+
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
     # reach the handlers/filters/off-box forwarder. Both are memory HYGIENE — neither bears on ASVS
@@ -2850,13 +2886,6 @@ def _serve(args: argparse.Namespace) -> int:
                     skew,
                 )
 
-    # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
-    # else the working directory (unchanged default). Resolved once here so the startup log shows the
-    # exact file env() values come from — the standalone-repo / NSSM footgun is a silently-wrong path.
-    from messagefoundry.config.environments import resolve_values_base_dir
-
-    env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
-    env_file = env_base / settings.environments.dir / f"{env_name}.toml"
     # Announce the active environment + posture so an operator can see which env() values resolve and
     # the tier in effect (the env is required — there is no silent default). Every instance carries
     # patient data (BACKLOG #1279), so there is no data class to report: the PHI gates always apply.

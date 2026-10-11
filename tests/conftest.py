@@ -23,7 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -258,8 +258,20 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[[Path], N
     def check_over_clean_readers(directory: Path) -> None:
         wiring._enforce_windows_config_source(directory, probes)
 
+    # The serve start check (vault BACKLOG #2626 step 3) reads the settings file, the value file, the
+    # interpreter and the package through its own seam, so it gets the same stand-in. The real call
+    # comes back with ``real_config_source_readers`` too, found by ``inspect.unwrap``.
+    real_paths = wiring._assert_trusted_paths_windows
+
+    @functools.wraps(real_paths)
+    def paths_over_clean_readers(
+        paths: Sequence[Path], *, lead: str, refuse: Callable[[str], None]
+    ) -> None:
+        wiring._enforce_windows_paths(paths, probes, lead=lead, always_present=None, refuse=refuse)
+
     patch = pytest.MonkeyPatch()
     patch.setattr(wiring, "_assert_safe_config_source_windows", check_over_clean_readers)
+    patch.setattr(wiring, "_assert_trusted_paths_windows", paths_over_clean_readers)
     try:
         yield real
     finally:
@@ -275,9 +287,17 @@ def real_config_source_readers(
     ``_win32_config_source_probes``: the real access list, or the readers a test hands it. A no-op
     off win32, where the session fixture above installs nothing."""
     if _read_the_checkout_as_a_clean_config_source is not None:
+        import messagefoundry.config.wiring as wiring
+
         monkeypatch.setattr(
-            "messagefoundry.config.wiring._assert_safe_config_source_windows",
+            wiring,
+            "_assert_safe_config_source_windows",
             _read_the_checkout_as_a_clean_config_source,
+        )
+        monkeypatch.setattr(
+            wiring,
+            "_assert_trusted_paths_windows",
+            inspect.unwrap(wiring._assert_trusted_paths_windows),
         )
 
 
