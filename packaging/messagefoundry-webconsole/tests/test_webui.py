@@ -4107,7 +4107,9 @@ async def test_cannot_disable_self_rerenders_error(engine: Engine) -> None:
         assert user is not None and not user.disabled
 
 
-async def test_set_roles_roundtrip_and_last_admin_guard(engine: Engine) -> None:
+async def test_set_roles_roundtrip_and_last_admin_guard(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = await _service(engine)
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
@@ -4116,9 +4118,20 @@ async def test_set_roles_roundtrip_and_last_admin_guard(engine: Engine) -> None:
         assert r.status_code == 303
         assert await service.store.get_user_role_ids(uid) == ["operator"]
         # boss IS the last enabled administrator: initialize() creates no account of its own (ADR
-        # 0183 Amendment A), so nothing else in this store holds the role.
+        # 0183 Amendment A), so nothing else in this store holds the role. The handler refuses a
+        # self-target first (BACKLOG #1149), so the last-administrator refusal is mapped from a
+        # viewer the guard is made to refuse, as tests/test_last_admin_guard.py does on the JSON
+        # plane.
         boss_id = await _uid(service, "boss")
         r = await _post_pairs(c, f"/ui/users/{boss_id}/roles", [("roles", "viewer")])
+        assert r.status_code == 400
+        assert "another administrator must change your own roles" in r.text
+
+        async def refuse(*_a: object, **_k: object) -> bool:
+            return False
+
+        monkeypatch.setattr(service.store, "remove_unless_last_admin", refuse)
+        r = await _post_pairs(c, f"/ui/users/{uid}/roles", [("roles", "viewer")])
         assert r.status_code == 400
         assert "cannot remove the last administrator" in r.text
 

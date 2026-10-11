@@ -1627,7 +1627,11 @@ class QueueStore(StoreLifecycle, Protocol):
         row and makes the set read as present-but-empty; that trade is deliberate and recorded."""
         ...
 
-    async def wal_checkpoint(self) -> None: ...
+    async def wal_checkpoint(self) -> bool | None:
+        """Truncate the SQLite ``-wal`` file. ``True`` when no ``-wal`` frames remain (an in-memory
+        or non-WAL SQLite store has none), ``False`` when the checkpoint could not finish (vault
+        BACKLOG #2619), and ``None`` on a server backend, whose method is a no-op."""
+        ...
 
     async def vacuum(self) -> None: ...
 
@@ -3385,6 +3389,7 @@ async def _open_backend(
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             read_only=read_only,
+            secure_delete=settings.secure_delete,
         )
     if settings.backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep

@@ -890,8 +890,8 @@ def test_two_concurrent_runs_announce_once(repo: Path, tmp_path: Path) -> None:
     pattern; lock.ps1 records PowerShell silently losing 4 of 8 concurrent writes.
 
     CORRECTED (BACKLOG #1339): this used to add "and block-blanket-git-stage twice in the project
-    file". That is FALSE -- that script is referenced ZERO times, in the project file and in every
-    other settings file. The assertion below was never affected; only this rationale was wrong,
+    file". That was FALSE -- the project file referenced that script zero times then, and it
+    references it once now. The assertion below was never affected; only this rationale was wrong,
     which is the harder kind to notice because nothing goes red.
     """
     sd = tmp_path / "state"

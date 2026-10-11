@@ -46,13 +46,19 @@ def _no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _probe_argv() -> list[str]:
     """The argv ``buildAdminProbeInvocation`` builds, after ``python -m messagefoundry``."""
-    return ["provision-admin", f"--username={_ts_string_const('PROBE_USERNAME')}", "--json"]
+    return [
+        "provision-admin",
+        f"--username={_ts_string_const('PROBE_USERNAME')}",
+        f"--email={_ts_string_const('PROBE_EMAIL')}",
+        "--json",
+    ]
 
 
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     """If the TypeScript stops building this argv, the two tests below stop describing the IDE."""
     src = _MODEL.read_text(encoding="utf-8")
-    assert '"provision-admin", `--username=${opts.username}`' in src
+    assert '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`' in src
+    assert "username: PROBE_USERNAME, email: PROBE_EMAIL" in src
     assert '[...inv.args, "--json"]' in src
 
 
@@ -78,7 +84,9 @@ def test_a_store_with_an_administrator_answers_with_the_exists_fragment(
     _key_in_this_shell(monkeypatch)
     with monkeypatch.context() as m:
         _tty(m, _PASSWORD, _PASSWORD)
-        assert main(["provision-admin", "--username", "site-admin"]) == 0
+        assert (
+            main(["provision-admin", "--username", "site-admin", "--email", "a@example.org"]) == 0
+        )
     capsys.readouterr()
 
     _no_terminal(monkeypatch)

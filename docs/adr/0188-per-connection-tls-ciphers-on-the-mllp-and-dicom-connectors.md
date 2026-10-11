@@ -2,10 +2,15 @@
 
 - **Status:** Accepted (2026-09-14) — built. **Amended 2026-09-23 (BACKLOG #300):** unset now narrows to the
   approved suites on all four seams, and the approved list is the default on every context the engine
-  builds, with recorded exceptions. See the amendment at the end; it supersedes AC-4, AC-5 and AC-6 below.
+  builds, with recorded exceptions. See the amendment of 2026-09-23; it supersedes AC-4, AC-5 and AC-6 below.
   **Amended 2026-09-26 (BACKLOG #2042, owner ruling R4):** the three AES-128-GCM suites leave the
   approved list, and TLS 1.3's `TLS_AES_128_GCM_SHA256` goes wherever the interpreter can remove it.
-  See the second amendment at the end.
+  See the amendment of 2026-09-26.
+  **Amended 2026-09-30 (BACKLOG #2494, option 3):** LDAPS handshakes on a context the engine builds,
+  so it narrows TLS 1.3 like the other engine-built hops. See the amendment of 2026-09-30.
+  **Amended 2026-10-10 (BACKLOG #2108, owner ruling 2026-10-08):** the desktop IDE still offers
+  `TLS_AES_128_GCM_SHA256` at TLS 1.3, and that is now a recorded gap, as on CPython 3.14. No code
+  changed. See the amendment of 2026-10-10.
 - **Date:** 2026-09-14
 - **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (WP-13b MLLP-over-TLS) · [ADR 0025](0025-dicom-codec-store-connectors.md) (DICOM C-STORE connectors) · [ADR 0094](0094-granular-expiry-only-tls-relaxation.md) (the per-connection TLS opt-in this copies) · [ADR 0172](0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md) (the engine always serves TLS) · CLAUDE.md §9 (PHI on the wire)
 
@@ -296,7 +301,7 @@ its own copy. Both reach the inner context of a `truststore` wrapper, which does
 | Where | TLS 1.2 | TLS 1.3 |
 |---|---|---|
 | Every engine-built hop in the first amendment's table, and the apiclient | 5 suites, no AES-128 | CPython 3.14: all three suites, `TLS_AES_128_GCM_SHA256` included. **A recorded gap, not an override.** Where `set_ciphersuites` exists: 2 suites |
-| IDE extension client | pins 5 names, none AES-128 (a runtime without a suite drops it) | pins the 2 approved names. Plain Node, a remote extension host, honours them. VS Code's desktop Electron (BoringSSL) ignores them and keeps all three, measured on Electron 42.10.0: a gap of the same kind that R4 does not name |
+| IDE extension client | pins 5 names, none AES-128 (a runtime without a suite drops it) | pins the 2 approved names. Plain Node, a remote extension host, honours them. VS Code's desktop Electron (BoringSSL) ignores them and keeps all three, measured on Electron 42.10.0: a gap of the same kind that R4 does not name. [Added 2026-10-10: an owner ruling of 2026-10-08 now names it as a recorded gap. See the amendment of that date at the end.] |
 | The library-built hops the first amendment lists as unchanged | unchanged | unchanged |
 
 `narrow_tls13_suites`'s docstring is the one statement of when the TLS 1.3 half acts, where its
@@ -418,3 +423,50 @@ and its equivalence test are gone.
   `test_ldap3s_host_name_check_still_runs_after_the_handshake`
 - **AC-15** -- The LDAPS hop is a client hop in `tests/test_tls_default_suites.py`, so AC-7, AC-8
   and AC-10 apply to it.
+
+---
+
+## Amendment (2026-10-10): the desktop IDE's AES-128 TLS 1.3 suite is a recorded gap (BACKLOG #2108, owner ruling 2026-10-08)
+
+**R4's recorded-gap treatment now covers VS Code's desktop IDE runtime too.** On 2026-10-08 the
+owner chose *"Yes, record it as a gap (Recommended)"* on BACKLOG #2108, in a dialog in a Claude
+session. The record is the #2108 entry in the vault's
+`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, and it marks the basis OWNER, the owner's own
+choice. It is the report of the seat that ran the dialog, and only the quoted option label is the
+owner's own words. That entry words the question as whether R4 also covers the VS Code desktop IDE
+runtime.
+
+### What it covers
+
+The IDE extension names only the two approved TLS 1.3 suites in its `ciphers` string. Whether they
+take effect depends on the runtime. At least these two runtimes differ:
+
+| IDE runtime | Against a TLS 1.3 server offering only `TLS_AES_128_GCM_SHA256` | Status |
+|---|---|---|
+| Plain Node. A remote extension host (Remote-SSH, WSL, dev containers) runs on plain Node. | refused, on one plain Node build | narrowed |
+| VS Code's desktop runtime, Electron with BoringSSL, which ignores TLS 1.3 names in `ciphers` | completes, on one Electron build | **a recorded gap, not an override** |
+
+The comment on `TLS_13_SUITES` in `ide/src/engineClient.ts` records that measurement and its
+versions. That measurement tested whether AES-128 was accepted. It did not capture the full set of suites either
+runtime offers. A remote host's own Node build was not measured.
+
+This gap is of the same kind as the engine's own on CPython 3.14, which the 2026-09-26 amendment
+records. In both, the code's own way of naming TLS 1.3 suites cannot remove this one. On 3.14 that
+is Python's `ssl` module. In the IDE it is Node's `ciphers` option under BoringSSL. R4 named only
+the CPython gap. The owner's 2026-10-08 ruling names this one as well.
+
+On a direct IDE-to-engine hop the engine is the server. A TLS 1.3 handshake can pick only a suite
+both ends offer, so the engine's own TLS 1.3 list bears on this hop too. `narrow_tls13_suites`'s
+docstring says when the engine drops the suite. Behind a TLS-terminating proxy, the IDE's peer is
+the proxy, and the proxy's configuration decides. BACKLOG #2108 reads the vault's reference nginx
+fence as letting the client's order decide, so the desktop IDE would likely negotiate AES-128 there. That
+reading is inferred, not measured.
+
+### What it does not change
+
+- **No code changed.** `TLS_13_SUITES` keeps its two names. Its comment now cites this ruling.
+- **No closing cost is ordered.** BACKLOG #2108 named at least three. One caps the IDE hop at TLS
+  1.2, where Electron honours the names. One closes a connection after a handshake that negotiated
+  AES-128. One documents a proxy requirement. The ruling chose none of them.
+- **It records no override.** As with R4, the gap is named, and no exception accepts it.
+- **It changes no proxy configuration.** The reference fence stays as it is.

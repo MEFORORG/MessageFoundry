@@ -1496,3 +1496,20 @@ async def test_cell_aad_binds_blob_to_file_id(tmp_path: Path) -> None:
     )
     with pytest.raises(CipherError):  # auth-tag mismatch — never a silent mis-decrypt
         await store.read_bytes(b.file_id)
+
+
+def test_upload_content_error_keeps_the_name_out_of_its_reason_and_survives_pickle() -> None:
+    """Vault BACKLOG #2619: ``reason`` is what the audit row records, so it must not hold the file
+    name, while ``str()`` still names it for the uploader. The error also copies and pickles."""
+    import copy
+    import pickle
+
+    from messagefoundry.uploads import UploadContentError, validate_upload_content
+
+    with pytest.raises(UploadContentError) as caught:
+        validate_upload_content("MRN_SYNTH_0001.png", b"x")
+    exc = caught.value
+    assert "MRN_SYNTH_0001" in str(exc)
+    assert "MRN_SYNTH_0001" not in exc.reason
+    for clone in (copy.copy(exc), pickle.loads(pickle.dumps(exc))):
+        assert (str(clone), clone.reason) == (str(exc), exc.reason)

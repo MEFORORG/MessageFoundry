@@ -66,7 +66,11 @@ def _check_contained(directory: Path, name: str) -> None:
     direct child of ``directory``. Lexical on purpose: the final component is never followed, and
     :func:`drop_atomic` never writes through an existing name anyway (``os.link`` refuses one).
     A name ending in a dot or a space is refused too: Windows strips those when it opens a name, so
-    ``.. `` would open ``..``. The refusal does not quote ``name``, which came from a message."""
+    ``.. `` would open ``..``. So is a name Windows reserves (:func:`ntpath.isreserved`: a device
+    such as ``CON`` or ``COM1.hl7``, a ``name:stream``, a wildcard) and any colon, which also names
+    a drive (``C:x.hl7``). :func:`drop_name` already filters these, but a caller that skips it must
+    not reach a device or a stream, so the check holds on every platform. The refusal does not
+    quote ``name``, which came from a message."""
     resolved = Path(os.path.abspath(directory))
     target = Path(os.path.normpath(resolved / name)) if name else resolved
     if (
@@ -75,7 +79,9 @@ def _check_contained(directory: Path, name: str) -> None:
         or "\x00" in name
         or "/" in name
         or "\\" in name
+        or ":" in name
         or name.endswith((".", " "))
+        or ntpath.isreserved(name)
         or target.parent != resolved
         or target.name != name
     ):

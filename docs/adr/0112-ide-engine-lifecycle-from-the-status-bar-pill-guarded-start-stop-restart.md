@@ -184,7 +184,8 @@ refused at the shipped posture.
 1. The existing gates: loopback, trusted workspace, the store-less confirm (which now names only the NEW database), and
    the interpreter preflight.
 2. It asks the engine whether the store already has an enabled Administrator. It runs `provision-admin --username=probe
-   --json` with no terminal. That command answers "an enabled Administrator already exists" before it checks for a
+   --email=probe@example.invalid --json` with no terminal (the address since BACKLOG #1138, which made `--email`
+   required; `.invalid` is reserved, and nothing stores it). That command answers "an enabled Administrator already exists" before it checks for a
    terminal, and otherwise refuses for want of one. It creates no store and no account either way. Store presence
    alone cannot answer this, because a store can exist with no Administrator in it. Only the `--json` answer counts;
    free text on stderr is kept as a reason and never read as an answer.
@@ -195,8 +196,8 @@ refused at the shipped posture.
    Start a dead end the probe caused.
 5. No Administrator: a modal offers **Provision administrator** or **Start without one**. The second is for a posture
    with sign-in off, which needs none; at the shipped posture `serve` refuses and names `provision-admin` itself.
-6. Provisioning asks a username and a notification address. The address is optional, and the prompt says the shipped
-   settings refuse to start until some enabled Administrator has one. Then `provision-admin` runs in **its own
+6. Provisioning asks a username and a notification address. The address is required and the prompt refuses a blank
+   one, since `provision-admin` requires `--email` (BACKLOG #1138). Then `provision-admin` runs in **its own
    terminal**. `serve` is its terminal's own process, so nothing can be chained in front of it. The user types the
    password into that terminal. The command has no `--password` on purpose, and the IDE adds no other way to pass
    one. A small Python wrapper holds that terminal open after the command exits, so its output can be read.

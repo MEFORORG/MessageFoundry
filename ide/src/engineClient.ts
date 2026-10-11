@@ -132,8 +132,10 @@ export const TLS_12_SUITES: readonly string[] = [
  *   remote extension host (Remote-SSH, WSL, dev containers) runs on plain Node.
  * - VS Code's desktop runtime, Electron 42.10.0 (BoringSSL), still COMPLETES on it. BoringSSL ignores
  *   TLS 1.3 names in `ciphers`, so on the desktop the IDE keeps offering that suite. It is a gap of
- *   the same kind as the engine's on CPython 3.14 (`narrow_tls13_suites` in `tls_policy.py`), but R4
- *   names only that one, so this one is recorded here rather than ruled on.
+ *   the same kind as the engine's on CPython 3.14 (`narrow_tls13_suites` in `tls_policy.py`). R4
+ *   named only that one. An owner ruling of 2026-10-08 (BACKLOG #2108) extends R4 to this one. So
+ *   it too is a recorded gap, not an override, and no code here changes for it. ADR 0188's amendment
+ *   of 2026-10-10 records it.
  *
  * Against a stock TLS 1.3 server, which is what a 3.14 engine is, the handshake completes with
  * these names present on both runtimes, so naming them refuses nothing a stock engine speaks.
