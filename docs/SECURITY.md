@@ -1978,6 +1978,30 @@ fingerprint counts. A later reload that fails and rolls back does not mark the r
 runs just before the write, so a change after it is not caught. A cluster convergence reload's
 row is still read from the engine's live state when it is written.
 
+**A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
+dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
+digest of the target directory, taken at request time. An approver sees it in the queue. The
+release takes the digest again twice. The first check runs before any config module runs, and the
+second just before the swap. The second digest is the one the `config_reload` row records. If
+either differs from the approved one, nothing loads past that point and nothing swaps. The approve
+answers **422**, the request moves to `failed`, and a `config_reload_failed` row records reason
+`digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold that took no digest
+is refused the same way. The requester asks again, and a second approver reviews the new bytes. A
+repeat request joins an open hold only while the digest is unchanged. An ungated reload takes no
+request-time digest. At least these limits remain:
+
+- the digest is not sealed. A writer to the `pending_approvals` table can replace it along with the
+  rest of the params. Sealing that row is vault BACKLOG #2592;
+- the digest covers what `config/fingerprint.py` hashes and no more. A planted `__pycache__` file
+  runs under an unchanged digest, and its other gaps are closing step 1 of vault BACKLOG #2596;
+- an edit that lands and is reverted while the release loads is not seen. Hashing, compiling and
+  running the same bytes is that same step 1;
+- a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
+  before a toggle is refused at release and must be asked for again;
+- a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
+  approved digest. Whether a restart under dual control refuses an unapproved digest is an open
+  owner question.
+
 Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624). Its `dead_letter_replay` row
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
 request moves to `failed`, and `approval.failed` names the error type. A released purge still writes
