@@ -240,9 +240,10 @@ Container-specific essentials (all detailed in [`../docker/README.md`](../docker
 - **Exposure:** Topology A (in-process TLS — the **recommended** of the two) or Topology B
   (reverse-proxy / same-pod sidecar). The engine serves TLS out of the box, on a self-signed pair it
   mints on first run (ADR 0172). `[api].tls_cert_file` defaults unset, and an off-loopback bind refuses
-  that placeholder by default, so Topology A needs an operator certificate.
-  Reaching a published port means binding off-loopback in the container, so the bind guard requires TLS —
-  exactly as on bare metal. Every listen type is guarded (MLLP, HTTP, the DICOM SCP, raw TCP/X12); raw
+  that placeholder by default, so Topology A needs an operator certificate. Under Topology B with no
+  operator certificate, the engine speaks plain HTTP to the proxy, so point the proxy at `http`.
+  Reaching a published port means binding off-loopback in the container, so the bind guard requires an
+  operator certificate or a declared TLS terminator, exactly as on bare metal. Every listen type is guarded (MLLP, HTTP, the DICOM SCP, raw TCP/X12); raw
   TCP/X12 have no TLS to enable, so publishing those ports means firewalling/segmenting them instead.
 - **Signals:** PID 1 is `tini`; `SIGTERM` → graceful `engine.stop()`. Allow a stop grace of ≥30s.
 

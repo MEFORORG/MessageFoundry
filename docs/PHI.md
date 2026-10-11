@@ -1099,7 +1099,7 @@ audit chain or be false.
 
 | Path | Today | Plan |
 |---|---|---|
-| MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true`, or a per-connection `tls_hop_attested` with its mandatory reason, or `serve --allow-insecure-bind` under `[security].enforcement = warn`. Under the default `enforce` the flag is inert. | — |
+| MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or a per-connection `tls_hop_attested` with its mandatory reason. Under `[security].enforcement = warn`, `serve --allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) also permits it. Under the default `enforce` both are inert. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
 | Engine API ↔ console | **The engine always serves TLS** ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)) `[BUILT]`, loopback included. An operator certificate (`[api].tls_cert_file`, WP-13a) wins; with none set, the engine mints a self-signed placeholder on first run. Off loopback, `serve` refuses that placeholder. Only `[security].enforcement = warn` with `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) accepts it. So an exposed bind needs an operator certificate **or** a trusted reverse proxy that terminates TLS upstream (`tls_terminated_upstream` + `trusted_proxies`, WP-15). That proxy is the one topology where the engine itself serves plaintext: with no `tls_cert_file`, the proxy-to-engine hop is plaintext, the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]`. No LDAP referral is followed, so the bind credentials never leave this hop for a referred host; a referral refuses the sign-in (BACKLOG #2530, 2026-09-30). A multi-domain forest would need a global catalog or a search base in the bound controller's own domain. | — |
@@ -1107,7 +1107,9 @@ audit chain or be false.
 
 **Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without an operator
 certificate or a declared TLS-terminating proxy in front of it. On the self-signed placeholder, no
-client can tell the engine from an on-path attacker unless it pins that exact certificate.
+client can tell the engine from an on-path attacker unless it pins that exact certificate. Behind a
+declared proxy with no operator certificate, the proxy-to-engine hop is plaintext, and securing it
+is the site's job (the Engine API row above).
 
 **DB-TLS CA trust + rotation `[BUILT — runbook]` (NIST SP 800-52r2; HIPAA §164.312(e)(1); CWE-295).**
 Validating the DB server certificate against a private/internal CA needs that CA trusted, and rotation
