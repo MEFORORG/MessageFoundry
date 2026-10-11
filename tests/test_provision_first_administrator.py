@@ -321,7 +321,9 @@ async def test_a_blank_or_malformed_address_is_refused_and_writes_nothing(addres
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        with pytest.raises(FirstAdministratorRefused, match="notification address was refused"):
+        with pytest.raises(
+            FirstAdministratorRefused, match="notification address was refused"
+        ) as refused:
             await service.provision_first_administrator(
                 username="site-admin",
                 password=_PASSWORD,
@@ -329,6 +331,10 @@ async def test_a_blank_or_malformed_address_is_refused_and_writes_nothing(addres
                 actor="test",
                 **provision_totp(),
             )
+        # The courtesy pre-check gives the same answer, so no prompt is shown first.
+        assert await service.provision_refusal("site-admin", notify_email=address) == str(
+            refused.value
+        )
         assert await store.get_user_by_username("site-admin") is None
         rows = [dict(r) for r in await store.list_audit(limit=50)]
         assert not any(r["action"] == "auth.first_administrator_provisioned" for r in rows)
@@ -1435,10 +1441,7 @@ async def test_a_takeover_notifies_the_address_the_account_held_before(
 # --- BACKLOG #2288: a row that holds an address is completed only when --email is given ----------
 
 
-@pytest.mark.parametrize("given", [None], ids=["no-email"])
-async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email(
-    given: str | None,
-) -> None:
+async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email() -> None:
     """Kept silently, the stored address would receive the sole Administrator's notices.
 
     A blank address had its own case here until BACKLOG #1138. The service now refuses a blank
@@ -1490,13 +1493,13 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
             await service.provision_first_administrator(
                 username="site-admin",
                 password=_PASSWORD,
-                notify_email=given,
+                notify_email=None,
                 actor="test",
                 **provision_totp(),
             )
         assert "holder@example.invalid" not in str(refused.value)
         # The courtesy pre-check gives the same answer, so no prompt is shown first.
-        assert await service.provision_refusal("site-admin", notify_email=given) == str(
+        assert await service.provision_refusal("site-admin", notify_email=None) == str(
             refused.value
         )
 
