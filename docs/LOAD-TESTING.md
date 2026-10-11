@@ -95,13 +95,47 @@ its nodes, and then signs in. You pass nothing.
 | You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. `provision-admin` declines when the store already has an Administrator, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs neither variable. |
 | The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. |
 
-**Signed-in polling is in the numbers.** The poller's reads are no longer free. The engine does two
-store commits for each signed-in request: it stamps the session's last use, and it audits the
-authorization grant. A poller sample is three requests, so six commits and three audit rows.
-Measured 2026-10-02 on an idle engine on SQLite, 20 samples moved `committed_txns` by 120; with
-sign-in off, before `serve` lost that mode, the same 20 moved it by 0. So `committed_txns`, `txn/msg (measured)` and DB growth carry
-that much per sample. A figure banked before rigs signed in is not comparable with one taken after
-until `6 x samples` is taken off the commit count. At a low message rate the share is not small.
+**Signed-in polling is in the numbers, and the report measures its share.** The poller's reads are
+not free. For each signed-in request the engine stamps the session's last use, one commit. With
+`[security].audit_all_authorization_decisions` on, the shipped default, it also audits the grant: a
+second commit and an audit row. A sample is three requests to each engine shard. So the cost per
+sample depends on the shard count and on that setting. Measured 2026-10-10 on one idle SQLite
+engine, a sample cost six commits with the audit on and three with it off.
+
+The load report does not assume that cost. It measures it (vault BACKLOG #2794):
+
+1. Before load starts, the runner takes four samples back to back while the engine is idle.
+2. The smallest `committed_txns` change between two neighbours is the cost of one sample on this
+   engine, backend, shard count and audit setting. The engine's own idle work can only add commits
+   to a pair, so the smallest is the closest to the poller alone.
+3. The poller counts every request that reached each shard between the baseline and final
+   `/stats` reads. A failed request is charged at the read rate too, though what it really
+   committed may differ, so a run with failed requests gets an approximate figure.
+4. The report takes that many requests' worth of commits off `committed_txns`.
+
+The console prints `txn/msg (engine, poller removed)` beside the raw `txn/msg (measured)`, with the
+arithmetic. `engine_side` in the JSON carries `poller_samples`, `poller_requests`,
+`poller_requests_per_sample`, `poller_commits_per_sample_measured` and
+`txn_per_message_poller_removed`.
+
+The poller-removed figure reads "not measured", never a guess, in at least these cases:
+
+| Case | Why |
+|---|---|
+| The calibration failed | No two idle samples in a row were answered. |
+| The raw figure is not measured | The counter never moved. On PostgreSQL it is not wired at all (vault BACKLOG #2643), and a counter that never moves also calibrates to 0. |
+| The poller's share is not below the raw count | The idle calibration overstated the poller, for example because the engine did work of its own at idle. |
+
+A session renewal's sign-in is not in the share, because calibration never measured one.
+`poller_renewals` says how many a run left in.
+
+**Subtraction fixes the count, not the slowdown.** The poller's commits take the same write lock as
+the pipeline's, so the pipeline still waited on them. Removing them from the count does not give
+back that time. Only a slower poll (`poll_interval_s`), or turning the grant audit off on a test
+rig, shrinks it. At a low message rate that share is not small.
+
+A figure banked before engine PR 1941, when rigs polled without signing in, excludes the poller's
+commits. Compare it with `txn/msg (engine, poller removed)`, not with the raw figure.
 
 ### Engine load-config knobs (env, read at serve time)
 

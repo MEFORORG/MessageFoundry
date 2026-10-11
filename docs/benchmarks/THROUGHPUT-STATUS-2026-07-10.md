@@ -1,5 +1,7 @@
 # Throughput: where we stand, and the path to 45M messages/day
 
+> **Break notice (added 2026-10-10, vault BACKLOG #2794):** every figure here was banked before engine PR 1941, when load rigs polled without signing in, so every commit count in it (`committed_txns`, transactions per message or per event) excludes signed-in poller commits. Compare one with a later run's `txn/msg (engine, poller removed)`, not its raw `txn/msg (measured)`; see [`docs/LOAD-TESTING.md`](../LOAD-TESTING.md).
+
 **Date:** 2026-07-10 · **Last updated:** **2026-07-13** (folds in **P0** — the `txn/event` falsifier — on top of
 **C5 / C6 / C7** and the C4-handback review caveats) · **Code assessed:** `origin/main` @ `aba035f`; C3–C7 rig runs
 pinned to engine commit `98bec81`, P0 to engine build `28f860e` ·
