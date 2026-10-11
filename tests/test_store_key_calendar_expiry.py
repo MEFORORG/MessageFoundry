@@ -261,6 +261,7 @@ def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "enforce_store_key_expiry" in named
@@ -296,6 +297,7 @@ def test_the_shipped_default_is_not_reported_as_a_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     ]
     assert named == []
