@@ -69,6 +69,10 @@ server-DB store seed (option (a)) is explicitly deferred as a separate, owner-sc
 In one line: #223 is **design + risk-acceptance + an opt-in vintage-floor token**, **not** the large
 engine-seed build.
 
+*Amended 2026-10-11 (BACKLOG #1502): option (a) is not scheduled; see the 2026-10-11 amendment at the
+end of this ADR. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
+`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.*
+
 ### (c) — the risk acceptance (the primary deliverable)
 
 The residual is real, bounded, and now **owned, dated, and scheduled for review** rather than implicit in a
@@ -127,6 +131,10 @@ audit `archive` field + the existing `_record_aborted` fail-closed path.
 
 ### (a) — the full engine-driven server-DB store seed (DEFERRED, owner decision)
 
+*Amended 2026-10-11 (BACKLOG #1502): option (a) is not scheduled; see the 2026-10-11 amendment at the
+end of this ADR. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
+`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.*
+
 The strongest fix is to extend #60 / ADR 0049 so the **engine itself** restores + fingerprints the
 server-DB store (e.g. an engine-orchestrated `pg_restore` / native-restore wrapper that stamps a
 verifiable vintage fingerprint the gate checks), making vintage **engine-verifiable** end to end. This is
@@ -177,6 +185,9 @@ to schedule separately** — not to be started without owner sign-off (CLAUDE.md
 4. **(a) Full engine-driven server-DB store seed** — strongest (engine-verifiable vintage end to end) but
    largest: re-opens the #52 DBA-delegation boundary, must wrap heterogeneous native tooling, multi-week
    build. **Deferred — owner decision to schedule separately** (not rejected; out of scope for #223).
+   *Amended 2026-10-11 (BACKLOG #1502): not scheduled; see the 2026-10-11 amendment at the end of
+   this ADR. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
+   `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.*
 5. **Message/queue row-count freshness signal** — Rejected: row counts are **unsafe** — legitimately `0` on
    a drained store, so "low counts" cannot distinguish stale/partial from correctly-drained. It would add a
    false-abort footgun with no reliable signal.
@@ -203,6 +214,11 @@ to schedule separately** — not to be started without owner sign-off (CLAUDE.md
   avoid a false abort.
 
 **Out of scope**
+
+*Amended 2026-10-11 (BACKLOG #1502): option (a) is not scheduled; see the 2026-10-11 amendment at the
+end of this ADR. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
+`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.*
+
 - **(a) The full engine-driven server-DB store seed** — owner decision, scheduled separately; not started
   here.
 - **Server-DB (Postgres/SQL Server) native backup/restore/PITR** — DBA-delegated (#52); unchanged.
@@ -217,3 +233,30 @@ to schedule separately** — not to be started without owner sign-off (CLAUDE.md
       Register and make the attestation explicit in ADR 0048's cold-restore runbook.
 - [ ] **Owner decision (separate schedule):** whether/when to build (a) — the engine-driven server-DB store
       seed that makes vintage *and* completeness engine-verifiable (re-opening the #52 boundary).
+      *Amended 2026-10-11 (BACKLOG #1502): not scheduled, and this box stays unticked; see the
+      2026-10-11 amendment below. Seat decision under owner delegation 2026-10-08, not an owner
+      ruling; vault `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.*
+
+## Amendment (2026-10-11) -- option (a) is not scheduled (BACKLOG #1502)
+
+**Basis: a seat decision under owner delegation 2026-10-08, not an owner ruling.** It is recorded in
+vault `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section "#1502 (batch 240)".
+
+**Option (a), the full engine-driven server-DB store seed, is not scheduled.** The vintage and
+completeness residual stays accepted under (c). Option (a) reopens on the register's existing re-score
+trigger, as (c) above quotes it: "a stale/partial DBA restore causing a clinical data-loss incident,
+or an adopter contract that mandates engine-verified DR vintage".
+
+This amendment does not edit the Decision text above. The gate in (a), "not to be started without
+owner sign-off", stands as written. It does not change the signed register row either.
+
+At least these places still say option (a) is an owner decision to schedule separately. Each one
+now has a dated pointer here, and none of their wording changed:
+
+- the Decision paragraph, "a separate, owner-scheduled decision". Its pointer sits after the paragraph,
+  before (c), and nothing is inserted into the paragraph;
+- the (a) heading, and its last sentence, "an owner decision to schedule separately";
+- item 4 under *Options considered*, "owner decision to schedule separately";
+- the first bullet under *Out of scope*, "owner decision, scheduled separately";
+- the last box under *To resolve on acceptance*, "Owner decision (separate schedule)". It stays
+  unticked.
