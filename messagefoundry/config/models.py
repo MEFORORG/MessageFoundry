@@ -167,8 +167,9 @@ class Priority(str, Enum):  # noqa: UP042
 
 class InternalErrorPolicy(str, Enum):  # noqa: UP042
     """What a worker does when an **internal/code error** hits a message: on an outbound's delivery
-    worker, a non-``DeliveryError`` exception escaping a connector's ``send`` (our bug, not the
-    partner's); on an inbound's router and transform workers, a router or handler raise. A
+    worker, at least a non-``DeliveryError`` exception escaping a connector's ``send`` (our bug, not
+    the partner's); on an inbound's router and transform workers, at least a router or handler
+    raise. A
     per-outbound ``internal_error`` sets it for that outbound's delivery worker. The ``[delivery]``
     ``internal_error`` default sets it for every other delivery worker and for every router and
     transform worker.
@@ -184,7 +185,7 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     outbound hands the whole batch to ``mark_batch_failed``, which decides from the first member
     still present: when that member has reached the cap, the dead-letter takes every member still
     present, whatever its own attempts. A WARNING says when a stop dead-letters, and names at most
-    10 of the messages whose rows it dead-lettered.
+    10 of the affected messages.
 
     The delivery cap is the outbound's own ``retry`` policy's ``max_attempts`` when it has one
     (code-first ``retry=RetryPolicy(...)``, or ``[outbound.retry]`` in ``connections.toml``), and

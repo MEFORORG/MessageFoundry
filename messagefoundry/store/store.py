@@ -1038,7 +1038,7 @@ class FailOutcome:
     slow send, and a second claim then spends another attempt.
 
     ``dead_messages`` holds the message ids of the rows that ``dead`` counts, each once, in the order
-    the call was handed the rows. So a vanished member is neither counted nor named."""
+    the call was handed the rows. It is empty whenever ``dead`` is 0."""
 
     retry_at: float | None = None
     dead: int = 0

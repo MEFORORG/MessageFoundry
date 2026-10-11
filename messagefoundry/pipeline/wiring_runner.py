@@ -547,10 +547,10 @@ def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: s
     log and the store disagree. The cap is kept on purpose: it bounds a STOP and re-arm loop on a
     row that always crashes. Ids and counts only, never the error text.
 
-    The line counts and names only what the store reported in ``failed``, so a member that vanished
-    is neither counted nor named. A batch takes one disposition from its first member still
-    present, so every member is dead-lettered, whatever its own attempts. How to replay a dead row,
-    by stage, is stated once, in docs/USER-GUIDE.md, *A lane stopped processing*."""
+    The line counts and names only what the store reported in ``failed``, never the rows the arm
+    handed it. A batch takes one disposition from its first member still present, whatever the
+    others' attempts. How to replay a dead row, by stage, is stated once, in docs/USER-GUIDE.md,
+    *A lane stopped processing*."""
     if not failed.dead:
         return
     outbound = stage == Stage.OUTBOUND.value
@@ -579,10 +579,10 @@ def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: s
         named = f"the first {_STOP_LINE_MAX_MESSAGES}: {named}"
     log.warning(
         "%s %r: batch row %s, the first one still present, had made %d attempt(s), at or past its "
-        "retry cap, so the stop dead-lettered all %d row(s) still present, whatever their own "
-        "attempts, instead of re-pending them; they belong to %d message(s), %s; "
+        "retry cap, so the stop dead-lettered the batch instead of re-pending it, whatever each "
+        "row's own attempts; the store reports %d row(s) from %d message(s), %s; "
         + (
-            "the dead-letter queue lists every one: replay them from there, or replay each message"
+            "each is an outbound row: replay them from the dead-letter queue, or replay each message"
             if outbound
             else "the dead-letter queue lists outbound rows only, so they are not there; replay "
             "each message to re-queue them"
@@ -8206,8 +8206,9 @@ class RegistryRunner:
             # Internal/code error (our bug, not the partner). The per-connection policy
             # decides: STOP halts the lane and alerts an operator, while CONTINUE (default)
             # dead-letters this row and advances so a code bug can't wedge the lane forever.
-            # STOP's mark_failed re-pends the row, or dead-letters it at a finite retry cap. Log the exception TYPE only — the full detail goes to
-            # the secured store's last_error, never the general log (PHI).
+            # STOP's mark_failed re-pends the row, or dead-letters it at a finite retry cap. Log
+            # the exception TYPE only — the full detail goes to the secured store's last_error,
+            # never the general log (PHI).
             if (
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
@@ -8516,8 +8517,9 @@ class RegistryRunner:
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
             # fault. The per-connection policy decides: STOP halts the lane and alerts, and
-            # mark_batch_failed re-pends all N, or dead-letters all N when the first member still
-            # present has reached a finite cap, whatever the others' attempts; CONTINUE (default)
+            # mark_batch_failed re-pends the batch, or dead-letters its members still present when
+            # the first of them has reached a finite cap, whatever the others' attempts (it skips a
+            # vanished member, and on the retry branch a terminal one); CONTINUE (default)
             # dead-letters all N (bad data can never frame/deliver — replayable from
             # the DLQ) so a code bug or a mis-typed feed can't wedge the lane forever.
             if (

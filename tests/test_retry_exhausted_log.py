@@ -486,9 +486,9 @@ async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
             assert (
                 f"batch row {item.id}, the first one still present, had made 1 attempt(s)" in text
             )
-            assert "dead-lettered all 2 row(s) still present, whatever their own attempts" in text
-            assert f"they belong to 2 message(s), {mids[0]}, {mids[1]};" in text
-            assert "the dead-letter queue lists every one: replay them from there" in text
+            assert "dead-lettered the batch instead of re-pending it, whatever each row's" in text
+            assert f"the store reports 2 row(s) from 2 message(s), {mids[0]}, {mids[1]};" in text
+            assert "each is an outbound row: replay them from the dead-letter queue" in text
         else:
             assert f"row {item.id} (message {mids[0]}) had made 1 attempt(s)" in text
             assert "at or past its retry cap" in text
@@ -675,7 +675,7 @@ async def test_a_stop_on_a_batch_dead_letters_members_below_the_cap(
     (line,) = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
     text = line.getMessage()
     assert f"batch row {head.id}, the first one still present, had made 6 attempt(s)" in text
-    assert "all 2 row(s) still present, whatever their own attempts" in text
+    assert "whatever each row's own attempts; the store reports 2 row(s)" in text
 
 
 async def test_a_stop_on_a_batch_neither_counts_nor_names_a_vanished_member(
@@ -706,8 +706,7 @@ async def test_a_stop_on_a_batch_neither_counts_nor_names_a_vanished_member(
     assert outcome is wiring_runner._ItemOutcome.STOPPED
     (line,) = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
     text = line.getMessage()
-    assert "all 2 row(s) still present" in text
-    assert f"they belong to 2 message(s), {mids[0]}, {mids[1]};" in text
+    assert f"the store reports 2 row(s) from 2 message(s), {mids[0]}, {mids[1]};" in text
     assert mids[2] not in text
 
 
@@ -721,9 +720,9 @@ def test_a_stop_line_names_the_first_ten_messages_and_counts_them_all(
     wiring_runner._note_stop_dead_letter("delivery worker", OUT, failed, Stage.OUTBOUND.value)
     (line,) = caplog.records
     text = line.getMessage()
-    assert "they belong to 12 message(s), the first 10: " + ", ".join(messages[:10]) + ";" in text
+    assert "12 row(s) from 12 message(s), the first 10: " + ", ".join(messages[:10]) + ";" in text
     assert "msg-10" not in text and "msg-11" not in text
-    assert "the dead-letter queue lists every one" in text
+    assert "each is an outbound row: replay them from the dead-letter queue" in text
 
 
 def test_a_stop_line_for_several_rows_takes_its_recovery_from_the_stage(
@@ -739,7 +738,7 @@ def test_a_stop_line_for_several_rows_takes_its_recovery_from_the_stage(
     text = line.getMessage()
     assert "the dead-letter queue lists outbound rows only, so they are not there" in text
     assert "replay each message to re-queue them" in text
-    assert "lists every one" not in text
+    assert "each is an outbound row" not in text
 
 
 def test_a_stop_line_writes_nothing_when_nothing_was_dead_lettered(
