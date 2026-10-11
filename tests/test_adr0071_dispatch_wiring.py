@@ -200,7 +200,8 @@ async def test_ingress_route_exc_stop(store: MessageStore, monkeypatch: pytest.M
     assert outcome == (_ItemOutcome.STOPPED, None)
     assert mf.calls and mf.calls[0][0] == "ing-1"
     assert mf.calls[0][1].startswith("router error (ingest stopped):")
-    assert mf.calls[0][2] is runner._delivery_defaults
+    # The delivery defaults with no cap: a STOP keeps the row queued (vault BACKLOG #3211).
+    assert mf.calls[0][2] == runner._delivery_defaults.model_copy(update={"max_attempts": None})
     assert cs.calls == [("IB", "router ValueError on ing-1")]
 
 
@@ -500,7 +501,8 @@ async def test_apply_router_internal_error_stop(
     out = await runner._apply_router_internal_error("IB", _ingress_item(), ValueError("x"))
     assert out == (_ItemOutcome.STOPPED, None)
     assert mf.calls[0][1].startswith("router error (ingest stopped):")
-    assert mf.calls[0][2] is runner._delivery_defaults
+    # The delivery defaults with no cap: a STOP keeps the row queued (vault BACKLOG #3211).
+    assert mf.calls[0][2] == runner._delivery_defaults.model_copy(update={"max_attempts": None})
     assert cs.calls[0] == ("IB", "router ValueError on ing-1")
 
 

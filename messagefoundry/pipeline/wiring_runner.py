@@ -189,9 +189,9 @@ from messagefoundry.pipeline.stage_dispatcher import (
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
+    FailOutcome,
     MessageStatus,
     OutboxItem,
-    OutboxStatus,
     QueueStore,
     Stage,
     StreamingAttachmentsUnsupported,
@@ -536,14 +536,24 @@ _REFUSAL_LOG_MAX_LINES_PER_WINDOW = 100
 _REFUSAL_LOG_MAX_PAIRS = 4096
 
 
+def _without_cap(retry: RetryPolicy) -> RetryPolicy:
+    """``retry`` with no attempt cap, for an internal-error STOP arm. ``InternalErrorPolicy.STOP``
+    promises to leave the row queued for replay, and ``mark_failed`` under a finite cap dead-letters
+    it once the cap is reached (vault BACKLOG #3211). The backoff is kept. It only decides when the
+    row comes due once an operator restarts the stopped lane."""
+    return retry.model_copy(update={"max_attempts": None})
+
+
 class _RefusalLog:
     """The WARNING a permanent refusal writes after the delivery worker dead-letters it, throttled per
     (connection, refusal code) (BACKLOG #3043).
 
     A transient failure that ran out a finite ``max_attempts`` writes the same line, with
-    ``exhausted=True`` (BACKLOG #3108). Its pairs are keyed ``exhausted:<code>``, so they do not
-    share a window or a held count with permanent refusals of the same code. Both kinds do share
-    the cross-pair cap below, which bounds the whole log, not one kind of line.
+    ``exhausted=True`` (BACKLOG #3108). That flag is the key's third field (vault BACKLOG #3211), so
+    those pairs do not share a window or a held count with permanent refusals of the same code, and
+    no code a peer sends can collide with them. A row dead-lettered with no running connector has
+    no exception and no code: its code is ``None``, which no peer can send either. Both kinds do
+    share the cross-pair cap below, which bounds the whole log, not one kind of line.
 
     **What the line may carry.** The connection, the outbox row id (and the message id where the
     caller has it), the exception's class name and its ``code``. Never ``str(exc)`` or
@@ -595,15 +605,20 @@ class _RefusalLog:
         self._clock = clock
         self._max_lines = max_lines
         self._prune_at = max_pairs
-        # (connection, code) -> (when its last line was written, rows held back since then)
-        self._state: dict[tuple[str, str], tuple[float, int]] = {}
+        # (connection, code, exhausted) -> (when its last line was written, rows held back since then)
+        self._state: dict[tuple[str, str | None, bool], tuple[float, int]] = {}
         self._lines = 0  # lines written, across all pairs, since _lines_since
         self._lines_since = -math.inf
+
+    def held(self, name: str, code: str | None, *, exhausted: bool = False) -> int:
+        """How many rows the pair ``(name, code)`` has counted rather than logged since its last
+        line. 0 for a pair with nothing held, or none at all."""
+        return self._state.get((name, code, exhausted), (0.0, 0))[1]
 
     def warning(
         self,
         name: str,
-        exc: DeliveryError,
+        exc: DeliveryError | None,
         rows: int,
         message: str,
         *args: object,
@@ -612,12 +627,13 @@ class _RefusalLog:
     ) -> None:
         """Log ``message % args`` at WARNING, followed by ``exc``'s class name and code, unless the
         pair ``(name, code)`` logged inside the window, in which case count its ``rows``. Call it
-        AFTER the dead-letter write, so a line never claims a dead-letter that did not happen."""
+        AFTER the dead-letter write, so a line never claims a dead-letter that did not happen.
+        ``exc`` is ``None`` when no send was attempted; ``message`` then has to say why."""
         # getattr: a connector may raise a subclass that never set `code` (see _lane_stopping_fault),
         # and a plain DeliveryError has none. A missing code must not turn the dead-letter into an
         # AttributeError loop.
-        code = str(getattr(exc, "code", "?"))
-        key = (name, f"exhausted:{code}" if exhausted else code)
+        code = None if exc is None else str(getattr(exc, "code", "?"))
+        key = (name, code, exhausted)
         now = self._clock()
         last, held = self._state.get(key, (-math.inf, 0))
         if now - self._lines_since >= self._window:
@@ -634,13 +650,16 @@ class _RefusalLog:
             self._prune_at = max(self._prune_at, 2 * len(self._state))
         self._lines += 1
         self._state[key] = (now, 0)
-        message += " (%s, code %r)"
-        args = (*args, type(exc).__name__, code)
+        like = "like it"
+        if exc is not None:
+            message += " (%s, code %r)"
+            args = (*args, type(exc).__name__, code)
+            like = "with this code"
         if held:
-            message += " (%d more row(s) %s with this code on this connection since its last line)"
-            args = (*args, held, "dead-lettered at the retry cap" if exhausted else "refused")
-        message += "; more with this code in the next %.0f s are counted, not logged"
-        args = (*args, self._window)
+            message += " (%d more row(s) %s %s on this connection since its last line)"
+            args = (*args, held, "dead-lettered at the retry cap" if exhausted else "refused", like)
+        message += "; more %s in the next %.0f s are counted, not logged"
+        args = (*args, like, self._window)
         log.warning(message, *args, stacklevel=stacklevel)
 
 
@@ -7962,9 +7981,10 @@ class RegistryRunner:
             # builds the connector — and alert on the growing backlog of a failed lane.
             failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
-            retry_until = await self._mark_failed_and_arm(name, item.id, detail, retry)
+            failed = await self._mark_failed_and_arm(name, item.id, detail, retry)
+            self._note_retry_exhausted(name, None, failed, message_id=item.message_id)
             await self._delivery_failure_alert_checks(name)
-            return _ItemOutcome.PROCESSED, retry_until
+            return _ItemOutcome.PROCESSED, failed.retry_at
         # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
         # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
         # send below. A cheap, SYNCHRONOUS is_leader() read (cached state — no DB round-trip)
@@ -8089,8 +8109,9 @@ class RegistryRunner:
                     item.message_id,
                 )
             else:
-                retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
-                await self._note_retry_exhausted(name, exc, retry, retry_until, [item])
+                failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
+                retry_until = failed.retry_at
+                self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
                 await self._delivery_failure_alert_checks(name)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756: a store READ the send needed failed (the document re-attach or the
@@ -8099,15 +8120,17 @@ class RegistryRunner:
             # on one row stays bounded by max_attempts, and run the buildup and stall checks. Not
             # the internal-error arm, which would dead-letter (or STOP on) an unsent message, and
             # not _note_lane_unhealthy, because the partner was never contacted.
-            retry_until = await self._mark_failed_and_arm(name, item.id, str(exc), retry)
-            self._note_store_read_fault(name, exc, 1, retry_until)
+            failed = await self._mark_failed_and_arm(name, item.id, str(exc), retry)
+            retry_until = failed.retry_at
+            self._note_store_read_fault(name, exc, 1, failed)
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             # Transport failure (connect/IO/timeout/unparseable ACK) — transient; retry
             # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
             # replayable DLQ — bounded, not discarded).
-            retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
-            await self._note_retry_exhausted(name, exc, retry, retry_until, [item])
+            failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
+            retry_until = failed.retry_at
+            self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
             await self._delivery_failure_alert_checks(name)
             # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
             self._note_lane_unhealthy(name, item.id, exc)
@@ -8134,7 +8157,7 @@ class RegistryRunner:
                 await self.store.mark_failed(
                     item.id,
                     f"internal error (connection stopped): {safe_exc(exc)}",
-                    retry,
+                    _without_cap(retry),
                 )
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering {item.id}"
@@ -8322,9 +8345,10 @@ class RegistryRunner:
         if connector is None:
             failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
-            retry_until = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
+            failed = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
+            self._note_retry_exhausted(name, None, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
-            return _ItemOutcome.PROCESSED, retry_until
+            return _ItemOutcome.PROCESSED, failed.retry_at
         # L1 batch twin — see the single-item path for the full rationale. Same reasoning, and the
         # stakes are higher here: mark_batch_failed decides ONE disposition from the head's
         # attempts and applies it to all N, so a finite retry cap dead-letters the whole batch on a
@@ -8344,7 +8368,6 @@ class RegistryRunner:
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
         refused: list[_RefusedMember] = []
-        kept = list(items)  # the rows behind `ids`, so a failure arm can read the head's attempts
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -8401,19 +8424,22 @@ class RegistryRunner:
                     ids[0],
                 )
             else:
-                retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
-                await self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
+                failed = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+                retry_until = failed.retry_at
+                self._note_retry_exhausted(name, exc, failed, batch=True)
                 await self._delivery_failure_alert_checks(name)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756, the batch twin of the single-row arm: nothing was sent, so all N
             # re-pend on the retry policy's backoff rather than dead-lettering through the
             # internal-error arm below.
-            retry_until = await self._mark_batch_failed_and_arm(name, ids, str(exc), retry)
-            self._note_store_read_fault(name, exc, len(ids), retry_until)
+            failed = await self._mark_batch_failed_and_arm(name, ids, str(exc), retry)
+            retry_until = failed.retry_at
+            self._note_store_read_fault(name, exc, len(ids), failed)
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
-            retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
-            await self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
+            failed = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+            retry_until = failed.retry_at
+            self._note_retry_exhausted(name, exc, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
             self._note_lane_unhealthy(name, ids[0] if ids else head.id, exc)
         except Exception as exc:
@@ -8434,7 +8460,9 @@ class RegistryRunner:
                     type(exc).__name__,
                 )
                 await self.store.mark_batch_failed(
-                    ids, f"internal error (connection stopped): {safe_exc(exc)}", retry
+                    ids,
+                    f"internal error (connection stopped): {safe_exc(exc)}",
+                    _without_cap(retry),
                 )
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
@@ -8553,17 +8581,13 @@ class RegistryRunner:
 
     async def _mark_batch_failed_and_arm(
         self, lane: str, ids: Sequence[str], error: str, retry: RetryPolicy
-    ) -> float | None:
+    ) -> FailOutcome:
         """``mark_batch_failed`` + (per_lane wake ON) arm a one-shot retry wake at the shared deadline —
         the batch counterpart of :meth:`_mark_failed_and_arm`. All N re-pend to the same
         ``next_attempt_at``, so one timer re-claims the identical prefix. A dispatcher-drained lane skips
         the arming (the dispatcher parks off the returned deadline); a worker-drained lane arms, exactly
         as the single row does."""
-        next_at = await self.store.mark_batch_failed(list(ids), error, retry)
-        if self._per_lane_delivery(lane) and self._per_lane_wake and next_at is not None:
-            delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
-            asyncio.get_running_loop().call_later(delay, self._wake_lane, Stage.OUTBOUND, lane)
-        return next_at
+        return self._arm_retry(lane, await self.store.mark_batch_failed(list(ids), error, retry))
 
     async def _router_worker(self, name: str) -> None:
         """Drain the **ingress** stage for one inbound — the router half of the split pipeline (ADR
@@ -8662,7 +8686,7 @@ class RegistryRunner:
             await self.store.mark_failed(
                 item.id,
                 f"router error (ingest stopped): {safe_exc(exc)}",
-                self._delivery_defaults,
+                _without_cap(self._delivery_defaults),
             )
             self._alert_sink.connection_stopped(
                 name, detail=f"router {type(exc).__name__} on {item.id}"
@@ -8697,7 +8721,7 @@ class RegistryRunner:
             await self.store.mark_failed(
                 item.id,
                 f"handler error (transform stopped): {safe_exc(exc)}",
-                self._delivery_defaults,
+                _without_cap(self._delivery_defaults),
             )
             self._alert_sink.connection_stopped(
                 name, detail=f"handler {type(exc).__name__} on {item.id}"
@@ -9868,75 +9892,65 @@ class RegistryRunner:
             return  # oldest message hasn't stalled long enough yet
         self._fire_stall(name, age=oldest_age, now=now)
 
-    async def _note_retry_exhausted(
+    def _note_retry_exhausted(
         self,
         name: str,
-        exc: DeliveryError,
-        retry: RetryPolicy,
-        retry_until: float | None,
-        rows: Sequence[OutboxItem],
+        exc: DeliveryError | None,
+        failed: FailOutcome,
         *,
         batch: bool = False,
+        message_id: str | None = None,
     ) -> None:
-        """Write the content-free WARNING when a transient failure's ``mark_failed`` (``rows`` the one
-        row) or ``mark_batch_failed`` (``batch``, ``rows`` the members it was handed, head first)
-        just dead-lettered at a finite ``max_attempts`` (BACKLOG #3108). Before this, the store
-        wrote DEAD with no log line at all. Call it AFTER that write.
+        """Write the content-free WARNING when a ``mark_failed`` (``message_id`` its row's message)
+        or a ``mark_batch_failed`` (``batch``) just dead-lettered at a finite ``max_attempts``
+        (BACKLOG #3108). Before that item the store wrote DEAD with no log line at all. Call it AFTER
+        that write, with what it returned. ``exc`` is the transient failure, or ``None`` when the
+        lane had no running connector, so nothing was sent.
 
-        The store returns ``None`` for a dead-lettered row, but also for a vanished one and, on
-        Postgres and SQL Server, for a final write the H1 epoch fence rolled back and re-pended. So
-        a ``None`` alone proves nothing. The store's own rule, ``max_attempts is not None and
-        attempts >= max_attempts`` on the attempts the claim returned, first skips every case
-        below the cap with no read. At the cap, one read of the head row's status confirms DEAD
-        before the line claims it. This costs one read per dead-letter, and only on this path.
-        The read is a diagnostic, so it never raises out of the failure arm: if it fails, the line
-        still goes out and says the DEAD is unconfirmed, naming only the read's exception class.
-        Throttled with the permanent-refusal line, under its own ``exhausted:`` key."""
-        # An empty batch also returns None, with nothing dead-lettered.
-        if retry_until is not None or retry.max_attempts is None or not rows:
+        The store reads the attempts and writes DEAD in one transaction, and its outcome says what
+        it did (vault BACKLOG #3211). So the line names the row the store decided from and the
+        attempts it read there, with no read back of the row. Nothing else here can disagree with
+        the write: not a batch head that vanished, not a lease sweep that moved the attempts, not an
+        operator replay that landed after the write. Throttled with the permanent-refusal line,
+        under its own ``exhausted`` key."""
+        if not failed.dead:
             return
-        head = rows[0]  # mark_batch_failed decides from its first member
-        if head.attempts < retry.max_attempts:
-            return
-        unconfirmed = ""
-        try:
-            outbox = await self.store.outbox_for(head.message_id)
-        except Exception as read_exc:  # noqa: BLE001 -- a diagnostic read must not change the arm
-            unconfirmed = f"; unconfirmed, the status read failed ({type(read_exc).__name__})"
-        else:
-            if not any(
-                r["id"] == head.id and r["status"] == OutboxStatus.DEAD.value for r in outbox
-            ):
-                return
         subject_args: tuple[object, ...]
         if batch:
-            subject, subject_args = "a batch of %d (head outbox row %s)", (len(rows), head.id)
+            subject, subject_args = (
+                "a batch of %d (head outbox row %s)",
+                (failed.dead, failed.head_id),
+            )
         else:
-            subject, subject_args = "outbox row %s (message %s)", (head.id, head.message_id)
+            subject, subject_args = "outbox row %s (message %s)", (failed.head_id, message_id)
+        cause = "failed" if exc is not None else "found no running connector"
         self._refusal_log.warning(
             name,
             exc,
-            len(rows),
-            "delivery worker %r: " + subject + " failed and was dead-lettered at the retry cap, "
-            "after %d attempt(s)" + (" of its head" if batch else "") + "%s",
+            failed.dead,
+            "delivery worker %r: " + subject + " " + cause + " and was dead-lettered at the retry "
+            "cap, after %d attempt(s)" + (" of its head" if batch else ""),
             name,
             *subject_args,
-            head.attempts,
-            unconfirmed,
+            failed.attempts,
             exhausted=True,
             stacklevel=3,
         )
 
     def _note_store_read_fault(
-        self, name: str, exc: _StoreReadFault, rows: int, retry_until: float | None
+        self, name: str, exc: _StoreReadFault, rows: int, failed: FailOutcome
     ) -> None:
         """Log a pre-send store read fault AFTER its outcome is written, so the line says what
-        happened: re-pended, or dead-lettered at the retry cap. Through a per-lane
+        happened: re-pended, dead-lettered at the retry cap, or neither, which is a row that was
+        gone or a final write the H1 fence re-pended (vault BACKLOG #3211). Through a per-lane
         :class:`~messagefoundry.log_backoff.FailureRun`, because an UNORDERED lane can fail a whole
         backlog fast during a store outage and a line per row would be a flood (BACKLOG #1844)."""
-        outcome = (
-            "re-pended with backoff" if retry_until is not None else "dead-lettered at the cap"
-        )
+        if failed.retry_at is not None:
+            outcome = "re-pended with backoff"
+        elif failed.dead:
+            outcome = "dead-lettered at the cap"
+        else:
+            outcome = "no retry scheduled: the row was gone, or the H1 fence re-pended it"
         run = self._store_read_fault_runs.get(name, FailureRun())
         self._store_read_fault_runs[name] = run.record(
             log,
@@ -10213,17 +10227,18 @@ class RegistryRunner:
 
     async def _mark_failed_and_arm(
         self, lane: str, outbox_id: str, error: str, retry: RetryPolicy
-    ) -> float | None:
+    ) -> FailOutcome:
         """``mark_failed`` + (per-lane wake ON) arm a one-shot timer that wakes this OUTBOUND lane just
         past the row's ``next_attempt_at`` — the retry re-claim used to ride the short idle poll, which
         the WS-C backstop removed, so the retry schedule needs its own wake. Slack keeps the wake at-or-
         after due time (an early wake claims nothing, then sleeps a whole backstop). ``mark_failed``
-        returns ``None`` when the row dead-lettered (or vanished) — nothing to re-claim, no timer. The
-        timer only sets an Event: firing after shutdown or a reload respawn is harmless (events are
+        returns no ``retry_at`` when the row dead-lettered (or vanished) — nothing to re-claim, no
+        timer. The timer only sets an Event: firing after shutdown or a reload respawn is harmless (events are
         get-or-create by stable lane name), and at-least-once never depends on it (the backstop and the
         always-re-claim loop still bound a lost timer to added latency, never loss).
 
-        Returns the row's retry ``next_attempt_at`` (``None`` when it dead-lettered/vanished) — the
+        Returns the store's :class:`~messagefoundry.store.FailOutcome` (vault BACKLOG #3211). Its
+        ``retry_at`` is the row's retry ``next_attempt_at`` (``None`` when it dead-lettered/vanished) — the
         additive ADR 0066 return the delivery body surfaces as its ``retry_until`` so the pooled
         dispatcher PARKs the lane on it. Since ADR 0157 Amendment A it comes back even when nothing was
         re-pended, which since the 2026-09-29 widening means the row was already DONE, DEAD or
@@ -10231,11 +10246,17 @@ class RegistryRunner:
         its own exact park timer off the returned deadline) and taken for a lane a per-lane WORKER
         drains — which under pooled means an UNORDERED lane (ADR 0066 D4), whose retry would otherwise
         ride the idle backstop because no dispatcher parks on its behalf."""
-        next_at = await self.store.mark_failed(outbox_id, error, retry)
+        return self._arm_retry(lane, await self.store.mark_failed(outbox_id, error, retry))
+
+    def _arm_retry(self, lane: str, failed: FailOutcome) -> FailOutcome:
+        """Arm the one-shot retry wake for ``failed``'s ``retry_at`` on a lane a per-lane WORKER
+        drains, and hand ``failed`` back. The shared tail of :meth:`_mark_failed_and_arm` and
+        :meth:`_mark_batch_failed_and_arm`."""
+        next_at = failed.retry_at
         if self._per_lane_delivery(lane) and self._per_lane_wake and next_at is not None:
             delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
             asyncio.get_running_loop().call_later(delay, self._wake_lane, Stage.OUTBOUND, lane)
-        return next_at
+        return failed
 
     async def _stop_or_sleep(self, delay: float) -> bool:
         """Sleep up to ``delay`` seconds; return True if a stop was requested meanwhile (so a

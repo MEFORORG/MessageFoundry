@@ -1016,6 +1016,30 @@ class OutboxItem:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class FailOutcome:
+    """What one ``mark_failed`` or ``mark_batch_failed`` call did, read inside its own write
+    (vault BACKLOG #3211). The runner logs a dead-letter at the retry cap from this, with no read
+    back of the row.
+
+    ``retry_at`` is the new ``next_attempt_at`` (the batch's shared one) on the retry branch. It
+    comes back even when the status term skipped every row (ADR 0157 Amendment A), so it does not
+    prove a row is PENDING. It is ``None`` on every other path.
+
+    ``dead`` is how many rows this call committed DEAD. It is 0 on the retry branch, for a vanished
+    row or an empty batch, and for a final write the H1 epoch fence rolled back and re-pended.
+
+    ``head_id`` and ``attempts`` name the row the store decided from, with the attempts it read
+    there: the one row, or a batch's first member still present. Both are ``None`` when no row was
+    present. They can differ from what the claim returned: a lease sweep can re-pend a row under a
+    slow send, and a second claim then spends another attempt."""
+
+    retry_at: float | None = None
+    dead: int = 0
+    head_id: str | None = None
+    attempts: int | None = None
+
+
 class ClaimAbortPhase(StrEnum):
     """WHICH statement of a claim transaction hit the lock timeout (BACKLOG #1270).
 
@@ -9672,17 +9696,18 @@ class MessageStore:
 
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
-    ) -> float | None:
-        """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns the
-        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT or
-        PENDING to re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry
-        wake on a float — WS-C; see the base contract)."""
+    ) -> FailOutcome:
+        """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns a
+        :class:`FailOutcome`: its ``retry_at`` is the new ``next_attempt_at`` on the retry branch,
+        whether or not the row was still INFLIGHT or PENDING to re-pend (the runner arms the
+        per-lane retry wake on it — WS-C), and ``dead`` is 1 when this call dead-lettered the row.
+        A missing row returns an empty outcome. See the base contract."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        rescheduled_at: float | None = None
+        outcome = FailOutcome()
 
         async def _body() -> None:
-            nonlocal rescheduled_at
+            nonlocal outcome
             row = await self._row(outbox_id)
             if row is None:
                 raise _AbortMember(None)
@@ -9722,10 +9747,14 @@ class MessageStore:
                     ),
                 ),
             )
-            if retrying:
-                rescheduled_at = next_at
-                if cur.rowcount == 0:
-                    raise _AbortMember(None)  # zero-mutation exit, as the other no-op paths
+            outcome = FailOutcome(
+                retry_at=next_at if retrying else None,
+                dead=0 if retrying else 1,
+                head_id=outbox_id,
+                attempts=attempts,
+            )
+            if retrying and cur.rowcount == 0:
+                raise _AbortMember(None)  # zero-mutation exit, as the other no-op paths
             await self._event(
                 row["message_id"],
                 event,
@@ -9737,7 +9766,7 @@ class MessageStore:
                 await self._maybe_finalize_message(row["message_id"], now)
 
         await self._run_grouped(_body)
-        return rescheduled_at
+        return outcome
 
     async def mark_batch_failed(
         self,
@@ -9745,23 +9774,24 @@ class MessageStore:
         error: str,
         retry: RetryPolicy,
         now: float | None = None,
-    ) -> float | None:
+    ) -> FailOutcome:
         """Re-pend (or dead-letter) N outbound rows that FAILED **as a unit** — one ``BHS``…``BTS``
         envelope send the partner rejected transiently or that hit a transport error (ADR 0082). The
         atomic-batch guarantee: the disposition (reschedule-with-backoff vs dead-letter) is decided from
         the **head** member's attempts and applied **identically** to every member, so all N re-pend to
         the SAME ``next_attempt_at`` and are re-claimed as the identical contiguous prefix (strict FIFO
         preserved), or all dead-letter together — never a split batch that fractures the prefix. Returns
-        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered (the
-        runner arms the lane retry wake on a float). A vanished member is skipped, and on the retry
+        a :class:`FailOutcome`: the shared ``next_attempt_at`` as ``retry_at`` when rescheduled (the
+        runner arms the lane retry wake on it), and the members it dead-lettered as ``dead``, decided
+        from the first member still present (``head_id``). A vanished member is skipped, and on the retry
         branch so is a member that is neither INFLIGHT nor PENDING (ADR 0157 Amendment A, widened
         2026-09-29), which is a terminal member; it keeps its own state."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        rescheduled_at: float | None = None
+        outcome = FailOutcome()
 
         async def _body() -> None:
-            nonlocal rescheduled_at
+            nonlocal outcome
             rows = [(oid, await self._row(oid)) for oid in outbox_ids]
             present = [(oid, r) for oid, r in rows if r is not None]
             if not present:
@@ -9774,7 +9804,6 @@ class MessageStore:
                 # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
                 backoff = retry.backoff_for(head_attempts)
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                rescheduled_at = next_at
             # ADR 0157 Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a
             # terminal member is skipped, event and all. The INFLIGHT and PENDING members re-pend
             # together to the one shared deadline.
@@ -9810,13 +9839,19 @@ class MessageStore:
                 )
                 if status == OutboxStatus.DEAD.value:
                     finalize[row["message_id"]] = None
+            outcome = FailOutcome(
+                retry_at=next_at if retrying else None,
+                dead=0 if retrying else changed,
+                head_id=present[0][0],
+                attempts=head_attempts,
+            )
             if not changed:
                 raise _AbortMember(None)  # every member was skipped: a zero-mutation exit
             for message_id in sorted(finalize):  # H-8 canonical order (see below)
                 await self._maybe_finalize_message(message_id, now)
 
         await self._run_grouped(_body)
-        return rescheduled_at
+        return outcome
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None

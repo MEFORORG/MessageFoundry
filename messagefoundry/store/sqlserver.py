@@ -165,6 +165,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    FailOutcome,
     FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
@@ -9208,10 +9209,11 @@ class SqlServerStore:
 
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
-    ) -> float | None:
-        """See the base contract: returns ``next_attempt_at`` on the retry branch, whether or not the
-        row was still INFLIGHT or PENDING to re-pend, and ``None`` when dead-lettered/missing (the
-        runner arms the per-lane retry wake on a float, WS-C)."""
+    ) -> FailOutcome:
+        """See the base contract: returns a :class:`FailOutcome` whose ``retry_at`` is set on the
+        retry branch, whether or not the row was still INFLIGHT or PENDING to re-pend (the runner
+        arms the per-lane retry wake on it, WS-C), and whose ``dead`` is 1 when this call
+        dead-lettered the row."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9223,7 +9225,7 @@ class SqlServerStore:
                 row = await cur.fetchone()
                 if row is None:
                     await self._commit(conn)
-                    return None
+                    return FailOutcome()
                 message_id, destination_name, attempts = row[0], row[1], row[2]
                 # max_attempts None = retry forever (never dead-letter here); a finite cap dead-letters
                 # once exhausted (mirrors the SQLite backend's mark_failed).
@@ -9273,7 +9275,7 @@ class SqlServerStore:
                     await cur.execute(sql, params)
                     if not await cur.fetchall():
                         await self._commit(conn)
-                        return next_at
+                        return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
                 else:
                     await self._exec_terminal(
                         cur, "mark_failed(dead)", (outbox_id,), sql, params, checked=bool(guard)
@@ -9284,16 +9286,16 @@ class SqlServerStore:
                 if status == OutboxStatus.DEAD.value:
                     await self._maybe_finalize(cur, message_id, now)
                     await self._commit(conn)
-                    return None
+                    return FailOutcome(dead=1, head_id=outbox_id, attempts=attempts)
                 await self._commit(conn)
-                return next_at
+                return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
             except Exception:
                 await conn.rollback()
                 raise
-        # Reached only when _fence_scope swallowed a rejected DEAD branch. None is what the DEAD branch
-        # returns, so _mark_failed_and_arm arms no retry timer: D1 re-pended the row, and only the
-        # SUCCESSOR may claim it.
-        return None
+        # Reached only when _fence_scope swallowed a rejected DEAD branch. No retry time, so
+        # _mark_failed_and_arm arms no retry timer: D1 re-pended the row, and only the SUCCESSOR may
+        # claim it. Nothing is dead: the fence rolled the DEAD write back.
+        return FailOutcome()
 
     async def mark_batch_failed(
         self,
@@ -9301,11 +9303,12 @@ class SqlServerStore:
         error: str,
         retry: RetryPolicy,
         now: float | None = None,
-    ) -> float | None:
+    ) -> FailOutcome:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
+        all dead-letter together). Returns a :class:`FailOutcome` naming the first member still
+        present, with the shared ``next_attempt_at`` or the count written DEAD.
         On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
         own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
         when every member was skipped."""
@@ -9324,7 +9327,7 @@ class SqlServerStore:
                         present.append((outbox_id, row[0], row[1], row[2]))
                 if not present:
                     await self._commit(conn)
-                    return None
+                    return FailOutcome()
                 head_attempts = present[0][3]
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
@@ -9356,6 +9359,7 @@ class SqlServerStore:
                     + guard
                 )
                 finalize: dict[str, None] = {}
+                changed = 0
                 for outbox_id, message_id, destination_name, attempts in present:
                     params = (
                         status,
@@ -9378,6 +9382,7 @@ class SqlServerStore:
                             params,
                             checked=bool(guard),
                         )
+                    changed += 1
                     await self._event(
                         cur,
                         message_id,
@@ -9391,12 +9396,17 @@ class SqlServerStore:
                 for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
-                return None if status == OutboxStatus.DEAD.value else next_at
+                return FailOutcome(
+                    retry_at=next_at if retrying else None,
+                    dead=0 if retrying else changed,
+                    head_id=present[0][0],
+                    attempts=head_attempts,
+                )
             except Exception:
                 await conn.rollback()
                 raise
         # Reached only when _fence_scope swallowed a rejected DEAD branch (D1 re-pended).
-        return None
+        return FailOutcome()
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
