@@ -552,7 +552,7 @@ Dependencies are declared in two tiers. pyproject.toml states mostly loose \>= m
 
 - **Vet before adopting.** The one real human decision: confirm a new package is real, reputable, maintained, and sanely licensed — which guards against typosquats and AI-hallucinated package names (a genuine risk: assistants routinely suggest packages that don’t exist). Choosing a widely-audited library is itself the mitigation for not reading it.
 
-- **Stay current through Dependabot.** Dependabot opens version-bump PRs; you review the changelog and the lockfile delta — not the library’s code — and CI re-audits and re-tests before merge. The exact pins are the exception. Dependabot proposes no release past a pin’s minor, and the wire test fails any bump it does propose. A human moves each pin after re-measuring the new release.
+- **Stay current through Dependabot.** Dependabot opens version-bump PRs; you review the changelog and the lockfile delta — not the library’s code — and CI re-audits and re-tests before merge. The exact pins are the exception. Dependabot proposes no release past a pin’s minor, and tests/test_header_floor_wire.py fails any bump it does propose. A human moves each pin after re-measuring the new release.
 
 - **CI enforces it (DEP-1).** requirements.lock must stay in sync with pyproject.toml, and pip-audit blocks the build on a known CVE in any pinned version; a weekly security cron, an SBOM job, and bandit/semgrep static analysis back it up.
 
