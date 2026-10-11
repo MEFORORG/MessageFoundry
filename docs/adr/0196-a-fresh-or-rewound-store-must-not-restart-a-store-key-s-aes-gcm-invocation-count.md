@@ -511,6 +511,10 @@ where they were, each marked as amended.
   and would leave this row unenforced.
 - The Transit attestation (`store/transit_attestation.py`, ADR 0138's 2026-10-07 amendment) binds to
   the Transit data-key name. It does not cover the local DEK.
+- The key-age clock skips this DEK too. The engine passes `cipher_info().active_key_id` as
+  `dek_key_id`, and a `TransitCipher` has none. So `enforce_store_key_expiry`
+  (`pipeline/secret_rotation.py`) returns early, on the stated premise that a Transit store has no
+  local DEK.
 
 So on this row nothing warns at 2^31 and nothing refuses at 2^32. ADR 0138's 2026-09-28 amendment
 says the Transit path writes no `cipher_meta` row. That is true of the cells; the archive path
@@ -521,10 +525,11 @@ reading of routes 1 to 3, a recreated store meets no row for the DEK, and the ne
 starts it again from zero. Nobody has measured that for the archive path.
 
 **What stays as it is.** Under `vault_transit`, archives keep sealing under the local DEK with local
-nonces. The store's cells stay out of this ADR's scope; their bound is ADR 0138's operator
+nonces. So each backup pass also puts that DEK in engine heap, which ADR 0138's `vault_transit` avoids
+for the cells. The store's cells stay out of this ADR's scope; their bound is ADR 0138's operator
 precondition and attestation. BACKLOG #2187 also offered two other choices, and neither was taken:
 seal Transit-mode archives under a salted sub-key, or seal them through Transit.
 
-Per engine `CLAUDE.md` section 0 there are no deployments. A first site on `vault_transit` that
-configures a key for the backup would seal every archive under that DEK in process, and no enforced
-ceiling would cover that key's archive use.
+Per engine `CLAUDE.md` section 0 there are no deployments. Take a first site on `vault_transit`
+that configures a key for the backup. It would seal every archive under that DEK in process. No
+enforced ceiling would cover that key's archive use.
