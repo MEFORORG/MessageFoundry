@@ -2738,6 +2738,10 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "encrypt",  # the keyless-PHI serve gate refuses it in its own right
         "trust_server_certificate",  # gated by weakened_tls_escape_permitted (the ADR 0092 clamp)
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
+        # Vault BACKLOG #2619. Ships ON; off, a SQLite purge leaves the old bytes in the file's free
+        # space. That IS a loosening, so reporting it in security_loosenings() is OWED, not decided
+        # against: it waits on that registry's own edit and its SECURITY-LOOSENING.md entry.
+        "secure_delete",
     }
     exempt_auth = {
         # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three

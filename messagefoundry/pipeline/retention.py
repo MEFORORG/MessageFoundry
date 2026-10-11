@@ -354,8 +354,9 @@ class RetentionRunner:
     def enabled(self) -> bool:
         """True when any window/threshold/maintenance knob is configured. When False, :meth:`start`
         spawns no task. Every purge window is off by default, but the low-disk floor
-        (``min_free_disk_mb``, BACKLOG #290) ships ON, so on a file-backed SQLite store the runner
-        starts on stock settings to run that one check. It purges nothing unless a window is set.
+        (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL truncate (``wal_checkpoint_seconds``,
+        vault BACKLOG #2619) ship ON, so on a file-backed SQLite store the runner starts on stock
+        settings to run those two. It purges nothing unless a window is set.
 
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
         per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
@@ -370,7 +371,7 @@ class RetentionRunner:
             or s.search_preset_days
             or s.reference_snapshot_days
             or s.max_db_mb
-            or s.wal_checkpoint_seconds
+            or self._wal_truncate_applies()
             or s.vacuum_time() is not None
             or self._disk_floor_applies()
         ):
@@ -684,7 +685,7 @@ class RetentionRunner:
         wal_checkpointed = False
         if (
             not _deadline_hit()
-            and s.wal_checkpoint_seconds > 0
+            and self._wal_truncate_applies()
             and now - self._last_wal >= s.wal_checkpoint_seconds
         ):
             await self._store.wal_checkpoint()
@@ -798,6 +799,12 @@ class RetentionRunner:
         """The low-disk floor (BACKLOG #290) is on AND this is a file-backed SQLite store
         (:func:`sqlite_store_file` decides the second half)."""
         return self._settings.min_free_disk_mb > 0 and self._floor_path is not None
+
+    def _wal_truncate_applies(self) -> bool:
+        """The WAL truncate is on AND this store has a ``-wal`` file to truncate, which is the same
+        file-backed SQLite test as the disk floor's. It ships ON (vault BACKLOG #2619), so both
+        ``enabled`` and the pass ask this, and neither runs it where ``wal_checkpoint`` is a no-op."""
+        return self._settings.wal_checkpoint_seconds > 0 and self._floor_path is not None
 
     async def _check_disk_floor(self) -> bool:
         """Log a WARNING when free space on the SQLite store's volume is below
