@@ -82,6 +82,30 @@
     `tests/test_claude_settings_contract.py` reads that row and evaluates it the way the client does,
     against the guard below, so the two cannot part again.
 
+    A DESKTOP SESSION GETS A SECOND, LABELLED SOURCE (BACKLOG #1459; seat decision under owner
+    delegation 2026-10-08, not an owner ruling). A Desktop or SDK session never runs a statusLine, so
+    on a Desktop-only config root the statusLine reading stays UNKNOWN for good. When it is UNKNOWN for
+    such a session, the hook also reads the Steward's out-of-repo `status.json` and prints it as its
+    own block. Four rules keep it from passing as a statusLine reading:
+
+      Its own label. Every line it prints says where it came from, and its verdict line never
+      replaces the statusLine verdict above it.
+
+      Its own age and TTL. Each entry records when the Steward read it (`ts`) and how long the
+      Steward itself would serve it (`ttl`). Past that TTL the fallback is UNKNOWN, never projected
+      from; the statusLine's $MaxAgeMinutes does not apply to it.
+
+      The same subject as the statusLine. The Steward keys a pool by the login record's
+      `oauthAccount.organizationUuid`, or `acct:<accountUuid>` without one (watch.py, main()). This
+      config root's login record names the key, and an entry naming another account is refused.
+
+      No grade. The Steward's `state` field is a severity label, not a stop order (korus
+      roles/STEWARD.md 3b), and usage.ps1's thresholds were set for statusLine readings. The
+      fallback prints the numbers with their age and leaves grading to the reader.
+
+    The file lives outside git and the Steward owns it. A schema version this hook does not know is
+    UNKNOWN rather than a guess.
+
 .EXAMPLE
     Drive it by hand the way the harness drives it:
         '{"tool_name":"Task"}' | pwsh -NoProfile -File scripts\hooks\usage-headroom-inject.ps1
@@ -97,7 +121,12 @@ param(
     [string]$StateDir,
     # The stated staleness threshold. Passed through, so the prose below and the reader that decides
     # UNKNOWN cannot name two different numbers.
-    [int]$MaxAgeMinutes = 20
+    [int]$MaxAgeMinutes = 20,
+    # The Steward's cache, read as a labelled fallback (BACKLOG #1459). Unset in production, so the
+    # path resolves the way the Steward's own watch.py resolves it; set by tests to a fixture.
+    [string]$StewardStatusFile,
+    # The login record that names this config root's pool. Unset in production; set by tests.
+    [string]$LoginRecord
 )
 
 # No `Stop`: this hook informs, and a throw here would be a tool call broken by a decoration.
@@ -176,13 +205,131 @@ function Get-CauseNote($Doc) {
         }
         return $out
     }
-    $ep = Get-Folded $env:CLAUDE_CODE_ENTRYPOINT 40
-    if ($ep -eq "claude-desktop" -or $ep -like "sdk-*") {
-        return @("  publisher: this session's entrypoint is '$ep', which never runs a statusLine, so " +
+    if (Test-NoStatusLineClient) {
+        return @("  publisher: this session's entrypoint is '$(Get-Entrypoint)', which never runs a statusLine, so " +
             "nothing this session does will refresh this file. Only an interactive terminal 'claude' " +
             "session pinned to this config root publishes it.")
     }
     return @()
+}
+
+function Get-Entrypoint { Get-Folded $env:CLAUDE_CODE_ENTRYPOINT 40 }
+
+# Only these clients are named; any other entrypoint, an unfamiliar one included, is not.
+function Test-NoStatusLineClient {
+    $ep = Get-Entrypoint
+    return ($ep -eq "claude-desktop" -or $ep -like "sdk-*")
+}
+
+# THE STEWARD'S status.json, AS A LABELLED FALLBACK (BACKLOG #1459; seat decision under owner
+# delegation 2026-10-08, not an owner ruling). The header says why each refusal below exists. Returns
+# the lines to print, or nothing when the fallback does not apply.
+#
+# UNDER -StateDir IT RUNS ONLY WHEN BOTH FILES ARE NAMED. A caller that named a state directory is a
+# test or a by-hand probe, and falling through to the real ~/.claude files there would read a live
+# account's numbers into a fixture run.
+function Get-StewardFallback {
+    if (-not (Test-NoStatusLineClient)) { return @() }
+    if ($StateDir -and -not ($StewardStatusFile -and $LoginRecord)) { return @() }
+
+    # WHERE THE STEWARD WRITES, resolved the way watch.py resolves it: MEFOR_USAGE_DIR, else the config
+    # root's mefor-usage, else the copy beside watch.py when that directory holds no tooling. The
+    # settings files invoke watch.py by absolute path under ~/.claude/mefor-usage (STEWARD.md 3c).
+    $cfg = $env:CLAUDE_CONFIG_DIR
+    $statusPath = $StewardStatusFile
+    if (-not $statusPath) {
+        $dir = $env:MEFOR_USAGE_DIR
+        if (-not $dir) { $dir = Join-Path $(if ($cfg) { $cfg } else { Join-Path $HOME ".claude" }) "mefor-usage" }
+        if (-not (Test-Path -LiteralPath (Join-Path $dir "usage-now.py"))) {
+            $dir = Join-Path (Join-Path $HOME ".claude") "mefor-usage"
+        }
+        $statusPath = Join-Path $dir "status.json"
+    }
+    # watch.py's CLAUDE_JSON: the pinned root's .claude.json, or ~/.claude.json for the default root.
+    $loginPath = $LoginRecord
+    if (-not $loginPath) {
+        $loginPath = if ($cfg) { Join-Path $cfg ".claude.json" } else { Join-Path $HOME ".claude.json" }
+    }
+
+    $lines = @("  fallback source: the Steward's status.json at " + (Get-Folded $statusPath) +
+        ". This is NOT a statusLine reading. It carries its own age and the Steward's own TTL.")
+    $unknown = {
+        param([string]$Why)
+        return $lines + "  fallback verdict: UNKNOWN -- $Why"
+    }
+
+    # -AsHashtable IS REQUIRED, NOT STYLE. A real .claude.json carries project keys that differ only by
+    # case, and plain ConvertFrom-Json throws on them -- measured on this box's own login record, where
+    # it made every root read "no readable login record".
+    $login = $null
+    try { $login = Get-Content -LiteralPath $loginPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { }
+    if (-not $login) {
+        return & $unknown ("no readable login record at " + (Get-Folded $loginPath) + ", so no pool can be named")
+    }
+    $org = Get-Folded $login.oauthAccount.organizationUuid 80
+    $acct = Get-Folded $login.oauthAccount.accountUuid 80
+    if (-not $org -and -not $acct) {
+        return & $unknown "the login record names no account, so no pool can be named"
+    }
+    # watch.py's _cli_pool_selfcheck: a login record that disagrees with itself cannot name a pool.
+    $billed = Get-Folded $login.cachedUsageUtilization.accountUuid 80
+    if ($acct -and $billed -and $acct -ne $billed) {
+        return & $unknown ("the login record disagrees with itself (oauthAccount names account " +
+            $acct.Substring(0, [math]::Min(8, $acct.Length)) + ", cachedUsageUtilization names " +
+            $billed.Substring(0, [math]::Min(8, $billed.Length)) + "), so it cannot name this pool")
+    }
+    $key = if ($org) { $org } else { "acct:$acct" }
+    $pool = $key.Substring(0, [math]::Min(13, $key.Length))
+
+    if (-not (Test-Path -LiteralPath $statusPath)) { return & $unknown "the Steward has never written this file" }
+    $doc = $null
+    try { $doc = Get-Content -LiteralPath $statusPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { }
+    if ($doc -isnot [System.Collections.IDictionary]) { return & $unknown "the file is present and nothing readable came out of it" }
+    if ([string]$doc.version -ne "3") {
+        return & $unknown ("its schema version is '" + (Get-Folded $doc.version 20) + "', and this hook reads only version 3")
+    }
+    $entry = $null
+    if ($doc.pools -is [System.Collections.IDictionary]) { $entry = $doc.pools[$key] }
+    if ($entry -isnot [System.Collections.IDictionary]) { return & $unknown "the Steward has no entry for pool $pool, the login this config root records" }
+
+    # The key matched; the entry must agree. An entry naming another account is refused, not read.
+    $entryOrg = Get-Folded $entry.org 80
+    $entryAcct = Get-Folded $entry.account 80
+    if (($org -and $entryOrg -and $entryOrg -ne $org) -or ($acct -and $entryAcct -and $entryAcct -ne $acct)) {
+        return & $unknown "the entry under pool $pool names another account, so it was read and refused"
+    }
+
+    $ts = $entry.ts -as [double]
+    $ttl = $entry.ttl -as [double]
+    if ($null -eq $ts -or -not [double]::IsFinite($ts)) { return & $unknown "the entry for pool $pool carries no read time" }
+    if ($null -eq $ttl -or -not [double]::IsFinite($ttl) -or $ttl -le 0) {
+        return & $unknown "the entry for pool $pool carries no TTL, so its freshness cannot be judged"
+    }
+    $ageSec = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 - $ts
+    # usage.ps1's skew allowance, so the two sources refuse a future date at the same point.
+    if ($ageSec -lt -120) { return & $unknown "the entry for pool $pool is dated in the FUTURE -- clock skew or a bad timestamp" }
+    $ageSec = [math]::Max(0.0, $ageSec)
+    $ageMin = "{0:0.0}" -f ($ageSec / 60)
+    $ttlMin = "{0:0.#}" -f ($ttl / 60)
+    if ($ageSec -gt $ttl) {
+        return & $unknown ("the entry for pool $pool is $ageMin min old, past the Steward's own TTL of " +
+            "$ttlMin min, so it is not projected from")
+    }
+    if ((Get-Folded $entry.kind 20) -ne "reading") {
+        return & $unknown "the Steward's own entry for pool $pool is not a reading"
+    }
+
+    $lines += "  fallback verdict: READ, not graded here -- pool $pool, the login this config root records"
+    foreach ($w in @(@("5-hour", "5h"), @("weekly", "7d"))) {
+        $v = $entry.levels.($w[0]) -as [double]
+        $label = "  steward {0,-3}" -f $w[1]
+        if ($null -eq $v -or -not [double]::IsFinite($v)) {
+            $lines += "$label UNKNOWN -- the Steward's entry carries no $($w[0]) reading"
+            continue
+        }
+        $lines += "$label {0,5:0.0}% used   [read {1} min ago by the Steward; its TTL is {2} min]" -f $v, $ageMin, $ttlMin
+    }
+    return $lines
 }
 
 # UNKNOWN IS STILL AN INJECTION. Exiting quietly on a failed read would leave the session with no
@@ -194,6 +341,7 @@ function Write-Unknown([string]$Detail, [string[]]$Extra = @()) {
             $Extra
             "  UNKNOWN is not zero headroom and it is not full headroom. It is no measurement."
             "  Spawn on your own judgment, and expect a cutoff to be possible at any point."
+            @(Get-StewardFallback)
         ) -join "`n")
 }
 
@@ -360,5 +508,7 @@ if ($state -eq "UNKNOWN") {
 $advice = Get-Folded $j.advice
 if ($advice) { $lines += "  $advice" }
 $lines += "  $AGE_NOTE"
+# AFTER the age note, which is about the statusLine reading and does not apply to the fallback.
+if ($state -eq "UNKNOWN") { $lines += @(Get-StewardFallback) }
 
 Write-Context ($lines -join "`n")
