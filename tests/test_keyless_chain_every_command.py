@@ -250,7 +250,18 @@ def test_provision_admin_refuses_before_writing_when_the_chain_cannot_take_a_row
     _fresh_store(db, key=generate_key())  # the keyed open writes the genesis row: keyed from row 1
     _opt_out(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     assert rc != 0
     assert "error" in json.loads(capsys.readouterr().out)
     assert _users(db) == 0, "the account was written before the audit row was refused"
@@ -1508,7 +1519,18 @@ def test_a_key_the_provider_did_not_resolve_is_refused_at_the_seam_with_its_caus
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "unresolved.db"
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 2
     assert "reads only MEFOR_STORE_ENCRYPTION_KEY" in error, error
@@ -1528,7 +1550,18 @@ def test_provision_admin_opens_an_existing_empty_store_under_the_opt_out(
     _fresh_store(db)
     _opt_out(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     assert rc == 0, capsys.readouterr()
     assert _users(db) == 1
     assert _audit_rows(db) == 1  # the provisioning row alone: the probe before it writes none

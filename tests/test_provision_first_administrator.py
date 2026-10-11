@@ -310,32 +310,28 @@ async def test_a_supplied_address_also_lands_on_a_repaired_row() -> None:
         await store.close()
 
 
-async def test_a_blank_address_is_no_address_in_every_column_and_in_the_audit() -> None:
-    """Normalized once, so the mirror, the notification column and the audit cannot disagree.
+@pytest.mark.parametrize("address", ["   ", "not-a-mailbox"])
+async def test_a_blank_or_malformed_address_is_refused_and_writes_nothing(address: str) -> None:
+    """BACKLOG #1138: the service checks a given address as ``create_local_user`` does, so a blank
+    one is refused rather than read as none (AC-9 before Amendment D), and a malformed one too.
 
-    A whitespace-only ``--email`` used to reach ``users.email`` untrimmed while auditing as though a
-    notice target had been set -- three readers of one argument, each with its own idea of "supplied".
-    """
+    A whitespace-only ``--email`` once reached ``users.email`` untrimmed while auditing as though a
+    notice target had been set. Refusing it first leaves the mirror, the notification column and
+    the audit nothing to disagree about."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
-        await service.provision_first_administrator(
-            username="site-admin",
-            password=_PASSWORD,
-            notify_email="   ",
-            actor="test",
-            **provision_totp(),
-        )
-        row = await store.get_user_by_username("site-admin")
-        assert row is not None and row.notify_email is None and row.email is None
-
+        with pytest.raises(FirstAdministratorRefused, match="notification address was refused"):
+            await service.provision_first_administrator(
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=address,
+                actor="test",
+                **provision_totp(),
+            )
+        assert await store.get_user_by_username("site-admin") is None
         rows = [dict(r) for r in await store.list_audit(limit=50)]
-        detail = next(
-            json.loads(r["detail"])
-            for r in rows
-            if r["action"] == "auth.first_administrator_provisioned"
-        )
-        assert detail["notified"] is False
+        assert not any(r["action"] == "auth.first_administrator_provisioned" for r in rows)
     finally:
         await store.close()
 
@@ -391,7 +387,21 @@ def test_cli_refuses_without_a_terminal(
     monkeypatch.chdir(tmp_path)
     _key_in_this_shell(monkeypatch)
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 1
+    )
     assert "no --password" in json.loads(capsys.readouterr().out)["error"]
     assert not db.exists()
 
@@ -401,7 +411,17 @@ def test_cli_has_no_password_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.chdir(tmp_path)
     for flag in ("--password", "--password-file"):
         with pytest.raises(SystemExit) as exc:
-            main(["provision-admin", "--username", "site-admin", flag, "x"])
+            main(
+                [
+                    "provision-admin",
+                    "--username",
+                    "site-admin",
+                    "--email",
+                    "ops@example.invalid",
+                    flag,
+                    "x",
+                ]
+            )
         assert exc.value.code == 2
 
 
@@ -413,7 +433,21 @@ def test_cli_refuses_a_mismatched_confirmation(
     _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD + "typo")
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 1
+    )
     assert "did not match" in json.loads(capsys.readouterr().out)["error"]
 
 
@@ -447,7 +481,7 @@ def test_cli_provisions_and_names_the_store_it_wrote_to(
     )
     out = capsys.readouterr().out
     assert str(db) in out
-    assert "WARNING" not in out, "an address was supplied, so the PHI warning must not fire"
+    assert "WARNING" not in out
 
     async def check() -> None:
         cipher = make_cipher(key)
@@ -465,125 +499,79 @@ def test_cli_provisions_and_names_the_store_it_wrote_to(
     asyncio.run(check())
 
 
-def test_cli_warns_when_no_notification_address_is_given(
+def test_cli_refuses_without_an_email_before_the_prompt_and_the_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The address is optional here and the PHI start gate stays the single authority on it.
+    """BACKLOG #1138 (owner ruling 2026-10-10): ``--email`` is required, so no Administrator is born
+    without the address its security notices go to.
 
-    Duplicating that gate's rule in the CLI would be a second, silently different copy of it, so the
-    command warns and names the flag instead of inventing its own refusal.
-    """
+    The parser refuses, so the refusal comes before the prompt and before any open, and no store is
+    left behind. The control is the same argv with ``--email``: it gets past the parser and reaches
+    the prompt, where the password policy refuses, so the refusal is about the missing flag."""
     monkeypatch.chdir(tmp_path)
     _key_in_this_shell(monkeypatch)
-    _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert (
-        main(["provision-admin", "--username", "site-admin", "--db", str(tmp_path / "p.db")]) == 0
-    )
-    assert "WARNING: no notification address" in capsys.readouterr().out
+    _no_prompt(monkeypatch)
+    db = tmp_path / "never.db"
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2
+    assert "--email" in capsys.readouterr().err
+    assert not db.exists(), "a refused provision left a store behind"
+
+    _tty(monkeypatch, "short", "short")
+    assert main([*argv, "--email", "ops@example.invalid"]) == 1
+    assert "at least 15 characters" in json.loads(capsys.readouterr().out)["error"]
+    assert not db.exists(), "a refused password left a store behind"
 
 
-@pytest.mark.parametrize(
-    ("username", "printed"),
-    [("site-admin", '--username="site-admin"'), ("site admin", '--username="site admin"')],
-)
-def test_the_warning_prints_a_username_every_shell_reads_the_same(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    username: str,
-    printed: str,
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_cli_refuses_a_blank_email_before_the_prompt_and_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], blank: str
 ) -> None:
-    """BACKLOG #1985. The command used to print ``--username 'site admin'``, Python's repr. cmd.exe
-    does not read single quotes as quoting, so a pasted name kept its quotes, or split at the space,
-    and the setter answered that no such user exists. Double quotes are read by cmd.exe, PowerShell
-    and POSIX shells alike. The printed command is then run as a POSIX shell would split it, and on
-    Windows it must split the same way under the Windows argv rules.
-
-    The printed command names no store, as before; ``--db`` is added here by hand, so this test
-    says nothing about whether a pasted command finds the store ``provision-admin`` wrote to."""
-    import shlex
-
+    """A blank ``--email`` was read as no address until BACKLOG #1138. It is refused now, in the
+    ``--json`` error object, before the prompt and before any open."""
     monkeypatch.chdir(tmp_path)
     _key_in_this_shell(monkeypatch)
-    _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    db = str(tmp_path / "p.db")
-    assert main(["provision-admin", "--username", username, "--db", db]) == 0
-    out = capsys.readouterr().out
-    assert f"admin-set-notify-email {printed} --email <address>" in out
-    assert "type it quoted" not in out
-
-    command = next(part for part in out.split("`") if part.startswith("messagefoundry "))
-    posix = shlex.split(command)
-    if sys.platform == "win32":
-        assert _windows_argv(command) == posix
-    argv = [arg.replace("<address>", "ops@example.invalid") for arg in posix[1:]]
-    assert main([*argv, "--db", db]) == 0
-    assert "OK" in capsys.readouterr().out
+    _no_prompt(monkeypatch)
+    db = tmp_path / "never.db"
+    argv = ["provision-admin", "--username", "site-admin", "--email", blank]
+    assert main([*argv, "--db", str(db), "--json"]) == 1
+    assert "notification address was refused" in json.loads(capsys.readouterr().out)["error"]
+    assert not db.exists(), "a refused provision left a store behind"
 
 
-def _windows_argv(command: str) -> list[str]:
-    """``command`` split by ``CommandLineToArgvW``, the rules a Windows process reads argv by."""
-    if sys.platform != "win32":  # also tells mypy on another platform to skip the rest
-        raise AssertionError("CommandLineToArgvW exists only on Windows")
-    import ctypes
-    from ctypes import wintypes
-
-    split = ctypes.windll.shell32.CommandLineToArgvW
-    split.restype = ctypes.POINTER(wintypes.LPWSTR)
-    split.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
-    count = ctypes.c_int()
-    argv = split(command, ctypes.byref(count))
-    try:
-        return [argv[i] for i in range(count.value)]
-    finally:
-        ctypes.windll.kernel32.LocalFree(argv)
-
-
-def test_a_username_no_one_quoting_reads_the_same_is_not_printed_as_if_it_were(
+def test_the_provisioned_administrator_carries_the_address_it_was_given(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``%`` expands inside cmd.exe's double quotes, so no single spelling works everywhere. The
-    warning prints a placeholder and says to quote the name for the shell in use."""
+    """The success half of BACKLOG #1138: the address lands in ``notify_email``, trimmed, and the
+    ``--json`` body no longer carries ``notify_email_set``, which could only ever read true."""
     monkeypatch.chdir(tmp_path)
-    _key_in_this_shell(monkeypatch)
+    key = _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert main(["provision-admin", "--username", "ops%team", "--db", str(tmp_path / "p.db")]) == 0
-    out = capsys.readouterr().out
-    assert "admin-set-notify-email --username <username> --email <address>" in out
-    assert "type it quoted for the shell in use" in out
+    db = tmp_path / "addressed.db"
+    argv = ["provision-admin", "--username", "site-admin", "--email", "  ops@example.invalid "]
+    assert main([*argv, "--db", str(db), "--json"]) == 0
+    body = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert body["ok"] is True
+    assert "notify_email_set" not in body
+    assert _stored_notify_email(db, key) == "ops@example.invalid"
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        'a"b',
-        "a$b",
-        "a`b",
-        "%USERNAME%",
-        "a!b",
-        "a\u201cb",
-        "caf\u00e9",
-        "/ops",
-        "a\\\\b",
-        "trail\\",
-        "tab\tname",
-    ],
-)
-def test_paste_safe_option_refuses_a_value_some_shell_would_change(value: str) -> None:
-    from messagefoundry.__main__ import _paste_safe_option
+def _stored_notify_email(db: Path, key: str) -> str | None:
+    """The ``notify_email`` the keyed store at ``db`` holds for ``site-admin``."""
 
-    assert _paste_safe_option("--username", value) is None
+    async def read() -> str | None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            row = await store.get_user_by_username("site-admin")
+            assert row is not None
+            return row.notify_email
+        finally:
+            await store.close()
 
-
-@pytest.mark.parametrize(
-    "value", ["site admin", "DOMAIN\\user", "o'brien", "a&b|c<d>e^f", "-leading", "a=b"]
-)
-def test_paste_safe_option_double_quotes_a_value_every_shell_passes_unchanged(value: str) -> None:
-    """Checked by hand on cmd.exe, PowerShell 7.6, Windows PowerShell 5.1 and bash for this set.
-    ``=`` keeps ``-leading`` from being read as a flag."""
-    from messagefoundry.__main__ import _paste_safe_option
-
-    assert _paste_safe_option("--username", value) == f'--username="{value}"'
+    return asyncio.run(read())
 
 
 # --- AC-15: refuse before prompting where it can, and leave no new store file ------------------
@@ -606,15 +594,24 @@ def _no_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     ("argv", "needle"),
     [
-        pytest.param(["--username", "   "], "username", id="blank-username"),
-        pytest.param(["--username", "u" * 257], "256", id="over-long-username"),
+        pytest.param(
+            ["--username", "   ", "--email", "ops@example.invalid"], "username", id="blank-username"
+        ),
+        pytest.param(
+            ["--username", "u" * 257, "--email", "ops@example.invalid"],
+            "256",
+            id="over-long-username",
+        ),
         pytest.param(
             ["--username", "site-admin", "--email", "a" * 241 + "@example.invalid"],
             "256",
             id="over-long-address",
         ),
         pytest.param(
-            ["--username", "site-admin", "--display-name", "d" * 257], "256", id="over-long-name"
+            ["--username", "site-admin", "--email", "ops@example.invalid"]
+            + ["--display-name", "d" * 257],
+            "256",
+            id="over-long-name",
         ),
     ],
 )
@@ -628,7 +625,8 @@ def test_an_argument_it_will_refuse_is_refused_before_the_prompt_and_the_open(
     """AC-15. The limits are the web console's, so this offline surface admits nothing it refuses.
 
     The address limit is the one ``admin-set-notify-email`` applies (a Manager decision carried from
-    Wave 1c), and a blank address is still no address rather than a refusal (AC-9).
+    Wave 1c). A missing or blank address is refused too since BACKLOG #1138; those have their own
+    tests above.
     """
     monkeypatch.chdir(tmp_path)
     _key_in_this_shell(monkeypatch)
@@ -685,18 +683,7 @@ def test_a_plain_address_still_provisions(
     argv = ["provision-admin", "--username", "site-admin", "--email", plain]
     assert main([*argv, "--db", str(db)]) == 0
     assert "WARNING" not in capsys.readouterr().out
-
-    async def stored() -> str | None:
-        cipher = make_cipher(key)
-        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
-        try:
-            row = await store.get_user_by_username("site-admin")
-            assert row is not None
-            return row.notify_email
-        finally:
-            await store.close()
-
-    assert asyncio.run(stored()) == plain
+    assert _stored_notify_email(db, key) == plain
 
 
 def test_a_password_the_policy_refuses_leaves_no_store(
@@ -711,7 +698,21 @@ def test_a_password_the_policy_refuses_leaves_no_store(
     _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, "short", "short")
     db = tmp_path / "never.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 1
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     # Pin the REFUSAL, not just the key. Since BACKLOG #1863 `main`'s dispatch floor also answers
     # an escaped exception with exit 1 and an `error` key, so the key alone no longer proves the
@@ -732,11 +733,38 @@ def test_an_existing_administrator_is_refused_before_the_prompt(
     _key_in_this_shell(monkeypatch)
     db = tmp_path / "provisioned.db"
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
 
     _no_prompt(monkeypatch)
-    assert main(["provision-admin", "--username", "other", "--db", str(db), "--json"]) == 1
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "other",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 1
+    )
     assert "already has an enabled Administrator" in json.loads(capsys.readouterr().out)["error"]
 
 
@@ -760,7 +788,20 @@ def test_an_existing_store_with_no_administrator_still_prompts_and_provisions(
     asyncio.run(create_empty())
     assert db.exists()
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        == 0
+    )
 
 
 # --- BACKLOG #2034: the trust-anchor enforcement dial reaches this command -----------------------
@@ -876,7 +917,15 @@ def test_the_command_provisions_where_serve_would_start(
     if store == "existing":
         _existing_empty_store(db, key)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--service-config",
+        str(cfg),
+    ]
     assert main([*argv, "--db", str(db)]) == 0
     assert "OK: created Administrator" in capsys.readouterr().out
     warned = [r.getMessage() for r in caplog.records if "writable by a non-owner" in r.getMessage()]
@@ -913,7 +962,15 @@ def test_a_weak_anchor_is_refused_cleanly_at_enforce(
     if store == "existing":
         _existing_empty_store(db, key)
     _no_prompt(monkeypatch)
-    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--service-config",
+        str(cfg),
+    ]
     assert main([*argv, "--db", str(db), "--json"]) == 1
     captured = capsys.readouterr()
     error = json.loads(captured.out)["error"]
@@ -957,7 +1014,18 @@ def test_a_key_provider_that_cannot_resolve_is_refused_before_the_prompt(
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "vault")
     _no_prompt(monkeypatch)
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 2, error
     # The Vault refusal itself, with this command's line after it, not the dispatch floor's report.
@@ -997,7 +1065,15 @@ def test_an_ad_bind_password_held_by_a_secret_provider_provisions(
     cfg = _secret_ad_config(tmp_path, monkeypatch, ref="MEFOR_TEST_AD_BIND_2081")
     db = tmp_path / "p.db"
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--service-config",
+        str(cfg),
+    ]
     assert main([*argv, "--db", str(db), "--json"]) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out)["username"] == "site-admin"
@@ -1016,7 +1092,15 @@ def test_a_secret_the_provider_cannot_resolve_is_refused_before_the_prompt_in_fi
     cfg = _secret_ad_config(tmp_path, monkeypatch, ref="MEFOR_TEST_AD_BIND_2081")
     db = tmp_path / "p.db"
     _no_prompt(monkeypatch)
-    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--service-config",
+        str(cfg),
+    ]
     assert main([*argv, "--db", str(db), "--json"]) == 1
     captured = capsys.readouterr()
     error = json.loads(captured.out)["error"]
@@ -1070,7 +1154,21 @@ def test_each_named_build_failure_is_refused_in_fixed_words_before_the_prompt(
         _existing_empty_store(db, key)
     monkeypatch.setattr("messagefoundry.auth.service.AuthService", _refusing_service(make_exc()))
     _no_prompt(monkeypatch)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 1
+    )
     captured = capsys.readouterr()
     error = json.loads(captured.out)["error"]
     assert error.startswith(lead), error
@@ -1102,7 +1200,20 @@ def test_the_command_builds_its_auth_service_once(
 
     monkeypatch.setattr(auth_service, "AuthService", counting)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        == 0
+    )
     assert len(built) == 1
 
 
@@ -1126,7 +1237,15 @@ def test_an_off_box_idp_with_no_revocation_check_is_refused_at_enforce_as_serve_
     text = cfg.read_text(encoding="utf-8").replace("127.0.0.1", "idp.example")
     cfg.write_text(text, encoding="utf-8")
     db = tmp_path / "p.db"
-    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--service-config",
+        str(cfg),
+    ]
     if enforcement == "warn":
         _tty(monkeypatch, _PASSWORD, _PASSWORD)
         assert main([*argv, "--db", str(db)]) == 0
@@ -1155,7 +1274,21 @@ def test_a_secret_provider_that_cannot_load_is_refused_in_its_own_fixed_words(
     monkeypatch.setattr("messagefoundry.config.secretprovider.resolve_secret_provider", cannot_load)
     db = tmp_path / "p.db"
     _no_prompt(monkeypatch)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 1
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 1
+    )
     captured = capsys.readouterr()
     error = json.loads(captured.out)["error"]
     assert error.startswith("the [secrets].provider could not be loaded"), error
@@ -1179,7 +1312,21 @@ def test_a_dpapi_key_that_cannot_be_read_is_refused_before_the_prompt(
     monkeypatch.setattr("messagefoundry.store.base.build_store_cipher", cannot_unprotect)
     db = tmp_path / "p.db"
     _no_prompt(monkeypatch)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 2
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 2
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert error == (
         "the key file could not be unprotected. Refusing to provision; nothing was written"
@@ -1288,11 +1435,15 @@ async def test_a_takeover_notifies_the_address_the_account_held_before(
 # --- BACKLOG #2288: a row that holds an address is completed only when --email is given ----------
 
 
-@pytest.mark.parametrize("given", [None, "   "], ids=["no-email", "blank-email"])
+@pytest.mark.parametrize("given", [None], ids=["no-email"])
 async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email(
     given: str | None,
 ) -> None:
     """Kept silently, the stored address would receive the sole Administrator's notices.
+
+    A blank address had its own case here until BACKLOG #1138. The service now refuses a blank
+    address before it reads the row, which
+    ``test_a_blank_or_malformed_address_is_refused_and_writes_nothing`` pins.
 
     The refusal writes nothing. The row keeps its address, password, factors and session, gains no
     role, and nobody is told of a takeover that did not happen. The row holds all of those on
@@ -1624,32 +1775,17 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
     assert [e.email for e in recorder.events] == ["holder@example.invalid"]
     assert "completed the existing roleless account" in out
     assert "Queued a takeover notice" in out
-    # An address was given, so the "no notification address" warning would be false here.
-    assert "WARNING: no notification address" not in out
 
 
-def test_cli_refuses_a_row_that_holds_an_address_before_any_prompt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """BACKLOG #2288: without ``--email`` the command stops before the password prompt, so no
-    authenticator key is shown for a run the store would then refuse. That nothing is written is
-    pinned at the service, by the refusal test above."""
-    monkeypatch.chdir(tmp_path)
-    key = _key_in_this_shell(monkeypatch)
-    db = tmp_path / "p.db"
-    _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
-    _no_prompt(monkeypatch)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
-    captured = capsys.readouterr()
-    assert "--email" in captured.out + captured.err
-    assert "holder@example.invalid" not in captured.out + captured.err
+# The CLI half of BACKLOG #2288 (refuse a row holding an address without --email, before the
+# prompt) is now the parser's refusal of every run without --email (BACKLOG #1138), pinned by
+# test_cli_refuses_without_an_email_before_the_prompt_and_the_open. The service half stays above.
 
 
 def test_cli_says_nobody_was_told_when_the_account_had_no_address(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The control on the test above: no earlier address, no notice, and the missing-address
-    warning still fires, because the account really has none."""
+    """The control on the takeover test above: no earlier address, so no notice."""
     monkeypatch.chdir(tmp_path)
     key = _key_in_this_shell(monkeypatch)
     db = tmp_path / "p.db"
@@ -1659,10 +1795,22 @@ def test_cli_says_nobody_was_told_when_the_account_had_no_address(
         "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        == 0
+    )
     out = capsys.readouterr().out
     assert "there was nobody to tell" in out
-    assert "WARNING: no notification address" in out
     assert recorder.events == []
 
 
@@ -1855,7 +2003,21 @@ def test_the_cli_enrols_totp_and_the_administrator_passes_a_live_lock_with_a_com
     key = _key_in_this_shell(monkeypatch)
     terminal = _drive_the_real_prompt(monkeypatch)
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 0
+    )
     captured = capsys.readouterr()
     body = json.loads(captured.out.strip().splitlines()[-1])
     assert body["ok"] is True and body["totp_enrolled"] is True
@@ -1935,7 +2097,20 @@ def test_a_wrong_code_at_the_prompt_writes_nothing(
         monkeypatch, ["000000", "111111", "222222", "333333", "444444"]
     )
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        != 0
+    )
     assert terminal.asked == 5
     assert "nothing was written" in capsys.readouterr().err
     assert not db.exists()
@@ -1974,7 +2149,20 @@ def test_with_no_console_the_key_is_not_shown_and_nothing_is_written(
     missing = tmp_path / "no-such-dir" / "console"
     monkeypatch.setattr(cli, "_controlling_terminal_path", lambda: str(missing))
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        != 0
+    )
     captured = capsys.readouterr()
     assert "could not open the console" in captured.err
     assert _TERMINAL_SECRET not in captured.out + captured.err
@@ -2001,7 +2189,21 @@ def test_recovery_codes_that_cannot_be_shown_are_not_printed_instead(
 
     monkeypatch.setattr(cli, "_show_on_terminal", show_the_key_only)
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 0
+    )
     captured = capsys.readouterr()
     assert json.loads(captured.out.strip().splitlines()[-1])["recovery_codes_shown"] is False
     assert "recovery codes could not be shown" in captured.err
@@ -2035,7 +2237,18 @@ def test_no_totp_is_refused_while_mfa_is_required(
     _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = tmp_path / "provision.db"
-    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--no-totp"])
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--no-totp",
+        ]
+    )
     assert rc != 0
     assert "--no-totp is refused" in capsys.readouterr().err
     assert not db.exists()
@@ -2278,7 +2491,20 @@ def test_the_cli_refuses_a_username_it_would_not_complete_before_any_prompt(
         raise AssertionError("an authenticator key was shown for an account the store refuses")
 
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", no_enrolment)
-    assert main(["provision-admin", "--username", "bob", "--db", str(db)]) != 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "bob",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        != 0
+    )
     assert "holds roles" in capsys.readouterr().err
 
 
@@ -2371,7 +2597,20 @@ def test_a_console_lost_at_the_code_prompt_refuses_and_writes_nothing(
 
     monkeypatch.setattr(cli, "_show_on_terminal", lose_it_at_the_prompt)
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+            ]
+        )
+        != 0
+    )
     err = capsys.readouterr().err
     assert "console went away" in err and "nothing was written" in err
     assert terminal.asked == 0
@@ -2388,6 +2627,17 @@ def test_the_last_wrong_code_is_not_told_to_try_again(
         monkeypatch, ["000000", "111111", "222222", "333333", "444444"]
     )
     assert (
-        main(["provision-admin", "--username", "site-admin", "--db", str(tmp_path / "p.db")]) != 0
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "site-admin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(tmp_path / "p.db"),
+            ]
+        )
+        != 0
     )
     assert sum("did not match" in text for text in terminal.shown) == 4

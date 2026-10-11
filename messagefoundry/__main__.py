@@ -863,12 +863,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--username", required=True, help="the administrator to create (no default, on purpose)"
     )
     provision_admin.add_argument("--display-name", default=None, help="optional display name")
+    # BACKLOG #1138 (owner ruling 2026-10-10): required, so no Administrator starts without the address
+    # its security notices go to. ADR 0183 Amendment D reverses that ADR's Option 5.
     provision_admin.add_argument(
         "--email",
-        default=None,
-        help="notification address for out-of-band security notices; a PHI instance under "
-        "[security].enforcement=enforce refuses to serve without one on some enabled Administrator. "
-        "Required to complete an existing roleless account that already holds an address",
+        required=True,
+        help="notification address for out-of-band security notices: one plain mailbox, such as "
+        "name@example.org (required; a blank or malformed address is refused before the prompt)",
     )
     provision_admin.add_argument(
         "--service-config",
@@ -883,9 +884,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="do not enrol an authenticator app (refused while [security].require_mfa is on)",
     )
 
-    # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An Administrator provisioned without --email is
+    # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An enabled Administrator with no address is
     # refused at the next start by the ADR 0167 deliverability gate, and provision-admin then refuses
-    # too, because an enabled Administrator exists. This is the offline exit, on admin-unlock's gate.
+    # too, because an enabled Administrator exists. provision-admin can no longer leave one (BACKLOG
+    # #1138), but a directory account granted the role can, and so can a store an earlier build wrote.
+    # This is the offline exit, on admin-unlock's gate.
     admin_set_notify_email = sub.add_parser(
         "admin-set-notify-email",
         help="set a missing security-notice address on an enabled Administrator from the host "
@@ -7229,24 +7232,23 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # AC-15: the argument checks, before the prompt and before any open. The limits are the web
     # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
-    # and the address limit is the one `admin-set-notify-email` applies. A blank address is still no
-    # address rather than a refusal (AC-9). A non-blank one also gets the one-mailbox check below.
+    # and the address limit is the one `admin-set-notify-email` applies.
     username = args.username.strip()
     if not username:
         return _emit_error("a username is required and must not be blank", as_json=args.json)
     if len(username) > _NAME_MAX:
         return _emit_error(f"the username is longer than {_NAME_MAX} characters", as_json=args.json)
-    if args.email is not None and len(args.email) > _NAME_MAX:
+    if len(args.email) > _NAME_MAX:
         return _emit_error(
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
         )
-    if args.email is not None and args.email.strip():
-        # The one-mailbox rule admin-set-notify-email and the API apply (vault BACKLOG #2870). It
-        # refuses an address the alert sender could never put on the RCPT TO line.
-        try:
-            _require_single_mailbox(args.email)
-        except InvalidNotifyEmail as exc:
-            return _emit_error(f"the notification address was refused: {exc}", as_json=args.json)
+    # A blank address is refused rather than read as none (BACKLOG #1138). The one-mailbox rule
+    # admin-set-notify-email and the API apply (vault BACKLOG #2870) refuses it, and an address the
+    # alert sender could never put on RCPT TO. The service checks it again; this is the early copy.
+    try:
+        email = _require_single_mailbox(args.email)
+    except InvalidNotifyEmail as exc:
+        return _emit_error(f"the notification address was refused: {exc}", as_json=args.json)
     if args.display_name is not None and len(args.display_name) > _NAME_MAX:
         return _emit_error(
             f"the display name is longer than {_NAME_MAX} characters", as_json=args.json
@@ -7327,8 +7329,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
             # and before an authenticator key is shown for an account that would then be refused.
-            # BACKLOG #2288: with --email, because a row that holds an address needs one.
-            return False, await service.provision_refusal(username, notify_email=args.email)
+            # BACKLOG #2288: with the address, so this pre-check agrees with the write.
+            return False, await service.provision_refusal(username, notify_email=email)
         finally:
             store_slot.current = None
             await store.close()
@@ -7470,7 +7472,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     username=args.username,
                     password=password,
                     display_name=args.display_name,
-                    notify_email=args.email,
+                    notify_email=email,
                     actor=f"cli:{getpass.getuser()}",
                     totp_secret=totp_secret,
                     totp_code=totp_code,
@@ -7555,7 +7557,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "user_id": outcome.user_id,
                 "repaired": outcome.repaired,
                 "store": store_path,
-                "notify_email_set": bool(args.email and args.email.strip()),
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
                 # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.
@@ -7595,23 +7596,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
-    # No --email means the account has no address at all: a repair of a row that held one is
-    # refused without --email (BACKLOG #2288), so no earlier address can be kept silently.
-    if not (args.email and args.email.strip()):
-        # Not `!r` (BACKLOG #1985): cmd.exe does not read single quotes as quoting.
-        user_arg = _paste_safe_option("--username", outcome.username)
-        hint = (
-            ""
-            if user_arg
-            else " The username has a character a shell or console could change, so type it quoted "
-            "for the shell in use."
-        )
-        _safe_print(
-            "WARNING: no notification address. A PHI instance under [security].enforcement=enforce "
-            "refuses to start unless some enabled Administrator carries one -- set it with "
-            f"`messagefoundry admin-set-notify-email {user_arg or '--username <username>'} --email "
-            f"<address>` before the first serve.{hint}"
-        )
     return 0
 
 
@@ -7619,9 +7603,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     """Set a missing notification address on an enabled Administrator from the host (#1136).
 
     ADR 0183 Amendment A, Wave 1c. The ADR 0167 gate refuses a PHI start under ``enforce`` unless some
-    enabled Administrator carries ``notify_email``. ``provision-admin`` without ``--email`` leaves
-    exactly that state, and then refuses to run again because an enabled Administrator exists; the
-    web console cannot be reached while the engine refuses. This is the exit that trades no control.
+    enabled Administrator carries ``notify_email``. ``provision-admin`` used to leave exactly that
+    state when run without ``--email``; it requires the flag since BACKLOG #1138. A directory account
+    granted the role with no address still leaves it, and so does a store an earlier build wrote.
+    ``provision-admin`` then refuses because an enabled Administrator exists, and the web console
+    cannot be reached while the engine refuses. This is the exit that trades no control.
 
     **The gate is host access**, the one argued on :func:`_admin_unlock` and in ADR 0171, and it runs
     through the same :func:`_host_gated_store_settings`.
@@ -10053,35 +10039,6 @@ def _security(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
     return 0
-
-
-#: ASCII characters that mean something inside double quotes to cmd.exe, PowerShell or a POSIX
-#: shell: ``%`` (cmd), ``$`` and backtick (PowerShell, POSIX), ``!`` (history, delayed expansion),
-#: and the double quote itself.
-_SHELL_SPECIAL_IN_QUOTES = frozenset('"$`%!')
-
-
-def _paste_safe_option(option: str, value: str) -> str | None:
-    """``option="value"`` if that one spelling passes ``value`` unchanged in cmd.exe, PowerShell
-    and a POSIX shell, else ``None`` (BACKLOG #1985).
-
-    Double quotes are the only quoting all three read. ``=`` keeps a value that starts with ``-``
-    from being read as a flag. A backslash is literal in all three unless it doubles or ends the
-    value, where POSIX halves a pair and Windows reads ``\\"`` as an escaped quote. A leading ``/``
-    is refused because Git Bash rewrites ``--opt=/x`` into a Windows path. Non-ASCII is refused
-    too: :func:`_safe_print` turns a character the console cannot encode into ``?``, and
-    PowerShell reads typographic quotes as quotes.
-    """
-    unsafe = (
-        any(
-            ch in _SHELL_SPECIAL_IN_QUOTES or not (ch.isascii() and ch.isprintable())
-            for ch in value
-        )
-        or "\\\\" in value
-        or value.endswith("\\")
-        or value.startswith("/")
-    )
-    return None if unsafe else f'{option}="{value}"'
 
 
 def _key_unresolved() -> tuple[type[Exception], ...]:

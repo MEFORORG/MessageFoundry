@@ -47,6 +47,10 @@ from messagefoundry.store.crypto import generate_key
 # The retracted "nobody can sign in" claim, one pattern shared with the doc guard that refuses it.
 from tests._sign_in_claim import SIGN_IN_CLAIM, rejoin_wrapped_hyphens
 
+# An Administrator with no address, written through the service: provision-admin can no longer
+# leave one (BACKLOG #1138). Same username as _ADMIN below.
+from tests.test_admin_set_notify_email import _seed
+
 # provision-admin's prompt stub and passphrase, imported rather than copied: that module pins them.
 from tests.test_provision_first_administrator import _PASSWORD, _tty
 
@@ -92,9 +96,9 @@ async def _start(app: FastAPI) -> None:
         pass
 
 
-def _provision(db: Path, monkeypatch: pytest.MonkeyPatch, *extra: str) -> int:
+def _provision(db: Path, monkeypatch: pytest.MonkeyPatch) -> int:
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    return main([_PROVISION, "--username", _ADMIN, "--db", str(db), *extra])
+    return main([_PROVISION, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db)])
 
 
 # --- AC-11: the shipped posture refuses, and provisioning that store is the fix ----------------
@@ -124,7 +128,7 @@ def test_the_gate_refuses_an_empty_store_and_provisioning_it_lets_the_next_start
     assert "bootstrap" not in message, "the refusal must not describe an account that is gone"
     assert db.exists(), "control: serve created the store, which is the order under test"
 
-    assert _provision(db, monkeypatch, "--email", _ADDRESS) == 0
+    assert _provision(db, monkeypatch) == 0
     assert "OK" in capsys.readouterr().out
 
     asyncio.run(_start(_app(db, key)))  # must not raise
@@ -136,14 +140,14 @@ def test_an_administrator_with_no_address_is_pointed_at_the_offline_setter(
     """AC-16: the address half of the gate names ``admin-set-notify-email``, and it works.
 
     ``provision-admin`` cannot help here, because an enabled Administrator exists, so naming it
-    would send the operator to a command that refuses.
+    would send the operator to a command that refuses. It cannot leave this state either, since
+    BACKLOG #1138 made ``--email`` required, so the Administrator is written through the service.
     """
     monkeypatch.chdir(tmp_path)
     key = generate_key()
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
     db = tmp_path / "no-address.db"
-    assert _provision(db, monkeypatch) == 0
-    capsys.readouterr()
+    _seed(db, key=key)
 
     with pytest.raises(RuntimeError) as refused:
         asyncio.run(_start(_app(db, key)))

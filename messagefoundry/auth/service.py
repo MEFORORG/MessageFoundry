@@ -2882,12 +2882,18 @@ class AuthService:
         Raises :class:`FirstAdministratorRefused` on every declined case, with operator-facing text.
         """
         username = username.strip()
-        # Normalized ONCE, so the three later readers cannot disagree about what "an address was
-        # supplied" means: a whitespace-only --email must not reach `users.email` untrimmed on the
-        # create, and must not audit as `"notified": true`.
-        notify_email = (notify_email or "").strip() or None
         if not username:
             raise FirstAdministratorRefused("a username is required and must not be blank")
+        # BACKLOG #1138: a given address is checked as `create_local_user` checks one, so a blank or
+        # malformed address is refused rather than read as none. Checked ONCE, so the three later
+        # readers (`users.email`, `notify_email` and the audit's `notified`) cannot disagree.
+        if notify_email is not None:
+            try:
+                notify_email = _require_single_mailbox(notify_email)
+            except InvalidNotifyEmail as exc:
+                raise FirstAdministratorRefused(
+                    f"the notification address was refused: {exc}"
+                ) from exc
         if await self.has_enabled_administrator():
             raise FirstAdministratorRefused(
                 "this store already has an enabled Administrator, so there is nothing to provision "
@@ -7810,9 +7816,10 @@ class AuthService:
 
         BACKLOG #1139 (ASVS 6.3.7). An account with no ``notify_email`` is told nothing out of band
         about a change to its authentication details, because the notifier drops a notice with no
-        address. At least three paths give birth to such an account: ``create_local_user`` with no
-        email, ``provision-admin`` with no ``--email``, and a directory sign-in whose directory returns
-        no ``mail``. (A fourth, the first-run bootstrap administrator, was retired by ADR 0183.) So the
+        address. At least two paths give birth to such an account: ``create_local_user`` with no
+        email, and a directory sign-in whose directory returns no ``mail``. (``provision-admin`` with
+        no ``--email`` was a third until BACKLOG #1138 made the flag required, and the first-run
+        bootstrap administrator a fourth until ADR 0183 retired it.) So the
         first sign-in sets one, in the shape of the ``must_change_password`` confinement.
 
         **ONLY WHEN A SECURITY-NOTICE CHANNEL IS WIRED**, which is ``[auth].notify_security_events``
@@ -11668,8 +11675,9 @@ class AuthService:
         BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
         alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
         *"is a transport configured"* and never *"can the account that matters actually receive"*.
-        Those come apart whenever an Administrator has no address -- ``provision-admin`` without
-        ``--email``, or an account made in the web console without one -- and
+        Those come apart whenever an Administrator has no address -- a directory account granted the
+        role with none, or a store written before ``provision-admin`` required ``--email`` (BACKLOG
+        #1138) -- and
         ``SecurityEventNotifier.notify`` starts ``if not event.email: return``, so every notice about
         the most privileged account on the instance no-ops while the gate reports a healthy channel.
 
