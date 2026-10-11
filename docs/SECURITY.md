@@ -3679,14 +3679,15 @@ on that session, for example) ends it as a revocation would.
   with 1008 before the next frame. Each frame's connections table uses the identity resolved for
   that frame, so a narrowed channel scope shapes the next frame.
 - The bulk message export (`GET` or `POST /messages/export`, streamed as newline-delimited JSON)
-  asks before every row. A refusal, or a channel scope that no longer covers the one the export
-  started with, records
-  `messages_export.stopped` with the selected and streamed counts and a reason, then aborts the
-  transfer, so the client sees a failed download rather than a short file. While rows flow, the
-  export moves the session's idle clock every quarter of the idle window, so a download longer
-  than the idle timeout does not end its own session. A stall past the idle window, whether the
-  client stops reading or a store read is slow, leaves the session idle, and the next row's check
-  ends both.
+  asks before every row. It stops on a refusal. It also stops when the caller's channel scope no
+  longer covers the scope the export started with. A widened scope does not stop it. A stop
+  records `messages_export.stopped` with the selected and streamed counts and a reason. Then it
+  aborts the transfer, so the client sees a failed download rather than a short file.
+- While rows flow, the export moves the session's idle clock at most every quarter of the idle
+  window. So a long download does not end its own session. One stall can, though. If the client
+  stops reading or a store read is slow, the session sits idle. A single stall of about three
+  quarters of the idle window can be enough. The next row's check then ends the session and the
+  export.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.

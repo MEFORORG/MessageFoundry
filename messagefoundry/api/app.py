@@ -5632,8 +5632,9 @@ def create_app(
         it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). The
         caller is re-resolved before each row. Once its standing fails, or its channel scope no longer
         covers the scope it started with, the stream records ``messages_export.stopped`` and aborts
-        (BACKLOG #1154). Each streamed body is re-checked against the starting per-channel scope
-        (load-bearing for the attacker-suppliable ``ids`` path); an out-of-scope id is skipped +
+        (BACKLOG #1154). Each streamed body is re-checked against that row's per-channel scope, which
+        covers at least the starting one (load-bearing for the attacker-suppliable ``ids`` path); an
+        out-of-scope id is skipped +
         audited (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
@@ -5705,14 +5706,13 @@ def create_app(
         token = bearer_token(request) if auth is not None else None
         touch_every = auth.session_idle_seconds / 4 if auth is not None else 0.0
 
-        gate_channels = identity.allowed_channels  # None = every channel
-
         def _still_covers(current: Identity) -> bool:
-            """Whether ``current``'s channel scope still covers the scope the export started with.
-            A widened scope covers it; only a narrowed one stops the export."""
+            """Whether ``current``'s channel scope still covers the scope the export started with
+            (None = every channel). A widened scope covers it; only a narrowed one stops it."""
             if current.allowed_channels is None:
                 return True
-            return gate_channels is not None and gate_channels <= current.allowed_channels
+            start = identity.allowed_channels
+            return start is not None and start <= current.allowed_channels
 
         async def _iter_ndjson() -> AsyncIterator[bytes]:
             streamed = 0
@@ -5724,9 +5724,10 @@ def create_app(
                 # resolved it once, and an export can run to 100,000 bodies, so a session revoked or
                 # a permission withdrawn mid-export would otherwise not reach it. Not the step-up:
                 # that proved the person when the export started. A flowing download is the
-                # caller's own act, so it moves the idle clock every quarter of the idle window. A
-                # stall past the idle window, of the client or of the store, leaves the session idle
-                # like any other, and the next row's re-check then ends both.
+                # caller's own act, so it moves the idle clock at most every quarter of the idle
+                # window. One stall of the client or of the store can still idle the session: the
+                # touch runs only at a row's top, so a stall of about three quarters of the window
+                # is enough, and the next row's re-check then ends both.
                 touch = time.monotonic() - last_touch >= touch_every
                 if touch:
                     last_touch = time.monotonic()
@@ -5744,12 +5745,8 @@ def create_app(
                 # A narrowed channel scope stops the export too, rather than skipping and auditing
                 # every later out-of-scope row: one stop row, not a denial per row that would trip
                 # the access-denied burst signal against an operator who did nothing.
-                reason: str | None = None
-                if current is None:
-                    reason = "standing_changed"
-                elif not _still_covers(current):
-                    reason = "scope_changed"
-                if reason is not None:
+                if current is None or not _still_covers(current):
+                    reason = "standing_changed" if current is None else "scope_changed"
                     # Counts only, never an id or a body.
                     _log.warning(
                         "message export stopped after %d of %d rows: %s",
@@ -5769,7 +5766,9 @@ def create_app(
                     raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
                 # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
                 # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                row = await read_scoped_message(engine, identity, mid, request)
+                # Read with THIS row's identity: it covers the starting scope, and a channel granted
+                # mid-export is now the caller's to read.
+                row = await read_scoped_message(engine, current, mid, request)
                 if row is None:
                     continue
                 streamed += 1

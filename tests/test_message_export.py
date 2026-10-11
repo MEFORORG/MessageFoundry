@@ -530,13 +530,12 @@ async def test_a_scope_widened_mid_export_does_not_stop_it(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The other polarity: a grant that widens the scope still covers every row the export started
-    with, so it streams to the end and records no stop. Only a narrowed scope stops it."""
+    with, so it streams to the end and records no stop. Only a narrowed scope stops it. A row in
+    the newly granted channel streams too, with no ``auth.channel_denied`` row: the caller holds
+    that channel now."""
     service = await _service(engine)
     uid = await _add_user(service, "op", [Role.OPERATOR.value], scope=["IB_A"])
-    mid_a, _mid_b = await _seed(engine)
-    mid_a2 = await engine.store.enqueue_message(
-        channel_id="IB_A", raw=ADT_A, deliveries=[], message_type="ADT^A01", control_id="MSGA2"
-    )
+    mid_a, mid_b = await _seed(engine)
 
     async def widen() -> None:
         await service.store.set_user_channel_scope(uid, '["IB_A", "IB_B"]', source="manual")
@@ -544,10 +543,12 @@ async def test_a_scope_widened_mid_export_does_not_stop_it(
     async with _client(engine, service) as c:
         token = await _login(c, "op")
         _after_first_read(monkeypatch, engine, widen)
-        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_a2]})
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
     assert r.status_code == 200, r.text
-    assert [row["id"] for row in _ndjson(r.text)] == [mid_a, mid_a2]
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a, mid_b]
     assert await _stop_rows(engine) == []
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
+    assert "auth.channel_denied" not in actions
 
 
 def _count_stream_touches(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> list[int]:
