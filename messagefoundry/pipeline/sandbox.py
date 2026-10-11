@@ -60,7 +60,7 @@ store/crypto). Its environment is an allowlist, not the engine's own
 (:mod:`messagefoundry.childenv`, which also says why that is not a boundary by itself).
 On top of that address-space boundary the child adds defence-in-depth: a
 forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus a
-POSIX ``RLIMIT_AS`` memory cap when available), and a fail-closed refusal of the live
+POSIX memory cap when available), and a fail-closed refusal of the live
 ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop, which a process boundary
 breaks — forwarding them over IPC is a documented next-phase residual). The import guard is
 **defence-in-depth only** — a module imported before it goes up keeps a live reference, so the
@@ -176,8 +176,12 @@ class SandboxPolicy:
     pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** at
     ``mode=subprocess``: the in-process path has no timeout at all. There is no ``RLIMIT_CPU``, so
     CPU that admin code spends outside a call has no bound (ADR 0087, amendment of 2026-10-07).
-    ``mem_mb`` adds a POSIX ``RLIMIT_AS`` backstop *inside* the child where the ``resource`` module
-    exists (a no-op on Windows). ``startup_seconds`` bounds the one-time child bootstrap (config load)."""
+    ``mem_mb`` adds a POSIX memory backstop *inside* the child where the ``resource`` module exists
+    (a no-op on Windows). On Linux it is headroom above the loaded graph: ``RLIMIT_DATA`` at the
+    worker's ``VmData`` once ``load_config`` has run, plus ``mem_mb``. Elsewhere on POSIX it is an
+    absolute ``RLIMIT_AS`` cap. A call that hits it is reported as the memory cap, and its worker is
+    recycled (ADR 0087, amendment of 2026-10-11). ``startup_seconds`` bounds the one-time child
+    bootstrap (config load)."""
 
     mode: SandboxMode
     wall_seconds: float = 5.0
@@ -925,6 +929,15 @@ class SandboxSession:
             # peer — it reaps the worker and leaves this proven answer standing.)
             self._reject_unsolicited(proc, "after")
             if not resp.ok:
+                if resp.kind == codec.FAIL_MEMORY:
+                    # The worker exits after this reply. Reap it now, so the next dispatch starts a
+                    # fresh one rather than writing to a worker on its way out (vault BACKLOG #3133).
+                    if proc is self._proc:
+                        self._kill(proc)
+                    raise SandboxError(
+                        f"sandbox {phase} {name!r} hit the memory cap, and its worker was "
+                        f"recycled: {resp.error}"
+                    )
                 verdict = "denied" if resp.kind == "denied" else "failed"
                 raise SandboxError(f"sandbox {verdict} {phase} {name!r}: {resp.error}")
             return resp.result

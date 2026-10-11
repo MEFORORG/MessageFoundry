@@ -221,6 +221,12 @@ def h_spin(msg):
 def h_lookup(msg):
     db_lookup("SOME_DB", "select 1", ())  # live bridge — forbidden in the sandbox
     return Send("OB_T", str(msg))
+
+
+@handler("h_oom")
+def h_oom(msg):
+    # Stands in for a call that ran out of memory, on a platform with no memory cap to hit.
+    raise MemoryError
 """
 
 
@@ -365,6 +371,159 @@ def test_a_reused_worker_has_no_lifetime_cpu_budget(graph: tuple[Registry, str])
         session.close()
 
 
+# --- the memory cap: headroom above the loaded graph, and a worker that hits it is recycled ------
+# Vault BACKLOG #3133 part 2, owner ruling 2026-10-11. The worker used to set RLIMIT_AS to mem_mb once
+# after load_config, so the cap covered the graph it had already loaded, and every thread's glibc
+# arena reserved about 64 MiB of address space that stayed mapped after the thread exited.
+
+_MEM_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_M", MLLP(port=19321), router="r")
+outbound("OB_T", MLLP(host="127.0.0.1", port=19322))
+
+# Held for the worker's whole life, so the loaded graph is bigger than the cap the tests set. bytes(n)
+# is calloc'd and never touched, so it costs address space and VmData, not resident memory.
+_BALLAST = bytes(__BALLAST__ * 1024 * 1024)
+
+
+@router("r")
+def r(msg):
+    return "h_alloc"
+
+
+@handler("h_alloc")
+def h_alloc(msg):
+    # An innocent call: about 100 MiB, then released. RLIMIT_DATA counts it whether or not it is
+    # touched, so it is not written.
+    block = bytes(100 * 1024 * 1024)
+    del block
+    return Send("OB_T", "ALLOCATED")
+
+
+@handler("h_runaway")
+def h_runaway(msg):
+    hoard = []
+    while True:
+        hoard.append(bytes(16 * 1024 * 1024))
+
+
+@handler("h_threads")
+def h_threads(msg):
+    # Eight threads alive at once, so each gets its own malloc arena, then all joined.
+    import threading
+
+    barrier = threading.Barrier(8)
+
+    def work():
+        block = bytearray(1024 * 1024)
+        barrier.wait()
+        del block
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return Send("OB_T", "JOINED")
+"""
+
+
+def _mem_graph(tmp_path: Path, ballast_mib: int) -> tuple[Registry, str]:
+    graph = tmp_path / "graph.py"
+    graph.write_text(_MEM_GRAPH.replace("__BALLAST__", "0"), encoding="utf-8")
+    registry = load_config(tmp_path)
+    # Only the worker needs the ballast. It loads the graph when it is first spawned, after this
+    # rewrite, so the test process never holds it.
+    graph.write_text(_MEM_GRAPH.replace("__BALLAST__", str(ballast_mib)), encoding="utf-8")
+    return registry, str(tmp_path)
+
+
+def _mem_session(config_dir: str, mem_mb: int) -> SandboxSession:
+    return _session(
+        config_dir,
+        "IB_M",
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0, mem_mb=mem_mb),
+    )
+
+
+def _alloc(registry: Registry, session: SandboxSession) -> list[tuple[str, str]]:
+    return _deliveries(registry, "h_alloc", sandbox=session, run_context=RunContext())
+
+
+_LINUX_ONLY = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="mem_mb is headroom above the loaded graph only on Linux, which has /proc/self/status",
+)
+
+
+@_LINUX_ONLY
+def test_a_graph_larger_than_mem_mb_does_not_fail_an_innocent_call(tmp_path: Path) -> None:
+    # The graph holds 192 MiB and the cap is 128 MiB. An absolute cap would leave no room at all.
+    registry, config_dir = _mem_graph(tmp_path, ballast_mib=192)
+    session = _mem_session(config_dir, mem_mb=128)
+    try:
+        assert _alloc(registry, session) == [("OB_T", "ALLOCATED")]
+    finally:
+        session.close()
+
+
+@_LINUX_ONLY
+def test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker(tmp_path: Path) -> None:
+    registry, config_dir = _mem_graph(tmp_path, ballast_mib=0)
+    session = _mem_session(config_dir, mem_mb=128)
+    try:
+        with pytest.raises(SandboxError, match="hit the memory cap") as caught:
+            _deliveries(registry, "h_runaway", sandbox=session, run_context=RunContext())
+        assert "128 MiB above the loaded graph" in str(caught.value)
+        # The worker exited and was reaped, so the next message gets a fresh one and succeeds.
+        assert session._proc is None
+        assert _alloc(registry, session) == [("OB_T", "ALLOCATED")]
+    finally:
+        session.close()
+
+
+@_LINUX_ONLY
+def test_threads_a_call_joined_do_not_spend_the_memory_cap(tmp_path: Path) -> None:
+    # Eight arenas of about 64 MiB of reserved address space is 512 MiB, twice this cap. Under an
+    # RLIMIT_AS cap the reservations stay counted after the join, and the 100 MiB call fails.
+    registry, config_dir = _mem_graph(tmp_path, ballast_mib=0)
+    session = _mem_session(config_dir, mem_mb=256)
+    try:
+        assert _deliveries(registry, "h_threads", sandbox=session, run_context=RunContext()) == [
+            ("OB_T", "JOINED")
+        ]
+        assert session._proc is not None
+        pid = session._proc.pid
+        assert _alloc(registry, session) == [("OB_T", "ALLOCATED")]
+        # The same worker served both calls: the second was not rescued by a respawn.
+        assert session._proc is not None and session._proc.pid == pid
+    finally:
+        session.close()
+
+
+def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
+    graph: tuple[Registry, str],
+) -> None:
+    # Runs on every platform: the Handler raises MemoryError itself, so no cap is needed to reach the
+    # reporting and recycling path.
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is not None
+        first = session._proc.pid
+        with pytest.raises(SandboxError, match="hit the memory cap, and its worker was recycled"):
+            _deliveries(registry, "h_oom", sandbox=session, run_context=RunContext())
+        assert session._proc is None
+        assert _deliveries(
+            registry, "h_ok", sandbox=session, run_context=RunContext()
+        ) == _deliveries(registry, "h_ok")
+        assert session._proc is not None and session._proc.pid != first
+    finally:
+        session.close()
+
+
 # --- (d) db_lookup / fhir_lookup are forbidden in the sandbox, fail-closed -----
 
 
@@ -494,11 +653,16 @@ def test_run_context_codec_snapshots_mappingproxy_views() -> None:
 # --- the IPC boundary itself (MFW2 codec) -------------------------------------
 
 
-def _session(config_dir: str, inbound: str = "IB_T", **kw: object) -> SandboxSession:
+def _session(
+    config_dir: str,
+    inbound: str = "IB_T",
+    policy: SandboxPolicy | None = None,
+    **kw: object,
+) -> SandboxSession:
     # The default lives in this TEST helper only, never in the production constructor, where a default
     # would silently reinstate the unattributable relay ADR 0176 exists to close.
     return SandboxSession(
-        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        policy or SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
         inbound=inbound,
         config_dir=config_dir,
         env=None,

@@ -21,7 +21,8 @@ direction, in either process.
    re-establishes the run-scoped context providers for the phase (substituting the boot-carried code
    sets, which the per-dispatch frame deliberately does not repeat), runs the function, and
    **describes** the result back as ``ok`` — or ``fail`` with ``kind`` ``denied`` (forbidden import, a
-   live ``db_lookup``/``fhir_lookup``, an undescribable result) or ``error`` (a plain handler raise).
+   live ``db_lookup``/``fhir_lookup``, an undescribable result), ``error`` (a plain handler raise) or
+   ``memory`` (a ``MemoryError``, after which the worker exits so the parent starts a fresh one).
    The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
    answers the call it made.
 
@@ -102,24 +103,69 @@ class _ForbiddenImportFinder:
         return None
 
 
-def _apply_resource_caps(mem_mb: int | None) -> None:
-    """Best-effort POSIX ``RLIMIT_AS`` backstop (a no-op on Windows). The parent's wall-clock cap is
-    the authoritative bound on every platform. There is deliberately no ``RLIMIT_CPU``, so CPU spent
-    outside a call has no bound (ADR 0087, amendment of 2026-10-07)."""
+#: The cap a ``MemoryError`` reply names when :func:`_apply_resource_caps` set none.
+_NO_MEMORY_CAP = "no memory cap is in force in this worker"
+
+
+def _proc_status_kib(field: str) -> int | None:
+    """One ``kB`` field of ``/proc/self/status``, such as ``VmData``, or ``None`` where it cannot be
+    read (no procfs, or no such field)."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _apply_resource_caps(mem_mb: int | None) -> str:
+    """Best-effort POSIX memory backstop (a no-op on Windows); return the cap in words, for the reply
+    to a call that runs out of memory. The parent's wall-clock cap is the authoritative bound on every
+    platform. There is deliberately no ``RLIMIT_CPU``, so CPU spent outside a call has no bound (ADR
+    0087, amendment of 2026-10-07).
+
+    Where ``/proc/self/status`` gives a ``VmData`` (Linux), ``mem_mb`` is HEADROOM above what the
+    worker holds once its graph is loaded: the cap is ``RLIMIT_DATA`` at that ``VmData`` plus
+    ``mem_mb`` (vault BACKLOG #3133 part 2, owner ruling 2026-10-11). Called right after
+    ``load_config``, so a graph larger than ``mem_mb`` does not start the worker over its cap.
+    ``RLIMIT_DATA`` counts writable private memory and not address space that is only reserved. A
+    thread's glibc malloc arena reserves about 64 MiB and keeps it mapped after the thread exits, so
+    an ``RLIMIT_AS`` cap became a lifetime budget that innocent threads used up. A live thread's
+    stack does count, and glibc keeps up to about 40 MiB of exited threads' stacks mapped for reuse.
+    Elsewhere on POSIX ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so."""
     try:
         import resource
     except ImportError:
-        return  # Windows / no rlimit support — wall cap governs
+        return _NO_MEMORY_CAP  # Windows / no rlimit support — wall cap governs
     with contextlib.suppress(ValueError, OSError):
         # No core file of a worker that holds message bodies: a crash signal such as SIGSEGV or
         # SIGABRT would otherwise dump one.
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # type: ignore[attr-defined,unused-ignore]
-    if mem_mb is not None:
-        try:
-            limit = int(mem_mb) * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))  # type: ignore[attr-defined,unused-ignore]
-        except (ValueError, OSError):
-            pass
+    if mem_mb is None:
+        return _NO_MEMORY_CAP
+    headroom = int(mem_mb) * 1024 * 1024
+    baseline_kib = _proc_status_kib("VmData")
+    if baseline_kib is not None:
+        rlimit = resource.RLIMIT_DATA  # type: ignore[attr-defined,unused-ignore]
+        limit = baseline_kib * 1024 + headroom
+        cap = f"[sandbox].mem_mb allows {mem_mb} MiB above the loaded graph (RLIMIT_DATA)"
+    else:
+        rlimit = resource.RLIMIT_AS  # type: ignore[attr-defined,unused-ignore]
+        limit = headroom
+        cap = f"[sandbox].mem_mb allows {mem_mb} MiB of address space in all (RLIMIT_AS)"
+        log.warning(
+            "sandbox worker: no VmData in /proc/self/status here, so [sandbox].mem_mb is an "
+            "absolute RLIMIT_AS cap of %d MiB on this platform, not headroom above the loaded graph",
+            mem_mb,
+        )
+    try:
+        resource.setrlimit(rlimit, (limit, limit))  # type: ignore[attr-defined,unused-ignore]
+    except (ValueError, OSError) as exc:
+        log.warning("sandbox worker: could not set the memory cap (%s)", exc)
+        return _NO_MEMORY_CAP
+    return cap
 
 
 def _install_import_guard(forbidden: tuple[str, ...]) -> None:
@@ -208,6 +254,8 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
         )
     except SandboxError as exc:
         return False, None, "denied", str(exc)
+    except MemoryError:
+        raise  # not a plain handler error: main() answers it and recycles the worker
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
         return False, None, "error", _error_text(exc)
     return True, result, "", ""
@@ -230,7 +278,8 @@ def _error_text(exc: BaseException) -> str:
 
 
 def _respond(registry: Any, req: Any, code_sets: Any) -> bytes:
-    """Build the response frame for one request. Never raises — an undescribable result is reported."""
+    """Build the response frame for one request. Never raises — an undescribable result is
+    reported — except ``MemoryError``, which :func:`main` answers."""
     from messagefoundry.pipeline import _sandbox_codec as codec
     from messagefoundry.pipeline._sandbox_codec import SandboxError
 
@@ -283,7 +332,7 @@ def main() -> int:
         import messagefoundry.config.fhir_lookup  # noqa: F401
         import messagefoundry.config.run_context  # noqa: F401
 
-        _apply_resource_caps(boot.mem_mb)
+        memory_cap = _apply_resource_caps(boot.mem_mb)
         _install_import_guard(boot.forbidden)
     except Exception as exc:  # noqa: BLE001 — report a bootstrap failure, do not crash silently
         try:  # noqa: SIM105
@@ -310,10 +359,27 @@ def main() -> int:
             # dead-letter) and respawns a clean child, rather than hanging to the wall cap.
             log.error("sandbox worker: undecodable request frame (%s)", exc)
             return 1
-        resp = _respond(registry, req, boot.code_sets)
+        recycle = False
+        try:
+            resp = _respond(registry, req, boot.code_sets)
+        except MemoryError as exc:
+            # A call that ran out of memory may leave memory held (a module global, a cache, a
+            # fragmented heap), and the next innocent message would pay for it. Answer, then exit so
+            # the parent starts a fresh worker (vault BACKLOG #3133 part 2). Caught here rather than
+            # around the Handler alone, so a result too big to encode is answered the same way.
+            recycle = True
+            resp = codec.encode_fail(
+                request_id=req.request_id,
+                phase=req.phase,
+                name=req.name,
+                kind=codec.FAIL_MEMORY,
+                error=f"{_error_text(exc)}; {memory_cap}",
+            )
         try:
             _write_frame(stdout, resp)
         except (OSError, SandboxError) as exc:
+            if recycle:
+                return 1  # a fallback "error" frame would leave the parent unaware it must reap
             # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time —
             # report it instead of dying so the child's "survives for the next message" contract holds,
             # rather than the parent reading EOF and paying a full config-reload respawn.
@@ -330,6 +396,8 @@ def main() -> int:
                 )
             except (OSError, SandboxError):
                 return 1
+        if recycle:
+            return 1
 
 
 if __name__ == "__main__":
