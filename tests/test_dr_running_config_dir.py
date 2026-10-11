@@ -1073,12 +1073,13 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
     assert row["kind"] == "profile"
 
 
-async def test_a_seed_marker_that_cannot_be_written_is_an_audited_abort_before_the_hook(
-    box: _Box, monkeypatch: pytest.MonkeyPatch
+async def test_an_unexpected_error_before_the_hook_is_an_audited_abort(
+    box: _Box, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Item 6. Red at origin/main 1d55295f66: an error outside the abort paths, here from the
     marker's digest provider, escaped the coordinator raw. The route then answered a bare 500, and
-    no dr_activation_aborted row said the activation had stopped."""
+    no dr_activation_aborted row said the activation had stopped. Kind "error" answers 503, so it
+    reads as a fault to retry, and the traceback is logged."""
     engine = box.engine
     await engine.reload_detail(box.tiered)
     coord = engine.dr_coordinator
@@ -1090,15 +1091,42 @@ async def test_a_seed_marker_that_cannot_be_written_is_an_audited_abort_before_t
         raise RuntimeError("the digest provider failed")
 
     monkeypatch.setattr(coord, "_config_fingerprint_provider", broken)
-    with pytest.raises(DrActivationError) as caught:
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.dr"),
+        pytest.raises(DrActivationError) as caught,
+    ):
         await coord.activate(actor="alice")
 
-    assert caught.value.kind == "state"
+    assert caught.value.kind == "error"
+    assert "store step" in str(caught.value)
     assert "the digest provider failed" in str(caught.value)
     assert hooks == []  # the VIP never moved for it
     assert coord.active is False and engine.dr_active is False
     (row,) = await _rows(engine.store, "dr_activation_aborted")
-    assert row["kind"] == "state"
+    assert row["kind"] == "error" and row["vip_hook_ran"] is False
+    (logged,) = [r for r in caplog.records if "unexpected error" in r.getMessage()]
+    assert logged.exc_info is not None
+
+
+async def test_a_takeover_hook_that_fails_names_the_seed_marker_it_followed(
+    box: _Box,
+) -> None:
+    """Item 11, at step 3. The hook abort comes after the marker, so its row names that marker
+    too. Red at origin/main 1d55295f66: the row carried only its kind and reason."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    coord._settings = coord.settings.model_copy(update={"takeover_hook": "exit 1"})
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+
+    assert caught.value.kind == "vip"
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    (marker,) = await _rows(engine.store, "dr_seed")
+    assert marker  # control: step 2 wrote the marker before the hook ran
+    assert isinstance(row["seed_segment"], str) and row["seed_segment"]
+    assert row["vip_hook_ran"] is False  # it did not exit 0
 
 
 async def test_a_step_4_abort_after_the_hook_names_the_hook_and_its_seed_marker(

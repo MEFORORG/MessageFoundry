@@ -88,13 +88,13 @@ _ACTION_ABORTED = "dr_activation_aborted"
 _ACTION_RELEASE_FAILED = "dr_release_failed"
 
 
-def _vip_note(hook: str) -> str:
+def _vip_note(*, ran: bool) -> str:
     """The note an abort after the takeover hook carries, since the box is then passive and may
-    hold the address. ``hook`` is how sure the abort is that the hook ran: ``"ran"`` or ``"may
-    have run"`` (vault BACKLOG #3094, item 11)."""
+    hold the address. ``ran`` is whether the abort knows the hook ran, rather than that it may
+    have (vault BACKLOG #3094, item 11)."""
     return (
-        f". The takeover hook {hook}, so the VIP may have moved to this box with no priority "
-        "listener bound -- check the load balancer before retrying"
+        f". The takeover hook {'ran' if ran else 'may have run'}, so the VIP may have moved to "
+        "this box with no priority listener bound -- check the load balancer before retrying"
     )
 
 
@@ -109,7 +109,7 @@ _REQUEST_ARCHIVE_REFUSED = (
 
 class DrActivationError(RuntimeError):
     """Activation (or release) was refused. Carries a ``kind`` (at least ``seed``/``key``/``vip``/
-    ``profile``/``state``/``audit``) so the caller (the API endpoint) can map it to an HTTP error and
+    ``profile``/``state``/``audit``/``error``, the last for an error no abort path caught) so the caller (the API endpoint) can map it to an HTTP error and
     the operator sees the failing phase. ``audit`` is the one kind that is not an abort: the box's
     posture already changed and the audit row recording that could not be written, so the call
     refuses rather than answer success with no row (vault BACKLOG #2751, #2752). The message is
@@ -229,6 +229,8 @@ class DrCoordinator:
         # The last completed hand-back, so a retry that finds the box passive answers with that
         # release's outcome (its depth left) rather than with nothing known.
         self._last_release: DrResult | None = None
+        # The activation running under the lock, read by its abort rows; None between them.
+        self._attempt: _ActivationProgress | None = None
         # Serialize activate/release so a double-promotion can't race the cold-seed/VIP/profile steps.
         self._lock = asyncio.Lock()
 
@@ -286,7 +288,7 @@ class DrCoordinator:
             if self._unrecorded_release is not None:
                 await self._record_owed_release()
             now = self._clock()
-            progress = _ActivationProgress()
+            progress = self._attempt = _ActivationProgress()
             try:
                 return await self._activate_locked(
                     archive=archive,
@@ -298,18 +300,25 @@ class DrCoordinator:
             except DrActivationError:
                 raise  # an abort path already wrote its row
             except Exception as exc:
-                # An error no abort path caught, such as a store fault while the seed marker is
-                # written. It used to escape with no abort row, and the route answered a bare 500
-                # (vault BACKLOG #3094, item 6). Once the profile is applied the box is active, and
-                # only the owed dr.activate row is left to write, so that error stands.
+                # An error no abort path caught, such as one from the seed marker's digest
+                # provider. It used to escape with no abort row, and the route answered a bare
+                # 500 (vault BACKLOG #3094, item 6). Every step after the hook has its own arm, so
+                # this one runs before the hook. Kind "error" answers 503, to be retried. Once
+                # the profile is applied the box is active and only its row is owed, so the error
+                # stands.
                 if progress.profile_applied:
                     raise
                 self._active = False
-                reason = f"activation failed during the {progress.step} step: {safe_exc(exc)}"
-                if progress.hook_ran:
-                    reason += _vip_note("ran")
+                log.error(
+                    "DR activation: an unexpected error during the %s step",
+                    progress.step,
+                    exc_info=True,
+                )
                 await self._record_aborted(
-                    "state", reason, actor, now, extra=progress.abort_fields()
+                    "error",
+                    f"activation failed during the {progress.step} step: {safe_exc(exc)}",
+                    actor,
+                    now,
                 )
             except BaseException as exc:
                 # A cancellation is not an Exception, so neither step 4's arm nor any abort path
@@ -322,6 +331,8 @@ class DrCoordinator:
                 if isinstance(exc, asyncio.CancelledError):
                     await self._record_interrupted_activation(progress, actor, now)
                 raise
+            finally:
+                self._attempt = None
 
     async def _activate_locked(
         self,
@@ -406,12 +417,12 @@ class DrCoordinator:
                 f"feeds): {safe_exc(exc)}"
             )
             if hook_ran:
-                reason += _vip_note("ran")
+                reason += _vip_note(ran=True)
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
             # abort, so a retry's own marker reads as a second attempt (vault BACKLOG #3094, item
             # 11). The takeover is not undone: a release hook could hand the address to a primary
             # that is down, so the runbook leaves that to the operator.
-            await self._record_aborted("profile", reason, actor, now, extra=progress.abort_fields())
+            await self._record_aborted("profile", reason, actor, now)
         progress.profile_applied = True
 
         # Owed from here: a write cut short is made good by the next activate or release call.
@@ -644,10 +655,8 @@ class DrCoordinator:
             return
         reason = f"activation interrupted during the {progress.step} step; the box stays passive"
         if progress.step in ("vip", "profile"):
-            reason += _vip_note("ran" if progress.hook_ran else "may have run")
-        await self._write_aborted_row(
-            "interrupted", reason, actor, now, extra=progress.abort_fields()
-        )
+            reason += _vip_note(ran=progress.hook_ran)
+        await self._write_aborted_row("interrupted", reason, actor, now)
 
     async def _record_release_failed(
         self,
@@ -1209,29 +1218,24 @@ class DrCoordinator:
         now: float,
         *,
         requested: str | None = None,
-        extra: Mapping[str, object] | None = None,
     ) -> NoReturn:
         """Record a ``dr_activation_aborted`` audit row (PHI-free) + raise :class:`DrActivationError`. The
         single fail path for every refused activation, so an aborted promotion always leaves an audit
         trail and the caller gets the failing phase. Never returns (always raises). ``requested`` is
-        a refused request path: it goes in the audit row and never in the raised message. ``extra``
-        adds PHI-free fields to the row, never replacing ``kind`` or ``reason``."""
-        await self._write_aborted_row(kind, message, actor, now, requested=requested, extra=extra)
+        a refused request path: it goes in the audit row and never in the raised message."""
+        await self._write_aborted_row(kind, message, actor, now, requested=requested)
         raise DrActivationError(kind, message)
 
     async def _write_aborted_row(
-        self,
-        kind: str,
-        message: str,
-        actor: str,
-        now: float,
-        *,
-        requested: str | None = None,
-        extra: Mapping[str, object] | None = None,
+        self, kind: str, message: str, actor: str, now: float, *, requested: str | None = None
     ) -> None:
         """The ``dr_activation_aborted`` row and its log line, without the raise. Best-effort:
-        recording the abort must never mask the abort itself."""
-        detail: dict[str, object] = {**(extra or {}), "kind": kind, "reason": message}
+        recording the abort must never mask the abort itself.
+
+        The row carries the running attempt's seed marker and whether its takeover hook ran, so a
+        retry's second marker is not read as the same attempt (vault BACKLOG #3094, item 11)."""
+        attempt = self._attempt.abort_fields() if self._attempt is not None else {}
+        detail: dict[str, object] = {**attempt, "kind": kind, "reason": message}
         if requested is not None:
             detail["requested"] = requested
         try:
