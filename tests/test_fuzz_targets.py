@@ -60,7 +60,7 @@ from fuzz.targets import (
 )
 from messagefoundry.framing import FrameDecoder
 from messagefoundry.mllpcodec import frame as mllp_frame
-from messagefoundry.parsing import HL7PeekError, Peek
+from messagefoundry.parsing import HL7PeekError, Peek, compression
 from messagefoundry.parsing.binary import (
     extract_obx_document,
     iter_obx_documents,
@@ -409,7 +409,7 @@ _OBX_ED_ADT = (
 #: on the way would swallow it. ``stream_frames`` has no patchable callee: ``feed`` does its work with
 #: ``bytes.find`` and slicing. A ``KeyError`` is used throughout because no codec's contract error is
 #: one, so a target that lets it escape is a target that would let a real one escape. The input is
-#: built BEFORE the patch goes on, because a builder may itself use what is patched (the gzip one does).
+#: built BEFORE the patch goes on, because a builder may itself use what is patched.
 _INJECTIONS: dict[str, tuple[object, str, Callable[[], bytes]]] = {
     "hl7_peek": (Peek, "routing", lambda: CLEAN_ADT.encode()),
     "hl7_tree": (fuzz_targets, "parse_tree", lambda: CLEAN_ADT.encode()),
@@ -418,7 +418,12 @@ _INJECTIONS: dict[str, tuple[object, str, Callable[[], bytes]]] = {
     "stream_frames": (FrameDecoder, "feed", lambda: b"\x00" + mllp_frame(CLEAN_ADT)),
     "x12_frames": (X12FrameReader, "_take_one", lambda: b"\x00" + _x12_sample()),
     "http_request": (http_listener, "HttpRequest", lambda: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"),
-    "compression": (gzip.GzipFile, "read", lambda: gzip.compress(CLEAN_ADT.encode(), mtime=0)),
+    # gzip_decompress walks its members through the shared inflate loop (BACKLOG #1129).
+    "compression": (
+        compression,
+        "bounded_inflate",
+        lambda: gzip.compress(CLEAN_ADT.encode(), mtime=0),
+    ),
     "binary_carriage": (Message, "count_segments", lambda: _OBX_ED_ADT),
 }
 

@@ -938,9 +938,12 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
   Each takes `max_output_bytes` as a required keyword with no default, so the Handler author must
   choose the ceiling. Passing `None` removes it, and has to be written out. `zip_decompress` also caps
   the member count at `max_entries`, default 1024, and refuses the whole archive when one member's
-  name or content fails the checks in `parsing/sniff.py`. A Handler is ordinary Python, though, and
-  can unpack with any library instead, such as `gzip` or `zipfile` directly. The engine then sets no
-  bound, and the Handler author owns the unpacked-size limit.
+  name or content fails the checks in `parsing/sniff.py`. `gzip_decompress` caps the number of gzip
+  members at `max_members`, default 1024 (BACKLOG #1129). A gzip stream has no member list to read
+  first. So the codec counts each member as it starts, and refuses the one past the cap before it
+  inflates. A Handler is ordinary Python, though, and can unpack with any library instead, such as
+  `gzip` or `zipfile` directly. The engine then sets no bound, and the Handler author owns the
+  unpacked-size limit.
 
 **Downloads.** The "Downloads are made safe at serve (ASVS 1.3.4)" clause below covers the attachment
 row only. The two export rows are made safe as their own row says.
@@ -1084,8 +1087,11 @@ its own policy block below):
   `decompress="gzip"` is enabled it gunzips each drop **before** the content sniff, the AV scan, and the
   batch split (so all three see the real bytes), and `max_decompressed_bytes` (default 64 MiB) caps the
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
-  provide (ASVS 5.2.3). A corrupt or over-ceiling archive is **quarantined to `.error`, never
-  accept-and-dropped**, and the decompressed body is never logged. Multi-entry zip stays Handler-composed.
+  provide (ASVS 5.2.3). The gunzip also refuses a drop of more gzip members than `gzip_decompress`'s
+  `max_members` default (see *Unpacking a payload* above), with no per-connection setting. Members
+  that inflate to nothing pass any byte ceiling, so the member count is its own limit. A corrupt,
+  over-ceiling or over-cap archive is **quarantined to `.error`, never accept-and-dropped**, and the
+  decompressed body is never logged. Multi-entry zip stays Handler-composed.
 - **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize file, or one
   whose content contradicts its declared type, is **moved to the `.error` subdirectory** (preserved for
   the operator) and logged. A *textual-but-non-conformant* HL7 file still flows through and is recorded
