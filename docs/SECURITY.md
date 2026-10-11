@@ -3651,7 +3651,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   longer has this problem: its step-up is the IdP leg above. See ADR 0142 *Consequences* and
   Amendment B.
 - **Out of scope:** SAML 2.0, cloud-only (non-hybrid) users, a JSON/API federated path (`/ui` only),
-  refresh tokens, and RP-initiated logout.
+  refresh tokens, and RP-initiated logout. So a sign-out at the IdP does not end an engine session;
+  [The engine session is independent of the IdP session](#the-engine-session-is-independent-of-the-idp-session-asvs-761)
+  says what does.
 
 Check the deployed posture with `messagefoundry verify --section federation`
 ([VERIFY.md](testing/VERIFY.md)), which can also replay a captured `id_token` offline through the
@@ -3900,6 +3902,59 @@ read, fails open for that one account (BACKLOG #2241). It is logged at WARNING b
 pass, and the rest of the estate is still reconciled. **The cost:** while it repeats, that account's
 sessions are never revoked by the reconciler, and no alert is raised. If it hits every probe, the
 pass reads as a directory outage.
+
+### The engine session is independent of the IdP session (ASVS 7.6.1)
+
+Once the engine mints a session, that session does not follow the identity provider (IdP) session
+that started it. The engine has at least two IdPs. One is the OIDC issuer behind federated sign-in.
+The other is the on-premises Kerberos key distribution center (KDC) behind Windows SSO. Both
+sign-in legs ship off (`[auth].oidc_enabled` and `[auth].kerberos_enabled` default to `false`), so
+this describes a site that turns one on.
+
+| Event | What it does to a live engine session |
+|---|---|
+| The user signs out at the IdP, or the IdP ends or revokes its own session | Nothing. The engine has no back-channel logout receiver, so it hears nothing from the IdP. |
+| The user signs out of the engine | Ends the engine session only. The engine sends no RP-initiated logout, so the IdP session stays. |
+| The Kerberos ticket the user signed in with expires | Nothing. The engine does not read the ticket's lifetime. A Kerberos session runs on the engine's own caps alone. |
+| Time passes | The session ends at the soonest of its caps: the idle and absolute limits for every session, plus the federated caps for an OIDC one. The *Session age* row of the [signal table](#contextual-and-environmental-security-inputs-asvs-813--814) names them. |
+| The directory disables or deletes the account, or a group change alters its roles or narrows its channel scope | The directory reconciler ends every session of the account, on the timing below. |
+
+**For OIDC, the engine does bound the time since the IdP authentication event.** It sends `max_age`
+and requires `auth_time`, as [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)
+says under *Time since the IdP sign-in is bounded too*. **A Kerberos session has no such bound.**
+
+**The directory reconciler above is the one path from the directory to a live session.** It runs
+every `[auth].ad_session_recheck_seconds`, 300 seconds by default, over directory accounts that hold
+a session. Every federated account is also a directory account, so it covers both legs. It acts at
+least on the directory events in the table's last row. In each case it ends every session of that
+account. It never disables or deletes the engine account itself. For a disable or delete it waits
+for `[auth].ad_session_recheck_strikes` passes, 2 by default.
+[Directory session reconciliation](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
+has the full rule, including when a pass revokes nothing. It does not see at least these: a sign-out
+or revocation at the IdP, a password reset in the directory, and an account expiry or lockout. Of
+the account's status flags, the pass reads only the disabled flag.
+
+**Why the engine keeps its own session.** The owner kept back-channel logout out of scope: a
+receiver would add an unauthenticated POST surface, and the reconciler already ends a disabled
+account's sessions ([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
+Amendment B.2). The SPNEGO library the engine uses, pyspnego, does not expose the Kerberos ticket's
+lifetime, and the project declined to fork or patch it to get one. A fixed fallback in its place
+would look like a directory bound when it is not
+([ADR 0079](adr/0079-kerberos-idp-session-coordination.md), amendment of 2026-07-21). So the
+engine bounds its own sessions with short caps, and the reconciler carries directory changes.
+
+**To narrow the gap, an operator can at least:**
+
+- lower `[security].max_session_hours` or `[security].sign_out_after_idle_minutes`, which bound every
+  session on both legs;
+- for OIDC, set `[auth].oidc_session_max_hours`, or lower `[auth].oidc_max_age_seconds`;
+- keep the reconciler on, and shorten its window by lowering `[auth].ad_session_recheck_seconds`
+  (60 at least) or `[auth].ad_session_recheck_strikes`. Setting the interval to `0` turns it off,
+  and that is a declared loosening;
+- end one user's sessions at once with `DELETE /users/{user_id}/sessions`, or by disabling the user
+  in the engine.
+
+[CONFIGURATION.md](CONFIGURATION.md) gives each setting's range.
 
 ### Session inventory & targeted revocation (WP-10)
 
