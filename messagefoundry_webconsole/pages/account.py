@@ -588,17 +588,11 @@ def _session_offer(others: int) -> Markup:
     same route as the sessions page's *Sign out everywhere else*, which keeps the current session.
     That route asks for a fresh re-proof, bound to the action, and then runs (ASVS 7.5.2). Declining
     is doing nothing: no session ends unless the caller asks."""
-    heading = el("h2", "Your other sessions")
     if not others:
-        return el(
-            "div",
-            heading,
-            el("p", "You have no other active sessions, so there is none to end.", class_="muted"),
-            class_="card",
-        )
+        return Markup("")  # nothing to end, as on the sessions page
     return el(
         "div",
-        heading,
+        el("h2", "Your other sessions"),
         el(
             "p",
             f"You changed how you sign in. You have {others} other active session(s). If you made "
@@ -631,10 +625,10 @@ def account_page(
     last_used_at / backed_up / usable / credential_id_hash) — this module never touches the store.
     ``webauthn_notice`` renders the fail-closed copy in place of the Add-a-passkey form (extra
     absent / public_origin unset). ``session_offer`` is the count of the caller's other sessions,
-    given only on the one view a factor change earned (BACKLOG #1147); ``None`` renders no offer."""
+    given only on the one view a factor change earned (BACKLOG #1147); ``None`` or 0 renders none."""
     banner = el("p", error, class_="banner") if error else Markup("")
     note = el("p", notice, class_="muted") if notice else Markup("")
-    offer = _session_offer(session_offer) if session_offer is not None else Markup("")
+    offer = _session_offer(session_offer or 0)
     is_ad = me.auth_provider == "ad"
     ident = el(
         "div",

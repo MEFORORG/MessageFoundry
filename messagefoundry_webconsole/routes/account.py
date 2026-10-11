@@ -497,6 +497,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
         code = form.get("code", "").strip()
+        # BACKLOG #1147: the offer's count, read BEFORE the confirm commits. Read after it, a store
+        # fault would answer 500 once TOTP is on and the token rotated, losing the one-time codes and
+        # this browser's session. The confirm ends no other session and rotates this one in place,
+        # so counting against this token counts against the session the new token continues.
+        others = await _other_session_count(service, identity.user_id, token)
         try:
             elevation = await service.confirm_mfa_enrollment(
                 identity, code, token=token, client=client
@@ -519,8 +524,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
-        # BACKLOG #1147: the offer rides this response, counted against the NEW token.
-        others = await _other_session_count(service, identity.user_id, elevation.token)
+        # BACKLOG #1147: the offer rides this response; accepting it acts as the new cookie below.
         resp = HTMLResponse(
             pages.mfa_recovery_page(list(elevation.recovery_codes), other_sessions=others)
         )
@@ -535,6 +539,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
     ) -> Response:
         assert_same_origin(request)
+        # BACKLOG #1147: the service answers a disable of TOTP that was never on as a success, and
+        # that changes no factor, so it earns no offer.
+        before = await service.store.get_user(identity.user_id)
+        was_on = before is not None and before.totp_enabled
         try:
             await admin.disable_my_mfa(request=request, service=service, identity=identity)
         except HTTPException as exc:
@@ -549,7 +557,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _account_response(
                 service, identity, request, error=str(exc.detail), status_code=exc.status_code
             )
-        _SESSION_OFFERS.mark(session_token(request))  # BACKLOG #1147
+        if was_on:
+            _SESSION_OFFERS.mark(session_token(request))  # BACKLOG #1147
         return RedirectResponse("/ui/account?m=mfa_off", status_code=303)
 
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---

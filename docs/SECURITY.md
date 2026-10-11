@@ -3901,14 +3901,16 @@ sessions** action for admin force-sign-out. It refuses the caller's own account 
 operator ends their other sessions from the **Active sessions…** view instead, and the current one
 with *Sign out*, since that view cannot end it.
 
-**Changing a second factor offers to end your other sessions (ASVS 7.4.3, BACKLOG #1147).** Four
-console lanes change a second factor: confirming a TOTP enrolment, turning TOTP off, adding a passkey
-and removing one. On success, each offers to sign out every other session of the account and keep
-this one. The enrolment confirm shows the offer in its own response, below the recovery codes. The
-other three set a single-use mark on the session. The next account page that session loads shows the
-offer and spends the mark. So a typed `/ui/account?m=mfa_off` shows the notice and no offer, and so
-does a failed attempt. The confirm and the passkey add rotate the session, so the mark and the count
-of other sessions follow the new token. Accepting posts to `POST /ui/account/sessions/revoke-others`.
+**Changing a second factor offers to end your other sessions (ASVS 7.4.3, BACKLOG #1147).** At
+least these four console lanes change a second factor: confirming a TOTP enrolment, turning TOTP off,
+adding a passkey and removing one. On success, each offers to sign out every other session of the
+account and keep this one. The enrolment confirm shows the offer in its own response, below the
+recovery codes. The other three set a single-use mark on the session. The next account page that
+session loads shows the offer and spends the mark. So a typed `/ui/account?m=mfa_off` shows the
+notice and no offer, and so does a failed attempt or a disable of TOTP that was never on. With no
+other session live, there is no offer. The confirm and the passkey add rotate the session. The
+confirm's count excludes this session across the rotation, and the passkey add marks the new token.
+Accepting posts to `POST /ui/account/sessions/revoke-others`.
 It asks for the same `session_terminate` re-proof as any terminate, then runs. Declining means doing
 nothing, and no session ends unasked. The mark is process-local, like the re-auth continuations. A
 lost mark costs the offer, and the **Active sessions…** view still has the control. The JSON twins,

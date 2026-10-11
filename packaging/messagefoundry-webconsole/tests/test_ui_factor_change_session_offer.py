@@ -90,8 +90,8 @@ async def test_enroll_confirm_shows_the_codes_and_the_offer_for_the_new_session(
     engine: Engine,
 ) -> None:
     """Lane 2. The recovery page is the confirm POST's own response, so it carries the offer. The
-    confirm re-keys the session, and the count is against the NEW token: counted against the old
-    one it would read 2, since the new session would count as another."""
+    count excludes this session across its re-key: had the route counted the rotated session as
+    another one, it would read 2. Accepting keeps the NEW token's session."""
     service = await _service(engine)
     async with _client(engine, service) as c:
         user_id = await provision(service, "op", ["operator"])
@@ -246,18 +246,27 @@ async def test_a_forged_notice_code_renders_no_offer(engine: Engine) -> None:
 
 
 async def test_a_failed_factor_change_offers_nothing(engine: Engine) -> None:
-    """A wrong confirm code and a delete of an unknown passkey change nothing, so neither the
-    response nor the next account page offers to end the other sessions."""
+    """A wrong confirm code, a disable of TOTP that was never on and a delete of an unknown passkey
+    change nothing, so neither the response nor the next account page offers anything."""
     service = await _service(engine)
     async with _client(engine, service) as c:
-        await provision(service, "op", ["operator"])
+        user_id = await provision(service, "op", ["operator"])
         assert (await service.login("op", PW)).ok
         await cookie_login(c, "op")
         await mint_bound_proof(c, "/ui/account/mfa/enroll")
         assert (await c.post("/ui/account/mfa/enroll", headers=SAME_ORIGIN)).status_code == 200
+        secret = await service.store.get_totp_secret(user_id)
+        assert secret is not None
         await mint_bound_proof(c, "/ui/account/mfa/confirm")
-        r = await c.post("/ui/account/mfa/verify", data={"code": "000000"}, headers=SAME_ORIGIN)
+        with held_totp_code(secret) as live:
+            wrong = f"{(int(live) + 1) % 1_000_000:06d}"  # never the live code (skew is 0 steps)
+            r = await c.post("/ui/account/mfa/verify", data={"code": wrong}, headers=SAME_ORIGIN)
         assert r.status_code == 400 and OFFER not in r.text
+        # A disable with TOTP never on succeeds in the service and changes no factor: no offer.
+        await mint_bound_proof(c, "/ui/account/mfa/disable")
+        r = await c.post("/ui/account/mfa/disable", headers=SAME_ORIGIN)
+        assert r.status_code == 303 and r.headers["location"] == "/ui/account?m=mfa_off"
+        assert OFFER not in (await c.get(r.headers["location"])).text
         path = "/ui/account/webauthn/no-such-passkey/delete"
         await mint_bound_proof(c, path)
         r = await c.post(path, headers=SAME_ORIGIN)
@@ -266,11 +275,11 @@ async def test_a_failed_factor_change_offers_nothing(engine: Engine) -> None:
 
 
 def test_the_offer_with_no_other_session_has_no_button() -> None:
-    """With nothing to end, the card says so and renders no form."""
+    """With nothing to end there is no offer, as the sessions page renders no button for none."""
     me = CurrentUser(user_id="u1", username="op", auth_provider="local", roles=[], permissions=[])
     mfa = MfaStatusResponse(enabled=False, required=False, recovery_codes_remaining=0)
     page = pages.account_page(me, mfa, session_offer=0)
-    assert "You have no other active sessions" in page and OFFER not in page
+    assert OFFER not in page and "Your other sessions" not in page
     assert OFFER in pages.account_page(me, mfa, session_offer=2)
     assert OFFER not in pages.account_page(me, mfa)
     assert OFFER not in pages.mfa_recovery_page(["a", "b"], other_sessions=0)
