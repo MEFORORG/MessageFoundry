@@ -1240,7 +1240,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/channels` | `monitoring:read` | `require` |
 | `GET` | `/connections` | `monitoring:read` | `require` — `error` gated on `messages:view_summary` and masked; the `reveal=<connection name>` act also needs `messages:view_summary` (BACKLOG #2443) |
 | `GET` | `/connections/{name}/metadata` | `monitoring:read` | `require` — per-channel for inbound; a shared outbound is barred to scoped users; credentials scrubbed unconditionally; `error` gated on `messages:view_summary` and masked; the `reveal=true` act also needs `messages:view_summary` (BACKLOG #2443) |
-| `GET` | `/events` | `monitoring:read` | `require` |
+| `GET` | `/events` | `monitoring:read` | `require` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/connections/{name}/events` | `monitoring:read` | `require` |
 | `GET` | `/stats` | `monitoring:read` | `require` |
 | `GET` | `/metrics` | `monitoring:read` | `require` |
@@ -1248,20 +1248,20 @@ tuple: they act only on the caller's own account.
 | `GET` | `/graph/edges` | `monitoring:read` | `require` |
 | `GET` | `/alerts/rules` | `monitoring:read` | `require` |
 | `GET` | `/config/provenance` | `monitoring:read` | `require` |
-| `GET` | `/status` | `monitoring:read` | `require` |
+| `GET` | `/status` | `monitoring:read` | `require` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/cluster/status` | `monitoring:read` | `require` |
 | `GET` | `/cluster/nodes` | `monitoring:read` | `require` |
 | `GET` | `/dr/status` | `monitoring:read` | `require` |
 | `GET` | `/service/status` | `monitoring:read` | `require` |
 | `GET` | `/logging/level` | `monitoring:diagnose` | `require` |
 | `PATCH` | `/logging/level` | `monitoring:diagnose` | `require_paced` (BACKLOG #287) |
-| `POST` | `/statistics/reset` | `monitoring:diagnose` | `require_paced` |
+| `POST` | `/statistics/reset` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/status/integrity-check` | `monitoring:diagnose` | `require_paced` |
 | `GET` | `/alerts/active` | `monitoring:diagnose` | `require` |
-| `POST` | `/alerts/{alert_id}/ack` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_paced` |
-| `POST` | `/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_paced` |
+| `POST` | `/alerts/{alert_id}/ack` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `POST` | `/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `POST` | `/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `POST` | `/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_paced` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/alerts/test-email` | `service:configure` | `require_paced` (BACKLOG #287) — operator test-send through the configured `[alerts]` email transport (BACKLOG #118); fires a live outbound SMTP dial, so it is admin-gated rather than `monitoring:diagnose`; sends a synthetic PHI-free event and returns no addresses; audited `alert_test_email` |
 | `WS` | `/ws/stats` | `monitoring:read` | `authorize_ui_ws` first, when the web console is mounted: a same-origin browser, by session cookie. If that yields no identity, `authorize_ws`: `Origin` validated against `[api].ws_allowed_origins`, then the Authorization header only, no `?token=` fallback. Both run **before** `accept()`; the WebSocket note under the gate table has the detail |
 | `GET` | `/service/identity` | `monitoring:read` | `require_service_cert` — **mTLS client certificate only**; PHI-fenced at app construction; writes a `service_cert_auth` audit row |
@@ -1313,7 +1313,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/search/presets` | `messages:read` | `require` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
 | `POST` | `/search/presets` | `messages:read` | `require_step_up` | **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1) |
 | `DELETE` | `/search/presets/{preset_id}` | `messages:read` | `require_paced` | paced since BACKLOG #287; **owner-scoped**: a caller sees only their OWN presets. Enforced on the identity's `user_id`, not on any client-supplied field, so the permission grants the FUNCTION and the row's owner grants the DATA (ASVS 8.1.1). A preset id belonging to another user is a miss, not a 403 -- ownership is part of the lookup |
-| `GET` | `/search/layered` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` |
+| `GET` | `/search/layered` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing`; data rule: *Single-route data rules* below (BACKLOG #1151) |
 
 #### Uploaded files (PHI at rest)
 
@@ -1778,6 +1778,49 @@ the same permission set on the same method reds CI until it is listed here.
 > least the Prometheus exposition above and `GET /alerts/rules` list them, and
 > `POST /connections/{name}/flag` has no per-channel check.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
+
+> **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
+> own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
+> non-administrator without the all-channels grant, including one with no channel at all. An
+> administrator is always all-channels, as the DLQ-SCOPE blockquote says, whatever scope is stored.
+>
+> - `GET /search/layered` reads each preset it layers by the caller's own `user_id`. Another user's
+>   preset id answers 404, the same answer an unknown id gets. The search it then runs is narrowed
+>   to the caller's channel scope.
+> - `POST /statistics/reset` with `all` set answers 403 to every scoped caller, whatever its scope,
+>   because a reset of every counter spans every channel. A targeted reset checks each target's
+>   `channel_id` against the scope. One target outside it refuses the whole request with 403, and
+>   nothing resets. A destination target is one inbound's edge into an outbound, so it passes when
+>   that inbound is in scope, and it resets only that edge. Both refusals are audited
+>   `auth.channel_denied`.
+> - `GET /status` narrows one field by scope. `channels_failed_names` lists only the failed inbounds
+>   in the caller's scope. At least `channels_failed`, `channels_total`, `outbox_by_status`, the
+>   `kpis` block and the `db` message and event counts are not narrowed. So a scoped caller can see
+>   a failure count higher than the names it is shown. Two other fields, `db.audit` and
+>   `logs.size_bytes`, follow a permission rule rather than a scope rule. The `## Audit` section
+>   near the end states it, under *Closed on the same channel*.
+> - `POST /alerts/{alert_id}/ack`, `POST /alerts/{alert_id}/resolve`,
+>   `POST /alerts/{alert_id}/suspend` and `POST /alerts/{alert_id}/resume` first read the alert
+>   through the caller's scope. An alert whose `connection` value is not in the scope answers 404,
+>   the same answer an unknown id gets. That includes an alert on a shared outbound an in-scope
+>   inbound feeds. Only a scope that lists the outbound by name reaches it. The handler stops before
+>   any state change and writes no audit row, not even `auth.channel_denied`. Only the gate's
+>   admission row, `auth.permission_granted`, is written.
+> - `GET /events` with a `connection=` filter outside the scope answers 403 and is audited
+>   `auth.channel_denied`. Without the filter it returns only the caller's own connections, as the
+>   monitoring paragraph above says.
+>
+> The console reaches the same rules, because its routes call these handlers in-process. That
+> covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
+> `/ui/alerts/{alert_id}/*` writes, `/ui/status` and `/ui/nav-status`. The console's preset
+> list, save and delete call the `/search/presets` handlers, so they carry those rows' owner rule.
+> One console difference: `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404
+> and redirects, so another user's preset id looks like one already deleted.
+>
+> `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
+> all-channels caller as the control. It reds if a bullet loses its route, a named fact, or its
+> route-map pointer, or names a route nothing executes. It does not execute this console paragraph,
+> the outbound-by-name case, or the administrator case; those are read from the code.
 
 > **Every route of the default JSON API has a channel-scope class, and a new one fails the build
 > until it gets one (BACKLOG #2627).** `tests/test_route_channel_scope_classification.py` holds the

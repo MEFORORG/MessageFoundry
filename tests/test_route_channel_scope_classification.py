@@ -311,6 +311,7 @@ _QUERY: dict[str, tuple[tuple[str, str], ...]] = {
 #: Scoped GETs on which this fixture gives the all-channels caller nothing to see, so the scoped
 #: side's silence there proves nothing. Named so the gap is visible; the test checks the set exactly.
 _QUIET_HERE = {
+    # tests/test_single_route_data_rules_doc_drift.py measures the narrowing with a stubbed failure.
     "/status": "no inbound failed to start, so there is no failed-inbound name to narrow",
 }
 
