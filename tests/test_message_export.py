@@ -552,6 +552,42 @@ async def test_a_scope_widened_mid_export_does_not_stop_it(
     assert "auth.channel_denied" not in actions
 
 
+@pytest.mark.parametrize(
+    ("start", "change"),
+    [
+        pytest.param(["IB_A"], ["IB_A", "IB_B"], id="widened"),
+        pytest.param(["IB_A", "IB_B"], ["IB_A"], id="narrowed"),
+    ],
+)
+async def test_an_administrator_scope_change_mid_export_stops_it_as_a_revoke(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, start: list[str], change: list[str]
+) -> None:
+    """BACKLOG #3381. An administrator's scope write revokes the session, in either direction, so
+    the next row's standing re-check refuses and the export stops with ``standing_changed``. The
+    direct store writes above are the no-revoke case; this is the path an administrator takes.
+    Without the revoke, the widened export would stream to the end and the narrowed one would stop
+    with ``scope_changed``, so the reason is what proves the revoke stopped it."""
+    service = await _service(engine)
+    uid = await _add_user(service, "op", [Role.OPERATOR.value], scope=start)
+    mid_a, mid_b = await _seed(engine)
+
+    async def administer() -> None:
+        await service.set_channel_scope(uid, change, actor="admin")
+
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        _after_first_read(monkeypatch, engine, administer)
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200  # the response had started; the abort is in the body
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "standing_changed"}
+    ]
+    assert await service.identity_for_token(token) is None  # the revoke is what stopped it
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
+    assert "auth.channel_denied" not in actions
+
+
 def _count_stream_touches(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> list[int]:
     """Count ``touch_session`` calls made after the export's own audit row, i.e. by the stream and
     not by sign-in or the gate. Returns a one-item list the caller reads after the request."""

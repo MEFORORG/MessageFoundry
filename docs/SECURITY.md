@@ -3733,18 +3733,30 @@ those ran at the gate. Each resolves the token it started with, so a session rot
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
-  with 1008 before the next frame. Each frame's connections table uses the identity resolved for
-  that frame, so a narrowed channel scope shapes the next frame.
+  with 1008 before the next frame. An administrator's scope change revokes the session, as the
+  export bullet below says, so the feed closes. Each frame's connections table uses the identity
+  resolved for that frame. So a scope change that reaches a live session without a revoke shapes
+  the next frame. A direct store write does that. So can a frame resolved in the export bullet's
+  write-to-revoke window, which then sends one frame on the new scope before the feed closes.
 - The bulk message export (`GET` or `POST /messages/export`, streamed as newline-delimited JSON)
   asks before every row. It stops on a refusal. An administrator's scope change, wider or
-  narrower, revokes the session, as the list above says. So the next row's check refuses it, and
-  the export stops with the reason `standing_changed`. A second check catches a scope change that
-  reaches a live session without a revoke. At least two cases do: a direct store write, and a row
-  checked between the scope write and its revoke. The export then stops, with the reason
-  `scope_changed`, when the caller's channel scope no longer covers the scope it started with. A
-  widened scope still covers it, so in those cases the export goes on. A stop records
-  `messages_export.stopped` with the selected and streamed counts and the reason. Then it aborts
-  the transfer, so the client sees a failed download rather than a short file.
+  narrower, revokes the session. At least two such changes do. One is a user's channel scope set,
+  from the list above. The other is an edit to the AD group-to-scope map, which revokes the
+  sessions of every enabled directory account. So the next row's check refuses it, and the export
+  stops with the reason `standing_changed`. The reconcile pass also revokes when the directory
+  narrows or withdraws a scope. Its audit row, `auth.ad_session_revoked`, carries the reason
+  `scope_changed`, or `roles_changed` with a `scope_changed` key when the roles changed too. The
+  export it ends still records `standing_changed`.
+
+  A second check catches a scope change that reaches a live session without a revoke. At least
+  two cases do. One is a direct store write. The other is a row checked after `set_channel_scope`
+  writes the scope but before its revoke lands. The AD map edit writes no user's scope, so it has
+  no such window. In both cases the export stops, with the reason `scope_changed`, when the
+  caller's channel scope no longer covers the scope it started with. A widened scope still covers
+  it. After a direct store write the export goes on. In the write-to-revoke window it goes on only
+  until the revoke lands, and the next row's check stops it with `standing_changed`. A stop
+  records `messages_export.stopped` with the selected and streamed counts and the reason. Then it
+  aborts the transfer, so the client sees a failed download rather than a short file.
 
   While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
