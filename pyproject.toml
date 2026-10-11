@@ -261,13 +261,11 @@ webauthn = ["webauthn>=3.0.0,<4"]
 # would have reached a release with no test exercising it. The `test` leg installs it now (ADR 0180's
 # TLS suite assertion needs to be executed, not merely shipped), so a major would at least be caught
 # by that leg -- keep the cap regardless: the leg proves the client still constructs, not that a major
-# preserved its TLS or redirect behaviour. The cap has a Dependabot ignore entry at `>=3.0.0`, as the
+# preserved its TLS or redirect behaviour. The cap has a matching Dependabot ignore entry, as the
 # webauthn major cap does (BACKLOG #2569; a seat decision under owner delegation 2026-10-08, not an
-# owner ruling). Without one, Dependabot widens the cap and holds the `python-deps-major` batch behind
-# it. Cost, accepted: a fix shipped only in hvac 3.x raises no Dependabot PR. GitHub's options
-# reference marks `ignore` as also changing security-update PRs, but does not say how a `versions`
-# range applies there, so treat the security track as withheld too. pip-audit over requirements.lock
-# still reports such an advisory, and the `<3` cap needs a human to lift it either way.
+# owner ruling). Cost, accepted: a fix shipped only in hvac 3.x raises no Dependabot PR, and
+# dependabot.yml's TRADE-OFF note says what still detects it. GitHub's options reference marks
+# `ignore` as also changing security-update PRs, but does not say how a `versions` range applies.
 # Net-new transitives (dep-vet 2026-07-10): requests + urllib3
 # (both ubiquitous, mature; the lock resolves urllib3>=2.7.0 — CVE-2025-50181/50182 SSRF-redirect fixes)
 # plus charset-normalizer/idna/certifi. hvac ships NO type stubs — mypy-strict containment lives inside

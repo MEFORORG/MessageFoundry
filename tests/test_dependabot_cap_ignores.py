@@ -424,7 +424,7 @@ def test_the_checker_reds_on_a_broken_exemption(
     assert any(expect in p for p in problems), f"no violation mentioning {expect!r}: {problems}"
 
 
-@pytest.mark.parametrize("name", ["hatchling"])  # explicit, so dropping one reds here
+@pytest.mark.parametrize("name", ["hatchling"])  # explicit: name each real exemption here
 def test_a_named_exemption_must_not_have_an_entry(name: str) -> None:
     """Mutation arm for the must-not list, over the real named exemption (hatchling)."""
     pyproject, dependabot = _fixture()

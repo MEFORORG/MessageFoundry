@@ -130,12 +130,10 @@ updates:
     # widened major cap holds that batch hostage too. `webauthn<4` is the major cap of the three.
     # `pynetdicom<3.1` is a minor cap, like `pydicom<3.1`; it was `<4` until vault BACKLOG #2713.
     # pyproject.toml's [dicom] comment says why those two hold, and what raising the pynetdicom cap
-    # requires. Its [webauthn] comment says why that one holds. Lift each entry in the same PR that
-    # lifts its cap.
-    #
-    # `hvac<3` is a major cap like webauthn's. It was a named exemption until BACKLOG #2569, which
-    # gave it this entry (a seat decision under owner delegation 2026-10-08, not an owner ruling).
-    # pyproject.toml's [vault] comment records the cost: a fix shipped only in hvac 3.x raises no PR.
+    # requires. Its [webauthn] comment says why that one holds. `hvac<3` is a major cap of the same
+    # case (BACKLOG #2569; a seat decision under owner delegation 2026-10-08, not an owner ruling),
+    # and its [vault] comment says why it holds and what its entry costs. Lift each entry in the
+    # same PR that lifts its cap.
     #
     # THE RULE (BACKLOG #2505): every upper bound in pyproject.toml has an entry here, exactly `>=`
     # the version the test derives (a `<` cap's bound; for an exact `==` pin, the next minor), unless
