@@ -116,10 +116,10 @@ from messagefoundry.store.transit_attestation import enforce_transit_bound_attes
 from messagefoundry.transports.base import IntakeGate
 
 __all__ = [
-    "Engine",
     "ApprovedConfig",
     "ConfigDigestMismatch",
     "ConfigReloadDenied",
+    "Engine",
     "ReloadOutcome",
     "ReloadStepFailure",
 ]
@@ -171,16 +171,13 @@ class ApprovedConfig:
     fingerprint: str | None
 
 
-def _require_approved(detail: Mapping[str, object] | None, approval: ApprovedConfig) -> None:
-    """Raise :class:`ConfigDigestMismatch` unless ``detail`` is the digest ``approval`` names. A
+def _require_approved(current: str | None, approval: ApprovedConfig) -> None:
+    """Raise :class:`ConfigDigestMismatch` unless ``current`` is the digest ``approval`` names. A
     digest that could not be taken (``None``) never matches."""
     from messagefoundry.config.fingerprint import fingerprint_matches
 
-    current = detail.get("fingerprint") if detail is not None else None
     if approval.fingerprint is None or not fingerprint_matches(current, approval.fingerprint):
-        raise ConfigDigestMismatch(
-            approval.fingerprint, current if isinstance(current, str) else None
-        )
+        raise ConfigDigestMismatch(approval.fingerprint, current)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2416,9 +2413,20 @@ class Engine:
             path = await self._existing_reload_target(config_dir)
         except (ConfigReloadDenied, WiringError, OSError):
             return None
-        detail, _reason = await self.fingerprint_bundle(path)
-        digest = detail.get("fingerprint") if detail is not None else None
-        return digest if isinstance(digest, str) else None
+        return await self._content_digest(path)
+
+    async def _content_digest(self, path: Path) -> str | None:
+        """The ADR 0041 D1 content digest of ``path`` alone, or ``None`` when it cannot be taken.
+
+        Not :meth:`fingerprint_bundle`, whose detail is lost whole when only its advisory VCS head
+        cannot be read. An approval binds content, so that failure must not refuse a release."""
+        from messagefoundry.config.fingerprint import config_fingerprint
+
+        try:
+            return await asyncio.to_thread(config_fingerprint, path)
+        except (OSError, ValueError) as exc:
+            log.warning("config content digest failed for %s: %s", path, safe_exc(exc))
+            return None
 
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by
@@ -2552,9 +2560,11 @@ class Engine:
             await self.preflight_settings()
         path = await self._existing_reload_target(config_dir)
         if approval is not None:
-            # Before load_config, which runs every config module's top-level code: bytes nobody
-            # approved are refused before any of them executes (vault BACKLOG #2596).
-            _require_approved((await self.fingerprint_bundle(path))[0], approval)
+            # Before load_config, which runs every config module's top-level code, so bytes
+            # changed since the request are refused before they run (vault BACKLOG #2596). This
+            # samples the files: an edit landing between here and the load still runs its module
+            # code, and the check before the swap then refuses it.
+            _require_approved(await self._content_digest(path), approval)
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
         # to add a missing value would never clear (review M-23).
@@ -2695,12 +2705,14 @@ class Engine:
         # otherwise-applicable config. Recorded as a step failure so the caller is not told the
         # reload was clean when GET /config/provenance will report nothing.
         fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
+        if fingerprint_failure is not None:
+            failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
         if approval is not None:
             # Again, on the digest the audit row records, so a released reload's row names the
             # approved digest. An edit that lands and is reverted inside the load is not seen.
-            _require_approved(fingerprint, approval)
-        elif fingerprint_failure is not None:
-            failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
+            taken = fingerprint.get("fingerprint") if fingerprint is not None else None
+            current = taken if isinstance(taken, str) else await self._content_digest(path)
+            _require_approved(current, approval)
         if runner is None:
             runner = self.add_registry(registry)
             try:

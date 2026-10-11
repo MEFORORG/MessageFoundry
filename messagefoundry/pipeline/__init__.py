@@ -27,9 +27,9 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
 __all__ = [
     "ApprovedConfig",
-    "Engine",
     "ConfigDigestMismatch",
     "ConfigReloadDenied",
+    "Engine",
     "RegistryRunner",
     "ReloadOutcome",
     "ReloadStepFailure",

@@ -1994,8 +1994,13 @@ request-time digest. At least these limits remain:
   rest of the params. Sealing that row is vault BACKLOG #2592;
 - the digest covers what `config/fingerprint.py` hashes and no more. A planted `__pycache__` file
   runs under an unchanged digest, and its other gaps are closing step 1 of vault BACKLOG #2596;
-- an edit that lands and is reverted while the release loads is not seen. Hashing, compiling and
-  running the same bytes is that same step 1;
+- each check samples the files. An edit that lands after the first check runs its module code
+  before the second check refuses it. An edit reverted while the release loads is not seen at all.
+  Hashing, compiling and running the same bytes is that same step 1;
+- a release refused at the second check may already have re-read this environment's values into
+  the running graph, as any reload refused after that read does;
+- the request-time digest is taken before the route checks its step-up proof, and a hold that took
+  no digest is still filed, though its release is certain to be refused;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
   before a toggle is refused at release and must be asked for again;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no

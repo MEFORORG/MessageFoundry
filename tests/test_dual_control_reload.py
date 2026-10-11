@@ -1246,3 +1246,23 @@ async def test_an_ungated_reload_takes_no_request_time_digest(
     async with _client(engine, service, NOT_GATED) as c:
         r = await c.post("/config/reload", json={}, headers=await _token(c, "deployer"))
     assert r.status_code == 200, r.text
+
+
+async def test_an_unreadable_vcs_head_does_not_refuse_an_unchanged_release(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The approval binds content. A git HEAD that cannot be read loses the whole fingerprint
+    detail, so the binding must not rest on that detail, or every held reload would be refused."""
+    import messagefoundry.config.fingerprint as fp_mod
+
+    def _bad_head(_start: Path) -> str | None:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(fp_mod, "_git_head", _bad_head)
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {})
+    assert r.status_code == 200, r.text
+    params = _held_params(await engine.store.get_pending_approval(approval_id))
+    assert isinstance(params["fingerprint"], str)
+    assert r.json()["result"]["failures"] == ["config_fingerprint"]  # reported, not refused
+    assert await _digest_mismatch_rows(engine) == []
