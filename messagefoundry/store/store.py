@@ -5831,8 +5831,14 @@ class MessageStore:
         audit_mac_fn: Callable[[bytes], str] | None = None,
         message_events: str = "all",
         read_only: bool = False,
+        secure_delete: bool = True,
     ) -> MessageStore:
         """Open (and, unless ``read_only``, create, schema-ensure and migrate) the store at ``path``.
+
+        ``secure_delete`` (vault BACKLOG #2619) sets ``PRAGMA secure_delete`` on the writer
+        connection. On, SQLite overwrites the bytes of a deleted row or a NULLed body with zeros, so a
+        retention purge and a consumed queue row leave no copy in the file's free space. The knob,
+        its default and its cost are ``[store].secure_delete`` in ``docs/CONFIGURATION.md``.
 
         ``read_only`` (BACKLOG #1780) is for a caller that means *inspect this store*. The file is
         opened through a ``mode=ro`` URI, so SQLite itself refuses to create it or write to it. No
@@ -5875,6 +5881,8 @@ class MessageStore:
                 # win vs FULL. `sync` is validated above, so this f-string can't inject. FULL is
                 # available for the paranoid (every commit fsynced) via [store] synchronous = "full".
                 await db.execute(f"PRAGMA synchronous={sync}")
+                # Per connection, and only the writer deletes: the read pool is query_only.
+                await db.execute(f"PRAGMA secure_delete={'ON' if secure_delete else 'OFF'}")
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
             if read_only:

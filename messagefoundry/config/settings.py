@@ -621,6 +621,12 @@ class StoreSettings(_Section):
     # --- SQLite (default backend) -------------------------------------------
     path: str = "messagefoundry.db"
     synchronous: SqliteSync = SqliteSync.NORMAL
+    # PRAGMA secure_delete on the writer connection (vault BACKLOG #2619). ON zeroes the bytes of a
+    # deleted row or a purged body, so a retention purge or a consumed queue row leaves no copy in the
+    # file's free space. Default ON. The cost is extra write I/O for each page a delete frees; turning
+    # it off is a throughput choice that leaves purged bytes readable in the file. SQLite only: the
+    # server backends ignore it, and how a server database reuses freed space is the DBA's.
+    secure_delete: bool = True
     # App-side group-commit (ADR 0055, SQLite only). When > 0, the SQLite store runs a dedicated
     # committer coroutine that COALESCES the grouped stage-handoff mutations (enqueue_ingress,
     # route_handoff, transform_handoff, mark_done, complete_with_response, dead_letter_now, mark_failed)
@@ -2569,8 +2575,10 @@ class RetentionSettings(_Section):
     survives; its PHI *columns* do not. Tiers that carry nothing but PHI and back no count (transform
     state, connection events) are DELETEd outright instead.
 
-    One knob here is default-ON rather than off: ``min_free_disk_mb``, the low-disk storage floor
-    (BACKLOG #290). It refuses a ``serve`` start and warns at runtime; it never purges anything.
+    Two knobs here are default-ON rather than off. ``min_free_disk_mb``, the low-disk storage floor
+    (BACKLOG #290), refuses a ``serve`` start and warns at runtime; it never purges anything.
+    ``wal_checkpoint_seconds`` truncates the SQLite ``-wal`` file once an hour, so a purged body
+    does not outlive the purge there (vault BACKLOG #2619).
     """
 
     # Past N days, null inbound bodies (raw/summary/error/metadata) of fully-resolved messages,
@@ -2671,10 +2679,12 @@ class RetentionSettings(_Section):
     # non-interruptible. 0 = off (the default — no cap, byte-identical to the pre-#121 pass); recommend
     # ~14400 (4h, the Corepoint default off-peak ceiling) when enabled.
     max_pass_seconds: float = 0.0
-    # PRAGMA wal_checkpoint(TRUNCATE) cadence in seconds (SQLite). 0 = off — rely on SQLite's
-    # auto-checkpoint. Evaluated once per purge pass, so a value below purge_interval_seconds is
-    # effectively rounded up to it.
-    wal_checkpoint_seconds: float = 0.0
+    # PRAGMA wal_checkpoint(TRUNCATE) cadence in seconds (SQLite). Default 3600, ON (vault BACKLOG
+    # #2619): SQLite's own auto-checkpoint reuses the -wal file but never shrinks it, so frames that
+    # still hold a purged body stay on disk past the write point. TRUNCATE empties the file, and the
+    # pass runs it after its purges. 0 = off — rely on auto-checkpoint. Evaluated once per purge
+    # pass, so a value below purge_interval_seconds is effectively rounded up to it.
+    wal_checkpoint_seconds: float = 3600.0
     # Daily local clock time "HH:MM" at which to run VACUUM (SQLite; reclaims space freed by purges).
     # "" = off. A daily off-peak time, not a cron expression, to avoid a new dependency — VACUUM holds
     # a write lock on the whole DB while it runs, so it is off by default and meant for a quiet window.

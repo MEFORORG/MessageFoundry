@@ -3383,6 +3383,7 @@ async def _open_backend(
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             read_only=read_only,
+            secure_delete=settings.secure_delete,
         )
     if settings.backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep
