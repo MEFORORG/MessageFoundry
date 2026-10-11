@@ -67,13 +67,18 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+# A bash that can see this process's files, or a loud failure: never the WSL launcher.
+from tests._bash_resolver import probe_env, require_bash
 
 # The deny ENVELOPE is one contract shared by every PreToolUse hook here, so its assertion has one
 # home; tests/test_worktree_gate_git.py imports it from the same place.
@@ -414,8 +419,9 @@ def test_a_scoped_path_is_not_a_whole_tree_pathspec(command: str) -> None:
 #
 # WHY THE REPAIR IS NOT IN THIS COMMIT. It is a quote-state parser change on a fail-open security
 # gate, and the owner declined that shape across the sibling family (#1066/#1070/#1086/#1305/#1336)
-# on 2026-08-25. The page's "What wiring waits on" says how that decline reached this script.
-# The measurement is in the PR body; the short version is that the two limbs are not separable. Honouring backslash escapes ALONE flips `echo "C:\temp\" ; git add -A` -- an ordinary
+# on 2026-08-25. The page's "What wiring waited on" section says how that decline reached this
+# script. The measurement is in the PR body; the short version is that the two limbs are not
+# separable. Honouring backslash escapes ALONE flips `echo "C:\temp\" ; git add -A` -- an ordinary
 # Windows path, measured to stage the whole tree under pwsh -- from DENY to ALLOW, because bash and
 # PowerShell disagree about what a backslash is. One scanner cannot be right for both shells at
 # once, which is the reason the family was declined rather than an argument for trying again.
@@ -711,33 +717,36 @@ ADDED_NOT_REPLACED = [
     ("Bash", "git add ." + "/" * 40 + "x; git add -A"),
 ]
 
-# THE MEASURED FAIL-OPENS THAT ARE STILL OPEN, IN TWO TABLES. Each row stages or commits the whole
-# tree in a real shell and is ALLOWED. They are pinned the same way as the quote class above, and
-# for the same reason: the assertion demands the DENY, `strict` turns a repair into a visible
-# XPASS, and nobody can write today's ALLOW down as a requirement.
+# THE KNOWN RESIDUALS, IN TWO TABLES. Each row stages or commits the whole tree in a real shell
+# and is ALLOWED. The guard is a best-effort check of the common spellings, and the owner's
+# 2026-10-09 answer, "Accept by mechanism (Recommended)", makes every form it does not match a
+# stated residual. The rows are pinned the same way as the quote class above, and for the same
+# reason: the assertion demands the DENY, `strict` turns a repair into a visible XPASS, and nobody
+# can write today's ALLOW down as a requirement.
 #
 # WHY EACH IS STILL OPEN DIFFERS BY ROW, so read the page before assuming a row cannot be closed.
-# Many need a quote-state parser. Nobody built one, and the page's "What wiring waits on" gives
-# the record of its decline. Others need a program-position test, built and reverted under #1229.
-# Others need the working directory, which the guard cannot see. Some were closed by a wider
-# reading that was then withdrawn. And some are plain reading mistakes that look closable and have
-# not been tried: the bare carriage return, the heredoc word with a dash, the arithmetic shift.
+# Many need a quote-state parser. Nobody built one, and the page's "What wiring waited on"
+# section gives the record of its decline. Others need a program-position test, built and
+# reverted under #1229. Others need the working directory, which the guard cannot see. Some were
+# closed by a wider reading that was then withdrawn. Three were plain reading mistakes, and
+# FIXED_READING_MISTAKES below drives their fix.
 #
-# WHICH TABLE A ROW SITS IN RECORDS WHICH PER-FORM OWNER ANSWER COVERS IT. Do not move a row INTO
-# the accepted table without a per-form owner answer (1 to 3) to cite. A move OUT of it, on a
-# corrected reading of an answer's words, only narrows the claim. It needs no answer; say why
-# beside the row.
+# WHICH TABLE A ROW SITS IN RECORDS WHETHER A PER-FORM OWNER ANSWER NAMES IT. It does not decide
+# whether the row is accepted; the mechanism answer does that for both tables. Do not move a row
+# INTO the per-form table without a per-form owner answer (1 to 3) whose words describe it. A move
+# OUT of it, on a corrected reading of an answer's words, only narrows the claim. It needs no
+# answer; say why beside the row.
 # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md carries the answers, the full tables and what git did for
-# each form. The answers are reported by the Special seat; no other seat saw the dialogs. A later
-# answer accepts by mechanism, and the page says what that covers. AT LEAST these.
-_ACCEPTED = pytest.mark.xfail(
+# each form. The answers are reported by the Special seat; no other seat saw the dialogs. AT LEAST
+# these.
+_PER_FORM = pytest.mark.xfail(
     strict=True,
-    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; a fail-open "
-    "a per-form owner answer covers, as docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md sections 2 and 3 "
-    "report",
+    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; a stated "
+    "residual that a per-form owner answer also names, as docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md "
+    "sections 2 and 3 report",
 )
 
-ACCEPTED_FAIL_OPENS = [
+PER_FORM_RESIDUALS = [
     # answer 2 (a), a word before git: needs a program-position test
     ("Bash", "if true; then git add -A; fi"),
     ("Bash", "for i in 1; do git add -A; done"),
@@ -785,20 +794,27 @@ ACCEPTED_FAIL_OPENS = [
 ]
 
 # UNDER NO PER-FORM ANSWER. No line in owner answers 1 to 3 describes these rows. The page lists
-# them in section 5, with the nearest accepted line for each. Answer 4 accepts them only by
-# mechanism, as stated residuals; the page says so.
-_NOT_ACCEPTED = pytest.mark.xfail(
+# them in section 5, with the nearest per-form line for each. They are stated residuals under the
+# mechanism answer. The owner settled that they do not hold wiring back, in two answers of
+# 2026-10-10 that the Special seat reports: "Yes, wire now (Recommended)" and "Yes, it counts
+# (Recommended)". The page's "What wiring waited on" section quotes both.
+_MECHANISM_ONLY = pytest.mark.xfail(
     strict=True,
-    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; under none of "
-    "the per-form owner answers, listed in docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5",
+    reason="BACKLOG #1339: measured to stage or commit the whole tree and allowed; a stated "
+    "residual that no per-form owner answer names, listed in "
+    "docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 5",
 )
 
-NOT_ACCEPTED_FAIL_OPENS = [
-    # next to no per-form answer: reading mistakes in the script
-    ("PowerShell", "Write-Host hi\rgit add -A"),
-    ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A"),
-    ("Bash", "echo $((1<<n))\ngit add -A"),
-    # next to an accepted line whose words do not fit
+MECHANISM_ONLY_RESIDUALS = [
+    # next to no per-form answer: a '<<' the heredoc readers still take for an opener, so they
+    # blank the lines after it. In a trailing comment; in a tag with an escaped backslash, where
+    # the narrow reading drops both backslashes; after an array subscript inside '$[...]'; and in
+    # a quoted 'let' expression. STILL_OPEN_CONTROLS holds the nearest denied form of each.
+    ("Bash", "echo $((1<<n)) # <<EOF-2\ngit add -A"),
+    ("Bash", f"cat <<E{_BS}{_BS}OF\nx\nE{_BS}OF\ngit add -A"),
+    ("Bash", "echo $[ a[1]<<n ]\ngit add -A"),
+    ("Bash", 'let "x=1<<n"\ngit add -A'),
+    # next to a per-form line whose words do not fit
     ("Bash", ">/dev/null git add -A"),
     ("PowerShell", "<# note #> git add -A"),
     ("Bash", "git add sub/.."),
@@ -812,7 +828,7 @@ NOT_ACCEPTED_FAIL_OPENS = [
     ("Bash", "git commit -m $(true && echo wip) ."),
     ("Bash", "git commit -m $(cat <<'EOF'\nsubject\nEOF\n) ."),
     # a commit under a line that says "a stage": answer 3, form 4's shape. Moved out of the
-    # accepted table on 2026-10-09 because the line's words name a stage, not a commit.
+    # per-form table on 2026-10-09 because the line's words name a stage, not a commit.
     ("Bash", "cat <<<x\ngit commit -m wip ."),
     ("Bash", 'read -r a b <<< "$line"\ngit commit -am wip'),
     # a pathspec or flag after a message that spans lines
@@ -841,6 +857,41 @@ STILL_OPEN_CONTROLS = [
     ("Bash", "cat <<EOF\nx\nEOF\ngit add -A"),
     ("Bash", "echo $((1 << 2))\ngit add -A"),
     ("PowerShell", '$m = @"\nx\n"@\ngit add -A'),
+    ("Bash", "echo $[1<<n]\ngit add -A"),
+    ("Bash", 'let "x=1<<n"; git add -A'),
+]
+
+# THE THREE PLAIN READING MISTAKES, FIXED (BACKLOG #1339). Each was in the page's section 5.1 and
+# in MECHANISM_ONLY_RESIDUALS above. Each fix is an ADDED view, so it can only add a deny:
+#   * a bare carriage return ends a PowerShell line, and the guard split at a line feed only;
+#   * a heredoc tag holding '-', '.' or other punctuation was cut short, so the guard waited for a
+#     line that never came and blanked the real stage after the heredoc;
+#   * a shift inside shell arithmetic was read as a heredoc opener, with the same result.
+# Each row is (tool, the blanket form that must now deny, a scoped form of the same shape that
+# must still allow). `test_a_fixed_reading_mistake_really_stages` runs both halves in a real
+# shell, so each row is a measured stage and not a shape that only looks like one.
+FIXED_READING_MISTAKES = [
+    ("PowerShell", "Write-Host hi\rgit add -A", "Write-Host hi\rgit add a.txt"),
+    ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A", "cat <<EOF-1\ngit add -A\nEOF-1"),
+    ("Bash", "cat <<E.O\nx\nE.O\ngit add -A", "cat <<E.O\ngit add -A\nE.O"),
+    ("Bash", "cat <<EOF+1\nx\nEOF+1\ngit add -A", "cat <<EOF+1\ngit add -A\nEOF+1"),
+    # a tag that is partly quoted or escaped: bash removes the quotes to get the delimiter
+    ("Bash", "cat <<'EOF'-1\nx\nEOF-1\ngit add -A", "cat <<'EOF'-1\ngit add -A\nEOF-1"),
+    ("Bash", 'cat <<"EOF"x\nx\nEOFx\ngit add -A', 'cat <<"EOF"x\ngit add -A\nEOFx'),
+    ("Bash", f"cat <<E{_BS}OF\nx\nEOF\ngit add -A", f"cat <<E{_BS}OF\ngit add -A\nEOF"),
+    ("Bash", "echo $((1<<n))\ngit add -A", "echo $((1<<n))\ngit add a.txt"),
+    ("Bash", "(( x = 1<<n ))\ngit add -A", "(( x = 1<<n ))\ngit add a.txt"),
+    ("Bash", "echo $(( (1+(2)) << n ))\ngit add -A", "echo $(( (1+(2)) << n ))\ngit add a.txt"),
+    ("Bash", "echo $[1<<n]\ngit add -A", "echo $[1<<n]\ngit add a.txt"),
+]
+
+# THE TOOL NAME IS WHAT PICKS THE CARRIAGE-RETURN SPLIT. bash does not end a line at a bare
+# carriage return, so under the Bash tool this is one command whose program is `Write-Host`, and
+# it staged nothing when measured. The heredoc row is ordinary bash: the arithmetic comes first on
+# the line, and the real heredoc after it still hides its body.
+FIXED_READING_MISTAKES_ALLOW = [
+    ("Bash", "Write-Host hi\rgit add -A"),
+    ("Bash", "echo $((1<<n)) ; cat <<EOF\ngit add -A\nEOF"),
 ]
 
 # HARMLESS COMMANDS THE GUARD REFUSES, PINNED THE SAME WAY. The assertion demands the ALLOW each is
@@ -888,9 +939,12 @@ _BATCHED: list[tuple[str, str]] = sorted(
     | {(tool, scoped) for tool, _, scoped in BLANKET_AND_SCOPED_CONTROL}
     | set(MUST_STAY_ALLOWED)
     | set(ADDED_NOT_REPLACED)
-    | set(ACCEPTED_FAIL_OPENS)
-    | set(NOT_ACCEPTED_FAIL_OPENS)
+    | set(PER_FORM_RESIDUALS)
+    | set(MECHANISM_ONLY_RESIDUALS)
     | set(STILL_OPEN_CONTROLS)
+    | {(tool, blanket) for tool, blanket, _ in FIXED_READING_MISTAKES}
+    | {(tool, scoped) for tool, _, scoped in FIXED_READING_MISTAKES}
+    | set(FIXED_READING_MISTAKES_ALLOW)
     | set(KNOWN_OVER_DENY)
 )
 
@@ -931,6 +985,9 @@ def test_the_batch_driver_agrees_with_a_real_invocation() -> None:
         ("Bash", f"git add -{_BS}\nA"),
         ("PowerShell", f"git add {_BT}\n-A"),
         ("PowerShell", f"git add src{_BS}\ngit diff --stat ."),
+        ("PowerShell", "Write-Host hi\rgit add -A"),
+        ("Bash", "cat <<EOF-1\nx\nEOF-1\ngit add -A"),
+        ("Bash", "echo $((1<<n))\ngit add -A"),
     ]:
         assert verdict(*row) == run_guard(bash(row[1], tool=row[0])), row
 
@@ -965,6 +1022,394 @@ def test_a_run_of_slashes_does_not_hang_the_hook() -> None:
     assert_denied(run_guard(bash("git add ." + "/" * 40 + "x; git add -A")))
 
 
+def test_a_slow_added_reading_cannot_delay_the_original_deny() -> None:
+    """The settings file gives the hook 15 seconds, and a hook that runs longer lets the command
+    run. Many unclosed brackets made the arithmetic skip slow: with every view built first, this
+    payload took 19.7 s and so turned a deny into an allow. The original views are now judged
+    first, so the real stage at the front is denied before any added reading runs."""
+    command = "git add -A; echo '" + "(" * 30000 + "' ; echo '<<'"
+    started = time.monotonic()
+    assert_denied(run_guard(bash(command)))
+    assert time.monotonic() - started < 15
+
+
+# RUN TIME, AND THE LENGTH CAP THAT BOUNDS IT. The settings file gives the hook 15 seconds, and a
+# hook that runs longer lets the command run. Every repair of a slow path so far has opened
+# another, so the guard refuses, unread, any command longer than its cap.
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a has the measurements, the table the cap was
+# chosen from, and the false denies the cap costs. Each timing test below was run against the guard
+# at 93f2775087 and failed there on time.
+#
+# Two limits are asserted. A command past the cap must be refused within 5 seconds, a third of the
+# timeout, because that path reads nothing. A command under the cap must be judged within the
+# 15-second timeout itself; the 5-second figure the cap was chosen by is a measurement on one
+# machine, and a slower or busier test runner should not turn it into a false failure.
+_CAP_REASON = "Command too long for the blanket-stage guard to check"
+
+
+def _max_command_length() -> int:
+    """The cap, read from the script so this file never holds a second copy of it."""
+    found = re.search(r"^\$MAX_COMMAND_LENGTH = (\d+)\r?$", GUARD.read_text(encoding="utf-8"), re.M)
+    assert found, "the guard's $MAX_COMMAND_LENGTH line was not found"
+    return int(found.group(1))
+
+
+MAX_COMMAND_LENGTH = _max_command_length()
+
+
+def _timed(command: str, tool: str = "Bash") -> tuple[dict[str, Any] | None, float]:
+    started = time.monotonic()
+    result = run_guard(bash(command, tool=tool))
+    return result, time.monotonic() - started
+
+
+def test_a_command_one_past_the_cap_is_denied_unread_and_quickly() -> None:
+    """The false-deny cost of the cap: a long harmless command is refused, and told what to do."""
+    command = "echo " + "a" * (MAX_COMMAND_LENGTH - 4)
+    assert len(command) == MAX_COMMAND_LENGTH + 1
+    result, took = _timed(command)
+    assert took < 5, f"took {took:.1f} s"
+    reason = assert_denied(result)
+    assert _CAP_REASON in reason
+    assert "script file" in reason
+
+
+def test_a_command_at_the_cap_is_read() -> None:
+    """The control: at exactly the cap the guard reads the command, so a harmless one is allowed,
+    and a real stage is refused with its own reason rather than the cap's."""
+    harmless = "echo " + "a" * (MAX_COMMAND_LENGTH - 5)
+    assert len(harmless) == MAX_COMMAND_LENGTH
+    assert_allowed(run_guard(bash(harmless)))
+    stage = "git add -A; echo " + "a" * (MAX_COMMAND_LENGTH - 17)
+    assert len(stage) == MAX_COMMAND_LENGTH
+    reason = assert_denied(run_guard(bash(stage)))
+    assert "git add/stage -A" in reason
+    assert _CAP_REASON not in reason
+
+
+_NEST = "(" * 65 + ")" * 65
+
+# Each kept the hook at 93f2775087 past 5 seconds. The first three are the shapes of the Lander's
+# review payloads for that commit; the last is the shape the commit before it fixed.
+PAST_THE_CAP = [
+    pytest.param(
+        "git commit -m x " + (_NEST + " ") * 9200 + "&& git add -A", id="1.2M-nests-past-64-levels"
+    ),
+    pytest.param(
+        "git commit -m x " + _NEST + " " + "\\( " * 300000 + "; git add -A",
+        id="900K-escaped-brackets",
+    ),
+    pytest.param(
+        "git commit -m x " + _NEST + " " + "(" * 1200000 + " && git add -A",
+        id="1.2M-unclosed-after-a-deep-nest",
+    ),
+    pytest.param("git commit -m x " + "(a) " * 600_000 + "&& git add -A", id="2.4M-sibling-pairs"),
+]
+
+
+@pytest.mark.parametrize("command", PAST_THE_CAP)
+def test_a_slow_payload_past_the_cap_is_denied_within_five_seconds(command: str) -> None:
+    result, took = _timed(command)
+    assert took < 5, f"took {took:.1f} s"
+    assert _CAP_REASON in assert_denied(result)
+
+
+def test_a_long_run_of_escapes_under_the_cap_is_judged_inside_the_time_limit() -> None:
+    """The line-continuation pattern looked behind every backslash in a run, which took time
+    quadratic in the run. An unknown tool name builds every view, so the pattern ran four times,
+    and at 93f2775087 this payload ran past the timeout. The deny is owed to the narrow heredoc
+    reading alone, so a timeout would have cost it."""
+    tail = " x\ncat <<EOF-1\nx\nEOF-1\ngit add -A"
+    head = "echo x\recho "
+    command = head + "\\" * (MAX_COMMAND_LENGTH - len(head) - len(tail)) + tail
+    assert len(command) == MAX_COMMAND_LENGTH
+    result, took = _timed(command, tool="SomeFutureTool")
+    assert took < 15, f"took {took:.1f} s"
+    assert "git add/stage -A" in assert_denied(result)
+
+
+def test_a_spent_arithmetic_budget_does_not_hide_a_later_stage() -> None:
+    """Two slow lines spend the narrow reading's arithmetic budget. A later line holding a shift
+    must then be skipped, not read as it is: read as it is, '<<n' opens a heredoc that never ends
+    and blanks the stage after it. The control has short lines in place of the slow ones."""
+    shift_then_stage = "echo $((1<<n))\ngit add -A"
+    slow = (": " + "(" * 20000 + " <\n") * 2
+    assert "git add/stage -A" in assert_denied(run_guard(bash(slow + shift_then_stage)))
+    assert "git add/stage -A" in assert_denied(run_guard(bash(": x <\n" * 3 + shift_then_stage)))
+
+
+def test_a_huge_tool_call_is_refused_before_it_is_parsed() -> None:
+    """The cap is checked on the parsed command, so the payload is read only up to the longest one
+    that could hold a command under the cap. Escaped control characters take six characters each
+    in JSON and are the slowest to parse. Read whole, this payload took 7.7 s with the cap checked
+    after the parse, and 32.8 s at 93f2775087."""
+    result, took = _timed("\x01" * 12_000_000)
+    assert took < 5, f"took {took:.1f} s"
+    reason = assert_denied(result)
+    assert _CAP_REASON in reason
+    assert "a tool call of more than" in reason
+
+
+def test_the_commit_rule_itself_denies_past_deep_nesting() -> None:
+    """Deep nesting with the deny owed to the COMMIT rule and no other segment: the dot after the
+    brackets is the commit's pathspec. The control is the dot moved inside the brackets."""
+    nest = "(" * 20000 + ")" * 20000
+    result, took = _timed("git commit -m x " + nest + " .")
+    assert took < 15, f"took {took:.1f} s"
+    assert "git commit with a whole-tree pathspec" in assert_denied(result)
+    assert_allowed(run_guard(bash("git commit -m x " + "(" * 20000 + " ." + ")" * 20000)))
+
+
+def test_many_commit_words_before_a_stage_are_judged_inside_the_time_limit() -> None:
+    """The commit rule's pathspec pattern backtracked quadratically on repeated 'commit' words. At
+    30,000 words, past today's cap, it kept the hook past its timeout. This is the shape under the
+    cap; it passes at 93f2775087 too, so it pins the repair rather than proving it."""
+    command = "git x " + "commit " * 9000 + "&& git add -A"
+    assert len(command) <= MAX_COMMAND_LENGTH
+    result, took = _timed(command)
+    assert took < 15, f"took {took:.1f} s"
+    assert_denied(result)
+
+
+# THE REWRITTEN PIECES, TIMED ON THEIR OWN. Each is lifted from the script by name and run in one
+# process on an input far past the cap, so a slope that is quadratic shows even where the cap would
+# hide it from a whole-hook test. Each input took more than 5 seconds at 93f2775087.
+_LINEAR_DRIVER = r"""
+$src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
+foreach ($line in [regex]::Matches($src, '(?m)^\$(?:BRACKET_\w+|ARITHMETIC_BUDGET) = .*$')) {
+    Invoke-Expression $line.Value
+}
+$arith = [regex]::Match($src, '(?ms)^\$ARITHMETIC = \[regex\]::new\(.*?^\s+\[timespan\]::FromMilliseconds\(\d+\)\)\r?$')
+if (-not $arith.Success) { throw 'ARITHMETIC not found' }
+Invoke-Expression $arith.Value
+foreach ($name in 'Remove-BracketedText', 'Edit-BothViews', 'Hide-HeredocBodies') {
+    $m = [regex]::Match($src, "(?s)function $name\b.*?\r?\n}\r?\n")
+    if (-not $m.Success) { throw "function $name not found" }
+    Invoke-Expression $m.Value
+}
+$tokenEnd = [regex]::Match($src, "\`$tokenEnd = '([^']*)'").Groups[1].Value
+$shortFlag = [regex]::Match($src, "\`$shortFlag = '([^']*)'").Groups[1].Value
+$commitFlag = [regex]::Match($src, '-or \$s -cmatch "\(\^\|\\s\)(.*?)\$tokenEnd"\)\)').Groups[1].Value
+$join = [regex]::Match($src, "Edit-BothViews \`$joined\[0\] \`$joined\[1\] '([^']*)' ''").Groups[1].Value
+$tickJoin = [regex]::Match($src, "Edit-BothViews \`$joined\[0\] \`$joined\[1\] '([^']*)' ' '").Groups[1].Value
+if (-not ($tokenEnd -and $shortFlag -and $commitFlag -and $join -and $tickJoin)) { throw 'a pattern was not found' }
+$nest = '(' * 65 + ')' * 65
+$cases = [ordered]@{
+    'brackets: 9200 nests past 64 levels' = { Remove-BracketedText ('git commit -m x ' + ($nest + ' ') * 9200) }
+    'brackets: 600,000 unclosed after a deep nest' = { Remove-BracketedText ('git commit -m x ' + $nest + ' ' + '(' * (600 * 1000)) }
+    'brackets: 600,000 escaped after a deep nest' = { Remove-BracketedText ('git commit -m x ' + $nest + ' ' + '\( ' * (600 * 1000)) }
+    'views: 60000 backtick continuations' = { Edit-BothViews ("a```n" * 60000) ("b```n" * 60000) $tickJoin ' ' }
+    'add flag: a cluster of 160000' = { ('git add -' + 'A' * 160000 + '-') -cmatch "(^|\s)[`"']?(?:$shortFlag)[`"']?$tokenEnd" }
+    'commit flag: a cluster of 160000' = { ('git commit -' + 'a' * 160000 + '-') -cmatch "(^|\s)$commitFlag$tokenEnd" }
+    'continuation: a run of 60000 escapes' = { [regex]::Matches('git status ' + '\' * 60000 + 'x', $join).Count }
+    'arithmetic: 40 lines of 4000 open brackets' = { Hide-HeredocBodies ((('(' * 4000) + " <<`n") * 40) -Narrow }
+}
+$out = [ordered]@{}
+foreach ($k in $cases.Keys) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $null = & $cases[$k]
+    $out[$k] = $sw.Elapsed.TotalSeconds
+}
+$out | ConvertTo-Json -Compress
+"""
+
+
+def test_each_rewritten_piece_runs_in_linear_time() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = Path(tmp) / "linear.ps1"
+        driver.write_text(_LINEAR_DRIVER, encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env={**os.environ, "MEFOR_BLANKET_GUARD_UNDER_TEST": str(GUARD)},
+        )
+    assert proc.returncode == 0, proc.stderr
+    took: dict[str, float] = json.loads(proc.stdout)
+    timed = list(took.items())
+    # Count the cases actually timed before asserting none was slow, so an empty run cannot pass.
+    assert len(timed) >= 8, f"timed {len(timed)} cases, expected 8"
+    assert len(timed) == 8, f"timed {len(timed)} cases, expected 8"
+    slow = {case: round(seconds, 1) for case, seconds in timed if seconds >= 5}
+    assert not slow, f"seconds per case: {slow}"
+
+
+# THE COMMIT RULE ACROSS BRACKETS. Each row is judged by the commit pathspec rule alone: no other
+# segment and no flag can deny it. Bracketed text is dropped to one space, a stray ')' is kept,
+# and everything from the first '(' that never closes is dropped.
+COMMIT_RULE_BRACKETS = [
+    # (command, the rule must deny)
+    ("git commit -m wip (a (b) c) .", True),  # nested, closed, dot after
+    ("git commit -m wip ((a)) :/", True),  # nested twice, ':/' after
+    ("git commit -m wip a) .", True),  # a stray ')' closes nothing and is kept
+    ("git commit -m wip (a) b) .", True),  # a closed span, then a stray ')'
+    ("git commit -m wip (a (b .) c)", False),  # the dot sits inside the nesting
+    ("git commit -m wip (a) (b .", False),  # an unclosed '(' after a closed span
+    ("git commit -m wip ((a) .", False),  # an unclosed '(' around a closed span
+    ("git commit -m wip a) b.py", False),  # a stray ')' and a scoped path
+]
+
+
+@pytest.mark.parametrize(("command", "denies"), COMMIT_RULE_BRACKETS)
+def test_the_commit_rule_reads_brackets_the_documented_way(command: str, denies: bool) -> None:
+    result = run_guard(bash(command))
+    if denies:
+        assert "git commit with a whole-tree pathspec" in assert_denied(result)
+    else:
+        assert_allowed(result)
+
+
+# THE TWO REWRITTEN PIECES AGAINST WHAT THEY REPLACED. Each old form is kept here, inside the test,
+# as the reference: the regex loop that dropped the innermost '(...)' until none was left, and the
+# single pattern for a pathspec after 'commit'. The guard's own functions are lifted from the
+# script by name, so the test compares the code that runs. Strings are seeded, so a failure
+# replays. No string holds a line feed: a segment never does, because the splitter cuts at each.
+_EQUIVALENCE_DRIVER = r"""
+$src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
+foreach ($line in [regex]::Matches($src, '(?m)^\$BRACKET_\w+ = .*$')) { Invoke-Expression $line.Value }
+foreach ($name in 'Remove-BracketedText', 'Test-CommitPathspec') {
+    $m = [regex]::Match($src, "(?s)function $name\b.*?\r?\n}\r?\n")
+    if (-not $m.Success) { throw "function $name not found" }
+    Invoke-Expression $m.Value
+}
+$dotFamily = [regex]::Match($src, "\`$dotFamily = '([^']*)'").Groups[1].Value
+$tokenEnd = [regex]::Match($src, "\`$tokenEnd = '([^']*)'").Groups[1].Value
+if (-not $dotFamily -or -not $tokenEnd) { throw 'pattern definitions not found' }
+function Old-Brackets([string]$t) {
+    do { $b = $t; $t = $t -creplace '\([^()]*\)', ' ' } while ($t -cne $b)
+    return ($t -creplace '\(.*$', '')
+}
+function Old-Commit([string]$t) { $t -cmatch "(^|\s)commit\s(?:.*\s)?(?:$dotFamily|:/)$tokenEnd" }
+$rng = [System.Random]::new(1339)
+$brackets = @('(', ')', 'a', ' ', '.', 'c')
+# Spaced words dominate, so strings often hold two 'commit' words with a pathspec between them.
+$words = @(' commit ', ' commit ', 'commit', ' . ', ' ./', ' :/ ', ' ', '.', '/', 'x', '<', '>',
+    '\', ' a.py', ' -m', "`t")
+$diff = 0
+for ($n = 0; $n -lt 20000; $n++) {
+    $t = -join (0..$rng.Next(0, 14) | ForEach-Object { $brackets[$rng.Next(0, $brackets.Count)] })
+    # One string in ten is wrapped in 60 to 70 levels, deep enough that the old loop needs many passes.
+    if ($n % 10 -eq 0) { $t = ('(' * $rng.Next(60, 71)) + $t + (')' * $rng.Next(60, 71)) + $t }
+    if ((Old-Brackets $t) -cne (Remove-BracketedText $t)) { $diff++ }
+    $c = -join (0..$rng.Next(0, 10) | ForEach-Object { $words[$rng.Next(0, $words.Count)] })
+    if ((Old-Commit $c) -ne (Test-CommitPathspec $c "$dotFamily|:/" $tokenEnd)) { $diff++ }
+}
+"$diff"
+"""
+
+
+def test_the_rewritten_commit_rule_answers_as_the_old_one_did() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = Path(tmp) / "equivalence.ps1"
+        driver.write_text(_EQUIVALENCE_DRIVER, encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env={**os.environ, "MEFOR_BLANKET_GUARD_UNDER_TEST": str(GUARD)},
+        )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0", f"{proc.stdout.strip()} differences; stderr: {proc.stderr}"
+
+
+# THE OTHER PIECES REWRITTEN FOR SPEED, AGAINST WHAT THEY REPLACED, the same way: the old form is
+# kept here, the new one is lifted from the script, and seeded strings are compared. The pieces are
+# the view editor and the two line-continuation patterns it runs, the two flag-cluster patterns,
+# and the pattern that finds the segments the program-name test accepts.
+_REWRITE_EQUIVALENCE_DRIVER = r"""
+$src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
+$m = [regex]::Match($src, "(?s)function Edit-BothViews\b.*?\r?\n}\r?\n")
+if (-not $m.Success) { throw 'function Edit-BothViews not found' }
+Invoke-Expression $m.Value
+foreach ($line in [regex]::Matches($src, '(?m)^\$GIT_(?:PROGRAM|SEGMENT) = .*$')) { Invoke-Expression $line.Value }
+$segment = "$GIT_SEGMENT"
+$tokenEnd = [regex]::Match($src, "\`$tokenEnd = '([^']*)'").Groups[1].Value
+$shortFlag = [regex]::Match($src, "\`$shortFlag = '([^']*)'").Groups[1].Value
+$commitFlag = [regex]::Match($src, '-or \$s -cmatch "\(\^\|\\s\)(.*?)\$tokenEnd"\)\)').Groups[1].Value
+$joins = @([regex]::Matches($src, "Edit-BothViews \`$joined\[0\] \`$joined\[1\] '([^']*)' '( ?)'"))
+if (-not ($segment -and $tokenEnd -and $shortFlag -and $commitFlag) -or $joins.Count -ne 2) {
+    throw 'a pattern was not found'
+}
+function Old-Edit([string]$Scan, [string]$Raw, [string]$Pattern, [string]$Fill) {
+    $s = New-Object System.Text.StringBuilder $Scan
+    $r = New-Object System.Text.StringBuilder $Raw
+    $found = [regex]::Matches($Scan, $Pattern)
+    for ($n = $found.Count - 1; $n -ge 0; $n--) {
+        $at = $found[$n].Index
+        $len = $found[$n].Length
+        [void]$s.Remove($at, $len)
+        [void]$r.Remove($at, $len)
+        [void]$s.Insert($at, $Fill * $len)
+        [void]$r.Insert($at, $Fill * $len)
+    }
+    return @($s.ToString(), $r.ToString())
+}
+$oldJoins = @('(?<=(?<!\\)(?:\\\\)*)\\\r?\n', '(?<=(?<!`)(?:``)*)`\r?\n')
+function Old-Segments([string]$t) {
+    $bounds = New-Object 'System.Collections.Generic.List[int[]]'
+    $cursor = 0
+    foreach ($m in [regex]::Matches($t, '(\|\||&&|[;|&\n])')) {
+        $bounds.Add(@($cursor, ($m.Index - $cursor)))
+        $cursor = $m.Index + $m.Length
+    }
+    $bounds.Add(@($cursor, ($t.Length - $cursor)))
+    $kept = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($b in $bounds) {
+        if ($b[1] -le 0) { continue }
+        if ($t.Substring($b[0], $b[1]).Trim() -imatch '^git(\.exe)?(\s|$)') { $kept.Add("$($b[0]):$($b[1])") }
+    }
+    return ($kept -join ',')
+}
+function New-Segments([string]$t) {
+    return ((@([regex]::Matches($t, $segment)) | ForEach-Object { "$($_.Index):$($_.Length)" }) -join ',')
+}
+function Pick([System.Random]$rng, [string[]]$from, [int]$most) {
+    return -join (0..$rng.Next(0, $most) | ForEach-Object { $from[$rng.Next(0, $from.Count)] })
+}
+$rng = [System.Random]::new(1339)
+$segmentParts = @('git', 'Git', 'GIT', 'git.exe', 'git.EXE', 'gitx', ' git', ' ', "`t", "`r", "`n", ';',
+    '|', '&', '||', '&&', 'a', '.', '.exe', 'x', [string][char]0xA0)
+$joinParts = @('\', '\', '`', '`', "`n", "`r", 'a', ' ')
+$flagParts = @('a', 'A', 'u', 'U', 'b', 'm')
+$diff = 0
+for ($n = 0; $n -lt 5000; $n++) {
+    $t = Pick $rng $segmentParts 12
+    if ((Old-Segments $t) -cne (New-Segments $t)) { $diff++ }
+    $scan = Pick $rng $joinParts 16
+    $raw = -join ($scan.ToCharArray() | ForEach-Object { [char]$rng.Next(97, 100) })
+    for ($k = 0; $k -lt 2; $k++) {
+        $fill = $joins[$k].Groups[2].Value
+        $old = Old-Edit $scan $raw $oldJoins[$k] $fill
+        $new = Edit-BothViews $scan $raw $joins[$k].Groups[1].Value $fill
+        if ($old[0] -cne $new[0] -or $old[1] -cne $new[1]) { $diff++ }
+    }
+    $token = (@(' ', '', "`t")[$rng.Next(0, 3)]) + (@('', '"', "'")[$rng.Next(0, 3)]) + '-' +
+        (Pick $rng $flagParts 8) + (@('', '"', "'")[$rng.Next(0, 3)]) + (@(' ', '', '<', '>', 'x', '-')[$rng.Next(0, 6)])
+    $add = "(^|\s)[`"']?(?:{0})[`"']?$tokenEnd"
+    if (($token -cmatch ($add -f '-[A-Za-z]*[Au][A-Za-z]*')) -ne ($token -cmatch ($add -f $shortFlag))) { $diff++ }
+    if (($token -cmatch "(^|\s)-[A-Za-z]*a[A-Za-z]*$tokenEnd") -ne ($token -cmatch "(^|\s)$commitFlag$tokenEnd")) { $diff++ }
+}
+"$diff"
+"""
+
+
+def test_the_faster_readings_answer_as_the_old_ones_did() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = Path(tmp) / "rewrites.ps1"
+        driver.write_text(_REWRITE_EQUIVALENCE_DRIVER, encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env={**os.environ, "MEFOR_BLANKET_GUARD_UNDER_TEST": str(GUARD)},
+        )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0", f"{proc.stdout.strip()} differences; stderr: {proc.stderr}"
+
+
 @pytest.mark.parametrize("continuation", [_BS, _BT])
 def test_an_unknown_tool_gets_both_continuation_characters(continuation: str) -> None:
     """The tool name picks ONE character for a tool the guard knows. For any other name it must
@@ -975,14 +1420,14 @@ def test_an_unknown_tool_gets_both_continuation_characters(continuation: str) ->
 
 
 @pytest.mark.parametrize(
-    ("tool", "command"), [pytest.param(*r, marks=_ACCEPTED) for r in ACCEPTED_FAIL_OPENS]
+    ("tool", "command"), [pytest.param(*r, marks=_PER_FORM) for r in PER_FORM_RESIDUALS]
 )
-def test_an_accepted_fail_open_is_still_allowed(tool: str, command: str) -> None:
+def test_a_residual_a_per_form_answer_names_is_still_allowed(tool: str, command: str) -> None:
     assert_denied(verdict(tool, command))
 
 
 @pytest.mark.parametrize(
-    ("tool", "command"), [pytest.param(*r, marks=_NOT_ACCEPTED) for r in NOT_ACCEPTED_FAIL_OPENS]
+    ("tool", "command"), [pytest.param(*r, marks=_MECHANISM_ONLY) for r in MECHANISM_ONLY_RESIDUALS]
 )
 def test_a_fail_open_no_per_form_answer_covers_is_still_allowed(tool: str, command: str) -> None:
     assert_denied(verdict(tool, command))
@@ -993,9 +1438,109 @@ def test_the_nearest_form_to_a_fail_open_is_denied(tool: str, command: str) -> N
     assert_denied(verdict(tool, command))
 
 
-def test_no_row_is_both_accepted_and_not_accepted() -> None:
+@pytest.mark.parametrize(("tool", "blanket", "scoped"), FIXED_READING_MISTAKES)
+def test_a_fixed_reading_mistake_denies_and_its_scoped_control_allows(
+    tool: str, blanket: str, scoped: str
+) -> None:
+    assert_denied(verdict(tool, blanket))
+    assert_allowed(verdict(tool, scoped))
+
+
+@pytest.mark.parametrize(("tool", "command"), FIXED_READING_MISTAKES_ALLOW)
+def test_a_fixed_reading_mistake_does_not_deny_its_neighbour(tool: str, command: str) -> None:
+    assert_allowed(verdict(tool, command))
+
+
+_TRACKED = ("a.txt", "sub/b.txt", "sub/deep/c.txt")
+_ALL_FIVE = {*_TRACKED, "new.txt", "sub/new2.txt"}
+
+
+@pytest.fixture(scope="module")
+def bash_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Resolved once: each probe starts bash at least twice."""
+    return require_bash(tmp_path_factory.mktemp("resolve-bash"))
+
+
+def _staged_in_a_throwaway_repo(tool: str, command: str, root: Path, shell: str) -> set[str]:
+    """Run COMMAND under the shell TOOL names, in a fresh repository, and return what git staged.
+
+    The repository is the page's measuring repository: three modified tracked files at three
+    depths and two untracked files. Inherited GIT_* variables are dropped and the user and system
+    config switched off, so nothing outside the temp directory can change what git does.
+    """
+    root.mkdir(parents=True)
+    repo = root / "repo"
+    (repo / "sub" / "deep").mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@example.invalid",
+    )
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=repo, env=env, capture_output=True, text=True, check=True
+        ).stdout
+
+    git("init", "-q")
+    for name in _TRACKED:
+        (repo / name).write_text("1\n", encoding="utf-8")
+    git("add", "--", *_TRACKED)
+    git("commit", "-q", "-m", "init")
+    for name in _TRACKED:
+        (repo / name).write_text("2\n", encoding="utf-8")
+    (repo / "new.txt").write_text("n\n", encoding="utf-8")
+    (repo / "sub" / "new2.txt").write_text("n\n", encoding="utf-8")
+
+    # Each command is written as bytes to a script file outside the repository, so it reaches the
+    # shell as typed. `bash -c` on Windows does not: measured, the argument loses one of two
+    # backslashes on the way to Git for Windows' bash, which changes a heredoc tag.
+    if tool == "Bash":
+        script = root / "command.sh"
+        argv = [shell, str(script)]
+        env = probe_env(Path(shell), env)
+    else:
+        script = root / "command.ps1"
+        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
+    script.write_bytes(command.encode("utf-8"))
+    subprocess.run(argv, cwd=repo, env=env, capture_output=True, timeout=120)
+    return set(git("diff", "--cached", "--name-only").split())
+
+
+@pytest.mark.parametrize("tool", sorted({tool for tool, _, _ in FIXED_READING_MISTAKES}))
+def test_the_real_shell_control_is_denied_and_stages_all_five(
+    tool: str, tmp_path: Path, bash_path: str
+) -> None:
+    """The control beside every row below: `git add -A` under the same shell. The guard denies it
+    and git stages all five, so the measuring repository can tell a whole-tree stage apart."""
+    assert_denied(run_guard(bash("git add -A", tool=tool)))
+    assert _staged_in_a_throwaway_repo(tool, "git add -A", tmp_path / "c", bash_path) == _ALL_FIVE
+
+
+@pytest.mark.parametrize(("tool", "blanket", "scoped"), FIXED_READING_MISTAKES)
+def test_a_fixed_reading_mistake_really_stages(
+    tool: str, blanket: str, scoped: str, tmp_path: Path, bash_path: str
+) -> None:
+    """Each fixed row is a real stage of the whole tree. The scoped half stages at most `a.txt`, so
+    its ALLOW above is not a hole."""
+    assert _staged_in_a_throwaway_repo(tool, blanket, tmp_path / "b", bash_path) == _ALL_FIVE
+    assert _staged_in_a_throwaway_repo(tool, scoped, tmp_path / "s", bash_path) <= {"a.txt"}
+
+
+@pytest.mark.parametrize(("tool", "command"), FIXED_READING_MISTAKES_ALLOW)
+def test_a_fixed_reading_mistake_neighbour_really_stages_nothing(
+    tool: str, command: str, tmp_path: Path, bash_path: str
+) -> None:
+    assert _staged_in_a_throwaway_repo(tool, command, tmp_path / "n", bash_path) == set()
+
+
+def test_no_row_is_in_both_residual_tables() -> None:
     """The two tables record which per-form answer covers a row, so a row in both says nothing."""
-    assert not set(ACCEPTED_FAIL_OPENS) & set(NOT_ACCEPTED_FAIL_OPENS)
+    assert not set(PER_FORM_RESIDUALS) & set(MECHANISM_ONLY_RESIDUALS)
 
 
 @pytest.mark.parametrize(
@@ -1003,6 +1548,57 @@ def test_no_row_is_both_accepted_and_not_accepted() -> None:
 )
 def test_a_known_over_deny_is_still_refused_and_should_not_be(tool: str, command: str) -> None:
     assert_allowed(verdict(tool, command))
+
+
+# ------------------------------------------------------------------------------------ the wiring
+
+# WIRING IS A PROPERTY OF settings.json, NOT OF THE SCRIPT (BACKLOG #1339). The settings walk comes
+# from the contract module rather than a second copy here, the same way
+# tests/test_unbounded_fs_scan_guard.py reads it for its sibling guard.
+
+
+def test_the_guard_is_wired_for_the_shell_tools() -> None:
+    from tests.test_claude_settings_contract import _load, _matchers_wiring, matcher_selects
+
+    matchers = _matchers_wiring(_load(), GUARD.name)
+    assert matchers, f"{GUARD.name} is referenced by no handler in .claude/settings.json"
+    for tool in ("Bash", "PowerShell"):
+        assert any(matcher_selects(m, tool) for m in matchers), (
+            f"no matcher wiring {GUARD.name} selects the {tool} tool, so the guard never runs on it"
+        )
+
+
+def _wired_command_line() -> list[str]:
+    """The exact argv the settings file runs for this guard, with the project placeholder bound."""
+    from tests.test_claude_settings_contract import _PLACEHOLDER, _ROOT, _hook_handlers, _load
+
+    argvs = [
+        [handler["command"], *handler.get("args", [])]
+        for _event, handler in _hook_handlers(_load())
+        if any(GUARD.name in str(a) for a in handler.get("args", []))
+    ]
+    assert len(argvs) == 1, f"expected one handler running {GUARD.name}, found {len(argvs)}"
+    return [str(a).replace(_PLACEHOLDER, _ROOT.as_posix()) for a in argvs[0]]
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_the_wired_command_line_denies_a_blanket_stage_and_allows_its_control(tool: str) -> None:
+    """Run the handler's own command line, not `run_guard`'s, so a wrong path or flag shows here."""
+    argv = _wired_command_line()
+
+    def decide(command: str) -> dict[str, Any] | None:
+        proc = subprocess.run(
+            argv,
+            input=json.dumps(bash(command, tool=tool)),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"wired hook exited {proc.returncode}: {proc.stderr}"
+        return json.loads(proc.stdout) if proc.stdout.strip() else None
+
+    assert_denied(decide("git add -A"))
+    assert_allowed(decide("git status --short"))
 
 
 # --------------------------------------------------------------------------------- still fail-open
