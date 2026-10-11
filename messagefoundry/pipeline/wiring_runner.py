@@ -547,10 +547,10 @@ def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: s
     log and the store disagree. The cap is kept on purpose: it bounds a STOP and re-arm loop on a
     row that always crashes. Ids and counts only, never the error text.
 
-    The line counts and names only what the store reported in ``failed``, never the rows the arm
-    handed it. A batch takes one disposition from its first member still present, whatever the
-    others' attempts. How to replay a dead row, by stage, is stated once, in docs/USER-GUIDE.md,
-    *A lane stopped processing*."""
+    The line counts and names from ``failed``, the store's report, not from the arm's own list of
+    rows. A batch takes one disposition from its first member still present, on that member's
+    attempts alone. docs/USER-GUIDE.md, *A lane stopped processing*, also says how to replay a
+    dead row, by stage."""
     if not failed.dead:
         return
     outbound = stage == Stage.OUTBOUND.value
@@ -579,8 +579,8 @@ def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: s
         named = f"the first {_STOP_LINE_MAX_MESSAGES}: {named}"
     log.warning(
         "%s %r: batch row %s, the first one still present, had made %d attempt(s), at or past its "
-        "retry cap, so the stop dead-lettered the batch instead of re-pending it, whatever each "
-        "row's own attempts; the store reports %d row(s) from %d message(s), %s; "
+        "retry cap, so the stop dead-lettered the batch instead of re-pending it, on that row's "
+        "attempts alone; the store reports %d row(s) from %d message(s), %s; "
         + (
             "each is an outbound row: replay them from the dead-letter queue, or replay each message"
             if outbound
@@ -8520,8 +8520,8 @@ class RegistryRunner:
             # mark_batch_failed re-pends the batch, or dead-letters its members still present when
             # the first of them has reached a finite cap, whatever the others' attempts (it skips a
             # vanished member, and on the retry branch a terminal one); CONTINUE (default)
-            # dead-letters all N (bad data can never frame/deliver — replayable from
-            # the DLQ) so a code bug or a mis-typed feed can't wedge the lane forever.
+            # dead-letters the members still present (bad data can never frame/deliver —
+            # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
             if (
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP

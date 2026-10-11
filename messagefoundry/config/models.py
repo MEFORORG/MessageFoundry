@@ -167,10 +167,10 @@ class Priority(str, Enum):  # noqa: UP042
 
 class InternalErrorPolicy(str, Enum):  # noqa: UP042
     """What a worker does when an **internal/code error** hits a message: on an outbound's delivery
-    worker, at least a non-``DeliveryError`` exception escaping a connector's ``send`` (our bug, not
-    the partner's); on an inbound's router and transform workers, at least a router or handler
-    raise. A
-    per-outbound ``internal_error`` sets it for that outbound's delivery worker. The ``[delivery]``
+    worker, at least an ``Exception`` other than a ``DeliveryError`` escaping a connector's
+    ``send`` (our bug, not the partner's); on an inbound's router and transform workers, at least a
+    router or handler raise. A per-outbound ``internal_error`` sets it for that outbound's
+    delivery worker. The ``[delivery]``
     ``internal_error`` default sets it for every other delivery worker and for every router and
     transform worker.
 
