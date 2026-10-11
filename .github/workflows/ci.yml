@@ -9,9 +9,9 @@ on:
   #
   # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
   # That was true when the trigger landed on 2026-08-26 and became false once a queue was
-  # configured; corrected 2026-09-03, after PR 754 merged through the queue. BACKLOG #340 carries
-  # the measurements and STAYS OPEN -- a live queue is not that item being finished, and who
-  # enabled the queue is recorded nowhere.
+  # configured; corrected 2026-09-03, after PR 754 merged through the queue. Vault BACKLOG #340
+  # carries the measurements; the owner chose on 2026-10-08 to close it, and cla.yml's header
+  # names one residual accepted. Who enabled the queue is recorded nowhere.
   merge_group:
   push:
     branches: [main]
