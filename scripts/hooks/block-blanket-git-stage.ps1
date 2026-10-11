@@ -140,38 +140,44 @@ function Resolve-GitSubcommand([string[]]$Tokens) {
 }
 
 # Drop each bracketed span '(...)' to one space, and everything from the first '(' that never
-# closes. That is what the commit pathspec rule used to get by deleting the innermost '(...)' over
-# and over, but that took one pass over the text per nesting level. Measured: 40,000 nested
-# brackets before a real 'git add -A' took 21.3 s, past the hook's 15 s timeout, so the stage
-# would have run. This is one pass, pairing brackets with a stack. On a segment, which never holds
-# a line feed because the splitter cuts at every one, it gives the same result as the old loop;
-# tests/test_blanket_stage_guard.py compares the two on seeded random strings.
+# closes. The old loop deleted the innermost '(...)' over and over, one fast pass per nesting
+# level, so deep nesting could keep the hook past its timeout; docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md
+# section 4a has the measurements. This keeps that loop for the first 64 levels, where it is
+# fastest, and pairs whatever is still left with a stack, visiting only the brackets. The stack
+# reads the partly collapsed text, and a collapsed span is one space either way, so the result is
+# the old loop's. That holds on a segment, which never holds a line feed: the splitter cuts at
+# every one. tests/test_blanket_stage_guard.py compares the two on seeded random strings.
 function Remove-BracketedText([string]$Text) {
-    # Most commands hold no bracket, and the character loop below is slower than the old regex on
-    # long text without one.
     if ($Text.IndexOf([char]'(') -lt 0) { return $Text }
-    $closeAt = New-Object 'int[]' $Text.Length
-    $open = New-Object 'System.Collections.Generic.Stack[int]'
-    for ($i = 0; $i -lt $Text.Length; $i++) {
-        $closeAt[$i] = -1
-        if ($Text[$i] -ceq '(') { $open.Push($i) }
-        elseif ($Text[$i] -ceq ')' -and $open.Count -gt 0) { $closeAt[$open.Pop()] = $i }
+    for ($pass = 0; $pass -lt 64; $pass++) {
+        $before = $Text
+        $Text = $Text -creplace '\([^()]*\)', ' '
+        if ($Text -ceq $before) { return ($Text -creplace '\(.*$', '') }
     }
+    $brackets = [char[]]@('(', ')')
+    $closeAt = @{}
+    $open = New-Object 'System.Collections.Generic.Stack[int]'
+    for ($i = $Text.IndexOfAny($brackets); $i -ge 0; $i = $Text.IndexOfAny($brackets, $i + 1)) {
+        if ($Text[$i] -ceq '(') { $open.Push($i) }
+        elseif ($open.Count -gt 0) { $closeAt[$open.Pop()] = $i }
+    }
+    # Every '(' before the first one that never closes is closed, and its span ends before it.
     $stop = $Text.Length
     foreach ($at in $open) { if ($at -lt $stop) { $stop = $at } }
     $sb = New-Object System.Text.StringBuilder
-    $i = 0
-    while ($i -lt $stop) {
-        if ($closeAt[$i] -ge 0) { [void]$sb.Append(' '); $i = $closeAt[$i] + 1 }
-        else { [void]$sb.Append($Text[$i]); $i++ }
+    $pos = 0
+    for ($i = $Text.IndexOf([char]'('); $i -ge 0 -and $i -lt $stop; $i = $Text.IndexOf([char]'(', $pos)) {
+        [void]$sb.Append($Text, $pos, $i - $pos).Append(' ')
+        $pos = $closeAt[$i] + 1
     }
-    return $sb.ToString()
+    return $sb.Append($Text, $pos, $stop - $pos).ToString()
 }
 
 # Does a whole-tree pathspec follow the word 'commit'? Two linear searches in place of one
-# pattern, '(^|\s)commit\s(?:.*\s)?(?:<pathspec>)<end>', that backtracked quadratically: measured,
-# 'git x ', 30,000 copies of 'commit ', then '&& git add -A' took 32.8 s, past the hook's 15 s
-# timeout, so the stage would have run. They answer the same. The FIRST 'commit' leaves the most
+# pattern, '(^|\s)commit\s(?:.*\s)?(?:<pathspec>)<end>', that backtracked quadratically on repeated
+# 'commit' words; the page's section 4a has the measurement. On text with no line feed, which is
+# every segment, they answer the same; across a line feed they do not, because '.*' stops there
+# and these searches do not. The FIRST 'commit' leaves the most
 # text after it, so if any 'commit' is followed by the pathspec, the first one is. The second
 # search starts AT the blank that ends 'commit ', the blank the old pattern allowed before the
 # pathspec. tests/test_blanket_stage_guard.py compares the two on seeded random strings.

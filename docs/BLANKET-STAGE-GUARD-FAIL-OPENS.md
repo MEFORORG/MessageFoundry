@@ -18,7 +18,7 @@ guard is asserted in `tests/test_claude_settings_contract.py`, so read it there.
 
 The owner made at least seven choices on these forms and on wiring: six answers, and a hold lift
 (*What wiring waited on*, item 3). Each was a choice in a dialog in the Special seat's session.
-**These seven are reported by that seat. No other seat saw the dialogs.** The vault's rulings
+**Every one listed here is reported by that seat. No other seat saw the dialogs.** The vault's rulings
 file of 2026-10-08
 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, entry #1339) records answer 1. The seat's
 comments on engine PR 2209 record answers 2 and 3, and its comment on engine PR 2217 records
@@ -551,14 +551,19 @@ the stage after it would then have run. Both are closed:
 
 | Payload | Before | After | The cause |
 |---|---|---|---|
-| `git commit -m x`, 40,000 nested brackets, `&& git add -A` | 21.3 s | about 1.8 s | Bracketed text was dropped one nesting level per pass. It is now one pass that pairs the brackets. |
-| `git x`, 30,000 copies of `commit `, `&& git add -A` | 32.8 s (the Lander's run; 26.6 s on mine) | about 2.5 s | The pathspec pattern after `commit` backtracked. It is now two linear searches. |
+| `git commit -m x`, 40,000 nested brackets, `&& git add -A` | 21.3 s | about 3.2 s | Bracketed text was dropped one nesting level per pass. The guard now does at most 64 such passes, then pairs what is left with a stack. |
+| `git x`, 30,000 copies of `commit `, `&& git add -A` | 32.8 s (the Lander's run; 26.6 s on the wiring Builder's) | about 2.5 s | The pathspec pattern after `commit` backtracked. It is now two linear searches. |
+
+A first fix paired every bracket a character at a time. That opened a new slow path on many
+shallow brackets: `git commit -m x`, 300,000 copies of `(a) `, `&& git add -A` took 17.75 s on a
+review run, against 9.03 s for the guard before it. The 64-pass limit keeps the old loop for that
+shape; it now takes about 7.4 s on the wiring Builder's run.
 
 Both rewrites give the same answers as the code they replaced, on a segment, which never holds a
 line feed. `tests/test_blanket_stage_guard.py` checks that on 20,000 seeded random strings for
-each, against the old code kept in the test, and pins both payloads under 15 seconds. A bracket-free
-command skips the bracket pass. A 600 KB commit message with no bracket took about 4.3 s before
-that change and about 2.8 s after.
+each, against the old code kept in the test; one string in ten is nested deep enough to reach the
+stack. It also pins the three payloads above under 15 seconds, at 150,000 copies for the shallow
+one. A bracket-free command skips the bracket pass.
 
 ## 5. Known residuals that no per-form answer names
 

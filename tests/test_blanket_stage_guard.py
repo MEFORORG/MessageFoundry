@@ -1034,9 +1034,10 @@ def test_a_slow_added_reading_cannot_delay_the_original_deny() -> None:
 
 def test_a_deeply_nested_commit_before_a_stage_is_judged_inside_the_time_limit() -> None:
     """The ORIGINAL reading's own cost, which the test above does not reach. The commit pathspec
-    rule used to drop one nesting level of brackets per pass, so 40,000 nested brackets in a commit
-    segment took 21.3 s before the 'git add -A' after it was read. That is past the 15 s timeout,
-    and a timed-out hook lets the stage run."""
+    rule used to drop one nesting level of brackets per pass, so deep nesting kept the hook past
+    its 15 s timeout before the 'git add -A' after it was read, and a timed-out hook lets the stage
+    run. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a holds the measurements for this test and
+    the three after it."""
     command = "git commit -m x " + "(" * 40000 + ")" * 40000 + " && git add -A"
     started = time.monotonic()
     assert_denied(run_guard(bash(command)))
@@ -1048,15 +1049,25 @@ def test_the_commit_rule_itself_denies_past_deep_nesting_inside_the_time_limit()
     the brackets is the commit's pathspec. The control is the dot moved inside the brackets."""
     nest = "(" * 40000 + ")" * 40000
     started = time.monotonic()
-    assert_denied(run_guard(bash("git commit -m x " + nest + " .")))
+    reason = assert_denied(run_guard(bash("git commit -m x " + nest + " .")))
     assert time.monotonic() - started < 15
+    assert "git commit with a whole-tree pathspec" in reason
     assert_allowed(run_guard(bash("git commit -m x " + "(" * 40000 + " ." + ")" * 40000)))
 
 
+def test_many_sibling_brackets_before_a_stage_are_judged_inside_the_time_limit() -> None:
+    """Shallow and wide, the other shape: one level deep, so the old loop finishes it in a pass or
+    two. A pairing done a character at a time was measured slow enough on this shape to cross
+    15 s at twice this size, so this pins it."""
+    command = "git commit -m x " + "(a) " * 150000 + "&& git add -A"
+    started = time.monotonic()
+    assert_denied(run_guard(bash(command)))
+    assert time.monotonic() - started < 15
+
+
 def test_many_commit_words_before_a_stage_are_judged_inside_the_time_limit() -> None:
-    """The commit rule's pathspec pattern backtracked quadratically on repeated 'commit' words.
-    This exact payload took 32.8 s on the Lander's run, past the 15 s timeout, so the stage would
-    have run."""
+    """The commit rule's pathspec pattern backtracked quadratically on repeated 'commit' words, and
+    this exact payload kept the hook past its 15 s timeout, so the stage would have run."""
     command = "git x " + "commit " * 30000 + "&& git add -A"
     started = time.monotonic()
     assert_denied(run_guard(bash(command)))
@@ -1083,7 +1094,7 @@ COMMIT_RULE_BRACKETS = [
 def test_the_commit_rule_reads_brackets_the_documented_way(command: str, denies: bool) -> None:
     result = run_guard(bash(command))
     if denies:
-        assert "whole-tree pathspec" in assert_denied(result)
+        assert "git commit with a whole-tree pathspec" in assert_denied(result)
     else:
         assert_allowed(result)
 
@@ -1116,6 +1127,8 @@ $words = @(' commit ', ' commit ', 'commit', ' . ', ' ./', ' :/ ', ' ', '.', '/'
 $diff = 0
 for ($n = 0; $n -lt 20000; $n++) {
     $t = -join (0..$rng.Next(0, 14) | ForEach-Object { $brackets[$rng.Next(0, $brackets.Count)] })
+    # One string in ten is wrapped in 60 to 70 levels, so the 64-pass loop gives way to the stack.
+    if ($n % 10 -eq 0) { $t = ('(' * $rng.Next(60, 71)) + $t + (')' * $rng.Next(60, 71)) + $t }
     if ((Old-Brackets $t) -cne (Remove-BracketedText $t)) { $diff++ }
     $c = -join (0..$rng.Next(0, 10) | ForEach-Object { $words[$rng.Next(0, $words.Count)] })
     if ((Old-Commit $c) -ne (Test-CommitPathspec $c "$dotFamily|:/" $tokenEnd)) { $diff++ }
