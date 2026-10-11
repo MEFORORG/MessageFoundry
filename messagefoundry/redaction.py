@@ -3084,14 +3084,20 @@ def prepare_log_record(record: logging.LogRecord) -> None:
         record.args = ()
 
 
-def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:
+def json_loads_or_refusal(
+    raw: str | bytes,
+    *,
+    object_pairs_hook: Callable[[list[tuple[str, Any]]], Any] | None = None,
+) -> tuple[Any, str | None]:
     """``json.loads(raw)`` as ``(value, None)``, or ``(None, hint)`` when it fails, never raising.
 
     Test the hint, never the value: a JSON ``null`` is ``(None, None)``.
 
     The hint is content-free: the line and column for a decode error, else the class name (a
     ``UnicodeDecodeError`` on bytes, or json's depth-limit ``RecursionError``, which is a
-    ``RuntimeError`` a ``ValueError`` arm does not reach -- BACKLOG #1600).
+    ``RuntimeError`` a ``ValueError`` arm does not reach -- BACKLOG #1600). A ``ValueError``
+    subclass that ``object_pairs_hook`` raises comes back as its class name too, so a caller can
+    tell its own refusal apart (vault BACKLOG #2804 refuses a repeated key that way).
 
     It returns rather than raises so a caller's refusal is raised outside any handler (BACKLOG
     #2048). The decode error holds the WHOLE input (``JSONDecodeError.doc``,
@@ -3100,7 +3106,7 @@ def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:
     out of reach of this: the raised error's traceback still holds the caller's frame."""
     refusal: str | None = None
     try:
-        return json.loads(raw), None
+        return json.loads(raw, object_pairs_hook=object_pairs_hook), None
     except json.JSONDecodeError as exc:
         refusal = f"JSONDecodeError at line {exc.lineno}, column {exc.colno}"
     except (ValueError, RecursionError) as exc:

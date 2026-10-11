@@ -2255,6 +2255,8 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
 | `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) |
+| `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load. Refused on any other interaction. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
+| `allowed_entry_types` | — (any type) | (vault BACKLOG #2804) `transaction`/`batch` only: the resource types an entry's `request.url` may name, such as `["Patient", "Encounter"]`. Unset means any type. Refused on any other interaction |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
@@ -2269,14 +2271,50 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 
 **Interactions.** The `interaction` plus the `ResourceType`/`id` (read from the outgoing body with the cheap
 `FhirPeek`, no typed parse) derive the method + path off the base `url`. A `transaction`/`batch` POSTs the
-`Bundle` to the base — the FHIR **server** applies it (transaction = all-or-nothing, batch = independent per
-entry); the engine never orchestrates cross-entry atomicity.
+`Bundle` to the base, and the FHIR **server** applies it (transaction = all-or-nothing, batch = independent
+per entry); the engine never orchestrates cross-entry atomicity. The engine does screen every entry first,
+as [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) says.
 
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
 is in the **URL** query), and `if-match` (optimistic lock on a known id via an ETag derived from the
 resource's `meta.versionId`, sent as the entry's `request.ifMatch`).
+
+#### A Bundle connection screens every entry
+
+On `transaction` and `batch`, each Bundle entry names its own method and URL. **If a Handler forwards a
+Bundle it received, the sender chooses them.** It can use every method, URL form and resource type your
+lists allow, with this connection's credentials. Set the lists to what the feed needs and no more. A feed
+that only creates and updates wants `allowed_entry_methods=["POST", "PUT"]`, and it should name its types.
+
+The engine checks the whole Bundle before it sends a byte (vault BACKLOG #2804). It refuses the message
+when any of these hold:
+
+1. The body is not JSON, is not a `Bundle`, or its `Bundle.type` is not the connection's interaction.
+2. A JSON object anywhere in the body repeats a key. The engine and the server might read different
+   values out of one body, so neither reading is trusted.
+3. `entry` is not a list, an entry is not an object, or an entry has no `request` object.
+4. An entry's `request.method` is not one of `allowed_entry_methods`.
+5. An entry's `request.url` does not fit its method. A `POST` takes `Type` only. Every other verb takes
+   `Type/id` or `Type?query`. The type and id follow the FHIR grammars, so neither can carry a
+   `$operation`, percent-encoding, `_search`, `_history`, an absolute URL or an extra path segment. The
+   query must be one or more `name=value` pairs joined by `&`, with no empty name or value. It must hold
+   no whitespace, `#`, backslash, control character or percent-encoded control character such as `%0A`.
+   Other percent-encoding in a query stays allowed, because a search value often needs it.
+6. The URL's type is not in `allowed_entry_types`, when that list is set.
+7. A `POST` or `PUT` entry carries a `resource` whose `resourceType` is not the URL's type.
+
+A refusal is permanent. The message is recorded as `ERROR` and dead-lettered, and no part of the Bundle is
+sent. The error names the entry's index, its method and the rule it broke. It never names the URL or its
+query, which can carry identifiers. The engine sends the Bundle exactly as the Handler built it; the check
+reads a copy. The one-entry Bundle the engine builds itself for an `update` is not screened.
+
+`Type?query` stays open to `PUT`, because per-entry conditional URLs are how a Bundle does what a
+connection-level `conditional` does. The engine checks a query's shape, not what its parameters mean. A
+conditional `DELETE` whose only criterion the server ignores can still match every resource of the type,
+so leave `DELETE` off the list unless the feed needs it. The `smart-scope` advisory that `messagefoundry check` prints does not yet read
+`allowed_entry_methods`.
 
 #### An update keeps the resource id out of the URL
 

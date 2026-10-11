@@ -305,7 +305,15 @@ _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
     ),
     # THE CONTROL: a transaction Bundle the Handler built is not the engine's wrap. The engine
     # never looks inside that reply, so nothing reads the body.
-    (ConnectorType.FHIR, {"capture_response": False, "interaction": "transaction"}, _DELIVERED),
+    (
+        ConnectorType.FHIR,
+        {
+            "capture_response": False,
+            "interaction": "transaction",
+            "allowed_entry_methods": ["POST"],
+        },
+        _DELIVERED,
+    ),
     # The other way a write becomes a wrapped update: if-match, whatever the interaction says.
     (ConnectorType.FHIR, {"capture_response": False, "conditional": "if-match"}, _REFUSED),
     # THE CONTROL: the other conditional forms are not wrapped, even under interaction="update".
