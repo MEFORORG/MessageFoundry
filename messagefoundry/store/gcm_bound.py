@@ -46,7 +46,8 @@ sub-key row and inherits its accumulated count. What the engine cannot see is a 
 rolled back outside it -- a VM snapshot, a DBA restore of a server database, a staging copy given the
 production key: that copy carries its salt and its row. ADR 0196 records it as an accepted limit.
 
-**Out of scope: ``vault_transit``.** That cipher draws no local nonce and builds no local ``AESGCM``.
+**Out of scope: the ``vault_transit`` store cipher.** It draws no local nonce and builds no local
+``AESGCM``.
 :func:`bounded_cipher` returns ``None`` for it and for the identity cipher, and every entry point here
 degrades to a no-op. So nothing counts, alarms or refuses on that path. Its bound is a DOCUMENTED
 OPERATOR PRECONDITION, not a counted one: the operator must rotate the Transit data key before any one
@@ -56,6 +57,15 @@ needs an engine-recorded attestation. ADR 0138's 2026-09-28 amendment states the
 (BACKLOG #1173). That attestation is :mod:`messagefoundry.store.transit_attestation` (BACKLOG #2337,
 ADR 0138's 2026-10-07 amendment): a CLI-written, audited store row naming the Transit key, without which
 ``serve`` refuses under enforce. It records who vouched for the rotation; it still counts nothing.
+
+**DR archives under ``vault_transit`` DO draw local nonces, with no enforced ceiling** (ADR 0196's
+2026-10-10 amendment, BACKLOG #2187; a seat decision under owner delegation 2026-10-08, not an owner
+ruling, which keeps them on the local DEK). ``pipeline/dr_backup.py`` resolves the local DEK through
+``resolve_active_key``, which never reads ``cipher_provider``, and gets no salt from a Transit store.
+``store/backup_codec.py`` then seals each frame under the raw DEK with a random local nonce, and the
+run charges the frames to the DEK's own ``cipher_meta`` row. Nothing enforces that row's ceiling in
+this mode: no ``AesGcmCipher`` reads it back, the charge ignores the total it returns, and the codec
+checks no ceiling. The Transit attestation names the Transit key, not the DEK.
 """
 
 from __future__ import annotations
