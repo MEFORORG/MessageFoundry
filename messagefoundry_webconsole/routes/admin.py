@@ -804,7 +804,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             return await _user_detail(
-                user_id, service, identity, error=str(exc.detail), status_code=400
+                user_id, service, identity, error=str(exc.detail), status_code=exc.status_code
             )
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
 

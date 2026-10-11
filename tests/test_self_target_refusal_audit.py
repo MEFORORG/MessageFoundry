@@ -63,7 +63,9 @@ ROUTES: list[tuple[str, str, str, str | None, Any, str]] = [
     # BACKLOG #1149 (ASVS 7.5.2): each of these revokes the target's sessions, so aimed at yourself
     # it would be a mass terminate on the login window alone.
     ("revoke_sessions", "DELETE", "/sessions", None, None, "self-service session controls"),
-    ("set_roles", "PUT", "/roles", None, {"roles": ["viewer"]}, "your own roles"),
+    # Keeps Administrator, so the last-admin guard passes and only the self-guard stops the write;
+    # the session backstop below then discriminates.
+    ("set_roles", "PUT", "/roles", None, {"roles": ["administrator"]}, "your own roles"),
     ("channel_scope", "PUT", "/channel-scope", None, {"channels": ["*"]}, "your own channel scope"),
 ]
 

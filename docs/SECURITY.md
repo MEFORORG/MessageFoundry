@@ -701,8 +701,11 @@ planes (vault BACKLOG #3260). The routes are at least reset-password, reset-mfa,
 federated-identity bind and unbind, disable, delete, the admin session revoke, the role write and
 the channel-scope write. The last three joined under BACKLOG #1149 (ASVS 7.5.2): each revokes the
 target's sessions on the login window, so aimed at yourself it would end every session you hold
-with no fresh proof. `DELETE /me/sessions` asks for a single-use `session_terminate` grant to do
-that. The row names the actor, the route as `op`, the caller's
+with no fresh proof. The self-service `DELETE /me/sessions` ends your other sessions only behind a
+single-use `session_terminate` grant, and *Sign out* ends the current one. The refusal is per
+route and by target, so it does not reach a write that ends a whole group's sessions. At least the
+AD group-map and scope-map saves and the custom-role edit and delete can still end the caller's own
+sessions on the login window. The row names the actor, the route as `op`, the caller's
 stored id and the caller's address. The guard refuses when the path's spelling or the stored id
 matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
 stored id matters on the console. The `404` that `DELETE /me/sessions/{session_id}` answers for
@@ -1215,7 +1218,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/users/directory` | `users:manage` | `require_step_up`. Creates a directory (AD) account's mirror row by name, without a sign-in (BACKLOG #2021). The row's `objectGUID`, display name and `mail` come from a service-account directory lookup, never from the request: the body carries `username` and an optional `notify_email`, and an unknown key is refused 422. The row is never born without a notification address: the directory's `mail` is it when BACKLOG #2014's rule adopts it, and `notify_email` is then refused; otherwise `notify_email` is required and checked as `POST /users` checks `email` (400). 404 when the directory has no enabled account by that name, 400 when it returns no readable `objectGUID`, 409 when a row already holds the name or id, 503 when the directory cannot be reached. No roles: they come from the AD-group map at sign-in |
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
-| `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- use `DELETE /me/sessions` instead |
+| `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |

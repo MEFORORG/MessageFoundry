@@ -63,7 +63,8 @@ ROUTES = [
         "set_roles",
         "/roles",
         None,
-        {"roles": "viewer"},
+        # Keeps Administrator, so only the self-guard stops the write and the session check bites.
+        {"roles": "administrator"},
         "another administrator must change your own roles",
     ),
     (

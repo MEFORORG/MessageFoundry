@@ -1304,8 +1304,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2). This route takes the login
         window, so on yourself it would end every session you hold with no fresh proof. The
-        self-service ``DELETE /me/sessions`` does that behind a single-use ``session_terminate``
-        grant instead."""
+        self-service ``DELETE /me/sessions`` ends your other sessions behind a single-use
+        ``session_terminate`` grant, and sign-out ends the current one."""
         target = await service.store.get_user(user_id)
         await _refuse_if_self(
             request,
