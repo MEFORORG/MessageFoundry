@@ -288,6 +288,10 @@ Amendment A, BACKLOG #1136). No start writes a password file. Engines before tha
 one-time password to `bootstrap-admin.txt` beside the store; if a development checkout still holds
 one, delete it.
 
+`--email` is required too (BACKLOG #1138, ADR 0183 Amendment D). The command refuses a missing,
+blank or malformed address before the password prompt. So every Administrator it creates starts
+with the address its security notices go to.
+
 **What a start does with no enabled Administrator.** At the shipped posture, once the earlier start
 checks pass (at least the store key, the low-disk floor and the `[alerts]` checks), the ADR 0167
 notice-deliverability gate refuses the start, and the refusal names `provision-admin` and the store
@@ -346,8 +350,8 @@ sign-in, password and code in one request.
 Re-running with the same username completes a provision an earlier run left half-written. The same
 repair takes over any enabled local account with that name that holds no roles, such as one an
 administrator created with none. The command says it completed an existing roleless account. It
-sets the new password, grants Administrator, and moves the notification address when `--email` is
-given. So the account's earlier holder is told: a `first_administrator_takeover` notice goes to the
+sets the new password, grants Administrator, and sets the notification address to the `--email`
+value. So the account's earlier holder is told: a `first_administrator_takeover` notice goes to the
 notification address the account held **before** the repair (BACKLOG #2019).
 
 - The command builds the notifier from the same `[auth]`, `[alerts]` and `[secrets]` settings
@@ -360,13 +364,16 @@ notification address the account held **before** the repair (BACKLOG #2019).
 - The `auth.first_administrator_provisioned` audit row gains `holder_notice`: `dispatched`,
   `no_prior_address`, `no_channel`, or null for a fresh create. It is written after the notice, so
   `dispatched` means the notifier took it. It does not mean the mail was delivered. The row also
-  gains `notify_email_moved`. The `notified` field keeps its old meaning: an address was given with
-  `--email`.
-- **An account that already holds a notification address needs `--email`** (BACKLOG #2288).
-  Without it the command refuses before the password prompt and writes nothing. Kept silently,
-  that address would receive every later notice for the new Administrator. A first run given
-  `--email` that stopped after creating the account left that address there, so run the same
-  command again, with `--email`. You may give the address the account already holds.
+  gains `notify_email_moved`. The `notified` field keeps its meaning: an address was given. Every
+  run of this command now gives one, so every row it writes reads true (BACKLOG #1138). It says
+  nothing about the notice to the earlier holder; `holder_notice` records that.
+- **A repair always writes the `--email` address to the account** (BACKLOG #2288, BACKLOG #1138).
+  It replaces any address the account held, so an earlier holder's address gets none of the new
+  Administrator's later notices. Before `--email` was required, the command refused to repair an
+  account that held an address unless `--email` was given. The parser now refuses every run
+  without `--email`, so that refusal cannot fire from this command. A first run that stopped after
+  creating the account left its own address there. Run the same command again to complete it. You
+  may give the address the account already holds.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes
 and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role

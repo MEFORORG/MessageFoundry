@@ -53,7 +53,8 @@ knob to buy a verdict.
 
 **The first administrator is named and credentialled by an operator at the host, offline, before the
 engine first serves — so the "not present" arm is the arm taken, and no account exists until a human
-names one.** `messagefoundry provision-admin --username <name>` creates it.
+names one.** `messagefoundry provision-admin --username <name>` creates it. *(Amended 2026-10-10 by
+Amendment D: the command also requires `--email <address>`.)*
 
 The way in is **filesystem authority over the store**, not an account. Every operator who installs
 the service already holds it; no attacker on the network does. That is the same gate ADR 0171
