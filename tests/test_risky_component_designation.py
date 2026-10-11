@@ -27,17 +27,24 @@ closure plus what each assessed extra adds (BACKLOG #2414 brought ``harness`` in
 each verdict from its recorded readings, and hold the page's tables, counts and dates to the
 snapshot. None of them reads today's date, so none goes red when the re-read date passes.
 
+The harness section leaves ``pyside6-addons`` undesignated because the harness imports no Qt module
+from it. That rests on the page's list of the Qt modules the harness imports, and a static walk of
+``harness/`` holds the list to the code (BACKLOG #2948).
+
 Each test names the mutation that must turn it RED.
 """
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
+import functools
 import json
 import re
 import subprocess
 import sys
 import urllib.error
+from collections.abc import Iterable
 from email.message import Message
 from pathlib import Path
 from typing import Any
@@ -443,6 +450,186 @@ def test_the_harness_section_rests_on_the_generated_reading() -> None:
     assert "It does not mean the Qt code inside those wheels has no known flaws." in section, (
         "the harness section no longer states the limit of an OSV reading by PyPI name"
     )
+
+
+#: The tree whose Qt imports the harness section lists (BACKLOG #2948). Only this tree is walked. A
+#: Qt import added to another package the harness process loads, such as ``messagefoundry``, is
+#: outside it; on the reading of 2026-10-11 no such package imports PySide6.
+_HARNESS_TREE = _ROOT / "harness"
+#: The harness section's sentence naming the Qt modules the harness imports, read with its line
+#: breaks folded to spaces. Group 1 is the count word, group 2 the listed modules.
+_QT_SENTENCE = re.compile(r"the harness imports (\w+) Qt modules?: ((?:`Qt\w+`(?:, |,? and )?)+)\.")
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+
+
+def _page_qt_modules(page: str | None = None) -> set[str]:
+    """The Qt modules the harness section says the harness imports.
+
+    The sentence must appear once, list each module once, and give a count word that matches the
+    list. The next sentence must say that many ship in ``pyside6-essentials``, so growing the list
+    means editing the sentence the split rests on. ``page`` defaults to the tracked page; a
+    positive control passes a broken copy instead.
+    """
+    section = " ".join(_region(_HARNESS_START, _ASVS_START, page).split())
+    found = _QT_SENTENCE.findall(section)
+    assert len(found) == 1, f"the harness section must name the harness's Qt modules once: {found}"
+    word, listed = found[0]
+    modules = re.findall(r"`(Qt\w+)`", listed)
+    assert len(set(modules)) == len(modules), f"the harness section lists a module twice: {modules}"
+    assert len(modules) < len(_NUMBER_WORDS), "extend _NUMBER_WORDS to count the listed modules"
+    assert word == _NUMBER_WORDS[len(modules)], (
+        f"the harness section says {word!r} Qt modules and lists {len(modules)}: {modules}"
+    )
+    # The sentence after the list is the one the not-designated split rests on.
+    split = f"All {word} ship in `pyside6-essentials`."
+    assert split in section, (
+        f"the harness section no longer says {split!r}; re-read the pyside6-addons row"
+    )
+    return set(modules)
+
+
+def _pyside6_imports(label: str, source: str | bytes) -> list[tuple[str, str | None]]:
+    """``(where, module)`` for each import statement in ``source`` that names PySide6.
+
+    ``module`` is the Qt module the statement names, such as ``QtCore`` for both
+    ``import PySide6.QtCore`` and ``from PySide6.QtCore import Qt``. It is None when the statement
+    names no module after ``PySide6``: ``import PySide6`` and ``from PySide6 import QtCore``. The
+    walk reaches imports nested in a function or a ``try``. It does not see an import built at run
+    time, such as ``importlib.import_module``, or a Qt module a dependency loads.
+    """
+    found: list[tuple[str, str | None]] = []
+    for node in ast.walk(ast.parse(source, filename=label)):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names = [node.module]
+        else:
+            continue
+        for name in names:
+            top, _, rest = name.partition(".")
+            if top == "PySide6":
+                found.append((f"{label}:{node.lineno}", rest.partition(".")[0] or None))
+    return found
+
+
+def _qt_import_drift(imports: Iterable[tuple[str, str | None]], listed: set[str]) -> list[str]:
+    """One line per way the given PySide6 imports and the page's list disagree.
+
+    ``imports`` is what ``_pyside6_imports`` returns, so a positive control can plant a statement
+    beside the real ones without writing to the tree. Both directions count: a module the page does
+    not list, and a listed module nothing imports any more. A statement that names no module is
+    refused outright, since this walk cannot tell which Qt module it reaches.
+    """
+    drift: list[str] = []
+    seen: dict[str, str] = {}
+    for where, module in imports:
+        if module is None:
+            drift.append(
+                f"{where}: names no Qt module after PySide6; write "
+                "`from PySide6.<QtModule> import ...` so this check can read it"
+            )
+        else:
+            seen.setdefault(module, where)
+    drift += [
+        f"{seen[m]}: imports PySide6.{m}, which the harness section does not list"
+        for m in sorted(seen.keys() - listed)
+    ]
+    drift += [
+        f"the harness section lists {m}, and no file under harness/ imports it"
+        for m in sorted(listed - seen.keys())
+    ]
+    return drift
+
+
+@functools.cache
+def _harness_imports() -> tuple[int, tuple[tuple[str, str | None], ...]]:
+    """How many Python files are under ``harness/``, and every PySide6 import in them.
+
+    Cached: the walk parses every harness file, and the controls below reuse it.
+    """
+    files = sorted(_HARNESS_TREE.rglob("*.py"))
+    imports = [
+        found
+        for path in files
+        for found in _pyside6_imports(
+            # Bytes, so ast.parse honours a byte-order mark the way an import does.
+            path.relative_to(_ROOT).as_posix(),
+            path.read_bytes(),
+        )
+    ]
+    return len(files), tuple(imports)
+
+
+def test_the_harness_imports_exactly_the_qt_modules_the_page_lists() -> None:
+    """RED when: a file under ``harness/`` imports a Qt module the harness section does not list,
+    imports from the bare ``PySide6`` package, or stops importing a module the section lists.
+
+    The section leaves ``pyside6-addons`` undesignated because the harness imports none of its
+    modules. A harness change that imports one, the web engine for example, would leave that row
+    wrong while every other gate stayed green (BACKLOG #2948). This test holds the module list.
+    It does not hold which wheel ships each module: that the listed ones are all in
+    ``pyside6-essentials`` is the section's own reading. It also misses what
+    ``_pyside6_imports`` cannot see.
+    """
+    files, imports = _harness_imports()
+    assert imports, "no PySide6 import found under harness/; the walk has gone stale"
+    drift = _qt_import_drift(imports, _page_qt_modules())
+    assert not drift, (
+        f"read {files} files under harness/ and {len(imports)} PySide6 imports. "
+        f"Correct {_DOC.name} or the import, and read the pyside6-addons row again:\n"
+        + "\n".join(drift)
+    )
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "from PySide6.QtWebEngineWidgets import QWebEngineView",
+        "import PySide6.QtWebEngineWidgets",
+        "import PySide6.QtWebEngineWidgets.sub as web",
+        "from PySide6 import QtWebEngineWidgets",
+        "import PySide6",
+        "def f() -> None:\n    try:\n        from PySide6.QtPdf import QPdfDocument\n    except ImportError:\n        pass\n",
+    ],
+)
+def test_the_qt_import_check_can_fail(planted: str) -> None:
+    """RED when: the Qt import walk stops seeing one form of PySide6 import.
+
+    THE POSITIVE CONTROL FOR THE TEST ABOVE, which passes whenever the walk finds nothing wrong. The
+    first case is the mutation BACKLOG #2948 names. Each case is read beside the real harness
+    imports, and the drift must name the planted file, so drift in the real tree cannot stand in.
+    """
+    planted_imports = _pyside6_imports("harness/planted.py", planted)
+    assert planted_imports, "the walk did not see the planted import"
+    drift = _qt_import_drift((*_harness_imports()[1], *planted_imports), _page_qt_modules())
+    assert any(line.startswith("harness/planted.py:") for line in drift), drift
+
+
+def test_a_listed_module_the_harness_drops_is_drift() -> None:
+    """RED when: the import check stops flagging a listed module that nothing imports any more."""
+    listed = _page_qt_modules()
+    assert "QtNetwork" in listed, "the harness section no longer lists QtNetwork; re-read this test"
+    dropped = [found for found in _harness_imports()[1] if found[1] != "QtNetwork"]
+    assert _qt_import_drift(dropped, listed) == [
+        "the harness section lists QtNetwork, and no file under harness/ imports it"
+    ]
+
+
+def test_the_qt_count_word_check_can_fail() -> None:
+    """RED when: the page sentence's reader stops seeing a count word that does not match its list,
+    or an essentials sentence that no longer counts every listed module."""
+    page = _DOC.read_text(encoding="utf-8")
+    listed = _page_qt_modules()
+    word = _NUMBER_WORDS[len(listed)]
+    wrong = next(other for other in _NUMBER_WORDS if other != word)
+    broken = page.replace(f"the harness imports {word} Qt", f"the harness imports {wrong} Qt", 1)
+    assert broken != page, "the harness section's count word moved; re-read this test"
+    with pytest.raises(AssertionError, match="Qt modules and lists"):
+        _page_qt_modules(broken)
+    unsplit = page.replace(f"All {word} ship in", f"All {wrong} ship in", 1)
+    assert unsplit != page, "the harness section's essentials sentence moved; re-read this test"
+    with pytest.raises(AssertionError, match="no longer says"):
+        _page_qt_modules(unsplit)
 
 
 def test_the_version_comparison_can_fail() -> None:
