@@ -1,6 +1,11 @@
 # 0202 — A Handler receives the whole decrypted message, so ASVS 11.7.2 is recorded as partial
 
-- **Status:** Proposed
+- **Status:** **Accepted -- 2026-10-10, by an owner ruling given to a Manager seat in session**
+  (batch 212, BACKLOG #1174). The owner confirmed the Handler boundary this ADR states. A Router and
+  a Handler each receive the whole decrypted message by design, so 11.7.2 stays partial on this
+  ground. The ruling does not re-score the ASVS record; that wording stays a separate record act
+  (see *Out of scope*). The ADR changes no code, so there is nothing to build.
+  > **Superseded status text, kept as a record.** Until 2026-10-10 this line read: *"Proposed"*.
 - **Date:** 2026-09-29
 - **Related:** BACKLOG #1174 (ASVS 11.7.2), #1185 (ASVS 14.2.2) · [ADR 0005](0005-transform-accessible-state.md) ·
   [ADR 0105](0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) · CLAUDE.md §1, §2, §9 · [`docs/PHI.md`](../PHI.md) §2
@@ -154,6 +159,6 @@ change.)
 
 ## To resolve on acceptance
 
-- [ ] The owner confirms the Handler boundary stated here. #1174 says the record already blesses
+- [x] The owner confirms the Handler boundary stated here. #1174 says the record already blesses
       a written boundary decision as an outcome; asking the owner to confirm this one is this ADR's
-      choice, not the row's.
+      choice, not the row's. **Settled 2026-10-10; see *Status*.**
