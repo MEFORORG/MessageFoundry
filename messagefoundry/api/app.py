@@ -225,6 +225,7 @@ from messagefoundry.api.security import (
     answers_before_body,
     authorize_ws,
     authorizes_in_body,
+    bearer_token,
     client_ip,
     deadline_utc,
     enforce_phi_read_hop,
@@ -234,6 +235,7 @@ from messagefoundry.api.security import (
     optional_identity,
     pending_credential_deadline,
     public_route,
+    recheck_standing,
     refuse_from_new_address,
     refuse_undeclared_route,
     require,
@@ -480,7 +482,7 @@ _UPLOAD_BODY_PATHS = frozenset({"/uploads", "/ui/uploaded-logs/upload"})
 _MAX_PRESET_LAYERS = 8
 _CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
-_WS_REVALIDATE_SECONDS = 3.0  # re-check the session on an open /ws/stats this often (API-WS)
+_WS_FRAME_SECONDS = 1.0  # one /ws/stats frame this often; the caller is re-resolved before each
 #: Path prefixes whose JSON responses are served ``Cache-Control: no-store`` (ASVS 14.2.2). These are
 #: the PHI-read route families — every route gated by ``require_phi_read`` and every step-up GET that
 #: charges the PHI-read hop/pacing budget lives under one of them, so a browser, a proxy or any other
@@ -2060,6 +2062,17 @@ def _summary(row: Row) -> MessageSummary:
         # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
         metadata=user_metadata(d.get("metadata")),
     )
+
+
+class ExportStopped(RuntimeError):
+    """A running bulk export lost its caller's standing, so the stream aborts (BACKLOG #1154).
+
+    The response has already started, so no status code can say so. Raising aborts the transfer,
+    and the client sees an incomplete download rather than a short file that looks complete. The
+    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
+    and uvicorn writes a traceback. Returning without the final body message would avoid
+    that, but the ``@app.middleware("http")`` layers above would then finish the response cleanly,
+    which is the short file this exists to prevent."""
 
 
 def _export_ndjson_line(row: Row) -> bytes:
@@ -5644,9 +5657,13 @@ def create_app(
 
         Selection is either an explicit ``ids`` set (the UI's *save-selected*) or the **basic**
         ``/messages/search`` filters (the UI's *save-all* — reusing ``search_messages`` for the id set);
-        it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). Each
-        streamed body is re-checked against the caller's per-channel scope (load-bearing for the
-        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited (``auth.channel_denied``).
+        it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). The
+        caller is re-resolved before each row. Once its standing fails, or its channel scope no longer
+        covers the scope it started with, the stream records ``messages_export.stopped`` and aborts
+        (BACKLOG #1154). Each streamed body is re-checked against that row's per-channel scope, which
+        covers at least the starting one (load-bearing for the attacker-suppliable ``ids`` path); an
+        out-of-scope id is skipped +
+        audited (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
         a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
@@ -5711,13 +5728,78 @@ def create_app(
             client=client_ip(request),
         )
 
+        # Read once, here, because the gate already refused a repeated header: the stream re-resolves
+        # the caller from this token before every row (BACKLOG #1154).
+        auth = get_auth(request)
+        token = bearer_token(request) if auth is not None else None
+        touch_every = auth.session_idle_seconds / 4 if auth is not None else 0.0
+
+        def _still_covers(current: Identity) -> bool:
+            """Whether ``current``'s channel scope still covers the scope the export started with
+            (None = every channel). A widened scope covers it; only a narrowed one stops it."""
+            if current.allowed_channels is None:
+                return True
+            start = identity.allowed_channels
+            return start is not None and start <= current.allowed_channels
+
         async def _iter_ndjson() -> AsyncIterator[bytes]:
+            streamed = 0
+            # -inf, so the first row touches. It cannot rescue a selection that ran longer than the
+            # whole idle window: the re-check finds that session idle before it would touch it.
+            last_touch = float("-inf")
             for mid in selected:
+                # Re-resolve the caller before EVERY row (BACKLOG #1154, ASVS 8.3.2). The gate
+                # resolved it once, and an export can run to 100,000 bodies, so a session revoked or
+                # a permission withdrawn mid-export would otherwise not reach it. Not the step-up:
+                # that proved the person when the export started. A flowing download is the
+                # caller's own act, so it moves the idle clock at most every quarter of the idle
+                # window. One stall of the client or of the store can still idle the session: the
+                # touch runs only at a row's top, so a stall of about three quarters of the window
+                # is enough, and the next row's re-check then ends both.
+                touch = time.monotonic() - last_touch >= touch_every
+                if touch:
+                    last_touch = time.monotonic()
+                current = (
+                    identity
+                    if auth is None
+                    else await recheck_standing(
+                        auth,
+                        token,
+                        Permission.MESSAGES_EXPORT,
+                        Permission.MESSAGES_VIEW_RAW,
+                        activity=touch,
+                    )
+                )
+                # A narrowed channel scope stops the export too, rather than skipping and auditing
+                # every later out-of-scope row: one stop row, not a denial per row that would trip
+                # the access-denied burst signal against an operator who did nothing.
+                if current is None or not _still_covers(current):
+                    reason = "standing_changed" if current is None else "scope_changed"
+                    # Counts only, never an id or a body.
+                    _log.warning(
+                        "message export stopped after %d of %d rows: %s",
+                        streamed,
+                        len(selected),
+                        reason,
+                    )
+                    await engine.store.record_audit(
+                        "messages_export.stopped",
+                        actor=identity.username,
+                        channel_id=channel_id,
+                        detail=json.dumps(
+                            {"selected": len(selected), "streamed": streamed, "reason": reason}
+                        ),
+                        client=client_ip(request),
+                    )
+                    raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
                 # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
                 # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                row = await read_scoped_message(engine, identity, mid, request)
+                # Read with THIS row's identity: it covers the starting scope, and a channel granted
+                # mid-export is now the caller's to read.
+                row = await read_scoped_message(engine, current, mid, request)
                 if row is None:
                     continue
+                streamed += 1
                 yield _export_ndjson_line(row)
 
         return StreamingResponse(
@@ -8518,15 +8600,15 @@ def create_app(
     @authorizes_in_body("the cookie gate, then the header gate, run before the socket is accepted")
     async def ws_stats(websocket: WebSocket) -> None:
         """Push queue-depth stats to the console roughly once a second until it disconnects — the
-        live monitor feed. The session is re-validated periodically so a revoked/expired/downgraded
-        token can't keep streaming forever, and concurrent sockets are capped (API-WS)."""
+        live monitor feed. The caller is re-resolved before every frame, so a revoked, expired or
+        downgraded session stops at the next frame, and concurrent sockets are capped (API-WS)."""
         # Browser (same-origin mf_session cookie) OR native (Authorization header) auth (ADR 0065). A
         # browser cannot set the WS Authorization header, so a same-origin browser handshake
         # authenticates via the cookie (the web console's authorize_ui_ws — CSWSH-guarded by a same-
         # origin Origin check + SameSite=Strict), installed as the app.state.ui_ws_authorize hook in
         # the serve_ui path (Option B Phase 0). Absent (JSON-only) → only the native header path runs.
         # A native client sends no Origin, so even with the hook present it falls through to the header
-        # path (authorize_ws) unchanged. `token` (cookie or header) backs the periodic revalidation.
+        # path (authorize_ws) unchanged. `token` (cookie or header) backs the per-frame re-check.
         identity: Identity | None = None
         token: str | None = None
         ui_ws_authorize = getattr(websocket.app.state, "ui_ws_authorize", None)
@@ -8571,42 +8653,33 @@ def create_app(
         # in the serve_ui path. Absent → counts-only push (see the send loop below).
         ui_connections_render = getattr(state, "ui_connections_render", None)
 
+        # A nested function rather than an inline call: scripts/security/route_gates.py reads a
+        # Permission in the handshake body as a gate argument, and lets a nested re-check repeat it.
         async def _reauthorize() -> Identity | None:
-            """Re-validate the open socket's session (revocation/expiry/disable/downgrade/password-
-            change) WITHOUT resetting the idle clock, and return the CURRENT identity (or None → close).
-
-            The enriched connections push is rendered with THIS identity, so a narrowed channel scope
-            takes effect within one revalidation window — not only when the socket eventually drops.
-            When no auth is enforced (embedding/dev), the handshake identity stands."""
+            """The caller as it stands now, or ``None`` to close. With no auth enforced
+            (embedding/dev), the handshake identity stands."""
             if auth is None:
                 return handshake_identity
-            # activity=False: this keepalive must not reset the session's idle clock.
-            current = await auth.identity_for_token(token, activity=False)
-            if (
-                current is None
-                or not current.has(Permission.MONITORING_READ)
-                or current.must_change_password
-            ):
-                return None
-            return current
+            return await recheck_standing(auth, token, Permission.MONITORING_READ)
 
         try:
             await websocket.accept()
-            # Re-check BEFORE the first push: a token revoked between the handshake authorize and
-            # accept() must not get even one frame (close the pre-first-send window — SEC-018).
-            current = await _reauthorize()
-            if current is None:
-                await websocket.close(code=1008)
-                return
-            last_revalidate = time.monotonic()
             while True:
+                # Re-resolved before EVERY frame, the first included: a token revoked between the
+                # handshake and accept() gets no frame at all (SEC-018), and no frame goes out on an
+                # identity older than this loop's turn (BACKLOG #1154, ASVS 8.3.2). A refusal closes
+                # the feed, and a narrowed channel scope shapes this frame.
+                current = await _reauthorize()
+                if current is None:
+                    await websocket.close(code=1008)
+                    return
                 # Enriched push for the browser dashboard (ADR 0065 M-ws follow-up): the queue-by-status
                 # counts PLUS the SERVER-RENDERED, already-escaped connections fragment, so the /ui table
                 # updates live over the socket (the client swaps it in and stops polling; the poll is the
                 # fallback if the socket drops). Rendering server-side reuses the same escaping as the
                 # poll path — no client-side table building, no XSS. connections_html is scoped to the
-                # CURRENT (revalidated) identity's per-channel RBAC — a narrowed scope is reflected within
-                # one revalidation window; a native client that only reads outbox_by_status ignores it.
+                # identity resolved for THIS frame; a native client that only reads outbox_by_status
+                # ignores it.
                 # The counts frame is built unconditionally; connections_html is attached only when the
                 # web console's render hook (app.state.ui_connections_render) is installed (serve_ui on,
                 # Option B Phase 0). Absent (JSON-only) → a counts-only push, native clients unaffected.
@@ -8624,16 +8697,7 @@ def create_app(
                     rows = await _dashboard_rows(engine_obj, current)
                     frame["connections_html"] = str(ui_connections_render(rows))
                 await websocket.send_json(frame)
-                await asyncio.sleep(1.0)
-                # Revalidate on an elapsed-time cadence (independent of the per-second send), so a
-                # revoked/downgraded token stops streaming (and a narrowed scope takes effect) within
-                # ~_WS_REVALIDATE_SECONDS.
-                if time.monotonic() - last_revalidate >= _WS_REVALIDATE_SECONDS:
-                    last_revalidate = time.monotonic()
-                    current = await _reauthorize()
-                    if current is None:
-                        await websocket.close(code=1008)
-                        return
+                await asyncio.sleep(_WS_FRAME_SECONDS)
         except WebSocketDisconnect:
             return
         finally:

@@ -7312,11 +7312,16 @@ class AuthService:
         **A rotation drops any open ``/ws/stats`` socket, and that is accepted.** The socket
         authenticates once at handshake and its keepalive re-validates the token CAPTURED there, so
         on a first deployment a rotation would make that captured token stop resolving and the server
-        would close the socket at the next revalidation tick -- indistinguishable from a revoke,
+        would close the socket before its next frame -- indistinguishable from a revoke,
         which is the fail-closed direction and the right one. ``app.js`` wires ``ws.onclose`` to
         resume the 5-second HTTP poll and to re-open the socket a bounded number of times, and the
         new handshake carries the NEW cookie, so the live push survives the rotation. That is a
         client reconnect, never a server-side grace window for the old token.
+
+        **A rotation also stops a running bulk export, with no reconnect** (BACKLOG #1154). The
+        export re-resolves its captured token before every row, so a step-up on the same session
+        mid-export ends it and records ``messages_export.stopped``. The client starts the export
+        again with the new token. Same fail-closed direction, same reason.
         """
         return await self._elevated_hash(
             hash_token(token),

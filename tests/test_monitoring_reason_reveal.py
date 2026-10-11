@@ -541,6 +541,63 @@ async def test_the_stats_socket_pushes_the_dashboard_rows_masked(dash: Engine) -
     assert errors.get("OB_A") == "****" and errors.get("OB_B") == "****", errors
 
 
+async def test_a_narrowed_scope_shapes_the_very_next_stats_frame(
+    dash: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1154 (ASVS 8.3.2): each frame's rows come from the caller as it stands for THAT
+    frame. The scope is narrowed in the store directly, so no session is revoked and only the
+    per-frame re-resolution can carry the change. Under the old 3 s re-check, the second frame
+    would still have carried every connection."""
+    from messagefoundry.api import app as app_module
+    from tests.test_ws_stats_revalidation import (
+        _HARNESS_TIMEOUT,
+        _wait_for_frames,
+        _WSHarness,
+    )
+
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(dash)
+    await _add(service, "op", Role.OPERATOR)
+    login = await service.login("op", PW)
+    assert login.token is not None
+    user = await service.store.get_user_by_username("op")
+    assert user is not None
+    real_stats = dash.store.stats
+    calls = 0
+
+    async def stats_then_narrow() -> dict[str, int]:
+        # Inside the first frame's stats call: after that frame's re-check, before its render. So
+        # the first frame renders wide and the second must render narrow, on any machine speed.
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await service.store.set_user_channel_scope(user.id, '["IB_MINE"]', source="manual")
+        return await real_stats()
+
+    monkeypatch.setattr(dash.store, "stats", stats_then_narrow)
+    app = create_app(dash, auth=service)
+    renders: list[set[str]] = []
+
+    def render(rows: list[ConnectionRow]) -> str:
+        renders.append({r.channel_id for r in rows})
+        return ""
+
+    app.state.ui_connections_render = render
+    harness = _WSHarness(app, login.token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    try:
+        # Each frame is rendered before it is sent, so two frames mean two renders.
+        await _wait_for_frames(harness, task, 2)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert len(renders) >= 2, renders
+    # The control: the first frame carried more than the narrowed scope allows.
+    assert renders[0] - {"IB_MINE"}, renders[0]
+    assert renders[1] <= {"IB_MINE"}, renders[1]
+
+
 def _source_row(name: str, status: str, error: str | None) -> ConnectionRow:
     return ConnectionRow(
         role="source",
