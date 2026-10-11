@@ -6205,9 +6205,10 @@ class DrSettings(_Section):
     # The symmetric release command run on POST /dr/release (release the VIP back to the recovered
     # primary). "" = no hook. Whitespace-only is rejected at load.
     release_hook: str = ""
-    # Bound (seconds) on the takeover/release hook AND on the KeyProvider-reachability check at the DR
-    # site: a hook or key probe that does not succeed within this aborts activation closed (no hang, no
-    # silent retry-forever — ADR 0048 AC-14). Must be > 0.
+    # Bound (seconds) on at least the takeover/release hook AND the KeyProvider-reachability check at
+    # the DR site: a hook or key probe that does not succeed within this aborts activation closed (no
+    # hang, no silent retry-forever — ADR 0048 AC-14). The takeover_timeout_seconds row of
+    # docs/CONFIGURATION.md lists the other steps it bounds (vault BACKLOG #3094). Must be > 0.
     takeover_timeout_seconds: float = 30.0
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),

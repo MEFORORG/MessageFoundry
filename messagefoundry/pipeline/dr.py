@@ -108,8 +108,9 @@ _REQUEST_ARCHIVE_REFUSED = (
 
 class DrActivationError(RuntimeError):
     """Activation (or release) was refused. Carries a ``kind`` (at least ``seed``/``key``/``vip``/
-    ``profile``/``state``/``audit``/``error``, the last for an error no abort path caught) so the caller (the API endpoint) can map it to an HTTP error and
-    the operator sees the failing phase. ``audit`` is the one kind that is not an abort: the box's
+    ``profile``/``state``/``audit``/``error``, the last for an error no abort path caught) so the
+    caller (the API endpoint) can map it to an HTTP error and the operator sees the failing phase.
+    ``audit`` is the one kind that is not an abort: the box's
     posture already changed and the audit row recording that could not be written, so the call
     refuses rather than answer success with no row (vault BACKLOG #2751, #2752). The message is
     ``safe_exc``-scrubbed (PHI-free)."""

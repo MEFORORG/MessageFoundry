@@ -120,8 +120,9 @@ async def test_vip_hook_timeout_aborts(tmp_path: Path) -> None:
     # docs/CONFIGURATION.md says what each hook outcome records (vault BACKLOG #3094).
     #
     # THE BUDGET IS 3.0s AND NOT 0.3s, AND THAT IS THE WHOLE POINT OF THIS COMMENT.
-    # `takeover_timeout_seconds` bounds TWO things, not one: the VIP takeover hook this test is
-    # about, and -- earlier in `activate()` -- the cold-seed restore-verify. At 0.3s the second one
+    # `takeover_timeout_seconds` bounds more than one step: at least the VIP takeover hook this
+    # test is about, and -- earlier in `activate()` -- the cold-seed restore-verify (the
+    # `takeover_timeout_seconds` row of docs/CONFIGURATION.md lists the rest). At 0.3s the second
     # lost the race intermittently and aborted with kind="key" ("the cold-seed key could not be
     # resolved within 0.3s", ADR 0048 AC-14), so the test failed asserting "vip" against a real
     # timeout of the WRONG step. It reads as a key-resolution defect and is not one.
