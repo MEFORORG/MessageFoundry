@@ -7,8 +7,21 @@
   (see *Out of scope*). The ADR changes no code, so there is nothing to build.
   > **Superseded status text, kept as a record.** Until 2026-10-10 this line read: *"Proposed"*.
 - **Date:** 2026-09-29
+- **Correction 2026-10-10 (BACKLOG #1174).** Factual only; the decision is unchanged, though some
+  of its wording under *Decision* moved. The draft read the tree at `8d389ad7b`, before #1174 part C
+  merged later that day as engine PR 1802 (`8efcff30cc`). Three places treated part C as not yet on
+  `main`. Decision item 5 and *Out of scope* said it was in review, and option 4 said it proposes the
+  change. Item 5 also said the state and reference caches hold decrypted values for the store's
+  lifetime. Each of the three now says what `main` does, checked at `1d55295f66`. Each keeps its old
+  wording as a quoted record. The same pass changed at least these other places:
+  - *Related* cited `docs/PHI.md` §2, but the section this ADR draws on is §3.
+  - *Out of scope* named the ASVS cell in words the project's ASVS vocabulary forbids. That phrase
+    is not repeated here.
+  - Decision item 2's list of gated properties lacked `reason`, which `main` added after the draft
+    (BACKLOG #2443). The old list was *"(summary, error, metadata, last_error, detail)"*.
+  - The line above the decision list now says which items were re-read, and when.
 - **Related:** BACKLOG #1174 (ASVS 11.7.2), #1185 (ASVS 14.2.2) · [ADR 0005](0005-transform-accessible-state.md) ·
-  [ADR 0105](0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) · CLAUDE.md §1, §2, §9 · [`docs/PHI.md`](../PHI.md) §2
+  [ADR 0105](0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) · CLAUDE.md §1, §2, §9 · [`docs/PHI.md`](../PHI.md) §3
 
 ---
 
@@ -57,7 +70,9 @@ is the audited keyless opt-out (a second flag under strict enforcement).
 
 ### Where minimization is enforced
 
-Each of these was read against the tree on 2026-09-29, at engine `origin/main` `8d389ad7b`. The list is
+Each of these was read against the tree on 2026-09-29, at engine `origin/main` `8d389ad7b`. Item 5's
+cache sentences and item 2's property list were re-read on 2026-10-10 at `1d55295f66`; see
+*Correction* above. The list is
 at least these; it is not complete.
 
 1. **The strict object model is built only on request.** Ingress reads the control id, message
@@ -68,7 +83,7 @@ at least these; it is not complete.
    corrects it.
 2. **Gated PHI properties in API responses are withheld by default.** `api/phi_gate.py` defines
    `PhiGatedModel`. A property in its `GATEABLE_PROPERTIES` (summary, error, metadata, last_error,
-   detail) serializes as `null` in JSON until something explicitly releases it for that instance,
+   detail, reason) serializes as `null` in JSON until something explicitly releases it for that instance,
    and the release set defaults empty. `redact_unauthorized` in `api/field_authz.py` is what
    releases it, and only what the caller holds. The raw body is not a gated property: its route
    is permission-gated instead (`messages:view_raw`).
@@ -82,8 +97,13 @@ at least these; it is not complete.
 5. **The staged queue drops each row at handoff, on the message path.** Each stage's row is
    consumed in the same transaction that writes the next stage's rows (CLAUDE.md §2), so the queue
    does not keep a message open between stages. This does not hold for the correlation
-   read-through caches: on `main` the state and reference caches hold decrypted values for the
-   store's lifetime by default. #1174 part C, in review and not on `main`, makes them decrypt on each read.
+   read-through caches, which keep every live key for the store's lifetime. Since #1174 part C
+   (engine PR 1802), each cached value is sealed and decrypted only inside the read that asks for
+   it. `docs/PHI.md` §3, *Sealed correlation caches*, says how and what that does not cover.
+   > **Superseded text, kept as a record (corrected 2026-10-10).** The last two sentences of this
+   > item read: *"This does not hold for the correlation read-through caches: on `main` the state
+   > and reference caches hold decrypted values for the store's lifetime by default. #1174 part C,
+   > in review and not on `main`, makes them decrypt on each read."*
 
 One more surface exists and is deliberately **not** counted here. An inbound's
 `stream_threshold_bytes` detaches an over-threshold document into the encrypted attachment store
@@ -137,9 +157,11 @@ surfaces this ADR relies on. Each links to an existing test that already guards 
    that a wiped string still matches its old `hash()` and still retrieves its old dict value, which
    leaves the object inconsistent.
 4. **Re-score 11.7.2 on the strength of a nearby control** (the no-store directive, the retention
-   purge, the detach seam, or the per-read decrypt of the caches that #1174 part C proposes).
+   purge, the detach seam, or the per-read decrypt of the caches that #1174 part C added).
    Rejected:
    none of them is the clinical body in engine memory, which is the verb's subject.
+   > **Superseded text, kept as a record (corrected 2026-10-10).** The parenthesis ended *"the
+   > per-read decrypt of the caches that #1174 part C proposes"*.
 
 ## Consequences
 
@@ -152,10 +174,15 @@ engine process's memory: a core dump, a debugger, unencrypted swap, or a local a
 exposure is the in-use residual `docs/PHI.md` §3 describes, which §10 carries as a stated
 deployment requirement.
 
-**Out of scope** — The ASVS record's own wording (the vault scorecard cell, a record act); the
-decrypted in-process caches (BACKLOG #1185, and #1174 part C, in review); host-level memory
-protection. (`docs/PHI.md` §3's peek bullet, once listed here, is corrected in the same
+**Out of scope** — The ASVS record's own wording (the ASVS cell for 11.7.2, a record act); the
+in-process caches (BACKLOG #1185, and #1174 part C, which seals them on `main`); host-level
+memory protection. (`docs/PHI.md` §3's peek bullet, once listed here, is corrected in the same
 change.)
+
+> **Superseded text, kept as a record (corrected 2026-10-10).** The caches item read: *"the
+> decrypted in-process caches (BACKLOG #1185, and #1174 part C, in review)"*. The first item's
+> parenthesis named the ASVS cell in words the ASVS vocabulary forbids, so that phrase is not
+> repeated here.
 
 ## To resolve on acceptance
 
