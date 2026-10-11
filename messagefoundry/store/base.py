@@ -1627,7 +1627,11 @@ class QueueStore(StoreLifecycle, Protocol):
         row and makes the set read as present-but-empty; that trade is deliberate and recorded."""
         ...
 
-    async def wal_checkpoint(self) -> None: ...
+    async def wal_checkpoint(self) -> bool | None:
+        """Truncate the SQLite ``-wal`` file. ``True`` when no ``-wal`` frames remain (an in-memory
+        or non-WAL SQLite store has none), ``False`` when the checkpoint could not finish (vault
+        BACKLOG #2619), and ``None`` on a server backend, whose method is a no-op."""
+        ...
 
     async def vacuum(self) -> None: ...
 
@@ -1794,7 +1798,9 @@ class AuditStore(Protocol):
         ``offset`` pages them, and ``until`` keeps only rows whose ``ts`` is at most it, so a pager
         that passes its first page's newest ``ts`` reads one snapshot while new rows arrive
         (BACKLOG #2438). The pin is a ``ts`` and not an ``id`` because an ``audit_log`` id is
-        global: the gap between two of a user's ids would count every other account's rows."""
+        global: the gap between two of a user's ids would count every other account's rows.
+        Rows older than the account's own ``created_at`` are left out, and so is every row when no
+        account holds ``username``, because ``actor`` is a reusable name (BACKLOG #1152)."""
         ...
 
     async def count_security_events_for_user(
@@ -3383,6 +3389,7 @@ async def _open_backend(
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             read_only=read_only,
+            secure_delete=settings.secure_delete,
         )
     if settings.backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep

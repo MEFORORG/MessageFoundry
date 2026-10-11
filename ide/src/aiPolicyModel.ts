@@ -22,6 +22,66 @@ export interface AiPolicy {
 }
 
 /**
+ * The cached form: the policy plus when the engine answered it, in epoch milliseconds. `cachedAt`
+ * is optional because a cache written before BACKLOG #1154 has none, and that cache is read as
+ * too old to vouch for anything.
+ */
+export interface CachedAiPolicy extends AiPolicy {
+  cachedAt?: number;
+}
+
+/**
+ * How long a cached answer that ENABLES assistance is trusted once the engine is unreachable: 12
+ * hours, the same figure as the engine's default `[auth].session_absolute_hours`. It counts from
+ * when the engine answered, not from a session's start, so it is a fixed bound and not a session's
+ * remaining life; a tokenless answer has no session at all. The bound applies only while the
+ * engine is unreachable. It forces no sign-in: a reachable engine answering a tokenless read
+ * says "unknown", `byo` treats that as allowed, and the answer is cached afresh. This is a bound,
+ * not a fix: inside it, a withdrawn grant still does not reach an offline IDE. A cached answer
+ * that DISABLES assistance has no age limit.
+ */
+export const CACHED_PERMIT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * The fail-closed policy for when nothing can vouch for one: the engine is unreachable, and either
+ * no authoritative answer is cached and the local CLI gives none, or the cached answer that enabled
+ * assistance is too old. {@link assistantState} disables assistance for it (SEC-022, CWE-636).
+ */
+export const UNVERIFIED_POLICY: AiPolicy = {
+  mode: "unverified",
+  dataScope: "code_only",
+  environment: null,
+  assistPermitted: null,
+  reason: null,
+};
+
+/**
+ * What a cached authoritative policy may still say once the engine is unreachable (BACKLOG #1154,
+ * ASVS 8.3.2). Before this, the cache answered with no age limit, so a withdrawn `ai:assist` never
+ * reached an IDE that could not reach the engine.
+ *
+ *  1. **A cached DISABLE is returned however old it is.** That is the SEC-022 rule, and it does not
+ *     change: a central "off" or an `ai:assist` deny must survive going offline.
+ *  2. **A cached ENABLE is returned only while it is no older than {@link CACHED_PERMIT_MAX_AGE_MS}.**
+ *     Past that, or with no `cachedAt`, or with a `cachedAt` in the future (a clock stepped back),
+ *     the answer is {@link UNVERIFIED_POLICY}, which disables assistance.
+ *
+ * "Enable" and "disable" are what {@link assistantState} says, so a mode added later is sorted the
+ * same way the gate sorts it. The returned policy never carries `cachedAt`.
+ */
+export function cachedPolicyOffline(cached: CachedAiPolicy, nowMs: number): AiPolicy {
+  const { cachedAt, ...policy } = cached;
+  if (!assistantState(policy).enabled) {
+    return policy;
+  }
+  if (typeof cachedAt !== "number") {
+    return UNVERIFIED_POLICY;
+  }
+  const age = nowMs - cachedAt;
+  return age >= 0 && age <= CACHED_PERMIT_MAX_AGE_MS ? policy : UNVERIFIED_POLICY;
+}
+
+/**
  * Narrow a permission bit to the EVALUABLE domain. Only the literals `true` and `false` are answers;
  * everything else means "not evaluated", NEVER "permitted".
  *

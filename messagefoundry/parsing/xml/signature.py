@@ -77,7 +77,8 @@ def _approved_signature_config(signxml: Any) -> Any:
     present). That restriction is NOT applied, because it would refuse the most common XML-DSig
     signature in use and the appendix's text cannot be read from this checkout to confirm it. Applying
     a break-the-common-case restriction on a relayed reading of a standard is not a call this change
-    makes.
+    makes. A DSA signature still fails, but on its KEY: :func:`_signing_key_refusal` refuses every
+    DSA key (BACKLOG #1166), whatever this accept-set admits.
     """
     default = signxml.SignatureConfiguration()
     weak = "224"
@@ -92,9 +93,16 @@ def _approved_signature_config(signxml: Any) -> Any:
 #: 2048, not 3072, by owner ruling R6 (2026-09-23): a partner signing key is counterparty material,
 #: and RSA-2048 is what healthcare partners and public CAs issue today. That is about 112 bits, so
 #: this floor closes the unbounded case and does NOT meet the 128-bit verb; the cell stays a recorded
-#: partial. The RSA number matches ``transports/direct.py``'s partner-key floor; Direct also refuses
-#: EC curves outside an allow-list, and this module does not.
+#: partial. The RSA number matches ``transports/direct.py``'s partner-key floor. That 112-bit
+#: residual covers RSA only: EC keys are held to :data:`_APPROVED_EC_CURVES`, and DSA is refused.
 _MIN_RSA_BITS = 2048
+
+#: EC curves whose signature ``verify`` will accept (BACKLOG #1166, ASVS 11.2.3). All three are at or
+#: above 128-bit security. Named positively, so a curve nobody considered is refused by construction.
+#: Twin of ``_APPROVED_EC_CURVES`` in ``transports/direct.py``; keep the two sets equal. It is copied,
+#: not imported, because ``parsing/`` is a pure leaf library and must not import ``transports/``.
+#: Only the curve sets are twins: Direct does not refuse DSA or an unlisted key type, and this does.
+_APPROVED_EC_CURVES = frozenset({"secp256r1", "secp384r1", "secp521r1"})
 
 #: Fixed, PHI-safe ``reason`` values. Each names a category, never key or document content.
 WEAK_SIGNING_KEY = "WeakSigningKey"
@@ -113,9 +121,16 @@ def _signing_key_refusal(result: Any) -> str | None:
     caller passed. On the ``ca_pem_file`` path the signing key comes from the document's own
     certificate chain, so the anchor alone cannot answer the question.
 
-    RSA ONLY, deliberately. EC and DSA keys pass through unchanged. Measured 2026-09-28 on signxml
-    5.1.0, a P-192 key and a 1024-bit DSA key both still verify; whether to floor them is a separate
-    call this change does not make.
+    THE KEY TYPE IS ALLOW-LISTED, so a type nobody considered is refused rather than passed:
+
+    - RSA passes at :data:`_MIN_RSA_BITS` or more.
+    - EC passes only on a curve in :data:`_APPROVED_EC_CURVES`. Measured 2026-09-28 on signxml 5.1.0,
+      a P-192 key verified before this check refused it.
+    - Ed25519 and Ed448 pass: both meet the 128-bit floor. signxml 5.1.0 offers no EdDSA signature
+      method, so neither reaches this check through a real signature today.
+    - DSA, and every other type, is refused at any size. Measured the same day, a 1024-bit DSA key
+      verified before this check refused it. DSA is not floored at 2048, because the accepted
+      112-bit residual on :data:`_MIN_RSA_BITS` covers RSA only.
 
     A key this cannot read is REFUSED rather than passed, and so is a result that names no key at
     all: a floor that cannot see the key and returns success anyway would report success forever.
@@ -123,7 +138,7 @@ def _signing_key_refusal(result: Any) -> str | None:
     # Imported here, not at module top: importing the xml package must stay free until a verify
     # path runs (see the package docstring).
     from cryptography.exceptions import UnsupportedAlgorithm
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, rsa
     from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
     results = result if isinstance(result, list) else [result]
@@ -134,7 +149,13 @@ def _signing_key_refusal(result: Any) -> str | None:
             key = load_pem_public_key(one.signature_key)
         except (AttributeError, TypeError, ValueError, UnsupportedAlgorithm):
             return UNREADABLE_SIGNING_KEY
-        if isinstance(key, rsa.RSAPublicKey) and key.key_size < _MIN_RSA_BITS:
+        if isinstance(key, rsa.RSAPublicKey):
+            strong = key.key_size >= _MIN_RSA_BITS
+        elif isinstance(key, ec.EllipticCurvePublicKey):
+            strong = key.curve.name in _APPROVED_EC_CURVES
+        else:
+            strong = isinstance(key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey))
+        if not strong:
             return WEAK_SIGNING_KEY
     return None
 
@@ -313,9 +334,10 @@ def verify(
     host's system CA store, so anyone with a public domain-validated certificate could forge a
     signature this returns ``verified=True`` for (DELTA-03). Returns an :class:`XmlSignatureResult` (a
     failed verification is **data**, not an exception, so a Handler can route the message). A
-    signature made with an RSA key under 2048 bits fails with ``reason`` :data:`WEAK_SIGNING_KEY`
-    even when the cryptography checks out, and one whose key cannot be read fails with
-    :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166).
+    signature whose key fails the floor in :func:`_signing_key_refusal` fails with ``reason``
+    :data:`WEAK_SIGNING_KEY` even when the cryptography checks out. That includes at least an RSA key
+    under 2048 bits, an EC key on a curve outside :data:`_APPROVED_EC_CURVES`, and any DSA key. One
+    whose key cannot be read fails with :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166).
 
     **Only a signature over the whole document verifies** (vault BACKLOG #2315). A document holding
     anything the signature does not cover fails with :data:`UNSIGNED_CONTENT`: for example a signed

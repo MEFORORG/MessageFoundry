@@ -13,6 +13,7 @@ import {
   type AiPolicyIo,
   type AiPolicyWire,
 } from "../../aiPolicy";
+import { CACHED_PERMIT_MAX_AGE_MS, type CachedAiPolicy } from "../../aiPolicyModel";
 import { peekToken } from "../../auth";
 
 // SEC-022 regression. The offline AI-policy resolution must FAIL CLOSED: when the engine is
@@ -249,5 +250,53 @@ suite("resolveAiPolicy — the guarded cache write (BACKLOG #330, defect 1)", ()
     await resolveAiPolicy(f.ctx, io);
     assert.strictEqual(f.updates(), 1, "the authoritative answer must be written exactly once");
     assert.strictEqual(f.stored()?.mode, "off");
+  });
+});
+
+// BACKLOG #1154 (ASVS 8.3.2) — the cache is stamped on write and aged on the offline read. The pure
+// rule is asserted node-side in ai-policy-model.test.ts; these pin that resolveAiPolicy wires it.
+suite("resolveAiPolicy — the cached permit's age bound (BACKLOG #1154)", () => {
+  const T0 = 1_800_000_000_000;
+
+  /** Engine answers once (stamping the cache at T0), then is unreachable; the CLI says byo. */
+  function onlineThenOffline(clock: { now: number }): AiPolicyIo & { online: boolean } {
+    const io = {
+      online: true,
+      url: () => "http://127.0.0.1:8765",
+      readToken: async () => "tok-abc",
+      getPolicy: async () => {
+        if (!io.online) {
+          throw new Error("engine unreachable");
+        }
+        return wire({ assist_permitted: true });
+      },
+      getCliPolicy: async () => wire({ assist_permitted: null }),
+      now: () => clock.now,
+    };
+    return io;
+  }
+
+  test("T15: a successful read stamps the cache with when the engine answered", async () => {
+    const f = fakeCtx();
+    const clock = { now: T0 };
+    await resolveAiPolicy(f.ctx, onlineThenOffline(clock));
+    assert.strictEqual((f.stored() as CachedAiPolicy | undefined)?.cachedAt, T0);
+  });
+
+  test("T16: offline, a fresh cached permit still enables; a stale one fails closed, not to the CLI", async () => {
+    const f = fakeCtx();
+    const clock = { now: T0 };
+    const io = onlineThenOffline(clock);
+    await resolveAiPolicy(f.ctx, io);
+    io.online = false;
+
+    clock.now = T0 + 60_000;
+    const fresh = await resolveAiPolicy(f.ctx, io);
+    assert.strictEqual(assistantState(fresh).enabled, true, "inside the bound the permit stands");
+
+    clock.now = T0 + CACHED_PERMIT_MAX_AGE_MS + 1;
+    const stale = await resolveAiPolicy(f.ctx, io);
+    assert.strictEqual(stale.mode, "unverified", "an expired permit must not fall to the CLI's byo");
+    assert.strictEqual(assistantState(stale).enabled, false);
   });
 });

@@ -134,6 +134,11 @@ export function buildBootstrapPlan(opts: {
  *  that would use it: with no terminal, the command refuses before it asks for a password. */
 export const PROBE_USERNAME = "probe";
 
+/** The address the probe passes. `provision-admin` requires `--email` (BACKLOG #1138) and checks its shape
+ *  first, so the probe needs one that passes. Nothing stores it: with no terminal, the command refuses
+ *  before it asks for a password. `.invalid` is a reserved name, so it can be no real mailbox. */
+export const PROBE_EMAIL = "probe@example.invalid";
+
 /** The fragment of `provision-admin`'s refusal that means "an enabled Administrator already exists". */
 export const ADMIN_EXISTS_REFUSAL = "already has an enabled Administrator";
 
@@ -143,37 +148,35 @@ export const NO_TERMINAL_REFUSAL = "refusing to provision without a terminal";
 /** Who to provision. The address is not a secret; the password is never here, and never in argv. */
 export interface AdminDetails {
   username: string;
-  /** The notification address. The shipped posture refuses to start without one on some Administrator. */
-  email?: string;
+  /** The notification address. `provision-admin` requires one (BACKLOG #1138). */
+  email: string;
 }
 
 /**
- * The `provision-admin` argv. Each value is bound with `=`, so a name that starts with a dash stays a value
- * and never becomes a flag. A blank address is left out, which `provision-admin` treats as no address.
+ * The `provision-admin` argv. Each value is bound with `=`, so a value that starts with a dash stays a value
+ * and never becomes a flag. The address always rides, trimmed: `provision-admin` refuses a blank one.
  */
 export function buildProvisionInvocation(opts: { python: string } & AdminDetails): {
   command: string;
   args: string[];
 } {
-  const args = ["-m", "messagefoundry", "provision-admin", `--username=${opts.username}`];
-  if (opts.email !== undefined && opts.email.trim() !== "") {
-    args.push(`--email=${opts.email.trim()}`);
-  }
+  const args = ["-m", "messagefoundry", "provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`];
   return { command: opts.python, args };
 }
 
-/** The probe's argv: {@link buildProvisionInvocation} for {@link PROBE_USERNAME}, answering in JSON. */
+/** The probe's argv: {@link buildProvisionInvocation} for {@link PROBE_USERNAME} and {@link PROBE_EMAIL},
+ *  answering in JSON. */
 export function buildAdminProbeInvocation(opts: { python: string }): {
   command: string;
   args: string[];
 } {
-  const inv = buildProvisionInvocation({ python: opts.python, username: PROBE_USERNAME });
+  const inv = buildProvisionInvocation({ python: opts.python, username: PROBE_USERNAME, email: PROBE_EMAIL });
   return { command: inv.command, args: [...inv.args, "--json"] };
 }
 
 /**
  * A terminal whose process is the command closes the moment the command exits, taking its output with it:
- * a refused password, the "OK: created" line, the missing-address warning. So the provisioning terminal runs
+ * a refused password, a refused address, the "OK: created" line. So the provisioning terminal runs
  * this small Python wrapper instead. It runs the same interpreter with the same argv, inherits the terminal
  * (so `provision-admin` still sees a real terminal and reads the password there), then waits for Enter and
  * exits with the command's own code. One line, no backslashes, so it survives Windows argv quoting.
@@ -263,6 +266,11 @@ export function storeLessStartPrompt(ws: string): string {
 /** The username prompt's check: blank is refused here, and everything else is the engine's to judge. */
 export function validateProvisionUsername(value: string): string | undefined {
   return value.trim() === "" ? "Enter a username for the first administrator." : undefined;
+}
+
+/** The address prompt's check: blank is refused here, and everything else is the engine's to judge. */
+export function validateProvisionEmail(value: string): string | undefined {
+  return value.trim() === "" ? "Enter a notification address for the first administrator." : undefined;
 }
 
 export type StartOutcome =

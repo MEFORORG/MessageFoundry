@@ -1,52 +1,62 @@
 # What the blanket-stage guard still lets through
 
 `scripts/hooks/block-blanket-git-stage.ps1` refuses a git command that stages or commits a whole
-tree. This page lists the blanket forms it still allows, each measured against real git. For
-every form it says one of three things: a per-form owner answer covers it, a change closed it, or
-no per-form answer covers it.
+tree. **It is a best-effort check of the common blanket-stage spellings.** Every blanket form it
+does not match is a stated residual. This page lists the known residuals, each measured against
+real git. Every list here is "at least": each measuring pass has found new shapes.
 
-At the measured commits no settings file in this repository ran the guard. The vault's rulings
-file of 2026-10-08 says the vault runs an older copy, which it measured to behave differently.
-This page measures the engine copy only. Section 5 lists the forms the guard allows that none of
-answers 1 to 3 covers. Whether a settings file here runs the guard now is asserted in
-`tests/test_claude_settings_contract.py`, so read it there. Every "would" below describes what a
-session would meet once the engine copy runs.
+That framing comes from the owner's fourth answer, "Accept by mechanism (Recommended)"; see *The
+owner answers*. The rest of this paragraph is the page's wording. The guard narrows how often a
+session sweeps another session's files into its commit. It does not make that impossible, and no
+reader should rely on it as if it did.
+
+This page measures the engine copy only. The vault's rulings file of 2026-10-08 says the vault
+runs an older copy, which it measured to behave differently. Whether a settings file here runs the
+guard is asserted in `tests/test_claude_settings_contract.py`, so read it there.
 
 ## The owner answers
 
-The owner answered at least four times on these forms. Each answer was a choice in a dialog in
-the Special seat's session. **These four are reported by that seat. No other seat saw the
-dialogs.** The vault's rulings file of 2026-10-08
+The owner made at least seven choices on these forms and on wiring: six answers, and a hold lift
+(*What wiring waited on*, item 3). Each was a choice in a dialog in the Special seat's session.
+**Every one listed here is reported by that seat. No other seat saw the dialogs.** The vault's rulings
+file of 2026-10-08
 (`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, entry #1339) records answer 1. The seat's
 comments on engine PR 2209 record answers 2 and 3, and its comment on engine PR 2217 records
-answer 4. The vault file also records an earlier answer that day, "Retire it, unwired
-(Recommended)". It says that answer is withdrawn, because its question rested on a false premise.
+answer 4. The seat reported answers 5 and 6 in its follow-up brief for the wiring change. The
+vault file also records an earlier answer on 2026-10-08, "Retire it, unwired (Recommended)". It
+says that answer is withdrawn, because its question rested on a false premise.
 
 | Answer | Date | The option the owner chose | What it covers | Section |
 |---|---|---|---|---|
 | 1 | 2026-10-08 | "Accept, wire it (Recommended)" | six fail-opens | 1 |
 | 2 | 2026-10-08 | "Accept all five, wire it (Recommended)" | five groups, (a) to (e) | 2 |
 | 3 | 2026-10-09 | "Accept the four, wire it (Recommended)" | four forms the Lander's review found | 3 |
-| 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | anything the guard does not match | every allowed form |
+| 4 | 2026-10-09 | "Accept by mechanism (Recommended)" | every form the guard does not match | every allowed form |
+| hold lift | 2026-10-09 | "Lift for #1339 only (Recommended)" | the hold on wiring | *What wiring waited on*, item 3 |
+| 5 | 2026-10-10 | "Yes, wire now (Recommended)" | the 2026-08-25 splitter condition | *What wiring waited on*, item 1 |
+| 6 | 2026-10-10 | "Yes, it counts (Recommended)" | the Lander's written-acceptance condition | *What wiring waited on*, item 2 |
 
-Only the option label is the owner's own choice. The item lines quoted in sections 1 to 3 are
-the Special seat's wording. For answer 1, the vault file says so: the seat worded the six items.
-Everything outside the quoted label is the seat's. For answers 2 and 3, the lines are the
-question text as the seat's PR 2209 comments give it.
+Dates on this page are US Central. Where a time is given, UTC follows in brackets.
 
-**Answers 1 to 3 are per form. Answer 4 is by mechanism.** Its question, as the seat's PR 2217
-comment gives it, asked: "Will you accept by mechanism instead? That is: the guard is a
-best-effort check against the common blanket-stage spellings; anything it does not match is a
-stated residual; the document lists the known ones as at least." So under answer 4, every
-allowed form on this page is a stated residual, section 5 included. This page still sorts each
-form by answers 1 to 3. A form in section 5 is a residual by mechanism, and no per-form answer
-names it.
+The owner's act is the choice of an option, and the quoted label is the option the owner chose.
+The questions, the option labels and the option text are the Special seat's wording. The item
+lines quoted in sections 1 to 3 are the seat's too. For answer 1, the vault file says so: the seat
+worded the six items. For answers 2 and 3, the lines are the question text as the seat's PR 2209
+comments give it.
 
-The dialogs for answers 1 to 3 showed one line per item, not the tables on this page. So this
-page puts a form under a per-form answer only when the line's own words describe it. A form the
-words do not describe is in section 5. That holds even where it sat in an accepted group on this
-page before. Where a line says "a stage", this page reads it as `git add` or `git stage` only. A
-commit form under such a line is in section 5 too.
+**Answer 4 governs this page.** Its question, as the seat's PR 2217 comment gives it, asked: "Will
+you accept by mechanism instead? That is: the guard is a best-effort check against the common
+blanket-stage spellings; anything it does not match is a stated residual; the document lists the
+known ones as at least." So every form on this page that the guard allows is a stated residual.
+That includes section 5, which no per-form answer names.
+
+**Answers 1 to 3 are per form, and this page still sorts by them.** The sort says which per-form
+answer, if any, names a form. It does not decide whether a form is accepted; answer 4 does that.
+The dialogs for answers 1 to 3 showed one line per item, not the tables on this page. So this page
+puts a form under a per-form answer only when the line's own words describe it. A form the words
+do not describe is in section 5. That holds even where it sat in an accepted group on this page
+before. Where a line says "a stage", this page reads it as `git add` or `git stage` only. A commit
+form under such a line is in section 5 too.
 
 The PR 2209 record of answer 2 also says what that answer leaves out: "forms in
 docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md that fall in none of the five groups, and the three
@@ -56,10 +66,11 @@ form, and those forms are in section 5.2.
 Sorting a form under a line is the reading of the Builders who wrote this page. The owner may
 draw a line elsewhere.
 
-## What wiring waits on
+## What wiring waited on, and where each stands
 
 At least these are on record. Items 1 and 3 come from the owner, as relayed or reported. Item 2
-is a Lander's condition.
+is a Lander's condition. **Each is now settled by an owner answer**, and the answer is quoted
+under the item. Everything outside the quotes is this page's wording.
 
 1. **Owner ruling 2026-08-25, relayed by the Liaison and not read first-hand here:** *"The
    blanket-git-stage guard is a CONTROL. Strike the claim now, wire it after the splitter
@@ -67,32 +78,56 @@ is a Lander's condition.
    as the quote-state repair, BACKLOG #1341. PR 579 landed the over-deny half of it. The rest
    needs a quote-state parser, and nobody built one. Ledger row #1341 records that the owner
    declined that parser family on 2026-08-25, for the sibling hooks. A Manager ruling of
-   2026-09-21 extended the decline to this script, as ledger row #1339 records. No record read
-   for this page shows the owner asked whether the splitter condition still stands. The vault
-   file's #1339 entry says the 2026-10-08 dialog did not put it.
+   2026-09-21 extended the decline to this script, as ledger row #1339 records.
+   *Where it stands: settled by answer 5.* The splitter repair is still not built, and it is no
+   longer a precondition. On 2026-10-10 (US Central) the Special seat asked whether the
+   2026-10-09 choices replace this condition. The owner chose "Yes, wire now (Recommended)". The
+   seat reports that option's text as: "The 2026-10-09 choices replace the 2026-08-25 condition.
+   The splitter repair is not a precondition."
 2. **A Lander amendment of 2026-09-22 on ledger row #1339, under that Manager ruling:** the
    guard's known fail-opens "must be accepted IN WRITING by the owner before anything wires
-   it". The wording is the Lander's, not the owner's. The owner answers above are reported dialog
-   choices. The vault file's #1339 entry leaves it to the Lander to ask the owner whether such a
-   choice meets that condition. No record read for this page shows that question answered.
+   it". The wording is the Lander's, not the owner's.
+   *Where it stands: settled by answer 6.* Answer 4 accepts every form the guard does not match,
+   and it is a reported dialog choice. The vault file's #1339 entry left it to the Lander to ask
+   the owner whether such a choice meets this condition. On 2026-10-10 (US Central) the Special
+   seat asked it. The owner chose "Yes, it counts (Recommended)". The seat reports that option's
+   text as: "Your dialog choice is your written acceptance. The condition is met."
 3. **A hold, as the Special seat reports it on PR 2217.** It says the owner told it to "start no
    new work", and that wiring waits until the owner lifts that. The option the owner chose in
    answer 4 carries this text, which the seat wrote: "Recorded as your ruling. When you lift the
    hold, one Builder wires the guard. The three plain reading mistakes it found (a bare carriage
-   return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser." Section
-   5.1 holds those three mistakes, in four rows.
+   return, a heredoc tag with - or ., $((1<<n))) are fixed first if they need no parser."
+   *Where it stands:* the Special seat reports that the owner then chose "Lift for #1339 only
+   (Recommended)", on the evening of 2026-10-09 (00:24:30Z on 2026-10-10 UTC). No engine record
+   holds that choice: the seat reported it in its brief for the wiring change, and a
+   maintainer-internal vault record holds it too. The brief's account of that lift, in the seat's
+   words, is that one wiring Builder is dispatched once engine PR 2217 merges. PR 2217 merged
+   later that evening, as `9afa08f5cf` (02:27:30Z on 2026-10-10 UTC). None of the three mistakes
+   needed a parser, and section 4a records their fix.
+
+**What the wiring rests on.** Four owner choices, each reported by the Special seat:
+1. Answer 4, "Accept by mechanism (Recommended)". Its option text, written by the seat, says
+   "When you lift the hold, one Builder wires the guard."
+2. The lift in item 3, "Lift for #1339 only (Recommended)".
+3. Answer 5, "Yes, wire now (Recommended)", for item 1.
+4. Answer 6, "Yes, it counts (Recommended)", for item 2.
+
 
 ## How this was measured
 
-Two passes, with the same tools and the same method.
+Three passes, with the same tools and the same method.
 
 - **First pass:** engine commit `773e43c3fadb51222ead5f69520c222ffab25e9c` (2026-10-08), for
   engine PR 2209. At least 430 payloads. The "allowed before" readings in section 4 are of the
   guard at that commit.
 - **Second pass:** engine commit `61361fff906067c9da0c0fa7d3457b7f229447b7` (2026-10-09), which
   holds PR 2209. At least 190 commands, each run in a repository. Also 18 payloads sent straight
-  to the hook, 14 of which it cannot read. Section 3, section 5.1 and every row marked "second
-  pass" come from this pass. So do the rows added to sections 1 and 2.
+  to the hook, 14 of which it cannot read. Section 3 and every row marked "second pass" come from
+  this pass. So do the rows added to sections 1 and 2, and the rows section 4a moved from 5.1.
+- **Third pass:** engine commit `9afa08f5cffefce5eb523dc8a4dac55878e00f9c` (2026-10-09), for the
+  wiring change. Each row in section 4a, its
+  scoped control and its neighbour were run again, before and after the fix. Section 4a marks
+  the rows this pass found.
 - **Tools:** git 2.55.0.windows.5, PowerShell 7.6.6, and GNU bash 5.3.15 from Git for Windows.
 - **Guard verdict:** each command went to the guard as a real `PreToolUse` payload on stdin, as a
   `Bash` tool call or a `PowerShell` tool call.
@@ -263,7 +298,7 @@ repository root, `git add ..` stages nothing: git answers `'..' is outside repos
 **(c) "quoting forms such as git commit -m wip '.' or "git" add -A".** The guard blanks quoted
 text before it reads a commit, so a quoted pathspec looks the same as a quoted message. A quoted
 or escaped command word hides the word. Closing these needs quote state, which nobody built.
-*What wiring waits on*, item 1, gives the record of its decline. At least:
+*What wiring waited on, and where each stands*, item 1, gives the record of its decline. At least:
 
 | Command | Shell | What git did |
 |---|---|---|
@@ -470,28 +505,166 @@ command that was denied at the first measured commit is allowed now.
   command is allowed today, as fail-open 1 of section 1 (measured in the second pass). The
   sibling guard, `scripts/hooks/block-unbounded-fs-scan.ps1`, does not take `<<<` for a heredoc.
 
-## 5. Under no per-form answer: residuals by mechanism only
+## 4a. Closed by the wiring change: three reading mistakes
+
+Each of these staged the whole tree, and each is now denied. The rows not marked as first measured
+for this change were in section 5.1.
+`tests/test_blanket_stage_guard.py` runs each in a throwaway repository under its shell, beside a
+`git add -A` control that the guard denies and that stages all five, and drives a scoped form of
+the same shape that must stay allowed. Measured with git 2.55.0.windows.5, PowerShell 7 and the
+bash from Git for Windows.
+
+| Command | Shell | What git did | The mistake |
+|---|---|---|---|
+| `Write-Host hi`, bare carriage return, `git add -A` | PowerShell | staged all five | PowerShell ends a line at a bare carriage return. The guard split lines at a line feed only. |
+| `cat <<EOF-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard read a heredoc word as letters, digits and underscores, so it waited for a line `EOF` that never comes. |
+| `cat <<E.O`, newline, `x`, newline, `E.O`, newline, `git add -A` | bash | staged all five | The same, with a dot in the word. |
+| `cat <<EOF+1`, newline, `x`, newline, `EOF+1`, newline, `git add -A` | bash | staged all five | The same, with a plus sign. First measured for this change. |
+| `cat <<'EOF'-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard took the quoted part alone as the word. bash removes the quotes and keeps the rest. First measured for this change. |
+| `cat <<"EOF"x`, newline, `x`, newline, `EOFx`, newline, `git add -A` | bash | staged all five | The same, with double quotes. First measured for this change. |
+| `cat <<E\OF`, newline, `x`, newline, `EOF`, newline, `git add -A` | bash | staged all five | The guard stopped the word at the backslash. bash removes it. First measured for this change. |
+| `echo $((1<<n))`, newline, `git add -A` | bash | staged all five | The guard read the shift `<<n` as the start of a heredoc. |
+| `(( x = 1<<n ))`, newline, `git add -A` | bash | staged all five | The same, in an arithmetic command. First measured for this change. |
+| `echo $(( (1+(2)) << n ))`, newline, `git add -A` | bash | staged all five | The same, with brackets nested inside. First measured for this change. |
+| `echo $[1<<n]`, newline, `git add -A` | bash | staged all five | The same, in bash's older spelling of arithmetic. First measured for this change. |
+
+How each was closed. Neither is a quote-state parser or a program-position test:
+
+- **Carriage return.** The guard also reads the command split at each bare carriage return. The
+  tool name picks it: `PowerShell` and an unknown tool get it, and `Bash` does not, because bash
+  does not end a line there. `Write-Host hi`, bare carriage return, `git add -A` under bash is
+  still allowed, and it staged nothing.
+- **Heredoc word and arithmetic.** The guard also reads heredocs a second way. It reads the
+  word the way bash does, up to the first blank or one of `;`, `&`, `|`, `<`, `>`, `(` and `)`,
+  and then removes its quotes and backslashes. It skips a `<<` inside `((` and `))` on the same
+  line, or inside `$[` and `]`.
+
+Both readings are added beside the old ones and never replace them. The guard judges the old
+readings first and builds the new ones only when the old ones allow. So a slow new reading cannot
+push the hook past its timeout before the old verdict is reached. Before that order was set, a
+payload of 30,000 brackets holding a real `git add -A` took 19.7 seconds, past the 15-second
+timeout, and would have run. `tests/test_blanket_stage_guard.py` pins that payload under 15
+seconds.
+
+### The hook's run time is bounded by a length cap
+
+`.claude/settings.json` gives the hook 15 seconds, and a hook that runs longer lets the command
+run. So a slow path is a way past the guard. Wiring the guard under that timeout made its slow
+paths matter, and three rounds of repair on the wiring change each closed one and found or opened
+another. **This page does not claim that no slow path is left.** The bound on run time is a cap
+on length instead.
+
+**The cap.** The guard refuses any command longer than 65,536 characters (64 KB) without reading
+it. The reason it gives says to write the command to a script file and run that. It also stops
+reading the tool call at the longest length that could hold such a command, 458,752 characters,
+because JSON can spell one character in six, and refuses a longer one the same way. So a huge
+payload is not parsed either. This is a seat
+decision under the owner's 2026-10-09 "Accept by mechanism" ruling, not an owner ruling. The
+Special seat's brief for the third repair round set the rule for choosing it: the largest multiple
+of 16 KB at which every known slow payload family finishes the whole hook in under 5 seconds, which
+leaves at least three times that against the timeout.
+
+**What the cap costs.** A harmless command longer than the cap is refused. The most likely case is
+a heredoc that writes a large file. *Harmless commands the guard would refuse* lists it.
+
+**How it was chosen.** Each payload below went to the hook as a real `PreToolUse` payload, run as
+its own `pwsh` process, and was timed from start to exit, so each figure includes about half a
+second of `pwsh` start-up. For the 80 KB column the guard ran with the cap lifted. Three families
+reached 5 seconds or more at 80 KB on at least one of up to twelve runs, so 64 KB is the largest
+multiple of 16 KB that passed. The machine was a Windows 11 desktop with PowerShell 7.6, with other
+sessions' work running beside it, so a figure can move by a second or more between runs. Where a
+cell is the largest of several runs, the header says so.
+
+Each family is filled to the size in its column. A family that ends in a real `git add -A` is
+denied; the rest are harmless and allowed.
+
+| Family | One unit of the payload | `93f2775087`, 64 KB | Now, 64 KB, largest of 3 runs | Now, 80 KB, cap lifted, largest of 1 to 12 runs | Now, 256 KB |
+|---|---|---|---|---|---|
+| Nests past 64 levels (the Lander's) | `git commit -m x`, then 65 `(`, 65 `)`, a blank, repeated, then `&& git add -A` | 0.8 s | 1.7 s | 1.0 s | refused by the cap, 0.6 s |
+| Escaped brackets after a deep nest (the Lander's) | one 65-level nest, then `\( ` repeated, then `; git add -A` | 1.6 s | 1.4 s | 0.8 s | refused, 0.6 s |
+| Unclosed brackets after a deep nest (the Lander's) | one 65-level nest, then `(` repeated, then `&& git add -A` | 1.8 s | 1.8 s | 0.9 s | refused, 0.8 s |
+| One deep nest | `git commit -m x`, then `(` and `)` to half the size each, then `&& git add -A` | 2.0 s | 1.6 s | 0.9 s | refused, 0.5 s |
+| Sibling pairs | `(a) ` repeated after `git commit -m x` | 0.9 s | 1.6 s | 0.8 s | refused, 0.5 s |
+| The commit word | `commit ` repeated after `git x` | 0.7 s | 1.4 s | 1.1 s | refused, 0.7 s |
+| Bracket-free text | `a ` repeated after `git commit -m x` | 0.9 s | 1.3 s | 0.8 s | refused, 0.9 s |
+| A heredoc body | `x x x x` lines inside `cat <<EOF-1` | 1.9 s | 1.8 s | 3.3 s | refused, 0.7 s |
+| Unclosed arithmetic | lines of 2,000 `(` and ` <<`, after `echo <<x` | 1.6 s | 1.3 s | 0.9 s | refused, 0.6 s |
+| Arithmetic on one line | `((` repeated after `echo $((1<<n))` | 3.7 s | 1.4 s | 1.1 s | refused, 0.7 s |
+| A run of backslashes | `\` repeated after `git status`, under `Bash` | 12.2 s | 1.6 s | 0.7 s | refused, 0.6 s |
+| A run of backticks | a backtick repeated after `git status`, under `PowerShell` | 14.5 s | 1.3 s | 0.7 s | refused, 0.6 s |
+| Backtick continuations | `a`, a backtick, a line feed, repeated, under `PowerShell` | 3.0 s | 1.6 s | 1.4 s | refused, 0.9 s |
+| Bare carriage returns | `a`, a carriage return, repeated, under `PowerShell` | 3.5 s | 1.7 s | 2.7 s | refused, 1.1 s |
+| A long `commit -a` cluster | `git commit -`, then `a` repeated | 2.2 s | 1.3 s | 0.9 s | refused, 0.7 s |
+| Empty lines | line feeds only | 2.8 s | 1.1 s | 1.1 s | refused, 0.8 s |
+| Many git segments | `git x a1;`, `git x a2;` and so on | 1.7 s | 2.2 s | 4.4 s | refused, 0.6 s |
+| Empty lines in a heredoc body | line feeds inside `cat <<x-1` | 4.6 s | 3.3 s | 5.1 s | refused, 0.5 s |
+| Both continuations and carriage returns | `cat <<x-1`, `x`, then a carriage return, a backtick continuation and a backslash continuation, repeated, under an unknown tool name | 6.6 s | 3.6 s | 4.9 s | refused, 0.4 s |
+| Eight views at once (the code review's) | `git t1`, carriage return, a backtick continuation, `;`, numbered, then `cat <<x-1`, `x` at the end, under an unknown tool name | 6.9 s | 2.9 s | 4.8 s | refused |
+| Git segments split by carriage returns | `git a1`, carriage return, `x`, a backtick continuation, `y;`, numbered, under `PowerShell` | 4.2 s | 3.3 s | 5.3 s | refused, 0.4 s |
+| The same, after a heredoc | the row above after `cat <<x-1`, `x`, under an unknown tool name | 4.3 s | 4.1 s | 5.2 s | refused, 0.4 s |
+
+At their own sizes, the Lander's three payloads ran 29.7 s (600 KB), 10.6 s (450 KB) and 24.7 s
+(1.2 MB) at `93f2775087`, on the Lander's run. The tests drive the same three shapes past the cap,
+at 1.2 MB, 900 KB and 1.2 MB, with a 2.4 MB run of sibling pairs beside them. At `93f2775087` those
+four took 13.8 s, 10.3 s, 20.3 s and 8.2 s. Now the cap refuses each in about 2 seconds or less.
+
+**What changed in the readings, and what pins each change.** "Linear" below means a test drives
+the change on an input far past the cap, in one process, and requires it to finish inside 5
+seconds. Each such input took longer than that at `93f2775087`. Each rewrite except the
+arithmetic budget gives the same answers as the code it replaced:
+`tests/test_blanket_stage_guard.py` compares the bracket, view-editor, continuation, flag and
+segment rewrites on seeded random strings, against the old code kept in the test. The heredoc
+changes have no test of their own. A one-off comparison of the whole hook against
+`93f2775087`, on 9,000 seeded short commands, found no difference; it is not kept in the tree. The
+budget changes answers once it is spent, and then only toward a deny in the narrow reading.
+
+A huge tool call is refused before it is parsed. A 12-million-character command of escaped
+control characters took 32.8 s at `93f2775087`; a test pins its refusal under 5 seconds.
+
+| Slow path at `93f2775087` | The change | What pins it |
+|---|---|---|
+| Dropping bracketed text in the commit rule. Past 64 nesting levels it paired brackets in a PowerShell loop, slow per bracket and quadratic in one step. | Two .NET regex calls that cannot backtrack. | Linear, on the Lander's three shapes. |
+| The line-continuation patterns looked behind every escape in a run of them, which took time quadratic in the run. | A lookahead runs first, so the look behind happens once per run. | Linear, and a 64 KB whole-hook test under the 15-second timeout. |
+| The view editor inserted each fill in place, which moved the rest of the string each time. Many backtick continuations took quadratic time. | It rebuilds each view front to back. | Linear. |
+| The flag-cluster patterns for `git add` and `git commit` were quadratic in a long run of letters. | A lookahead for the trigger letter, then the run. | Linear. |
+| The arithmetic pattern's time limit was per line, so many slow lines added up. | A budget of 500 milliseconds across all lines. It is checked before each line, and one line can run its own 500-millisecond limit, so it can reach about a second. Past it, or on a line that times out, a line that could hold arithmetic is not searched for a heredoc at all, so it blanks nothing. That can only add a deny. | Linear, and a test that a stage after a spent budget is still denied. |
+| Lines without `<<` went through the heredoc patterns, and every segment went through the loop. | Those lines are skipped, and one .NET pattern finds only the segments that start with `git`. | The table above only. At 64 KB the guard at `93f2775087` took about 5 seconds or less on these, so no whole-hook test under the cap could fail there. |
+
+Two earlier repairs on the wiring change are older than this table: the commit rule's pathspec
+pattern after `commit`, and the pass that dropped one nesting level of brackets at a time. Each
+kept the hook past 15 seconds at its size then. Both shapes are now past the cap, and a test pins
+each under the cap.
+
+## 5. Known residuals that no per-form answer names
 
 Each form below is still allowed, and git stages or commits a whole tree with it. No line in
-answers 1 to 3 describes it. Under answer 4 each is a stated residual by mechanism, and this list
-is how the owner sees them. At least:
+answers 1 to 3 describes it. Under answer 4 each is a stated residual, like every other allowed
+form on this page. Whether these residuals block wiring was settled by the owner, not by this
+page: answer 5, "Yes, wire now (Recommended)", and answer 6, "Yes, it counts (Recommended)". See
+*What wiring waited on*. This list is how the owner sees them. At least:
 
-**5.1 Forms next to no per-form answer.** All were first measured in the second pass.
+**5.1 Forms next to no per-form answer.** The four rows that stood here are closed; see section
+4a. At least these are still open, each first measured for the wiring change:
 
 | Command | Shell | What git did | Why the guard allows it |
 |---|---|---|---|
-| `Write-Host hi`, bare carriage return, `git add -A` | PowerShell | staged all five | PowerShell ends a line at a bare carriage return. The guard splits lines at a line feed only. |
-| `cat <<EOF-1`, newline, `x`, newline, `EOF-1`, newline, `git add -A` | bash | staged all five | The guard reads a heredoc word as letters, digits and underscores, so it waits for a line `EOF` that never comes. |
-| `cat <<E.O`, newline, `x`, newline, `E.O`, newline, `git add -A` | bash | staged all five | The same, with a dot in the word. |
-| `echo $((1<<n))`, newline, `git add -A` | bash | staged all five | The guard reads the shift `<<n` as the start of a heredoc. |
+| `echo $((1<<n)) # <<EOF-2`, newline, `git add -A` | bash | staged all five | Both heredoc readings take the `<<EOF-2` inside a trailing comment as an opener, and blank every later line. |
+| `cat <<E\\OF`, newline, `x`, newline, `E\OF`, newline, `git add -A` | bash | staged all five | bash's delimiter is `E\OF`. The narrow reading drops both backslashes and waits for `EOF`; the old one waits for `E`. |
+| `echo $[ a[1]<<n ]`, newline, `git add -A` | bash | staged all five | The `$[...]` skip ends at the first `]`, so the `<<n` after the subscript reads as an opener. |
+| `let "x=1<<n"`, newline, `git add -A` | bash | staged all five | The `<<n` inside the quoted `let` expression reads as an opener. |
 
-Controls from the same runs: `cat <<EOF`, newline, `x`, newline, `EOF`, newline, `git add -A` is
-denied, and so is `echo $((1 << 2))`, newline, `git add -A`. The bare carriage return row stages
-nothing under bash, which does not end a line there.
+Controls from the same runs, each denied, and each staged all five: `cat <<EOF`, newline, `x`,
+newline, `EOF`, newline, `git add -A`; `echo $[1<<n]`, newline, `git add -A`; and
+`let "x=1<<n"; git add -A`, where the stage is on the same line. These were measured with bash
+reading the command from a script file. `bash -c` on Windows drops one of two backslashes from its
+argument, which changes the escaped-backslash row.
 
-These rows are reading mistakes in the script, not limits of the method. Each looks closable
-without a quote-state parser or a program-position test: a split at a carriage return for the
-PowerShell tool, and a narrower heredoc opener. Neither was built or measured here.
+**The hook's time limit is a residual too.** `.claude/settings.json` gives the hook 15 seconds,
+and a hook that runs longer lets the command run, whatever the guard would have decided. The
+length cap in section 4a is what bounds the run time: a command past it is refused unread. Under
+the cap, every payload family measured for section 4a finished well inside the limit. A slow
+machine, or a payload shape nobody has measured, could still take longer. This page does not claim
+that none exists.
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.
@@ -600,6 +773,7 @@ means the guard at the first measured commit allowed the command.
 | `git commit -ma a.txt` | committed `a.txt` only, with the message `a` | before |
 | `git add a.txt # not .`, `git add a.txt # not -A` | staged `a.txt` only | before |
 | `git commit -m wip a.txt # not -a` | committed `a.txt` only | before |
+| Any command longer than 65,536 characters, such as a heredoc that writes a large file | not measured; most run no git at all | the length cap |
 
 Notes on these rows:
 
@@ -614,5 +788,8 @@ Notes on these rows:
   `commit -a` rule read the comment as arguments. Only the commit pathspec rule drops it, so
   `git commit -m wip a.txt # not .` is allowed.
 - **The dry-run rows** change nothing in the repository.
+- **The last row** is the price of the length cap in section 4a. The guard refuses such a command
+  unread, whatever it does, and says to write it to a script file and run that.
 
-`tests/test_blanket_stage_guard.py` pins a sample of these rows as strict expected failures.
+`tests/test_blanket_stage_guard.py` pins a sample of these rows as strict expected failures. It
+pins the last row as an ordinary test, because the refusal is deliberate.

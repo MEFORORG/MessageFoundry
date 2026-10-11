@@ -542,17 +542,17 @@ The runtime core is around twenty packages; everything past it is an **opt-in ex
 | \[otel\] | opentelemetry-sdk, opentelemetry-exporter-otlp | Optional OpenTelemetry export; the Prometheus /metrics path needs none of it. |
 | \[dev\] | pytest (+ asyncio / timeout / rerun plugins), ruff, mypy | Tests, lint/format, and strict type-checking. |
 
-Version floors carry security rationale, not just compatibility — e.g. cryptography is floored at the release that fixes a specific advisory, and Starlette carries an **explicit** floor of its own (fastapi’s pin would allow an older one) that clears three CVEs.
+Some version floors carry security rationale, not just compatibility — e.g. cryptography is floored at the release that fixes a specific advisory, and Starlette carries an **explicit** floor of its own (fastapi’s pin would allow an older one) that clears three CVEs.
 
 ### How they’re pinned and kept current
 
-Dependencies are declared in two tiers. pyproject.toml states mostly loose \>= minimums — the contract of lowest acceptable versions, each with a security floor. Some also carry an upper bound. At least uvicorn and websockets are pinned exactly, to the one version the protocol header floor was measured on. requirements.lock is the fully-pinned, hash-locked lockfile exported from uv.lock (via the uv tool); installs require those hashes, so every deployment gets the exact, tamper-checked tree.
+Dependencies are declared in two tiers. pyproject.toml states mostly loose \>= minimums — the contract of lowest acceptable versions. Some of those minimums are security floors. Others, such as mypy and pyyaml, are not. Some minimums also carry an upper bound. At least uvicorn and websockets are pinned exactly, to the one version the protocol header floor was measured on. requirements.lock is the fully-pinned, hash-locked lockfile exported from uv.lock (via the uv tool); installs require those hashes, so every deployment gets the exact, tamper-checked tree.
 
 - **Change deps only in** pyproject.toml**, then re-lock** (uv lock + uv export) — never an ad-hoc pip install.
 
 - **Vet before adopting.** The one real human decision: confirm a new package is real, reputable, maintained, and sanely licensed — which guards against typosquats and AI-hallucinated package names (a genuine risk: assistants routinely suggest packages that don’t exist). Choosing a widely-audited library is itself the mitigation for not reading it.
 
-- **Stay current automatically.** Dependabot opens version-bump PRs; you review the changelog and the lockfile delta — not the library’s code — and CI re-audits and re-tests before merge.
+- **Stay current through Dependabot.** Dependabot opens version-bump PRs; you review the changelog and the lockfile delta — not the library’s code — and CI re-audits and re-tests before merge. The exact pins are the exception. Dependabot proposes no release past a pin’s minor, and tests/test_header_floor_wire.py fails any bump it does propose. A human moves each pin after re-measuring the new release.
 
 - **CI enforces it (DEP-1).** requirements.lock must stay in sync with pyproject.toml, and pip-audit blocks the build on a known CVE in any pinned version; a weekly security cron, an SBOM job, and bandit/semgrep static analysis back it up.
 
