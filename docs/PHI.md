@@ -959,7 +959,11 @@ the platform's concern, not covered by the [§7](#7-logging--phi-redaction) inve
 
 ### Data minimization during processing (in-use posture, ASVS 11.7.2)
 
-PHI is exposed for the **minimum window and surface** needed to route and transform it:
+The engine limits the window and surface of plaintext PHI at the points below. It does not limit
+them inside a Router or Handler, which receives the whole decrypted message by design
+([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
+An earlier version of this line said PHI is exposed for the minimum window and surface needed to
+route and transform it (BACKLOG #1174).
 
 - **A tolerant parse at ingress; the strict model only on request.** Before the ACK, the listener
   parses an HL7 body with the tolerant `Peek` ([parsing/peek.py](../messagefoundry/parsing/peek.py)),
@@ -971,10 +975,17 @@ PHI is exposed for the **minimum window and surface** needed to route and transf
   transformation are the site's own Python ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
   An earlier version of this bullet said routing reads only the fields a Router asks for; that was
   not what the code does (BACKLOG #1174).
-- **Encrypt-after-use at the boundary.** A decrypted body lives in heap only for the lifetime of one
-  pipeline stage; the store cipher re-encrypts every PHI column the moment it is written back
-  ([store/crypto.py](../messagefoundry/store/crypto.py)), so persisted data never lingers in plaintext
-  at rest and the staged queue carries the message forward rather than holding it open.
+- **Re-encryption happens on write.** With a key set, the store cipher re-encrypts every PHI column the
+  moment it is written back ([store/crypto.py](../messagefoundry/store/crypto.py)). So the columns it
+  covers do not linger in plaintext at rest, and the staged queue carries the message forward rather
+  than holding it open. `[security].allow_unencrypted_phi` is the audited keyless opt-out. The
+  decrypted body in process memory is never re-encrypted. It lives in the engine's heap, and also in
+  a per-inbound worker's under `[sandbox].mode = "subprocess"`. It stays there as immutable Python
+  strings, and so does every copy the Router's or Handler's own code makes. It is gone only when that
+  code and the garbage collector let it go
+  ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
+  An earlier version of this bullet, titled *Encrypt-after-use at the boundary*, said a decrypted body
+  lives in heap only for one pipeline stage. That was not what the code does (BACKLOG #1174).
 - **Sealed correlation caches `[BUILT — #1174]`.** The transform-state and reference read-through
   caches, which a Handler reads through `state_get` and `reference(...)`, keep each value as AES-256-GCM
   ciphertext under a per-process key and decrypt it inside the read that asks for it

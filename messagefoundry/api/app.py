@@ -8969,8 +8969,9 @@ async def _assert_security_notice_is_deliverable(
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
     table can. BACKLOG #1139 narrowed that ground: the address this check reads -- ``notify_email``
     -- is engine-owned and named by no directory-sync statement, so a directory login no longer
-    moves it. The conclusion stands on what is left: an operator can still forget, and
-    ``provision-admin`` without ``--email`` succeeds with a warning.
+    moves it. The conclusion stands on what is left. ``provision-admin`` requires ``--email`` since
+    BACKLOG #1138, but a directory account can still be granted the Administrator role with no
+    address, and a table-state check covers that where a creation-time rule cannot.
 
     **It reads ``notify_email`` and not ``email`` for the reason the split exists.** They are two
     columns now, and only one of them is where a notice is addressed. Asking about ``email`` would be
