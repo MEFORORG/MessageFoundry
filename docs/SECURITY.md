@@ -5170,8 +5170,16 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   It is carried as a **stated deployment requirement** — disabled/encrypted swap, restricted local
   admin, and a confidential-compute host where memory forensics is in scope (see
   [PHI.md §10](PHI.md#10-secure-deployment--operations-checklist)) — accepted via the same register
-  entry rather than enforced by the engine. 11.7.2's encrypt-after-use guarantee is active only on a
-  keyed instance (a key must be configured), which is already the case for any PHI-bearing deployment.
+  entry rather than enforced by the engine.
+- **11.7.2 is a recorded partial.** A Router and a Handler receive the whole decrypted message.
+  [ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)
+  records that the body in memory is never re-encrypted, and why 11.7.2 cannot pass. Re-encryption happens only on write, and only
+  with a key set; `[security].allow_unencrypted_phi` is the audited keyless opt-out.
+  [PHI.md §3](PHI.md#3-encryption-at-rest), *Data minimization during processing*, says what each
+  covers. **CORRECTED 2026-10-10 (BACKLOG #1174):** the 11.7.1 bullet above ended *"11.7.2's
+  encrypt-after-use guarantee is active only on a keyed instance (a key must be configured), which
+  is already the case for any PHI-bearing deployment."* No such guarantee covers the body in memory,
+  and the opt-out means a PHI-bearing instance can run with no key.
 
 ### On vault_transit, a recorded attestation stands in for the AES-GCM count (BACKLOG #2337)
 
