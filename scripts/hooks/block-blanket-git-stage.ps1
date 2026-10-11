@@ -19,10 +19,12 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 # Shell arithmetic, where '<<' is a shift and not a heredoc. Used by Hide-HeredocBodies -Narrow.
 # '((...))' is matched to any depth with a balancing group, and '$[...]' is the older spelling.
-# A line with many unclosed '((' makes this quadratic, so the match carries a time limit; on a
-# timeout the narrow reading keeps the line as it is, which costs only the deny it would add.
-# The limit is per line, and a command can hold many such lines, so Hide-HeredocBodies also
-# stops using the pattern once it has spent $ARITHMETIC_BUDGET on it, across all lines.
+# A line with many unclosed '((' makes this quadratic, so the match carries a time limit. The
+# limit is per line, and a command can hold many such lines, so Hide-HeredocBodies also stops
+# using the pattern once it has spent $ARITHMETIC_BUDGET on it, across all lines. A line that
+# could hold arithmetic and was not cleared of it, on a timeout or once the budget is spent, is
+# not searched for an opener at all. Read as it is, its shift would open a heredoc that never ends
+# and blank every later line; skipped, it blanks nothing, which can only add a deny.
 $ARITHMETIC_BUDGET = [timespan]::FromMilliseconds(500)
 $ARITHMETIC = [regex]::new(
     '\(\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)\)|\$\[[^\]]*\]',
@@ -89,11 +91,15 @@ function Hide-HeredocBodies([string]$Text, [switch]$Narrow) {
         if (-not $line.Contains($mark)) { continue }
         # Only the opener SEARCH skips arithmetic; the line itself is kept whole.
         $probe = $line
-        if ($Narrow -and $arithmeticSpent.Elapsed -lt $ARITHMETIC_BUDGET) {
-            $arithmeticSpent.Start()
-            try { $probe = $ARITHMETIC.Replace($line, '') }
-            catch [System.Text.RegularExpressions.RegexMatchTimeoutException] { $probe = $line }
-            $arithmeticSpent.Stop()
+        if ($Narrow -and ($line.Contains('((') -or $line.Contains('$['))) {
+            $probe = $null
+            if ($arithmeticSpent.Elapsed -lt $ARITHMETIC_BUDGET) {
+                $arithmeticSpent.Start()
+                try { $probe = $ARITHMETIC.Replace($line, '') }
+                catch [System.Text.RegularExpressions.RegexMatchTimeoutException] { $probe = $null }
+                $arithmeticSpent.Stop()
+            }
+            if ($null -eq $probe) { continue }
         }
         $m = [regex]::Match($probe, $opener)
         if ($m.Success -and $Narrow) {
@@ -210,20 +216,6 @@ function Edit-BothViews([string]$Scan, [string]$Raw, [string]$Pattern, [string]$
     return @($s.ToString(), $r.ToString())
 }
 
-$cmd = $null
-$tool = $null
-try {
-    $raw = [Console]::In.ReadToEnd()
-    if (-not [string]::IsNullOrWhiteSpace($raw)) {
-        $j = $raw | ConvertFrom-Json
-        $cmd = [string]$j.tool_input.command
-        $tool = [string]$j.tool_name
-    }
-} catch {
-    exit 0
-}
-if ([string]::IsNullOrWhiteSpace($cmd)) { exit 0 }
-
 function Write-Deny([string]$Message) {
     $payload = [pscustomobject]@{
         hookSpecificOutput = [pscustomobject]@{
@@ -239,18 +231,38 @@ function Write-Deny([string]$Message) {
 # THE LENGTH CAP IS WHAT BOUNDS THIS HOOK'S RUN TIME. .claude/settings.json gives the hook a
 # timeout, and a hook that runs past it lets the command run, so every slow path is a way past the
 # guard. Each repair of a slow path has so far opened another, and nothing proves none is left. So
-# a command longer than the cap is refused unread, and the reason says what to do instead. The
-# cap was chosen by measurement: the largest multiple of 16 KB at which every known slow payload
-# family finishes the whole hook in under 5 seconds, a third of the timeout.
-# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a has the table, and the false denies it costs.
-# The cap is a seat decision under the owner's 2026-10-09 "Accept by mechanism" ruling, not an
-# owner ruling.
+# a command longer than the cap is refused unread, and the reason says what to do instead.
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a says how the cap was chosen, gives the
+# measurements, and lists the false denies it costs. The cap is a seat decision under the owner's
+# 2026-10-09 "Accept by mechanism" ruling, not an owner ruling.
 $MAX_COMMAND_LENGTH = 65536
-if ($cmd.Length -gt $MAX_COMMAND_LENGTH) {
-    Write-Deny ("Command too long for the blanket-stage guard to check: $($cmd.Length) characters, " +
-        "and the limit is $MAX_COMMAND_LENGTH. Write it to a script file and run that instead. " +
+# JSON spells one character in at most six ('\u0000'), so a payload past this length cannot hold
+# a command under the cap beside fields of ordinary size. Reading stops there, so neither the read
+# nor the parse can run long on a huge payload.
+$MAX_PAYLOAD_LENGTH = 6 * $MAX_COMMAND_LENGTH + 65536
+function Write-TooLong([string]$Size) {
+    Write-Deny ("Command too long for the blanket-stage guard to check: $Size, and the limit is " +
+        "$MAX_COMMAND_LENGTH characters. Write it to a script file and run that instead. " +
         "(MessageFoundry guard; disable via /hooks.)")
 }
+
+$cmd = $null
+$tool = $null
+try {
+    $buffer = New-Object char[] ($MAX_PAYLOAD_LENGTH + 1)
+    $read = [Console]::In.ReadBlock($buffer, 0, $buffer.Length)
+    if ($read -gt $MAX_PAYLOAD_LENGTH) { Write-TooLong "a tool call of more than $MAX_PAYLOAD_LENGTH characters" }
+    $raw = [string]::new($buffer, 0, $read)
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+        $j = $raw | ConvertFrom-Json
+        $cmd = [string]$j.tool_input.command
+        $tool = [string]$j.tool_name
+    }
+} catch {
+    exit 0
+}
+if ([string]::IsNullOrWhiteSpace($cmd)) { exit 0 }
+if ($cmd.Length -gt $MAX_COMMAND_LENGTH) { Write-TooLong "$($cmd.Length) characters" }
 
 # Scan the BLANKED form. Quoted spans and heredoc bodies are data; everything outside them keeps
 # its exact offsets, so a real command is unchanged by this pass.
@@ -335,10 +347,12 @@ $longFlag = "--(?:$($longNames -join '|'))"
 # The splitter cuts at '||', '&&', ';', '|', '&' and a line feed. Every one of those characters
 # is a separator, so a segment with any text in it is a run of other characters. $GIT_SEGMENT
 # finds only the runs whose trimmed text the program-name test in the loop accepts, in one .NET
-# call. That test still runs and still decides; the pattern saves a pass of the loop for every
-# segment that is not git, which on a command of many short segments was most of the hook's time.
-# Leading blanks are kept in the bound, as the old cut kept them; the loop trims them.
-$GIT_SEGMENT = [regex]::new('(?<![^;|&\n])[^\S\n]*(?i:git(?:\.exe)?)(?=\s|[;|&]|\z)[^;|&\n]*')
+# call. That test still runs; the pattern saves a pass of the loop for every segment that is not
+# git, which on a command of many short segments was most of the hook's time. Both are built from
+# $GIT_PROGRAM, so widening the program name widens both, and a segment the test would accept is
+# never left uncut. Leading blanks are kept in the bound, as the old cut kept them; the loop trims.
+$GIT_PROGRAM = '(?i:git(?:\.exe)?)'
+$GIT_SEGMENT = [regex]::new("(?<![^;|&\n])[^\S\n]*$GIT_PROGRAM(?=\s|[;|&]|\z)[^;|&\n]*")
 $bounds = New-Object 'System.Collections.Generic.List[int[]]'
 $cut = 0
 $addedBuilt = $false
@@ -396,7 +410,7 @@ while ($true) {
     # git ('C:/.../git.exe add -A', 'env git add -A') is BACKLOG #1305's axis and is left alone,
     # because closing it needs a wrapper allowlist -- the construct BACKLOG #1229 measured as
     # fail-open on the sibling gate.
-    if ($s -inotmatch '^git(\.exe)?(\s|$)') { continue }
+    if ($s -cnotmatch "^$GIT_PROGRAM(\s|$)") { continue }
     if (-not $judged.Add("$($s.Length):$s$rawSeg")) { continue }
 
     # $s is trimmed and starts with git, so the split yields no empty token to filter out.

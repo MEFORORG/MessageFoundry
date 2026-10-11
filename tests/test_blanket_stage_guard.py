@@ -1128,6 +1128,28 @@ def test_a_long_run_of_escapes_under_the_cap_is_judged_inside_the_time_limit() -
     assert "git add/stage -A" in assert_denied(result)
 
 
+def test_a_spent_arithmetic_budget_does_not_hide_a_later_stage() -> None:
+    """Two slow lines spend the narrow reading's arithmetic budget. A later line holding a shift
+    must then be skipped, not read as it is: read as it is, '<<n' opens a heredoc that never ends
+    and blanks the stage after it. The control has short lines in place of the slow ones."""
+    shift_then_stage = "echo $((1<<n))\ngit add -A"
+    slow = (": " + "(" * 20000 + " <\n") * 2
+    assert "git add/stage -A" in assert_denied(run_guard(bash(slow + shift_then_stage)))
+    assert "git add/stage -A" in assert_denied(run_guard(bash(": x <\n" * 3 + shift_then_stage)))
+
+
+def test_a_huge_tool_call_is_refused_before_it_is_parsed() -> None:
+    """The cap is checked on the parsed command, so the payload is read only up to the longest one
+    that could hold a command under the cap. Escaped control characters take six characters each
+    in JSON and are the slowest to parse. Read whole, this payload took 7.7 s with the cap checked
+    after the parse, and 32.8 s at 93f2775087."""
+    result, took = _timed("\x01" * 12_000_000)
+    assert took < 5, f"took {took:.1f} s"
+    reason = assert_denied(result)
+    assert _CAP_REASON in reason
+    assert "a tool call of more than" in reason
+
+
 def test_the_commit_rule_itself_denies_past_deep_nesting() -> None:
     """Deep nesting with the deny owed to the COMMIT rule and no other segment: the dot after the
     brackets is the commit's pathspec. The control is the dot moved inside the brackets."""
@@ -1298,7 +1320,8 @@ $src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
 $m = [regex]::Match($src, "(?s)function Edit-BothViews\b.*?\r?\n}\r?\n")
 if (-not $m.Success) { throw 'function Edit-BothViews not found' }
 Invoke-Expression $m.Value
-$segment = [regex]::Match($src, "\`$GIT_SEGMENT = \[regex\]::new\('([^']*)'\)").Groups[1].Value
+foreach ($line in [regex]::Matches($src, '(?m)^\$GIT_(?:PROGRAM|SEGMENT) = .*$')) { Invoke-Expression $line.Value }
+$segment = "$GIT_SEGMENT"
 $tokenEnd = [regex]::Match($src, "\`$tokenEnd = '([^']*)'").Groups[1].Value
 $shortFlag = [regex]::Match($src, "\`$shortFlag = '([^']*)'").Groups[1].Value
 $commitFlag = [regex]::Match($src, '-or \$s -cmatch "\(\^\|\\s\)(.*?)\$tokenEnd"\)\)').Groups[1].Value

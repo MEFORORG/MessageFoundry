@@ -555,7 +555,10 @@ another. **This page does not claim that no slow path is left.** The bound on ru
 on length instead.
 
 **The cap.** The guard refuses any command longer than 65,536 characters (64 KB) without reading
-it. The reason it gives says to write the command to a script file and run that. This is a seat
+it. The reason it gives says to write the command to a script file and run that. It also stops
+reading the tool call at the longest length that could hold such a command, 458,752 characters,
+because JSON can spell one character in six, and refuses a longer one the same way. So a huge
+payload is not parsed either. This is a seat
 decision under the owner's 2026-10-09 "Accept by mechanism" ruling, not an owner ruling. The
 Special seat's brief for the third repair round set the rule for choosing it: the largest multiple
 of 16 KB at which every known slow payload family finishes the whole hook in under 5 seconds, which
@@ -595,7 +598,8 @@ denied; the rest are harmless and allowed.
 | Empty lines | line feeds only | 2.8 s | 1.1 s | 1.1 s | refused, 0.8 s |
 | Many git segments | `git x a1;`, `git x a2;` and so on | 1.7 s | 2.2 s | 4.4 s | refused, 0.6 s |
 | Empty lines in a heredoc body | line feeds inside `cat <<x-1` | 4.6 s | 3.3 s | 5.1 s | refused, 0.5 s |
-| Every view at once | `cat <<x-1`, `x`, then a carriage return, a backtick continuation and a backslash continuation, repeated, under an unknown tool name | 6.6 s | 3.6 s | 4.9 s | refused, 0.4 s |
+| Both continuations and carriage returns | `cat <<x-1`, `x`, then a carriage return, a backtick continuation and a backslash continuation, repeated, under an unknown tool name | 6.6 s | 3.6 s | 4.9 s | refused, 0.4 s |
+| Eight views at once (the code review's) | `git t1`, carriage return, a backtick continuation, `;`, numbered, then `cat <<x-1`, `x` at the end, under an unknown tool name | 6.9 s | 2.9 s | 4.8 s | refused |
 | Git segments split by carriage returns | `git a1`, carriage return, `x`, a backtick continuation, `y;`, numbered, under `PowerShell` | 4.2 s | 3.3 s | 5.3 s | refused, 0.4 s |
 | The same, after a heredoc | the row above after `cat <<x-1`, `x`, under an unknown tool name | 4.3 s | 4.1 s | 5.2 s | refused, 0.4 s |
 
@@ -606,9 +610,16 @@ four took 13.8 s, 10.3 s, 20.3 s and 8.2 s. Now the cap refuses each in about 2 
 
 **What changed in the readings, and what pins each change.** "Linear" below means a test drives
 the change on an input far past the cap, in one process, and requires it to finish inside 5
-seconds. Each such input took longer than that at `93f2775087`. Every rewrite gives the same
-answers as the code it replaced: `tests/test_blanket_stage_guard.py` compares them on seeded
-random strings, against the old code kept in the test.
+seconds. Each such input took longer than that at `93f2775087`. Each rewrite except the
+arithmetic budget gives the same answers as the code it replaced:
+`tests/test_blanket_stage_guard.py` compares the bracket, view-editor, continuation, flag and
+segment rewrites on seeded random strings, against the old code kept in the test. The heredoc
+changes have no test of their own. A one-off comparison of the whole hook against
+`93f2775087`, on 9,000 seeded short commands, found no difference; it is not kept in the tree. The
+budget changes answers once it is spent, and then only toward a deny in the narrow reading.
+
+A huge tool call is refused before it is parsed. A 12-million-character command of escaped
+control characters took 32.8 s at `93f2775087`; a test pins its refusal under 5 seconds.
 
 | Slow path at `93f2775087` | The change | What pins it |
 |---|---|---|
@@ -616,7 +627,7 @@ random strings, against the old code kept in the test.
 | The line-continuation patterns looked behind every escape in a run of them, which took time quadratic in the run. | A lookahead runs first, so the look behind happens once per run. | Linear, and a 64 KB whole-hook test under the 15-second timeout. |
 | The view editor inserted each fill in place, which moved the rest of the string each time. Many backtick continuations took quadratic time. | It rebuilds each view front to back. | Linear. |
 | The flag-cluster patterns for `git add` and `git commit` were quadratic in a long run of letters. | A lookahead for the trigger letter, then the run. | Linear. |
-| The arithmetic pattern's time limit was per line, so many slow lines added up. | One 500-millisecond budget across all lines. Past it, a line is read as it is, which costs only a deny the narrow reading would add. | Linear. |
+| The arithmetic pattern's time limit was per line, so many slow lines added up. | A budget of 500 milliseconds across all lines. It is checked before each line, and one line can run its own 500-millisecond limit, so it can reach about a second. Past it, or on a line that times out, a line that could hold arithmetic is not searched for a heredoc at all, so it blanks nothing. That can only add a deny. | Linear, and a test that a stage after a spent budget is still denied. |
 | Lines without `<<` went through the heredoc patterns, and every segment went through the loop. | Those lines are skipped, and one .NET pattern finds only the segments that start with `git`. | The table above only. At 64 KB the guard at `93f2775087` took about 5 seconds or less on these, so no whole-hook test under the cap could fail there. |
 
 Two earlier repairs on the wiring change are older than this table: the commit rule's pathspec
