@@ -88,6 +88,13 @@ this line.**
 
 ### Security
 
+- **Changing a second factor now offers to sign out your other sessions.** Confirming a TOTP
+  enrolment, turning TOTP off, adding a passkey and removing one each end with an offer to end
+  every other session and keep this one (ASVS 7.4.3). The enrolment confirm shows it below the
+  recovery codes. The other three show it once, on the account page they land on, through a
+  single-use mark on the session, so a typed `?m=` link shows no offer. Accepting asks for the
+  usual re-proof, then signs the other sessions out. Declining ends nothing. Factors changed in
+  Active Directory or at an identity provider are outside it. No seam change. (`BACKLOG #1147`)
 - **A `/ui` write that does not name where it came from is refused.** It answers `403` and
   changes nothing. At least two cases that used to pass are refused now: a write with neither
   `Sec-Fetch-Site` nor `Origin`, which left the sign-in POST with no cross-site control, and a
