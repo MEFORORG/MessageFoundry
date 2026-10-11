@@ -3736,11 +3736,17 @@ on that session, for example) ends it as a revocation would.
   with 1008 before the next frame. Each frame's connections table uses the identity resolved for
   that frame, so a narrowed channel scope shapes the next frame.
 - The bulk message export (`GET` or `POST /messages/export`, streamed as newline-delimited JSON)
-  asks before every row. It stops on a refusal. It also stops when the caller's channel scope no
-  longer covers the scope the export started with. A widened scope does not stop it. A stop
-  records `messages_export.stopped` with the selected and streamed counts and a reason. Then it
-  aborts the transfer, so the client sees a failed download rather than a short file.
-- While rows flow, the export moves the session's idle clock at most every quarter of the idle
+  asks before every row. It stops on a refusal. An administrator's scope change, wider or
+  narrower, revokes the session, as the list above says. So the next row's check refuses it, and
+  the export stops with the reason `standing_changed`. A second check catches a scope change that
+  reaches a live session without a revoke. At least two cases do: a direct store write, and a row
+  checked between the scope write and its revoke. The export then stops, with the reason
+  `scope_changed`, when the caller's channel scope no longer covers the scope it started with. A
+  widened scope still covers it, so in those cases the export goes on. A stop records
+  `messages_export.stopped` with the selected and streamed counts and the reason. Then it aborts
+  the transfer, so the client sees a failed download rather than a short file.
+
+  While rows flow, the export moves the session's idle clock at most every quarter of the idle
   window. So a long download does not end its own session. One stall can, though. If the client
   stops reading or a store read is slow, the session sits idle. A single stall of about three
   quarters of the idle window can be enough. The next row's check then ends the session and the

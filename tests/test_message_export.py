@@ -530,9 +530,10 @@ async def test_a_scope_widened_mid_export_does_not_stop_it(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The other polarity: a grant that widens the scope still covers every row the export started
-    with, so it streams to the end and records no stop. Only a narrowed scope stops it. A row in
-    the newly granted channel streams too, with no ``auth.channel_denied`` row: the caller holds
-    that channel now."""
+    with, so it streams to the end and records no stop. A direct store write is a change with no
+    revoke; an administrator's widen revokes the session, which stops the export. A row in the
+    newly granted channel streams too, with no ``auth.channel_denied`` row: the caller holds that
+    channel now."""
     service = await _service(engine)
     uid = await _add_user(service, "op", [Role.OPERATOR.value], scope=["IB_A"])
     mid_a, mid_b = await _seed(engine)
