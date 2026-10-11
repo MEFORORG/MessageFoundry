@@ -7064,6 +7064,51 @@ def config_py_files(directory: Path) -> list[Path]:
     return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
 
 
+#: The folder Python's source loader reads compiled modules from. A matching cache file there runs
+#: in place of the source beside it, so whoever can write it changes the code a load runs.
+_BYTECODE_CACHE_DIR = "__pycache__"
+
+
+def config_source_trust_paths(directory: Path) -> list[Path]:
+    """Every path in ``directory`` whose writer could change what a load of it runs or reads.
+
+    The directory and each ``*.py`` (:func:`config_py_files`), and, when they exist, the
+    ``__pycache__`` folder and each entry in it, ``connections.toml``, and the ``codesets`` folder
+    with each table the loader reads from it. Both config-source trust checks walk this list (vault
+    BACKLOG #2626 step 3, #2596 step 4).
+
+    **The cache folder is the reason for the list.** The loader uses Python's ordinary source loader,
+    which runs a matching ``.pyc`` in place of the ``.py`` and never compares the two. The checks
+    used to read the ``.py`` alone, so a cache file nobody vetted could run under a source that
+    passed (vault BACKLOG #2596).
+
+    **Not on the list:** the value file and the settings file, which sit outside the config
+    directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
+    folders above ``directory``."""
+    # Lazy: connections_file imports this module (no circular import at load time).
+    from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
+
+    paths = [directory, *config_py_files(directory)]
+    cache = directory / _BYTECODE_CACHE_DIR
+    if cache.is_dir():
+        paths.append(cache)
+        paths.extend(sorted(cache.iterdir()))
+    connections = directory / CONNECTIONS_FILE_NAME
+    if connections.exists():
+        paths.append(connections)
+    codesets = directory / CODESETS_DIR_NAME
+    if codesets.is_dir():
+        paths.append(codesets)
+        # The loader's own rule (code_sets.load_code_sets): a file whose suffix, in lower case, is
+        # .csv or .toml. Matched the same way here, so a table spelled .CSV is vetted on POSIX too.
+        paths.extend(
+            p
+            for p in sorted(codesets.iterdir())
+            if p.is_file() and p.suffix.lower() in (".csv", ".toml")
+        )
+    return paths
+
+
 def _config_module_name(path: Path) -> str:
     # Derive a collision-free module name from the resolved absolute path (not just the stem):
     # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
@@ -7693,10 +7738,35 @@ class _WinConfigSourceProbes:
 
 
 def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProbes) -> None:
-    """Refuse the config source unless the directory and each ``*.py`` read clean and pass the policy.
+    """Refuse the config source unless every path in :func:`config_source_trust_paths` reads clean
+    and passes the policy.
 
-    The candidate set matches POSIX: the directory plus every ``*.py``, ``_*.py`` helpers included.
-    A NULL DACL is a refusal, and so is anything :func:`_evaluate_config_dacl` rejects.
+    The candidate set matches POSIX: the directory, every ``*.py`` with ``_*.py`` helpers included,
+    and the cache, connections and code-set files that list names. A NULL DACL is a refusal, and so
+    is anything :func:`_evaluate_config_dacl` rejects. :func:`_enforce_windows_paths` makes the
+    per-path decisions."""
+    _enforce_windows_paths(
+        config_source_trust_paths(directory),
+        probes,
+        action="load config from",
+        always_present=directory,
+        refuse=_refuse_unsafe_config_source,
+    )
+
+
+def _enforce_windows_paths(
+    paths: Sequence[Path],
+    probes: _WinConfigSourceProbes,
+    *,
+    action: str,
+    always_present: Path | None,
+    refuse: Callable[[str], None],
+) -> None:
+    """Hand ``refuse`` a reason for each path in ``paths`` that does not read clean and pass the
+    policy. Each message starts ``refusing to <action> <path>``.
+
+    ``always_present`` is the one path a not-found read refuses outright. Any other path that is gone
+    by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -7714,19 +7784,25 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
     wider ``except OSError: continue`` that this change leaves as it is.
 
     Kept free of ctypes so the whole decision is testable on every platform."""
+    if not paths:
+        return
     if probes.self_sid is None:
-        _refuse_unsafe_config_source(
-            f"refusing to load config from {directory}: this process's own user SID could not be "
-            f"read, so the owner of the config source cannot be vetted; see docs/SERVICE.md"
+        refuse(
+            f"refusing to {action} {always_present or paths[0]}: this process's own user SID could "
+            f"not be read, so the owner of each path cannot be vetted; see docs/SERVICE.md"
         )
-    for path in [directory, *config_py_files(directory)]:
+    for path in paths:
         sec = probes.read_path(path)
-        if sec.status in _WIN_PATH_GONE_ERRORS and path != directory and not os.path.lexists(path):
+        if (
+            sec.status in _WIN_PATH_GONE_ERRORS
+            and path != always_present
+            and not os.path.lexists(path)
+        ):
             continue
         if sec.status != 0:
             detail = f": {sec.status_text}" if sec.status_text else ""
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: its owner and DACL could not be read (Win32 "
+            refuse(
+                f"refusing to {action} {path}: its owner and DACL could not be read (Win32 "
                 f"error {sec.status}{detail}), so it cannot be shown safe to execute; see "
                 f"docs/SERVICE.md for required permissions"
             )
@@ -7734,20 +7810,20 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
         # A NULL DACL means "no DACL present": everyone is implicitly allowed full control. That is an
         # observed insecure state, not an inability to read one.
         if not sec.dacl_present:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: it has no DACL at all (a null DACL: everyone "
+            refuse(
+                f"refusing to {action} {path}: it has no DACL at all (a null DACL: everyone "
                 f"implicitly has full control); see docs/SERVICE.md for required permissions"
             )
             continue
         if sec.owner_sid is None:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: its owner SID could not be resolved, so it "
+            refuse(
+                f"refusing to {action} {path}: its owner SID could not be resolved, so it "
                 f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
             )
             continue
         if sec.aces is None:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: its DACL could not be enumerated, so it "
+            refuse(
+                f"refusing to {action} {path}: its DACL could not be enumerated, so it "
                 f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
             )
             continue
@@ -7755,8 +7831,8 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
             sec.owner_sid, sec.aces, probes.self_sid, probes.owner_in_admins
         )
         if reason is not None:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from writable-by-others path {path}: {reason}; "
+            refuse(
+                f"refusing to {action} writable-by-others path {path}: {reason}; "
                 f"see docs/SERVICE.md for required permissions"
             )
 
@@ -8181,12 +8257,12 @@ def _assert_safe_config_source(directory: Path) -> None:
     uid; when the engine runs as root, only a root owner is trusted** -- the owner rule
     :func:`messagefoundry.auth.anchor_path.posix_path_verdict` applies to a trust anchor. A
     root-owned, read-only config is therefore accepted under a service-account engine. This check
-    reads only the directory and its ``*.py`` (following links), not the directories above it, as
-    that function does; docs/SERVICE.md states what the layout then still depends on. On Windows the
-    equivalent
-    NTFS-DACL check now runs in-process
-    (:func:`_assert_safe_config_source_windows`, SEC-003): the directory and each ``*.py``
-    owner/DACL is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
+    reads the paths :func:`config_source_trust_paths` lists (following links): the directory, its
+    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables. It does not read the
+    directories above it, as that function does; docs/SERVICE.md states what the layout then still
+    depends on. On Windows the equivalent NTFS-DACL check now runs in-process
+    (:func:`_assert_safe_config_source_windows`, SEC-003): the owner and DACL of each of those
+    paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
     principal a write-class right, **or when its owner is neither the engine's own account nor an
     administrator** (the Windows counterpart of that foreign-uid arm, CONFIG-2) — no longer a silent
     no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
@@ -8197,6 +8273,21 @@ def _assert_safe_config_source(directory: Path) -> None:
         return
     if os.name != "posix":
         return
+    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
+    # writable/foreign-owned helper is just as much an injection vector (review M-21).
+    _enforce_posix_paths(
+        config_source_trust_paths(directory),
+        action="load config from",
+        refuse=_refuse_unsafe_config_source,
+    )
+
+
+def _enforce_posix_paths(
+    paths: Sequence[Path], *, action: str, refuse: Callable[[str], None]
+) -> None:
+    """Hand ``refuse`` a reason for each path in ``paths`` another account could write: a group- or
+    world-writable mode, or an owner other than root or the engine's own effective uid. Each message
+    starts ``refusing to <action>``. A path that cannot be stat'ed is skipped."""
     # The EFFECTIVE uid is the account the executed code runs as, so it is the one to compare. Called
     # directly: os.geteuid exists on every POSIX platform, and a missing one must fail loudly rather
     # than switch the owner check off.
@@ -8205,17 +8296,14 @@ def _assert_safe_config_source(directory: Path) -> None:
     # root engine trusts only root (the set collapses to {0}): any other owner could rewrite code
     # that then runs as root.
     trusted_uids = frozenset({0, euid})
-    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
-    # writable/foreign-owned helper is just as much an injection vector (review M-21).
-    candidates = [directory, *config_py_files(directory)]
-    for path in candidates:
+    for path in paths:
         try:
             st = path.stat()
         except OSError:
             continue
         if st.st_mode & _GROUP_WORLD_WRITABLE:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from group/world-writable path {path} "
+            refuse(
+                f"refusing to {action} group/world-writable path {path} "
                 f"(mode {oct(st.st_mode & 0o777)}); see docs/SERVICE.md for required permissions"
             )
             continue
@@ -8223,8 +8311,8 @@ def _assert_safe_config_source(directory: Path) -> None:
         # escalation vector even at 0644 -- that user can rewrite it (CONFIG-2 / review M-21).
         if st.st_uid not in trusted_uids:
             trusted = "root" if euid == 0 else f"root or uid {euid}"
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path} owned by uid {st.st_uid} -- the engine runs as "
+            refuse(
+                f"refusing to {action} {path} owned by uid {st.st_uid} -- the engine runs as "
                 f"uid {euid} and trusts only an owner that is {trusted}; that owner could rewrite "
                 "the executed code (see docs/SERVICE.md)"
             )
