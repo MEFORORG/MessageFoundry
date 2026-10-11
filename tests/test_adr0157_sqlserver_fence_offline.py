@@ -30,7 +30,7 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import StoreSettings
-from messagefoundry.store import OutboxStatus
+from messagefoundry.store import FailOutcome, OutboxStatus
 from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.sqlserver import (
     _EPOCH_GUARD_CLAIM,
@@ -403,13 +403,17 @@ async def test_mark_failed_fences_the_dead_branch_and_status_filters_the_retry_b
     NO epoch guard but a status term, read from the OUTPUT rowset."""
     cur, conn = _Cursor(matched=0), _Conn()
     store, released = _store(cur, conn, epoch=5)
-    assert await store.mark_failed("row-1", "boom", RetryPolicy(max_attempts=1), now=1.0) is None
+    assert (
+        await store.mark_failed("row-1", "boom", RetryPolicy(max_attempts=1), now=1.0)
+    ) == FailOutcome()
     assert released == [["row-1"]] and store.fenced_writes == 1 and conn.commits == 0
 
     cur2, conn2 = _Cursor(matched=1), _Conn()
     store2, released2 = _store(cur2, conn2, epoch=5)
     events = _counting_events(store2)
-    next_at = await store2.mark_failed("row-2", "x", RetryPolicy(max_attempts=None), now=1.0)
+    next_at = (
+        await store2.mark_failed("row-2", "x", RetryPolicy(max_attempts=None), now=1.0)
+    ).retry_at
     assert isinstance(next_at, float)
     (sql, params), *_ = _updates(cur2)
     assert sql == _RETRY_SQL
@@ -431,7 +435,9 @@ async def test_a_retry_that_matches_no_open_row_is_a_quiet_no_op() -> None:
         cur, conn = _Cursor(matched=0), _Conn()
         store, released = _store(cur, conn, epoch=epoch)
         events = _counting_events(store)
-        next_at = await store.mark_failed("row-1", "x", RetryPolicy(max_attempts=None), now=1.0)
+        next_at = (
+            await store.mark_failed("row-1", "x", RetryPolicy(max_attempts=None), now=1.0)
+        ).retry_at
         assert isinstance(next_at, float) and next_at > 1.0, epoch
         assert events == [], epoch
         assert released == [] and store.fenced_writes == 0, epoch
@@ -445,9 +451,9 @@ async def test_a_batch_retry_skips_the_terminal_members() -> None:
     cur, conn = _Cursor(matched=0), _Conn()
     store, released = _store(cur, conn, epoch=5)
     events = _counting_events(store)
-    next_at = await store.mark_batch_failed(
-        ["a", "b", "c"], "x", RetryPolicy(max_attempts=None), now=1.0
-    )
+    next_at = (
+        await store.mark_batch_failed(["a", "b", "c"], "x", RetryPolicy(max_attempts=None), now=1.0)
+    ).retry_at
     assert isinstance(next_at, float)
     assert events == [] and released == [] and store.fenced_writes == 0
     assert [p[-3:] for _s, p in _updates(cur)] == [(oid, *_OPEN) for oid in ("a", "b", "c")]

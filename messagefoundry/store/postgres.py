@@ -179,6 +179,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    FailOutcome,
     FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
@@ -5479,18 +5480,18 @@ class PostgresStore:
 
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
-    ) -> float | None:
-        """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns the
-        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT or
-        PENDING to re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry
-        wake on a float — WS-C; see the base contract)."""
+    ) -> FailOutcome:
+        """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns a
+        :class:`FailOutcome`: ``retry_at`` on the retry branch, whether or not the row was still
+        INFLIGHT or PENDING to re-pend (the runner arms the per-lane retry wake on it — WS-C), and
+        ``dead`` 1 when this call dead-lettered the row. See the base contract."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
             async with self._timed_acquire() as conn, conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
-                    return None
+                    return FailOutcome()
                 attempts = row["attempts"]
                 # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
@@ -5534,7 +5535,7 @@ class PostgresStore:
                     # terminal (or vanished) row. It writes nothing, not even the 'failed' event, and
                     # still returns the retry time, as Amendment A's ruling item 3 chose.
                     if _rowcount(await conn.execute(sql, *args)) == 0:
-                        return next_at
+                        return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
                 else:
                     await self._exec_terminal(
                         conn, "mark_failed(dead)", (outbox_id,), sql, *args, checked=bool(guard)
@@ -5549,13 +5550,18 @@ class PostgresStore:
                 )
                 if status == OutboxStatus.DEAD.value:
                     await self._maybe_finalize_message(conn, row["message_id"], now)
-                    return None
-                return next_at
+                    return FailOutcome(
+                        dead=1,
+                        head_id=outbox_id,
+                        attempts=attempts,
+                        dead_messages=(row["message_id"],),
+                    )
+                return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)
-            # None is what the DEAD branch returns today, so _mark_failed_and_arm arms no retry timer.
-            # Correct: D1 re-pended the row and only the SUCCESSOR may claim it.
-            return None
+            # No retry time, so _mark_failed_and_arm arms no retry timer: D1 re-pended the row and
+            # only the SUCCESSOR may claim it. Nothing is dead: the fence rolled the DEAD write back.
+            return FailOutcome()
 
     async def mark_batch_failed(
         self,
@@ -5563,11 +5569,12 @@ class PostgresStore:
         error: str,
         retry: RetryPolicy,
         now: float | None = None,
-    ) -> float | None:
+    ) -> FailOutcome:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
+        all dead-letter together). Returns a :class:`FailOutcome` naming the first member still
+        present, with the shared ``next_attempt_at`` or the count written DEAD.
         On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
         own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
         when every member was skipped."""
@@ -5581,7 +5588,7 @@ class PostgresStore:
                     if row is not None:
                         present.append((outbox_id, row))
                 if not present:
-                    return None
+                    return FailOutcome()
                 head_attempts = present[0][1]["attempts"]
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
@@ -5609,6 +5616,7 @@ class PostgresStore:
                     " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard
                 )
                 finalize: dict[str, None] = {}
+                changed = 0
                 for outbox_id, row in present:
                     args = (
                         status,
@@ -5630,6 +5638,7 @@ class PostgresStore:
                             *args,
                             checked=bool(guard),
                         )
+                    changed += 1
                     await self._event(
                         conn,
                         row["message_id"],
@@ -5642,10 +5651,16 @@ class PostgresStore:
                         finalize[row["message_id"]] = None
                 for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize_message(conn, message_id, now)
-                return None if status == OutboxStatus.DEAD.value else next_at
+                return FailOutcome(
+                    retry_at=next_at if retrying else None,
+                    dead=0 if retrying else changed,
+                    head_id=present[0][0],
+                    attempts=head_attempts,
+                    dead_messages=tuple(finalize),  # filled on the DEAD branch only
+                )
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)
-            return None
+            return FailOutcome()
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
