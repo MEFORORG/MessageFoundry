@@ -7722,11 +7722,13 @@ LOCKOUT_THRESHOLD_CEILING = 100
 
 def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str]]:
     """The ``[api].trusted_proxies`` entries that cover more than one address, as
-    ``(whole_family, ranges)``, in order and each named once (BACKLOG #1131).
+    ``(whole_family, ranges)``, in order and as written; a repeated spelling is named once
+    (BACKLOG #1131).
 
-    ``whole_family`` holds the multi-address entries of a family whose entries, together, cover
-    every address of it. Collapsed per family, so the two ``/1`` halves of ``0.0.0.0/0`` count as
-    the whole. ``ranges`` holds every other multi-address entry. A single-host entry is in neither.
+    ``whole_family`` holds EVERY multi-address entry of a family whose entries, together, cover
+    every address of it, so a ``10.0.0.0/8`` beside ``0.0.0.0/0`` lands there too. Collapsed per
+    family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole. ``ranges`` holds the
+    multi-address entries of every other family. A single-host entry is in neither.
 
     The cutoff is one address, not a size. Every host inside a trusted range may set its own
     ``X-Forwarded-For``, so a ``/31``, a ``/127`` or a small pool trusts a host that is not the
@@ -8970,7 +8972,8 @@ def security_loosenings(
             f"host inside it -- each such host {forged} (list each proxy's exact address)"
         )
     if proxy_risks:
-        out.append(("trusted_proxies", "; and ".join(proxy_risks)))
+        # Not "; ": the serve WARNING already joins one loosening to the next with "; ".
+        out.append(("trusted_proxies", ". Also, ".join(proxy_risks)))
     # Vault BACKLOG #2385: the [api] bools are under a completeness floor now, and this is the one
     # that was a deviation with no entry. create_app registers the documentation routes only when
     # it is on, and none of them asks for sign-in.

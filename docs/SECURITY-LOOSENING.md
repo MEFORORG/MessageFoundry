@@ -990,7 +990,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > **Entries that cover every address get their own wording.** The load refuses `*`, but an entry of
 > `0.0.0.0/0` or `::/0` loads and does the same thing for its address family. So do ranges whose union
 > covers a whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The entry names
-> those as trusting every peer, and names any other range beside them with the range wording.
+> every range of that family as trusting every peer, so a `10.0.0.0/8` beside `0.0.0.0/0` gets that
+> wording too. A range in the other family gets the range wording.
 >
 > The check parses each entry the way uvicorn does, strictly. An entry with host bits set, such as
 > `10.1.2.3/0`, would become a literal in uvicorn that matches no peer, so the load refuses it

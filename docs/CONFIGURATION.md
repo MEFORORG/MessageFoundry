@@ -342,7 +342,7 @@ The one row that *does* vary:
 > **in-process TLS** (`tls_cert_file` [+`tls_key_file`]) — the browser connects directly to the
 > engine — or a **declared upstream terminator** (`tls_terminated_upstream = true` +
 > `plaintext_upstream_hop_acknowledged = true` +
-> `trusted_proxies = ["<proxy egress IP or CIDR>"]` + **`[security].web_console_public_address`**,
+> `trusted_proxies = ["<proxy egress IP>"]` + **`[security].web_console_public_address`**,
 > which the L5b ladder now requires — set it under `[security]`, not as the rejected
 > `[api].public_origin`). `trusted_proxies` entries match the proxy's **direct TCP peer address exactly** (CIDR
 > supported, but scope it to the proxy pool — every host inside an entry may forge its own source

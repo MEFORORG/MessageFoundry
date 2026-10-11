@@ -77,7 +77,7 @@ the gate. The right topology depends on the orchestrator.
 |---|---|---|---|
 | **Plain Docker, single host** | **(a) in-process TLS** — engine binds `0.0.0.0:8443`, mount PEM cert/key, `-p 8443:8443` | in-container **MLLP-over-TLS** (`tls=true` per connection), `-p 2575:2575` | Self-contained, matches the single-binary / broker-free ethos; no extra moving parts. |
 | **Kubernetes / same-pod sidecar / `--network host`** | **(c→b) loopback + TLS-terminating sidecar** — engine binds `127.0.0.1`, sidecar terminates TLS, forwards to `127.0.0.1`; set `trusted_proxies=[127.0.0.1]` + `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055) | a **TLS-terminating TCP sidecar** for MLLP, engine MLLP binds loopback (gate passes) — *or* in-container MLLP-over-TLS | A shared network namespace makes the engine genuinely loopback-bound, so the gate passes **trivially** and only the hardened proxy is exposed. Cleanest from the engine's view. |
-| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP/subnet>]` + `plaintext_upstream_hop_acknowledged=true`; do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
+| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP>]` + `plaintext_upstream_hop_acknowledged=true`; do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
 
 ### The three options, justified
 
@@ -226,7 +226,7 @@ is withheld and what you can request.
 > address — so a broad range like `10.0.0.0/8` on a LAN numbered out of 10/8 lets *any* workstation
 > forge its own source IP, poisoning the audit trail, the per-IP login limiter, and the new-client-IP
 > step-up signal. A CIDR is accepted (for a genuine proxy pool), but scope it to the pool and nothing
-> more. `"*"` and unparseable entries are **refused at config load** — the latter because uvicorn would
+> more; any entry wider than one host is a named security loosening (BACKLOG #1131). `"*"` and unparseable entries are **refused at config load** — the latter because uvicorn would
 > otherwise silently treat them as a literal that never matches, collapsing every client to the proxy.
 
 ```python

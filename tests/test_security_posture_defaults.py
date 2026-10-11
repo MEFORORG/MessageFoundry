@@ -1359,9 +1359,21 @@ def test_multi_address_entries_are_read_strictly_and_named_once() -> None:
 
 def test_a_whole_family_and_a_range_in_another_family_each_get_their_wording() -> None:
     risk = _proxy_risk("0.0.0.0/0", "fd00::/8")
-    whole, _, rest = risk.partition("; and ")
+    # The serve WARNING separates loosenings with "; ", so one risk must not contain it.
+    assert "; " not in risk
+    whole, _, rest = risk.partition(". Also, ")
     assert "0.0.0.0/0" in whole and _WHOLE_FAMILY in whole and "fd00::/8" not in whole
     assert "fd00::/8" in rest and _RANGE in rest and "0.0.0.0/0" not in rest
+
+
+def test_a_range_beside_a_whole_family_entry_of_the_same_family_gets_the_whole_family_wording() -> (
+    None
+):
+    """The family is trusted whole, so a range inside it is named with that wording, as the
+    SECURITY-LOOSENING.md section says, and no range clause is added."""
+    risk = _proxy_risk("0.0.0.0/0", "10.0.0.0/8")
+    assert _WHOLE_FAMILY in risk and _RANGE not in risk
+    assert "0.0.0.0/0" in risk and "10.0.0.0/8" in risk
 
 
 def test_the_trust_every_peer_check_skips_a_host_bits_entry() -> None:
