@@ -1227,8 +1227,11 @@ def test_each_rewritten_piece_runs_in_linear_time() -> None:
         )
     assert proc.returncode == 0, proc.stderr
     took: dict[str, float] = json.loads(proc.stdout)
-    assert len(took) == 8
-    slow = {case: round(seconds, 1) for case, seconds in took.items() if seconds >= 5}
+    timed = list(took.items())
+    # Count the cases actually timed before asserting none was slow, so an empty run cannot pass.
+    assert len(timed) >= 8, f"timed {len(timed)} cases, expected 8"
+    assert len(timed) == 8, f"timed {len(timed)} cases, expected 8"
+    slow = {case: round(seconds, 1) for case, seconds in timed if seconds >= 5}
     assert not slow, f"seconds per case: {slow}"
 
 
