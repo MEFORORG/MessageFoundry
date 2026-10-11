@@ -697,8 +697,15 @@ behaviour and is reported as a loosening; the volume it trades away is one row p
 per `require()`-gated route, on the JSON API.
 
 An admin route that refuses the caller's own account writes `auth.self_target_refused` on both
-planes (vault BACKLOG #3260). The routes are reset-password, reset-mfa, the federated-identity
-bind and unbind, disable and delete. The row names the actor, the route as `op`, the caller's
+planes (vault BACKLOG #3260). The routes are at least reset-password, reset-mfa, the
+federated-identity bind and unbind, disable, delete, the admin session revoke, the role write and
+the channel-scope write. The last three joined under BACKLOG #1149 (ASVS 7.5.2): each revokes the
+target's sessions on the login window, so aimed at yourself it would end every session you hold
+with no fresh proof. The self-service `DELETE /me/sessions` ends your other sessions only behind a
+single-use `session_terminate` grant, and *Sign out* ends the current one. The refusal is per
+route and by target, so it does not reach a write that ends a whole group's sessions. At least the
+AD group-map and scope-map saves and the custom-role edit and delete can still end the caller's own
+sessions on the login window. The row names the actor, the route as `op`, the caller's
 stored id and the caller's address. The guard refuses when the path's spelling or the stored id
 matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
 stored id matters on the console. The `404` that `DELETE /me/sessions/{session_id}` answers for
@@ -1211,15 +1218,15 @@ tuple: they act only on the caller's own account.
 | `POST` | `/users/directory` | `users:manage` | `require_step_up`. Creates a directory (AD) account's mirror row by name, without a sign-in (BACKLOG #2021). The row's `objectGUID`, display name and `mail` come from a service-account directory lookup, never from the request: the body carries `username` and an optional `notify_email`, and an unknown key is refused 422. The row is never born without a notification address: the directory's `mail` is it when BACKLOG #2014's rule adopts it, and `notify_email` is then refused; otherwise `notify_email` is required and checked as `POST /users` checks `email` (400). 404 when the directory has no enabled account by that name, 400 when it returns no readable `objectGUID`, 409 when a row already holds the name or id, 503 when the directory cannot be reached. No roles: they come from the AD-group map at sign-in |
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
-| `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up` |
-| `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up` |
+| `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
+| `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
 | `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; either one revokes every live session of the account, in the same transaction as the write (vault BACKLOG #2609). **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C); 409 when another account holds the identity, and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026), also audited as `auth.federated_bind_refused`, with reason `federated_binding_changed` and the expected pair (BACKLOG #2331). 404 for an unknown user, including one deleted while the bind ran (BACKLOG #2331). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound`. **A bound account is refused Windows SSO from then on**, whether or not `oidc_enabled` is on (vault BACKLOG #2609; [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits) |
 | `DELETE` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Removes the binding and revokes the account's sessions (BACKLOG #1474's service method); its next federated login is refused until it is bound again. The body's required `expected_issuer`/`expected_subject` is the pair the caller saw: a stored pair that differs is refused 409 `federated_binding_changed` with nothing changed, compared under the clear's row lock (BACKLOG #2026). That refusal writes an `auth.federated_unbind_refused` audit row naming the actor, with reason `federated_binding_changed` and the expected pair (BACKLOG #2331) |
 | `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
-| `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up` |
+| `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
 | `PUT` | `/ad-group-map` | `users:manage` | `require_step_up` |
 | `GET` | `/ad-group-scope-map` | `users:manage` | `require` |
@@ -3958,7 +3965,30 @@ revoke + "sign out everywhere else". The console renders **no Revoke button on t
 so the list cannot leave the operator mid-request; *Sign out* is the console's way to end it. That is
 a property of the **page**, not of the API — `DELETE /me/sessions/{id}` checks ownership only, so it
 accepts the caller's own current session id and revokes it. The **Users** page has a **Revoke
-sessions** action for admin force-sign-out.
+sessions** action for admin force-sign-out. It refuses the caller's own account (BACKLOG #1149). An
+operator ends their other sessions from the **Active sessions…** view instead, and the current one
+with *Sign out*, since that view cannot end it.
+
+**Changing a second factor offers to end your other sessions (ASVS 7.4.3, BACKLOG #1147).** At
+least these four console lanes change a second factor: confirming a TOTP enrolment, turning TOTP off,
+adding a passkey and removing one. On success, each offers to sign out every other session of the
+account and keep this one. The enrolment confirm shows the offer in its own response, below the
+recovery codes. The other three set a single-use mark on the session. The next account page that
+session loads shows the offer and spends the mark. So a typed `/ui/account?m=mfa_off` shows the
+notice and no offer, and so does a failed attempt or a disable of TOTP that was never on. With no
+other session live, there is no offer. The confirm and the passkey add rotate the session. The
+confirm's count excludes this session across the rotation, and the passkey add marks the new token.
+Accepting posts to `POST /ui/account/sessions/revoke-others`.
+It asks for the same `session_terminate` re-proof as any terminate, then runs. Declining means doing
+nothing, and no session ends unasked. The mark is process-local, like the re-auth continuations. A
+lost mark costs the offer, and the **Active sessions…** view still has the control. The JSON twins,
+`POST /me/mfa/confirm` and `DELETE /me/mfa`, do not carry the offer yet. A password change is
+unchanged: it ends every session, the caller's included.
+
+The offer covers factors the engine holds, on local and directory accounts alike. A password or
+factor changed in Active Directory, or at an OpenID Connect provider, never reaches the engine. The
+engine cannot offer anything at that moment, so those changes are a stated boundary of this control
+(owner ruling 2026-10-10).
 
 **Signing in again ends the session the browser held (ASVS 7.2.4).** Each console sign-in leg (the
 password form, Windows SSO and federated sign-in) answers with a cookie that replaces the browser's
