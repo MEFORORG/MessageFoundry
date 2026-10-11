@@ -7,6 +7,7 @@ to messagefoundry.service. No real service is touched."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -149,18 +150,42 @@ def test_service_install_requires_env(capsys: pytest.CaptureFixture[str]) -> Non
     assert "requires --env" in capsys.readouterr().err
 
 
-def test_service_install_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    installs: list[tuple[str, str]] = []
+def test_service_install_requires_config(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The installer has no default config directory (vault BACKLOG #2626), so the CLI asks for one
+    before it raises a UAC prompt."""
+    launched: list[object] = []
+    monkeypatch.setattr(svc, "install_service", lambda *a, **k: launched.append(a))
+    assert main(["service", "install", "--env", "dev"]) == 2
+    assert "requires --config" in capsys.readouterr().err
+    assert launched == []
+
+
+def test_service_install_dispatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``--config`` and ``--service-config`` reach the installer ABSOLUTE, because the elevated
+    child starts in the system directory (vault BACKLOG #2626)."""
+    installs: list[tuple[str, str, str, str | None]] = []
     monkeypatch.setattr(svc, "install_script_path", lambda: Path("install-service.ps1"))
 
-    def _install(script: str, env: str) -> svc.ServiceControlOutcome:
-        installs.append((script, env))
+    def _install(
+        script: str, env: str, *, config: str, service_config: str | None = None
+    ) -> svc.ServiceControlOutcome:
+        installs.append((script, env, config, service_config))
         return svc.ServiceControlOutcome.DISPATCHED
 
     monkeypatch.setattr(svc, "install_service", _install)
+    monkeypatch.chdir(tmp_path)
 
-    assert main(["service", "install", "--env", "dev"]) == 0
-    assert installs == [("install-service.ps1", "dev")]
+    install = ["service", "install", "--env", "dev", "--config", "cfg"]
+    assert main(install) == 0
+    assert main([*install, "--service-config", "messagefoundry.toml"]) == 0
+    config = os.path.abspath(tmp_path / "cfg")
+    settings = os.path.abspath(tmp_path / "messagefoundry.toml")
+    assert installs == [
+        ("install-service.ps1", "dev", config, None),
+        ("install-service.ps1", "dev", config, settings),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -178,9 +203,9 @@ def test_service_install_refused_launch_exits_1(
 ) -> None:
     """A declined UAC prompt or a failed launch of the installer exits 1 (vault BACKLOG #2787)."""
     monkeypatch.setattr(svc, "install_script_path", lambda: Path("install-service.ps1"))
-    monkeypatch.setattr(svc, "install_service", lambda script, env: outcome)
+    monkeypatch.setattr(svc, "install_service", lambda script, env, **_paths: outcome)
 
-    assert main(["service", "install", "--env", "dev"]) == 1
+    assert main(["service", "install", "--env", "dev", "--config", "cfg"]) == 1
     captured = capsys.readouterr()
     assert says in captured.err
     assert captured.out == ""
@@ -190,5 +215,5 @@ def test_service_install_missing_script(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(svc, "install_script_path", lambda: None)
-    assert main(["service", "install", "--env", "dev"]) == 2
+    assert main(["service", "install", "--env", "dev", "--config", "cfg"]) == 2
     assert "install-service.ps1" in capsys.readouterr().err

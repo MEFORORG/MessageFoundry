@@ -38,9 +38,10 @@ venv interpreter) and the per-connection firewall openings the service needs.
    skipped this way. On a host with no internet access, pass `-NssmPath` with the win64 `nssm.exe`
    from `nssm-2.24.zip`. The uninstaller runs no `nssm.exe` at all.
 3. **An elevated PowerShell** (Run as Administrator) — required to register a service.
-   `messagefoundry service install --env <name>` elevates for you (a UAC prompt) and runs the
-   install script below in a visible window so you can read its output. It passes the environment
-   only, so the script stops at its `-Config` refusal. Run the script yourself to name the config.
+   `messagefoundry service install --env <name> --config <dir>` elevates for you (a UAC prompt)
+   and runs the install script below in a visible window so you can read its output. It passes
+   `--config` as `-Config` and, when you give it, `--service-config` as `-ServiceConfig`, each made
+   absolute first. Run the script yourself for any other option.
 4. **A synchronized host clock.** The engine trusts the host's wall clock and does not set it.
    [SYSTEM-REQUIREMENTS.md, *Host clock*](SYSTEM-REQUIREMENTS.md#host-clock) states the
    requirement and how to check it with `w32tm`.

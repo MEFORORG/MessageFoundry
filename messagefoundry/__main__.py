@@ -1313,6 +1313,18 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="active environment the service runs as (required for `install`; passed to "
         "install-service.ps1 as -Environment, i.e. serve --env)",
     )
+    service.add_argument(
+        "--config",
+        default=None,
+        help="config directory the service loads (required for `install`; passed to "
+        "install-service.ps1 as an absolute -Config, i.e. serve --config)",
+    )
+    service.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings file (messagefoundry.toml) for `install`; passed to "
+        "install-service.ps1 as an absolute -ServiceConfig, i.e. serve --service-config",
+    )
 
     return parser, _DISPATCH
 
@@ -5450,6 +5462,8 @@ def _service(args: argparse.Namespace) -> int:
     A declined UAC prompt or a failed elevation exits 1 with the reason on stderr, so a wrapper
     script never reads a refused action as success (vault BACKLOG #2787). A service already in the
     requested state exits 0, so ``stop`` and ``start`` are idempotent."""
+    import os
+
     from messagefoundry import service as svc
 
     action = args.action
@@ -5464,6 +5478,15 @@ def _service(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.config is None:
+            # The installer has no default config directory (vault BACKLOG #2626), so asking here
+            # saves a UAC prompt that would only end at the installer's own refusal.
+            print(
+                "error: `service install` requires --config <dir> (the config directory the "
+                "service loads, passed to install-service.ps1 as -Config)",
+                file=sys.stderr,
+            )
+            return 2
         script = svc.install_script_path()
         if script is None:
             print(
@@ -5473,7 +5496,16 @@ def _service(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            launched = svc.install_service(str(script), args.env)
+            # Absolute here: the elevated installer starts in the system directory, so it would
+            # resolve a relative path there rather than where the operator typed it.
+            launched = svc.install_service(
+                str(script),
+                args.env,
+                config=os.path.abspath(args.config),
+                service_config=(
+                    None if args.service_config is None else os.path.abspath(args.service_config)
+                ),
+            )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
