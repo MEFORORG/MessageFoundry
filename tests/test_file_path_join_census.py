@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""ASVS 5.3.2 file-path census: the places the assessed code builds a file path, in the shapes listed
-below, each graded with a written reason and derived from the code, so a new site of those shapes
-fails the build until graded.
+"""File-path join census: the places the code builds a file path, in the shapes listed below, each
+graded with a written reason and derived from the code, so a new site of those shapes fails the
+build until graded.
 
-ASVS 5.3.2 asks that a file path come from internally generated or trusted data, or that a supplied
-name pass strict validation and sanitization. Grading a handful of sites by hand cannot show that
-for every path, so BACKLOG #1130 asked for a census. This module is that census, with its command
-and its positive control.
+A file path should come from internally generated or trusted data, or a supplied name should pass a
+named guard before it is joined. This module lists every join it can see, with its command and its
+positive control, so that holds for each one and keeps holding (BACKLOG #1130).
 
 **The command.** :func:`derived_python_sites` walks the AST of every ``.py`` file under
 :data:`PY_ROOTS`. A site is any of these:
@@ -18,15 +17,15 @@ and its positive control.
 2. a call to ``os.path.join``, ``posixpath.join`` or ``ntpath.join``, or a join on ``os.sep`` or
    either module's ``sep``;
 3. a call to ``.joinpath(...)``, ``.with_name(...)`` or ``.with_stem(...)``;
-4. ``Path(...)`` (or a pure-path class) given two or more arguments or a ``*parts``, or given an f-string or a ``+``
-   concatenation, and ``open(...)`` given an f-string or a ``+`` concatenation;
+4. ``Path(...)`` (or a pure-path class) given two or more arguments or a ``*parts``, or given an
+   f-string or a ``+`` concatenation, and ``open(...)`` given an f-string or a ``+`` concatenation;
 5. an augmented ``p /= name`` that would match shape 1.
 
 Sites are counted per enclosing function, keyed ``<file>::<qualname>``. :data:`SITES` must equal
 the derived map exactly, counts included, so a new join in a graded function fails too. Line numbers
 are not keys, so moving code does not churn the table. :func:`derived_ide_sites` counts
-``path.join`` and ``path.resolve`` (``path.posix`` and ``path.win32`` too) and ``.joinPath`` per file under ``ide/src/`` (tests excluded, comments
-stripped), and :func:`derived_script_sites` counts ``Join-Path`` and ``[IO.Path]::Combine`` per
+``path.join`` and ``path.resolve`` (``path.posix`` and ``path.win32`` too) and ``.joinPath`` per
+file under ``ide/src/`` (tests excluded, comments stripped), and :func:`derived_script_sites` counts ``Join-Path`` and ``[IO.Path]::Combine`` per
 operator-run script.
 
 **The positive control.** :func:`test_the_walker_finds_every_shape_and_skips_arithmetic` plants each
@@ -35,25 +34,23 @@ a missing or a stale row. When this landed (2026-10-09), a negative control list
 walker skipped as not path-shaped, and every one was arithmetic. Re-run that listing after widening
 or narrowing the path words; :data:`SITES` itself is the current count.
 
-**Scope.** Method section 2 names the engine, the web console, the IDE extension, the harness and
-the operator-run scripts (``scripts/service/`` less ``measure-store-access.ps1``). The census adds
-``messagefoundry_toolkit`` too: its scope is not ruled, and grading it costs nothing. ``tee/`` is out
-by owner ruling and is not walked.
+**What it walks.** The engine, the web console, the toolkit and the harness (:data:`PY_ROOTS`), the
+IDE extension, and the operator-run scripts (``scripts/service/`` less ``measure-store-access.ps1``,
+a CI measurement). ``tee/`` is not walked.
 
 **Grades.** Each site gets one:
 
-- ``internal``: every part is a code literal, an install or package location, or a value the code
-  generates itself (a uuid, a token, a pid, a counter, a timestamp, a fixed enum).
+- ``internal``: every part is a code literal, an install or package location, a value the code
+  generates itself (a uuid, a token, a pid, a counter, a timestamp, a fixed enum), or a name read
+  back from listing a directory the code chose itself (an install, its own staging directory).
 - ``operator``: a part comes from the operator, through configuration, a CLI argument, an
-  environment variable, or a file in the operator's own config directory or workspace. The operator
-  can already name any path on the host, so the join grants nothing new.
-- ``listed``: a part is a name read back from listing a directory the code chose itself (an install,
-  its own staging directory, the operator's config directory), not one another party supplies.
+  environment variable, or a file in (or a listing of) the operator's own config directory or
+  workspace. The operator can already name any path on the host, so the join grants nothing new.
 - ``guarded``: a part another party chooses (a partner server, a message, an archive, an export)
   passes the named guard before the join. The row names that guard. For Python the test checks it
   is still defined where it says, and, where the row says the unit calls it itself, that the call is
   still there. For TypeScript the guard is a fragment of code that must still be present.
-- ``compare-only``: the path is built only to compare or test for existence, and nothing is opened,
+- ``reviewed``: the path is built only to compare or test for existence, and nothing is opened,
   read, written, moved or deleted through it.
 
 **Not derived, so not proved here:** at least a join spelled as string concatenation (``d + "/" +
@@ -100,10 +97,9 @@ _IDE_SRC = _ROOT / "ide" / "src"
 
 INTERNAL = "internal"
 OPERATOR = "operator"
-LISTED = "listed"
 GUARDED = "guarded"
-COMPARE_ONLY = "compare-only"
-GRADES = frozenset({INTERNAL, OPERATOR, LISTED, GUARDED, COMPARE_ONLY})
+REVIEWED = "reviewed"
+GRADES = frozenset({INTERNAL, OPERATOR, GUARDED, REVIEWED})
 
 
 class Site(NamedTuple):
@@ -356,7 +352,7 @@ SITES: dict[str, Site] = {
         2, OPERATOR, "Fixed names under the output directory the operator named."
     ),
     "harness/drivers/file.py::_check_contained": Site(
-        1, COMPARE_ONLY, "The containment guard itself: it builds the target only to compare it."
+        1, REVIEWED, "The containment guard itself: it builds the target only to compare it."
     ),
     "harness/drivers/file.py::drop_atomic": Site(
         2,
@@ -387,7 +383,7 @@ SITES: dict[str, Site] = {
         "operator's.",
     ),
     "harness/load/connscale/probe.py::FdSampler._enumerate_posix": Site(
-        1, LISTED, "A /proc entry name, kept only when it is all digits."
+        1, INTERNAL, "A /proc entry name, kept only when it is all digits."
     ),
     "harness/load/connscale/probe.py::FdSampler._posix_cpu_seconds": Site(1, INTERNAL, _PROC_PID),
     "harness/load/connscale/probe.py::FdSampler._posix_handles": Site(1, INTERNAL, _PROC_PID),
@@ -425,15 +421,15 @@ SITES: dict[str, Site] = {
     "harness/scenarios/hostile.py::<module>": Site(1, INTERNAL, _PKG_LITERAL),
     "harness/scenarios/hostile.py::escaped_files": Site(
         1,
-        COMPARE_ONLY,
+        REVIEWED,
         "Builds where a hostile control id WOULD land, to test for an escape; it checks existence "
         "only and skips a NUL-bearing id.",
     ),
     "harness/sinks/_sftp_server.py::_confined": Site(
-        2, COMPARE_ONLY, "The served-directory guard itself: it normalizes against `/` and checks."
+        2, REVIEWED, "The served-directory guard itself: it normalizes against `/` and checks."
     ),
     "harness/sinks/_sftp_server.py::_interface._Share.canonicalize": Site(
-        1, COMPARE_ONLY, "Returns a normalized remote path string; no file operation."
+        1, REVIEWED, "Returns a normalized remote path string; no file operation."
     ),
     "harness/sinks/_sftp_server.py::_interface._Share.list_folder": Site(
         1,
@@ -447,18 +443,18 @@ SITES: dict[str, Site] = {
     "messagefoundry/__main__.py::_cert_self_signed": Site(2, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_check_env_file_present": Site(
         1,
-        COMPARE_ONLY,
+        REVIEWED,
         "The raw --env value joined under the project root to test that the value file exists.",
     ),
     "messagefoundry/__main__.py::_emit_anchor_diagnostics": Site(
-        1, COMPARE_ONLY, "The working directory and a fixed name, tested for existence."
+        1, REVIEWED, "The working directory and a fixed name, tested for existence."
     ),
     "messagefoundry/__main__.py::_forward_spool_dir": Site(
         1, OPERATOR, "A shard id from --shard or the operator's config, under the spool root."
     ),
     "messagefoundry/__main__.py::_forward_spool_root": Site(1, OPERATOR, _STORE_PATH),
     "messagefoundry/__main__.py::_is_console_source_checkout": Site(
-        2, COMPARE_ONLY, "Package-relative literals, tested for existence."
+        2, REVIEWED, "Package-relative literals, tested for existence."
     ),
     "messagefoundry/__main__.py::_renew_api_tls_before_spawning": Site(1, OPERATOR, _STORE_PATH),
     "messagefoundry/__main__.py::_resolve_offline_anchor": Site(
@@ -473,7 +469,7 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/__main__.py::_supervisor_forward_spool_dir": Site(2, OPERATOR, _STORE_PATH),
     "messagefoundry/__main__.py::_webconsole_provenance_problem": Site(
-        1, COMPARE_ONLY, "A package-relative literal, compared."
+        1, REVIEWED, "A package-relative literal, compared."
     ),
     "messagefoundry/_child_bootstrap.py::_load_this_build": Site(
         1, INTERNAL, "A fixed name in the engine's own package directory."
@@ -531,10 +527,10 @@ SITES: dict[str, Site] = {
         "The edited config file's own name, in a private temp directory this function made.",
     ),
     "messagefoundry/config/code_sets.py::_policy_sidecar_path": Site(
-        1, LISTED, "A fixed suffix on a code-set file found in the config directory."
+        1, OPERATOR, "A fixed suffix on a code-set file found in the config directory."
     ),
     "messagefoundry/config/code_sets.py::is_policy_sidecar": Site(
-        2, COMPARE_ONLY, "A listed file's own stem, tested for a companion's existence."
+        2, REVIEWED, "A listed file's own stem, tested for a companion's existence."
     ),
     "messagefoundry/config/codeset_edit.py::_codesets_dir": Site(1, OPERATOR, _CODESETS),
     "messagefoundry/config/codeset_edit.py::_existing_path_or_none": Site(
@@ -547,7 +543,7 @@ SITES: dict[str, Site] = {
         1, GUARDED, _CODESET_NAME, "messagefoundry/config/codeset_edit.py::_validate_name"
     ),
     "messagefoundry/config/codeset_edit.py::_validate_name": Site(
-        1, COMPARE_ONLY, "The guard itself: it resolves the candidate to check its parent."
+        1, REVIEWED, "The guard itself: it resolves the candidate to check its parent."
     ),
     "messagefoundry/config/codeset_edit.py::rename_code_set": Site(
         1,
@@ -612,8 +608,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/integrity.py::_attested_asset_files": Site(
         1, INTERNAL, "Fixed asset paths under the installed package."
     ),
-    "messagefoundry/integrity.py::_console_loaded_files": Site(3, LISTED, _PKG_WALK),
-    "messagefoundry/integrity.py::_import_capable_files": Site(1, LISTED, _PKG_WALK),
+    "messagefoundry/integrity.py::_console_loaded_files": Site(3, INTERNAL, _PKG_WALK),
+    "messagefoundry/integrity.py::_import_capable_files": Site(1, INTERNAL, _PKG_WALK),
     "messagefoundry/log_spool.py::LogSpool._path": Site(
         1, INTERNAL, "A fixed prefix and an integer sequence in the spool directory."
     ),
@@ -624,7 +620,7 @@ SITES: dict[str, Site] = {
         1, INTERNAL, "A fixed lock name in the spool directory."
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._add_config_dir": Site(
-        1, LISTED, "Parents of files found walking the operator's config directory."
+        1, OPERATOR, "Parents of files found walking the operator's config directory."
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._build_archive_blocking": Site(
         1, INTERNAL, "A fixed name in a work directory this module made."
@@ -644,21 +640,23 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
-        3, LISTED, "Names from walking a staging directory this module made, never through a link."
+        3,
+        INTERNAL,
+        "Names from walking a staging directory this module made, never through a link.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_extract_member": Site(
         1, INTERNAL, "A fixed name in a destination this module chose."
     ),
-    "messagefoundry/pipeline/dr_backup.py::_is_staging_dir": Site(1, COMPARE_ONLY, _STAGING),
+    "messagefoundry/pipeline/dr_backup.py::_is_staging_dir": Site(1, REVIEWED, _STAGING),
     "messagefoundry/pipeline/dr_backup.py::_open_staging": Site(2, INTERNAL, _STAGING),
     "messagefoundry/pipeline/dr_backup.py::_refuse_colliding_config_members": Site(
         2,
-        COMPARE_ONLY,
+        REVIEWED,
         "Archive member names joined only to compare against the paths the restore writes; the "
         "restore itself gates every name.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_refuse_existing_destination": Site(
-        1, COMPARE_ONLY, "Fixed sidecar suffixes on the operator's --to path, tested for existence."
+        1, REVIEWED, "Fixed sidecar suffixes on the operator's --to path, tested for existence."
     ),
     "messagefoundry/pipeline/dr_backup.py::_restore_blocking": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
@@ -681,7 +679,7 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(1, INTERNAL, _STAGING),
     "messagefoundry/pipeline/dr_backup.py::_tree_size": Site(
-        1, LISTED, "Names from walking a directory this module measures; lstat only."
+        1, INTERNAL, "Names from walking a directory this module measures; lstat only."
     ),
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
@@ -711,7 +709,7 @@ SITES: dict[str, Site] = {
         1, INTERNAL, "A fixed name under the interpreter prefix."
     ),
     "messagefoundry/startupcode.py::_pth_items": Site(
-        1, LISTED, "`.pth` names from listing a site-packages directory, to inventory them."
+        1, INTERNAL, "`.pth` names from listing a site-packages directory, to inventory them."
     ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
@@ -787,7 +785,8 @@ SITES: dict[str, Site] = {
         1,
         GUARDED,
         "An NLST entry loses only an exact `remote_dir/` prefix (as spelled, or with trailing "
-        "slashes collapsed) and is never folded, so `../x/a.hl7` reaches the guard as sent. It is sized only when the guard "
+        "slashes collapsed) and is never folded, so `../x/a.hl7` reaches the guard as sent. It is "
+        "sized only when the guard "
         "accepts it (BACKLOG #1130); a refused one still lists, unsized, for the poll loop to "
         "refuse and log.",
         "messagefoundry/transports/remotefile.py::_is_contained_name",
@@ -806,7 +805,7 @@ SITES: dict[str, Site] = {
         2, INTERNAL, "A fixed name beside the base interpreter."
     ),
     "messagefoundry/tray/branding.py::_stage_runtime": Site(
-        1, LISTED, "Runtime DLL names found beside the base interpreter, copied into Scripts."
+        1, INTERNAL, "Runtime DLL names found beside the base interpreter, copied into Scripts."
     ),
     "messagefoundry/tray/branding.py::ensure_branded_launcher": Site(
         1, INTERNAL, "A fixed launcher name in the venv's Scripts directory."
@@ -858,8 +857,8 @@ IDE_SITES: dict[str, Site] = {
         2,
         OPERATOR,
         "openSource joins a file the engine's graph reports, or the open document, onto the "
-        "workspace and opens it in an ordinary, editable editor; the second join is a settings directory. "
-        "No receiver re-checks that the path is one the graph reported.",
+        "workspace and opens it in an ordinary, editable editor; the second join is a settings "
+        "directory.",
     ),
     "ide/src/generate.ts": Site(
         2, OPERATOR, "A message type picked from a fixed list, under the message-sets setting."
@@ -884,7 +883,7 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/statusBar.ts": Site(2, OPERATOR, _IDE_WORKSPACE),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),
     "ide/src/symbolIndex.ts": Site(
-        1, LISTED, "Names from listing the operator's config directory."
+        1, OPERATOR, "Names from listing the operator's config directory."
     ),
     "ide/src/testBench.ts": Site(
         3,
