@@ -371,10 +371,13 @@ def install_service(
     PowerShell 5.1, the host the installer is written for (:func:`_system_exe`). Starting the child
     in the system directory is safe for the installer, which derives its repo root from
     ``$PSScriptRoot`` rather than from the working directory."""
-    # Validates the environment and both paths on every platform.
-    params = _install_params(script_path, environment, config=config, service_config=service_config)
+    # The environment name is vetted on every platform. The paths are vetted as Windows paths, so
+    # only where they are one: elsewhere the answer is UNSUPPORTED, not a path error.
+    if not is_safe_environment(environment):
+        raise ValueError(f"unsafe environment name {environment!r}")
     if sys.platform != "win32":
         return ServiceControlOutcome.UNSUPPORTED
+    params = _install_params(script_path, environment, config=config, service_config=service_config)
     launched = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",

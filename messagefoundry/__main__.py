@@ -4258,8 +4258,7 @@ def _serve(args: argparse.Namespace) -> int:
     # MEFOR_VALUE_* env, anchored at env_base (above). The active environment is the single selector
     # [ai].environment. Passed as a provider (re-read on each reload, not just startup) so a promote
     # picks up edited values without a service restart (review M-23) — the anchor is fixed per process.
-    import os
-
+    # _read_environment_values says what each read checks and how a failure travels.
     from messagefoundry.config.wiring import WiringError
     from messagefoundry.redaction import safe_exc
 

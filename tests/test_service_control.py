@@ -351,6 +351,12 @@ def test_install_service_off_windows_is_unsupported_but_still_validates(
     )
     with pytest.raises(ValueError, match="unsafe environment name"):
         install_service("script.ps1", "bad;env", config=_CFG)
+    # A POSIX path is not a Windows path, but off Windows the answer is UNSUPPORTED, not a path
+    # error the operator could not act on.
+    assert (
+        install_service("script.ps1", "dev", config="/srv/mefor/cfg")
+        is service_control.ServiceControlOutcome.UNSUPPORTED
+    )
 
 
 @pytest.mark.parametrize(
@@ -419,9 +425,32 @@ def test_cli_install_unsafe_config_exits_2(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """``service install --config '<unsafe>'`` surfaces the path ValueError as exit 2, before any
-    elevation (vault BACKLOG #2626)."""
+    elevation (vault BACKLOG #2626). This pins the plumbing only: off Windows the made-absolute path
+    is a POSIX one, which fails for that reason too. ``test_install_params_rejects_unsafe_paths``
+    pins each rule on its own."""
+    elevated: list[object] = []
+
+    class _Windll:
+        class shell32:  # noqa: N801
+            @staticmethod
+            def ShellExecuteW(*a: object) -> int:  # noqa: N802
+                elevated.append(a)
+                return 42
+
     monkeypatch.setattr(service_control, "install_script_path", lambda: Path("install-service.ps1"))
-    monkeypatch.setattr(service_control.sys, "platform", "linux")
+    monkeypatch.setattr(service_control.sys, "platform", "win32")
+    monkeypatch.setattr(service_control.ctypes, "windll", _Windll, raising=False)
     rc = main(["service", "install", "--env", "dev", "--config", "a|b"])
     assert rc == 2
     assert "unsafe config path" in capsys.readouterr().err
+    assert elevated == []
+
+
+def test_cli_install_off_windows_says_windows_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Off Windows a well-formed install reports Windows-only, not a path error."""
+    monkeypatch.setattr(service_control, "install_script_path", lambda: Path("install-service.ps1"))
+    monkeypatch.setattr(service_control.sys, "platform", "linux")
+    assert main(["service", "install", "--env", "dev", "--config", "cfg"]) == 1
+    assert "Windows-only" in capsys.readouterr().err

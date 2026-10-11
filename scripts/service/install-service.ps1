@@ -1277,13 +1277,25 @@ function Get-DefaultServiceConfig {
     <#
       The settings file a service registered without -ServiceConfig is given: messagefoundry.toml
       under $Anchor when it exists, else "". $Anchor is -ProjectRoot, or the working directory when
-      there is none, so this names the same file `serve` would have read from its working directory,
-      and registers it by absolute path (vault BACKLOG #2626).
+      there is none. For a passed -AppExe with no -ProjectRoot, that is the file `serve` would have
+      read from its working directory. For the default install it sits beside the value folder,
+      above -Config, the layout docs/INSTALL-GUIDE.md shows. `serve` would not find that file on
+      its own, so the installer names it by absolute path (vault BACKLOG #2626).
     #>
     param([Parameter(Mandatory)][string]$Anchor)
     $candidate = Join-Path $Anchor "messagefoundry.toml"
     if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
     return ""
+}
+
+function Format-QuotedPath {
+    <#
+      $Path in double quotes for the service's command line. A drive root such as D:\ ends in a
+      backslash, which the command-line parser would read as escaping the closing quote. Trailing
+      backslashes are doubled, and the parser reads each pair as one (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    return '"' + ($Path -replace '\\+$', '$0$0') + '"'
 }
 
 # --- absolute paths, before anything consumes one (BACKLOG #1554) -----------------------------------
@@ -1306,8 +1318,9 @@ function Resolve-AbsolutePath {
 }
 
 $DataDir = Resolve-AbsolutePath $DataDir
+# With -PythonExe alone there is no launcher to name, and nothing below reads one.
 if ($UsesDefaultInstall) { $AppExe = Join-Path $DefaultInstallRoot "Scripts\messagefoundry.exe" }
-else { $AppExe = Resolve-AbsolutePath $AppExe }
+elseif ($AppExe) { $AppExe = Resolve-AbsolutePath $AppExe }
 # The interpreter the service runs (vault BACKLOG #2701). Named here, with the other paths, so it
 # is absolute before anything consumes it. Empty when none is found; refused below.
 if ($PythonExe) { $PythonExe = Resolve-AbsolutePath $PythonExe }
@@ -1352,8 +1365,14 @@ if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path $AppEx
 #
 # Get-NssmHomeProblem answers that question for any file, not only nssm.exe: who other than
 # administrators could replace it, through the file or any folder above it.
+#
+# The launcher only names the install. The interpreter is what the service runs and the engine
+# package is what it imports, so each is checked as well when it is there.
 if ($UsesDefaultInstall) {
-    $installProblem = Get-NssmHomeProblem -File $AppExe
+    $installFiles = @($AppExe, $PythonExe,
+        (Join-Path $DefaultInstallRoot "Lib\site-packages\messagefoundry\__init__.py"))
+    $installProblem = @($installFiles | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+        ForEach-Object { Get-NssmHomeProblem -File $_ } | Where-Object { $_ }) -join "; "
     if ($installProblem) {
         throw ("The default install root '$DefaultInstallRoot' is not administrator-only: " +
             "$installProblem. Set its access list and owner as docs/SERVICE.md 'Install the " +
@@ -1390,7 +1409,7 @@ $AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config `"$Conf
 # Absolute, so the file the service reads does not depend on its working directory (vault BACKLOG
 # #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
 if ($ServiceConfig) { $AppParams += " --service-config `"$ServiceConfig`"" }
-if ($ProjectRoot) { $AppParams += " --project-root `"$ProjectRoot`"" }
+if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
 
 # --- install -----------------------------------------------------------------
 
@@ -1759,11 +1778,17 @@ if ($LockConfigDir) {
     $ValueFolder = Join-Path $ValuesAnchor "environments"
     $LockPaths = @($Config)
     if (Test-Path -LiteralPath $ValueFolder -PathType Container) { $LockPaths += $ValueFolder }
+    # The settings file's folder too, for the same refusal. In the default layout that is the folder
+    # above -Config, so locking it re-owns everything it holds.
+    if ($ServiceConfig) {
+        $SettingsFolder = Split-Path -Parent $ServiceConfig
+        if ($LockPaths -notcontains $SettingsFolder) { $LockPaths += $SettingsFolder }
+    }
     foreach ($LockPath in $LockPaths) {
         Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount
     }
-    if ($LockPaths.Count -gt 1) {
-        Write-Host "  Values : '$ValueFolder' locked the same way (vault BACKLOG #2626)."
+    foreach ($LockPath in ($LockPaths | Select-Object -Skip 1)) {
+        Write-Host "  Locked : '$LockPath' the same way (vault BACKLOG #2626)."
     }
     $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
                    else { "SYSTEM/Administrators (F)" }

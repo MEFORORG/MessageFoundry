@@ -7670,7 +7670,7 @@ def _evaluate_config_dacl(
     reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
     process token could not be read) **skips** the owner comparison here, because there is nothing to
     compare an owner against. This function does not refuse on it; the caller does.
-    :func:`_enforce_windows_config_source` refuses an unreadable token before any path is evaluated
+    :func:`_enforce_windows_paths` refuses an unreadable token before any path is evaluated
     (BACKLOG #1654), so the skip is reached only when an honoured
     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has downgraded that refusal, and the ACE pass still runs
     for that load.
@@ -7714,7 +7714,7 @@ class _WinPathSecurity:
     """What the Win32 read of one candidate path returned, before any policy is applied.
 
     :func:`_win32_config_source_probes` fills this in with ctypes, and
-    :func:`_enforce_windows_config_source` decides on it. The split lets every error arm of the Windows
+    :func:`_enforce_windows_paths` decides on it. The split lets every error arm of the Windows
     check run on the Linux CI leg: a test hands the enforcer a fake reader at this boundary instead of
     replacing the check itself (BACKLOG #1654). The enforcer reads the fields in order, and the first
     one that failed is the one its refusal names."""
@@ -7744,23 +7744,6 @@ class _WinConfigSourceProbes:
     owner_in_admins: Callable[[str], bool | None]
 
 
-def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProbes) -> None:
-    """Refuse the config source unless every path in :func:`config_source_trust_paths` reads clean
-    and passes the policy.
-
-    The candidate set matches POSIX: the directory, every ``*.py`` with ``_*.py`` helpers included,
-    and the cache, connections and code-set files that list names. A NULL DACL is a refusal, and so
-    is anything :func:`_evaluate_config_dacl` rejects. :func:`_enforce_windows_paths` makes the
-    per-path decisions."""
-    _enforce_windows_paths(
-        config_source_trust_paths(directory),
-        probes,
-        lead=_CONFIG_SOURCE_LEAD,
-        refuse=_refuse_unsafe_config_source,
-        first_is_required=True,
-    )
-
-
 def _enforce_windows_paths(
     paths: Sequence[Path],
     probes: _WinConfigSourceProbes,
@@ -7772,7 +7755,9 @@ def _enforce_windows_paths(
     """Hand ``refuse`` a reason for each path in ``paths`` that does not read clean and pass the
     policy. Each message starts with ``lead``.
 
-    With ``first_is_required``, a not-found read of the first path refuses outright: that is the
+    For a config load ``paths`` is :func:`config_source_trust_paths`: the directory, every ``*.py``
+    with ``_*.py`` helpers included, and the cache, connections and code-set files, the same set the
+    POSIX arm reads. With ``first_is_required``, a not-found read of the first path refuses outright: that is the
     config directory itself. Any other path that is gone by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
@@ -7873,7 +7858,7 @@ def _assert_safe_config_source_windows(
 
 
 def _win32_config_source_probes() -> _WinConfigSourceProbes:
-    """Build the ctypes/advapi32 readers for :func:`_enforce_windows_config_source`.
+    """Build the ctypes/advapi32 readers for :func:`_enforce_windows_paths`.
 
     Nothing here decides. Each reader reports what it could and could not read, and the enforcer
     turns a failed read into a refusal."""

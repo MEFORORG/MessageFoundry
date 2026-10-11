@@ -69,13 +69,41 @@ def test_only_the_default_install_root_is_checked_for_broad_write() -> None:
     """The check on a passed -AppExe waits on an owner ruling, so the one call sits under the
     default-install condition and refuses there."""
     text = _text()
-    calls = [m.start() for m in re.finditer(r"Get-NssmHomeProblem -File \$AppExe", text)]
-    assert len(calls) == 1, calls
-    guard = text.rindex("if ($UsesDefaultInstall) {", 0, calls[0])
-    assert text[guard : calls[0]].count("}") == 0, (
-        "the call is not inside the default-install block"
+    listed = [m.start() for m in re.finditer(r"\$installFiles = @\(\$AppExe, \$PythonExe,", text)]
+    assert len(listed) == 1, listed
+    guard = text.rindex("if ($UsesDefaultInstall) {", 0, listed[0])
+    assert text[guard : listed[0]].count("}") == 0, (
+        "the list is not inside the default-install block"
     )
-    assert "throw" in text[calls[0] : calls[0] + 500]
+    # The launcher, the interpreter the service runs and the package it imports.
+    assert "Lib\\site-packages\\messagefoundry\\__init__.py" in text[listed[0] : listed[0] + 200]
+    assert "Get-NssmHomeProblem -File $_" in text[listed[0] : listed[0] + 500]
+    assert "throw" in text[listed[0] : listed[0] + 700]
+
+
+def test_python_exe_alone_needs_no_launcher() -> None:
+    """With -PythonExe and no -AppExe there is no launcher to normalise, and an empty one would
+    fail Resolve-AbsolutePath's mandatory parameter."""
+    assert "elseif ($AppExe) { $AppExe = Resolve-AbsolutePath $AppExe }" in _text()
+
+
+def test_a_drive_root_project_root_keeps_its_closing_quote(tmp_path: Path) -> None:
+    """``D:\\`` quoted as is would end in ``\\"``, which the command-line parser reads as a quote."""
+    assert _SCRIPT is not None
+    assert (
+        'if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }'
+        in (_text())
+    )
+    body = (
+        "  [pscustomobject]@{\n"
+        "    root = (Format-QuotedPath 'D:\\')\n"
+        "    folder = (Format-QuotedPath 'D:\\hl7')\n"
+        "  } | ConvertTo-Json -Compress\n"
+    )
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Format-QuotedPath"], body), tmp_path).strip().splitlines()[-1]
+    )
+    assert got == {"root": '"D:\\\\"', "folder": '"D:\\hl7"'}
 
 
 def test_the_settings_file_and_project_root_are_registered_by_absolute_path() -> None:
@@ -85,7 +113,7 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
         'if ($ServiceConfig) { $AppParams += " --service-config `"$ServiceConfig`"" }'
     )
     project_root = text.index(
-        'if ($ProjectRoot) { $AppParams += " --project-root `"$ProjectRoot`"" }'
+        'if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }'
     )
     assert params < service_config < project_root
     # Both are normalised with the other paths (tests/test_service_install_manifest.py holds when).
@@ -93,13 +121,17 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
     assert "$ProjectRoot = Resolve-AbsolutePath $ProjectRoot" in text
 
 
-def test_lock_config_dir_locks_the_value_folder_too() -> None:
+def test_lock_config_dir_locks_the_value_and_settings_folders_too() -> None:
+    """``serve`` refuses a value file or settings file whose folder another account can write, so
+    ``-LockConfigDir`` locks both folders with the config directory."""
     text = _text()
     block = text.index("if ($LockConfigDir) {")
     folder = text.index('$ValueFolder = Join-Path $ValuesAnchor "environments"')
     added = text.index("$LockPaths += $ValueFolder")
+    settings = text.index("$SettingsFolder = Split-Path -Parent $ServiceConfig")
+    settings_added = text.index("$LockPaths += $SettingsFolder")
     lock = text.index("Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount")
-    assert block < folder < added < lock
+    assert block < folder < added < settings < settings_added < lock
 
 
 def test_the_default_settings_file_is_the_one_serve_would_read(tmp_path: Path) -> None:
