@@ -10,8 +10,9 @@ admin and erase the dual-admin separation-of-duties safeguard. These tests pin t
 
 * disabling/deleting a NON-last admin still succeeds, and a non-admin is always disable-able/deletable
   (the guard only fires on the sole enabled admin); and
-* the roles path (which permits self-target, unlike disable/delete) still refuses to strip the last
-  admin — the invariant the disable/delete paths now share.
+* the role write still refuses to strip the last admin -- the invariant the disable/delete paths
+  now share. Since BACKLOG #1149 the roles route refuses a self-target too, so that refusal is
+  pinned on ``AuthService.set_roles``.
 
 **Where the guard lives now (vault BACKLOG #2779).** The routes no longer call
 ``is_last_enabled_admin``; the guard is the store write ``remove_unless_last_admin``, reached through
@@ -29,7 +30,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, LastAdministratorRefused
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_admin
@@ -142,10 +143,13 @@ async def test_non_admin_can_always_be_disabled_and_deleted(engine: Engine) -> N
         assert (await c.delete(f"/users/{viewer}", headers=h)).status_code == 200
 
 
-async def test_roles_path_still_refuses_to_strip_last_admin(engine: Engine) -> None:
-    # The roles endpoint permits self-target, so it is the path on which the last-admin guard is
-    # directly observable end-to-end: stripping admin from the sole enabled admin is refused (400),
-    # and once a second admin exists the demotion succeeds.
+async def test_roles_path_refuses_self_and_the_service_still_refuses_the_last_admin(
+    engine: Engine,
+) -> None:
+    # BACKLOG #1149: the roles route refuses a self-target now, as disable and delete do, so the
+    # sole admin demoting themselves is refused by the self-guard, before and after a second admin
+    # exists. The last-admin guard behind it is pinned on the service it lives in: stripping admin
+    # from the sole enabled admin is refused, and once a second admin exists it succeeds.
     # Last-admin guard is a step-up admin-CRUD flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the disable/delete/roles ops first.
     service = AuthService(
@@ -153,13 +157,18 @@ async def test_roles_path_still_refuses_to_strip_last_admin(engine: Engine) -> N
     )
     async with _client(engine, service) as c:
         h, my_id = await _admin_session(c, service)
-        assert (
-            await c.put(f"/users/{my_id}/roles", headers=h, json={"roles": ["viewer"]})
-        ).status_code == 400
+        r = await c.put(f"/users/{my_id}/roles", headers=h, json={"roles": ["viewer"]})
+        assert (r.status_code, r.json()["detail"]) == (
+            400,
+            "another administrator must change your own roles",
+        )
+        with pytest.raises(LastAdministratorRefused):
+            await service.set_roles(my_id, ["viewer"], actor="root")
         await _create_user(c, h, "root2", "administrator")
-        assert (
-            await c.put(f"/users/{my_id}/roles", headers=h, json={"roles": ["viewer"]})
-        ).status_code == 200
+        r = await c.put(f"/users/{my_id}/roles", headers=h, json={"roles": ["viewer"]})
+        assert r.status_code == 400, "a second admin does not make a self-demotion acceptable"
+        await service.set_roles(my_id, ["viewer"], actor="root2")
+        assert await engine.store.get_user_role_ids(my_id) == ["viewer"]
 
 
 async def test_disable_and_delete_routes_carry_last_admin_guard(engine: Engine) -> None:
