@@ -416,7 +416,9 @@ class ApprovalGate:
         gate enforces. A request already pending keeps the deadline stamped when it was made."""
         return self._settings.model_copy(deep=True)
 
-    def _gated(self, operation: str) -> bool:
+    def gates(self, operation: str) -> bool:
+        """Whether :meth:`guard` would hold ``operation`` now. A route reads it to capture params
+        that cost a read, such as a reload's config digest, only for a request that will be held."""
         return self._settings.enabled and operation in self._settings.operations
 
     async def guard(
@@ -460,7 +462,7 @@ class ApprovalGate:
 
         Every approver sees ``params`` in the queue; :class:`~messagefoundry.api.models.PendingApprovalInfo`
         states what they may carry (BACKLOG #2458)."""
-        if not self._gated(operation):
+        if not self.gates(operation):
             return None
         # Enforce the write half of the invariant here, matching `create_upload`'s guard on
         # `uploader_id`: a row persisted without an owner id is unapprovable, and refusing it at the
@@ -564,7 +566,7 @@ class ApprovalGate:
         expired between them is still named in the 202. Nothing new runs or is held because of it.
         The read also covers only the newest :data:`REJOIN_SCAN_LIMIT` open requests; past that, the
         repeat needs a proof, and :meth:`guard` then joins it."""
-        if not self._gated(operation) or not requester_user_id:
+        if not self.gates(operation) or not requester_user_id:
             return None
         wanted = json.dumps(dict(params), sort_keys=True)
         rows = await self._store.list_pending_approvals(now=self._clock(), limit=REJOIN_SCAN_LIMIT)
@@ -637,7 +639,7 @@ class ApprovalGate:
             "decided_at": (None if r["decided_at"] is None else float(r["decided_at"])),
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
-            "gated": self._gated(operation),
+            "gated": self.gates(operation),
         }
 
     async def approve(
@@ -709,7 +711,7 @@ class ApprovalGate:
             op is None
         ):  # registered op was removed between request and approval — refuse, stay pending
             raise ApprovalError(409, f"operation '{operation}' is no longer available")
-        if not self._gated(operation):
+        if not self.gates(operation):
             # Dual control was turned off for this operation after the request was held. Releasing
             # it now would run a held request under a control the deployment no longer applies,
             # and the request's own configured shape (who must approve, how old) says nothing

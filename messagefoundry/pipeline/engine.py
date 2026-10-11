@@ -115,7 +115,14 @@ from messagefoundry.store.store import (
 from messagefoundry.store.transit_attestation import enforce_transit_bound_attestation
 from messagefoundry.transports.base import IntakeGate
 
-__all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
+__all__ = [
+    "Engine",
+    "ApprovedConfig",
+    "ConfigDigestMismatch",
+    "ConfigReloadDenied",
+    "ReloadOutcome",
+    "ReloadStepFailure",
+]
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +146,41 @@ class ConfigReloadDenied(Exception):
     The API maps this to 403. Because the loader executes Python from the target directory, a
     reload may only load from the server's startup ``--config`` dir or an explicitly configured
     ``config_reload_roots`` entry — never an arbitrary client-supplied path."""
+
+
+class ConfigDigestMismatch(Exception):
+    """A released reload's config is not the config its approval named (vault BACKLOG #2596).
+
+    :meth:`Engine.reload_detail` raises it before anything is swapped. ``approved`` is the digest
+    the hold captured, or ``None`` when it captured none; ``current`` is the digest of the directory
+    now, or ``None`` when it could not be read. Both are content digests, never file content."""
+
+    def __init__(self, approved: str | None, current: str | None) -> None:
+        super().__init__("the config on disk is not the config this reload's approval named")
+        self.approved = approved
+        self.current = current
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedConfig:
+    """The config a dual-control approval released, which :meth:`Engine.reload_detail` binds a
+    reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the hold captured at
+    request time, or ``None`` when it captured none; a reload bound to ``None`` refuses every
+    config."""
+
+    fingerprint: str | None
+
+
+def _require_approved(detail: Mapping[str, object] | None, approval: ApprovedConfig) -> None:
+    """Raise :class:`ConfigDigestMismatch` unless ``detail`` is the digest ``approval`` names. A
+    digest that could not be taken (``None``) never matches."""
+    from messagefoundry.config.fingerprint import fingerprint_matches
+
+    current = detail.get("fingerprint") if detail is not None else None
+    if approval.fingerprint is None or not fingerprint_matches(current, approval.fingerprint):
+        raise ConfigDigestMismatch(
+            approval.fingerprint, current if isinstance(current, str) else None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2361,6 +2403,34 @@ class Engine:
             log.warning("config fingerprint failed for %s: %s", path, reason)
             return None, reason
 
+    async def reload_target_digest(self, config_dir: str | Path | None) -> str | None:
+        """The content digest of the directory a reload of ``config_dir`` would load, or ``None``.
+
+        A held reload's approval carries it, and the release passes it back to
+        :meth:`reload_detail` in an :class:`ApprovedConfig` (vault BACKLOG #2596). The target is
+        found by :meth:`_existing_reload_target`, as a reload finds it, so a path outside the reload
+        roots is never read. ``None`` means no digest could be taken: the target is refused, missing
+        or unreadable. A release of such a hold still meets the refusal the reload itself raises
+        first, and otherwise is refused as a digest mismatch."""
+        try:
+            path = await self._existing_reload_target(config_dir)
+        except (ConfigReloadDenied, WiringError, OSError):
+            return None
+        detail, _reason = await self.fingerprint_bundle(path)
+        digest = detail.get("fingerprint") if detail is not None else None
+        return digest if isinstance(digest, str) else None
+
+    async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
+        """The directory a reload of ``config_dir`` loads: resolved and confined by
+        :meth:`_resolve_reload_target`, and refused with ``FileNotFoundError`` when it is not a
+        directory. Off the event loop: the resolve opens the target and each parent, and a slow
+        volume would otherwise stall every listener for as long as that takes (vault BACKLOG
+        #2581)."""
+        path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
+        if not await asyncio.to_thread(path.is_dir):
+            raise FileNotFoundError(f"config directory not found: {config_dir}")
+        return path
+
     async def capture_start_provenance(self) -> str | None:
         """Take the provenance baseline for the graph a start loaded from :attr:`config_dir`.
 
@@ -2420,6 +2490,7 @@ class Engine:
         *,
         dry_run: bool = False,
         propagate: bool = False,
+        approval: ApprovedConfig | None = None,
     ) -> ReloadOutcome:
         """Load the code-first graph from ``config_dir`` and apply it to the running engine.
 
@@ -2459,9 +2530,18 @@ class Engine:
         single-node (``is_clustered()`` False) never bumps. The initiator advances its OWN applied
         version right after bumping, so its convergence loop sees no change and does not re-reload.
 
+        ``approval`` binds the reload to the digest a dual-control approval named (vault BACKLOG
+        #2596, step 3; :meth:`reload_target_digest` took it at request time). The bundle's digest is
+        checked against it twice: before ``load_config`` runs any config module, and again with the
+        digest taken just before the swap, the one the audit row records. Either miss raises
+        :class:`ConfigDigestMismatch` with nothing swapped. ``None`` binds nothing: an ungated
+        reload, a convergence reload and a dry run pass none. The digest covers what
+        :mod:`messagefoundry.config.fingerprint` hashes and no more.
+
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``FileNotFoundError``
-        (missing dir) or ``WiringError`` (invalid / empty config / unresolved env value / an
-        environment value file this reload could not read) — the caller maps these to HTTP errors.
+        (missing dir), ``ConfigDigestMismatch`` (not the approved bytes) or ``WiringError`` (invalid /
+        empty config / unresolved env value / an environment value file this reload could not read)
+        — the caller maps these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
         live graph is the one that was already running.
         """
@@ -2470,11 +2550,11 @@ class Engine:
             # First, so every reload route refuses a bad settings anchor at the point the reload
             # route used to, before anything is read or swapped (BACKLOG #2034).
             await self.preflight_settings()
-        # Off the event loop: the resolve opens the target and each parent, and a slow volume would
-        # otherwise stall every listener for as long as that takes (vault BACKLOG #2581).
-        path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
-        if not await asyncio.to_thread(path.is_dir):
-            raise FileNotFoundError(f"config directory not found: {config_dir}")
+        path = await self._existing_reload_target(config_dir)
+        if approval is not None:
+            # Before load_config, which runs every config module's top-level code: bytes nobody
+            # approved are refused before any of them executes (vault BACKLOG #2596).
+            _require_approved((await self.fingerprint_bundle(path))[0], approval)
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
         # to add a missing value would never clear (review M-23).
@@ -2615,7 +2695,11 @@ class Engine:
         # otherwise-applicable config. Recorded as a step failure so the caller is not told the
         # reload was clean when GET /config/provenance will report nothing.
         fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
-        if fingerprint_failure is not None:
+        if approval is not None:
+            # Again, on the digest the audit row records, so a released reload's row names the
+            # approved digest. An edit that lands and is reverted inside the load is not seen.
+            _require_approved(fingerprint, approval)
+        elif fingerprint_failure is not None:
             failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
         if runner is None:
             runner = self.add_registry(registry)
