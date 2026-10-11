@@ -421,6 +421,35 @@ in-flight rows stranded.
 > enforced through their markers and not at the door. After an operator start the calendar owns
 > such an inbound again, as Decision 3 says, and a door refusal would take that from it.
 
+> **Amendment (vault BACKLOG #3094): what can still stop an activation after the hook, and for how
+> long.** The activation reads no config dir before its re-apply, as the #3067 amendment says, so
+> an empty dir or one that does not answer cannot stop it. After the takeover hook, at least the
+> trust-anchor preflights and the reload's build check can still refuse it.
+> `tests/test_dr_running_config_dir.py` pins each rule below.
+>
+> - **The preflights are bounded** by `[dr].takeover_timeout_seconds`. They run under the
+>   coordinator's lock, so an anchor on a share that stopped answering used to hold every later
+>   activate and release too. One that does not answer in time is an abort like any refusal.
+> - **The re-apply is not bounded.** Cancelling it partway rolls back a takeover the VIP has
+>   already moved for, and a lane's first build is isolated to that lane, as the #3263 amendment
+>   says. So a `validate_startup` probe there still has no bound of its own.
+> - **The preflights do not move before the hook.** Running them there as well would write their
+>   audit rows twice. Running them only there would let an anchor changed during the hook load
+>   unchecked. The deeper fix splits the reload into a prepare step before the hook and an apply
+>   step after it. It is not built.
+> - **A step 4 abort names its seed marker and whether the hook ran.** The marker stays, as audit
+>   rows do, and a retry writes its own, so each attempt's fork point is recorded. The abort row's
+>   `seed_segment` ties the first marker to it. When the hook ran, its reason says the VIP may be
+>   on this box. The engine does not run the release hook to undo the takeover, since that could
+>   hand the address to a primary that is down; the runbook leaves it to the operator. An
+>   interrupted activation's row names its marker too, once one is written.
+> - **An error no abort path catches is an audited abort** of kind `state`, as long as the profile
+>   is not yet applied. A `dr_seed` marker the store refuses is one. Such an error used to escape
+>   with no abort row, and the route answered a bare `500`.
+> - **`engine.stop()` still neither waits for nor cancels an activation.** The managed lifespan
+>   drains the long operations first. That cancels a running activation, whose own arm records it
+>   (vault BACKLOG #2751). Only an embedder that drives the coordinator itself meets the gap.
+
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
 **Locked (owner posture, 2026-06-28): the DR store is COLD-seeded from #60's encrypted backups on activation —
