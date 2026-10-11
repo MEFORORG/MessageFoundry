@@ -92,12 +92,20 @@
       replaces the statusLine verdict above it.
 
       Its own age and TTL. Each entry records when the Steward read it (`ts`) and how long the
-      Steward itself would serve it (`ttl`). Past that TTL the fallback is UNKNOWN, never projected
-      from; the statusLine's $MaxAgeMinutes does not apply to it.
+      Steward itself would serve it (`ttl`). The fallback serves an entry only while watch.py's
+      _is_fresh would: not future-dated, younger than its TTL, and with its stored projection not run
+      out. Otherwise it is UNKNOWN, never projected from. The statusLine's $MaxAgeMinutes does not
+      apply to it. A desktop-sourced entry's data is older than its read time by `sample_age`, so the
+      printed data age adds it.
 
-      The same subject as the statusLine. The Steward keys a pool by the login record's
-      `oauthAccount.organizationUuid`, or `acct:<accountUuid>` without one (watch.py, main()). This
-      config root's login record names the key, and an entry naming another account is refused.
+      The pool the Steward would name for this session, chosen the way watch.py main() chooses it.
+      A claude-desktop session is named first by the desktop app's own record for this session id
+      (claude-code-sessions/<accountUuid>/<orgUuid>/local_*.json). Without a record, a session with a
+      pinned CLAUDE_CONFIG_DIR is named by that root's login record, after watch.py's self-check. An
+      SDK session is named by the login record. watch.py's last resort for an unpinned Desktop session
+      is the app's CURRENT account, a global signal that moves when the owner switches login, so the
+      fallback refuses there rather than guess. The key is `organizationUuid`, or `acct:<accountUuid>`
+      without one, and an entry that does not show the same org and account is refused.
 
       No grade. The Steward's `state` field is a severity label, not a stop order (korus
       roles/STEWARD.md 3b), and usage.ps1's thresholds were set for statusLine readings. The
@@ -126,7 +134,10 @@ param(
     # path resolves the way the Steward's own watch.py resolves it; set by tests to a fixture.
     [string]$StewardStatusFile,
     # The login record that names this config root's pool. Unset in production; set by tests.
-    [string]$LoginRecord
+    [string]$LoginRecord,
+    # The desktop app's session records. Unset in production (%APPDATA%\Claude\claude-code-sessions);
+    # set by tests.
+    [string]$DesktopSessionsDir
 )
 
 # No `Stop`: this hook informs, and a throw here would be a tool call broken by a decoration.
@@ -225,23 +236,26 @@ function Test-NoStatusLineClient {
 # delegation 2026-10-08, not an owner ruling). The header says why each refusal below exists. Returns
 # the lines to print, or nothing when the fallback does not apply.
 #
-# UNDER -StateDir IT RUNS ONLY WHEN BOTH FILES ARE NAMED. A caller that named a state directory is a
-# test or a by-hand probe, and falling through to the real ~/.claude files there would read a live
-# account's numbers into a fixture run.
+# UNDER -StateDir IT RUNS ONLY WHEN ALL THREE INPUTS ARE NAMED. A caller that named a state directory
+# is a test or a by-hand probe, and falling through to the real ~/.claude or %APPDATA% files there
+# would read a live account's numbers into a fixture run.
 function Get-StewardFallback {
     if (-not (Test-NoStatusLineClient)) { return @() }
-    if ($StateDir -and -not ($StewardStatusFile -and $LoginRecord)) { return @() }
+    if ($StateDir -and -not ($StewardStatusFile -and $LoginRecord -and $DesktopSessionsDir)) { return @() }
 
-    # WHERE THE STEWARD WRITES, resolved the way watch.py resolves it: MEFOR_USAGE_DIR, else the config
-    # root's mefor-usage, else the copy beside watch.py when that directory holds no tooling. The
-    # settings files invoke watch.py by absolute path under ~/.claude/mefor-usage (STEWARD.md 3c).
+    # WHERE THE STEWARD WRITES, resolved the way watch.py resolves DIR: MEFOR_USAGE_DIR, else the config
+    # root's mefor-usage; and when that directory holds no usage-now.py, the directory beside watch.py,
+    # but only if THAT one holds it. The settings files invoke watch.py by absolute path under
+    # ~/.claude/mefor-usage (korus roles/STEWARD.md 3c), so that is "beside watch.py" here.
     $cfg = $env:CLAUDE_CONFIG_DIR
     $statusPath = $StewardStatusFile
     if (-not $statusPath) {
         $dir = $env:MEFOR_USAGE_DIR
         if (-not $dir) { $dir = Join-Path $(if ($cfg) { $cfg } else { Join-Path $HOME ".claude" }) "mefor-usage" }
-        if (-not (Test-Path -LiteralPath (Join-Path $dir "usage-now.py"))) {
-            $dir = Join-Path (Join-Path $HOME ".claude") "mefor-usage"
+        $beside = Join-Path (Join-Path $HOME ".claude") "mefor-usage"
+        if (-not (Test-Path -LiteralPath (Join-Path $dir "usage-now.py")) -and
+            (Test-Path -LiteralPath (Join-Path $beside "usage-now.py"))) {
+            $dir = $beside
         }
         $statusPath = Join-Path $dir "status.json"
     }
@@ -250,6 +264,8 @@ function Get-StewardFallback {
     if (-not $loginPath) {
         $loginPath = if ($cfg) { Join-Path $cfg ".claude.json" } else { Join-Path $HOME ".claude.json" }
     }
+    $sessionsDir = $DesktopSessionsDir
+    if (-not $sessionsDir -and $env:APPDATA) { $sessionsDir = Join-Path (Join-Path ([string]$env:APPDATA) "Claude") "claude-code-sessions" }
 
     $lines = @("  fallback source: the Steward's status.json at " + (Get-Folded $statusPath) +
         ". This is NOT a statusLine reading. It carries its own age and the Steward's own TTL.")
@@ -264,35 +280,25 @@ function Get-StewardFallback {
         return Unknown ("its schema version is '" + (Get-Folded $doc.version 20) + "', and this hook reads only version 3")
     }
 
-    $login = Read-JsonDictionary $loginPath
-    if (-not $login) {
-        return Unknown ("no readable login record at " + (Get-Folded $loginPath) + ", so no pool can be named")
-    }
-    $org = Get-Folded $login.oauthAccount.organizationUuid 80
-    $acct = Get-Folded $login.oauthAccount.accountUuid 80
-    if (-not $org -and -not $acct) { return Unknown "the login record names no account, so no pool can be named" }
-    # watch.py's _cli_pool_selfcheck: a login record that disagrees with itself cannot name a pool.
-    $billed = Get-Folded $login.cachedUsageUtilization.accountUuid 80
-    if ($acct -and $billed -and $acct -ne $billed) {
-        return Unknown ("the login record disagrees with itself (oauthAccount names account " +
-            (Get-Prefix $acct 8) + ", cachedUsageUtilization names " + (Get-Prefix $billed 8) +
-            "), so it cannot name this pool")
-    }
+    $who = Resolve-StewardPool $loginPath $sessionsDir
+    if ($who.why) { return Unknown $who.why }
+    $org = $who.org
+    $acct = $who.acct
     $key = if ($org) { $org } else { "acct:$acct" }
     $pool = Get-Prefix $key 13
 
     $entry = $null
     if ($doc.pools -is [System.Collections.IDictionary]) { $entry = $doc.pools[$key] }
     if ($entry -isnot [System.Collections.IDictionary]) {
-        return Unknown "the Steward has no entry for pool $pool, the login this config root records"
+        return Unknown "the Steward has no entry for pool $pool, named by $($who.how)"
     }
-    # The key matched; the entry must agree. An entry naming another account is refused, not read.
-    $entryOrg = Get-Folded $entry.org 80
-    $entryAcct = Get-Folded $entry.account 80
-    if (($org -and $entryOrg -and $entryOrg -ne $org) -or ($acct -and $entryAcct -and $entryAcct -ne $acct)) {
-        return Unknown "the entry under pool $pool names another account, so it was read and refused"
+    # The key matched; the entry must SHOW it agrees. Fail closed: an entry that names another account,
+    # or names none, is refused rather than read as this session's headroom.
+    if (($org -and (Get-Folded $entry.org 80) -ne $org) -or ($acct -and (Get-Folded $entry.account 80) -ne $acct)) {
+        return Unknown "the entry under pool $pool does not name this session's account, so it was read and refused"
     }
 
+    # watch.py's _is_fresh, rule for rule, so this serves exactly what the Steward itself would serve.
     $ts = Get-Finite $entry.ts
     $ttl = Get-Finite $entry.ttl
     if ($null -eq $ts) { return Unknown "the entry for pool $pool carries no read time" }
@@ -300,26 +306,90 @@ function Get-StewardFallback {
         return Unknown "the entry for pool $pool carries no TTL, so its freshness cannot be judged"
     }
     $ageSec = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 - $ts
-    # The same allowance as usage.ps1's `$age -lt -2` (minutes) in its window check, so the two sources
-    # refuse a future date at the same point. Nothing ties the two literals; change both together.
-    if ($ageSec -lt -120) { return Unknown "the entry for pool $pool is dated in the FUTURE -- clock skew or a bad timestamp" }
-    $ageSec = [math]::Max(0.0, $ageSec)
+    if ($ageSec -lt 0) { return Unknown "the entry for pool $pool is dated in the FUTURE -- a bad timestamp" }
     $ageMin = "{0:0.0}" -f ($ageSec / 60)
     $ttlMin = "{0:0.#}" -f ($ttl / 60)
-    if ($ageSec -gt $ttl) {
+    if ($ageSec -ge $ttl) {
         return Unknown ("the entry for pool $pool is $ageMin min old, past the Steward's own TTL of " +
             "$ttlMin min, so it is not projected from")
     }
+    $burn = @($entry.burn)
+    if ($null -ne $entry.burn -and $burn.Count -eq 3) {
+        $left = Get-Finite $burn[1]
+        if ($null -eq $left -or $left - $ageSec / 60 -le 0) {
+            return Unknown "the Steward's own projection for pool $pool has run out, so the stored numbers are past"
+        }
+    }
     if ((Get-Folded $entry.kind 20) -ne "reading") { return Unknown "the Steward's own entry for pool $pool is not a reading" }
 
-    $lines += "  fallback verdict: READ, not graded here -- pool $pool, the login this config root records"
+    # A desktop-sourced entry carries a sample that was already sample_age seconds old when the Steward
+    # read it (watch.py _read_pool), so the data is older than the read.
+    $dataAge = $ageMin
+    if ((Get-Folded $entry.source 20) -eq "desktop") {
+        $sample = Get-Finite $entry.sample_age
+        $dataAge = if ($null -eq $sample -or $sample -lt 0) { "UNKNOWN" } else { "{0:0.0}" -f (($ageSec + $sample) / 60) }
+    }
+
+    $lines += "  fallback verdict: READ, not graded here -- pool $pool, named by $($who.how)"
     foreach ($w in ([ordered]@{ "5-hour" = "5h"; "weekly" = "7d" }).GetEnumerator()) {
         $v = Get-Finite $entry.levels.($w.Key)
         $label = "  steward {0,-3}" -f $w.Value
         if ($null -eq $v) { $lines += "$label UNKNOWN -- the Steward's entry carries no $($w.Key) reading"; continue }
-        $lines += "$label {0,5:0.0}% used   [read {1} min ago by the Steward; its TTL is {2} min]" -f $v, $ageMin, $ttlMin
+        $lines += ("$label {0,5:0.0}% used   [data {1} min old; read {2} min ago by the Steward; its TTL is {3} min]" -f
+            $v, $dataAge, $ageMin, $ttlMin)
     }
     return $lines
+}
+
+# WHICH POOL THE STEWARD WOULD NAME FOR THIS SESSION, in watch.py main()'s order. Returns @{org; acct;
+# how}, or @{why} when no pool can be named. The header says why each branch is what it is.
+function Resolve-StewardPool([string]$LoginPath, [string]$SessionsDir) {
+    if ((Get-Entrypoint) -eq "claude-desktop") {
+        $rec = Find-DesktopSessionRecord $SessionsDir
+        if ($rec) { return $rec }
+        if (-not $env:CLAUDE_CONFIG_DIR) {
+            return @{ why = ("the desktop app has no record of this session and no config root is pinned, " +
+                    "so only the app's current account is left, which is a global signal and not this session's") }
+        }
+    }
+    $login = Read-JsonDictionary $LoginPath
+    if (-not $login) { return @{ why = "no readable login record at " + (Get-Folded $LoginPath) + ", so no pool can be named" } }
+    $org = Get-Folded $login.oauthAccount.organizationUuid 80
+    $acct = Get-Folded $login.oauthAccount.accountUuid 80
+    if (-not $org -and -not $acct) { return @{ why = "the login record names no account, so no pool can be named" } }
+    # watch.py's _cli_pool_selfcheck: a login record that disagrees with itself cannot name a pool.
+    $billed = Get-Folded $login.cachedUsageUtilization.accountUuid 80
+    if ($acct -and $billed -and $acct -ne $billed) {
+        return @{ why = ("the login record disagrees with itself (oauthAccount names account " +
+                (Get-Prefix $acct 8) + ", cachedUsageUtilization names " + (Get-Prefix $billed 8) +
+                "), so it cannot name this pool") }
+    }
+    return @{ org = $org; acct = $acct; how = "this config root's login record" }
+}
+
+# watch.py _desktop_pool: the record whose cliSessionId is this session's id, newest first, at most 400
+# records. Its two parent directories ARE the identity. The raw text is searched before any parse, so
+# a scan that finds nothing parses nothing.
+function Find-DesktopSessionRecord([string]$Dir) {
+    $sid = if ($SessionId) { $SessionId } else { [string]$env:CLAUDE_SESSION_ID }
+    if (-not $sid -or -not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $null }
+    $files = @(Get-ChildItem -LiteralPath $Dir -Directory | Get-ChildItem -Directory |
+        Get-ChildItem -Filter "local_*.json" -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 400)
+    foreach ($f in $files) {
+        $raw = $null
+        try { $raw = [System.IO.File]::ReadAllText($f.FullName) } catch { continue }
+        if (-not $raw -or -not $raw.Contains($sid)) { continue }
+        $rec = $null
+        try { $rec = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { continue }
+        if ($rec -is [System.Collections.IDictionary] -and [string]$rec.cliSessionId -ceq $sid) {
+            return @{
+                org  = Get-Folded $f.Directory.Name 80
+                acct = Get-Folded $f.Directory.Parent.Name 80
+                how  = "the desktop app's record for this session"
+            }
+        }
+    }
+    return $null
 }
 
 # -AsHashtable IS REQUIRED, NOT STYLE. A real .claude.json carries project keys that differ only by
@@ -336,7 +406,11 @@ function Get-Prefix([string]$Text, [int]$Length) { $Text.Substring(0, [math]::Mi
 
 # A number out of a file, or $null when it is absent, not numeric, NaN or infinite. Python's json.dump
 # writes NaN and Infinity, so the Steward's file can carry either.
+#
+# ONLY A JSON NUMBER COUNTS. `$null -as [double]` and `"" -as [double]` are both 0 in PowerShell, so a
+# missing key would otherwise read as a confident zero.
 function Get-Finite($Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) { return $null }
     $d = $Value -as [double]
     if ($null -eq $d -or -not [double]::IsFinite($d)) { return $null }
     return $d
@@ -378,10 +452,13 @@ $raw = ""
 try { if ([Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() } } catch { $raw = "" }
 
 $toolName = $null
+# The session id names the desktop app's record for this session; the Steward fallback reads it.
+$SessionId = $null
 if ($raw) {
     try {
         $p = $raw | ConvertFrom-Json -ErrorAction Stop
         if ($p.PSObject.Properties.Name -contains "tool_name") { $toolName = [string]$p.tool_name }
+        if ($p.PSObject.Properties.Name -contains "session_id") { $SessionId = [string]$p.session_id }
     }
     catch { }
 }
