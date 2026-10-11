@@ -43,6 +43,7 @@ from messagefoundry.config.settings import (
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
+    StoreBackend,
     StoreSettings,
     _classify_proxy_entries,
     load_settings,
@@ -108,6 +109,7 @@ def _pairs(
         audit_chain_unkeyed=None,
         remote_debug=None,
         startup=None,
+        service_env=None,
     )
 
 
@@ -164,6 +166,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "aad_bind" in named
@@ -200,6 +203,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -233,6 +237,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -327,6 +332,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "admin_new_ip_step_up" in named
@@ -487,6 +493,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     ).get(switch)
 
@@ -1487,6 +1494,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     risk = named["plaintext_upstream_hop_acknowledged"]
@@ -2239,6 +2247,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "cleartext_accepted" in named
@@ -2287,6 +2296,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "tls_allow_expired" in named
@@ -2326,6 +2336,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "generic_odbc_tls_unenforced" in named
@@ -2362,6 +2373,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     )
     assert "tls_revocation_attested" in named
@@ -2734,6 +2746,8 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "encrypt",  # the keyless-PHI serve gate refuses it in its own right
         "trust_server_certificate",  # gated by weakened_tls_escape_permitted (the ADR 0092 clamp)
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
+        # secure_delete left this set when vault BACKLOG #2619 began naming it; the loop below now
+        # pins that it is reported, and its own tests pin the file-backed condition.
     }
     exempt_auth = {
         # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three
@@ -2812,6 +2826,36 @@ def _unreported_bools(model: type[Any], exempt: Collection[str], section: str) -
         and isinstance(info.default, bool)
         and field not in _names(**{section: model(**{field: not info.default})})
     ]
+
+
+@pytest.mark.parametrize(
+    ("store", "named"),
+    [
+        (StoreSettings(secure_delete=False), True),
+        (StoreSettings(secure_delete=False, path=":memory:"), False),
+        (
+            StoreSettings(
+                backend=StoreBackend.SQLSERVER,
+                server="s",
+                database="d",
+                username="u",
+                secure_delete=False,
+            ),
+            False,
+        ),
+        (StoreSettings(), False),
+    ],
+)
+def test_secure_delete_off_is_named_on_a_file_backed_sqlite_store(
+    store: StoreSettings, named: bool
+) -> None:
+    """Vault BACKLOG #2619: off, a purge leaves the old bytes in the SQLite file. An in-memory store
+    has no file to keep them in, and a server backend ignores the switch, so neither is named, and
+    the shipped value is not either. The first case is the control that the entry exists."""
+    pairs = dict(_pairs(store=store))
+    assert ("secure_delete" in pairs) is named
+    if named:
+        assert "NOT overwritten in the SQLite file" in pairs["secure_delete"]
 
 
 @pytest.mark.parametrize(

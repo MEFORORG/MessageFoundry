@@ -930,6 +930,7 @@ names = [name for name, _ in security_loosenings(
     backup=BackupSettings(),
     store_privilege=None, audit_chain_unkeyed=None, remote_debug=remote_debug_posture(),
     startup=startup,
+    service_env=None,
 )]
 print(json.dumps({"names": names, "isolated": startup.launch.isolated,
                   "safe_path": startup.launch.safe_path, "path": sys.path}))

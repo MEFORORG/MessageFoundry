@@ -292,6 +292,7 @@ def _loosening_names(audit_chain_unkeyed: bool | None) -> set[str]:
             audit_chain_unkeyed=audit_chain_unkeyed,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     }
 

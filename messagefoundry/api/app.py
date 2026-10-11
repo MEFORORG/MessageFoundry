@@ -418,6 +418,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
 from messagefoundry.service_status import query_service_state
+from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
@@ -465,7 +466,6 @@ from messagefoundry.uploads import (
     UploadTooLargeError,
     UploadUnreadableError,
     browse_messages,
-    sanitize_filename,
     split_uploaded,
 )
 
@@ -1237,13 +1237,14 @@ def _posture_loosenings(
     *,
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
+    service_env: ServiceEnvPosture,
 ) -> tuple[list[tuple[str, str]], str | None]:
     """The active ``security_loosenings()`` entries and the scope note, read off ``state``, plus
     the ``allow_no_auth`` open mode, which is an app opt-in rather than a setting.
 
     ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
-    call this, so the row records the list the route would report. ``runner`` and the two process
-    readings (vault BACKLOG #2700 / #2701) are passed in rather than read here, so a caller that
+    call this, so the row records the list the route would report. ``runner`` and the three process
+    readings (vault BACKLOG #2700 / #2701 / #2595) are passed in rather than read here, so a caller that
     also reports them elsewhere reads each once."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
@@ -1341,6 +1342,7 @@ def _posture_loosenings(
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
             remote_debug=remote_debug,
             startup=startup,
+            service_env=service_env,
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
@@ -1995,6 +1997,7 @@ async def _record_start_audit(
             engine.registry_runner,
             remote_debug=remote_debug_posture(),
             startup=await asyncio.to_thread(startup_posture),
+            service_env=await asyncio.to_thread(service_env_posture),
         )
         switches = [name for name, _risk in pairs]
     except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
@@ -3354,8 +3357,16 @@ def create_app(
         # reading reads files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
+        # Vault BACKLOG #2595: the service-environment reading `serve` took as it started, kept
+        # for the life of the process. Off the event loop for the same reason as the one above.
+        service_env = await asyncio.to_thread(service_env_posture)
         pairs, loosenings_scope = _posture_loosenings(
-            request.app.state, engine, runner, remote_debug=remote_debug, startup=startup
+            request.app.state,
+            engine,
+            runner,
+            remote_debug=remote_debug,
+            startup=startup,
+            service_env=service_env,
         )
         loosenings = [SecurityLoosening(switch=name, risk=risk) for name, risk in pairs]
         interpreter_view = InterpreterView.from_readings(startup, remote_debug)
@@ -6804,9 +6815,15 @@ def create_app(
         (EXIF/XMP/docProps) can ever be stored.
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
-        to you and to authorized operators holding ``files:access_any`` (administrators), and recorded in
-        the audit log; submitting an upload is your consent. The file itself is **owner-only** (ASVS
-        8.2.2): only you and an override holder can list, browse, resend or delete it."""
+        to you and to authorized operators holding ``files:access_any`` (administrators). Your username
+        is recorded in the audit log and the filename is not; submitting an upload is your consent. The
+        file itself is **owner-only** (ASVS 8.2.2): only you and an override holder can list, browse,
+        resend or delete it.
+
+        **No audit row carries the file name (vault BACKLOG #2619).** ``audit_log.detail`` is plaintext
+        and kept, and an operator-chosen name that holds a medical record number would put a patient
+        identifier there. A stored file is named by its random ``file_id``, whose sealed sidecar holds
+        the name while the file exists. A refused file has no id, so its row carries the reason only."""
         us = _require_upload_store(request)
         body = await request.body()
         try:
@@ -6827,9 +6844,7 @@ def create_app(
             await engine.store.record_audit(
                 "upload.reject",
                 actor=identity.username,
-                detail=json.dumps(
-                    {"filename": sanitize_filename(part.filename), "reason": nontext}
-                ),
+                detail=json.dumps({"reason": nontext}),
                 client=client_ip(request),
             )
             raise HTTPException(415, nontext) from None
@@ -6846,14 +6861,12 @@ def create_app(
             raise HTTPException(413, str(exc)) from None
         except UploadContentError as exc:
             # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
-            # metadata-only audit (the sanitized filename + the reason string — NEVER any content). Covers
+            # metadata-only audit: the reason without the file name (#2619), NEVER any content. Covers
             # both POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
             await engine.store.record_audit(
                 "upload.reject",
                 actor=identity.username,
-                detail=json.dumps(
-                    {"filename": sanitize_filename(part.filename), "reason": str(exc)}
-                ),
+                detail=json.dumps({"reason": exc.reason}),
                 client=client_ip(request),
             )
             raise HTTPException(400, str(exc)) from None
@@ -6864,9 +6877,7 @@ def create_app(
             await engine.store.record_audit(
                 "upload.reject_quota",
                 actor=identity.username,
-                detail=json.dumps(
-                    {"filename": sanitize_filename(part.filename), "reason": str(exc)}
-                ),
+                detail=json.dumps({"reason": str(exc)}),
                 client=client_ip(request),
             )
             raise HTTPException(409, str(exc)) from None
@@ -6876,7 +6887,6 @@ def create_app(
             detail=json.dumps(
                 {
                     "file_id": meta.file_id,
-                    "filename": meta.filename,
                     "size": meta.size,
                     "message_count": meta.message_count,
                 }
@@ -7264,9 +7274,7 @@ def create_app(
         await engine.store.record_audit(
             "upload.delete",
             actor=identity.username,
-            detail=json.dumps(
-                {"file_id": meta.file_id, "filename": meta.filename, "size": meta.size}
-            ),
+            detail=json.dumps({"file_id": meta.file_id, "size": meta.size}),
             client=client_ip(request),
         )
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
