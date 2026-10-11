@@ -1554,14 +1554,18 @@ def _places_reading_as_an_anon_import(root: Path) -> tuple[list[str], int]:
     """Each ``path:line`` the pattern matches in the source walk under ``root``, and the number of
     files that walk read.
 
-    The texts come from `_absence_corpus`, which blanks comments and strings under `scripts/`. It
-    returns no paths, so the paths come from a second `_python_sources` call over the same tree,
-    paired by position.
+    The texts come from `_absence_corpus`, which blanks comments and strings in the `.py` files
+    under `scripts/`. It returns no paths, so the paths come from a second `_absence_sources` call
+    over the same tree, paired by position. Only the `.py` files count, in the matches and in the
+    number read: the pattern is a Python import, and `_MIN_ANON_SEARCH_FILES` was set from a census
+    of Python files, so the corpus's TypeScript, JavaScript and PowerShell must not pad it.
     """
-    sources = scorecard._python_sources(root)
-    _raw, pattern_texts, _viewed = scorecard._absence_corpus(root)
+    sources = scorecard._absence_sources(root)
+    _raw, all_texts, _viewed = scorecard._absence_corpus(root)
+    paired = [(p, t) for p, t in zip(sources, all_texts, strict=True) if p.suffix == ".py"]
+    pattern_texts = [t for _p, t in paired]
     places: list[str] = []
-    for path, text in zip(sources, pattern_texts, strict=True):
+    for path, text in paired:
         rel = path.relative_to(root).as_posix()
         # The whole text at once. `splitlines` would cut at a form feed, which the pattern's
         # `[^\n]*` can cross.
