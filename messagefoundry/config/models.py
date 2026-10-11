@@ -172,14 +172,21 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     ``CONTINUE`` (default): error-and-continue — dead-letter the offending row (replayable) and move
     on, so a code bug can't wedge the whole lane. ``STOP``: halt the connection's delivery worker and
     raise a ``connection_stopped`` alert, leaving the message queued for replay — for operators who
-    would rather a lane freeze (and page someone) than auto-dead-letter on an unexpected error. A
-    row already at a finite ``max_attempts`` is dead-lettered instead, which bounds a stop and
-    re-arm loop on a row that always crashes, and a WARNING names the row and its message (vault
-    BACKLOG #3211). The router and transform stages take that cap from the ``[delivery]`` defaults.
-    An outbound row lands in the dead-letter queue. A router or transform row does not, because
-    that view and its bulk replay cover outbound rows only: its message shows as ERROR, and the
-    per-message replay re-queues it (``POST /messages/{id}/replay``, or Replay on the message in the
-    web console). No CLI command replays a message.
+    would rather a lane freeze (and page someone) than auto-dead-letter on an unexpected error.
+
+    **At the cap (vault BACKLOG #3211).** Below a finite ``max_attempts`` a stop re-pends the row.
+    A row already at the cap is dead-lettered instead, which bounds a stop and re-arm loop on a row
+    that always crashes, and a WARNING names every message whose row was dead-lettered. The router
+    and transform stages take that cap from the ``[delivery]`` defaults. This is the one statement
+    of how to recover such a row; the log line, the runner and the docs point here.
+
+    - An outbound row is in the dead-letter queue, and its bulk replay re-queues it.
+    - A router (ingress) or transform (routed) row is not: that view and its bulk replay cover
+      outbound rows only.
+    - Either way, replaying the message re-queues its dead rows (``store.replay``), while their
+      bodies are kept (retention erases them later, and an erased row is never re-queued). Routes
+      to it include at least ``POST /messages/{id}/replay``, the web console's Replay on the
+      message, and ``EngineClient.replay()`` in ``messagefoundry.apiclient``.
     Partner rejections (``NegativeAckError``) and transport failures are unaffected — this governs
     only the engine-internal-error case.
     """

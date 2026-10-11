@@ -536,48 +536,57 @@ _REFUSAL_LOG_MAX_LINES_PER_WINDOW = 100
 _REFUSAL_LOG_MAX_PAIRS = 4096
 
 
-def _note_stop_dead_letter(
-    worker: str,
-    name: str,
-    failed: FailOutcome,
-    message_id: str | None,
-    *,
-    outbound: bool,
-    batch: bool = False,
-) -> None:
-    """Say so when an internal-error STOP arm's ``mark_failed`` dead-lettered its row at a finite
-    cap rather than re-pending it (vault BACKLOG #3211). The STOP's own line says the lane stopped,
-    and the policy reads as keeping the row queued, so without this line the log and the store
-    disagree. The cap is kept on purpose: it bounds a STOP and re-arm loop on a row that always
-    crashes. Ids and counts only, never the error text.
+# Most message ids one STOP dead-letter line names; past this it names the first ones and a count.
+_STOP_LINE_MAX_MESSAGES = 10
 
-    The line names the message, because that is what an operator replays. An ``outbound`` row is
-    in the dead-letter queue. An ingress or routed row (the router and transform STOP arms) is not:
-    that view and its bulk replay cover outbound rows only. Its message shows as ERROR, and the
-    per-message replay re-queues the dead row (``POST /messages/{id}/replay``, or Replay on the
-    message in the web console)."""
-    if not failed.dead:
+
+def _note_stop_dead_letter(
+    worker: str, name: str, failed: FailOutcome, rows: Sequence[OutboxItem]
+) -> None:
+    """Say so when an internal-error STOP arm's ``mark_failed`` or ``mark_batch_failed``
+    dead-lettered at a finite cap rather than re-pending (vault BACKLOG #3211). ``rows`` are the
+    rows the arm handed the store. The STOP's own line says the lane stopped, so without this line
+    the log and the store disagree. The cap is kept on purpose: it bounds a STOP and re-arm loop on
+    a row that always crashes. Ids and counts only, never the error text.
+
+    The line names every message to replay. How a dead row is found and replayed, by stage, is
+    stated once, in :class:`~messagefoundry.config.models.InternalErrorPolicy`."""
+    if not failed.dead or not rows:
         return
-    subject_args: tuple[object, ...]
-    if batch:
-        subject = "a batch of %d (head row %s, its message %s)"
-        subject_args = (failed.dead, failed.head_id, message_id)
-    else:
-        subject, subject_args = "row %s (message %s)", (failed.head_id, message_id)
-    recovery = (
-        "replay it from the dead-letter queue, or replay the message"
-        if outbound
-        else "it is not in the dead-letter queue, which lists outbound rows only; the message "
-        "shows as ERROR, and replaying the message re-queues the row"
-    )
+    outbound = rows[0].stage == Stage.OUTBOUND.value
+    if len(rows) == 1:
+        recovery = (
+            "replay it from the dead-letter queue, or replay message %s"
+            if outbound
+            else "it is not in the dead-letter queue, which lists outbound rows only; "
+            "replaying message %s re-queues it"
+        )
+        log.warning(
+            "%s %r: row %s (message %s) reached the retry cap after %d attempt(s), so the stop "
+            "dead-lettered it rather than keeping it queued; " + recovery,
+            worker,
+            name,
+            failed.head_id,
+            rows[0].message_id,
+            failed.attempts,
+            rows[0].message_id,
+        )
+        return
+    messages = list(dict.fromkeys(r.message_id for r in rows))
+    named = ", ".join(messages[:_STOP_LINE_MAX_MESSAGES])
+    if len(messages) > _STOP_LINE_MAX_MESSAGES:
+        named += f" and {len(messages) - _STOP_LINE_MAX_MESSAGES} more"
     log.warning(
-        "%s %r: " + subject + " reached the retry cap after %d attempt(s), so the stop "
-        "dead-lettered it rather than keeping it queued; %s",
+        "%s %r: the head row %s of a batch of %d reached the retry cap after %d attempt(s) of its "
+        "own, so the stop dead-lettered the batch rather than keeping it queued; its rows belong to "
+        "%d message(s): %s; replay them from the dead-letter queue, or replay each message",
         worker,
         name,
-        *subject_args,
+        failed.head_id,
+        len(rows),
         failed.attempts,
-        recovery,
+        len(messages),
+        named,
     )
 
 
@@ -8212,9 +8221,7 @@ class RegistryRunner:
                     f"internal error (connection stopped): {safe_exc(exc)}",
                     retry,
                 )
-                _note_stop_dead_letter(
-                    "delivery worker", name, failed, item.message_id, outbound=True
-                )
+                _note_stop_dead_letter("delivery worker", name, failed, [item])
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering {item.id}"
                 )
@@ -8519,11 +8526,9 @@ class RegistryRunner:
                 failed = await self.store.mark_batch_failed(
                     ids, f"internal error (connection stopped): {safe_exc(exc)}", retry
                 )
-                head_message = next(
-                    (it.message_id for it in items if it.id == failed.head_id), None
-                )
+                handed = set(ids)
                 _note_stop_dead_letter(
-                    "delivery worker", name, failed, head_message, outbound=True, batch=True
+                    "delivery worker", name, failed, [it for it in items if it.id in handed]
                 )
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
@@ -8749,7 +8754,7 @@ class RegistryRunner:
                 f"router error (ingest stopped): {safe_exc(exc)}",
                 self._delivery_defaults,
             )
-            _note_stop_dead_letter("router worker", name, failed, item.message_id, outbound=False)
+            _note_stop_dead_letter("router worker", name, failed, [item])
             self._alert_sink.connection_stopped(
                 name, detail=f"router {type(exc).__name__} on {item.id}"
             )
@@ -8785,9 +8790,7 @@ class RegistryRunner:
                 f"handler error (transform stopped): {safe_exc(exc)}",
                 self._delivery_defaults,
             )
-            _note_stop_dead_letter(
-                "transform worker", name, failed, item.message_id, outbound=False
-            )
+            _note_stop_dead_letter("transform worker", name, failed, [item])
             self._alert_sink.connection_stopped(
                 name, detail=f"handler {type(exc).__name__} on {item.id}"
             )

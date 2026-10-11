@@ -442,17 +442,24 @@ async def test_an_outbound_that_never_started_logs_its_dead_letter(
 
 
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
-async def test_a_stop_that_dead_letters_at_the_cap_says_so(
+async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
     store: MessageStore, caplog: pytest.LogCaptureFixture, batch: bool
 ) -> None:
     # Item 5: the STOP arm's mark_failed dead-letters at a finite cap, which bounds a STOP and
-    # re-arm loop, while the STOP reads as keeping the row queued. A line now says which happened.
+    # re-arm loop. A line says so and names what to replay; InternalErrorPolicy states how. The
+    # batch is drawn from two messages, so the line has to name both.
     caplog.set_level(logging.WARNING, logger=LOGGER)
     for cap, status in ((2, OutboxStatus.PENDING), (1, OutboxStatus.DEAD)):
         caplog.clear()
         runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=cap, **FAST))
         runner._internal_error[OUT] = InternalErrorPolicy.STOP
-        await _enqueue(store, 1)
+        mids = [
+            await store.enqueue_message(
+                channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
+            )
+            for n in ((1, 2) if batch else (1,))
+        ]
+        dead_before = await store.count_dead(allowed_channels=None)
         item = await _claim(store)
         if batch:
             cfg = BatchConfig(max_count=2, max_wait_ms=1)
@@ -461,16 +468,37 @@ async def test_a_stop_that_dead_letters_at_the_cap_says_so(
         else:
             outcome, _ = await runner._process_delivery_item(OUT, item)
         assert outcome is wiring_runner._ItemOutcome.STOPPED
-        assert await _status(store, item.id) == status.value
+        rows = [r for m in mids for r in await store.outbox_for(m)]
+        assert [r["status"] for r in rows] == [status.value] * len(mids)
         said = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
-        assert len(said) == (1 if status is OutboxStatus.DEAD else 0)
-        if said:
-            assert item.id in said[0].getMessage()
-        await store.dead_letter_now(item.id, "clear the lane for the next case")
+        if status is OutboxStatus.PENDING:
+            assert said == []  # below the cap the stop re-pends and says nothing more
+            for r in rows:
+                await store.dead_letter_now(str(r["id"]), "clear the lane for the next case")
+            continue
+        (line,) = said
+        text = line.getMessage()
+        if batch:
+            assert f"the head row {item.id} of a batch of 2" in text
+            assert "after 1 attempt(s) of its own" in text
+            assert f"2 message(s): {mids[0]}, {mids[1]};" in text
+            assert "replay them from the dead-letter queue, or replay each message" in text
+        else:
+            assert f"row {item.id} (message {mids[0]})" in text
+            assert f"replay it from the dead-letter queue, or replay message {mids[0]}" in text
+        # Both recoveries the line names hold for an outbound row: the dead-letter queue lists it,
+        # and replaying each named message re-queues its row.
+        assert await store.count_dead(allowed_channels=None) == dead_before + len(mids)
+        for m in mids:
+            assert await store.replay(m) == 1
+        assert [r["status"] for m in mids for r in await store.outbox_for(m)] == [
+            OutboxStatus.PENDING.value
+        ] * len(mids)
 
 
-async def _ingest_row(store: MessageStore, stage: str) -> tuple[str, OutboxItem]:
-    """A real claimed ingress row, or a real claimed routed row, as each STOP arm meets it."""
+async def _ingest_row(store: MessageStore, stage: str, handlers: int) -> tuple[str, OutboxItem]:
+    """A real claimed ingress row, or a real claimed routed row, as each STOP arm meets it. With two
+    handlers the message has a sibling routed row that stays PENDING."""
     mid = await store.enqueue_ingress(channel_id="c1", raw=_adt(1), now=100.0)
     row = await store.claim_next_fifo("c1", now=1e12, stage=Stage.INGRESS.value)
     assert row is not None and row.stage == Stage.INGRESS.value
@@ -479,7 +507,7 @@ async def _ingest_row(store: MessageStore, stage: str) -> tuple[str, OutboxItem]
             ingress_id=row.id,
             message_id=mid,
             channel_id="c1",
-            handlers=[("h", _adt(1))],
+            handlers=[(f"h{n}", _adt(1)) for n in range(handlers)],
             disposition=MessageStatus.ROUTED,
             now=101.0,
         )
@@ -488,22 +516,38 @@ async def _ingest_row(store: MessageStore, stage: str) -> tuple[str, OutboxItem]
     return mid, row
 
 
-@pytest.mark.parametrize("stage", ["router", "transform"])
+@pytest.mark.parametrize(
+    ("stage", "handlers", "cap"),
+    [
+        ("router", 1, 1),
+        ("transform", 1, 1),
+        ("transform", 2, 1),
+        ("router", 1, 2),
+        ("transform", 2, 2),
+    ],
+    ids=[
+        "router",
+        "transform",
+        "transform-two-handlers",
+        "router-below-cap",
+        "transform-below-cap",
+    ],
+)
 async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
-    store: MessageStore, caplog: pytest.LogCaptureFixture, stage: str
+    store: MessageStore, caplog: pytest.LogCaptureFixture, stage: str, handlers: int, cap: int
 ) -> None:
     # Item 5, the router and transform STOP arms, which take the cap from the delivery defaults.
-    # Their dead row is an ingress or routed row, which the outbound-only dead-letter queue never
-    # lists, so the line names the message and the per-message replay, which does re-queue it.
+    # Their dead row is an ingress or routed row, which the dead-letter queue never lists; the line
+    # says so and names the message to replay. InternalErrorPolicy states the recovery once.
     caplog.set_level(logging.WARNING, logger=LOGGER)
     runner = RegistryRunner(
         Registry(),
         store,
         egress=EgressSettings(deny_by_default=False),
-        delivery_defaults=RetryPolicy(max_attempts=1, **FAST),
+        delivery_defaults=RetryPolicy(max_attempts=cap, **FAST),
         internal_error_default=InternalErrorPolicy.STOP,
     )
-    mid, item = await _ingest_row(store, stage)
+    mid, item = await _ingest_row(store, stage, handlers)
     apply = (
         runner._apply_router_internal_error
         if stage == "router"
@@ -511,18 +555,22 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
     )
     outcome, _ = await apply("c1", item, RuntimeError("bug"))
     assert outcome is wiring_runner._ItemOutcome.STOPPED
+    said = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
+    if cap == 2:
+        assert await _status(store, item.id) == OutboxStatus.PENDING.value
+        assert said == []
+        return
     assert await _status(store, item.id) == OutboxStatus.DEAD.value
-    (said,) = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
-    text = said.getMessage()
+    (line,) = said
+    text = line.getMessage()
     assert f"{stage} worker 'c1': row {item.id} (message {mid})" in text
-    assert "replay it from the dead-letter queue" not in text
-    assert "not in the dead-letter queue" in text and "replaying the message" in text
-    # What the line tells the operator holds: the view does not list it, the message reads ERROR,
-    # and the per-message replay re-queues the dead row.
+    assert "it is not in the dead-letter queue, which lists outbound rows only" in text
+    assert f"replaying message {mid} re-queues it" in text
+    assert "ERROR" not in text and "replay it from the dead-letter queue" not in text
+    # Both claims hold in every shape, the two-handler one included: the view does not list the
+    # row, and replaying the message re-queues it (with any sibling still PENDING).
     assert await store.count_dead(allowed_channels=None) == 0
-    (msg,) = await store.list_messages(channel_id="c1", allowed_channels=None)
-    assert msg["id"] == mid and msg["status"] == MessageStatus.ERROR.value
-    assert await store.replay(mid) == 1
+    assert await store.replay(mid) == handlers
     assert await _status(store, item.id) == OutboxStatus.PENDING.value
 
 
