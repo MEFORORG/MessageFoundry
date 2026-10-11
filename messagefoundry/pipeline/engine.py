@@ -778,6 +778,7 @@ class Engine:
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
                 profile_provenance=self._dr_config_drift,
+                after_release=self._dr_release_cleanup,
                 config_fingerprint_provider=self._dr_config_fingerprint,
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
@@ -834,6 +835,9 @@ class Engine:
         and an activation is not where it changes."""
         was_active = self._dr_active
         rr = self._registry_runner
+        # What an operator had bound before this call, which a failed activation does not unbind.
+        # It does not bind again one the attempt's own reload had parked.
+        listening = rr.listening_inbounds() if rr is not None else frozenset()
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
         # graph is what the operator last applied, through whatever approval that reload needed, so
         # an activation must not swap in bytes edited since then with no second person, nor the
@@ -863,6 +867,30 @@ class Engine:
             # rolls its intake back to the previous graph (RegistryRunner.reload), so the latch has
             # to follow it there too.
             self._set_dr_active(was_active)
+            standby = self._dr_standby_threshold()
+            if rr is not None and standby is not None:
+                # The box is passive again, so it must answer on nothing (vault BACKLOG #3263).
+                # At least two paths left a listener bound here. A reload that committed and was then
+                # cancelled had bound the critical set. And an operator reload already running
+                # when the latch flipped bound that set under the new threshold, before this
+                # call's own reload was refused. The park takes the reload lock, so it also
+                # waits out such a reload that is still binding. The outbound sessions the
+                # attempt opened are closed too, as after a release. A second cancellation
+                # stops this, which is the caller insisting, as in the runner's reload rollback.
+                try:
+                    await rr.park_intake(standby, keep=listening)
+                except Exception:
+                    log.exception(
+                        "DR activation failed, and unbinding the listeners it had bound failed "
+                        "too; POST /config/reload unbinds them"
+                    )
+                try:
+                    await rr.close_passive_connectors()
+                except Exception:
+                    log.exception(
+                        "DR activation failed, and closing the outbound sessions it had opened "
+                        "failed too; POST /config/reload closes them"
+                    )
             raise
 
     async def _dr_config_drift(self) -> dict[str, object]:
@@ -974,9 +1002,23 @@ class Engine:
             # the threshold stay parked, and the next reload binds the auto-start ones at or above it.
             rr.restore_dr_intake(before)
             raise
+        # No await from here to the return, so nothing can cut in between the latch going off
+        # and the coordinator recording the hand-back. The coordinator closes the connectors after
+        # it tries to write that row, whether or not the write lands (:meth:`_dr_release_cleanup`):
+        # a cancellation in the close used to leave the engine passive beside a coordinator that
+        # stayed active (vault BACKLOG #3263).
         self._set_dr_active(False)
-        await rr.close_passive_connectors()  # a passive box holds no partner session open
         return {"depth_left": depth, "drained": depth <= held, "held_on_parked_outbounds": held}
+
+    async def _dr_release_cleanup(self) -> None:
+        """What a completed release still owes, run by the DR coordinator after it tries to write
+        the ``dr.release`` row, whether or not that write lands: close the connector of each
+        parked outbound, so the released box holds
+        no session open to a partner the primary must reach (vault BACKLOG #3262). A no-op once
+        the box is active again."""
+        rr = self._registry_runner
+        if rr is not None:
+            await rr.close_passive_connectors()
 
     async def _drain_pipeline(
         self, *, timeout: float | None = None, poll: float = 0.1

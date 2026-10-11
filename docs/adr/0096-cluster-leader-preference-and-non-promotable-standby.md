@@ -76,7 +76,9 @@ not *lease acquisition*; a DR box that also contends for the cluster lease could
 the primary store cross-WAN. The intended warm-DR posture is a **non-promotable cluster member**
 (`[cluster].enabled = true, promotable = false`), not a lease-contending `[dr]` box. A
 provisioned-but-passive DR box (`enabled = true, activate = false`) may still coexist with cluster
-membership.
+membership. *(That last sentence is superseded: `[dr].enabled` with `[cluster].enabled` is refused
+at load whatever `activate` says. The #3263 amendment of
+[ADR 0048](0048-third-tier-disaster-recovery-standby.md) says why.)*
 
 **What it must not break:** the self-fencing lease + split-brain guard, at-least-once delivery, and
 strict FIFO. Default `(delay = 0.0, promotable = True)` is **behaviourally byte-identical** to before —
@@ -109,6 +111,8 @@ short-circuits, and the added `nodes` columns default to `0`/`TRUE`.
 - **AC-7** — IF `[dr].activate` is combined with `[cluster].enabled`, THEN THE SYSTEM SHALL refuse the
   config at load.
   → `tests/test_settings.py::test_dr_activate_with_cluster_is_rejected`
+  *(Widened by vault BACKLOG #3263 to `[dr].enabled`:
+  `tests/test_settings.py::test_dr_enabled_but_not_activated_with_cluster_is_rejected`.)*
 - **AC-8** — THE SYSTEM SHALL surface each node's `acquire_delay_seconds` + `promotable` in
   `GET /cluster/nodes`.
   → `tests/test_cluster.py::test_build_coordinator_threads_leader_preference_knobs`

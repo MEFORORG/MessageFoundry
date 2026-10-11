@@ -70,7 +70,8 @@ updates:
     # Lift a cap and delete its entry in the SAME PR.
     # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
     # routine one (`update-types` is the version-only knob and cannot express a range). A ruff
-    # 0.15.x or uvicorn 0.54.x advisory fix still flows. Detection is untouched — security.yml's
+    # 0.15.x advisory fix still flows; a uvicorn 0.54.x one opens a PR that stays red until the
+    # wire suite is re-measured (the uvicorn note below). Detection is untouched — security.yml's
     # REQUIRED `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a
     # withheld fix reds a merge-blocking gate within ~24h and a human lifts the cap. Note the
     # ceiling is the pyproject CAP, not this entry: a human would have to lift it either way.
@@ -115,10 +116,14 @@ updates:
     # security.yml runs pip-audit over ci/locks/release-tools.lock. Lift this entry in the same PR
     # that moves the pyproject spec to a validated 7.4.
     #
-    # `uvicorn` is the same WIDENED-CAP case, and `websockets` is a major cap beside it (BACKLOG
-    # #1120). Why each cap exists, and where it sits, is beside it in pyproject.toml; read it there.
-    # pyproject.toml declares plain `uvicorn`, not `uvicorn[standard]`, so the bare name here matches
-    # it as written. Move each entry in the same PR that moves its cap.
+    # `uvicorn` and `websockets` are exact `==` pins in the base dependencies (BACKLOG #1120). Each
+    # entry starts at the pin's next minor, per THE RULE below. A patch release still gets a PR,
+    # and tests/test_header_floor_wire.py reds it until someone re-reads the server and moves
+    # the measured version with the pin. That was true under the old ranges too. The entries also
+    # withhold the security track from the next minor on; pip-audit still sees an advisory. Why
+    # each pin exists is beside it in pyproject.toml. pyproject.toml declares plain `uvicorn`,
+    # not `uvicorn[standard]`, so the bare name here matches it as written. Move each entry in the
+    # same PR that moves its pin.
     #
     # `pydicom`, `webauthn` and `pynetdicom` are the same WIDENED-CAP case (BACKLOG #2505). A major
     # cap needs its entry as much as a minor one: `python-deps-major` is one batch on `*`, so a
@@ -144,7 +149,7 @@ updates:
       - dependency-name: "uvicorn"
         versions: [">=0.55.0"]
       - dependency-name: "websockets"
-        versions: [">=18.0.0"]
+        versions: [">=17.3.0"]
       # Why: the comment above the [dicom] extra in pyproject.toml.
       - dependency-name: "pydicom"
         versions: [">=3.1.0"]
