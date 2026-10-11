@@ -1209,8 +1209,15 @@ async def test_a_hold_that_captured_no_digest_is_refused_at_release(
     service = await _service(engine)
     approval_id, r = await _hold_then_release(engine, service, {})
     assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "this request named no config digest, so it cannot be released; request the reload again"
+    )
     assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] is None
-    [row] = await _digest_mismatch_rows(engine)
+    [row] = [
+        json.loads(r["detail"])
+        for r in await engine.store.list_audit(action="config_reload_failed")
+    ]
+    assert row["reason"] == "no_approved_digest"
     assert row["approved_fingerprint"] is None and isinstance(row["current_fingerprint"], str)
     assert await engine.store.list_audit(action="config_reload") == []
 

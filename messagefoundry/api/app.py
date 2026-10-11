@@ -1683,8 +1683,9 @@ async def _audit_refused_reload(
     answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
     filter sees both, and ``invalid_config`` otherwise. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch`` and both
-    digests, and answers 422 (vault BACKLOG #2596); only the executor meets it.
+    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
+    ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
+    BACKLOG #2596); only the executor meets it.
 
     The inline route and the dual-control executor share this, so a held reload whose directory
     vanished or left the reload roots before its release is refused and recorded the way an inline
@@ -1711,12 +1712,26 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     elif isinstance(exc, ConfigDigestMismatch):
-        _log.warning("config reload refused: the config changed after its approval was requested")
-        action, detail["reason"] = "config_reload_failed", "digest_mismatch"
+        # A hold that took no digest is told apart, so nobody goes looking for an edit that
+        # never happened.
+        unbound = exc.approved is None
+        _log.warning(
+            "config reload refused: %s",
+            "its approval named no config digest"
+            if unbound
+            else "the config changed after its approval was requested",
+        )
+        action = "config_reload_failed"
+        detail["reason"] = "no_approved_digest" if unbound else "digest_mismatch"
         detail["approved_fingerprint"] = exc.approved
         detail["current_fingerprint"] = exc.current
         status = 422
-        answer = "the config changed after this reload was requested; request the reload again"
+        answer = (
+            "this request named no config digest, so it cannot be released; request the reload "
+            "again"
+            if unbound
+            else "the config changed after this reload was requested; request the reload again"
+        )
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
         _log.warning(

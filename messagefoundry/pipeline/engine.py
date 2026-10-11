@@ -51,6 +51,7 @@ from messagefoundry.config.wiring import (
     connector_secret_env_values,
     load_config,
 )
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
@@ -2420,12 +2421,24 @@ class Engine:
 
         Not :meth:`fingerprint_bundle`, whose detail is lost whole when only its advisory VCS head
         cannot be read. An approval binds content, so that failure must not refuse a release."""
+        return await asyncio.to_thread(self._content_digest_blocking, path)
+
+    @staticmethod
+    def _content_digest_blocking(path: Path) -> str | None:
+        """:meth:`_content_digest` on a worker thread. A direct call, so the crypto inventory
+        scanner, which follows a call it can see, keeps this hash on its record."""
         from messagefoundry.config.fingerprint import config_fingerprint
 
         try:
-            return await asyncio.to_thread(config_fingerprint, path)
+            return config_fingerprint(path)
         except (OSError, ValueError) as exc:
-            log.warning("config content digest failed for %s: %s", path, safe_exc(exc))
+            # The path can come from a client's config_dir, so it is scrubbed for CodeQL
+            # py/log-injection as the reload refusal logs scrub theirs.
+            log.warning(
+                "config content digest failed for %s: %s",
+                scrub_log_argument(str(path)),
+                safe_exc(exc),
+            )
             return None
 
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:

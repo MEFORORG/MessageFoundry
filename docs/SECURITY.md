@@ -1986,14 +1986,15 @@ second just before the swap. The second digest is the one the `config_reload` ro
 either differs from the approved one, nothing loads past that point and nothing swaps. The approve
 answers **422**, the request moves to `failed`, and a `config_reload_failed` row records reason
 `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold that took no digest
-is refused the same way. The requester asks again, and a second approver reviews the new bytes. A
+is refused the same way, with reason `no_approved_digest`. The requester asks again, and a second approver reviews the new bytes. A
 repeat request joins an open hold only while the digest is unchanged. An ungated reload takes no
 request-time digest. At least these limits remain:
 
 - the digest is not sealed. A writer to the `pending_approvals` table can replace it along with the
   rest of the params. Sealing that row is vault BACKLOG #2592;
 - the digest covers what `config/fingerprint.py` hashes and no more. A planted `__pycache__` file
-  runs under an unchanged digest, and its other gaps are closing step 1 of vault BACKLOG #2596;
+  runs under an unchanged digest. So does an edit to an environment value file outside the config
+  directory, or to a `MEFOR_VALUE_*` variable. These gaps are closing step 1 of vault BACKLOG #2596;
 - each check samples the files. An edit that lands after the first check runs its module code
   before the second check refuses it. An edit reverted while the release loads is not seen at all.
   Hashing, compiling and running the same bytes is that same step 1;
@@ -2003,6 +2004,10 @@ request-time digest. At least these limits remain:
   no digest is still filed, though its release is certain to be refused;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
   before a toggle is refused at release and must be asked for again;
+- a repeat after an edit files a second hold and leaves the first pending. The first is refused
+  at release unless the edit is reverted, and then it can be released;
+- in a cluster, the release compares the digest with the disk of the node that handles the approve,
+  which may not be the node that took it;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.
