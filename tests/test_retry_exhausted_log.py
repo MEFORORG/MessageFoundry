@@ -435,31 +435,39 @@ async def test_an_outbound_that_never_started_logs_its_dead_letter(
 
 
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
-async def test_the_stop_policy_keeps_the_row_queued_at_the_cap(
-    store: MessageStore, batch: bool
+async def test_a_stop_that_dead_letters_at_the_cap_says_so(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, batch: bool
 ) -> None:
-    # Item 5: STOP promises to leave the message queued for replay. At the cap, mark_failed with
-    # the lane's finite policy dead-lettered it instead.
-    runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=1, **FAST))
-    runner._internal_error[OUT] = InternalErrorPolicy.STOP
-    await _enqueue(store, 1)
-    item = await _claim(store)
-    if batch:
-        cfg = BatchConfig(max_count=2, max_wait_ms=1)
-        runner._batch[OUT] = cfg
-        outcome, _ = await runner._process_delivery_batch(OUT, item, cfg)
-    else:
-        outcome, _ = await runner._process_delivery_item(OUT, item)
-    assert outcome is wiring_runner._ItemOutcome.STOPPED
-    assert await _status(store, item.id) == OutboxStatus.PENDING.value
+    # Item 5: the STOP arm's mark_failed dead-letters at a finite cap, which bounds a STOP and
+    # re-arm loop, while the STOP reads as keeping the row queued. A line now says which happened.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    for cap, status in ((2, OutboxStatus.PENDING), (1, OutboxStatus.DEAD)):
+        caplog.clear()
+        runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=cap, **FAST))
+        runner._internal_error[OUT] = InternalErrorPolicy.STOP
+        await _enqueue(store, 1)
+        item = await _claim(store)
+        if batch:
+            cfg = BatchConfig(max_count=2, max_wait_ms=1)
+            runner._batch[OUT] = cfg
+            outcome, _ = await runner._process_delivery_batch(OUT, item, cfg)
+        else:
+            outcome, _ = await runner._process_delivery_item(OUT, item)
+        assert outcome is wiring_runner._ItemOutcome.STOPPED
+        assert await _status(store, item.id) == status.value
+        said = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
+        assert len(said) == (1 if status is OutboxStatus.DEAD else 0)
+        if said:
+            assert item.id in said[0].getMessage()
+        await store.dead_letter_now(item.id, "clear the lane for the next case")
 
 
 @pytest.mark.parametrize("stage", ["router", "transform"])
-async def test_the_stop_policy_keeps_an_ingest_row_queued_at_the_cap(
-    store: MessageStore, stage: str
+async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_so(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, stage: str
 ) -> None:
-    # Item 5, the same promise on the router and transform STOP arms, which used the finite
-    # delivery defaults.
+    # Item 5, the router and transform STOP arms, which use the finite delivery defaults.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
     runner = RegistryRunner(
         Registry(),
         store,
@@ -476,7 +484,9 @@ async def test_the_stop_policy_keeps_an_ingest_row_queued_at_the_cap(
     )
     outcome, _ = await apply("c1", item, RuntimeError("bug"))
     assert outcome is wiring_runner._ItemOutcome.STOPPED
-    assert await _status(store, item.id) == OutboxStatus.PENDING.value
+    assert await _status(store, item.id) == OutboxStatus.DEAD.value
+    (said,) = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
+    assert f"{stage} worker 'c1': row {item.id}" in said.getMessage()
 
 
 async def test_a_store_read_fault_on_a_vanished_row_does_not_claim_a_dead_letter(
@@ -526,7 +536,7 @@ async def test_a_store_read_fault_that_reaches_the_cap_writes_the_retry_cap_line
         await runner._process_delivery_item(OUT, item)
     assert await _status(store, item.id) == OutboxStatus.DEAD.value
     (line,) = _exhausted_lines(caplog)
-    assert "could not be read from the store" in line.getMessage() and item.id in line.getMessage()
+    assert "hit a store read fault" in line.getMessage() and item.id in line.getMessage()
 
 
 def test_held_reports_the_rows_a_pair_holds() -> None:

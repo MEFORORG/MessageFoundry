@@ -1033,7 +1033,8 @@ class FailOutcome:
 
     ``head_id`` and ``attempts`` name the row the store decided from, with the attempts it read
     there: the one row, or a batch's first member still present. Both are ``None`` when no row was
-    present. They can differ from what the claim returned: a lease sweep can re-pend a row under a
+    present, and on Postgres and SQL Server also when the H1 fence rolled back a DEAD write on a row
+    that was present. They can differ from what the claim returned: a lease sweep can re-pend a row under a
     slow send, and a second claim then spends another attempt."""
 
     retry_at: float | None = None

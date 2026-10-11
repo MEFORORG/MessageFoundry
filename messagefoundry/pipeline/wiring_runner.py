@@ -536,12 +536,29 @@ _REFUSAL_LOG_MAX_LINES_PER_WINDOW = 100
 _REFUSAL_LOG_MAX_PAIRS = 4096
 
 
-def _without_cap(retry: RetryPolicy) -> RetryPolicy:
-    """``retry`` with no attempt cap, for an internal-error STOP arm. ``InternalErrorPolicy.STOP``
-    promises to leave the row queued for replay, and ``mark_failed`` under a finite cap dead-letters
-    it once the cap is reached (vault BACKLOG #3211). The backoff is kept. It only decides when the
-    row comes due once an operator restarts the stopped lane."""
-    return retry.model_copy(update={"max_attempts": None})
+def _note_stop_dead_letter(
+    worker: str, name: str, failed: FailOutcome, *, batch: bool = False
+) -> None:
+    """Say so when an internal-error STOP arm's ``mark_failed`` dead-lettered its row at a finite
+    cap rather than re-pending it (vault BACKLOG #3211). The STOP's own line says the lane stopped,
+    and the policy reads as keeping the row queued, so without this line the log and the store
+    disagree. The cap is kept on purpose: it bounds a STOP and re-arm loop on a row that always
+    crashes. Ids and counts only, never the error text."""
+    if not failed.dead:
+        return
+    subject_args: tuple[object, ...]
+    if batch:
+        subject, subject_args = "a batch of %d (head row %s)", (failed.dead, failed.head_id)
+    else:
+        subject, subject_args = "row %s", (failed.head_id,)
+    log.warning(
+        "%s %r: " + subject + " reached the retry cap after %d attempt(s), so the stop "
+        "dead-lettered it rather than keeping it queued; replay it from the dead-letter queue",
+        worker,
+        name,
+        *subject_args,
+        failed.attempts,
+    )
 
 
 class _EngineCause(Enum):
@@ -550,12 +567,12 @@ class _EngineCause(Enum):
     peer sends. The value is the line's wording."""
 
     NO_CONNECTOR = "found no running connector"
-    STORE_READ = "could not be read from the store before sending"
+    STORE_READ = "hit a store read fault before sending"
 
 
 class _RefusalLog:
     """The WARNING a permanent refusal writes after the delivery worker dead-letters it, throttled per
-    (connection, refusal code) (BACKLOG #3043).
+    (connection, refusal code) (BACKLOG #3043). The key has a third field, ``exhausted``, below.
 
     A transient failure that ran out a finite ``max_attempts`` writes the same line, with
     ``exhausted=True`` (BACKLOG #3108). That flag is the key's third field (vault BACKLOG #3211), so
@@ -635,7 +652,7 @@ class _RefusalLog:
         stacklevel: int = 2,
     ) -> None:
         """Log ``message % args`` at WARNING, followed by ``exc``'s class name and code, unless the
-        pair ``(name, code)`` logged inside the window, in which case count its ``rows``. Call it
+        key ``(name, code, exhausted)`` logged inside the window, in which case count its ``rows``. Call it
         AFTER the dead-letter write, so a line never claims a dead-letter that did not happen.
         ``exc`` is an :class:`_EngineCause` when no peer raised anything; ``message`` then says
         why."""
@@ -8166,14 +8183,16 @@ class RegistryRunner:
                     item.id,
                     type(exc).__name__,
                 )
-                # Preserve the message for replay (reschedule, don't dead-letter) and halt
-                # this worker. A normal return is not respawned (_on_worker_done); a later
-                # reload re-spawns the worker, re-arming the lane.
-                await self.store.mark_failed(
+                # Re-pend the message for replay and halt this worker. A normal return is not
+                # respawned (_on_worker_done); a later reload re-spawns the worker, re-arming the
+                # lane. At a finite cap the store dead-letters the row instead (replayable), which
+                # bounds a STOP and re-arm loop on a row that always crashes; the line says so.
+                failed = await self.store.mark_failed(
                     item.id,
                     f"internal error (connection stopped): {safe_exc(exc)}",
-                    _without_cap(retry),
+                    retry,
                 )
+                _note_stop_dead_letter("delivery worker", name, failed)
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering {item.id}"
                 )
@@ -8460,7 +8479,7 @@ class RegistryRunner:
             self._note_lane_unhealthy(name, ids[0] if ids else head.id, exc)
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
-            # fault. The per-connection policy decides: STOP halts the lane (preserve the batch, alert);
+            # fault. The per-connection policy decides: STOP halts the lane (re-pend the batch, alert);
             # CONTINUE (default) dead-letters all N (bad data can never frame/deliver — replayable from
             # the DLQ) so a code bug or a mis-typed feed can't wedge the lane forever.
             if (
@@ -8475,11 +8494,10 @@ class RegistryRunner:
                     len(ids),
                     type(exc).__name__,
                 )
-                await self.store.mark_batch_failed(
-                    ids,
-                    f"internal error (connection stopped): {safe_exc(exc)}",
-                    _without_cap(retry),
+                failed = await self.store.mark_batch_failed(
+                    ids, f"internal error (connection stopped): {safe_exc(exc)}", retry
                 )
+                _note_stop_dead_letter("delivery worker", name, failed, batch=True)
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
                 )
@@ -8699,11 +8717,12 @@ class RegistryRunner:
                 item.id,
                 type(exc).__name__,
             )
-            await self.store.mark_failed(
+            failed = await self.store.mark_failed(
                 item.id,
                 f"router error (ingest stopped): {safe_exc(exc)}",
-                _without_cap(self._delivery_defaults),
+                self._delivery_defaults,
             )
+            _note_stop_dead_letter("router worker", name, failed)
             self._alert_sink.connection_stopped(
                 name, detail=f"router {type(exc).__name__} on {item.id}"
             )
@@ -8734,11 +8753,12 @@ class RegistryRunner:
                 item.id,
                 type(exc).__name__,
             )
-            await self.store.mark_failed(
+            failed = await self.store.mark_failed(
                 item.id,
                 f"handler error (transform stopped): {safe_exc(exc)}",
-                _without_cap(self._delivery_defaults),
+                self._delivery_defaults,
             )
+            _note_stop_dead_letter("transform worker", name, failed)
             self._alert_sink.connection_stopped(
                 name, detail=f"handler {type(exc).__name__} on {item.id}"
             )

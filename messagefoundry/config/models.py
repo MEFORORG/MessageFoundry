@@ -172,7 +172,9 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     ``CONTINUE`` (default): error-and-continue — dead-letter the offending row (replayable) and move
     on, so a code bug can't wedge the whole lane. ``STOP``: halt the connection's delivery worker and
     raise a ``connection_stopped`` alert, leaving the message queued for replay — for operators who
-    would rather a lane freeze (and page someone) than auto-dead-letter on an unexpected error.
+    would rather a lane freeze (and page someone) than auto-dead-letter on an unexpected error. A
+    row already at a finite ``max_attempts`` is dead-lettered (replayable) instead, which bounds a
+    stop and re-arm loop on a row that always crashes; a WARNING says so (vault BACKLOG #3211).
     Partner rejections (``NegativeAckError``) and transport failures are unaffected — this governs
     only the engine-internal-error case.
     """

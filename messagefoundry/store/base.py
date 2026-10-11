@@ -867,7 +867,8 @@ class QueueStore(StoreLifecycle, Protocol):
         as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. The
         head is the first member still present, and the returned :class:`FailOutcome` names it, with
         the shared ``next_attempt_at`` as ``retry_at`` when rescheduled and the members written DEAD
-        as ``dead``. An empty or wholly vanished batch returns an empty outcome. On the
+        as ``dead``. An empty or wholly vanished batch returns an empty outcome, and so does a final
+        write the H1 fence rolled back. On the
         retry branch a terminal member (neither ``inflight`` nor ``pending``) is skipped, event and
         all, as in
         :meth:`mark_failed`, and the shared retry time is returned even when every member was
