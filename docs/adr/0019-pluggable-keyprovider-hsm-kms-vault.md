@@ -653,11 +653,13 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
 > 2026-09-28 amendment states the deployment precondition and cites the pages read.
 
-> **Corrected 2026-10-10 (BACKLOG #1173).** The operator still owns the rotation precondition the
-> note above describes. Since BACKLOG #2337, the engine also records who attested to it, and
-> `Engine.start` checks that record through `enforce_transit_bound_attestation`. So "documented"
-> undersells the control now on `main`. ADR 0138's 2026-10-07 amendment says what the check does,
-> what it does not change, and that whether it meets R3 is a scorecard call.
+> **Corrected 2026-10-10 (BACKLOG #1173).** The rotation precondition above still stands, and the
+> engine still counts no Transit encrypts. What changed is the record. Since BACKLOG #2337, an
+> operator attests to the precondition with `messagefoundry store attest-transit-bound`, and
+> `Engine.start` reads that record through `enforce_transit_bound_attestation`. So "documented"
+> now undersells it. The R3 ruling above judged the precondition before that record existed;
+> whether the record meets R3 is a scorecard call. ADR 0138's 2026-10-07 amendment says what the
+> check does under each enforcement level, and what it does not change.
 
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
