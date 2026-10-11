@@ -446,61 +446,68 @@ _STOP_SAID = "so the stop dead-lettered"
 
 
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize(
+    ("cap", "status"),
+    [(2, OutboxStatus.PENDING), (1, OutboxStatus.DEAD)],
+    ids=["below-cap", "at-cap"],
+)
 async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
-    store: MessageStore, caplog: pytest.LogCaptureFixture, batch: bool
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    batch: bool,
+    cap: int,
+    status: OutboxStatus,
 ) -> None:
     # Item 5: the STOP arm's mark_failed dead-letters at a finite cap, which bounds a STOP and
     # re-arm loop. A line says so and names what to replay; docs/USER-GUIDE.md states how. The
     # batch is drawn from two messages, so the line has to name both.
     caplog.set_level(logging.WARNING, logger=LOGGER)
-    for cap, status in ((2, OutboxStatus.PENDING), (1, OutboxStatus.DEAD)):
-        caplog.clear()
-        runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=cap, **FAST))
-        runner._internal_error[OUT] = InternalErrorPolicy.STOP
-        mids = [
-            await store.enqueue_message(
-                channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
-            )
-            for n in ((1, 2) if batch else (1,))
-        ]
-        dead_before = await store.count_dead(allowed_channels=None)
-        item = await _claim(store)
-        if batch:
-            cfg = BatchConfig(max_count=2, max_wait_ms=1)
-            runner._batch[OUT] = cfg
-            outcome, _ = await runner._process_delivery_batch(OUT, item, cfg)
-        else:
-            outcome, _ = await runner._process_delivery_item(OUT, item)
-        assert outcome is wiring_runner._ItemOutcome.STOPPED
-        rows = [r for m in mids for r in await store.outbox_for(m)]
-        assert [r["status"] for r in rows] == [status.value] * len(mids)
-        said = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
-        if status is OutboxStatus.PENDING:
-            assert said == []  # below the cap the stop re-pends and says nothing more
-            for r in rows:
-                await store.dead_letter_now(str(r["id"]), "clear the lane for the next case")
-            continue
-        (line,) = said
-        text = line.getMessage()
-        if batch:
-            assert (
-                f"batch row {item.id}, the first one still present, had made 1 attempt(s)" in text
-            )
-            assert "dead-lettered the batch instead of re-pending it, on that row's" in text
-            assert f"the store reports 2 row(s) from 2 message(s), {mids[0]}, {mids[1]};" in text
-            assert "each is an outbound row: replay them from the dead-letter queue" in text
-        else:
-            assert f"row {item.id} (message {mids[0]}) had made 1 attempt(s)" in text
-            assert "at or past its retry cap" in text
-            assert f"replay it from the dead-letter queue, or replay message {mids[0]}" in text
-        # Both recoveries the line names hold for an outbound row: the dead-letter queue lists it,
-        # and replaying each named message re-queues its row.
-        assert await store.count_dead(allowed_channels=None) == dead_before + len(mids)
-        for m in mids:
-            assert await store.replay(m) == 1
-        assert [r["status"] for m in mids for r in await store.outbox_for(m)] == [
-            OutboxStatus.PENDING.value
-        ] * len(mids)
+    runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=cap, **FAST))
+    runner._internal_error[OUT] = InternalErrorPolicy.STOP
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
+        )
+        for n in ((1, 2) if batch else (1,))
+    ]
+    dead_before = await store.count_dead(allowed_channels=None)
+    item = await _claim(store)
+    if batch:
+        cfg = BatchConfig(max_count=2, max_wait_ms=1)
+        runner._batch[OUT] = cfg
+        outcome, _ = await runner._process_delivery_batch(OUT, item, cfg)
+    else:
+        outcome, _ = await runner._process_delivery_item(OUT, item)
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    rows = [r for m in mids for r in await store.outbox_for(m)]
+    assert [r["status"] for r in rows] == [status.value] * len(mids)
+    # Positive control: the capture saw this stop's own STOPPING ERROR, so an empty `said` below
+    # means the dead-letter line was not written, not that nothing was captured.
+    assert len(caplog.records) >= 1
+    assert len([r for r in caplog.records if "STOPPING" in r.getMessage()]) == 1
+    said = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
+    if status is OutboxStatus.PENDING:
+        assert said == []  # below the cap the stop re-pends and says nothing more
+        return
+    (line,) = said
+    text = line.getMessage()
+    if batch:
+        assert f"batch row {item.id}, the first one still present, had made 1 attempt(s)" in text
+        assert "dead-lettered the batch instead of re-pending it, on that row's" in text
+        assert f"the store reports 2 row(s) from 2 message(s), {mids[0]}, {mids[1]};" in text
+        assert "each is an outbound row: replay them from the dead-letter queue" in text
+    else:
+        assert f"row {item.id} (message {mids[0]}) had made 1 attempt(s)" in text
+        assert "at or past its retry cap" in text
+        assert f"replay it from the dead-letter queue, or replay message {mids[0]}" in text
+    # Both recoveries the line names hold for an outbound row: the dead-letter queue lists it,
+    # and replaying each named message re-queues its row.
+    assert await store.count_dead(allowed_channels=None) == dead_before + len(mids)
+    for m in mids:
+        assert await store.replay(m) == 1
+    assert [r["status"] for m in mids for r in await store.outbox_for(m)] == [
+        OutboxStatus.PENDING.value
+    ] * len(mids)
 
 
 async def _ingest_row(store: MessageStore, stage: str, handlers: int) -> tuple[str, OutboxItem]:
@@ -562,6 +569,9 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
     )
     outcome, _ = await apply("c1", item, RuntimeError("bug"))
     assert outcome is wiring_runner._ItemOutcome.STOPPED
+    # Positive control, as in the delivery test: the capture saw the stop's own STOPPING ERROR.
+    assert len(caplog.records) >= 1
+    assert len([r for r in caplog.records if "STOPPING" in r.getMessage()]) == 1
     said = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
     if cap == 2:
         assert await _status(store, item.id) == OutboxStatus.PENDING.value
