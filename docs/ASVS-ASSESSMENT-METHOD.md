@@ -41,7 +41,8 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
 
 1. **Does the requirement apply to this product on the declared scope (§2)?**
    No → **`na`**, and write the rationale. No rationale, no `na`. Rule 1 scopes out a whole
-   requirement, never one limb of it, and a cell grades every limb (§1.1b).
+   requirement, never one limb of it, and a cell grades every limb (§1.1b). §1.1d says how a limb
+   that applies only when a feature is used is graded.
 2. **Has this cell been read against the ASVS requirement text at a known commit?**
    No → **`unverified`**. *This is not a Pass.* **CAUTION:** It is also **not** "nobody looked" — the earlier
    lineage graded these cells. What it graded them against was a paraphrase, because the ASVS 5.0.0
@@ -98,7 +99,8 @@ recur; all three are now settled.
    argument**, and accepting it would make rule 4's first limb unfalsifiable: *every* off-by-default
    control removes its own trigger, so the argument is available to all of them and discriminates
    between none of them. A property predicated of an object the shipped default never creates is not
-   *satisfied*.
+   *satisfied*. That sentence covers an object that some configuration of the shipped artifacts can
+   create. An object that no configuration can create is §1.1d's case, where the limb is met.
 3. **"No code change could improve the cell, so a `partial` manufactures a phantom remediation item."**
    Rejected as a ground, and usually **false on the facts** as well. Before offering it, name the change
    that would make the verb hold on a stock install and say why it is impossible. Flipping a default,
@@ -144,6 +146,25 @@ repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
 
 **The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
 it stands.
+
+**Three questions R2 left open are answered by Manager decision (2026-10-10).** Engine PR 1488 wrote
+R2 into this section and routed four questions it did not decide. The batch 309 Manager seat
+answered the first three under the owner's driver rule. They are not owner rulings, and the owner
+may overturn any of them. The record is `docs/security/ASVS-MANAGER-RULINGS-2026-10-10-BATCH309.md`
+in the `MessageFoundry-vault` repository, on vault branch `b309-rulings-and-cells` until it merges.
+§1.1d answers the fourth.
+
+1. A reverse proxy that the assessed posture (§2.2) names cannot meet a host-substrate limb. The
+   posture decides the configuration a cell is graded in. It does not add the proxy to the five
+   software artifacts that §2 assesses, so a cell grades what those artifacts ship. The one route to
+   `pass` for such a limb is an engine gate that refuses to start when the limb's precondition is
+   absent. That is rule 4's second limb, and §1.1a says what it requires.
+2. R2 accepts a consequence, as §1.1a did for its ruling. A limb that only the host substrate can
+   meet, with no engine gate of the kind item 1 names, never reaches `pass`. Neither does its cell.
+   A cell that moves down for this reason is a §2.2 cause-4 movement, not a regression.
+3. R2 leaves the 5.4.3 row in §1.2 as it is. R2 bars scoping out one limb, and that row scopes out
+   the whole requirement under rule 1. The row is closed by owner decision, so this answer does not
+   re-derive it.
 
 ### 1.1c What counts as documentation: a docstring or a code comment does not (owner ruling, 2026-10-08), and the method's reading of what does
 
@@ -208,6 +229,38 @@ The first ruling was given in session on 2026-10-08, after adversarial review, a
 2026-10-09. Both are recorded on pull requests in the `MessageFoundry-vault` repository, and a
 rulings file there is pending. As in §1.1a, this document records the rule and deliberately not a
 list of the cells it moves.
+
+### 1.1d A conditional limb is met when no configuration can reach its condition (owner ruling, 2026-10-10)
+
+Some requirements carry a limb that applies only when a feature is used: *if Y is used, then the
+software must do Z*. R2 (§1.1b) keeps every such limb in scope. This section says how a cell grades
+one.
+
+1. If no configuration of the shipped artifacts can reach Y, the limb is met.
+2. If some configuration can turn Y on, grade the limb under §1.1a, which grades the shipped default.
+
+Four limits come with that rule.
+
+1. Only a limb is met this way. A requirement that is conditional as a whole still goes to rule 1,
+   as the 10.5.5 row in §1.2 does.
+2. The vacuity argument in §1.1a item 2 does not reach a Y that no configuration can create. That
+   item now says so.
+3. Show that Y is unreachable with an instrument, and never assert it. An absence claim with a live
+   positive control (§3) is one such instrument. At least one cell in the record carried an
+   unreachable claim that a later pass found false.
+4. Applying the rule raises at least one cell. As §1.1a explains, this document records the rule and
+   deliberately not the cells it moves. The owner rulings file below names that cell.
+
+**One consequence is flagged, and nobody has decided it.** At least one cell is graded `pass` on a
+precondition that is false. Limit 1 grades that shape under rule 1, as the 10.5.5 row does, so the
+cell is a candidate for a re-read. The Manager rulings file named in §1.1b names it.
+
+**Which parts are the owner's.** On 2026-10-10 the owner was asked about the two-branch rule above.
+The question said adversarial review had upheld it with amendments. The owner chose the option whose
+description begins *"Adopt the split"*. The four limits are those amendments. Their wording is the
+batch 309 Manager seat's, after adversarial review, and the owner was not asked about them one by
+one. The record is `docs/security/OWNER-RULINGS-2026-10-10-BATCH309.md` in the
+`MessageFoundry-vault` repository, on vault branch `b309-rulings-and-cells` until it merges.
 
 ### 1.2 Worked examples — the ones that actually broke
 
