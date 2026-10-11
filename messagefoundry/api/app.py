@@ -415,6 +415,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
 from messagefoundry.service_status import query_service_state
+from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
@@ -1234,13 +1235,14 @@ def _posture_loosenings(
     *,
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
+    service_env: ServiceEnvPosture,
 ) -> tuple[list[tuple[str, str]], str | None]:
     """The active ``security_loosenings()`` entries and the scope note, read off ``state``, plus
     the ``allow_no_auth`` open mode, which is an app opt-in rather than a setting.
 
     ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
-    call this, so the row records the list the route would report. ``runner`` and the two process
-    readings (vault BACKLOG #2700 / #2701) are passed in rather than read here, so a caller that
+    call this, so the row records the list the route would report. ``runner`` and the three process
+    readings (vault BACKLOG #2700 / #2701 / #2595) are passed in rather than read here, so a caller that
     also reports them elsewhere reads each once."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
@@ -1338,6 +1340,7 @@ def _posture_loosenings(
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
             remote_debug=remote_debug,
             startup=startup,
+            service_env=service_env,
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
@@ -1992,6 +1995,7 @@ async def _record_start_audit(
             engine.registry_runner,
             remote_debug=remote_debug_posture(),
             startup=await asyncio.to_thread(startup_posture),
+            service_env=await asyncio.to_thread(service_env_posture),
         )
         switches = [name for name, _risk in pairs]
     except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
@@ -3339,8 +3343,16 @@ def create_app(
         # reading reads files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
+        # Vault BACKLOG #2595: the service-environment reading `serve` took as it started, kept
+        # for the life of the process. Off the event loop for the same reason as the one above.
+        service_env = await asyncio.to_thread(service_env_posture)
         pairs, loosenings_scope = _posture_loosenings(
-            request.app.state, engine, runner, remote_debug=remote_debug, startup=startup
+            request.app.state,
+            engine,
+            runner,
+            remote_debug=remote_debug,
+            startup=startup,
+            service_env=service_env,
         )
         loosenings = [SecurityLoosening(switch=name, risk=risk) for name, risk in pairs]
         interpreter_view = InterpreterView.from_readings(startup, remote_debug)

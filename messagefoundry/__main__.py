@@ -2491,6 +2491,18 @@ def _serve(args: argparse.Namespace) -> int:
         print(f"error: refusing to start: {startup_refused}.", file=sys.stderr)
         return 2
 
+    # Vault BACKLOG #2595 and #2601: a store key in this engine's own Windows service environment,
+    # which NSSM keeps in a registry key any local user can read. Refused under EVERY enforcement
+    # setting (owner ruling 2026-10-01). Other engine secrets there are only named, in the
+    # loosening list below. messagefoundry/serviceenv.py says what the reading covers.
+    from messagefoundry.serviceenv import service_env_posture, service_env_refusal
+
+    service_env = service_env_posture()
+    service_env_refused = service_env_refusal(service_env)
+    if service_env_refused is not None:
+        print(f"error: refusing to start: {service_env_refused}.", file=sys.stderr)
+        return 2
+
     # ADR 0118: [security].require_encryption_for_remote=false is the config-file twin of
     # --allow-insecure-bind (accept off-machine access on the API's self-signed placeholder, and on a
     # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind gate + the SAME
@@ -2753,9 +2765,9 @@ def _serve(args: argparse.Namespace) -> int:
     # GET /security/posture. None here is "not yet observed", never "observed and clean". The same
     # holds for the #1905 audit-chain keying observation: the store logs its own WARNING when it opens
     # onto a keyless chain, and GET /security/posture reports it off the live store.
-    # The remote-debugging reading (vault BACKLOG #2700) and the start-up reading (vault BACKLOG
-    # #2701) are the observations that ARE complete here: each is a fact about this process, and
-    # this is the process.
+    # The remote-debugging reading (vault BACKLOG #2700), the start-up reading (vault BACKLOG
+    # #2701) and the service-environment reading (vault BACKLOG #2595) are the observations that
+    # ARE complete here: each is a fact about this process, and this is the process.
     _loosenings = security_loosenings(
         settings.security,
         settings.store,
@@ -2778,6 +2790,7 @@ def _serve(args: argparse.Namespace) -> int:
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
         startup=startup,
+        service_env=service_env,
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -4748,6 +4761,31 @@ def _supervise(args: argparse.Namespace) -> int:
         security_lines.append(startup_entry)
         logging.getLogger(__name__).warning(
             "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
+        )
+
+    # Vault BACKLOG #2595: the service-environment check each engine shard's `serve` makes. A
+    # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
+    # both, so every shard would refuse on a store key there. Refused under every enforcement
+    # setting, as in `serve`.
+    from messagefoundry.serviceenv import (
+        service_env_loosenings,
+        service_env_posture,
+        service_env_refusal,
+    )
+
+    service_env = service_env_posture()
+    service_env_refused = service_env_refusal(service_env)
+    if service_env_refused is not None:
+        print(
+            f"error: {service_env_refused}. Every engine shard would refuse to start; refusing to "
+            "start the fleet.",
+            file=sys.stderr,
+        )
+        return 2
+    for service_env_entry in service_env_loosenings(service_env):
+        security_lines.append(service_env_entry)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *service_env_entry
         )
 
     # BACKLOG #2356: the two credential gates `serve` makes next, in its order. The
@@ -9933,8 +9971,9 @@ def _security(args: argparse.Namespace) -> int:
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
         # posture. GET /security/posture is the complete surface; `messagefoundry check` adds the
         # connection-scoped entries but opens no store either. The remote-debugging reading (vault
-        # BACKLOG #2700) and the start-up reading (vault BACKLOG #2701) are facts about the ENGINE
-        # process, and this command is another process, so it passes None for those too.
+        # BACKLOG #2700), the start-up reading (vault BACKLOG #2701) and the service-environment
+        # reading (vault BACKLOG #2595) are facts about the ENGINE process, and this command is
+        # another process, so it passes None for those too.
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
@@ -9959,6 +9998,7 @@ def _security(args: argparse.Namespace) -> int:
                 audit_chain_unkeyed=None,
                 remote_debug=None,
                 startup=None,
+                service_env=None,
             )
         ]
 
@@ -9992,8 +10032,9 @@ def _security(args: argparse.Namespace) -> int:
             "tls_revocation_attested and FHIR update_url_form declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). Nor are the engine process's remote-debugging "
-            "reading and its start-up reading (launch flags, start-up code, writable site "
-            "directories): this command is a separate process (GET /security/posture reports them). "
+            "reading, its start-up reading (launch flags, start-up code, writable site "
+            "directories) and its Windows service-environment reading: this command is a separate "
+            "process (GET /security/posture reports them). "
             "These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
             "GET /security/posture. One entry is not read from the file at all: "

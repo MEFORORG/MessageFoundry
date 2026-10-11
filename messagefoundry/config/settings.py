@@ -105,6 +105,7 @@ from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
 from messagefoundry.service_status import is_safe_service_name
+from messagefoundry.serviceenv import ServiceEnvPosture, service_env_loosenings
 from messagefoundry.startupcode import StartupPosture, startup_loosenings
 
 __all__ = [
@@ -8469,6 +8470,7 @@ def security_loosenings(
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
     startup: StartupPosture | None,
+    service_env: ServiceEnvPosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -8502,7 +8504,8 @@ def security_loosenings(
     ``update_url_form="path"`` (vault BACKLOG #2571) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
     the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
-    interpreter (vault BACKLOG #2701), and
+    interpreter (vault BACKLOG #2701), the OBSERVED environment of its own Windows service (vault
+    BACKLOG #2595), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
@@ -8581,6 +8584,13 @@ def security_loosenings(
     isolated mode, the start-up code (``.pth`` import lines, ``sitecustomize``) it does not know,
     and whether the engine's own account can write the directories that code is read from.
     ``None`` has the meaning it has for ``remote_debug``, for the same reason.
+
+    ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
+    :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
+    Windows service, which engine secrets that service's registry-held environment list names,
+    and whether a store key reaches it through its environment. A store key in that list refuses
+    the start, so this registry names only what does not refuse. ``None`` has the meaning it has
+    for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -9208,6 +9218,11 @@ def security_loosenings(
     # kind of observation, with its wording beside its reader for the same reason.
     if startup is not None:
         out.extend(startup_loosenings(startup))
+    # --- the engine PROCESS's own Windows service environment (vault BACKLOG #2595, #2601;
+    # key-custody slice S2a). A store key reaching a service through its environment, an engine
+    # secret in the service's registry-held NSSM list, and a list that could not be read.
+    if service_env is not None:
+        out.extend(service_env_loosenings(service_env))
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.
