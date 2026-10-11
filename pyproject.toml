@@ -263,11 +263,13 @@ webauthn = ["webauthn>=3.0.0,<4"]
 # by that leg -- keep the cap regardless: the leg proves the client still constructs, not that a major
 # preserved its TLS or redirect behaviour. The cap has a matching Dependabot ignore entry, as the
 # webauthn major cap does (vault BACKLOG #2569; a seat decision under owner delegation 2026-10-08,
-# not an owner ruling). Without one, Dependabot widens the cap inside a grouped major PR, and only
-# that PR's review and the `test` leg above stand between it and a 3.x lock. Cost, accepted: a fix shipped only in
-# hvac 3.x raises no Dependabot PR, and dependabot.yml's TRADE-OFF note says what still detects it.
-# That note treats the security track as withheld for the range. GitHub's docs support `ignore`
-# reaching security-update PRs, but none read on 2026-10-10 says how a `versions` range applies.
+# not an owner ruling). Without one, Dependabot widens the cap inside a grouped major PR. Then only
+# that PR's review and the `test` leg above stand between the widening and a 3.x lock.
+# Cost, accepted: a fix shipped only in hvac 3.x raises no routine Dependabot PR. Treat it as
+# raising no security PR either, as dependabot.yml's TRADE-OFF note does; that note also says what
+# still detects the advisory. Two GitHub pages read 2026-10-10, dependabot-options-reference and
+# troubleshooting-dependabot-errors, show `ignore` reaching security PRs. Neither says how a
+# `versions` range applies there, so that half is not established.
 # Net-new transitives (dep-vet 2026-07-10): requests + urllib3
 # (both ubiquitous, mature; the lock resolves urllib3>=2.7.0 — CVE-2025-50181/50182 SSRF-redirect fixes)
 # plus charset-normalizer/idna/certifi. hvac ships NO type stubs — mypy-strict containment lives inside

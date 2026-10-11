@@ -130,10 +130,10 @@ updates:
     # widened major cap holds that batch hostage too. `webauthn<4` is the major cap of the three.
     # `pynetdicom<3.1` is a minor cap, like `pydicom<3.1`; it was `<4` until vault BACKLOG #2713.
     # pyproject.toml's [dicom] comment says why those two hold, and what raising the pynetdicom cap
-    # requires. Its [webauthn] comment says why that one holds. `hvac<3` is a major cap of the same
-    # case (vault BACKLOG #2569; a seat decision under owner delegation 2026-10-08, not an owner ruling),
-    # and its [vault] comment says why it holds and what its entry costs. Lift each entry in the
-    # same PR that lifts its cap.
+    # requires. Its [webauthn] comment says why that one holds. `hvac<3` is a second major cap with
+    # an entry, so Dependabot cannot widen it (vault BACKLOG #2569; a seat decision under owner
+    # delegation 2026-10-08, not an owner ruling). Its [vault] comment says why it holds and what
+    # the entry costs. Lift each entry in the same PR that lifts its cap.
     #
     # THE RULE (BACKLOG #2505): every upper bound in pyproject.toml has an entry here, exactly `>=`
     # the version the test derives (a `<` cap's bound; for an exact `==` pin, the next minor), unless
