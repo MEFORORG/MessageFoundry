@@ -25,7 +25,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -257,16 +257,8 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[..., None
     # The one Windows seam: the config load and the serve start check (vault BACKLOG #2626) both
     # read through it, so replacing it covers the settings file, the value file and the install.
     @functools.wraps(real)
-    def check_over_clean_readers(
-        paths: Sequence[Path],
-        *,
-        lead: str,
-        refuse: Callable[[str], None],
-        first_is_required: bool = False,
-    ) -> None:
-        wiring._enforce_windows_paths(
-            paths, probes, lead=lead, refuse=refuse, first_is_required=first_is_required
-        )
+    def check_over_clean_readers(paths: Sequence[Path], **options: Any) -> None:
+        wiring._enforce_windows_paths(paths, probes, **options)
 
     patch = pytest.MonkeyPatch()
     patch.setattr(wiring, "_assert_safe_config_source_windows", check_over_clean_readers)

@@ -2341,15 +2341,14 @@ def _start_logging(
     return None
 
 
-def _read_environment_values(
-    env_file: Path, *, base_dir: Path, dir_name: str, environment: str
-) -> dict[str, Any]:
-    """This instance's environment values: ``env_file`` (``<base_dir>/<dir_name>/<environment>.toml``)
-    plus the ``MEFOR_VALUE_*`` environment. ``serve`` hands it to the Engine as the
-    ``env_values_provider``, so it runs at start and again on every reload."""
+def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str) -> dict[str, Any]:
+    """This instance's environment values: the value file
+    :func:`~messagefoundry.config.environments.values_file_path` names, plus the ``MEFOR_VALUE_*``
+    environment. ``serve`` hands it to the Engine as the ``env_values_provider``, so it runs at
+    start and again on every reload."""
     import os
 
-    from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.environments import load_environment_values, values_file_path
     from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
     from messagefoundry.redaction import safe_exc
 
@@ -2378,6 +2377,7 @@ def _read_environment_values(
     # reads it again on every reload. So each read vets it again first, and a file edited or
     # created after the start is not read unvetted. Outside the try below, because WiringError
     # is a ValueError and that arm would wrap the refusal as a read failure.
+    env_file = values_file_path(base_dir, dir_name, environment)
     assert_trusted_start_paths([env_file], lead="refusing to read environment values from")
     try:
         return load_environment_values(
@@ -2587,10 +2587,10 @@ def _serve(args: argparse.Namespace) -> int:
     # else the working directory (unchanged default). Resolved here, ahead of the trust check below
     # and of the startup log that names it, because the standalone-repo / NSSM footgun is a
     # silently-wrong path.
-    from messagefoundry.config.environments import resolve_values_base_dir
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
 
     env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
-    env_file = env_base / settings.environments.dir / f"{env_name}.toml"
+    env_file = values_file_path(env_base, settings.environments.dir, env_name)
 
     if _start_files_refused(service_config, env_file):
         return 2
@@ -4265,7 +4265,6 @@ def _serve(args: argparse.Namespace) -> int:
 
     env_values = functools.partial(
         _read_environment_values,
-        env_file,
         base_dir=env_base,
         dir_name=settings.environments.dir,
         environment=env_name,
@@ -4829,12 +4828,12 @@ def _supervise(args: argparse.Namespace) -> int:
     # account can write would refuse every engine shard, and the supervisor would only restart
     # them. The value file is anchored as each engine shard anchors it: the forwarded
     # --project-root, else [environments].base_dir.
-    from messagefoundry.config.environments import resolve_values_base_dir
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
 
-    env_file = (
-        resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd)
-        / settings.environments.dir
-        / f"{env_name}.toml"
+    env_file = values_file_path(
+        resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd),
+        settings.environments.dir,
+        env_name,
     )
     if _start_files_refused(
         service_config,

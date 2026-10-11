@@ -2491,7 +2491,9 @@ class Engine:
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             try:
-                self._env_values = dict(self._env_values_provider())
+                # Off the event loop: the CLI provider reads the value file and, before that, its
+                # owner and access list (vault BACKLOG #2626), like every other file the engine reads.
+                self._env_values = dict(await asyncio.to_thread(self._env_values_provider))
             except WiringError:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.

@@ -275,7 +275,6 @@ def test_each_read_of_the_value_file_vets_it_again(tmp_path: Path) -> None:
     _settings, values = _two_files(tmp_path)
     read = functools.partial(
         _read_environment_values,
-        values,
         base_dir=tmp_path,
         dir_name="environments",
         environment="dev",

@@ -463,19 +463,7 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed name under the project root the operator named."
     ),
     "messagefoundry/__main__.py::_serve": Site(
-        2,
-        GUARDED,
-        "The store path is the operator's; the environment name passes the settings validator, "
-        "which allows no separator.",
-        "messagefoundry/config/settings.py::_valid_environment_name",
-    ),
-    "messagefoundry/__main__.py::_supervise": Site(
-        1,
-        GUARDED,
-        "The value file each engine shard reads, built to check who can write it before any "
-        "starts (vault BACKLOG #2626); the environment name passes the settings validator, which "
-        "allows no separator.",
-        "messagefoundry/config/settings.py::_valid_environment_name",
+        1, OPERATOR, "The operator's [store].path under the project root the operator named."
     ),
     "messagefoundry/__main__.py::_supervisor_forward_spool_dir": Site(2, OPERATOR, _STORE_PATH),
     "messagefoundry/__main__.py::_webconsole_provenance_problem": Site(
@@ -576,7 +564,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/config/connections_file.py::validating_candidate": Site(
         1, OPERATOR, _CONFIG_FIXED
     ),
-    "messagefoundry/config/environments.py::load_environment_values": Site(
+    "messagefoundry/config/environments.py::values_file_path": Site(
         1,
         GUARDED,
         "Every caller passes [ai].environment, which the validator holds to letters, digits, `.`, "
