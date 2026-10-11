@@ -1555,10 +1555,10 @@ def _places_reading_as_an_anon_import(root: Path) -> tuple[list[str], int]:
     files that walk read.
 
     The texts come from `_absence_corpus`, which blanks comments and strings under `scripts/`. It
-    returns no paths, so the paths come from a second `_python_sources` call over the same tree,
+    returns no paths, so the paths come from a second `_absence_sources` call over the same tree,
     paired by position.
     """
-    sources = scorecard._python_sources(root)
+    sources = scorecard._absence_sources(root)
     _raw, pattern_texts, _viewed = scorecard._absence_corpus(root)
     places: list[str] = []
     for path, text in zip(sources, pattern_texts, strict=True):

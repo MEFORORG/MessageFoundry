@@ -1612,6 +1612,8 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
 
     The control reads RAW text over every root. The pattern reads raw text under the shipped roots,
     ``harness/`` included, and a code-only view under ``scripts/`` (see :data:`_CODE_ONLY_ROOTS`).
+    The in-scope operator PowerShell reads with its comments blanked, and the IDE's TypeScript and
+    the web console's JavaScript read raw (see :func:`_absence_sources`).
 
     **INERT and BLIND are both asked of the view as well as of the raw text (BACKLOG #2210).** The
     raw questions alone let two things through silently. A mutation the view blanks cannot fire
@@ -1637,12 +1639,14 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             # Before asking what the corpus says, ask whether the pattern is a pattern at all. A prose
             # narration greps to nothing and is indistinguishable from a true absence.
             raw_inert = not re.search(a.pattern, a.mutation)
-            lands_in_view = (
-                PurePosixPath(a.mutation_path.replace("\\", "/")).as_posix() in viewed_paths
-            )
+            mutation_rel = PurePosixPath(a.mutation_path.replace("\\", "/"))
+            lands_in_view = mutation_rel.as_posix() in viewed_paths
             view_inert = False
             if not raw_inert:
-                mutation_view, cut = _code_only_view(a.mutation)
+                # A claim landing in a viewed file is read through that file's own view, by the
+                # corpus's rule. Every other claim is asked of the Python view.
+                landed = _pattern_view(mutation_rel, a.mutation) if lands_in_view else None
+                mutation_view, cut = landed or _code_only_view(a.mutation)
                 if cut is not None and not a.mutation[cut:].strip():
                     # Every token was read before the stop, so the view is whole and the claim is
                     # decided, not UNDETERMINED (BACKLOG #2275).
@@ -1690,6 +1694,8 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                 seen_view = seen_raw and any(control_rx.search(t) for t in pattern_texts)
             if not seen_raw or (lands_in_view and not seen_view):
                 # One site for both, for the same reason as INERT above.
+                # Keep "that tokenizes" word for word: the vault's baseline parser matches it. An
+                # operator PowerShell view always completes, so it counts as a file that tokenizes.
                 where = (
                     ""
                     if not seen_raw
@@ -1720,6 +1726,18 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                 )
 
 
+def _absence_sources(root: Path) -> list[Path]:
+    """Every file the absence corpus reads, in the order :func:`_absence_corpus` reads them.
+
+    Python under the shipped roots and ``scripts/``; the operator-run PowerShell owner ruling R3
+    (2026-10-02) puts in the assessed scope (:func:`_operator_powershell_sources`); and the IDE
+    extension's TypeScript and the web console's JavaScript (:func:`_script_sources`). Before
+    BACKLOG #2040's widening the corpus read ``*.py`` only, so an absence claim never saw an
+    in-scope file in any other language.
+    """
+    return _python_sources(root) + _operator_powershell_sources(root) + _script_sources(root)
+
+
 def _python_sources(root: Path) -> list[Path]:
     out: list[Path] = []
     # messagefoundry_toolkit receives code that moves out of messagefoundry/ (ADR 0201), so an
@@ -1741,12 +1759,145 @@ def _python_sources(root: Path) -> list[Path]:
     return out
 
 
+#: The directory of operator-run PowerShell. Owner ruling R3 (2026-10-02) puts the operator-run
+#: scripts in the assessed scope: ``scripts/service/`` and any script the operator documentation
+#: tells a deployer to run. ``docs/ASVS-ASSESSMENT-METHOD.md`` section 2 states that scope. Every
+#: other ``.ps1`` under ``scripts/`` is coordination, worktree, hook or development tooling, which R3
+#: puts out, so it is not read. That is a reading of today's tree and nothing enforces it: an
+#: operator-run ``.ps1`` added outside this directory is unread until it is named here.
+_OPERATOR_POWERSHELL_DIR: Final[str] = "scripts/service"
+
+#: Matched case-insensitively, as the crypto gate's PowerShell arm matches them.
+_POWERSHELL_SUFFIXES: Final[tuple[str, ...]] = (".ps1", ".psm1")
+
+#: Under :data:`_OPERATOR_POWERSHELL_DIR` but outside the assessed scope. The method document's
+#: section 2 classifies it out, by a reading the owner may overrule: a CI measurement, not a
+#: deployment step. Remove it from this set when that reading falls.
+_OUT_OF_SCOPE_POWERSHELL: Final[frozenset[str]] = frozenset(
+    {"scripts/service/measure-store-access.ps1"}
+)
+
+
+def _operator_powershell_sources(root: Path) -> list[Path]:
+    """The in-scope operator-run PowerShell, read through :func:`_powershell_code_only`."""
+    base = root / _OPERATOR_POWERSHELL_DIR
+    if not base.is_dir():
+        return []
+    return sorted(
+        p
+        for p in base.rglob("*")
+        if p.suffix.lower() in _POWERSHELL_SUFFIXES
+        and p.is_file()
+        and p.relative_to(root).as_posix() not in _OUT_OF_SCOPE_POWERSHELL
+    )
+
+
+#: The TypeScript and JavaScript roots, suffixes and pruned directories. A COPY of
+#: ``NON_PYTHON_WALK_ROOTS``, ``NON_PYTHON_SUFFIXES`` and ``NON_PYTHON_SKIP_DIRS`` in
+#: ``scripts/security/crypto_inventory_check.py``, not an import: the vault runs this file as a bare
+#: script with only ``scripts/asvs`` on ``sys.path`` (tests/test_asvs_verifier_vault_contract.py), so
+#: a first-party import would break it there. tests/test_asvs_scorecard.py pins the copy to the gate.
+_SCRIPT_ROOTS: Final[tuple[str, ...]] = ("ide", "messagefoundry_webconsole")
+_SCRIPT_SUFFIXES: Final[tuple[str, ...]] = (".ts", ".js", ".mjs", ".cjs")
+_SCRIPT_SKIP_DIRS: Final[frozenset[str]] = frozenset(
+    {"node_modules", "out", "dist", ".vscode-test", "coverage"}
+)
+
+#: The one difference from the crypto gate's walk: the extension's own test suite. It does not
+#: ship, and the Python corpus never reads ``tests/`` either. Read raw, a test's fixture data
+#: matches patterns written for shipped code, such as a handler named by a two-character string.
+_SCRIPT_TEST_DIRS: Final[frozenset[str]] = frozenset({"ide/src/test"})
+
+
+def _script_sources(root: Path) -> list[Path]:
+    """Every first-party TypeScript or JavaScript source under :data:`_SCRIPT_ROOTS`.
+
+    **Known limit: these files are read RAW.** No lexer here tells a ``//`` comment from the ``//``
+    of a URL in a string, so comments and string contents stay visible to the pattern. A claim can
+    therefore read FALSE on a token a comment or a string names, which over-reports; it never goes
+    quiet on a real call.
+    """
+    out: list[Path] = []
+    for name in _SCRIPT_ROOTS:
+        base = root / name
+        if not base.is_dir():
+            continue
+        for dirpath, dirnames, filenames in base.walk():
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in _SCRIPT_SKIP_DIRS
+                and (dirpath / d).relative_to(root).as_posix() not in _SCRIPT_TEST_DIRS
+            ]
+            out.extend(dirpath / f for f in filenames if f.endswith(_SCRIPT_SUFFIXES))
+    return sorted(out)
+
+
+def _powershell_code_only(text: str) -> str:
+    """``text`` with PowerShell comment lines replaced by spaces, IN PLACE.
+
+    The same decisions as ``_powershell_code`` in ``scripts/security/crypto_inventory_check.py``,
+    which tests/test_asvs_scorecard.py pins: a line whose code starts with ``#`` is a comment, and a
+    ``<#`` opens a block comment only where it starts the remaining code on a line. That function
+    drops what it removes; this one blanks it, so line structure holds as in :func:`_code_only`.
+
+    Known limits, both in the over-reporting direction. A trailing ``#`` comment after code is
+    kept, as the gate keeps it. Strings are NOT blanked, unlike the Python view, because these are
+    shipped operator scripts and a pattern that names a string argument must still fire on them.
+    """
+    out: list[str] = []
+    in_block = False
+    for raw_line in text.splitlines(keepends=True):
+        content = raw_line.splitlines()[0]
+        ending = raw_line[len(content) :]
+        line = content
+        if in_block:
+            end = line.find("#>")
+            if end < 0:
+                out.append(" " * len(content) + ending)
+                continue
+            line = line[end + 2 :]
+            in_block = False
+        while True:
+            stripped = line.lstrip()
+            if not stripped.startswith("<#"):
+                break
+            end = stripped.find("#>", 2)
+            if end < 0:
+                in_block = True
+                line = ""
+                break
+            line = stripped[end + 2 :]
+        stripped = line.strip()
+        kept = line if stripped and not stripped.startswith("#") else ""
+        # What survives is always a suffix of the line, so blanking the rest keeps every column.
+        out.append(" " * (len(content) - len(kept)) + kept + ending)
+    return "".join(out)
+
+
+def _pattern_view(rel: PurePosixPath, text: str) -> tuple[str, int | None] | None:
+    """The view the absence pattern reads ``text`` through at ``rel``, or ``None`` for raw.
+
+    One rule, used for a corpus file and for a claim's mutation landing in one. The result has
+    :func:`_code_only_view`'s shape: a PowerShell view never stops early, and a Python view may.
+    """
+    suffix = rel.suffix.lower()
+    if suffix in _POWERSHELL_SUFFIXES:
+        return _powershell_code_only(text), None
+    if suffix == ".py" and rel.parts and rel.parts[0] in _CODE_ONLY_ROOTS:
+        return _code_only_view(text)
+    return None
+
+
 #: Roots whose files the absence PATTERN reads through :func:`_code_only` (BACKLOG #2040). Tooling
 #: here names the tokens it hunts for -- a crypto detector table maps the KDF call names to ``kdf``,
 #: a CI comment names GitHub's query API -- and a raw grep read those names as the thing itself, so
-#: claims about shipped code read FALSE on hits in a tool. The root stays IN the corpus on purpose:
-#: dropping it would settle whether ``scripts/`` is in the scan's scope, which BACKLOG #1136 and ADR
-#: 0183 record as open. A real call in a script still reads FALSE when the pattern names code. A
+#: claims about shipped code read FALSE on hits in a tool. Owner ruling R3 (2026-10-02) settled the
+#: scope: only the operator-run scripts are in it. Every ``.py`` under ``scripts/`` stays in the
+#: corpus anyway, because reading more than the scope over-reports a hit, which is the safe
+#: direction for an absence claim, and narrowing it is a separate decision. The in-scope PowerShell
+#: is read through :func:`_powershell_code_only` instead. A real call in a script still reads FALSE
+#: when the pattern names code. A
 #: pattern that names a string ARGUMENT cannot fire here, and that is this view's cost: for a claim
 #: whose own mutation goes quiet under it, the view does narrow the scope. :func:`check_absences`
 #: names each such claim as a ``view-inert`` advisory, so the count is whatever a run prints beside
@@ -1773,24 +1924,25 @@ _LITERAL_MIDDLES: Final[frozenset[int]] = frozenset(
 def _absence_corpus(root: Path) -> tuple[list[str], list[str], list[str | None]]:
     """Read the corpus once: raw texts for the positive controls, and the texts patterns search.
 
-    The third list names, as a POSIX path relative to ``root``, each file whose pattern text is the
-    code-only view, and holds ``None`` for one read raw. A code-only file that will not tokenize is
-    read raw, so it is ``None`` too. :func:`check_absences` asks this list whether a claim's
-    ``mutation_path`` is read through the view, so the answer is the corpus's own and never a
-    second copy of its rules.
+    The third list names, as a POSIX path relative to ``root``, each file whose pattern text is a
+    view, and holds ``None`` for one read raw. A ``.py`` file under a code-only root is read through
+    the code-only view, and one that will not tokenize is read raw, so it is ``None`` too. An
+    in-scope PowerShell file is read through :func:`_powershell_code_only`, which always completes.
+    TypeScript and JavaScript are read raw. :func:`check_absences` asks this list whether a claim's
+    ``mutation_path`` is read through a view, so the answer is the corpus's own and never a second
+    copy of its rules.
     """
     raw: list[str] = []
     view: list[str] = []
     viewed: list[str | None] = []
-    for path in _python_sources(root):
+    for path in _absence_sources(root):
         text = path.read_text(encoding="utf-8", errors="replace")
         raw.append(text)
-        rel = path.relative_to(root)
+        rel = PurePosixPath(path.relative_to(root).as_posix())
         pattern_text, seen_as = text, None
-        if rel.parts[0] in _CODE_ONLY_ROOTS:
-            code_view, cut = _code_only_view(text)
-            if cut is None:
-                pattern_text, seen_as = code_view, rel.as_posix()
+        got = _pattern_view(rel, text)
+        if got is not None and got[1] is None:
+            pattern_text, seen_as = got[0], rel.as_posix()
         view.append(pattern_text)
         viewed.append(seen_as)
     return raw, view, viewed

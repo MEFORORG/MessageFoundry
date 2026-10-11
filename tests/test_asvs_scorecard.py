@@ -1263,6 +1263,189 @@ def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
     assert len(problems) == 1 and "FALSE" in problems[0]
 
 
+# --- the absence corpus reads the in-scope non-Python sources (BACKLOG #2040, #1164) -------------
+#
+# The corpus read *.py only, so an absence claim never saw the operator-run PowerShell that owner
+# ruling R3 (2026-10-02) puts in the assessed scope, nor the IDE's TypeScript or the web console's
+# JavaScript. tee/ stays out, by owner ruling R4 of the same day.
+
+_PS_CERT = (r"(?i)\bImport-Certificate\b", "Import-Certificate -FilePath $ca")
+_SERVICE_PS = "scripts/service/install-service.ps1"
+
+
+def test_absence_reads_a_call_in_operator_powershell_as_FALSE(tmp_path: Path) -> None:
+    """Positive control: before the widening, this hit sat in a file the corpus never opened."""
+    root = _absence_tree(tmp_path, {_SERVICE_PS: "Import-Certificate -FilePath $ca\n"})
+    problems = _absence_problems(root, *_PS_CERT)
+    assert len(problems) == 1 and "FALSE" in problems[0], problems
+
+
+def test_absence_reads_a_string_argument_in_operator_powershell(tmp_path: Path) -> None:
+    """Operator scripts ship, so their strings stay visible, unlike a Python script's."""
+    root = _absence_tree(tmp_path, {_SERVICE_PS: "$p = 'SameSite=None'\n"})
+    problems = _absence_problems(root, r"(?i)samesite=none", "x = 'SameSite=None'")
+    assert len(problems) == 1 and "FALSE" in problems[0], problems
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# Import-Certificate -FilePath $ca\n",
+        "    # Import-Certificate\n",
+        "<#\n.EXAMPLE\n  Import-Certificate -FilePath ca.cer\n#>\n$x = 1\n",
+        "<# Import-Certificate #>\n",
+    ],
+)
+def test_absence_quiet_on_a_powershell_comment(tmp_path: Path, text: str) -> None:
+    """Negative control: help text and comments name the cmdlet without calling it."""
+    root = _absence_tree(tmp_path, {_SERVICE_PS: text})
+    assert _absence_problems(root, *_PS_CERT) == []
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "scripts/coord/tool.ps1",
+        "scripts/service/measure-store-access.ps1",
+        "tee/run.ps1",
+        "samples/install.ps1",
+    ],
+)
+def test_absence_quiet_on_powershell_outside_the_assessed_scope(tmp_path: Path, rel: str) -> None:
+    """Negative control: R3 puts tooling out, the method reads the CI measurement out, R4 tee/."""
+    root = _absence_tree(tmp_path, {rel: "Import-Certificate -FilePath $ca\n"})
+    assert _absence_problems(root, *_PS_CERT) == []
+
+
+def test_absence_reads_web_console_javascript_and_ide_typescript_raw(tmp_path: Path) -> None:
+    """Raw, so a comment counts too: the known limit, over-reporting rather than going quiet."""
+    for n, rel in enumerate(
+        (
+            "messagefoundry_webconsole/static/app.js",
+            "ide/src/extension.ts",
+            "ide/media/view.js",
+        )
+    ):
+        root = _absence_tree(tmp_path / str(n), {rel: "// fetch('/ui/logs/tail')\n"})
+        problems = _absence_problems(root, r"/ui/logs/tail", "fetch('/ui/logs/tail')")
+        assert len(problems) == 1 and "FALSE" in problems[0], (rel, problems)
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "ide/node_modules/dep/index.js",
+        "ide/out/extension.js",
+        "ide/src/test/suite/a.test.ts",
+        "messagefoundry_webconsole/static/app.css",
+        "tee/static/app.js",
+    ],
+)
+def test_absence_quiet_on_scripts_the_corpus_does_not_read(tmp_path: Path, rel: str) -> None:
+    """Negative control: dependency and build trees, the IDE's tests, other suffixes, tee/."""
+    root = _absence_tree(tmp_path, {rel: "fetch('/ui/logs/tail')\n"})
+    assert _absence_problems(root, r"/ui/logs/tail", "fetch('/ui/logs/tail')") == []
+
+
+def test_absence_landing_in_operator_powershell_is_read_through_its_view(tmp_path: Path) -> None:
+    """A claim landing in an operator script is asked of the PowerShell view, never the Python one.
+
+    A comment mutation there could never fire, so it is INERT. A code mutation is not, and its
+    PowerShell syntax must not leave the Python tokenizer to call it undetermined.
+    """
+    root = _absence_tree(tmp_path, {_SERVICE_PS: "$x = 1\n"})
+    f = _absence_findings(root, r"(?i)Import-Certificate", "# Import-Certificate", control="x")
+    assert f.problems == [] and f.advisory_kinds == {"view-inert": 1}, f.problems
+    f = _absence_findings(
+        root, r"(?i)Import-Certificate", "# Import-Certificate", "x", mutation_path=_SERVICE_PS
+    )
+    assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
+    f = _absence_findings(
+        root, *_PS_CERT, control=r"\$x = 1", mutation_path=_SERVICE_PS.replace("/", "\\")
+    )
+    assert f.problems == [] and f.advisories == [], (f.problems, f.advisories)
+
+
+def test_absence_corpus_pairs_with_its_source_list(tmp_path: Path) -> None:
+    """Callers pair `_absence_sources` with `_absence_corpus` by position, so both must agree."""
+    root = _absence_tree(
+        tmp_path,
+        {
+            _SERVICE_PS: "# c\n$x = 1\n",
+            "scripts/tool.py": "x = 1  # c\n",
+            "messagefoundry_webconsole/static/app.js": "// c\n",
+        },
+    )
+    sources = scorecard_module._absence_sources(root)
+    raw, view, viewed = scorecard_module._absence_corpus(root)
+    rels = [p.relative_to(root).as_posix() for p in sources]
+    assert len(rels) == len(raw) == len(view) == len(viewed) == 4, rels
+    by_rel = dict(zip(rels, viewed, strict=True))
+    assert by_rel[_SERVICE_PS] == _SERVICE_PS
+    assert by_rel["scripts/tool.py"] == "scripts/tool.py"
+    assert by_rel["messagefoundry_webconsole/static/app.js"] is None
+    assert by_rel["messagefoundry/m.py"] is None
+
+
+def test_powershell_view_blanks_in_place_and_keeps_line_structure() -> None:
+    text = "# a\r\n$x = 1 # t\n<# b\nc #> $y = 2\n\fz\n"
+    out = scorecard_module._powershell_code_only(text)
+    assert len(out) == len(text)
+    assert out.splitlines(keepends=True)[1] == "$x = 1 # t\n"  # a trailing comment is kept
+    assert [ln.strip() for ln in out.splitlines()] == ["", "$x = 1 # t", "", "$y = 2", "", "z"]
+    assert [i for i, ch in enumerate(text) if ch in "\r\n\f"] == [
+        i for i, ch in enumerate(out) if ch in "\r\n\f"
+    ]
+
+
+_PS_PARITY_SAMPLES = (
+    "# only a comment\n",
+    "$a = 1 # trailing\n",
+    "<# one-line #> $b = 2\n",
+    "  <# opens\n still in #> $c = 3\n<# x #> # then a comment\n",
+    "$s = '<# not a block'\n$d = 4\n",
+    "<# a #> <# b #> $e = 5\n<# unclosed\n$hidden = 6\n",
+)
+
+
+def test_powershell_view_makes_the_crypto_gates_decisions() -> None:
+    """Parity: the verifier cannot import the gate (it runs bare in the vault), so it copies it.
+
+    Every real ``.ps1`` and ``.psm1`` under ``scripts/``, plus edge cases, must keep exactly the
+    code lines the gate's ``_powershell_code`` keeps.
+    """
+    from scripts.security import crypto_inventory_check as gate
+
+    repo = Path(__file__).resolve().parents[1]
+    real = gate.powershell_sources(repo / "scripts")
+    assert len(real) >= 5, real  # an empty walk would prove nothing
+    texts = [p.read_text(encoding="utf-8", errors="replace") for p in real]
+    for text in (*texts, *_PS_PARITY_SAMPLES):
+        mine = [ln.strip() for ln in scorecard_module._powershell_code_only(text).splitlines()]
+        theirs = [ln.strip() for ln in gate._powershell_code(text)]
+        assert [ln for ln in mine if ln] == theirs, text[:200]
+
+
+def test_script_walk_matches_the_crypto_gates_walk() -> None:
+    """Parity: the same roots, suffixes and pruned directories as the gate, less the IDE's tests."""
+    from scripts.security import crypto_inventory_check as gate
+
+    assert scorecard_module._SCRIPT_ROOTS == gate.NON_PYTHON_WALK_ROOTS
+    assert scorecard_module._SCRIPT_SUFFIXES == gate.NON_PYTHON_SUFFIXES
+    assert scorecard_module._SCRIPT_SKIP_DIRS == gate.NON_PYTHON_SKIP_DIRS
+    assert scorecard_module._POWERSHELL_SUFFIXES == gate.POWERSHELL_SUFFIXES
+    repo = Path(__file__).resolve().parents[1]
+    theirs = {
+        p.relative_to(repo).as_posix()
+        for name in gate.NON_PYTHON_WALK_ROOTS
+        for p in gate.non_python_sources(repo / name)
+    }
+    mine = {p.relative_to(repo).as_posix() for p in scorecard_module._script_sources(repo)}
+    tests = {p for p in theirs if p.startswith("ide/src/test/")}
+    assert tests and mine, (len(tests), len(mine))  # both sides read something
+    assert mine == theirs - tests
+
+
 def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:
     src = (
         'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nc = f"a}}{{b\\N{BULLET}"\n'
