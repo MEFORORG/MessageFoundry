@@ -463,10 +463,11 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed name under the project root the operator named."
     ),
     "messagefoundry/__main__.py::_serve": Site(
-        2,
+        3,
         GUARDED,
         "The store path is the operator's; the environment name passes the settings validator, "
-        "which allows no separator.",
+        "which allows no separator; the default settings file is a fixed name in the working "
+        "directory, checked before it steers anything (vault BACKLOG #2626).",
         "messagefoundry/config/settings.py::_valid_environment_name",
     ),
     "messagefoundry/__main__.py::_supervisor_forward_spool_dir": Site(2, OPERATOR, _STORE_PATH),
@@ -590,6 +591,13 @@ SITES: dict[str, Site] = {
     "messagefoundry/config/wiring.py::_HelperImporter._load": Site(
         1, OPERATOR, "A helper module name from an import in the operator's own config code."
     ),
+    "messagefoundry/config/wiring.py::config_source_trust_paths": Site(
+        3,
+        REVIEWED,
+        "Fixed names under the operator's config directory, built only to list, stat or read the "
+        "access list of for the trust check; no file is opened through them here.",
+    ),
+    "messagefoundry/config/wiring.py::install_trust_paths": Site(2, INTERNAL, _PKG_LITERAL),
     "messagefoundry/config/wiring.py::load_config": Site(1, OPERATOR, _CODESETS),
     "messagefoundry/config/wiring.py::validate_config": Site(1, OPERATOR, _CODESETS),
     "messagefoundry/corepoint_import.py::_replace_modules": Site(
@@ -899,10 +907,11 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        19,
+        21,
         OPERATOR,
-        "Fixed names under paths the operator passes or the script derives (repo root, data "
-        "directory, NSSM directory, temp), plus registry keys named after the service's own images.",
+        "Fixed names under paths the operator passes or the script derives (repo root, install "
+        "root, project root, data directory, NSSM directory, temp), plus registry keys named after "
+        "the service's own images.",
     ),
     "scripts/service/uninstall-net-helper.ps1": Site(
         1, OPERATOR, "A fixed name under the install directory."

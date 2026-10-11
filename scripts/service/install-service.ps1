@@ -28,13 +28,28 @@ param(
     # The engine's console-script launcher, e.g. <venv>\Scripts\messagefoundry.exe. It names the
     # INSTALL the service runs from. The service does not run it: it runs the Python interpreter of
     # that install directly, so the interpreter options below reach it (vault BACKLOG #2701).
+    # Defaults to the admin-only install root, "$env:ProgramFiles\MessageFoundry\engine", which the
+    # installer checks and does not build (vault BACKLOG #2626). docs/SERVICE.md "Install the engine
+    # where only administrators can write" builds it from the wheel. A checkout's venv still works
+    # when passed here.
     [string]$AppExe,
     # The interpreter the service runs. Defaults to the python.exe of the install -AppExe is in:
     # beside it for a virtual environment, one folder up for a system-wide install. Pass it when
     # neither is right. It must be able to import messagefoundry in isolated mode, which leaves
     # out the user's own site directory, so a `pip install --user` copy will not do.
     [string]$PythonExe,
+    # The config directory the service loads. Required: it used to default to the checkout's
+    # samples\config, a demo graph in a folder its developers can write (vault BACKLOG #2626).
     [string]$Config,
+    # The service settings file (messagefoundry.toml), registered as an absolute --service-config.
+    # Without it, the installer registers <ProjectRoot or working directory>\messagefoundry.toml
+    # when that file exists, which is the file `serve` would read from its working directory.
+    [string]$ServiceConfig,
+    # The config-repo root the value file environments\<env>.toml resolves under, registered as
+    # --project-root. Without it, a service on the default install root uses the folder above
+    # -Config, the layout docs/INSTALL-GUIDE.md shows, and a service on a passed -AppExe uses its
+    # working directory, as before.
+    [string]$ProjectRoot,
     [string]$DbPath,
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
     [string]$ListenHost = "127.0.0.1",
@@ -70,6 +85,8 @@ param(
     # Opt-in: strip inherited ACEs from the config dir and lock it to SYSTEM + Administrators + the
     # service account (RX). The in-process source-trust guard (SEC-003) refuses to load config from a
     # dir/module a low-privileged principal can write, so this one flag satisfies that requirement.
+    # It locks the folder of the value file the same way, because `serve` refuses a start whose value
+    # file another account can write (vault BACKLOG #2626).
     # Default OFF because the config dir often lives inside a developer's repo, where stripping
     # inheritance is surprising; for production point -Config at a dedicated admin-owned dir and pass
     # this switch (see docs/SERVICE.md "Restrict the config directory").
@@ -1242,9 +1259,42 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Installing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-# Repo root is two levels up from this script (scripts\service\). Computed FIRST: -AppExe and
-# -Config default from it, and the normalization below has to run before anything CONSUMES a path.
+# Repo root is two levels up from this script (scripts\service\). Computed FIRST: it is the working
+# directory of a service run from a checkout (a passed -AppExe), and the normalization below has to
+# run before anything CONSUMES a path.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
+# The default install root (vault BACKLOG #2626). Under Program Files, so a new folder there inherits
+# an access list only administrators can write; the installer checks that below rather than assume
+# it. The installer does not build the root: docs/SERVICE.md "Install the engine where only
+# administrators can write" installs the hash-locked dependencies and the engine wheel into it, never
+# editable. A checkout's own venv stays usable by passing -AppExe, and whether the installer may stop
+# accepting one is an open owner question, so nothing here refuses it.
+$DefaultInstallRoot = Join-Path $env:ProgramFiles "MessageFoundry\engine"
+$UsesDefaultInstall = -not ($AppExe -or $PythonExe)
+
+function Get-DefaultServiceConfig {
+    <#
+      The settings file a service registered without -ServiceConfig is given: messagefoundry.toml
+      under $Anchor when it exists, else "". $Anchor is -ProjectRoot, or the working directory when
+      there is none, so this names the same file `serve` would have read from its working directory,
+      and registers it by absolute path (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][string]$Anchor)
+    $candidate = Join-Path $Anchor "messagefoundry.toml"
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    return ""
+}
+
+function Get-ValueFileFolder {
+    <#
+      The folder of the value file environments\<env>.toml the service reads: under -ProjectRoot,
+      or under the working directory when there is none. The default folder name only: a settings
+      file that renames [environments].dir moves it, and this does not read the settings.
+    #>
+    param([string]$ProjectRoot, [Parameter(Mandatory)][string]$AppDirectory)
+    return (Join-Path $(if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }) "environments")
+}
 
 # --- absolute paths, before anything consumes one (BACKLOG #1554) -----------------------------------
 # A service resolves a relative path against its own working directory, so every path baked into the
@@ -1266,14 +1316,28 @@ function Resolve-AbsolutePath {
 }
 
 $DataDir = Resolve-AbsolutePath $DataDir
-if (-not $AppExe) { $AppExe = Join-Path $RepoRoot ".venv\Scripts\messagefoundry.exe" }
+if ($UsesDefaultInstall) { $AppExe = Join-Path $DefaultInstallRoot "Scripts\messagefoundry.exe" }
 else { $AppExe = Resolve-AbsolutePath $AppExe }
 # The interpreter the service runs (vault BACKLOG #2701). Named here, with the other paths, so it
 # is absolute before anything consumes it. Empty when none is found; refused below.
 if ($PythonExe) { $PythonExe = Resolve-AbsolutePath $PythonExe }
 else { $PythonExe = Get-EngineInterpreter -AppExe $AppExe }
-if (-not $Config) { $Config = Join-Path $RepoRoot "samples\config" }
-else { $Config = Resolve-AbsolutePath $Config }
+# No default (vault BACKLOG #2626). It used to be the checkout's samples\config: a demo graph, in a
+# folder its developers can write, run as the service account.
+if (-not $Config) {
+    throw ("Pass -Config with the config directory the service loads. It has no default: the old " +
+        "one was this checkout's samples\config, a demo graph (docs/SERVICE.md 'Install').")
+}
+$Config = Resolve-AbsolutePath $Config
+# The working directory: the install root for the default install, and the checkout for a passed
+# -AppExe, as before. -m resolves nothing against it either way: the service runs isolated (-I).
+$AppDirectory = if ($UsesDefaultInstall) { $DefaultInstallRoot } else { $RepoRoot }
+if ($ProjectRoot) { $ProjectRoot = Resolve-AbsolutePath $ProjectRoot }
+elseif ($UsesDefaultInstall) { $ProjectRoot = Split-Path -Parent $Config }
+if ($ServiceConfig) { $ServiceConfig = Resolve-AbsolutePath $ServiceConfig }
+else {
+    $ServiceConfig = Get-DefaultServiceConfig -Anchor $(if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory })
+}
 # Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
@@ -1287,8 +1351,23 @@ $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
 # The launcher only names the install, so it is required only while it is what finds the
 # interpreter. With -PythonExe the service's program is already named.
 if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path $AppExe)) {
-    throw ("Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, " +
-        "or pass -AppExe, or name the interpreter with -PythonExe.")
+    throw ("Engine executable not found at: $AppExe`nBuild the install root from the engine wheel " +
+        "(docs/SERVICE.md 'Install the engine where only administrators can write'), or pass " +
+        "-AppExe, or name the interpreter with -PythonExe.")
+}
+# The default root must be what its name says. A passed -AppExe is not checked here: refusing one a
+# broad principal can write would end most services run from a checkout, and that waits on an owner
+# ruling. `serve` reports such an install at every start.
+#
+# Get-NssmHomeProblem answers that question for any file, not only nssm.exe: who other than
+# administrators could replace it, through the file or any folder above it.
+if ($UsesDefaultInstall) {
+    $installProblem = Get-NssmHomeProblem -File $AppExe
+    if ($installProblem) {
+        throw ("The default install root '$DefaultInstallRoot' is not administrator-only: " +
+            "$installProblem. Set its access list and owner as docs/SERVICE.md 'Install the " +
+            "engine where only administrators can write' shows, or pass -AppExe.")
+    }
 }
 # NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
 # install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in the
@@ -1301,6 +1380,9 @@ if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf))
         "engine is in (docs/SERVICE.md 'The service launch').")
 }
 if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
+if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Leaf)) {
+    throw "Service settings file not found at: $ServiceConfig"
+}
 
 $LogDir   = Join-Path $DataDir "logs"
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -1314,6 +1396,10 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 $StdoutLog = Join-Path $LogDir "service.out.log"
 $StderrLog = Join-Path $LogDir "service.err.log"
 $AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
+# Absolute, so the file the service reads does not depend on its working directory (vault BACKLOG
+# #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
+if ($ServiceConfig) { $AppParams += " --service-config `"$ServiceConfig`"" }
+if ($ProjectRoot) { $AppParams += " --project-root `"$ProjectRoot`"" }
 
 # --- install -----------------------------------------------------------------
 
@@ -1498,7 +1584,7 @@ try {
 # The interpreter, with the options in $AppParams ahead of `-m messagefoundry` (vault BACKLOG #2701).
 Invoke-Nssm set $ServiceName Application $PythonExe
 Invoke-Nssm set $ServiceName AppParameters $AppParams
-Invoke-Nssm set $ServiceName AppDirectory $RepoRoot
+Invoke-Nssm set $ServiceName AppDirectory $AppDirectory
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"
 Invoke-Nssm set $ServiceName Description "MessageFoundry HL7 v2 integration engine."
 Invoke-Nssm set $ServiceName Start SERVICE_AUTO_START
@@ -1675,7 +1761,17 @@ if ($ServiceAccount) {
 # Without the switch we stay additive and WARN that the guard will refuse to load if an inherited write
 # ACE survives.
 if ($LockConfigDir) {
-    Set-SecureConfigAcl -Path $Config -Account $ServiceAccount
+    # The value file's folder too, when there is one: `serve` refuses a start whose value file, or
+    # its folder, another account can write (vault BACKLOG #2626).
+    $ValueFolder = Get-ValueFileFolder -ProjectRoot $ProjectRoot -AppDirectory $AppDirectory
+    $LockPaths = @($Config)
+    if (Test-Path -LiteralPath $ValueFolder -PathType Container) { $LockPaths += $ValueFolder }
+    foreach ($LockPath in $LockPaths) {
+        Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount
+    }
+    if ($LockPaths.Count -gt 1) {
+        Write-Host "  Values : '$ValueFolder' locked the same way (vault BACKLOG #2626)."
+    }
     $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
                    else { "SYSTEM/Administrators (F)" }
     Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."

@@ -1017,7 +1017,15 @@ def test_the_smoke_stop_runs_after_a_failed_step_and_before_the_uninstall() -> N
 # ORDER IS THE DEFECT, so the guards below are about WHERE the normalization happens, not merely that
 # it happens. Three assertions of shape and one of behaviour.
 
-_PATH_PARAMS = ["DataDir", "AppExe", "PythonExe", "Config", "DbPath"]
+_PATH_PARAMS = [
+    "DataDir",
+    "AppExe",
+    "PythonExe",
+    "Config",
+    "ServiceConfig",
+    "ProjectRoot",
+    "DbPath",
+]
 
 
 def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
@@ -1090,20 +1098,25 @@ def test_every_path_parameter_is_absolute_before_anything_consumes_it(tmp_path: 
 
 
 def test_the_repo_root_is_computed_before_the_defaults_that_need_it(tmp_path: Path) -> None:
-    """$AppExe and $Config default from $RepoRoot, so $RepoRoot has to exist first.
+    """Each default is built from a root that has to exist first: $AppExe and $AppDirectory from
+    $DefaultInstallRoot, and $AppDirectory from $RepoRoot for a checkout (vault BACKLOG #2626).
 
     This is the second half of the reorder: moving the normalization up is wrong if it lands above
-    the value two of the four defaults are built from.
+    the value a default is built from.
     """
     facts = _preflight_facts(tmp_path)
-    root = [a for a in facts["assignments"] if a["lhs"] == "RepoRoot"]
-    assert len(root) == 1, f"expected one $RepoRoot assignment, found {len(root)}"
-    for var in ("AppExe", "Config"):
-        first = min(a["start"] for a in facts["assignments"] if a["lhs"] == var)
-        assert root[0]["start"] < first, (
-            f"$RepoRoot (line {root[0]['line']}) is computed after the first write to ${var}, "
-            "whose default is built from it"
-        )
+    for root_var, dependents in (
+        ("RepoRoot", ("AppDirectory",)),
+        ("DefaultInstallRoot", ("AppExe", "AppDirectory")),
+    ):
+        root = [a for a in facts["assignments"] if a["lhs"] == root_var]
+        assert len(root) == 1, f"expected one ${root_var} assignment, found {len(root)}"
+        for var in dependents:
+            first = min(a["start"] for a in facts["assignments"] if a["lhs"] == var)
+            assert root[0]["start"] < first, (
+                f"${root_var} (line {root[0]['line']}) is computed after the first write to "
+                f"${var}, whose default is built from it"
+            )
 
 
 def test_no_path_parameter_is_normalized_with_resolve_path(tmp_path: Path) -> None:

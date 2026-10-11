@@ -3988,14 +3988,16 @@ jobs:
           # path") and `serve` crash-loops to SERVICE_PAUSED, so /health never comes up. Locking the
           # config dir (strip inheritance -> SYSTEM/Administrators + the run-as account, RX) is the
           # production-correct posture docs/SERVICE.md prescribes, and exercises the real -LockConfigDir
-          # install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape.
+          # install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape. It also locks
+          # environments\, the value file's folder, which `serve` now refuses to read when Users can
+          # write it (vault BACKLOG #2626). -Config is named because it no longer has a default.
           # #224: NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
           # the least-privilege virtual account NT SERVICE\MessageFoundry (no password). This leg is the
           # gate for that flip: it proves the virtual account is granted config-read (RX, via the
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
           # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
           # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir @cached
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -Config samples\config -LogLevel INFO -Environment prod -LockConfigDir @cached
           # vault BACKLOG #2702: that install gives the service a restricted token. The samples
           # graph has File connections under the working directory (in\, dev-inbox\, out\), and a
           # grant to Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator
