@@ -111,7 +111,11 @@ dependencies = [
     # engine does use are declared below with the extra's own markers.
     "uvicorn==0.54.0",
     # The API's HTTP parser (llhttp). serve pins it and refuses to start without it (BACKLOG #1125).
-    "httptools>=0.8.0",
+    # Pinned exactly: llhttp, vendored in httptools, decides which ambiguous request framings are
+    # refused. 0.8.0 is the release measured, and tests/test_api_request_framing_wire.py holds the
+    # same version. Move the pin only after re-running that suite's framing shapes against a new
+    # release.
+    "httptools==0.8.0",
     # The library behind both WebSocket protocols protocol_headers.py floors: the sans-I/O one
     # ``ws="auto"`` resolves to from uvicorn 0.50, and the legacy server before it. /ws/stats runs on
     # it. Without a WebSocket library uvicorn serves no WebSocket route at all.

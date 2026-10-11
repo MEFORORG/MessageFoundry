@@ -23,18 +23,21 @@ from __future__ import annotations
 
 import asyncio
 import re
+import tomllib
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httptools
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from messagefoundry.api import create_app
 from messagefoundry.api.protocol_headers import floored_http_protocol_class
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
-from tests.test_header_floor_wire import _served
+from tests.test_header_floor_wire import _ROOT, _served
 
 #: The httptools this suite was measured against. See its test before moving it.
 _MEASURED_HTTPTOOLS = "0.8.0"
@@ -150,6 +153,21 @@ def test_the_suite_is_measuring_the_httptools_it_was_written_against() -> None:
     assert httptools.__version__ == _MEASURED_HTTPTOOLS, (
         f"httptools is {httptools.__version__}, and this suite measured {_MEASURED_HTTPTOOLS}. "
         "Re-run the framing shapes against it, then move the pin."
+    )
+
+
+def test_pyproject_pins_the_httptools_this_suite_measured() -> None:
+    """The base dependencies pin httptools exactly, to the version measured here, on every
+    platform. The installed-version test above cannot see a range that still resolves to the
+    measured version in the lock, though a fresh install could take a release nobody drove."""
+    pyproject = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = list(map(Requirement, pyproject["project"]["dependencies"]))
+    same = [r for r in deps if canonicalize_name(r.name) == "httptools"]
+    assert len(same) == 1, f"httptools has {len(same)} entries in [project].dependencies, not one"
+    (req,) = same
+    assert req.marker is None, f"httptools is pinned on some platforms only: {req}"
+    assert str(req.specifier) == f"=={_MEASURED_HTTPTOOLS}", (
+        f"httptools is not pinned to {_MEASURED_HTTPTOOLS}: {req}"
     )
 
 
