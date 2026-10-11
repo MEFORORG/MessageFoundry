@@ -1371,21 +1371,31 @@ def test_absence_view_is_chosen_by_the_claims_path_even_when_the_file_is_absent(
 ) -> None:
     """A PowerShell path gets the PowerShell view, a TS or JS path gets none: both read their kind.
 
-    The file need not exist yet, so a claim about a new operator script is still asked of the view
-    that script will be read through, never of the Python tokenizer.
+    The file need not exist yet. An in-scope operator script is read only through its view, so a
+    claim naming a new one lands there, with the same INERT and BLIND checks as an existing one.
     """
-    root = _absence_tree(tmp_path, {})
+    root = _absence_tree(tmp_path, {_SERVICE_PS: "$x = 1\n"})
     new_ps = "scripts/service/new.ps1"
-    f = _absence_findings(
-        root, r"(?i)Import-Certificate", "# Import-Certificate", "Control", new_ps
-    )
-    assert f.problems == [] and f.advisory_kinds == {"view-inert": 1}, f.advisories
-    f = _absence_findings(root, *_PS_CERT, mutation_path=new_ps)
+    f = _absence_findings(root, r"(?i)Import-Certificate", "# Import-Certificate", "x", new_ps)
+    assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
+    f = _absence_findings(root, *_PS_CERT, control=r"\$x = 1", mutation_path=new_ps)
     assert f.problems == [] and f.advisories == [], f.advisories
+    # The control must be sighted in a PowerShell view; the Python fixture's class does not count.
+    f = _absence_findings(root, *_PS_CERT, mutation_path=new_ps)
+    assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    # Outside the scope, the claim does not land: the Python view answers, as an advisory.
+    f = _absence_findings(
+        root,
+        r"(?i)Import-Certificate",
+        "# Import-Certificate",
+        "x",
+        "scripts/service/measure-store-access.ps1",
+    )
+    assert f.problems == [], f.problems
     for rel in ("messagefoundry_webconsole/static/app.js", "ide/src/x.ts"):
         f = _absence_findings(root, *_SAMESITE, mutation_path=rel)
         assert f.problems == [] and f.advisories == [], (rel, f.advisories)
-        f = _absence_findings(root, "x", "`${x}", mutation_path=rel)
+        f = _absence_findings(root, "zq", "`${zq}", mutation_path=rel)
         assert f.problems == [] and f.advisories == [], (rel, f.advisories)
 
 

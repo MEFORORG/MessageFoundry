@@ -1632,12 +1632,14 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     """
     raw_texts, pattern_texts, viewed = _absence_corpus(root)
     viewed_paths = {p for p in viewed if p is not None}
-    # Grouped by view kind, so a control sighted in one kind of view never stands in for another.
+    # Split by view kind, so a control sighted in one kind of view never stands in for another.
     # A PowerShell view keeps strings that the Python view blanks.
-    views_by_kind: dict[bool, list[str]] = {}
+    python_views: list[str] = []
+    powershell_views: list[str] = []
     for text, seen_as in zip(pattern_texts, viewed, strict=True):
         if seen_as is not None:
-            views_by_kind.setdefault(_is_powershell(PurePosixPath(seen_as)), []).append(text)
+            kind = powershell_views if _is_powershell(PurePosixPath(seen_as)) else python_views
+            kind.append(text)
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
@@ -1645,13 +1647,17 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             # narration greps to nothing and is indistinguishable from a true absence.
             raw_inert = not re.search(a.pattern, a.mutation)
             mutation_rel = PurePosixPath(a.mutation_path.replace("\\", "/"))
-            lands_in_view = mutation_rel.as_posix() in viewed_paths
+            # An in-scope operator script is read only through its view, so a claim naming one
+            # lands there even before the file exists.
+            lands_in_view = mutation_rel.as_posix() in viewed_paths or _is_operator_powershell(
+                mutation_rel
+            )
             view_inert = False
             # The view is chosen by the claim's path, by the corpus's own rule, whether or not that
             # file exists yet. A shipped root or no path at all is asked of the Python view, since
             # such a claim covers every root. A TypeScript or JavaScript path is read raw, so it
             # asks no view question at all.
-            asks_view = mutation_rel.suffix.lower() not in _SCRIPT_SUFFIXES
+            asks_view = not mutation_rel.name.endswith(_SCRIPT_SUFFIXES)
             if not raw_inert and asks_view:
                 mutation_view, cut = _pattern_view(mutation_rel, a.mutation) or _code_only_view(
                     a.mutation
@@ -1698,7 +1704,7 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             control_rx = re.compile(a.positive_control)
             seen_raw = any(control_rx.search(t) for t in raw_texts)
             if lands_in_view:
-                same_kind = views_by_kind.get(_is_powershell(mutation_rel), [])
+                same_kind = powershell_views if _is_powershell(mutation_rel) else python_views
                 seen_view = any(control_rx.search(t) for t in same_kind)
             else:
                 seen_view = seen_raw and any(control_rx.search(t) for t in pattern_texts)
@@ -1788,6 +1794,15 @@ _OUT_OF_SCOPE_POWERSHELL: Final[frozenset[str]] = frozenset(
 )
 
 
+def _is_operator_powershell(rel: PurePosixPath) -> bool:
+    """Whether ``rel`` names in-scope operator PowerShell, whether or not the file exists."""
+    return (
+        _is_powershell(rel)
+        and rel.is_relative_to(_OPERATOR_POWERSHELL_DIR)
+        and rel.as_posix() not in _OUT_OF_SCOPE_POWERSHELL
+    )
+
+
 def _operator_powershell_sources(root: Path) -> list[Path]:
     """The in-scope operator-run PowerShell, read through :func:`_powershell_code_only`."""
     base = root / _OPERATOR_POWERSHELL_DIR
@@ -1796,9 +1811,7 @@ def _operator_powershell_sources(root: Path) -> list[Path]:
     return sorted(
         p
         for p in base.rglob("*")
-        if p.suffix.lower() in _POWERSHELL_SUFFIXES
-        and p.is_file()
-        and p.relative_to(root).as_posix() not in _OUT_OF_SCOPE_POWERSHELL
+        if p.is_file() and _is_operator_powershell(PurePosixPath(p.relative_to(root).as_posix()))
     )
 
 
