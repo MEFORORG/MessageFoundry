@@ -1049,8 +1049,9 @@ def _spy_hook(coord: Any, monkeypatch: pytest.MonkeyPatch, hooks: list[str]) -> 
 
     async def ran(command: str, *, phase: str, actor: str, now: float) -> bool:
         hooks.append(phase)
-        # What the real hook runner records once the hook's process starts.
-        coord._attempt.hook_ran = True
+        # What the real hook runner records once a takeover hook's process starts.
+        if phase == "takeover" and coord._attempt is not None:
+            coord._attempt.hook_ran = True
         return True
 
     monkeypatch.setattr(coord, "_run_vip_hook", ran)
@@ -1286,6 +1287,45 @@ async def test_a_retry_is_refused_while_a_timed_out_preflight_read_is_still_stuc
     result = await asyncio.wait_for(coord.activate(actor="alice"), 60)
     assert result.active is True
     assert len(reads) == 2  # the retry ran its own preflight
+
+
+async def test_a_preflight_left_to_finish_starts_no_check_past_its_bound(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 4. A preflight that timed out in its settings check finishes that check once
+    the read returns, but does not start the registry check nobody waits for."""
+    engine = box.engine
+    coord = _short_engine_takeover(engine)
+    await engine.reload_detail(box.tiered)
+    share = threading.Event()
+    settings_returned = asyncio.Event()
+    registry_checks: list[object] = []
+    real_registry = engine.preflight_registry
+
+    async def stuck_settings() -> None:
+        await asyncio.to_thread(share.wait, 30)
+        settings_returned.set()
+
+    async def counted_registry(registry: Any) -> None:
+        registry_checks.append(registry)
+        await real_registry(registry)
+
+    monkeypatch.setattr(engine, "preflight_settings", stuck_settings)
+    monkeypatch.setattr(engine, "preflight_registry", counted_registry)
+    try:
+        with pytest.raises(DrActivationError) as caught:
+            await asyncio.wait_for(coord.activate(actor="alice"), 60)
+        assert "did not answer within 0.5s" in str(caught.value)
+    finally:
+        share.set()
+    await asyncio.wait_for(settings_returned.wait(), 30)
+    for _ in range(5):  # let the left task end and its done-callback run
+        await asyncio.sleep(0)
+
+    assert registry_checks == []  # the left preflight started no second check
+    result = await asyncio.wait_for(coord.activate(actor="alice"), 60)
+    assert result.active is True
+    assert len(registry_checks) == 1  # control: a preflight that is waited for runs both
 
 
 async def test_a_step_4_abort_after_the_hook_names_the_hook_and_its_seed_marker(

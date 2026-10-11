@@ -435,7 +435,9 @@ in-flight rows stranded.
 >   failed. The bound stops the wait, not the read: the thread reading the share stays blocked until
 >   the share answers. The preflight that timed out is left to finish, so its audit rows can land
 >   after the abort's. While its read is blocked, the next activation's preflight is refused as an
->   abort and starts no thread. So retries against a dead share cannot use up the default executor.
+>   abort and starts no read. So retried DR preflights do not pile threads onto a dead share. That
+>   retry still runs steps 1 to 3 first, the takeover hook included. The guard covers only this
+>   preflight: at least an operator reload's own anchor reads can still each block a thread.
 > - The reload after them is not bounded. Cancelling it partway rolls back a takeover the VIP has
 >   already moved for. A lane's first build is isolated to that lane, as the #3263 amendment says.
 >   So the reload's own reads still have no bound: at least each outbound and FTPS poller CA

@@ -912,7 +912,7 @@ class Engine:
         it. While it runs, a new DR preflight raises :class:`DrPreflightBusyError` and starts no
         thread, so retries against a share that does not answer cannot use up the executor. Once
         its read returns, it finishes the check it was in, and its audit rows can land after the
-        abort's; it starts no further check. An activation cancelled while its preflight runs
+        abort's; it starts no check past its bound. An activation cancelled while its preflight runs
         cancels the preflight, as before, and a read it was blocked in is not tracked.
 
         It tells the coordinator while it runs (:meth:`DrCoordinator.note_profile_preflight`), so
@@ -928,7 +928,8 @@ class Engine:
                 "the trust anchors are on, and retry once that read returns"
             )
         timeout = self._dr_settings.takeover_timeout_seconds
-        task = asyncio.ensure_future(self._dr_preflight_checks(registry))
+        deadline = asyncio.get_running_loop().time() + timeout
+        task = asyncio.ensure_future(self._dr_preflight_checks(registry, deadline))
         try:
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         except BaseException:
@@ -939,16 +940,23 @@ class Engine:
             self._dr_preflight_left = task
             task.add_done_callback(self._dr_preflight_ended)
             raise TimeoutError(f"the trust-anchor preflight did not answer within {timeout:g}s")
+        if task.cancelled():
+            # Cancelled by something other than this caller, whose own cancellation is handled
+            # above. Read as a refusal, never as this activation being cancelled.
+            raise RuntimeError("the trust-anchor preflight was cancelled")
         task.result()  # re-raise its refusal, including a TimeoutError of its own
         if coord is not None:
             coord.note_profile_preflight(False)
 
-    async def _dr_preflight_checks(self, registry: Registry) -> None:
-        """The two trust-anchor preflights :meth:`_dr_preflight` bounds. One left to finish after
-        a timeout skips the second, so it starts no read nobody waits for."""
+    async def _dr_preflight_checks(self, registry: Registry, deadline: float) -> None:
+        """The two trust-anchor preflights :meth:`_dr_preflight` bounds. Past ``deadline`` the
+        caller has stopped waiting, so one left to finish refuses rather than start the second
+        read nobody waits for. The loop clock decides, not whether the caller has recorded the
+        timeout yet, which can come a loop turn later. It raises rather than returns, so a caller
+        that has not yet seen its timeout never reads a skipped check as passed."""
         await self.preflight_settings()
-        if self._dr_preflight_left is asyncio.current_task():
-            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError("the trust-anchor preflight ran past its bound")
         await self.preflight_registry(registry)
 
     def _dr_preflight_ended(self, task: asyncio.Task[None]) -> None:

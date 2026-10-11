@@ -2,8 +2,9 @@
   settings and registry preflights a `POST /dr/activate` runs before it re-applies the graph now
   share one bound, `[dr].takeover_timeout_seconds`. They run under the coordinator's lock, so an
   anchor on a share that stopped answering used to hold every later activate and release too.
-  While a timed-out preflight's read is still blocked, the next activation is refused and starts no
-  thread. The re-apply itself is still not bounded, so at least the outbound and FTPS poller CA
+  While a timed-out preflight's read is still blocked, the next activation's preflight is refused
+  and starts no read of its own. That activation still runs its earlier steps first, the takeover
+  hook included. The re-apply itself is still not bounded, so at least the outbound and FTPS poller CA
   reads it makes can still hold an activation. Every `dr_activation_aborted` row of an activation
   now records the `seed_segment` of the marker that attempt wrote, and `vip_hook_ran`. That field
   says whether the takeover hook's process started. An abort after a hook that started says the VIP may

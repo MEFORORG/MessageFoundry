@@ -1213,10 +1213,10 @@ class DrCoordinator:
         ("VIP acquired"/"VIP released"); any non-zero or a timeout is a failure. On the **takeover** phase
         a failure ABORTS activation (acquire-VIP-or-abort) + records ``dr_activation_aborted``; on the
         **release** phase a failure is logged but does not block the hand-back (the passive LB still moves
-        the VIP when intake unbinds — the hook is belt-and-braces). Returns whether the hook's process
-        started. A takeover records that on the running attempt at the moment
-        :attr:`_ActivationProgress.hook_ran` names (vault BACKLOG #3094). ``""`` = no hook (rely on
-        the passive ADR-0047 LB)."""
+        the VIP when intake unbinds — the hook is belt-and-braces). For a takeover, returns whether
+        the hook's process started, and records that on the running attempt at the moment
+        :attr:`_ActivationProgress.hook_ran` names (vault BACKLOG #3094). For a release, returns
+        whether a hook was invoked. ``""`` = no hook (rely on the passive ADR-0047 LB)."""
         if not command:
             return False
         started = False
@@ -1263,7 +1263,9 @@ class DrCoordinator:
                 log.warning(
                     "DR release: %s — continuing hand-back (passive LB moves the VIP)", reason
                 )
-        return started
+        # A release keeps its old meaning, "invoked": a release hook a timeout cut off while it
+        # started is left to run, so it may still move the address.
+        return started if phase == "takeover" else True
 
     async def _record_aborted(
         self,
