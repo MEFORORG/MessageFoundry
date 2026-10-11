@@ -99,8 +99,9 @@ recur; all three are now settled.
    argument**, and accepting it would make rule 4's first limb unfalsifiable: *every* off-by-default
    control removes its own trigger, so the argument is available to all of them and discriminates
    between none of them. A property predicated of an object the shipped default never creates is not
-   *satisfied*. That sentence covers an object that some configuration of the shipped artifacts can
-   create. An object that no configuration can create is §1.1d's case, where the limb is met.
+   *satisfied*. Since the owner ruling of 2026-10-10 (§1.1d), that sentence covers an object that
+   some configuration of the shipped artifacts can create. An object that no configuration can
+   create is §1.1d's case.
 3. **"No code change could improve the cell, so a `partial` manufactures a phantom remediation item."**
    Rejected as a ground, and usually **false on the facts** as well. Before offering it, name the change
    that would make the verb hold on a stock install and say why it is impossible. Flipping a default,
@@ -149,22 +150,26 @@ it stands.
 
 **Three questions R2 left open are answered by Manager decision (2026-10-10).** Engine PR 1488 wrote
 R2 into this section and routed four questions it did not decide. The batch 309 Manager seat
-answered the first three under the owner's driver rule. They are not owner rulings, and the owner
-may overturn any of them. The record is `docs/security/ASVS-MANAGER-RULINGS-2026-10-10-BATCH309.md`
-in the `MessageFoundry-vault` repository, on vault branch `b309-rulings-and-cells` until it merges.
-§1.1d answers the fourth.
+answered the first three under the owner's driver rule, which tells that seat to decide calls like
+these itself. They are not owner rulings, and the owner may overturn any of them. The record is
+`docs/security/ASVS-MANAGER-RULINGS-2026-10-10-BATCH309.md`, pending in the `MessageFoundry-vault`
+repository on vault branch `b309-rulings-and-cells`. §1.1d answers the fourth.
 
 1. A reverse proxy that the assessed posture (§2.2) names cannot meet a host-substrate limb. The
    posture decides the configuration a cell is graded in. It does not add the proxy to the five
    software artifacts that §2 assesses, so a cell grades what those artifacts ship. The one route to
    `pass` for such a limb is an engine gate that refuses to start when the limb's precondition is
-   absent. That is rule 4's second limb, and §1.1a says what it requires.
-2. R2 accepts a consequence, as §1.1a did for its ruling. A limb that only the host substrate can
-   meet, with no engine gate of the kind item 1 names, never reaches `pass`. Neither does its cell.
-   A cell that moves down for this reason is a §2.2 cause-4 movement, not a regression.
-3. R2 leaves the 5.4.3 row in §1.2 as it is. R2 bars scoping out one limb, and that row scopes out
-   the whole requirement under rule 1. The row is closed by owner decision, so this answer does not
-   re-derive it.
+   absent. That is rule 4's second limb, and §1.1a says what it requires. A gate that an operator's
+   declaration clears falls under rule 4's text on relaxations and ruling R8 (§1.1). This decision
+   does not extend them.
+2. R2 recorded no accepted consequence, though §1.1a's ruling did. This decision records one. A limb
+   that only the host substrate can meet, with no engine gate of the kind item 1 names, never
+   reaches `pass`. Neither does its cell. Rules 3 and 5 then pick the verdict in order, as for any
+   cell. A cell that moves down for this reason is a §2.2 cause-4 movement, not a regression.
+3. R2 does not reach the 5.4.3 row in §1.2. R2 bars scoping out one limb, and that row scopes out the
+   whole requirement under rule 1. The row already says its verdict depends on the enterprise
+   covering every path. It is closed by owner decision (2026-08-02), and R2 gives no ground to
+   reopen it.
 
 ### 1.1c What counts as documentation: a docstring or a code comment does not (owner ruling, 2026-10-08), and the method's reading of what does
 
@@ -239,28 +244,37 @@ one.
 1. If no configuration of the shipped artifacts can reach Y, the limb is met.
 2. If some configuration can turn Y on, grade the limb under §1.1a, which grades the shipped default.
 
-Four limits come with that rule.
+This ruling does not say whether operator-authored Router or Handler code counts as a
+configuration. That code can import any library. Until someone decides it, default to the worse
+verdict (§1.3).
 
-1. Only a limb is met this way. A requirement that is conditional as a whole still goes to rule 1,
-   as the 10.5.5 row in §1.2 does.
+Four limits come with the two-branch rule.
+
+1. Only a limb is met this way. A requirement that is conditional as a whole, on a Y that no
+   configuration can reach, still goes to rule 1, as the 10.5.5 row in §1.2 does. If some
+   configuration can turn that Y on, rule 1 does not fire, and §1.1a governs.
 2. The vacuity argument in §1.1a item 2 does not reach a Y that no configuration can create. That
    item now says so.
-3. Show that Y is unreachable with an instrument, and never assert it. An absence claim with a live
-   positive control (§3) is one such instrument. At least one cell in the record carried an
+3. Show that Y is unreachable with an instrument, and never assert it. A search for one token
+   answers a narrower question than whether any configuration reaches Y (§3), so the cell records
+   what the instrument covered beside what it found. At least one cell in the record carried an
    unreachable claim that a later pass found false.
 4. Applying the rule raises at least one cell. As §1.1a explains, this document records the rule and
    deliberately not the cells it moves. The owner rulings file below names that cell.
 
-**One consequence is flagged, and nobody has decided it.** At least one cell is graded `pass` on a
-precondition that is false. Limit 1 grades that shape under rule 1, as the 10.5.5 row does, so the
-cell is a candidate for a re-read. The Manager rulings file named in §1.1b names it.
+**One consequence is flagged, and nobody has decided it.** Limit 1 may change the rule under which
+at least one cell is graded today. That cell is a candidate for a re-read. The Manager rulings file
+named in §1.1b names it.
 
 **Which parts are the owner's.** On 2026-10-10 the owner was asked about the two-branch rule above.
 The question said adversarial review had upheld it with amendments. The owner chose the option whose
 description begins *"Adopt the split"*. The four limits are those amendments. Their wording is the
 batch 309 Manager seat's, after adversarial review, and the owner was not asked about them one by
-one. The record is `docs/security/OWNER-RULINGS-2026-10-10-BATCH309.md` in the
-`MessageFoundry-vault` repository, on vault branch `b309-rulings-and-cells` until it merges.
+one. Three passages are neither the ruling nor its amendments: the paragraph on operator-authored
+code, the last sentence of limit 1, and the second sentence of limit 3. They are this section's
+reading, added in code review. The ruling was given in session. Its record is
+`docs/security/OWNER-RULINGS-2026-10-10-BATCH309.md`, pending in the `MessageFoundry-vault`
+repository on vault branch `b309-rulings-and-cells`.
 
 ### 1.2 Worked examples — the ones that actually broke
 
