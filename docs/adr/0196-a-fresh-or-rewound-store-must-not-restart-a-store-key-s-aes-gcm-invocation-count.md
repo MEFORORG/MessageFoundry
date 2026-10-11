@@ -10,6 +10,9 @@
   > (2026-09-26). An options memo with the drafter's recommendation. The owner accepts or rejects it,
   > and no code may follow until it is Accepted. BACKLOG #2070 stays open until then; its closing step
   > 1 asks for exactly this record before any build."*
+- **Amended:** 2026-10-10, BACKLOG #2187. The `vault_transit` scope note covers the store's cells
+  only; DR archives in that mode still draw local nonces. A seat decision under owner delegation
+  2026-10-08, not an owner ruling. See the amendment at the end.
 - **Date:** 2026-09-26
 - **Related:** BACKLOG #2070 (the row this answers) ·
   [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md), amendment 2026-07-22 (the persisted
@@ -227,6 +230,9 @@ The count is kept
 per sub-key. A fresh store has a fresh salt, so it has a fresh AES key, and a count of zero is then
 the key's **true** count, not a reset. This works for any key provider that hands the engine key
 bytes; `vault_transit` is already out of scope because it draws no local nonce.
+*(Amended 2026-10-10, BACKLOG #2187: true of the store's cells only. Under `vault_transit` the DR
+archives still seal under the local DEK with local nonces. Seat decision under owner delegation
+2026-10-08, not an owner ruling; see the amendment at the end of this ADR.)*
 
 **Closes.** Routes 1 to 3, by construction and with no operator step. On an empty server database,
 several HA nodes may open at once, so minting the salt must be an atomic insert-if-absent that every
@@ -413,7 +419,9 @@ stays open by choice.
 
 **Out of scope.** Resisting someone who can write to the store; they can already zero the row.
 Detecting a rewound store against an off-box witness, such as the audit anchor, which could be a later
-item. `vault_transit`, which has no local nonce. Re-scoring ASVS 11.3.4, which is record work for a
+item. `vault_transit`, which has no local nonce. *(Amended 2026-10-10, BACKLOG #2187: its cells
+have none, but its DR archives do. Seat decision under owner delegation 2026-10-08, not an owner
+ruling; see the amendment at the end of this ADR.)* Re-scoring ASVS 11.3.4, which is record work for a
 Manager-dispatched vault Builder once something is built.
 
 ## To resolve on acceptance
@@ -459,3 +467,69 @@ Manager-dispatched vault Builder once something is built.
       comment in `store.py`; the invocation-bound comment in `crypto.py` and the `_count_invocation`
       error text; the `_rotate_key` docstring; and the "Rotation semantics" paragraph of ADR 0019's
       2026-07-22 amendment.
+
+## Amendment (2026-10-10): DR archives under `vault_transit` still draw local nonces under the local DEK (BACKLOG #2187)
+
+**Basis: a seat decision under owner delegation 2026-10-08, not an owner ruling.** The owner
+delegated a set of open decisions on 2026-10-08, and the seat that made them recorded each one in
+the maintainer-internal `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`. Its entry for #2187
+reads: "Amend the scope text only. Archives still seal under the local DEK with local nonces in that
+mode." This amendment changes text only. No code changes with it.
+
+**What the scope text got wrong.** Option C said `vault_transit` "is already out of scope because it
+draws no local nonce", and *Out of scope* under *Consequences* said the same. That holds for the
+store's cells. `TransitCipher` seals each value inside Transit, and `bounded_cipher` in
+`store/gcm_bound.py` returns `None` for it. It does not hold for DR archives. Both sentences stay
+where they were, each marked as amended.
+
+**What the archive path does under `vault_transit`.** Read from the code at engine `origin/main`
+`1d55295f66`, by symbol. No test runs a backup under `vault_transit`, so none of this is measured.
+
+1. `BackupRunner._resolve_key` (`pipeline/dr_backup.py`) gets its key from `resolve_active_key`.
+   That goes through `resolve_key_provider` and never reads `cipher_provider`. So whenever a key
+   resolves, the backup seals under that DEK in process, whatever `cipher_provider` says. The
+   `cipher_provider` row of `docs/CONFIGURATION.md` tells a Transit site to configure a local key,
+   and says Transit does not cover backups. With no key, `_do_backup` refuses unless
+   `[backup].allow_unencrypted` is set, and then writes the archive in clear.
+2. `BackupRunner._store_salt` asks `bounded_cipher` for the store's cipher. A `TransitCipher` gets
+   `None`, so the archive has no salt.
+3. `encrypt_stream` (`store/backup_codec.py`) then builds one `AESGCM` over the raw DEK for the
+   archive, through `_frame_aes`. Each frame it seals draws a random 96-bit nonce from `os.urandom`.
+4. `BackupRunner._build_archive_blocking` records the frames under `key_fingerprint(key)`, the DEK's
+   own id. `_charge_archive_invocations` adds them to that `cipher_meta` row through
+   `add_cipher_invocations`.
+
+**Nothing enforces that row's ceiling under `vault_transit`.**
+
+- Under `cipher_provider = "aesgcm"` the store's own `AesGcmCipher` charges the same row the
+  archive does, and learns the row's total each time it reserves a block. So the archive frames
+  count toward its 2^31 warning and 2^32 refusal. Under `vault_transit` the store has no
+  `AesGcmCipher`, so nothing reads the DEK's row back.
+- `_charge_archive_invocations` drops the new total that `add_cipher_invocations` returns.
+- `encrypt_stream` checks no ceiling before or while it seals. That is the fourth review gap under
+  *Context*. A fix for that gap that takes its ceiling from `bounded_cipher` would get `None` here,
+  and would leave this row unenforced.
+- The Transit attestation (`store/transit_attestation.py`, ADR 0138's 2026-10-07 amendment) binds to
+  the Transit data-key name. It does not cover the local DEK.
+- The key-age clock skips this DEK too. The engine passes `cipher_info().active_key_id` as
+  `dek_key_id`, and a `TransitCipher` has none. So `enforce_store_key_expiry`
+  (`pipeline/secret_rotation.py`) returns early, on the stated premise that a Transit store has no
+  local DEK.
+
+So on this row nothing warns at 2^31 and nothing refuses at 2^32. ADR 0138's 2026-09-28 amendment
+says the Transit path writes no `cipher_meta` row. That is true of the cells; the archive path
+writes this one.
+
+**The row can also read low.** It lives in the store, like every `cipher_meta` row. By this ADR's
+reading of routes 1 to 3, a recreated store meets no row for the DEK, and the next archive's charge
+starts it again from zero. Nobody has measured that for the archive path.
+
+**What stays as it is.** Under `vault_transit`, archives keep sealing under the local DEK with local
+nonces. So each backup pass also puts that DEK in engine heap, which ADR 0138's `vault_transit` avoids
+for the cells. The store's cells stay out of this ADR's scope; their bound is ADR 0138's operator
+precondition and attestation. BACKLOG #2187 also offered two other choices, and neither was taken:
+seal Transit-mode archives under a salted sub-key, or seal them through Transit.
+
+Per engine `CLAUDE.md` section 0 there are no deployments. Take a first site on `vault_transit`
+that configures a key for the backup. It would seal every archive under that DEK in process. No
+enforced ceiling would cover that key's archive use.

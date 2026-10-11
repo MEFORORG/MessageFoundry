@@ -180,6 +180,7 @@ def test_each_switch_is_a_named_loosening() -> None:
                 audit_chain_unkeyed=None,
                 remote_debug=None,
                 startup=None,
+                service_env=None,
             )
         ]
 

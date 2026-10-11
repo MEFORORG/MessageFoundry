@@ -105,6 +105,7 @@ from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
 from messagefoundry.service_status import is_safe_service_name
+from messagefoundry.serviceenv import ServiceEnvPosture, service_env_loosenings
 from messagefoundry.startupcode import StartupPosture, startup_loosenings
 
 __all__ = [
@@ -622,6 +623,13 @@ class StoreSettings(_Section):
     # --- SQLite (default backend) -------------------------------------------
     path: str = "messagefoundry.db"
     synchronous: SqliteSync = SqliteSync.NORMAL
+    # PRAGMA secure_delete on the writer connection (vault BACKLOG #2619). ON zeroes the bytes of a
+    # deleted row or a purged body, so a retention purge or a consumed queue row leaves no copy in the
+    # file's free space. Default ON. The cost is extra write I/O for each page a delete frees; turning
+    # it off is a throughput choice that leaves purged bytes readable in the file, and a LOOSENING
+    # that security_loosenings() names on a file-backed store. SQLite only: the server backends
+    # ignore it, and how a server database reuses freed space is the DBA's.
+    secure_delete: bool = True
     # App-side group-commit (ADR 0055, SQLite only). When > 0, the SQLite store runs a dedicated
     # committer coroutine that COALESCES the grouped stage-handoff mutations (enqueue_ingress,
     # route_handoff, transform_handoff, mark_done, complete_with_response, dead_letter_now, mark_failed)
@@ -2570,8 +2578,10 @@ class RetentionSettings(_Section):
     survives; its PHI *columns* do not. Tiers that carry nothing but PHI and back no count (transform
     state, connection events) are DELETEd outright instead.
 
-    One knob here is default-ON rather than off: ``min_free_disk_mb``, the low-disk storage floor
-    (BACKLOG #290). It refuses a ``serve`` start and warns at runtime; it never purges anything.
+    Two knobs here are default-ON rather than off. ``min_free_disk_mb``, the low-disk storage floor
+    (BACKLOG #290), refuses a ``serve`` start and warns at runtime; it never purges anything.
+    ``wal_checkpoint_seconds`` truncates the SQLite ``-wal`` file once an hour, so a purged body
+    does not outlive the purge there (vault BACKLOG #2619).
     """
 
     # Past N days, null inbound bodies (raw/summary/error/metadata) of fully-resolved messages,
@@ -2672,10 +2682,12 @@ class RetentionSettings(_Section):
     # non-interruptible. 0 = off (the default — no cap, byte-identical to the pre-#121 pass); recommend
     # ~14400 (4h, the Corepoint default off-peak ceiling) when enabled.
     max_pass_seconds: float = 0.0
-    # PRAGMA wal_checkpoint(TRUNCATE) cadence in seconds (SQLite). 0 = off — rely on SQLite's
-    # auto-checkpoint. Evaluated once per purge pass, so a value below purge_interval_seconds is
-    # effectively rounded up to it.
-    wal_checkpoint_seconds: float = 0.0
+    # PRAGMA wal_checkpoint(TRUNCATE) cadence in seconds (SQLite). Default 3600, ON (vault BACKLOG
+    # #2619): SQLite's own auto-checkpoint reuses the -wal file but never shrinks it, so frames that
+    # still hold a purged body stay on disk past the write point. TRUNCATE empties the file, and the
+    # pass runs it after its purges. 0 = off — rely on auto-checkpoint. Evaluated once per purge
+    # pass, so a value below purge_interval_seconds is effectively rounded up to it.
+    wal_checkpoint_seconds: float = 3600.0
     # Daily local clock time "HH:MM" at which to run VACUUM (SQLite; reclaims space freed by purges).
     # "" = off. A daily off-peak time, not a cron expression, to avoid a new dependency — VACUUM holds
     # a write lock on the whole DB while it runs, so it is off by default and meant for a quiet window.
@@ -7721,14 +7733,26 @@ def _reconcile_effective_bind(settings: ServiceSettings) -> None:
 LOCKOUT_THRESHOLD_CEILING = 100
 
 
-def _trust_every_peer_entries(entries: Sequence[str]) -> list[str]:
-    """The ``[api].trusted_proxies`` ranges that, together, trust every peer of an address family,
-    read the way uvicorn reads them: a strict network parse, where a host-bits-set entry is not a
-    network. Collapsed per family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole.
-    Returns the multi-address entries of each such family (a single-host entry adds nothing)."""
+def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str]]:
+    """The ``[api].trusted_proxies`` entries that cover more than one address, as
+    ``(whole_family, ranges)``, in order and as written; a repeated spelling is named once
+    (BACKLOG #1131).
+
+    ``whole_family`` holds EVERY multi-address entry of a family whose entries, together, cover
+    every address of it, so a ``10.0.0.0/8`` beside ``0.0.0.0/0`` lands there too. Collapsed per
+    family, so the two ``/1`` halves of ``0.0.0.0/0`` count as the whole. ``ranges`` holds the
+    multi-address entries of every other family. A single-host entry is in neither.
+
+    The cutoff is one address, not a size. Every host inside a trusted range may set its own
+    ``X-Forwarded-For``, so a ``/31``, a ``/127`` or a small pool trusts a host that is not the
+    proxy as surely as a ``/8`` does. Any cutoff above one would leave some range silent.
+
+    Each entry is read the way uvicorn reads it: a strict parse, where a host-bits-set entry is not
+    a network and is skipped. The load refuses such an entry (BACKLOG #2488), so on a loaded config
+    nothing is skipped."""
     v4: list[tuple[str, ipaddress.IPv4Network]] = []
     v6: list[tuple[str, ipaddress.IPv6Network]] = []
-    for entry in entries:
+    for entry in dict.fromkeys(entries):  # a repeated entry is named once, in order
         try:
             net = ipaddress.ip_network(entry)
         except ValueError:
@@ -7737,12 +7761,18 @@ def _trust_every_peer_entries(entries: Sequence[str]) -> list[str]:
             v4.append((entry, net))
         else:
             v6.append((entry, net))
-    named: list[str] = []
-    if any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v4)):
-        named += [entry for entry, net in v4 if net.num_addresses > 1]
-    if any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6)):
-        named += [entry for entry, net in v6 if net.num_addresses > 1]
-    return list(dict.fromkeys(named))  # a repeated entry is named once, in order
+    whole_family: list[str] = []
+    ranges: list[str] = []
+    # collapse_addresses takes one family at a time, so each is collapsed on its own.
+    families: list[tuple[Sequence[tuple[str, ipaddress.IPv4Network | ipaddress.IPv6Network]], bool]]
+    families = [
+        (v4, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v4))),
+        (v6, any(n.prefixlen == 0 for n in ipaddress.collapse_addresses(net for _, net in v6))),
+    ]
+    for family, covers_all in families:
+        multi = [entry for entry, net in family if net.num_addresses > 1]
+        (whole_family if covers_all else ranges).extend(multi)
+    return whole_family, ranges
 
 
 def _auth_default(field: str) -> Any:
@@ -8470,6 +8500,7 @@ def security_loosenings(
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
     startup: StartupPosture | None,
+    service_env: ServiceEnvPosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -8478,7 +8509,8 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
-    ``[store].allow_unmarked_ciphertext`` (#1169),
+    ``[store].allow_unmarked_ciphertext`` (#1169), ``[store].secure_delete`` on a file-backed
+    SQLite store (vault BACKLOG #2619),
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
@@ -8487,7 +8519,8 @@ def security_loosenings(
     AD timeout, step-up window, TOTP skew and temporary-password life
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
-    (#2489), an ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
+    (#2489), any ``[api].trusted_proxies`` entry covering more than one address, with its own
+    wording where the entries together cover every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302),
@@ -8503,7 +8536,8 @@ def security_loosenings(
     ``update_url_form="path"`` (vault BACKLOG #2571) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
     the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
-    interpreter (vault BACKLOG #2701), and
+    interpreter (vault BACKLOG #2701), the OBSERVED environment of its own Windows service (vault
+    BACKLOG #2595), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
@@ -8582,6 +8616,13 @@ def security_loosenings(
     isolated mode, the start-up code (``.pth`` import lines, ``sitecustomize``) it does not know,
     and whether the engine's own account can write the directories that code is read from.
     ``None`` has the meaning it has for ``remote_debug``, for the same reason.
+
+    ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
+    :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
+    Windows service, which engine secrets that service's registry-held environment list names,
+    and whether a store key reaches it through its environment. A store key in that list refuses
+    the start, so this registry names only what does not refuse. ``None`` has the meaning it has
+    for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -8825,6 +8866,23 @@ def security_loosenings(
                 "(no effect without a store key)",
             )
         )
+    # Vault BACKLOG #2619. Off, SQLite leaves what a delete frees in the file as it was, so a purge
+    # blanks a body without removing it. Only a file-backed SQLite store has such a file: the server
+    # backends ignore the switch, and an in-memory store leaves nothing behind.
+    if (
+        not store.secure_delete
+        and store.backend is StoreBackend.SQLITE
+        and store.path != ":memory:"
+    ):
+        out.append(
+            (
+                "secure_delete",
+                "a deleted row or a retention-purged body is NOT overwritten in the SQLite file -- "
+                "its old bytes stay in the file's free space, readable by anyone who can read the "
+                "file (and, for a sealed body, holds the key), until SQLite reuses the page or a "
+                "VACUUM rebuilds the file",
+            )
+        )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
     # engine keeps starting on a key past its documented cadence, and the only remaining signal is an
     # alert nobody has to answer. Named here because a silent opt-out from a refusal is indistinguishable
@@ -8927,21 +8985,35 @@ def security_loosenings(
     # such as "10.1.2.3/0" would be a literal that matches nothing there, and the validator now
     # refuses it at load (BACKLOG #2488), so it never reaches this check. Not gated on sign-in: a
     # forged source address poisons the audit trail either way.
+    # A range short of a whole family is named too, with its own wording: any host inside it may
+    # forge X-Forwarded-For, which poisons the same three signals for that range's hosts. Every
+    # entry covering more than one address counts, /31 and /127 included; the helper says why.
+    # It stays ADVISORY: the load refuses none of these (only allowed_client_networks refuses one).
     # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
     # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
     # but a refactor of the helper may raise one. The ranges are quoted on purpose: they are the
     # finding. ADR 0034's 2026-10-03 amendment, rule 3, says how to triage such an alert.
-    trust_all = _trust_every_peer_entries(api.trusted_proxies)
+    trust_all, ranges = _classify_proxy_entries(api.trusted_proxies)
+    forged = (
+        "can declare its own source address, poisoning the audit trail, the per-address sign-in "
+        "limit and the new-client-IP step-up signal"
+    )
+    proxy_risks: list[str] = []
     if trust_all:
-        out.append(
-            (
-                "trusted_proxies",
-                f"[api].trusted_proxies includes {', '.join(trust_all)}, which together cover every "
-                "address of their family, so X-Forwarded-For is trusted from EVERY such peer, as the "
-                "refused '*' would be -- any client can declare its own source address, poisoning "
-                "the audit trail, the per-address sign-in limit and the new-client-IP step-up signal",
-            )
+        proxy_risks.append(
+            f"[api].trusted_proxies includes {', '.join(trust_all)}, which together cover every "
+            "address of their family, so X-Forwarded-For is trusted from EVERY such peer, as the "
+            f"refused '*' would be -- any client {forged}"
         )
+    if ranges:
+        proxy_risks.append(
+            f"[api].trusted_proxies includes {', '.join(ranges)}, each a range of more than one "
+            "address rather than a single proxy host, so X-Forwarded-For is trusted from every "
+            f"host inside it -- each such host {forged} (list each proxy's exact address)"
+        )
+    if proxy_risks:
+        # Not "; ": the serve WARNING already joins one loosening to the next with "; ".
+        out.append(("trusted_proxies", ". Also, ".join(proxy_risks)))
     # Vault BACKLOG #2385: the [api] bools are under a completeness floor now, and this is the one
     # that was a deviation with no entry. create_app registers the documentation routes only when
     # it is on, and none of them asks for sign-in.
@@ -9209,6 +9281,11 @@ def security_loosenings(
     # kind of observation, with its wording beside its reader for the same reason.
     if startup is not None:
         out.extend(startup_loosenings(startup))
+    # --- the engine PROCESS's own Windows service environment (vault BACKLOG #2595, #2601;
+    # key-custody slice S2a). A store key reaching a service through its environment, an engine
+    # secret in the service's registry-held NSSM list, and a list that could not be read.
+    if service_env is not None:
+        out.extend(service_env_loosenings(service_env))
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

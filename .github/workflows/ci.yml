@@ -4053,8 +4053,16 @@ jobs:
           $env:MEFOR_STORE_ENCRYPTION_KEY = $storeKey
           cmd /c "python -m harness.load.rigadmin provision --db ""C:\ProgramData\MessageFoundry\messagefoundry.db"" 2>&1"
           $provisioned = $LASTEXITCODE
+          # Vault BACKLOG #2595: the service refuses a store key in its NSSM environment, which any
+          # local user can read, so the key reaches it the way docs/SERVICE.md says first: a DPAPI
+          # key file, made from the same key while it is in this shell, and readable by the
+          # service's virtual account. The service is registered above, so that account exists.
+          $storeKeyFile = "C:\ProgramData\MessageFoundry\store.key.dpapi"
+          cmd /c "python -m messagefoundry protect-key --out ""$storeKeyFile"" --grant-account ""NT SERVICE\MessageFoundry"" 2>&1"
+          $protected = $LASTEXITCODE
           Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY
           if ($provisioned -ne 0) { throw "could not provision the rig Administrator (exit $provisioned)" }
+          if ($protected -ne 0 -or -not (Test-Path $storeKeyFile)) { throw "protect-key could not write the store key file (exit $protected)" }
           # The service's own environment. With sign-in on it carries two things for the rig account:
           # require_mfa off (provision-admin enrols an authenticator app at a terminal and offers no
           # other way, so the account has none; the bind is loopback), and an [alerts] channel (an
@@ -4086,7 +4094,7 @@ jobs:
             "MEFOR_ALERTS_EMAIL_SMTP_PORT=2525" `
             "MEFOR_ALERTS_EMAIL_FROM=rig-operator@example.invalid" `
             "MEFOR_ALERTS_EMAIL_TO=rig-operator@example.invalid" `
-            "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
+            "MEFOR_STORE_ENCRYPTION_KEY_FILE=$storeKeyFile" `
             "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
             "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
             "MEFOR_RETENTION_SEARCH_PRESET_DAYS=30" `
@@ -4357,6 +4365,12 @@ jobs:
           if ($interpreter.ignore_environment -ne $true) { $wrong += "the interpreter reads PYTHON* variables" }
           if ($interpreter.remote_debug_enabled -ne $false) { $wrong += "remote debugging is enabled" }
           foreach ($name in "interpreter_not_isolated", "remote_debug_enabled", "remote_debug_unguarded", "startup_code_unexpected") {
+            if ($loosened -contains $name) { $wrong += "the posture names the loosening $name" }
+          }
+          # Vault BACKLOG #2595: the engine read its own NSSM service's environment lists, and the
+          # store key reached it through the DPAPI key file, not the environment. An unreadable
+          # list here means the store-key refusal never fires on a real service.
+          foreach ($name in "service_environment_unobservable", "service_environment_secret", "store_key_in_service_environment") {
             if ($loosened -contains $name) { $wrong += "the posture names the loosening $name" }
           }
           if ($wrong.Count -gt 0) { throw "the running engine is not on the hardened launch: $($wrong -join '; ')" }

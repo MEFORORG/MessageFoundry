@@ -798,8 +798,25 @@ try {
         throw ("the service is configured to run as '$startName', not $ServiceIdentity; this arm " +
             "would not measure the default virtual account, so it measures nothing")
     }
-    # The key reaches the service the way the service smoke above passes its own: NSSM's
-    # AppEnvironmentExtra, which docs/SERVICE.md documents. It is synthetic, per run, and masked.
+    # Vault BACKLOG #2595: the service refuses a store key in its NSSM environment, which any local
+    # user can read. So the key reaches it the way the service smoke passes its own: a DPAPI key
+    # file that only the service's virtual account and administrators can read, which
+    # docs/SERVICE.md lists first. protect-key makes it from the key in this process's environment,
+    # cleared after. Start-Process with redirected files, for the reason Invoke-OperatorCli gives.
+    $StoreKeyFile = Join-Path $DataDir "store.key.dpapi"
+    $env:MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
+    try {
+        $protect = Start-Process -FilePath $AppExe `
+            -ArgumentList "protect-key --out `"$StoreKeyFile`" --grant-account `"$ServiceIdentity`"" `
+            -RedirectStandardOutput (Join-Path $Work "protect-key.out.txt") `
+            -RedirectStandardError (Join-Path $Work "protect-key.err.txt") -NoNewWindow -Wait -PassThru
+        $protectCode = $protect.ExitCode
+    } finally {
+        Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY -ErrorAction SilentlyContinue
+    }
+    if ($protectCode -ne 0 -or -not (Test-Path -LiteralPath $StoreKeyFile)) {
+        throw "protect-key could not write the store key file $StoreKeyFile (exit $protectCode)"
+    }
     # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
     # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving is
     # fine. The CA+CRL goes in the data directory, whose inherited ACL lets the service account read it.
@@ -807,7 +824,7 @@ try {
     if (-not (Test-Path -LiteralPath $syslogCa)) { throw "make_syslog_ca_crl.py produced no CA+CRL bundle" }
     $global:LASTEXITCODE = $null
     & $Nssm set $ServiceName AppEnvironmentExtra `
-        "MEFOR_STORE_ENCRYPTION_KEY=$StoreKey" `
+        "MEFOR_STORE_ENCRYPTION_KEY_FILE=$StoreKeyFile" `
         "MEFOR_ALERTS_EMAIL_SMTP_HOST=127.0.0.1" `
         "MEFOR_ALERTS_EMAIL_SMTP_PORT=2525" `
         "MEFOR_ALERTS_EMAIL_FROM=mefor-w0@example.invalid" `
