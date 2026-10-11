@@ -570,6 +570,51 @@ def reauth_continue(next_path: str, label: str) -> Markup:
 # --- L4b: self-service account pages (change password + TOTP MFA lifecycle) ------------------------
 
 
+def _revoke_others_form(label: str) -> Markup:
+    """The one form that signs out every session but this one; it keeps the current session."""
+    return el(
+        "form",
+        el("button", label, type="submit"),
+        method="post",
+        action="/ui/account/sessions/revoke-others",
+        class_="ctl",
+    )
+
+
+def _session_offer(others: int) -> Markup:
+    """The offer to end the caller's other sessions after a factor change (BACKLOG #1147, ASVS 7.4.3).
+
+    ``others`` is the count of the caller's live sessions besides this one. The form posts to the
+    same route as the sessions page's *Sign out everywhere else*, which keeps the current session.
+    That route asks for a fresh re-proof, bound to the action, and then runs (ASVS 7.5.2). Declining
+    is doing nothing: no session ends unless the caller asks."""
+    heading = el("h2", "Your other sessions")
+    if not others:
+        return el(
+            "div",
+            heading,
+            el("p", "You have no other active sessions, so there is none to end.", class_="muted"),
+            class_="card",
+        )
+    return el(
+        "div",
+        heading,
+        el(
+            "p",
+            f"You changed how you sign in. You have {others} other active session(s). If you made "
+            "this change because a device or a code may be in the wrong hands, sign them out now. "
+            "This session stays signed in.",
+        ),
+        _revoke_others_form(f"Sign out my other sessions ({others})"),
+        el(
+            "p",
+            "You will be asked to prove it is you first. To keep them signed in, do nothing.",
+            class_="muted",
+        ),
+        class_="card",
+    )
+
+
 def account_page(
     me: CurrentUser,
     mfa: MfaStatusResponse,
@@ -578,15 +623,18 @@ def account_page(
     error: str | None = None,
     passkeys: Sequence[Mapping[str, object]] | None = None,
     webauthn_notice: str | None = None,
+    session_offer: int | None = None,
 ) -> Markup:
     """The signed-in user's account overview: identity, password rotation, and MFA posture/actions.
 
     ``passkeys`` (ADR 0068): plain row mappings built by the route (label / created_at /
     last_used_at / backed_up / usable / credential_id_hash) — this module never touches the store.
     ``webauthn_notice`` renders the fail-closed copy in place of the Add-a-passkey form (extra
-    absent / public_origin unset)."""
+    absent / public_origin unset). ``session_offer`` is the count of the caller's other sessions,
+    given only on the one view a factor change earned (BACKLOG #1147); ``None`` renders no offer."""
     banner = el("p", error, class_="banner") if error else Markup("")
     note = el("p", notice, class_="muted") if notice else Markup("")
+    offer = _session_offer(session_offer) if session_offer is not None else Markup("")
     is_ad = me.auth_provider == "ad"
     ident = el(
         "div",
@@ -643,6 +691,7 @@ def account_page(
         el("h1", "My account"),
         note,
         banner,
+        offer,
         ident,
         el("div", el("h2", "Password"), pw_section, class_="card"),
         el("div", el("h2", "Multi-factor authentication"), mfa_section, class_="card"),
@@ -706,15 +755,7 @@ def sessions_page(sessions: Sequence[Mapping[str, object]], *, notice: str | Non
         *rows,
     )
     sign_out_others = (
-        el(
-            "form",
-            el("button", f"Sign out everywhere else ({others})", type="submit"),
-            method="post",
-            action="/ui/account/sessions/revoke-others",
-            class_="ctl",
-        )
-        if others
-        else Markup("")
+        _revoke_others_form(f"Sign out everywhere else ({others})") if others else Markup("")
     )
     body = el(
         "div",
@@ -1067,10 +1108,14 @@ def mfa_confirm_page(*, error: str | None = None) -> Markup:
     return page("Confirm MFA", body, active="account")
 
 
-def mfa_recovery_page(codes: Sequence[str]) -> Markup:
-    """The single-use recovery codes — shown ONCE, immediately after activation. Never re-fetchable."""
+def mfa_recovery_page(codes: Sequence[str], *, other_sessions: int) -> Markup:
+    """The single-use recovery codes — shown ONCE, immediately after activation. Never re-fetchable.
+
+    The confirm POST renders this page itself, so it also carries the offer to end the caller's
+    ``other_sessions`` (BACKLOG #1147). The offer navigates away, so the page says to save the
+    codes first."""
     items = [el("li", el("code", c)) for c in codes]
-    body = el(
+    codes_card = el(
         "div",
         el("h1", "MFA is active"),
         el(
@@ -1083,6 +1128,17 @@ def mfa_recovery_page(codes: Sequence[str]) -> Markup:
         el("p", el("a", "← My account", href="/ui/account")),
         class_="card",
     )
+    save_first = (
+        el(
+            "p",
+            "Save your recovery codes before you sign out your other sessions. "
+            "This page is not shown again.",
+            class_="muted",
+        )
+        if other_sessions
+        else Markup("")
+    )
+    body = el("div", codes_card, save_first, _session_offer(other_sessions))
     return page("Recovery codes", body, active="account")
 
 
