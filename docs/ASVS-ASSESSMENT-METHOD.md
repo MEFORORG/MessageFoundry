@@ -156,19 +156,19 @@ these itself. They are not owner rulings, and the owner may overturn any of them
 repository on vault branch `b309-rulings-and-cells`. §1.1d answers the fourth.
 
 1. A reverse proxy that the assessed posture (§2.2) names cannot meet a host-substrate limb. The
-   posture decides the configuration a cell is graded in. It does not add the proxy to the five
-   software artifacts that §2 assesses, so a cell grades what those artifacts ship. The one route to
-   `pass` for such a limb is an engine gate that refuses to start when the limb's precondition is
-   absent. That is rule 4's second limb, and §1.1a says what it requires. A gate that an operator's
-   declaration clears falls under rule 4's text on relaxations and ruling R8 (§1.1). This decision
-   does not extend them.
-2. R2 recorded no accepted consequence, though §1.1a's ruling did. This decision records one. A limb
-   that only the host substrate can meet, with no engine gate of the kind item 1 names, never
-   reaches `pass`. Neither does its cell. Rules 3 and 5 then pick the verdict in order, as for any
-   cell. A cell that moves down for this reason is a §2.2 cause-4 movement, not a regression.
+   proxy is not one of the five software artifacts that §2 assesses, so a cell grades what those
+   artifacts ship. The one route to `pass` for such a limb is an engine gate that refuses to start
+   when the limb's precondition is absent. That is rule 4's second limb, and §1.1a says what it
+   requires. A gate that an operator's declaration clears falls under rule 4's text on relaxations
+   and ruling R8 (§1.1). This decision does not extend them.
+2. R2 recorded no accepted consequence, though §1.1a's ruling did. This decision states one, and the
+   owner has not accepted it. A limb that only the host substrate can meet never reaches `pass`
+   unless an engine gate of the kind item 1 names exists. Neither does its cell. This decision rules
+   out `pass` and nothing more: rules 2 to 6 still pick the verdict. A cell that moves down for this
+   reason is a §2.2 cause-4 movement.
 3. R2 does not reach the 5.4.3 row in §1.2. R2 bars scoping out one limb, and that row scopes out the
    whole requirement under rule 1. The row already says its verdict depends on the enterprise
-   covering every path. It is closed by owner decision (2026-08-02), and R2 gives no ground to
+   covering those paths. It is closed by owner decision (2026-08-02), and R2 gives no ground to
    reopen it.
 
 ### 1.1c What counts as documentation: a docstring or a code comment does not (owner ruling, 2026-10-08), and the method's reading of what does
@@ -244,23 +244,25 @@ one.
 1. If no configuration of the shipped artifacts can reach Y, the limb is met.
 2. If some configuration can turn Y on, grade the limb under §1.1a, which grades the shipped default.
 
+Branch 2 does not skip a rule. Rules 2 to 6 still run in order, and §1.1a governs where Y ships off.
+
 This ruling does not say whether operator-authored Router or Handler code counts as a
-configuration. That code can import any library. Until someone decides it, default to the worse
-verdict (§1.3).
+configuration. That code can import any library. Until someone decides it, a cell whose verdict
+turns on that question is `needs-review`, the verdict §1 gives a cell blocked on a decision.
 
 Four limits come with the two-branch rule.
 
-1. Only a limb is met this way. A requirement that is conditional as a whole, on a Y that no
-   configuration can reach, still goes to rule 1, as the 10.5.5 row in §1.2 does. If some
-   configuration can turn that Y on, rule 1 does not fire, and §1.1a governs.
+1. Only a limb is met this way. A requirement can be conditional as a whole. If no configuration
+   can reach its Y, it still goes to rule 1, as the 10.5.5 row in §1.2 does. If some configuration
+   can turn that Y on, rule 1 does not fire.
 2. The vacuity argument in §1.1a item 2 does not reach a Y that no configuration can create. That
    item now says so.
-3. Show that Y is unreachable with an instrument, and never assert it. A search for one token
-   answers a narrower question than whether any configuration reaches Y (§3), so the cell records
-   what the instrument covered beside what it found. At least one cell in the record carried an
-   unreachable claim that a later pass found false.
-4. Applying the rule raises at least one cell. As §1.1a explains, this document records the rule and
-   deliberately not the cells it moves. The owner rulings file below names that cell.
+3. Show that Y is unreachable with an instrument, and never assert it. The instrument must answer
+   that question and not a narrower one. A search for one token shows only that the token is absent
+   (§3). At least one cell in the record carried an unreachable claim that a later pass found false.
+4. Applying the rule raises at least one cell. That is a §2.2 cause-4 movement, and no code changed.
+   As §1.1a explains, this document records the rule and deliberately not the cells it moves. The
+   owner rulings file below names that cell.
 
 **One consequence is flagged, and nobody has decided it.** Limit 1 may change the rule under which
 at least one cell is graded today. That cell is a candidate for a re-read. The Manager rulings file
@@ -270,9 +272,15 @@ named in §1.1b names it.
 The question said adversarial review had upheld it with amendments. The owner chose the option whose
 description begins *"Adopt the split"*. The four limits are those amendments. Their wording is the
 batch 309 Manager seat's, after adversarial review, and the owner was not asked about them one by
-one. Three passages are neither the ruling nor its amendments: the paragraph on operator-authored
-code, the last sentence of limit 1, and the second sentence of limit 3. They are this section's
-reading, added in code review. The ruling was given in session. Its record is
+one. Some text here is neither the ruling nor its amendments. It is this section's reading, added
+in code review. At least these passages are that reading:
+
+- the paragraph after the two branches, and the one on operator-authored code;
+- in limit 1, the words *"If no configuration can reach its Y"*, and the last sentence;
+- in limit 3, the two sentences on what the instrument must answer;
+- the cause-4 sentence in limit 4, and the flagged consequence.
+
+The ruling was given in session. Its record is
 `docs/security/OWNER-RULINGS-2026-10-10-BATCH309.md`, pending in the `MessageFoundry-vault`
 repository on vault branch `b309-rulings-and-cells`.
 
