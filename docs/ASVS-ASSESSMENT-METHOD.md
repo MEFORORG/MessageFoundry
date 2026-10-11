@@ -99,7 +99,7 @@ recur; all three are now settled.
    argument**, and accepting it would make rule 4's first limb unfalsifiable: *every* off-by-default
    control removes its own trigger, so the argument is available to all of them and discriminates
    between none of them. A property predicated of an object the shipped default never creates is not
-   *satisfied*. Since the owner ruling of 2026-10-10 (§1.1d), that sentence covers an object that
+   *satisfied*. Since the owner ruling of 2026-10-11 (§1.1d), that sentence covers an object that
    some configuration of the shipped artifacts can create. An object that no configuration can
    create is §1.1d's case.
 3. **"No code change could improve the cell, so a `partial` manufactures a phantom remediation item."**
@@ -148,11 +148,11 @@ repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
 **The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
 it stands.
 
-**Three questions R2 left open are answered by Manager decision (2026-10-10).** Engine PR 1488 wrote
+**Three questions R2 left open are answered by Manager decision (2026-10-11).** Engine PR 1488 wrote
 R2 into this section and routed four questions it did not decide. The batch 309 Manager seat
 answered the first three under the owner's driver rule, which tells that seat to decide calls like
 these itself. They are not owner rulings, and the owner may overturn any of them. The record is
-`docs/security/ASVS-MANAGER-RULINGS-2026-10-10-BATCH309.md`, pending in the `MessageFoundry-vault`
+`docs/security/ASVS-MANAGER-RULINGS-2026-10-11-BATCH309.md`, pending in the `MessageFoundry-vault`
 repository on vault branch `b309-rulings-and-cells`. §1.1d answers the fourth.
 
 1. A reverse proxy that the assessed posture (§2.2) names cannot meet a host-substrate limb. The
@@ -235,7 +235,7 @@ The first ruling was given in session on 2026-10-08, after adversarial review, a
 rulings file there is pending. As in §1.1a, this document records the rule and deliberately not a
 list of the cells it moves.
 
-### 1.1d A conditional limb is met when no configuration can reach its condition (owner ruling, 2026-10-10)
+### 1.1d A conditional limb is met when no configuration can reach its condition (owner ruling, 2026-10-11)
 
 Some requirements carry a limb that applies only when a feature is used: *if Y is used, then the
 software must do Z*. R2 (§1.1b) keeps every such limb in scope. This section says how a cell grades
@@ -268,7 +268,7 @@ Four limits come with the two-branch rule.
 at least one cell is graded today. That cell is a candidate for a re-read. The Manager rulings file
 named in §1.1b names it.
 
-**Which parts are the owner's.** On 2026-10-10 the owner was asked about the two-branch rule above.
+**Which parts are the owner's.** On 2026-10-11 the owner was asked about the two-branch rule above.
 The question said adversarial review had upheld it with amendments. The owner chose the option whose
 description begins *"Adopt the split"*. The four limits are those amendments. Their wording is the
 batch 309 Manager seat's, after adversarial review, and the owner was not asked about them one by
@@ -281,7 +281,7 @@ in code review. At least these passages are that reading:
 - the cause-4 sentence in limit 4, and the flagged consequence.
 
 The ruling was given in session. Its record is
-`docs/security/OWNER-RULINGS-2026-10-10-BATCH309.md`, pending in the `MessageFoundry-vault`
+`docs/security/OWNER-RULINGS-2026-10-11-BATCH309.md`, pending in the `MessageFoundry-vault`
 repository on vault branch `b309-rulings-and-cells`.
 
 ### 1.2 Worked examples — the ones that actually broke
