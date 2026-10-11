@@ -138,7 +138,10 @@ number for it.
   calls `AesGcmCipher._count_invocation`.
 - `store/gcm_bound.py` `bounded_cipher` returns `None` for any cipher that is not an `AesGcmCipher`. So
   this path writes no `cipher_meta` row, raises no 2^31 `gcm_invocations` alert, and has no 2^32
-  refusal.
+  refusal. *(2026-10-10, BACKLOG #2187: true of the store's cells. When a key resolves for the backup,
+  DR archives in this mode still seal under that DEK and charge its `cipher_meta` row, with no
+  enforced ceiling; see ADR 0196's 2026-10-10 amendment. A seat decision under owner delegation
+  2026-10-08, not an owner ruling.)*
 - At startup `build_transit_cipher` checks that the data key exists and that its type is in
   `TRANSIT_KEY_TYPES_DATA`. `require_transit_key_type` reads the key's metadata with `read_key` and
   checks only its type. It does not check the key's rotation settings.
