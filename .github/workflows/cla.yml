@@ -27,18 +27,18 @@ on:
   # manufactures a permanent green-that-means-not-applicable on the merge path -- the silent-control
   # decay ADR 0158 names.
   #
-  # WHETHER THAT QUEUE-TIME GREEN IS MERELY DECORATIVE IS UNESTABLISHED. DO NOT READ IT EITHER WAY.
-  # PR 754 did carry a green PR-time `cla` before it was queued (check-run success 19:25:55Z, the
-  # only `cla` among 41 check-runs on head 1e9f1cb3), which is consistent with the PR-time check
-  # being the one that does the work. But nobody has established that GitHub REQUIRES that PR-time
-  # green before an entry may join the queue, and no negative case was manufactured to find out. It
-  # is recorded as open on BACKLOG #340. Signing enforcement is NOT weakened by anything written
-  # here; it is also not proven by it.
+  # THE QUEUE-TIME GREEN IS DECORATIVE FOR SIGNING AND LOAD-BEARING FOR MERGING, ON GITHUB'S WORD.
+  # Load-bearing for the first paragraph's reason. GitHub's merge-queue docs say a pull request joins
+  # the queue only after passing all required branch protection checks. So the PR-time `cla` run has
+  # done the signing work. The owner accepted that entry condition by ruling 2026-09-14, recorded on
+  # vault BACKLOG #340. PR 754 fits it without testing it: on 2026-09-03 its one `cla` check-run went
+  # green at 19:25:55Z on head 1e9f1cb3, before it was queued. The merge-path green that means
+  # not-applicable is a STATED RESIDUAL, accepted by the owner on 2026-10-08. At least one route stays
+  # open: if the entry condition ever failed, an unsigned PR could merge on that green. That route is
+  # NOT MEASURED HERE, because the owner declined the experiment. Nothing here proves signing holds.
   #
-  # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
-  # That was true when the trigger landed on 2026-08-26 and became false once a queue was
-  # configured; corrected 2026-09-03. BACKLOG #340 carries the measurements and STAYS OPEN -- a
-  # live queue is not that item being finished, and who enabled the queue is recorded nowhere.
+  # FORMERLY "INERT UNTIL A MERGE QUEUE EXISTS": true on 2026-08-26, false once a queue was set up,
+  # corrected 2026-09-03. The owner chose on 2026-10-08 to close BACKLOG #340.
   merge_group:
   issue_comment:
     types: [created]
