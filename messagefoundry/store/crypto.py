@@ -1361,6 +1361,9 @@ class AesGcmCipher(_UnmarkedPolicy):
     def _candidates(self, key_id: str, salt: bytes | None) -> Iterator[AESGCM]:
         """The keys to try on one value: the named DEK first, then every other one in keyring order.
 
+        :meth:`decrypt` relies on this order: its fast path is index 0 when the name is in the
+        keyring (BACKLOG #1167). Change the order and that fast path must change with it.
+
         For a v4 value each is that DEK's sub-key for the value's salt, derived only when reached, so
         the common case (the named key opens it) derives at most one."""
         ordered = [key_id] if key_id in self._keyring else []
@@ -1392,40 +1395,44 @@ class AesGcmCipher(_UnmarkedPolicy):
         # Try the named key first (the fast path for current-format rows), then every other key — this
         # transparently decrypts legacy key_id='0' rows and rows written under a retired key mid-rotation.
         #
-        # BACKLOG #1167 (ASVS 11.2.4) EXAMINED THIS SHORT-CIRCUIT AND IS DELIBERATELY LEAVING IT.
-        # It is a literal short-circuit return inside a cryptographic loop, so it looks like the verb's
-        # target, and the sibling one in `_verify_second_factor` WAS a real leak and was fixed (ADR
-        # 0170). This one is not, for three independent reasons — any one of which is sufficient:
+        # BACKLOG #1167 (ASVS 11.2.4). MANAGER DECISION 2026-10-10, taken under the owner's standing
+        # driver rule and NOT an owner ruling; the owner may still overrule it. This comment used to
+        # reserve the read-cost trade below to the owner by name; the owner answered that question
+        # with the driver rule, and the Manager decided it.
         #
-        #   1. THE INPUT IS NOT ATTACKER-SUPPLIED. `stored` comes from the store, not from a request.
-        #      Submitting chosen ciphertext here already requires database write access.
-        #   2. WHAT THE TIMING REVEALS IS ALREADY IN PLAINTEXT. The candidate count varies with which
-        #      key encrypted the row — and `key_id` is parsed out of `stored` two lines above, because
-        #      the marker publishes it. The "leak" is a value the same string hands over for free.
-        #   3. THE PER-CANDIDATE COST IS A GMAC TAG CHECK. Microseconds, and constant-time inside
-        #      `cryptography`. The recovery-code walk mattered because each step was a ~64 MiB argon2id.
+        # The fast path keeps its early exit. It tries first the key the marker's PLAINTEXT `key_id`
+        # names, and stops if that key opens the row. Its timing shows only whether the named key
+        # opened it. `_candidates` yields the named key first; this loop relies on that order.
         #
-        # AND THE "FIX" WOULD COST SOMETHING REAL: forcing all candidates would tag-check every row
-        # against every retired key on every read, multiplying store read cost through a rotation, to
-        # conceal a value the ciphertext already prints. Recorded here rather than left to be
-        # rediscovered — an unreported non-defect gets "fixed" by the next reader.
+        # The FALLBACK has no early exit. It runs when the marker names no configured key (a legacy
+        # key_id='0' row, a key not in the keyring) or when the named key fails. It used to stop at
+        # the first key that verified, so its timing told which configured key sealed the row, and no
+        # header field says that. Now it tries EVERY remaining key, keeps the first plaintext that
+        # verified, and decides only after the loop. The decrypted value and the CipherError texts
+        # are unchanged. One thing does change: an error other than InvalidTag from a later key, which
+        # the old loop never reached, now surfaces.
         #
-        # NOT a licence to reuse this argument elsewhere: #1167 names extending it to the recovery-code
-        # walk as the one move that would NOT be an honest pass. It is scoped to this loop.
+        # THE COST, ON FALLBACK ROWS ONLY: one tag check per keyring key on every read. For a v4 row
+        # it is also one sub-key derivation per keyring key, and each takes a slot in the bounded
+        # sub-key cache, so fallback reads across many salts evict sooner. A row whose named key opens
+        # it pays nothing extra. The earlier reasons for leaving the short-circuit (the input comes
+        # from the store, not a request; the per-key cost is a constant-time GMAC check) still
+        # describe the impact. They never answered the absolute verb, and the decision above does.
         #
-        # AND IT ANSWERS IMPACT, NOT CONFORMANCE — do not read the three reasons above as closing the
-        # ASVS question. 11.2.4's verb is ABSOLUTE: no short-circuit operations in comparisons,
-        # calculations or returns. This is a short-circuit return whether or not the value it leaks is
-        # secret, so the cell stays PARTIAL on this loop by design, and its record named closing BOTH
-        # this and the recovery-code walk as what would earn the pass — before either was written, so
-        # the arithmetic is not after-the-fact. Both statements are true at once: no vulnerability
-        # here, and no conformance either. Whether the read-cost trade above is worth paying to reach
-        # the absolute verb is an OWNER call, not an assessor's and not this comment's.
-        for aes in self._candidates(key_id, salt):
+        # NOT a licence to reuse any of this reasoning for the recovery-code walk: #1167 names that as
+        # the one move that would NOT be an honest pass.
+        named = key_id in self._keyring
+        decrypted: bytes | None = None
+        for index, aes in enumerate(self._candidates(key_id, salt)):
             try:
-                decrypted = aes.decrypt(nonce, ct, gcm_aad)
+                opened = aes.decrypt(nonce, ct, gcm_aad)
             except InvalidTag:
                 continue
+            if decrypted is None:
+                decrypted = opened  # the first key that verified wins, as before
+            if named and index == 0:
+                break  # the fast path: the marker named this key in plaintext
+        if decrypted is not None:
             # Copy the plaintext into an owned, lockable buffer so its mutable lifetime is bounded and it
             # is wiped after decoding. RESIDUAL (documented): `cryptography.decrypt` returns an IMMUTABLE
             # `bytes` we cannot scrub, and the returned `str` is immutable too — both linger until GC.
@@ -1434,7 +1441,7 @@ class AesGcmCipher(_UnmarkedPolicy):
             try:
                 # A UnicodeDecodeError's .object is the decrypted plaintext, so it is suppressed and
                 # the refusal raised after the block, chaining nothing (BACKLOG #2308, the Transit
-                # twin's shape). The tag verified, so no other key is tried: the row is corrupt.
+                # twin's shape). The tag verified, so the row is corrupt, whatever other keys said.
                 with contextlib.suppress(UnicodeDecodeError):
                     return pt.decode("utf-8")
             finally:

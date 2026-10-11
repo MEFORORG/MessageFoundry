@@ -119,6 +119,7 @@ from messagefoundry.auth.anchor_path import (
     anchor_path_verdict,
 )
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.service_status import _system_exe
 
@@ -728,7 +729,10 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     fingerprint = hashlib.sha256(data).hexdigest()
     pin_ok: bool | None = None
     if spec.pin is not None:
-        pin_ok = fingerprint == _normalize_pin(spec.pin)
+        # Constant-time (ASVS 11.2.4, BACKLOG #1167). A CA's fingerprint is public, so this hides no
+        # secret; it keeps a short-circuit `==` off the pin check. Both sides are 64 lowercase hex
+        # chars: `hexdigest` emits that form, and `_normalize_pin` produces it or raises.
+        pin_ok = constant_time_equal(fingerprint, _normalize_pin(spec.pin))
     path_check = anchor_path_verdict(spec.path)
     return AnchorVerdict(
         fingerprint=fingerprint,
