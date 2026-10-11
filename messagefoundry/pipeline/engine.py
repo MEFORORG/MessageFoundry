@@ -854,8 +854,7 @@ class Engine:
         # DR decision is never a cluster-wide config bump.
         try:
             if rr is not None:
-                await self.preflight_settings()
-                await self.preflight_registry(rr.registry)
+                await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
                 await rr.reload()
@@ -892,6 +891,29 @@ class Engine:
                         "failed too; POST /config/reload closes them"
                     )
             raise
+
+    async def _dr_preflight(self, registry: Registry) -> None:
+        """The settings and registry preflights a DR activation runs before its reload, bounded by
+        ``[dr].takeover_timeout_seconds`` (vault BACKLOG #3094, item 3).
+
+        They read trust-anchor files, which may sit on a share at the failed site, and they run
+        under the coordinator's lock, so with no bound a share that stops answering held every
+        later activate and release too. A timeout raises ``TimeoutError``, which the caller rolls
+        back like any refusal. The reload that follows is not bounded here. Cancelling it partway
+        rolls back a takeover the VIP has already moved for, and the runner gives each lane's first
+        build its own isolation (ADR 0048, the vault BACKLOG #3263 amendment)."""
+        timeout = self._dr_settings.takeover_timeout_seconds
+        bound = asyncio.timeout(timeout)
+        try:
+            async with bound:
+                await self.preflight_settings()
+                await self.preflight_registry(registry)
+        except TimeoutError as exc:
+            if not bound.expired():
+                raise  # a TimeoutError from inside the preflight is its own error
+            raise TimeoutError(
+                f"the trust-anchor preflight did not answer within {timeout:g}s"
+            ) from exc
 
     async def _dr_config_drift(self) -> dict[str, object]:
         """The provenance fields a DR activation records: the activated graph's digest, and whether

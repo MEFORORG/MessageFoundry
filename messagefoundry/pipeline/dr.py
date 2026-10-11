@@ -87,6 +87,17 @@ _ACTION_ABORTED = "dr_activation_aborted"
 #: only a completed hand-back writes, so a filter on that action still finds only fail-backs.
 _ACTION_RELEASE_FAILED = "dr_release_failed"
 
+
+def _vip_note(hook: str) -> str:
+    """The note an abort after the takeover hook carries, since the box is then passive and may
+    hold the address. ``hook`` is how sure the abort is that the hook ran: ``"ran"`` or ``"may
+    have run"`` (vault BACKLOG #3094, item 11)."""
+    return (
+        f". The takeover hook {hook}, so the VIP may have moved to this box with no priority "
+        "listener bound -- check the load balancer before retrying"
+    )
+
+
 #: The one answer for every refused request archive, whichever check refused it. It names the
 #: setting and no part of the path, so the refusal says nothing about what exists on the DR box.
 _REQUEST_ARCHIVE_REFUSED = (
@@ -137,6 +148,14 @@ class _ActivationProgress:
 
     step: str = "seed"  # seed | store | vip | profile
     profile_applied: bool = False
+    #: The row hash of the dr_seed marker this attempt wrote, once written. An abort after it names
+    #: it, so a retry's second marker is not read as the same attempt (vault BACKLOG #3094).
+    seed_segment: str | None = None
+    hook_ran: bool = False  # the takeover hook ran to exit 0
+
+    def abort_fields(self) -> dict[str, object]:
+        """The fields an abort row carries about this attempt (vault BACKLOG #3094, item 11)."""
+        return {"seed_segment": self.seed_segment, "vip_hook_ran": self.hook_ran}
 
 
 class DrCoordinator:
@@ -276,17 +295,32 @@ class DrCoordinator:
                     now=now,
                     progress=progress,
                 )
+            except DrActivationError:
+                raise  # an abort path already wrote its row
+            except Exception as exc:
+                # An error no abort path caught, such as a store fault while the seed marker is
+                # written. It used to escape with no abort row, and the route answered a bare 500
+                # (vault BACKLOG #3094, item 6). Once the profile is applied the box is active, and
+                # only the owed dr.activate row is left to write, so that error stands.
+                if progress.profile_applied:
+                    raise
+                self._active = False
+                reason = f"activation failed during the {progress.step} step: {safe_exc(exc)}"
+                if progress.hook_ran:
+                    reason += _vip_note("ran")
+                await self._record_aborted(
+                    "state", reason, actor, now, extra=progress.abort_fields()
+                )
             except BaseException as exc:
                 # A cancellation is not an Exception, so neither step 4's arm nor any abort path
                 # sees one (vault BACKLOG #2751). The API runs activation so that a request
                 # deadline does not cancel it (api/outlive.py); this arm is for what still can,
                 # such as a shutdown. It puts the flag back unless the run-profile was applied,
                 # records the outcome, and re-raises.
-                if not isinstance(exc, Exception):
-                    if not progress.profile_applied:
-                        self._active = False
-                    if isinstance(exc, asyncio.CancelledError):
-                        await self._record_interrupted_activation(progress, actor, now)
+                if not progress.profile_applied:
+                    self._active = False
+                if isinstance(exc, asyncio.CancelledError):
+                    await self._record_interrupted_activation(progress, actor, now)
                 raise
 
     async def _activate_locked(
@@ -345,13 +379,13 @@ class DrCoordinator:
                 actor,
                 now,
             )
-        seed_segment = await self._record_seed_marker(seed, verify, now)
+        progress.seed_segment = seed_segment = await self._record_seed_marker(seed, verify, now)
 
         # (3) Acquire-VIP-or-abort (ADR 0048). The optional takeover_hook is belt-and-braces for a
         # non-LB topology; an ADR-0047 LB deployment omits it (the passive LB moves the VIP once the
         # listeners bind in step 4). A hook failure/timeout ABORTS before any listener serves the VIP.
         progress.step = "vip"
-        hook_ran = await self._run_vip_hook(
+        progress.hook_ran = hook_ran = await self._run_vip_hook(
             self._settings.takeover_hook, phase="takeover", actor=actor, now=now
         )
 
@@ -371,7 +405,13 @@ class DrCoordinator:
                 "DR run-profile activation failed (the engine could not bind the priority "
                 f"feeds): {safe_exc(exc)}"
             )
-            await self._record_aborted("profile", reason, actor, now)
+            if hook_ran:
+                reason += _vip_note("ran")
+            # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
+            # abort, so a retry's own marker reads as a second attempt (vault BACKLOG #3094, item
+            # 11). The takeover is not undone: a release hook could hand the address to a primary
+            # that is down, so the runbook leaves that to the operator.
+            await self._record_aborted("profile", reason, actor, now, extra=progress.abort_fields())
         progress.profile_applied = True
 
         # Owed from here: a write cut short is made good by the next activate or release call.
@@ -604,11 +644,10 @@ class DrCoordinator:
             return
         reason = f"activation interrupted during the {progress.step} step; the box stays passive"
         if progress.step in ("vip", "profile"):
-            reason += (
-                ". The takeover hook may have run, so the VIP may have moved to this box with no "
-                "priority listener bound -- check the load balancer before retrying"
-            )
-        await self._write_aborted_row("interrupted", reason, actor, now)
+            reason += _vip_note("ran" if progress.hook_ran else "may have run")
+        await self._write_aborted_row(
+            "interrupted", reason, actor, now, extra=progress.abort_fields()
+        )
 
     async def _record_release_failed(
         self,
@@ -1093,8 +1132,9 @@ class DrCoordinator:
         chain's tip hash** (read via :meth:`Store.audit_anchor`). Each side then stays independently
         verifiable and the fork is explicit/attributable, rather than blindly extending the restored chain
         (ADR 0049/0041 audit-chain-fork handling). Returns the marker row's own hash digest (PHI-free)."""
-        # Before the anchor read, so the hash of the config dir does not widen the window in which
-        # another audit row could land between the anchor and this marker.
+        # The engine's provider reads the running graph's digest from memory (vault BACKLOG #3067),
+        # so where it runs against the anchor read no longer matters; before it keeps the window
+        # between the anchor and this marker as short as a provider that does read a file allows.
         provider = self._config_fingerprint_provider
         config_fp = await provider() if provider is not None else None
         restored_seq, restored_tip = await self._store.audit_anchor()
@@ -1162,21 +1202,36 @@ class DrCoordinator:
         return True
 
     async def _record_aborted(
-        self, kind: str, message: str, actor: str, now: float, *, requested: str | None = None
+        self,
+        kind: str,
+        message: str,
+        actor: str,
+        now: float,
+        *,
+        requested: str | None = None,
+        extra: Mapping[str, object] | None = None,
     ) -> NoReturn:
         """Record a ``dr_activation_aborted`` audit row (PHI-free) + raise :class:`DrActivationError`. The
         single fail path for every refused activation, so an aborted promotion always leaves an audit
         trail and the caller gets the failing phase. Never returns (always raises). ``requested`` is
-        a refused request path: it goes in the audit row and never in the raised message."""
-        await self._write_aborted_row(kind, message, actor, now, requested=requested)
+        a refused request path: it goes in the audit row and never in the raised message. ``extra``
+        adds PHI-free fields to the row, never replacing ``kind`` or ``reason``."""
+        await self._write_aborted_row(kind, message, actor, now, requested=requested, extra=extra)
         raise DrActivationError(kind, message)
 
     async def _write_aborted_row(
-        self, kind: str, message: str, actor: str, now: float, *, requested: str | None = None
+        self,
+        kind: str,
+        message: str,
+        actor: str,
+        now: float,
+        *,
+        requested: str | None = None,
+        extra: Mapping[str, object] | None = None,
     ) -> None:
         """The ``dr_activation_aborted`` row and its log line, without the raise. Best-effort:
         recording the abort must never mask the abort itself."""
-        detail = {"kind": kind, "reason": message}
+        detail: dict[str, object] = {**(extra or {}), "kind": kind, "reason": message}
         if requested is not None:
             detail["requested"] = requested
         try:

@@ -42,7 +42,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import DrParkedError
 from tests.test_dr_activation import _seed
-from tests.test_dr_outlive_deadline import _admin_client
+from tests.test_dr_outlive_deadline import _admin_client, _rows
 
 # A name that cannot be encoded as UTF-8: a lone surrogate. NTFS stores it as UTF-16, and on a
 # POSIX file system Python writes it as the raw byte 0x80. Under environments/ it is fingerprinted
@@ -1018,3 +1018,219 @@ async def test_the_dr_fingerprint_is_not_taken_on_the_event_loop(
     # below are not an empty list.
     assert seen, "the activation took no digest of the config dir"
     assert all(thread != loop_thread for _name, thread in seen), seen
+
+
+# --- vault BACKLOG #3094: activation follow-ups from engine PR 2057 --------------------------------
+
+
+def _short_engine_takeover(engine: Engine, seconds: float = 0.5) -> Any:
+    """Shorten ``[dr].takeover_timeout_seconds`` for the engine's own bounds only, and return the
+    coordinator. It is built first, so it keeps the settings it was built with. Its restore-verify
+    step then keeps the default bound, which a loaded runner can need more than 0.5s of."""
+    coord = engine.dr_coordinator
+    assert coord is not None
+    engine._dr_settings = engine.dr_settings.model_copy(
+        update={"takeover_timeout_seconds": seconds}
+    )
+    return coord
+
+
+def _spy_hook(coord: Any, monkeypatch: pytest.MonkeyPatch, hooks: list[str]) -> None:
+    """Record each hook phase, and answer as a hook that ran and exited 0."""
+
+    async def ran(command: str, *, phase: str, actor: str, now: float) -> bool:
+        hooks.append(phase)
+        return True
+
+    monkeypatch.setattr(coord, "_run_vip_hook", ran)
+
+
+async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeover_bound(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 3. Red at origin/main 1d55295f66: the trust-anchor preflights in step 4 ran under the
+    coordinator lock with no bound. A share that stopped answering held the activation, and every
+    later activate or release waiting on that lock, for good."""
+    engine = box.engine
+    coord = _short_engine_takeover(engine)
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+
+    async def hang(registry: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine, "preflight_registry", hang)
+    with pytest.raises(DrActivationError) as caught:
+        await asyncio.wait_for(coord.activate(actor="alice"), 60)
+
+    assert caught.value.kind == "profile"
+    assert "did not answer within 0.5s" in str(caught.value)
+    assert coord.active is False and engine.dr_active is False
+    assert rr.dr_threshold is None and rr.dr_standby is Priority.CRITICAL
+    assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["kind"] == "profile"
+
+
+async def test_a_seed_marker_that_cannot_be_written_is_an_audited_abort_before_the_hook(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 6. Red at origin/main 1d55295f66: an error outside the abort paths, here from the
+    marker's digest provider, escaped the coordinator raw. The route then answered a bare 500, and
+    no dr_activation_aborted row said the activation had stopped."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    hooks: list[str] = []
+    _spy_hook(coord, monkeypatch, hooks)
+
+    async def broken() -> str | None:
+        raise RuntimeError("the digest provider failed")
+
+    monkeypatch.setattr(coord, "_config_fingerprint_provider", broken)
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+
+    assert caught.value.kind == "state"
+    assert "the digest provider failed" in str(caught.value)
+    assert hooks == []  # the VIP never moved for it
+    assert coord.active is False and engine.dr_active is False
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["kind"] == "state"
+
+
+async def test_a_step_4_abort_after_the_hook_names_the_hook_and_its_seed_marker(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 11. Red at origin/main 1d55295f66: the abort row said only that the profile failed.
+    The takeover hook had run and a dr_seed marker was written, and a retry writes a second one,
+    with nothing tying the first to the abort."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    coord = engine.dr_coordinator
+    assert coord is not None
+    hooks: list[str] = []
+    _spy_hook(coord, monkeypatch, hooks)
+    real_reload = rr.reload
+
+    async def failing_reload(registry: object = None) -> None:
+        raise OSError("a listener could not bind")
+
+    monkeypatch.setattr(rr, "reload", failing_reload)
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+    assert caught.value.kind == "profile"
+    assert hooks == ["takeover"]  # control: the hook ran before step 4 refused
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["vip_hook_ran"] is True
+    first_segment = row["seed_segment"]
+    assert isinstance(first_segment, str) and first_segment
+    assert "VIP may have moved" in str(row["reason"])
+    assert "VIP may have moved" in str(caught.value)
+
+    monkeypatch.setattr(rr, "reload", real_reload)
+    result = await coord.activate(actor="alice")  # the retry opens its own segment
+    assert result.active is True and result.seed_segment != first_segment
+    assert len(await engine.store.list_audit(action="dr_seed")) == 2
+
+
+async def test_a_step_4_abort_with_no_hook_does_not_say_the_vip_moved(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above. With no takeover hook configured nothing moved the VIP, so
+    the row says the hook did not run and makes no claim about the address."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+
+    async def failing_reload(registry: object = None) -> None:
+        raise OSError("a listener could not bind")
+
+    monkeypatch.setattr(rr, "reload", failing_reload)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    with pytest.raises(DrActivationError):
+        await coord.activate(actor="alice")
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["vip_hook_ran"] is False
+    assert "VIP" not in str(row["reason"])
+
+
+async def test_an_empty_config_dir_does_not_stop_the_activation(box: _Box) -> None:
+    """Item 7, a pin. At engine PR 2057 an empty dir passed the listing preflight, and step 4 then
+    refused it after the hook. Engine PR 2070 removed both the preflight and the step 4 disk read,
+    so an empty dir, such as an unmounted mount point, is now only recorded as drift."""
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    for child in box.staging.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    assert not any(box.staging.iterdir())  # control: the dir is there, and empty
+    coord = engine.dr_coordinator
+    assert coord is not None
+
+    result = await coord.activate(actor="alice")
+
+    assert result.active is True
+    assert _inbound_names(engine) == {"IB_STAGING_ADT"}
+    assert await _rows(engine.store, "dr_activation_aborted") == []
+    assert (await _activate_row(engine))["disk_config"] == "differs"
+
+
+async def test_a_config_dir_that_does_not_answer_is_bounded_and_recorded(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Items 3 and 8, a pin. The one read of the config dir an activation still makes is the drift
+    digest after step 4. Engine PR 2070 bounded it by [dr].takeover_timeout_seconds, and no test
+    pinned the bound. Red with that bound removed: the activation never answers."""
+    engine = box.engine
+    coord = _short_engine_takeover(engine)
+    await engine.reload_detail(box.staging)
+
+    async def hang(path: Path) -> tuple[dict[str, object] | None, str | None]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(engine, "fingerprint_bundle", hang)
+    result = await asyncio.wait_for(coord.activate(actor="alice"), 60)
+
+    assert result.active is True and engine.dr_active is True
+    row = await _activate_row(engine)
+    assert row["disk_config"] == "unreadable"
+    assert row["disk_config_error"] == "no answer within 0.5s"
+
+
+async def test_an_engine_with_no_running_graph_activates(box: _Box) -> None:
+    """Item 9, a pin of the no-runner guard. With no graph loaded the activation has nothing to
+    preflight or reload, and it still latches the profile. Red with the guard removed: the
+    preflight reads the registry of a runner that does not exist."""
+    engine = box.engine
+    assert engine.registry_runner is None  # control: nothing was loaded
+    coord = engine.dr_coordinator
+    assert coord is not None
+
+    result = await coord.activate(actor="alice")
+
+    assert result.active is True and engine.dr_active is True
+    assert await _rows(engine.store, "dr_activation_aborted") == []
+
+
+async def test_a_digest_that_is_not_a_string_is_not_recorded(box: _Box) -> None:
+    """Item 9, a pin. The seed marker records the running graph's digest only when it is a string.
+    Red with that check removed: the marker and the dr.activate row record the value as it is."""
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    engine.loaded_config_fingerprint = {"fingerprint": 123}
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+
+    assert (await _seed_marker(engine))["config_fingerprint"] is None
+    assert (await _activate_row(engine))["config_fingerprint"] is None
