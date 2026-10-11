@@ -8292,6 +8292,8 @@ def _enforce_posix_paths(
     """Hand ``refuse`` a reason for each path in ``paths`` another account could write: a group- or
     world-writable mode, or an owner other than root or the engine's own effective uid. Each message
     starts with ``lead``. A path that cannot be stat'ed is skipped."""
+    if sys.platform == "win32":  # pragma: no cover - callers reach this arm off Windows only
+        return
     # The EFFECTIVE uid is the account the executed code runs as, so it is the one to compare. Called
     # directly: os.geteuid exists on every POSIX platform, and a missing one must fail loudly rather
     # than switch the owner check off.
