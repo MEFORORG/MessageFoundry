@@ -2,9 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ASVS 11.2.4 (BACKLOG #1167): the constant-time compare sweep.
 
-Each converted site gets two tests. One pins that the outcome is unchanged, on a match and on a
-mismatch. The other spies on the module's own ``constant_time_equal`` binding and asserts the site
-called it, so a revert to ``==`` turns the spy test RED while the outcome tests stay green.
+Sections 1 to 5 cover the converted compares. Each gets an outcome test, on a match and on a
+mismatch, and a spy on the module's own ``constant_time_equal`` binding, so a revert to ``==`` turns
+the spy test RED while the outcome tests stay green.
+
+Section 6 is not a compare. It covers the store cipher's keyring fallback, which now tries every
+key with no early exit, and it counts decrypt calls rather than spying on a helper.
 
 The web console's session-list route is pinned beside its existing tests in
 ``packaging/messagefoundry-webconsole/tests/test_webui.py``, because its fixtures live there.
@@ -14,14 +17,17 @@ Synthetic data only: random keys, made-up hashes, a throwaway PEM-shaped file.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from messagefoundry import credential
 from messagefoundry.api import auth_routes
@@ -31,6 +37,7 @@ from messagefoundry.auth.service import STEP_UP_ACTION_MFA_ENROLL, AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import backup_codec as bc
+from messagefoundry.store import crypto
 from messagefoundry.store.store import SessionRecord
 
 # Fixed-width, hex, made up: the shape of a session token hash (SHA-256 hex).
@@ -199,3 +206,96 @@ def test_key_id_compare_is_constant_time(monkeypatch: pytest.MonkeyPatch) -> Non
 
     kid = bc.key_fingerprint(key)
     assert calls == [(kid, kid)]
+
+
+# --- 6. store/crypto AesGcmCipher.decrypt: the keyring fallback has no early exit ----------------
+# Manager decision 2026-10-10 under the owner's driver rule, not an owner ruling (see the comment
+# in AesGcmCipher.decrypt). The fast path still stops at the key the marker names.
+
+
+def _keyring() -> tuple[crypto.AesGcmCipher, list[bytes]]:
+    """An active key plus three retired keys: the first, middle and last retired slots."""
+    b64 = [crypto.generate_key() for _ in range(4)]
+    cipher = crypto.make_cipher(b64[0], b64[1:])
+    assert isinstance(cipher, crypto.AesGcmCipher)
+    return cipher, [base64.b64decode(k) for k in b64]
+
+
+def _sealed(key: bytes, plaintext: bytes, *, key_id: str = "0") -> str:
+    """A v1 row sealed by ``key`` whose marker names ``key_id``. The default "0" is a legacy row."""
+    nonce = os.urandom(12)
+    blob = base64.b64encode(nonce + AESGCM(key).encrypt(nonce, plaintext, None)).decode()
+    return f"{crypto.PREFIX}{key_id}:{blob}"
+
+
+class _Counting:
+    """Wraps one candidate AESGCM and counts its decrypt calls."""
+
+    def __init__(self, aes: AESGCM, calls: list[int]) -> None:
+        self._aes = aes
+        self._calls = calls
+
+    def decrypt(self, nonce: bytes, data: bytes, aad: bytes | None) -> bytes:
+        self._calls.append(1)
+        return self._aes.decrypt(nonce, data, aad)
+
+
+def _count_tries(monkeypatch: pytest.MonkeyPatch, cipher: crypto.AesGcmCipher) -> list[int]:
+    calls: list[int] = []
+    real = cipher._candidates
+
+    def counted(key_id: str, salt: bytes | None) -> Iterator[Any]:
+        return (_Counting(aes, calls) for aes in real(key_id, salt))
+
+    monkeypatch.setattr(cipher, "_candidates", counted)
+    return calls
+
+
+@pytest.mark.parametrize("slot", [1, 2, 3], ids=["first-retired", "middle-retired", "last-retired"])
+def test_a_fallback_row_sealed_by_any_retired_key_still_decrypts(slot: int) -> None:
+    cipher, keys = _keyring()
+    assert cipher.decrypt(_sealed(keys[slot], b"synthetic-legacy")) == "synthetic-legacy"
+
+
+def test_a_row_whose_named_key_fails_tries_every_key_and_decrypts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the loop breaks on any hit once the marker names a key (`if named: break`)."""
+    cipher, keys = _keyring()
+    calls = _count_tries(monkeypatch, cipher)
+    # The marker names the ACTIVE key, but the FIRST retired key (candidate 2 of 4) sealed it.
+    row = _sealed(keys[1], b"synthetic-misnamed", key_id=cipher.active_key_id)
+    assert cipher.decrypt(row) == "synthetic-misnamed"
+    assert len(calls) == 4
+
+
+def test_a_row_no_key_opens_raises_the_same_error() -> None:
+    cipher, _ = _keyring()
+    with pytest.raises(crypto.CipherError, match="no configured key decrypts this value"):
+        cipher.decrypt(_sealed(os.urandom(32), b"synthetic-orphan"))
+
+
+def test_an_unreadable_plaintext_still_raises_the_utf8_error() -> None:
+    cipher, keys = _keyring()
+    with pytest.raises(crypto.CipherError, match="not valid UTF-8"):
+        cipher.decrypt(_sealed(keys[1], b"\xff\xfe"))
+
+
+def test_the_fallback_tries_every_key_even_after_an_early_one_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the fallback loop gets its early exit back. The FIRST retired key (candidate 2 of
+    4) opens this legacy row, and all four candidates must still be tried."""
+    cipher, keys = _keyring()
+    calls = _count_tries(monkeypatch, cipher)
+    assert cipher.decrypt(_sealed(keys[1], b"synthetic-legacy")) == "synthetic-legacy"
+    assert len(calls) == 4
+
+
+def test_the_named_fast_path_still_stops_at_the_named_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED when: the fast path loses its early exit and every read pays for the whole keyring."""
+    cipher, keys = _keyring()
+    calls = _count_tries(monkeypatch, cipher)
+    row = _sealed(keys[0], b"synthetic-current", key_id=cipher.active_key_id)
+    assert cipher.decrypt(row) == "synthetic-current"
+    assert len(calls) == 1
