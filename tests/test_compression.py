@@ -204,6 +204,121 @@ def test_gzip_accepts_a_bytearray() -> None:  # #1129
     blob.extend(b"!")  # nothing still holds an export on the caller's buffer
 
 
+# --- #1129: the trial pass runs before the real one ---------------------------
+#
+# Owner ruling 2026-10-11: a bounded inflate that keeps no output, and refuses an over-cap stream
+# before the real decompression, is a check "before uncompressing". Each test records whether every
+# inflate kept its output, so "the real pass never ran" is measured rather than inferred.
+
+_TRIAL_CAP = 4096
+
+
+def _record_inflates(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record ``keep_output`` for every inflate of a gzip member or zlib stream, and for every zip
+    member read. ``False`` is the trial pass and ``True`` is the real one."""
+    kept: list[bool] = []
+    real_inflate = bounded_inflate
+    real_read = compression._read_zip_member
+
+    def inflate(*args: Any, **kwargs: Any) -> InflateResult:
+        kept.append(kwargs["keep_output"])
+        return real_inflate(*args, **kwargs)
+
+    def read(*args: Any, **kwargs: Any) -> tuple[bytes, int]:
+        kept.append(kwargs["keep_output"])
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(compression, "bounded_inflate", inflate)
+    monkeypatch.setattr(compression, "_read_zip_member", read)
+    return kept
+
+
+def _first_output(out: object) -> bytes:
+    # zip_decompress returns a mapping; every other decompressor returns the body first.
+    if isinstance(out, dict):
+        return b"".join(out.values())
+    return out[0] if isinstance(out, tuple) else out  # type: ignore[return-value]
+
+
+# (decompressor, how to pack a body for it). Two gzip members, so the trial walks the member loop.
+_TRIAL_CODECS = [
+    pytest.param(
+        gzip_decompress,
+        lambda body: gzip_compress(body[:100]) + gzip_compress(body[100:]),
+        id="gzip",
+    ),
+    pytest.param(deflate_decompress, deflate_compress, id="deflate"),
+    pytest.param(deflate_decompress_with_tail, deflate_compress, id="deflate_with_tail"),
+    pytest.param(
+        zip_decompress,
+        lambda body: zip_compress({"a.txt": body[:100], "b.txt": body[100:]}),
+        id="zip",
+    ),
+]
+
+
+@pytest.mark.parametrize(("fn", "pack"), _TRIAL_CODECS)
+def test_an_over_cap_stream_is_refused_before_the_real_pass_runs(
+    fn: Callable[..., object], pack: Callable[[bytes], bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:  # #1129
+    blob = pack(b"x" * (_TRIAL_CAP + 1))
+    kept = _record_inflates(monkeypatch)
+    with pytest.raises(CompressionError, match=f"beyond the {_TRIAL_CAP}-byte ceiling"):
+        fn(blob, max_output_bytes=_TRIAL_CAP)
+    assert kept, "the instrument saw no inflate at all"
+    assert True not in kept, "the real pass ran on a stream the trial pass should have refused"
+
+
+@pytest.mark.parametrize(("fn", "pack"), _TRIAL_CODECS)
+def test_an_at_cap_stream_passes_the_trial_and_round_trips(
+    fn: Callable[..., object], pack: Callable[[bytes], bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:  # #1129
+    body = random.Random(1129).randbytes(_TRIAL_CAP)
+    blob = pack(body)
+    kept = _record_inflates(monkeypatch)
+    assert _first_output(fn(blob, max_output_bytes=_TRIAL_CAP)) == body
+    # Every trial inflate comes before every real one, and both cover the same members.
+    trial, real = kept.count(False), kept.count(True)
+    assert trial and kept == [False] * trial + [True] * real
+    assert trial == real
+
+
+def test_a_gzip_stream_over_the_member_cap_is_refused_before_the_real_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1129
+    # The member cap cannot be off, so the trial runs even with no byte ceiling.
+    kept = _record_inflates(monkeypatch)
+    with pytest.raises(CompressionError, match="over the 3-member cap"):
+        gzip_decompress(gzip_compress(b"real") * 5, max_output_bytes=None, max_members=3)
+    assert kept == [False] * 3
+
+
+@pytest.mark.parametrize(
+    ("fn", "blob"),
+    [
+        pytest.param(deflate_decompress, deflate_compress(_BODY), id="deflate"),
+        pytest.param(deflate_decompress_with_tail, deflate_compress(_BODY), id="with_tail"),
+        pytest.param(zip_decompress, zip_compress({"a.hl7": _BODY}), id="zip"),
+    ],
+)
+def test_with_no_byte_ceiling_the_trial_has_nothing_to_refuse_and_is_skipped(
+    fn: Callable[..., object], blob: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:  # #1129
+    kept = _record_inflates(monkeypatch)
+    assert _first_output(fn(blob, max_output_bytes=None)) == _BODY
+    assert kept == [True]
+
+
+def test_the_trial_refuses_a_zip_member_name_before_its_bytes_are_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1129
+    # The name check still runs before a member's bytes are read, in the trial as in the real pass.
+    kept = _record_inflates(monkeypatch)
+    with pytest.raises(CompressionError, match="member 1 refused"):
+        zip_decompress(_hostile_zip({"../evil.txt": b"x"}), max_output_bytes=_TRIAL_CAP)
+    assert kept == []
+
+
 # --- deflate -----------------------------------------------------------------
 
 
