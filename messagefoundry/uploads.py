@@ -170,13 +170,19 @@ class UploadContentError(UploadError):
     ``.txt``) is refused at the chokepoint before anything is written. The API maps it to HTTP 400 and a
     metadata-only ``upload.reject`` audit.
 
-    ``str(exc)`` names the file, for the uploader's own 400 response. ``audit_reason`` is the same
-    reason without the name, and is what the audit row records: the audit log is plaintext and kept,
-    and an operator-chosen file name can carry a patient identifier (vault BACKLOG #2619)."""
+    ``str(exc)`` names the file, for the uploader's own 400 response. ``reason`` is the same text
+    without the name, and is what the audit row records: the audit log is plaintext and kept, and an
+    operator-chosen file name can carry a patient identifier (vault BACKLOG #2619)."""
 
-    def __init__(self, message: str, *, audit_reason: str) -> None:
-        super().__init__(message)
-        self.audit_reason = audit_reason
+    def __init__(self, display: str, reason: str) -> None:
+        super().__init__(f"upload {display!r} {reason}")
+        self.display = display
+        self.reason = reason
+
+    def __reduce__(self) -> tuple[type[UploadContentError], tuple[str, str]]:
+        # The default rebuilds from ``self.args``, the one formatted message, which this signature
+        # does not take; copy and pickle would raise TypeError.
+        return (type(self), (self.display, self.reason))
 
 
 class UploadQuotaError(UploadError):
@@ -404,29 +410,21 @@ def validate_upload_content(display: str, data: bytes) -> None:
     Pure + off-loop friendly (no I/O). Reuses the shared ``parsing.sniff`` magic-byte helpers, so the
     upload chokepoint and the File connectors enforce the same sniff."""
     if not display.lower().endswith(_ALLOWED_UPLOAD_EXTENSIONS):
-        permitted = ", ".join(_ALLOWED_UPLOAD_EXTENSIONS)
         raise UploadContentError(
-            f"upload {display!r} has a disallowed extension; permitted: {permitted}",
-            audit_reason=f"disallowed extension; permitted: {permitted}",
+            display,
+            f"has a disallowed extension; permitted: {', '.join(_ALLOWED_UPLOAD_EXTENSIONS)}",
         )
     ctype = content_type_for(display)
     if ctype == "hl7v2":
         if not _looks_like_hl7(data):
             raise UploadContentError(
-                f"upload {display!r} is not HL7 (no MSH/FHS/BHS header) despite its extension",
-                audit_reason="not HL7 (no MSH/FHS/BHS header) despite its extension",
+                display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
             )
     elif ctype == "xml":
         if not _lstrip_bom_ws(data).startswith(b"<"):
-            raise UploadContentError(
-                f"upload {display!r} is not XML (no leading '<') despite its extension",
-                audit_reason="not XML (no leading '<') despite its extension",
-            )
+            raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
     elif b"\x00" in data:  # text (.txt) — no magic; NUL-free is the only structural check
-        raise UploadContentError(
-            f"upload {display!r} declares .txt but contains NUL bytes (not plain text)",
-            audit_reason="declares .txt but contains NUL bytes (not plain text)",
-        )
+        raise UploadContentError(display, "declares .txt but contains NUL bytes (not plain text)")
 
 
 def _decode_text(data: bytes) -> str:

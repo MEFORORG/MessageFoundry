@@ -304,7 +304,7 @@ async def test_upload_rejects_disallowed_extension(engine: Engine, tmp_path: Pat
     detail = rej[0]["detail"] or ""
     # Vault BACKLOG #2619: the reason only. The name is operator-chosen and the audit is plaintext.
     assert json.loads(detail) == {
-        "reason": "disallowed extension; permitted: .hl7, .hl7v2, .txt, .xml"
+        "reason": "has a disallowed extension; permitted: .hl7, .hl7v2, .txt, .xml"
     }
     assert "evil" not in detail
 
@@ -517,7 +517,7 @@ async def test_no_upload_audit_row_carries_the_file_name(engine: Engine, tmp_pat
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
     transport = httpx.ASGITransport(app=app)
-    name = "MRN99887766_DOE.hl7"
+    name = "MRN_SYNTH_0001.hl7"
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         up = await c.post("/uploads", files={"file": (name, ADT, "text/plain")}, headers=h)
@@ -529,17 +529,17 @@ async def test_no_upload_audit_row_carries_the_file_name(engine: Engine, tmp_pat
             "/uploads", files={"file": (name, b"plain text, not HL7\n", "text/plain")}, headers=h
         )
         assert (
-            mismatch.status_code == 400 and "MRN99887766" in mismatch.text
+            mismatch.status_code == 400 and "MRN_SYNTH_0001" in mismatch.text
         )  # told to the uploader
         assert (await c.delete(f"/uploads/{fid}", headers=h)).status_code == 200
     rows = [a for a in await engine.store.list_audit() if str(a["action"]).startswith("upload.")]
     assert {a["action"] for a in rows} >= {"upload.create", "upload.reject", "upload.delete"}
     for row in rows:
-        assert "MRN99887766" not in str(row["detail"] or ""), row
+        assert "MRN_SYNTH_0001" not in str(row["detail"] or ""), row
     by_action = {a["action"]: json.loads(str(a["detail"])) for a in rows}
     assert set(by_action["upload.create"]) == {"file_id", "size", "message_count"}
     assert by_action["upload.reject"] == {
-        "reason": "not HL7 (no MSH/FHS/BHS header) despite its extension"
+        "reason": "is not HL7 (no MSH/FHS/BHS header) despite its extension"
     }
     assert set(by_action["upload.delete"]) == {"file_id", "size"}
 

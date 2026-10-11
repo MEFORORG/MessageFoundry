@@ -685,7 +685,7 @@ class RetentionRunner:
         wal_checkpointed = False
         if (
             not _deadline_hit()
-            and s.wal_checkpoint_seconds > 0
+            and self._wal_truncate_applies()
             and now - self._last_wal >= s.wal_checkpoint_seconds
         ):
             await self._store.wal_checkpoint()
@@ -802,8 +802,8 @@ class RetentionRunner:
 
     def _wal_truncate_applies(self) -> bool:
         """The WAL truncate is on AND this store has a ``-wal`` file to truncate, which is the same
-        file-backed SQLite test as the disk floor's. It ships ON (vault BACKLOG #2619), so this keeps
-        it from starting a runner on a store where ``wal_checkpoint`` is a no-op."""
+        file-backed SQLite test as the disk floor's. It ships ON (vault BACKLOG #2619), so both
+        ``enabled`` and the pass ask this, and neither runs it where ``wal_checkpoint`` is a no-op."""
         return self._settings.wal_checkpoint_seconds > 0 and self._floor_path is not None
 
     async def _check_disk_floor(self) -> bool:

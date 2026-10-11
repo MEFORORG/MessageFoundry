@@ -6712,7 +6712,7 @@ def create_app(
         resend or delete it.
 
         **No audit row carries the file name (vault BACKLOG #2619).** ``audit_log.detail`` is plaintext
-        and kept, and an operator-chosen name such as ``MRN12345_smith.hl7`` would put a patient
+        and kept, and an operator-chosen name that holds a medical record number would put a patient
         identifier there. A stored file is named by its random ``file_id``, whose sealed sidecar holds
         the name while the file exists. A refused file has no id, so its row carries the reason only."""
         us = _require_upload_store(request)
@@ -6757,7 +6757,7 @@ def create_app(
             await engine.store.record_audit(
                 "upload.reject",
                 actor=identity.username,
-                detail=json.dumps({"reason": exc.audit_reason}),
+                detail=json.dumps({"reason": exc.reason}),
                 client=client_ip(request),
             )
             raise HTTPException(400, str(exc)) from None
