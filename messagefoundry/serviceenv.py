@@ -63,7 +63,14 @@ KEY_CLASS_NAMES: tuple[str, ...] = (
 #: The engine's other environment-only secrets. In a Windows service's environment lists each is
 #: named as a loosening. ``tests/test_service_env_secrets.py`` holds this set to the settings'
 #: own lists of environment-only secrets, so a secret added there is not missed here.
-SECRET_CLASS_NAMES: tuple[str, ...] = (
+#:
+#: WHY "LOOSENING" AND NOT "SECRET". The identifier names what happens to these names, because
+#: CodeQL's ``py/clear-text-logging-sensitive-data`` takes a value as a secret by the identifier
+#: it is bound to, such as one that says secret or password. These are names only, printed on
+#: purpose, so no identifier in this module says such a word. The test file pins that for this
+#: module only, against its own stand-in list of words; a caller that binds the printed lines to
+#: such a name brings the alert back.
+LOOSENING_CLASS_NAMES: tuple[str, ...] = (
     "MEFOR_STORE_PASSWORD",
     "MEFOR_AUTH_AD_BIND_PASSWORD",
     "MEFOR_AUTH_OIDC_CLIENT_SECRET",
@@ -133,9 +140,10 @@ class ServiceEnvPosture:
         return tuple(name for name in KEY_CLASS_NAMES if name in self.listed)
 
     @property
-    def listed_secrets(self) -> tuple[str, ...]:
-        """The other engine secrets the service's environment lists set."""
-        return tuple(name for name in SECRET_CLASS_NAMES if name in self.listed)
+    def listed_loosening_names(self) -> tuple[str, ...]:
+        """The other engine secrets the service's environment lists set. Each comes from
+        :data:`LOOSENING_CLASS_NAMES`, never from the registry."""
+        return tuple(name for name in LOOSENING_CLASS_NAMES if name in self.listed)
 
     def named_with_source(self, names: Sequence[str]) -> str:
         """``names``, each with the registry value that sets it."""
@@ -419,14 +427,14 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
                 "with `messagefoundry protect-key`)",
             )
         )
-    secrets = posture.listed_secrets
-    if secrets:
+    named = posture.listed_loosening_names
+    if named:
         out.append(
             (
                 "service_environment_secret",
-                f"{posture.named_with_source(secrets)} is set in {_where(posture)}. Any local user may be able to "
-                "read that key, and with it these secrets. The engine has no protected channel "
-                "for them yet, so this is named and not refused",
+                f"{posture.named_with_source(named)} is set in {_where(posture)}. Any local "
+                "user may be able to read that key, and with it these secrets. The engine has no "
+                "protected channel for them yet, so this is named and not refused",
             )
         )
     return out

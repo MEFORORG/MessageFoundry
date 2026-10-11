@@ -12,8 +12,11 @@ on every platform; the Windows probe itself is exercised on a Windows host only.
 from __future__ import annotations
 
 import argparse
+import inspect
+import re
 import sys
-from collections.abc import Iterator
+import types
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,7 +39,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.serviceenv import (
     KEY_CLASS_NAMES,
-    SECRET_CLASS_NAMES,
+    LOOSENING_CLASS_NAMES,
     ServiceEnvPosture,
     ServiceEnvStatus,
     read_service_env_posture,
@@ -129,6 +132,83 @@ def test_the_reading_keeps_names_and_never_a_value() -> None:
     assert _PASSWORD_VALUE not in rendered
 
 
+def test_every_name_printed_is_a_constant_and_never_a_registry_string() -> None:
+    """The registry decides only WHICH constant prints. In a loosening or a refusal line, a name
+    the engine does not know never prints, and a known one prints as the module's own constant,
+    not the registry's spelling. ``posture.listed`` and ``sources`` keep the registry's names."""
+    known = (*KEY_CLASS_NAMES, *LOOSENING_CLASS_NAMES)
+    posture = _service(
+        [f"{name.lower()}=-----BEGIN x" for name in known]
+        + ["MEFOR_STORE_PASSWORDX=x", "mefor_unknown_thing=x"],
+        MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE,
+    )
+    for name in (*posture.listed_keys, *posture.listed_loosening_names):
+        assert any(name is constant for constant in known), name
+    printed = "".join(risk for _name, risk in service_env_loosenings(posture)) + str(
+        service_env_refusal(posture)
+    )
+    assert set(re.findall(r"MEFOR_[A-Z_]+", printed, flags=re.IGNORECASE)) == set(known)
+
+
+#: A stand-in for the identifier words CodeQL's ``py/clear-text-logging-sensitive-data`` takes as
+#: sensitive by name alone. It is not CodeQL's own pattern, and nothing checks it against the
+#: query, so an alert it misses can still come back in CI.
+_SENSITIVE_IDENTIFIER = re.compile(
+    r"secret|trusted|pass(wd|word|code|phrase)|token|private|cert"
+    r"|acc(ou)?nt|user_?(name|id)|session_?(id|key)",
+    re.IGNORECASE,
+)
+
+
+def _code_names(code: types.CodeType) -> set[str]:
+    """The local, cell, global and attribute names in ``code`` and in the functions and
+    comprehensions nested in it."""
+    names = set(code.co_varnames) | set(code.co_cellvars) | set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _code_names(const)
+    return names
+
+
+def test_no_identifier_in_the_module_reads_as_a_secret_to_codeql() -> None:
+    """The printed lines carry names only. An identifier that reads as a secret makes CodeQL
+    report each line as a secret logged in clear text, as it did on PR 2238. The walk covers
+    this module's functions, methods, static and class methods, and properties, so a new one is
+    covered too. It does not cover the callers that print the lines."""
+    namespaces: list[Mapping[str, object]] = [vars(serviceenv)]
+    namespaces += [
+        vars(obj)
+        for obj in vars(serviceenv).values()
+        if inspect.isclass(obj) and obj.__module__ == serviceenv.__name__
+    ]
+    identifiers: set[str] = set()
+    walked: set[str] = set()
+    for namespace in namespaces:
+        for name, obj in namespace.items():
+            if name.startswith("__"):
+                continue
+            identifiers.add(name)
+            fn: object
+            if isinstance(obj, property):
+                fn = obj.fget
+            elif isinstance(obj, (staticmethod, classmethod)):
+                fn = obj.__func__
+            else:
+                fn = obj
+            if callable(fn):
+                fn = inspect.unwrap(fn)  # a decorator such as functools.cache hides the body
+            if inspect.isfunction(fn) and fn.__module__ == serviceenv.__name__:
+                identifiers |= _code_names(fn.__code__)
+                walked.add(fn.__qualname__)
+    # A control for each kind of member the module has today: a function, a method, a property.
+    assert {
+        "service_env_loosenings",
+        "ServiceEnvPosture.named_with_source",
+        "ServiceEnvPosture.listed_loosening_names",
+    } <= walked, sorted(walked)
+    assert not sorted(name for name in identifiers if _SENSITIVE_IDENTIFIER.search(name))
+
+
 def test_a_name_set_to_nothing_is_not_listed() -> None:
     posture = _service(["MEFOR_STORE_ENCRYPTION_KEY=", "MEFOR_STORE_PASSWORD=   ", "=orphan"])
     assert posture.listed == ()
@@ -218,7 +298,7 @@ def test_an_oidc_signing_key_path_is_not_a_secret_but_the_inline_key_is() -> Non
     path = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:/keys/oidc.pem"])
     assert path.listed == ()
     inline = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=-----BEGIN PRIVATE KEY----- x"])
-    assert inline.listed_secrets == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+    assert inline.listed_loosening_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
 
 
 def test_off_windows_the_host_reading_is_not_a_service() -> None:
@@ -327,10 +407,10 @@ def test_every_environment_only_secret_the_settings_know_is_checked() -> None:
         f"MEFOR_{section.upper()}_{key.upper()}" for section, key in _FILE_SECRET_KEYS
     }
     from_rotation = set(ENFORCEABLE_SECRET_EXPIRY_CLASSES) - {"connector"}
-    known = set(KEY_CLASS_NAMES) | set(SECRET_CLASS_NAMES)
+    known = set(KEY_CLASS_NAMES) | set(LOOSENING_CLASS_NAMES)
     assert from_file_list <= known, sorted(from_file_list - known)
     assert from_rotation <= known, sorted(from_rotation - known)
-    assert not set(KEY_CLASS_NAMES) & set(SECRET_CLASS_NAMES)
+    assert not set(KEY_CLASS_NAMES) & set(LOOSENING_CLASS_NAMES)
     assert set(KEY_CLASS_NAMES) == {
         "MEFOR_STORE_ENCRYPTION_KEY",
         "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
