@@ -5171,14 +5171,15 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   admin, and a confidential-compute host where memory forensics is in scope (see
   [PHI.md §10](PHI.md#10-secure-deployment--operations-checklist)) — accepted via the same register
   entry rather than enforced by the engine.
-- **11.7.2 is a recorded partial.** A Router and a Handler receive the whole decrypted message, and
-  the engine never re-encrypts that body in memory.
+- **11.7.2 is a recorded partial.** A Router and a Handler receive the decrypted message, and the
+  engine never encrypts that body again while it is in memory.
   [ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)
-  records the decision. The store cipher re-encrypts PHI only as it writes it, and only with a key
-  set. [PHI.md §3, *Data minimization during processing*](PHI.md#data-minimization-during-processing-in-use-posture-asvs-1172)
-  says which columns that covers. Running keyless is an audited opt-out:
-  `[security].allow_unencrypted_phi`, plus a second flag under `enforcement = enforce`
-  ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)).
+  records the decision and its one off-by-default exception. The store cipher encrypts PHI only as
+  it writes it to the store, and only with a key set;
+  [PHI.md §3, *Data minimization during processing*](PHI.md#data-minimization-during-processing-in-use-posture-asvs-1172)
+  says what that does and does not cover. A PHI instance can still start keyless through the
+  audited opt-out that `[security].allow_unencrypted_phi` sets. PHI.md §3, under *Fail-closed*,
+  states the second flag that strict enforcement adds and the other settings involved.
   **CORRECTED 2026-10-10 (BACKLOG #1174):** the 11.7.1 bullet above ended *"11.7.2's
   encrypt-after-use guarantee is active only on a keyed instance (a key must be configured), which
   is already the case for any PHI-bearing deployment."* No such guarantee covers the body in memory,
