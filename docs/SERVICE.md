@@ -126,9 +126,13 @@ Defaults:
 | Log level | `INFO` |
 
 **A registered `--project-root` wins over `[environments].base_dir` in the settings file.** The
-default install registers one unless `-Config` sits at a drive root, and the installer does not
-read the settings. So if your settings file sets `base_dir`, pass the same folder as
-`-ProjectRoot`, or the service reads its value file from the folder above `-Config`.
+default install registers the folder above `-Config`, which is a drive root when `-Config` is a
+top-level folder such as `D:\config`. It registers none only when `-Config` is itself a drive root.
+The installer does not read the settings. So if your settings file sets `base_dir`, pass the same
+folder as `-ProjectRoot`, or the service reads its value file from the folder above `-Config`.
+
+**`-ListenHost` must be an IP address or a host name**, and no path may contain a double quote.
+Each goes on the service's command line, so the installer refuses anything else before it acts.
 
 Override any of them, e.g.:
 
@@ -647,8 +651,12 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     `supervise` makes the same check before it starts any engine shard. Every reload reads the
     value file again, so it checks it again first and refuses the reload the same way. The dev/test
     escape below downgrades these refusals too. `install-service.ps1 -LockConfigDir` locks the
-    value file's folder with the config directory. It never locks the settings file's folder,
-    which can be a drive root or a checkout; it warns instead, and you restrict that folder.
+    value file's folder with the config directory. It locks the settings file's folder only when
+    that is a folder of its own: not a volume root, a junction, this checkout or a folder in it,
+    and not one that holds the data directory or the install. In the default layout, the folder
+    above `-Config`, that holds. Any folder it leaves is named in a warning, and you restrict it.
+    It refuses outright a `-Config` that is a volume root, a junction, or a folder holding the data
+    directory, the checkout or the install.
   - **It also reads the interpreter and the engine package, and only reports them.** A start whose
     interpreter or `messagefoundry` package folder another account can write logs a WARNING,
     *"the engine runs code from writable-by-others path ..."*, and goes on. Refusing would end every

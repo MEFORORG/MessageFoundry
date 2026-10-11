@@ -85,11 +85,13 @@ param(
     # Opt-in: strip inherited ACEs from the config dir and lock it to SYSTEM + Administrators + the
     # service account (RX). The in-process source-trust guard (SEC-003) refuses to load config from a
     # dir/module a low-privileged principal can write, so this one flag satisfies that requirement.
-    # It locks the folder of the value file the same way, because `serve` refuses a start whose value
-    # file another account can write (vault BACKLOG #2626).
+    # It locks the value file's folder the same way, and the settings file's folder when that is a
+    # folder of its own, because `serve` refuses a start whose value or settings file another account
+    # can write (vault BACKLOG #2626). It refuses a -Config that is a volume root, a junction, or a
+    # folder holding the data directory, the checkout or the install.
     # Default OFF because the config dir often lives inside a developer's repo, where stripping
     # inheritance is surprising; for production point -Config at a dedicated admin-owned dir and pass
-    # this switch (see docs/SERVICE.md "Restrict the config directory").
+    # this switch (see docs/SERVICE.md "Lock down the config directory (CONFIG-2)").
     [switch]$LockConfigDir,
     # Opt-in: suppress Windows Error Reporting crash dumps for the engine image MACHINE-WIDE (ADR 0152
     # Phase 0). A WER dump of a running engine writes in-flight HL7 bodies, decrypted plaintext and the
@@ -1295,7 +1297,89 @@ function Format-QuotedPath {
       backslashes are doubled, and the parser reads each pair as one (vault BACKLOG #2626).
     #>
     param([Parameter(Mandatory)][string]$Path)
+    # No Windows path holds a double quote. One here would end the quoted path early, and the
+    # parser would read the rest as more arguments, such as a second --host.
+    if ($Path.Contains('"')) { throw "A path on the service's command line cannot contain a double quote: $Path" }
     return '"' + ($Path -replace '\\+$', '$0$0') + '"'
+}
+
+function Test-LegacyNativeArgumentPassing {
+    <#
+      Whether this host hands a native program its arguments the old way: Windows PowerShell 5.1,
+      PowerShell 7.0 to 7.2, or a later one set to 'Legacy'. Such a host puts an argument that holds
+      a space inside double quotes and does not escape the double quotes already in it, so the
+      program's parser strips them (vault BACKLOG #2626). PowerShell 7.3 and later escape them for a
+      program such as nssm.exe.
+    #>
+    $mode = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue
+    return (-not $mode) -or ($mode -eq 'Legacy')
+}
+
+function ConvertTo-NativeArgument {
+    <#
+      $Value as one argument that reaches a native program unchanged. With -Legacy (see
+      Test-LegacyNativeArgumentPassing), each double quote is escaped as the program's parser reads
+      it: the backslashes before it are doubled and a backslash goes in front of it. Trailing
+      backslashes are doubled too, because the host adds a closing quote after them. Without
+      -Legacy the host escapes, so $Value goes as it is.
+
+      This is what keeps the quotes in AppParameters. Measured 2026-10-11 on Windows PowerShell
+      5.1.26100: without it, nssm received --config "D:\hl7 cfg\config" as two words with no quotes.
+    #>
+    param([Parameter(Mandatory)][string]$Value, [switch]$Legacy)
+    if (-not $Legacy) { return $Value }
+    return (($Value -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1')
+}
+
+function Test-ListenHost {
+    <#
+      Whether $Value can go on the service's command line as the --host value: an IP address, or a
+      host name of letters, digits, hyphens and dots. It goes in unquoted, so anything else, such as
+      a space, would add arguments (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    if ($Value -notmatch '^[A-Za-z0-9.:%-]{1,253}\z') { return $false }
+    $parsed = $null
+    if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) { return $true }
+    $label = '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    return $Value -match "^$label(\.$label)*\z"
+}
+
+function Get-LockPathProblem {
+    <#
+      Why -LockConfigDir must not lock $Path, or "" when it may. Locking strips inherited access,
+      grants SYSTEM and Administrators full control and the service account read, and makes
+      Administrators the owner of everything below $Path (Set-SecureConfigAcl). So $Path must not be
+      a volume root, a junction or mounted folder, or a folder that holds or is any of $Holds, such
+      as the data directory or this checkout. With -NotWithin, it must also not be inside one of
+      those folders (vault BACKLOG #2626).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Holds = @(),
+        [string[]]$NotWithin = @()
+    )
+    $trimmed = $Path.TrimEnd('\')
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    if ($root -and $trimmed -eq $root.TrimEnd('\')) { return "it is the root of a volume" }
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            return "it is a junction, a link or a mounted volume"
+        }
+    }
+    $prefix = $trimmed + '\'
+    foreach ($kept in @($Holds | Where-Object { $_ })) {
+        if (($kept.TrimEnd('\') + '\').StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return "it holds '$kept'"
+        }
+    }
+    foreach ($outer in @($NotWithin | Where-Object { $_ })) {
+        if ($prefix.StartsWith($outer.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return "it is inside '$outer'"
+        }
+    }
+    return ""
 }
 
 # --- absolute paths, before anything consumes one (BACKLOG #1554) -----------------------------------
@@ -1347,6 +1431,34 @@ if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
 
 $NssmDir = Resolve-AbsolutePath $NssmDir
+
+# --- what goes on the service's command line, checked before anything acts (vault BACKLOG #2626) -----
+# The paths go in quoted, and Format-QuotedPath refuses a double quote; asking here refuses it
+# before the NSSM copy below. -ListenHost goes in unquoted.
+foreach ($named in @(@('Config', $Config), @('DbPath', $DbPath), @('ServiceConfig', $ServiceConfig),
+        @('ProjectRoot', $ProjectRoot))) {
+    if ($named[1] -and $named[1].Contains('"')) {
+        throw "-$($named[0]) cannot contain a double quote: $($named[1])"
+    }
+}
+if (-not (Test-ListenHost $ListenHost)) {
+    throw ("invalid -ListenHost '$ListenHost': pass an IP address, such as 127.0.0.1, or a host " +
+        "name of letters, digits, hyphens and dots.")
+}
+
+# --- what -LockConfigDir may lock (vault BACKLOG #2626) ------------------------------------------------
+# Set-SecureConfigAcl re-owns everything below the folder it locks, so it must never reach these.
+# A -Config that holds one, or is a volume root or a junction, is refused here, before anything
+# acts. The value and settings folders are checked again where they are locked, below.
+$LockKeepOut = @($DataDir, (Split-Path -Parent $DbPath), $NssmDir, $RepoRoot, $AppDirectory,
+    $(if ($PythonExe) { Split-Path -Parent $PythonExe }), $env:SystemRoot)
+if ($LockConfigDir) {
+    $configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut
+    if ($configLockProblem) {
+        throw ("-LockConfigDir will not lock the config directory '$Config': $configLockProblem. " +
+            "Point -Config at a dedicated folder (docs/SERVICE.md 'Lock down the config directory').")
+    }
+}
 
 # AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
 # with that path, so a relative one would be resolved against a different directory later.
@@ -1593,7 +1705,8 @@ try {
 
 # The interpreter, with the options in $AppParams ahead of `-m messagefoundry` (vault BACKLOG #2701).
 Invoke-Nssm set $ServiceName Application $PythonExe
-Invoke-Nssm set $ServiceName AppParameters $AppParams
+# Escaped for this host, so the quotes around each path reach nssm on Windows PowerShell 5.1 too.
+Invoke-Nssm set $ServiceName AppParameters (ConvertTo-NativeArgument $AppParams -Legacy:(Test-LegacyNativeArgumentPassing))
 Invoke-Nssm set $ServiceName AppDirectory $AppDirectory
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"
 Invoke-Nssm set $ServiceName Description "MessageFoundry HL7 v2 integration engine."
@@ -1770,19 +1883,38 @@ if ($ServiceAccount) {
 # satisfying the in-process guard that refuses a config dir/module any low-privilege principal can write.
 # Without the switch we stay additive and WARN that the guard will refuse to load if an inherited write
 # ACE survives.
+# The folders `serve` checks at start besides -Config, each with the file in it: the value file's
+# and the settings file's (vault BACKLOG #2626). The value folder is the default name only: a
+# settings file that renames [environments].dir moves the value file, and the installer does not
+# read the settings.
+$ValueFolder = Join-Path $ValuesAnchor "environments"
+$StartFolders = @()
+if (Test-Path -LiteralPath $ValueFolder -PathType Container) {
+    $StartFolders += [pscustomobject]@{ Path = $ValueFolder; NotWithin = @() }
+}
+# The settings file's folder is wherever that file sits, so it is locked only when it is a folder
+# of its own: not a volume root, not the checkout or a folder inside it, and not a folder that
+# holds the data directory or the install. The value folder may sit in the checkout, as the
+# config directory may: it is a folder of its own by name, and the windows-service-smoke CI leg
+# locks the checkout's environments\ this way.
+if ($ServiceConfig) {
+    $StartFolders += [pscustomobject]@{ Path = (Split-Path -Parent $ServiceConfig); NotWithin = @($RepoRoot) }
+}
+$StartFolders = @($StartFolders | Where-Object { $_.Path.TrimEnd('\') -ne $Config.TrimEnd('\') })
+$UnlockedFolders = @()
 if ($LockConfigDir) {
-    # The value file's folder too, when there is one: `serve` refuses a start whose value file, or
-    # its folder, another account can write (vault BACKLOG #2626).
-    # The default folder name only: a settings file that renames [environments].dir moves the
-    # value file, and the installer does not read the settings.
-    $ValueFolder = Join-Path $ValuesAnchor "environments"
     $LockPaths = @($Config)
-    if (Test-Path -LiteralPath $ValueFolder -PathType Container) { $LockPaths += $ValueFolder }
+    foreach ($folder in $StartFolders) {
+        $problem = Get-LockPathProblem -Path $folder.Path -Holds $LockKeepOut -NotWithin $folder.NotWithin
+        if ($problem) { $UnlockedFolders += "'$($folder.Path)' ($problem)" }
+        else { $LockPaths += $folder.Path }
+    }
     foreach ($LockPath in $LockPaths) {
         Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount
     }
     if ($LockPaths.Count -gt 1) {
-        Write-Host "  Values : '$ValueFolder' locked the same way (vault BACKLOG #2626)."
+        Write-Host ("  Start  : " + (($LockPaths | Select-Object -Skip 1 | ForEach-Object { "'$_'" }) -join ", ") +
+            " locked the same way (vault BACKLOG #2626).")
     }
     $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
                    else { "SYSTEM/Administrators (F)" }
@@ -1798,16 +1930,16 @@ if ($LockConfigDir) {
         "write/modify on the dir or any *.py in it, AND separately if the dir's owner is neither the " +
         "run-as account nor an administrator it can resolve. Re-run with -LockConfigDir (which sets " +
         "both), or point -Config at a dedicated admin-owned dir; see docs/SERVICE.md " +
-        "'Restrict the config directory'.")
+        "'Lock down the config directory (CONFIG-2)'.")
+    $UnlockedFolders = @($StartFolders | ForEach-Object { "'$($_.Path)'" })
 }
-# The settings file is not locked, because its folder can be anything: a drive root, a checkout,
-# the data directory. `serve` refuses a settings file or folder another account can write, so
-# the operator is told where it is (vault BACKLOG #2626).
-if ($ServiceConfig) {
-    Write-Warning ("The service reads its settings from '$ServiceConfig'. 'serve' refuses to " +
-        "start when an account other than administrators or the service account can write that " +
-        "file or its folder; this installer does not change either. See docs/SERVICE.md " +
-        "'Restrict the config directory'.")
+# The same two criteria as the config dir, for each start folder left as it was.
+if ($UnlockedFolders) {
+    Write-Warning ("This installer did not lock " + ($UnlockedFolders -join ", ") + ". 'serve' " +
+        "checks the settings file and the value file at start, each with its folder, and refuses to " +
+        "start when an account other than SYSTEM, an administrator or the run-as account can write " +
+        "one, AND separately when one's owner is neither the run-as account nor an administrator. " +
+        "Restrict them as docs/SERVICE.md 'Lock down the config directory (CONFIG-2)' shows.")
 }
 if ($ServiceAccount) {
     Write-Host "  ACLs   : granted read on '$Config'; read/write on '$DataDir' (docs/SERVICE.md)."

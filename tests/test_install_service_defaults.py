@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -121,19 +125,233 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
     assert "$ProjectRoot = Resolve-AbsolutePath $ProjectRoot" in text
 
 
-def test_lock_config_dir_locks_the_value_folder_and_names_the_settings_file() -> None:
-    """``-LockConfigDir`` locks the value folder with the config directory. The settings file's
-    folder can be a drive root, a checkout or the data directory, so it is never locked; the
-    installer warns that ``serve`` checks it instead."""
+def test_lock_config_dir_locks_each_start_folder_it_may() -> None:
+    """``-LockConfigDir`` locks the value folder and the settings file's folder with the config
+    directory, each only when Get-LockPathProblem clears it. The settings folder must also not sit
+    in the checkout. Whatever stays unlocked is named in one warning, with both refusal criteria."""
     text = _text()
-    block = text.index("if ($LockConfigDir) {")
     folder = text.index('$ValueFolder = Join-Path $ValuesAnchor "environments"')
-    added = text.index("$LockPaths += $ValueFolder")
+    settings = text.index(
+        "$StartFolders += [pscustomobject]@{ Path = (Split-Path -Parent $ServiceConfig); "
+        "NotWithin = @($RepoRoot) }"
+    )
+    block = text.index("if ($LockConfigDir) {\n    $LockPaths = @($Config)")
+    check = text.index(
+        "Get-LockPathProblem -Path $folder.Path -Holds $LockKeepOut -NotWithin $folder.NotWithin"
+    )
+    cleared = text.index("else { $LockPaths += $folder.Path }")
     lock = text.index("Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount")
-    assert block < folder < added < lock
-    assert "$SettingsFolder" not in text
-    warning = text.index("Write-Warning (\"The service reads its settings from '$ServiceConfig'")
-    assert lock < warning
+    warning = text.index('Write-Warning ("This installer did not lock "')
+    assert folder < settings < block < check < cleared < lock < warning
+    # The warning names the owner arm as well as a write grant, and a section that exists.
+    said = text[warning : warning + 700]
+    assert "owner is neither the run-as account nor an administrator" in said
+    assert "'Lock down the config directory (CONFIG-2)'" in said
+    assert "'Restrict the config directory'" not in text
+
+
+def test_lock_config_dir_refuses_a_config_it_must_not_lock_before_anything_acts() -> None:
+    text = _text()
+    check = text.index("$configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut")
+    assert "throw" in text[check : check + 300]
+    assert check < text.index("$NssmPath = Resolve-Nssm")
+    keep = text.index("$LockKeepOut = @(")
+    listed = text[keep : text.index("\n", text.index("$env:SystemRoot", keep))]
+    for name in ("$DataDir", "$NssmDir", "$RepoRoot", "$AppDirectory", "$DbPath", "$PythonExe"):
+        assert name in listed, name
+
+
+def _lock_problems(tmp_path: Path, cases: dict[str, str]) -> dict[str, str]:
+    assert _SCRIPT is not None
+    body = (
+        "  [pscustomobject]@{\n"
+        + "".join(f"    {key} = ({call})\n" for key, call in cases.items())
+        + "  } | ConvertTo-Json -Compress\n"
+    )
+    out = _ok(_extract(_SCRIPT, ["Get-LockPathProblem"], body), tmp_path)
+    got: dict[str, str] = json.loads(out.strip().splitlines()[-1])
+    return got
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows paths and junctions")
+def test_get_lock_path_problem_refuses_a_root_a_junction_a_holder_and_the_checkout(
+    tmp_path: Path,
+) -> None:
+    dedicated = tmp_path / "hl7"
+    (dedicated / "config").mkdir(parents=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    (repo / "settings").mkdir(parents=True)
+    neighbour = tmp_path / "repo2"
+    neighbour.mkdir()
+    junction = tmp_path / "junction"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(dedicated)], capture_output=True
+    )
+    assert made.returncode == 0, made
+    q = _psq
+    got = _lock_problems(
+        tmp_path,
+        {
+            "drive": "Get-LockPathProblem -Path 'D:\\'",
+            "system": "Get-LockPathProblem -Path 'C:\\'",
+            "junction": f"Get-LockPathProblem -Path {q(str(junction))}",
+            "holder": f"Get-LockPathProblem -Path {q(str(tmp_path))} -Holds @({q(str(data))})",
+            "same": f"Get-LockPathProblem -Path {q(str(data))} -Holds @({q(str(data))})",
+            "inside": (
+                f"Get-LockPathProblem -Path {q(str(repo / 'settings'))} -NotWithin @({q(str(repo))})"
+            ),
+            "neighbour": (
+                f"Get-LockPathProblem -Path {q(str(neighbour))} -Holds @({q(str(repo))}) "
+                f"-NotWithin @({q(str(repo))})"
+            ),
+            "dedicated": (
+                f"Get-LockPathProblem -Path {q(str(dedicated))} -Holds @({q(str(data))}, "
+                f"{q(str(repo))}, '') -NotWithin @({q(str(repo))})"
+            ),
+        },
+    )
+    assert got["drive"] == got["system"] == "it is the root of a volume"
+    assert got["junction"] == "it is a junction, a link or a mounted volume"
+    assert got["holder"] == f"it holds '{data}'"
+    assert got["same"] == f"it holds '{data}'"
+    assert got["inside"] == f"it is inside '{repo}'"
+    assert got["neighbour"] == ""
+    assert got["dedicated"] == ""
+
+
+def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_anything_acts(
+    tmp_path: Path,
+) -> None:
+    """A double quote would end a quoted path early, and an unquoted host with a space would add
+    arguments: either way a later ``--host 0.0.0.0`` could override the loopback default."""
+    assert _SCRIPT is not None
+    text = _text()
+    first_act = text.index("$NssmPath = Resolve-Nssm")
+    assert text.index("cannot contain a double quote: $($named[1])") < first_act
+    assert text.index("if (-not (Test-ListenHost $ListenHost)) {") < first_act
+    body = (
+        "  $quote = try { Format-QuotedPath 'D:\\x\" --host 0.0.0.0 \"' } catch { 'refused' }\n"
+        "  [pscustomobject]@{\n"
+        "    quote = $quote\n"
+        "    good = @('127.0.0.1', '::1', '0.0.0.0', 'localhost', 'engine-1.example.org' |"
+        " ForEach-Object { Test-ListenHost $_ })\n"
+        "    bad = @('127.0.0.1 --host 0.0.0.0', '\"127.0.0.1\"', '', '-x', 'a..b', 'a_b' |"
+        " ForEach-Object { Test-ListenHost $_ })\n"
+        "  } | ConvertTo-Json -Compress\n"
+    )
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Format-QuotedPath", "Test-ListenHost"], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
+    )
+    assert got == {"quote": "refused", "good": [True] * 5, "bad": [False] * 6}
+
+
+def _hosts() -> list[str]:
+    return [host for host in ("pwsh", "powershell") if shutil.which(host)]
+
+
+def _run_on(host: str, script: str, tmp_path: Path) -> str:
+    f = tmp_path / f"harness-{uuid.uuid4().hex}.ps1"
+    f.write_text(script, encoding="utf-8")
+    r = subprocess.run(
+        [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(f)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert r.returncode == 0, f"{host} harness failed:\n{(r.stderr + r.stdout)[:2000]}"
+    return r.stdout
+
+
+def _app_params_lines() -> str:
+    """The three lines that build $AppParams, as the script has them."""
+    text = _text()
+    lines = [
+        line
+        for line in text.splitlines()
+        if line.startswith("$AppParams = ")
+        or line.startswith("if ($ServiceConfig) { $AppParams += ")
+        or line.startswith("if ($ProjectRoot) { $AppParams += ")
+    ]
+    assert len(lines) == 3, lines
+    return "\n".join(lines)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="the service's command line is parsed on Windows"
+)
+@pytest.mark.parametrize("host", ["pwsh", "powershell"])
+def test_each_path_reaches_the_service_whole_on_each_host(host: str, tmp_path: Path) -> None:
+    """The registered AppParameters, handed to a native program the way the script hands it to
+    nssm, then split as the service's command line is split. Windows PowerShell 5.1 strips the
+    quotes from an argument unless they are escaped, so a path with a space came apart there.
+
+    The raw arm is the positive control: on a legacy host the unescaped string does NOT arrive
+    whole, so the instrument can see the defect the escape removes."""
+    if not shutil.which(host):
+        pytest.skip(f"SKIP (nothing run): {host} not on PATH")
+    assert _SCRIPT is not None
+    assert (
+        "Invoke-Nssm set $ServiceName AppParameters (ConvertTo-NativeArgument $AppParams "
+        "-Legacy:(Test-LegacyNativeArgumentPassing))"
+    ) in _text()
+    paths = {
+        "--config": "D:\\hl7 cfg\\config",
+        "--db": "C:\\Mefor Data\\messagefoundry.db",
+        "--service-config": "D:\\hl7 cfg\\messagefoundry.toml",
+        "--project-root": "D:\\",
+    }
+    body = (
+        "  $EngineInterpreterOptions = '-I -X disable-remote-debug'\n"
+        f"  $Config = {_psq(paths['--config'])}\n"
+        f"  $DbPath = {_psq(paths['--db'])}\n"
+        f"  $ServiceConfig = {_psq(paths['--service-config'])}\n"
+        f"  $ProjectRoot = {_psq(paths['--project-root'])}\n"
+        "  $ListenHost = '127.0.0.1'; $Port = 8765; $LogLevel = 'INFO'; $Environment = 'prod'\n"
+        + _app_params_lines()
+        + "\n"
+        f"  $py = {_psq(sys.executable)}\n"
+        "  $echo = 'import sys, json; print(json.dumps(sys.argv[1]))'\n"
+        "  $legacy = Test-LegacyNativeArgumentPassing\n"
+        "  $sent = & $py -c $echo (ConvertTo-NativeArgument $AppParams -Legacy:$legacy)\n"
+        "  $raw = & $py -c $echo $AppParams\n"
+        "  [pscustomobject]@{ legacy = $legacy; built = $AppParams; sent = ($sent | ConvertFrom-Json);"
+        " raw = ($raw | ConvertFrom-Json) } | ConvertTo-Json -Compress\n"
+    )
+    script = _extract(
+        _SCRIPT,
+        ["Format-QuotedPath", "Test-LegacyNativeArgumentPassing", "ConvertTo-NativeArgument"],
+        body,
+    )
+    got = json.loads(_run_on(host, script, tmp_path).strip().splitlines()[-1])
+    assert got["sent"] == got["built"], got
+    if host == "powershell":
+        assert got["legacy"] is True
+        assert got["raw"] != got["built"], "the positive control: 5.1 strips unescaped quotes"
+    argv = _split_like_the_service(got["sent"])
+    for flag, path in paths.items():
+        assert argv[argv.index(flag) + 1] == path, (flag, argv)
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+    assert argv.count("--host") == 1
+
+
+def _split_like_the_service(params: str) -> list[str]:
+    """``params`` split by CommandLineToArgvW, the rule a Windows program's arguments follow."""
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32")  # type: ignore[attr-defined,unused-ignore]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    count = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW("python.exe " + params, ctypes.byref(count))
+    try:
+        return [argv[i] for i in range(1, count.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)  # type: ignore[attr-defined,unused-ignore]
 
 
 def test_the_default_settings_file_is_the_one_serve_would_read(tmp_path: Path) -> None:
