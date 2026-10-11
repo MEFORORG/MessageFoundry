@@ -10,6 +10,9 @@
   > (2026-09-26). An options memo with the drafter's recommendation. The owner accepts or rejects it,
   > and no code may follow until it is Accepted. BACKLOG #2070 stays open until then; its closing step
   > 1 asks for exactly this record before any build."*
+- **Amended:** 2026-10-10, BACKLOG #2187. The `vault_transit` scope note covers the store's cells
+  only; DR archives in that mode still draw local nonces. A seat decision under owner delegation
+  2026-10-08, not an owner ruling. See the amendment at the end.
 - **Date:** 2026-09-26
 - **Related:** BACKLOG #2070 (the row this answers) ·
   [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md), amendment 2026-07-22 (the persisted
@@ -483,13 +486,15 @@ where they were, each marked as amended.
 `1d55295f66`, by symbol. No test runs a backup under `vault_transit`, so none of this is measured.
 
 1. `BackupRunner._resolve_key` (`pipeline/dr_backup.py`) gets its key from `resolve_active_key`.
-   That goes through `resolve_key_provider` and never reads `cipher_provider`. So when a local key is
-   configured, the backup gets the local DEK. The `cipher_provider` row of `docs/CONFIGURATION.md`
-   tells a Transit site to configure one, and says Transit does not cover backups.
+   That goes through `resolve_key_provider` and never reads `cipher_provider`. So whenever a key
+   resolves, the backup seals under that DEK in process, whatever `cipher_provider` says. The
+   `cipher_provider` row of `docs/CONFIGURATION.md` tells a Transit site to configure a local key,
+   and says Transit does not cover backups. With no key, `_do_backup` refuses unless
+   `[backup].allow_unencrypted` is set, and then writes the archive in clear.
 2. `BackupRunner._store_salt` asks `bounded_cipher` for the store's cipher. A `TransitCipher` gets
    `None`, so the archive has no salt.
-3. `encrypt_stream` (`store/backup_codec.py`) then seals every frame with its own `AESGCM` over the
-   raw DEK. Each frame draws a random 96-bit nonce from `os.urandom`.
+3. `encrypt_stream` (`store/backup_codec.py`) then builds one `AESGCM` over the raw DEK for the
+   archive, through `_frame_aes`. Each frame it seals draws a random 96-bit nonce from `os.urandom`.
 4. `BackupRunner._build_archive_blocking` records the frames under `key_fingerprint(key)`, the DEK's
    own id. `_charge_archive_invocations` adds them to that `cipher_meta` row through
    `add_cipher_invocations`.
@@ -502,7 +507,8 @@ where they were, each marked as amended.
   `AesGcmCipher`, so nothing reads the DEK's row back.
 - `_charge_archive_invocations` drops the new total that `add_cipher_invocations` returns.
 - `encrypt_stream` checks no ceiling before or while it seals. That is the fourth review gap under
-  *Context*.
+  *Context*. A fix for that gap that takes its ceiling from `bounded_cipher` would get `None` here,
+  and would leave this row unenforced.
 - The Transit attestation (`store/transit_attestation.py`, ADR 0138's 2026-10-07 amendment) binds to
   the Transit data-key name. It does not cover the local DEK.
 
@@ -519,5 +525,6 @@ nonces. The store's cells stay out of this ADR's scope; their bound is ADR 0138'
 precondition and attestation. BACKLOG #2187 also offered two other choices, and neither was taken:
 seal Transit-mode archives under a salted sub-key, or seal them through Transit.
 
-Per engine `CLAUDE.md` section 0 there are no deployments. A first site on `vault_transit` would
-seal every archive under the local DEK, and no enforced ceiling would cover that key's archive use.
+Per engine `CLAUDE.md` section 0 there are no deployments. A first site on `vault_transit` that
+configures a key for the backup would seal every archive under that DEK in process, and no enforced
+ceiling would cover that key's archive use.

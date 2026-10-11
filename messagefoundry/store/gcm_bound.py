@@ -49,7 +49,7 @@ production key: that copy carries its salt and its row. ADR 0196 records it as a
 **Out of scope: the ``vault_transit`` store cipher.** It draws no local nonce and builds no local
 ``AESGCM``.
 :func:`bounded_cipher` returns ``None`` for it and for the identity cipher, and every entry point here
-degrades to a no-op. So nothing counts, alarms or refuses on that path. Its bound is a DOCUMENTED
+degrades to a no-op. So nothing counts, alarms or refuses on the store cipher's path. Its bound is a DOCUMENTED
 OPERATOR PRECONDITION, not a counted one: the operator must rotate the Transit data key before any one
 key version seals 2**32 values, and the engine does not check that they do. It is weaker than this
 module's bound, and the owner ruled on 2026-09-28 that it does not meet ASVS 11.5.2 ruling R3, which
@@ -58,14 +58,10 @@ needs an engine-recorded attestation. ADR 0138's 2026-09-28 amendment states the
 ADR 0138's 2026-10-07 amendment): a CLI-written, audited store row naming the Transit key, without which
 ``serve`` refuses under enforce. It records who vouched for the rotation; it still counts nothing.
 
-**DR archives under ``vault_transit`` DO draw local nonces, with no enforced ceiling** (ADR 0196's
-2026-10-10 amendment, BACKLOG #2187; a seat decision under owner delegation 2026-10-08, not an owner
-ruling, which keeps them on the local DEK). ``pipeline/dr_backup.py`` resolves the local DEK through
-``resolve_active_key``, which never reads ``cipher_provider``, and gets no salt from a Transit store.
-``store/backup_codec.py`` then seals each frame under the raw DEK with a random local nonce, and the
-run charges the frames to the DEK's own ``cipher_meta`` row. Nothing enforces that row's ceiling in
-this mode: no ``AesGcmCipher`` reads it back, the charge ignores the total it returns, and the codec
-checks no ceiling. The Transit attestation names the Transit key, not the DEK.
+**DR archives under ``vault_transit`` DO draw local nonces.** ``pipeline/dr_backup.py`` seals them
+under the DEK in process and charges the DEK's own ``cipher_meta`` row, and nothing enforces that
+row's ceiling in this mode. ADR 0196's 2026-10-10 amendment traces the path by symbol (BACKLOG #2187;
+a seat decision under owner delegation 2026-10-08, not an owner ruling).
 """
 
 from __future__ import annotations
