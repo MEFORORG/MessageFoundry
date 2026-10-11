@@ -1775,9 +1775,16 @@ the same permission set on the same method reds CI until it is listed here.
 > With the engine not started there is no graph and no name exists. Every route still checks the
 > scope first, so a name outside it gets the 403. A name inside it gets 503 from the first three
 > routes and 404 from the control routes, with no denial row. Names still show elsewhere. At
-> least the Prometheus exposition above and `GET /alerts/rules` list them, and
-> `POST /connections/{name}/flag` has no per-channel check.
+> least the Prometheus exposition above lists them.
+> `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
+> an inbound in its own scope, and every other target gets that 403, before the engine looks the
+> name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
+> reaches the engine, which answers 409 for a name with no `connections.toml` entry.
+> `GET /alerts/rules` shows a scoped caller
+> only the rules that name no connection outside its scope: `connection` is `*` or a name in its
+> scope, and `control_target` is unset or in it.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
+> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules.
 
 > **Every route of the default JSON API has a channel-scope class, and a new one fails the build
 > until it gets one (BACKLOG #2627).** `tests/test_route_channel_scope_classification.py` holds the

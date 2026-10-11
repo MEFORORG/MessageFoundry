@@ -1794,7 +1794,9 @@ class AuditStore(Protocol):
         ``offset`` pages them, and ``until`` keeps only rows whose ``ts`` is at most it, so a pager
         that passes its first page's newest ``ts`` reads one snapshot while new rows arrive
         (BACKLOG #2438). The pin is a ``ts`` and not an ``id`` because an ``audit_log`` id is
-        global: the gap between two of a user's ids would count every other account's rows."""
+        global: the gap between two of a user's ids would count every other account's rows.
+        Rows older than the account's own ``created_at`` are left out, and so is every row when no
+        account holds ``username``, because ``actor`` is a reusable name (BACKLOG #1152)."""
         ...
 
     async def count_security_events_for_user(
