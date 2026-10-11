@@ -440,14 +440,29 @@ def test_an_unavailable_probe_leaves_the_prior_outcome_in_place() -> None:
     assert "u2" not in plan.outcomes and plan.outcomes["u1"] is U
 
 
-def test_held_probes_are_left_out_of_the_breakers_count() -> None:
-    """Rule item 7. Six absent accounts beside 94 held ones: counted over all 100 the breaker would
-    pass six (not over 34). Counted over the six it could revoke, it trips."""
+def test_held_probes_stay_in_the_breakers_count() -> None:
+    """ADR 0195 amendment 2026-10-11 (BACKLOG #2138). Six genuine revocations beside 94 held
+    accounts are judged over all 100 probes, so they pass. RED when: held probes leave the count,
+    so the breaker judges six of six and trips on every pass while the wave is held. The control:
+    the same six with nothing beside them do trip."""
     held = [reconcile.Probe(f"h{i}", f"h{i}", U) for i in range(94)]
     gone = [reconcile.Probe(f"g{i}", f"g{i}", reconcile.ProbeOutcome.ABSENT) for i in range(6)]
+    strikes = {p.user_id: 1 for p in gone}
+    plan = _plan(held + gone, prior_strikes=strikes)
+    assert plan.aborted is None and plan.hold and len(plan.held) == 94
+    assert plan.judged == 100 and len(plan.revocations) == 6
+    assert _plan(gone, prior_strikes=strikes).aborted == "mass_revoke_breaker"
+
+
+def test_a_mass_revocation_wave_beside_a_held_one_still_trips_the_breaker() -> None:
+    """Counting held probes dilutes the fraction, but a genuine wave still exceeds it: 30 absent
+    accounts beside 40 held ones are more than 0.34 of 70. The hold survives the abort."""
+    held = [reconcile.Probe(f"h{i}", f"h{i}", U) for i in range(40)]
+    gone = [reconcile.Probe(f"g{i}", f"g{i}", reconcile.ProbeOutcome.ABSENT) for i in range(30)]
     plan = _plan(held + gone, prior_strikes={p.user_id: 1 for p in gone})
-    assert plan.aborted == "mass_revoke_breaker" and plan.hold and len(plan.held) == 94
-    assert plan.outcomes and plan.undetermined == 94  # the hold survives the abort
+    assert plan.aborted == "mass_revoke_breaker" and plan.revocations == ()
+    assert plan.judged == 70 and plan.hold and len(plan.held) == 40
+    assert plan.outcomes and plan.undetermined == 40
 
 
 def test_an_outage_carries_the_hold_state_and_judges_nothing() -> None:

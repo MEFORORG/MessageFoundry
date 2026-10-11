@@ -17,6 +17,20 @@
   second read. No client sees the difference. The reconciler's new UNKEYED outcome, for an id-less
   row it does not probe, is deliberately not UNDETERMINED, so it never moves this rule's hold (ADR
   0184 amendment 2026-10-06).
+- **Amendment 2026-10-11 (BACKLOG #2138). A seat decision under owner delegation 2026-10-08, not
+  an owner ruling.** Rule item 7's last sentence no longer holds and is kept as the record: held
+  probes now stay in the mass-revoke breaker's probed count. Left out, a large hold beside more than
+  `ad_session_revoke_max` genuine revocations tripped the breaker on every pass while the wave was
+  held. So genuine disables and deletions went unrevoked, and the breaker alerted, for as long as
+  the hold stood. Counted in, the breaker judges revocations against every principal the pass
+  probed, as it already does for referred and unreachable ones (BACKLOG #2538). The cost is that a
+  hold dilutes the fraction a wave of false absences must exceed. A genuine wave still trips it:
+  30 absences beside 40 held accounts exceed 0.34 of 70. **Not measured:** a hold that comes with
+  false absences from one directory fault. Such a wave would be judged against a count the hold
+  has inflated, and nothing here says how often the two arrive together. The
+  `auth.ad_reconcile_aborted` row drops its `judged` key, which would now always equal `probed`.
+  `ReconcilePlan.judged` carries the rule, and
+  `tests/test_ad_session_reconcile.py::test_held_probes_stay_in_the_breakers_count` pins it.
 - **Related:** [ADR 0079](0079-kerberos-idp-session-coordination.md) (mechanism 2, the directory
   session reconciler, and its mass-revoke breaker) · [CLAUDE.md](../../CLAUDE.md) section 0 (not
   deployed) and section 11 (SDS-3.6, SDS-3.7) · BACKLOG #1639 (the fail-closed read this follows) ·
@@ -221,7 +235,8 @@ at one.
    before it is revoked. That covers an access change that is still replicating. The existing breaker
    keeps strikes on abort to stop its alert flickering. That reason does not apply here, because the
    hold does not read strikes. Every other probe plans as today. The mass-revoke breaker then judges
-   what remains, with held probes left out of its probed count.
+   what remains, with held probes left out of its probed count. *Amended 2026-10-11, see the
+   amendment of that date in the header: held probes now stay in that count.*
 8. **When not held**, a single `UNDETERMINED` probe strikes and revokes exactly as `ABSENT` does, and
    counts against the mass-revoke breaker's budget.
 9. **Operator signal.** Every pass that holds writes its own audit row and raises its own alert type.
