@@ -9,6 +9,10 @@ rule that decides what this repository publishes and what it withholds.
 Open a pull request. Nothing here requires a backlog item first, and you do not need one to be
 accepted.
 
+Post a bug report, but never a vulnerability, in the
+[Bugs category of GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions/categories/bugs),
+as [`CONTRIBUTING.md`](../CONTRIBUTING.md#finding-something-to-work-on) describes.
+
 Report a security issue through the private advisory process in
 [`SECURITY.md`](../.github/SECURITY.md). Do not open a pull request or a public report for one.
 
