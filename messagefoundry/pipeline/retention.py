@@ -278,6 +278,12 @@ class RetentionPass:
     # nothing in the store, so it adds no audit row, and a disk that stays low would otherwise write
     # one every pass. False when the floor is off, on a server backend, or when the probe failed.
     below_disk_floor: bool = False
+    # The pass ran its WAL truncate and it did NOT finish (vault BACKLOG #2619): a reader or a DR
+    # snapshot copy held the WAL, so the -wal file keeps its frames, and a WARNING was logged. Not
+    # part of `did_work`, for the reason `below_disk_floor` is not, but a pass that is audited
+    # records it, so its purge row says the purge may survive in the -wal file. False when no
+    # truncate ran.
+    wal_left_untruncated: bool = False
 
     @property
     def did_work(self) -> bool:
@@ -683,14 +689,30 @@ class RetentionRunner:
         # the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass (#121). A
         # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
         wal_checkpointed = False
+        wal_left_untruncated = False
         if (
             not _deadline_hit()
             and self._wal_truncate_applies()
             and now - self._last_wal >= s.wal_checkpoint_seconds
         ):
-            await self._store.wal_checkpoint()
+            # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies` skips.
+            wal_left_untruncated = await self._store.wal_checkpoint() is False
+            # The marker advances either way, so a reader that pins the WAL costs writers one busy
+            # timeout per cadence rather than one per pass.
             self._last_wal = now
             wal_checkpointed = True
+            if wal_left_untruncated:
+                # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the file
+                # and the cause only; no message content reaches this line.
+                log.warning(
+                    "retention: the WAL truncate did not finish -- another connection (one of the "
+                    "engine's own reads, a DR snapshot copy, or another process on this store) "
+                    "still held %s-wal, so frames written before this pass, purged bodies among "
+                    "them, stay in that file until a later truncate (the first retention pass at "
+                    "least %gs from now)",
+                    self._floor_path,
+                    s.wal_checkpoint_seconds,
+                )
 
         vacuumed = False
         if not _deadline_hit() and self._vacuum_due(now):
@@ -723,6 +745,7 @@ class RetentionRunner:
             reference_snapshots_purged=reference_snapshots_purged,
             capped=capped,
             below_disk_floor=below_disk_floor,
+            wal_left_untruncated=wal_left_untruncated,
         )
         if result.did_work:
             await self._audit(result)
@@ -1188,6 +1211,11 @@ class RetentionRunner:
                 "max_pass_seconds": self._settings.max_pass_seconds,
                 "capped": result.capped,
                 "vacuumed": result.vacuumed,
+                # Vault BACKLOG #2619: a purge this row records may still sit in the -wal frames.
+                # null when this pass ran no truncate, so "never tried" cannot read as "truncated".
+                "wal_left_untruncated": (
+                    result.wal_left_untruncated if result.wal_checkpointed else None
+                ),
                 "db_size_bytes": result.size_bytes,
                 "max_db_mb": self._settings.max_db_mb,
                 "over_limit": result.over_limit,

@@ -12,6 +12,7 @@ import gzip
 import json
 import logging
 import os
+import sqlite3
 import time
 from typing import Any
 
@@ -698,6 +699,71 @@ async def test_the_default_pass_truncates_the_wal_after_its_purge(store: Message
         assert marker not in fh.read()
 
 
+async def test_wal_checkpoint_says_so_when_a_reader_pins_the_wal(store: MessageStore) -> None:
+    """A read transaction that started on WAL frames makes TRUNCATE give up after the busy timeout,
+    and the store now says so (vault BACKLOG #2619). The control is the same call once the reader
+    is gone, which finishes. The busy timeout is cut to keep the test fast; the outcome is SQLite's
+    busy flag either way."""
+    await _delivered(store, now=0.0)
+    cur = await store._db.execute("PRAGMA busy_timeout=50")
+    await cur.close()
+    reader = sqlite3.connect(str(store.path))
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM messages").fetchone()
+        assert await store.wal_checkpoint() is False
+    finally:
+        reader.close()
+    assert await store.wal_checkpoint() is True
+    assert os.path.getsize(f"{store.path}-wal") == 0
+
+
+async def test_a_pass_whose_truncate_did_not_finish_warns_and_records_it(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The pass used to say nothing when its truncate gave up. Now it logs a WARNING that names the
+    file and not the content, and the pass result records it. The control is the same pass with a
+    truncate that finishes: no warning, nothing recorded."""
+    marker = "UNTRUNCATED-MARKER-2619"
+    await _delivered(store, now=0.0, raw="MSH|^~\\&|" + marker, summary=marker)
+
+    async def busy() -> bool:
+        return False
+
+    settings = RetentionSettings(messages_days=1, wal_checkpoint_seconds=1)
+    caplog.set_level(logging.WARNING, logger=retention_mod.__name__)
+    clean = await RetentionRunner(store, settings, clock=lambda: 30 * DAY).run_once()
+    assert clean.wal_checkpointed is True
+    assert clean.wal_left_untruncated is False
+    assert not [r for r in caplog.records if "WAL truncate" in r.getMessage()]
+
+    monkeypatch.setattr(store, "wal_checkpoint", busy)
+    # A second purgeable message, so the second pass is audited too.
+    await _delivered(store, now=DAY, raw="MSH|^~\\&|" + marker, summary=marker, control="CID-2")
+    result = await RetentionRunner(store, settings, clock=lambda: 31 * DAY).run_once()
+    assert result.wal_checkpointed is True
+    assert result.wal_left_untruncated is True
+    warned = [r for r in caplog.records if "WAL truncate did not finish" in r.getMessage()]
+    assert len(warned) == 1
+    assert warned[0].levelno == logging.WARNING
+    assert f"{os.path.abspath(store.path)}-wal" in warned[0].getMessage()
+    assert marker not in caplog.text
+    # Each pass purged, so each wrote an audit row, and the row says whether the WAL kept the frames.
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    left = sorted(json.loads(r["detail"])["wal_left_untruncated"] for r in audit)
+    assert left == [False, True]
+
+
+async def test_a_purge_pass_with_no_truncate_records_null_not_false(store: MessageStore) -> None:
+    """A pass that ran no truncate must not record ``false``, which would read as "truncated"."""
+    await _delivered(store, now=0.0)
+    settings = RetentionSettings(messages_days=1, wal_checkpoint_seconds=0)
+    result = await RetentionRunner(store, settings, clock=lambda: 30 * DAY).run_once()
+    assert result.messages_purged == 1 and result.wal_checkpointed is False
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert [json.loads(r["detail"])["wal_left_untruncated"] for r in audit] == [None]
+
+
 # --- RetentionRunner ----------------------------------------------------------
 
 
@@ -915,9 +981,10 @@ async def test_run_once_cap_skips_phase_after_deadline(store: MessageStore, monk
     }  # a controllable monotonic clock for the deadline (separate from the window clock)
     orig_wal = store.wal_checkpoint
 
-    async def slow_wal() -> None:
-        await orig_wal()
+    async def slow_wal() -> bool:
+        finished = await orig_wal()
         mono["t"] = 100.0  # the WAL phase overruns the 5s cap
+        return finished
 
     monkeypatch.setattr(store, "wal_checkpoint", slow_wal)
 

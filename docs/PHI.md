@@ -1890,7 +1890,7 @@ alone leaves the purged body in the file's free space. `[store].secure_delete` (
 queue row. `[retention].wal_checkpoint_seconds` (default `3600`) tries to truncate the `-wal` file
 after the pass's purges, because SQLite's own checkpoint reuses that file without shrinking it. A
 reader or a DR snapshot copy that holds the WAL leaves it untruncated until a later pass, and the pass
-does not record which happened. At least these are still outside the two settings: pages freed before `secure_delete` was on, which keep their bytes
+logs a WARNING when that happens. At least these are still outside the two settings: pages freed before `secure_delete` was on, which keep their bytes
 until a `VACUUM`; blocks the filesystem or an SSD keeps after SQLite overwrites or truncates; and any
 backup or copy taken before the purge. On SQL Server and Postgres the engine sets neither, and how freed
 space is reused is the DBA's.
