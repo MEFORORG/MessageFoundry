@@ -251,9 +251,10 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (an
   operator `[api].tls_cert_file` or a declared TLS-terminating proxy), and that refusal holds even under
   `--allow-insecure-bind`. `serve` refuses a missing `web_console_public_address` only behind a declared
-  terminator (`[api].tls_terminated_upstream`). With an operator certificate and no address it warns
-  and serves `/ui`: the origin checks then use the request Host, and passkeys fail closed until the
-  address is set.
+  terminator (`[api].tls_terminated_upstream`). With an operator certificate and no address, this check
+  only warns: the `/ui` origin checks then use the request Host, and passkeys fail closed until the
+  address is set. Other gates can still refuse that start, at least the in-process TLS revocation
+  gate (unless `MEFOR_TLS_REVOCATION_ATTESTED=1`) and MFA-at-exposure.
 
 ### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
