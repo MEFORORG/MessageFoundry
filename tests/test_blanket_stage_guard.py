@@ -67,6 +67,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1032,46 +1033,181 @@ def test_a_slow_added_reading_cannot_delay_the_original_deny() -> None:
     assert time.monotonic() - started < 15
 
 
-def test_a_deeply_nested_commit_before_a_stage_is_judged_inside_the_time_limit() -> None:
-    """The ORIGINAL reading's own cost, which the test above does not reach. The commit pathspec
-    rule used to drop one nesting level of brackets per pass, so deep nesting kept the hook past
-    its 15 s timeout before the 'git add -A' after it was read, and a timed-out hook lets the stage
-    run. docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a holds the measurements for this test and
-    the three after it."""
-    command = "git commit -m x " + "(" * 40000 + ")" * 40000 + " && git add -A"
+# RUN TIME, AND THE LENGTH CAP THAT BOUNDS IT. The settings file gives the hook 15 seconds, and a
+# hook that runs longer lets the command run. Every repair of a slow path so far has opened
+# another, so the guard refuses, unread, any command longer than its cap.
+# docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a has the measurements, the table the cap was
+# chosen from, and the false denies the cap costs. Each timing test below was run against the guard
+# at 93f2775087 and failed there on time.
+#
+# Two limits are asserted. A command past the cap must be refused within 5 seconds, a third of the
+# timeout, because that path reads nothing. A command under the cap must be judged within the
+# 15-second timeout itself; the 5-second figure the cap was chosen by is a measurement on one
+# machine, and a slower or busier test runner should not turn it into a false failure.
+_CAP_REASON = "Command too long for the blanket-stage guard to check"
+
+
+def _max_command_length() -> int:
+    """The cap, read from the script so this file never holds a second copy of it."""
+    found = re.search(r"^\$MAX_COMMAND_LENGTH = (\d+)\r?$", GUARD.read_text(encoding="utf-8"), re.M)
+    assert found, "the guard's $MAX_COMMAND_LENGTH line was not found"
+    return int(found.group(1))
+
+
+MAX_COMMAND_LENGTH = _max_command_length()
+
+
+def _timed(command: str, tool: str = "Bash") -> tuple[dict[str, Any] | None, float]:
     started = time.monotonic()
-    assert_denied(run_guard(bash(command)))
-    assert time.monotonic() - started < 15
+    result = run_guard(bash(command, tool=tool))
+    return result, time.monotonic() - started
 
 
-def test_the_commit_rule_itself_denies_past_deep_nesting_inside_the_time_limit() -> None:
-    """The same nesting, with the deny owed to the COMMIT rule and no other segment: the dot after
-    the brackets is the commit's pathspec. The control is the dot moved inside the brackets."""
-    nest = "(" * 40000 + ")" * 40000
-    started = time.monotonic()
-    reason = assert_denied(run_guard(bash("git commit -m x " + nest + " .")))
-    assert time.monotonic() - started < 15
-    assert "git commit with a whole-tree pathspec" in reason
-    assert_allowed(run_guard(bash("git commit -m x " + "(" * 40000 + " ." + ")" * 40000)))
+def test_a_command_one_past_the_cap_is_denied_unread_and_quickly() -> None:
+    """The false-deny cost of the cap: a long harmless command is refused, and told what to do."""
+    command = "echo " + "a" * (MAX_COMMAND_LENGTH - 4)
+    assert len(command) == MAX_COMMAND_LENGTH + 1
+    result, took = _timed(command)
+    assert took < 5, f"took {took:.1f} s"
+    reason = assert_denied(result)
+    assert _CAP_REASON in reason
+    assert "script file" in reason
 
 
-def test_many_sibling_brackets_before_a_stage_are_judged_inside_the_time_limit() -> None:
-    """Shallow and wide, the other shape: one level deep, so the old loop finishes it in a pass or
-    two. A pairing done a character at a time was measured slow enough on this shape to cross
-    15 s at twice this size, so this pins it."""
-    command = "git commit -m x " + "(a) " * 150000 + "&& git add -A"
-    started = time.monotonic()
-    assert_denied(run_guard(bash(command)))
-    assert time.monotonic() - started < 15
+def test_a_command_at_the_cap_is_read() -> None:
+    """The control: at exactly the cap the guard reads the command, so a harmless one is allowed,
+    and a real stage is refused with its own reason rather than the cap's."""
+    harmless = "echo " + "a" * (MAX_COMMAND_LENGTH - 5)
+    assert len(harmless) == MAX_COMMAND_LENGTH
+    assert_allowed(run_guard(bash(harmless)))
+    stage = "git add -A; echo " + "a" * (MAX_COMMAND_LENGTH - 17)
+    assert len(stage) == MAX_COMMAND_LENGTH
+    reason = assert_denied(run_guard(bash(stage)))
+    assert "git add/stage -A" in reason
+    assert _CAP_REASON not in reason
+
+
+_NEST = "(" * 65 + ")" * 65
+
+# Each kept the hook at 93f2775087 past 5 seconds. The first three are the shapes of the Lander's
+# review payloads for that commit; the last is the shape the commit before it fixed.
+PAST_THE_CAP = [
+    pytest.param(
+        "git commit -m x " + (_NEST + " ") * 9200 + "&& git add -A", id="1.2M-nests-past-64-levels"
+    ),
+    pytest.param(
+        "git commit -m x " + _NEST + " " + "\\( " * 300000 + "; git add -A",
+        id="900K-escaped-brackets",
+    ),
+    pytest.param(
+        "git commit -m x " + _NEST + " " + "(" * 1200000 + " && git add -A",
+        id="1.2M-unclosed-after-a-deep-nest",
+    ),
+    pytest.param("git commit -m x " + "(a) " * 600_000 + "&& git add -A", id="2.4M-sibling-pairs"),
+]
+
+
+@pytest.mark.parametrize("command", PAST_THE_CAP)
+def test_a_slow_payload_past_the_cap_is_denied_within_five_seconds(command: str) -> None:
+    result, took = _timed(command)
+    assert took < 5, f"took {took:.1f} s"
+    assert _CAP_REASON in assert_denied(result)
+
+
+def test_a_long_run_of_escapes_under_the_cap_is_judged_inside_the_time_limit() -> None:
+    """The line-continuation pattern looked behind every backslash in a run, which took time
+    quadratic in the run. An unknown tool name builds every view, so the pattern ran four times,
+    and at 93f2775087 this payload ran past the timeout. The deny is owed to the narrow heredoc
+    reading alone, so a timeout would have cost it."""
+    tail = " x\ncat <<EOF-1\nx\nEOF-1\ngit add -A"
+    head = "echo x\recho "
+    command = head + "\\" * (MAX_COMMAND_LENGTH - len(head) - len(tail)) + tail
+    assert len(command) == MAX_COMMAND_LENGTH
+    result, took = _timed(command, tool="SomeFutureTool")
+    assert took < 15, f"took {took:.1f} s"
+    assert "git add/stage -A" in assert_denied(result)
+
+
+def test_the_commit_rule_itself_denies_past_deep_nesting() -> None:
+    """Deep nesting with the deny owed to the COMMIT rule and no other segment: the dot after the
+    brackets is the commit's pathspec. The control is the dot moved inside the brackets."""
+    nest = "(" * 20000 + ")" * 20000
+    result, took = _timed("git commit -m x " + nest + " .")
+    assert took < 15, f"took {took:.1f} s"
+    assert "git commit with a whole-tree pathspec" in assert_denied(result)
+    assert_allowed(run_guard(bash("git commit -m x " + "(" * 20000 + " ." + ")" * 20000)))
 
 
 def test_many_commit_words_before_a_stage_are_judged_inside_the_time_limit() -> None:
-    """The commit rule's pathspec pattern backtracked quadratically on repeated 'commit' words, and
-    this exact payload kept the hook past its 15 s timeout, so the stage would have run."""
-    command = "git x " + "commit " * 30000 + "&& git add -A"
-    started = time.monotonic()
-    assert_denied(run_guard(bash(command)))
-    assert time.monotonic() - started < 15
+    """The commit rule's pathspec pattern backtracked quadratically on repeated 'commit' words. At
+    30,000 words, past today's cap, it kept the hook past its timeout. This is the shape under the
+    cap; it passes at 93f2775087 too, so it pins the repair rather than proving it."""
+    command = "git x " + "commit " * 9000 + "&& git add -A"
+    assert len(command) <= MAX_COMMAND_LENGTH
+    result, took = _timed(command)
+    assert took < 15, f"took {took:.1f} s"
+    assert_denied(result)
+
+
+# THE REWRITTEN PIECES, TIMED ON THEIR OWN. Each is lifted from the script by name and run in one
+# process on an input far past the cap, so a slope that is quadratic shows even where the cap would
+# hide it from a whole-hook test. Each input took more than 5 seconds at 93f2775087.
+_LINEAR_DRIVER = r"""
+$src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
+foreach ($line in [regex]::Matches($src, '(?m)^\$(?:BRACKET_\w+|ARITHMETIC_BUDGET) = .*$')) {
+    Invoke-Expression $line.Value
+}
+$arith = [regex]::Match($src, '(?ms)^\$ARITHMETIC = \[regex\]::new\(.*?^\s+\[timespan\]::FromMilliseconds\(\d+\)\)\r?$')
+if (-not $arith.Success) { throw 'ARITHMETIC not found' }
+Invoke-Expression $arith.Value
+foreach ($name in 'Remove-BracketedText', 'Edit-BothViews', 'Hide-HeredocBodies') {
+    $m = [regex]::Match($src, "(?s)function $name\b.*?\r?\n}\r?\n")
+    if (-not $m.Success) { throw "function $name not found" }
+    Invoke-Expression $m.Value
+}
+$tokenEnd = [regex]::Match($src, "\`$tokenEnd = '([^']*)'").Groups[1].Value
+$shortFlag = [regex]::Match($src, "\`$shortFlag = '([^']*)'").Groups[1].Value
+$commitFlag = [regex]::Match($src, '-or \$s -cmatch "\(\^\|\\s\)(.*?)\$tokenEnd"\)\)').Groups[1].Value
+$join = [regex]::Match($src, "Edit-BothViews \`$joined\[0\] \`$joined\[1\] '([^']*)' ''").Groups[1].Value
+$tickJoin = [regex]::Match($src, "Edit-BothViews \`$joined\[0\] \`$joined\[1\] '([^']*)' ' '").Groups[1].Value
+if (-not ($tokenEnd -and $shortFlag -and $commitFlag -and $join -and $tickJoin)) { throw 'a pattern was not found' }
+$nest = '(' * 65 + ')' * 65
+$cases = [ordered]@{
+    'brackets: 9200 nests past 64 levels' = { Remove-BracketedText ('git commit -m x ' + ($nest + ' ') * 9200) }
+    'brackets: 600,000 unclosed after a deep nest' = { Remove-BracketedText ('git commit -m x ' + $nest + ' ' + '(' * (600 * 1000)) }
+    'brackets: 600,000 escaped after a deep nest' = { Remove-BracketedText ('git commit -m x ' + $nest + ' ' + '\( ' * (600 * 1000)) }
+    'views: 60000 backtick continuations' = { Edit-BothViews ("a```n" * 60000) ("b```n" * 60000) $tickJoin ' ' }
+    'add flag: a cluster of 160000' = { ('git add -' + 'A' * 160000 + '-') -cmatch "(^|\s)[`"']?(?:$shortFlag)[`"']?$tokenEnd" }
+    'commit flag: a cluster of 160000' = { ('git commit -' + 'a' * 160000 + '-') -cmatch "(^|\s)$commitFlag$tokenEnd" }
+    'continuation: a run of 60000 escapes' = { [regex]::Matches('git status ' + '\' * 60000 + 'x', $join).Count }
+    'arithmetic: 40 lines of 4000 open brackets' = { Hide-HeredocBodies ((('(' * 4000) + " <<`n") * 40) -Narrow }
+}
+$out = [ordered]@{}
+foreach ($k in $cases.Keys) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $null = & $cases[$k]
+    $out[$k] = $sw.Elapsed.TotalSeconds
+}
+$out | ConvertTo-Json -Compress
+"""
+
+
+def test_each_rewritten_piece_runs_in_linear_time() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = Path(tmp) / "linear.ps1"
+        driver.write_text(_LINEAR_DRIVER, encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env={**os.environ, "MEFOR_BLANKET_GUARD_UNDER_TEST": str(GUARD)},
+        )
+    assert proc.returncode == 0, proc.stderr
+    took: dict[str, float] = json.loads(proc.stdout)
+    assert len(took) == 8
+    slow = {case: round(seconds, 1) for case, seconds in took.items() if seconds >= 5}
+    assert not slow, f"seconds per case: {slow}"
 
 
 # THE COMMIT RULE ACROSS BRACKETS. Each row is judged by the commit pathspec rule alone: no other
@@ -1106,6 +1242,7 @@ def test_the_commit_rule_reads_brackets_the_documented_way(command: str, denies:
 # replays. No string holds a line feed: a segment never does, because the splitter cuts at each.
 _EQUIVALENCE_DRIVER = r"""
 $src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
+foreach ($line in [regex]::Matches($src, '(?m)^\$BRACKET_\w+ = .*$')) { Invoke-Expression $line.Value }
 foreach ($name in 'Remove-BracketedText', 'Test-CommitPathspec') {
     $m = [regex]::Match($src, "(?s)function $name\b.*?\r?\n}\r?\n")
     if (-not $m.Success) { throw "function $name not found" }
@@ -1127,7 +1264,7 @@ $words = @(' commit ', ' commit ', 'commit', ' . ', ' ./', ' :/ ', ' ', '.', '/'
 $diff = 0
 for ($n = 0; $n -lt 20000; $n++) {
     $t = -join (0..$rng.Next(0, 14) | ForEach-Object { $brackets[$rng.Next(0, $brackets.Count)] })
-    # One string in ten is wrapped in 60 to 70 levels, so the 64-pass loop gives way to the stack.
+    # One string in ten is wrapped in 60 to 70 levels, deep enough that the old loop needs many passes.
     if ($n % 10 -eq 0) { $t = ('(' * $rng.Next(60, 71)) + $t + (')' * $rng.Next(60, 71)) + $t }
     if ((Old-Brackets $t) -cne (Remove-BracketedText $t)) { $diff++ }
     $c = -join (0..$rng.Next(0, 10) | ForEach-Object { $words[$rng.Next(0, $words.Count)] })
@@ -1141,6 +1278,101 @@ def test_the_rewritten_commit_rule_answers_as_the_old_one_did() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         driver = Path(tmp) / "equivalence.ps1"
         driver.write_text(_EQUIVALENCE_DRIVER, encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env={**os.environ, "MEFOR_BLANKET_GUARD_UNDER_TEST": str(GUARD)},
+        )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0", f"{proc.stdout.strip()} differences; stderr: {proc.stderr}"
+
+
+# THE OTHER PIECES REWRITTEN FOR SPEED, AGAINST WHAT THEY REPLACED, the same way: the old form is
+# kept here, the new one is lifted from the script, and seeded strings are compared. The pieces are
+# the view editor and the two line-continuation patterns it runs, the two flag-cluster patterns,
+# and the pattern that finds the segments the program-name test accepts.
+_REWRITE_EQUIVALENCE_DRIVER = r"""
+$src = Get-Content -LiteralPath $env:MEFOR_BLANKET_GUARD_UNDER_TEST -Raw
+$m = [regex]::Match($src, "(?s)function Edit-BothViews\b.*?\r?\n}\r?\n")
+if (-not $m.Success) { throw 'function Edit-BothViews not found' }
+Invoke-Expression $m.Value
+$segment = [regex]::Match($src, "\`$GIT_SEGMENT = \[regex\]::new\('([^']*)'\)").Groups[1].Value
+$tokenEnd = [regex]::Match($src, "\`$tokenEnd = '([^']*)'").Groups[1].Value
+$shortFlag = [regex]::Match($src, "\`$shortFlag = '([^']*)'").Groups[1].Value
+$commitFlag = [regex]::Match($src, '-or \$s -cmatch "\(\^\|\\s\)(.*?)\$tokenEnd"\)\)').Groups[1].Value
+$joins = @([regex]::Matches($src, "Edit-BothViews \`$joined\[0\] \`$joined\[1\] '([^']*)' '( ?)'"))
+if (-not ($segment -and $tokenEnd -and $shortFlag -and $commitFlag) -or $joins.Count -ne 2) {
+    throw 'a pattern was not found'
+}
+function Old-Edit([string]$Scan, [string]$Raw, [string]$Pattern, [string]$Fill) {
+    $s = New-Object System.Text.StringBuilder $Scan
+    $r = New-Object System.Text.StringBuilder $Raw
+    $found = [regex]::Matches($Scan, $Pattern)
+    for ($n = $found.Count - 1; $n -ge 0; $n--) {
+        $at = $found[$n].Index
+        $len = $found[$n].Length
+        [void]$s.Remove($at, $len)
+        [void]$r.Remove($at, $len)
+        [void]$s.Insert($at, $Fill * $len)
+        [void]$r.Insert($at, $Fill * $len)
+    }
+    return @($s.ToString(), $r.ToString())
+}
+$oldJoins = @('(?<=(?<!\\)(?:\\\\)*)\\\r?\n', '(?<=(?<!`)(?:``)*)`\r?\n')
+function Old-Segments([string]$t) {
+    $bounds = New-Object 'System.Collections.Generic.List[int[]]'
+    $cursor = 0
+    foreach ($m in [regex]::Matches($t, '(\|\||&&|[;|&\n])')) {
+        $bounds.Add(@($cursor, ($m.Index - $cursor)))
+        $cursor = $m.Index + $m.Length
+    }
+    $bounds.Add(@($cursor, ($t.Length - $cursor)))
+    $kept = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($b in $bounds) {
+        if ($b[1] -le 0) { continue }
+        if ($t.Substring($b[0], $b[1]).Trim() -imatch '^git(\.exe)?(\s|$)') { $kept.Add("$($b[0]):$($b[1])") }
+    }
+    return ($kept -join ',')
+}
+function New-Segments([string]$t) {
+    return ((@([regex]::Matches($t, $segment)) | ForEach-Object { "$($_.Index):$($_.Length)" }) -join ',')
+}
+function Pick([System.Random]$rng, [string[]]$from, [int]$most) {
+    return -join (0..$rng.Next(0, $most) | ForEach-Object { $from[$rng.Next(0, $from.Count)] })
+}
+$rng = [System.Random]::new(1339)
+$segmentParts = @('git', 'Git', 'GIT', 'git.exe', 'git.EXE', 'gitx', ' git', ' ', "`t", "`r", "`n", ';',
+    '|', '&', '||', '&&', 'a', '.', '.exe', 'x', [string][char]0xA0)
+$joinParts = @('\', '\', '`', '`', "`n", "`r", 'a', ' ')
+$flagParts = @('a', 'A', 'u', 'U', 'b', 'm')
+$diff = 0
+for ($n = 0; $n -lt 5000; $n++) {
+    $t = Pick $rng $segmentParts 12
+    if ((Old-Segments $t) -cne (New-Segments $t)) { $diff++ }
+    $scan = Pick $rng $joinParts 16
+    $raw = -join ($scan.ToCharArray() | ForEach-Object { [char]$rng.Next(97, 100) })
+    for ($k = 0; $k -lt 2; $k++) {
+        $fill = $joins[$k].Groups[2].Value
+        $old = Old-Edit $scan $raw $oldJoins[$k] $fill
+        $new = Edit-BothViews $scan $raw $joins[$k].Groups[1].Value $fill
+        if ($old[0] -cne $new[0] -or $old[1] -cne $new[1]) { $diff++ }
+    }
+    $token = (@(' ', '', "`t")[$rng.Next(0, 3)]) + (@('', '"', "'")[$rng.Next(0, 3)]) + '-' +
+        (Pick $rng $flagParts 8) + (@('', '"', "'")[$rng.Next(0, 3)]) + (@(' ', '', '<', '>', 'x', '-')[$rng.Next(0, 6)])
+    $add = "(^|\s)[`"']?(?:{0})[`"']?$tokenEnd"
+    if (($token -cmatch ($add -f '-[A-Za-z]*[Au][A-Za-z]*')) -ne ($token -cmatch ($add -f $shortFlag))) { $diff++ }
+    if (($token -cmatch "(^|\s)-[A-Za-z]*a[A-Za-z]*$tokenEnd") -ne ($token -cmatch "(^|\s)$commitFlag$tokenEnd")) { $diff++ }
+}
+"$diff"
+"""
+
+
+def test_the_faster_readings_answer_as_the_old_ones_did() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = Path(tmp) / "rewrites.ps1"
+        driver.write_text(_REWRITE_EQUIVALENCE_DRIVER, encoding="utf-8")
         proc = subprocess.run(
             ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
             capture_output=True,

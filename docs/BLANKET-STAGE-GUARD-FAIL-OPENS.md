@@ -543,27 +543,86 @@ Both readings are added beside the old ones and never replace them. The guard ju
 readings first and builds the new ones only when the old ones allow. So a slow new reading cannot
 push the hook past its timeout before the old verdict is reached. Before that order was set, a
 payload of 30,000 brackets holding a real `git add -A` took 19.7 seconds, past the 15-second
-timeout, and would have run.
+timeout, and would have run. `tests/test_blanket_stage_guard.py` pins that payload under 15
+seconds.
 
-The old readings had at least two slow paths of their own, both in the commit pathspec rule, and
-wiring the guard under a timeout made them matter. Each could keep the hook past 15 seconds, and
-the stage after it would then have run. Both are closed:
+### The hook's run time is bounded by a length cap
 
-| Payload | Before | After | The cause |
-|---|---|---|---|
-| `git commit -m x`, 40,000 nested brackets, `&& git add -A` | 21.3 s | about 3.2 s | Bracketed text was dropped one nesting level per pass. The guard now does at most 64 such passes, then pairs what is left with a stack. |
-| `git x`, 30,000 copies of `commit `, `&& git add -A` | 32.8 s (the Lander's run; 26.6 s on the wiring Builder's) | about 2.5 s | The pathspec pattern after `commit` backtracked. It is now two linear searches. |
+`.claude/settings.json` gives the hook 15 seconds, and a hook that runs longer lets the command
+run. So a slow path is a way past the guard. Wiring the guard under that timeout made its slow
+paths matter, and three rounds of repair on the wiring change each closed one and found or opened
+another. **This page does not claim that no slow path is left.** The bound on run time is a cap
+on length instead.
 
-A first fix paired every bracket a character at a time. That opened a new slow path on many
-shallow brackets: `git commit -m x`, 300,000 copies of `(a) `, `&& git add -A` took 17.75 s on a
-review run, against 9.03 s for the guard before it. The 64-pass limit keeps the old loop for that
-shape; it now takes about 7.4 s on the wiring Builder's run.
+**The cap.** The guard refuses any command longer than 65,536 characters (64 KB) without reading
+it. The reason it gives says to write the command to a script file and run that. This is a seat
+decision under the owner's 2026-10-09 "Accept by mechanism" ruling, not an owner ruling. The
+Special seat's brief for the third repair round set the rule for choosing it: the largest multiple
+of 16 KB at which every known slow payload family finishes the whole hook in under 5 seconds, which
+leaves at least three times that against the timeout.
 
-Both rewrites give the same answers as the code they replaced, on a segment, which never holds a
-line feed. `tests/test_blanket_stage_guard.py` checks that on 20,000 seeded random strings for
-each, against the old code kept in the test; one string in ten is nested deep enough to reach the
-stack. It also pins the three payloads above under 15 seconds, at 150,000 copies for the shallow
-one. A bracket-free command skips the bracket pass.
+**What the cap costs.** A harmless command longer than the cap is refused. The most likely case is
+a heredoc that writes a large file. *Harmless commands the guard would refuse* lists it.
+
+**How it was chosen.** Each payload below went to the hook as a real `PreToolUse` payload, run as
+its own `pwsh` process, and was timed from start to exit, so each figure includes about half a
+second of `pwsh` start-up. For the 80 KB column the guard ran with the cap lifted. Three families
+reached 5 seconds or more at 80 KB on at least one of up to twelve runs, so 64 KB is the largest
+multiple of 16 KB that passed. The machine was a Windows 11 desktop with PowerShell 7.6, with other
+sessions' work running beside it, so a figure can move by a second or more between runs. Where a
+cell is the largest of several runs, the header says so.
+
+Each family is filled to the size in its column. A family that ends in a real `git add -A` is
+denied; the rest are harmless and allowed.
+
+| Family | One unit of the payload | `93f2775087`, 64 KB | Now, 64 KB, largest of 3 runs | Now, 80 KB, cap lifted, largest of 1 to 12 runs | Now, 256 KB |
+|---|---|---|---|---|---|
+| Nests past 64 levels (the Lander's) | `git commit -m x`, then 65 `(`, 65 `)`, a blank, repeated, then `&& git add -A` | 0.8 s | 1.7 s | 1.0 s | refused by the cap, 0.6 s |
+| Escaped brackets after a deep nest (the Lander's) | one 65-level nest, then `\( ` repeated, then `; git add -A` | 1.6 s | 1.4 s | 0.8 s | refused, 0.6 s |
+| Unclosed brackets after a deep nest (the Lander's) | one 65-level nest, then `(` repeated, then `&& git add -A` | 1.8 s | 1.8 s | 0.9 s | refused, 0.8 s |
+| One deep nest | `git commit -m x`, then `(` and `)` to half the size each, then `&& git add -A` | 2.0 s | 1.6 s | 0.9 s | refused, 0.5 s |
+| Sibling pairs | `(a) ` repeated after `git commit -m x` | 0.9 s | 1.6 s | 0.8 s | refused, 0.5 s |
+| The commit word | `commit ` repeated after `git x` | 0.7 s | 1.4 s | 1.1 s | refused, 0.7 s |
+| Bracket-free text | `a ` repeated after `git commit -m x` | 0.9 s | 1.3 s | 0.8 s | refused, 0.9 s |
+| A heredoc body | `x x x x` lines inside `cat <<EOF-1` | 1.9 s | 1.8 s | 3.3 s | refused, 0.7 s |
+| Unclosed arithmetic | lines of 2,000 `(` and ` <<`, after `echo <<x` | 1.6 s | 1.3 s | 0.9 s | refused, 0.6 s |
+| Arithmetic on one line | `((` repeated after `echo $((1<<n))` | 3.7 s | 1.4 s | 1.1 s | refused, 0.7 s |
+| A run of backslashes | `\` repeated after `git status`, under `Bash` | 12.2 s | 1.6 s | 0.7 s | refused, 0.6 s |
+| A run of backticks | a backtick repeated after `git status`, under `PowerShell` | 14.5 s | 1.3 s | 0.7 s | refused, 0.6 s |
+| Backtick continuations | `a`, a backtick, a line feed, repeated, under `PowerShell` | 3.0 s | 1.6 s | 1.4 s | refused, 0.9 s |
+| Bare carriage returns | `a`, a carriage return, repeated, under `PowerShell` | 3.5 s | 1.7 s | 2.7 s | refused, 1.1 s |
+| A long `commit -a` cluster | `git commit -`, then `a` repeated | 2.2 s | 1.3 s | 0.9 s | refused, 0.7 s |
+| Empty lines | line feeds only | 2.8 s | 1.1 s | 1.1 s | refused, 0.8 s |
+| Many git segments | `git x a1;`, `git x a2;` and so on | 1.7 s | 2.2 s | 4.4 s | refused, 0.6 s |
+| Empty lines in a heredoc body | line feeds inside `cat <<x-1` | 4.6 s | 3.3 s | 5.1 s | refused, 0.5 s |
+| Every view at once | `cat <<x-1`, `x`, then a carriage return, a backtick continuation and a backslash continuation, repeated, under an unknown tool name | 6.6 s | 3.6 s | 4.9 s | refused, 0.4 s |
+| Git segments split by carriage returns | `git a1`, carriage return, `x`, a backtick continuation, `y;`, numbered, under `PowerShell` | 4.2 s | 3.3 s | 5.3 s | refused, 0.4 s |
+| The same, after a heredoc | the row above after `cat <<x-1`, `x`, under an unknown tool name | 4.3 s | 4.1 s | 5.2 s | refused, 0.4 s |
+
+At their own sizes, the Lander's three payloads ran 29.7 s (600 KB), 10.6 s (450 KB) and 24.7 s
+(1.2 MB) at `93f2775087`, on the Lander's run. The tests drive the same three shapes past the cap,
+at 1.2 MB, 900 KB and 1.2 MB, with a 2.4 MB run of sibling pairs beside them. At `93f2775087` those
+four took 13.8 s, 10.3 s, 20.3 s and 8.2 s. Now the cap refuses each in about 2 seconds or less.
+
+**What changed in the readings, and what pins each change.** "Linear" below means a test drives
+the change on an input far past the cap, in one process, and requires it to finish inside 5
+seconds. Each such input took longer than that at `93f2775087`. Every rewrite gives the same
+answers as the code it replaced: `tests/test_blanket_stage_guard.py` compares them on seeded
+random strings, against the old code kept in the test.
+
+| Slow path at `93f2775087` | The change | What pins it |
+|---|---|---|
+| Dropping bracketed text in the commit rule. Past 64 nesting levels it paired brackets in a PowerShell loop, slow per bracket and quadratic in one step. | Two .NET regex calls that cannot backtrack. | Linear, on the Lander's three shapes. |
+| The line-continuation patterns looked behind every escape in a run of them, which took time quadratic in the run. | A lookahead runs first, so the look behind happens once per run. | Linear, and a 64 KB whole-hook test under the 15-second timeout. |
+| The view editor inserted each fill in place, which moved the rest of the string each time. Many backtick continuations took quadratic time. | It rebuilds each view front to back. | Linear. |
+| The flag-cluster patterns for `git add` and `git commit` were quadratic in a long run of letters. | A lookahead for the trigger letter, then the run. | Linear. |
+| The arithmetic pattern's time limit was per line, so many slow lines added up. | One 500-millisecond budget across all lines. Past it, a line is read as it is, which costs only a deny the narrow reading would add. | Linear. |
+| Lines without `<<` went through the heredoc patterns, and every segment went through the loop. | Those lines are skipped, and one .NET pattern finds only the segments that start with `git`. | The table above only. At 64 KB the guard at `93f2775087` took about 5 seconds or less on these, so no whole-hook test under the cap could fail there. |
+
+Two earlier repairs on the wiring change are older than this table: the commit rule's pathspec
+pattern after `commit`, and the pass that dropped one nesting level of brackets at a time. Each
+kept the hook past 15 seconds at its size then. Both shapes are now past the cap, and a test pins
+each under the cap.
 
 ## 5. Known residuals that no per-form answer names
 
@@ -590,13 +649,11 @@ reading the command from a script file. `bash -c` on Windows drops one of two ba
 argument, which changes the escaped-backslash row.
 
 **The hook's time limit is a residual too.** `.claude/settings.json` gives the hook 15 seconds,
-and a hook that runs longer lets the command run. The added readings are the slow part: the
-narrow heredoc reading walks the whole command a character at a time a second time. A 600 KB
-payload holding `<<` was measured at about 12.6 seconds, close to the limit. A longer one could
-pass it. The guard judges the old readings first, so a timeout there costs only the denies the
-added readings would make. The old readings can be slow too: section 4a records two slow paths
-found and closed. This page does not claim no other exists. A command long enough to keep the old
-readings past 15 seconds would run, whatever they would have decided.
+and a hook that runs longer lets the command run, whatever the guard would have decided. The
+length cap in section 4a is what bounds the run time: a command past it is refused unread. Under
+the cap, every payload family measured for section 4a finished well inside the limit. A slow
+machine, or a payload shape nobody has measured, could still take longer. This page does not claim
+that none exists.
 
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.
@@ -705,6 +762,7 @@ means the guard at the first measured commit allowed the command.
 | `git commit -ma a.txt` | committed `a.txt` only, with the message `a` | before |
 | `git add a.txt # not .`, `git add a.txt # not -A` | staged `a.txt` only | before |
 | `git commit -m wip a.txt # not -a` | committed `a.txt` only | before |
+| Any command longer than 65,536 characters, such as a heredoc that writes a large file | not measured; most run no git at all | the length cap |
 
 Notes on these rows:
 
@@ -719,5 +777,8 @@ Notes on these rows:
   `commit -a` rule read the comment as arguments. Only the commit pathspec rule drops it, so
   `git commit -m wip a.txt # not .` is allowed.
 - **The dry-run rows** change nothing in the repository.
+- **The last row** is the price of the length cap in section 4a. The guard refuses such a command
+  unread, whatever it does, and says to write it to a script file and run that.
 
-`tests/test_blanket_stage_guard.py` pins a sample of these rows as strict expected failures.
+`tests/test_blanket_stage_guard.py` pins a sample of these rows as strict expected failures. It
+pins the last row as an ordinary test, because the refusal is deliberate.
