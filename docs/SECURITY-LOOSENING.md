@@ -1648,6 +1648,52 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
   supervisor starts it with `-P`, not `-I`.
 
+### `service_environment_secret`, `store_key_in_service_environment` and `service_environment_unobservable`: secrets in the Windows service's environment
+
+> **OBSERVATIONS, not switches.** No setting declares them. They follow from where the engine's
+> Windows service gets its environment. Vault BACKLOG #2595 and #2601.
+- **What they are about:** a Windows service's environment lists live in its registry key:
+  NSSM's `AppEnvironmentExtra` and `AppEnvironment` under `Parameters`, and the service's own
+  `Environment` value. Who can read that key, and how that was measured, is stated once in
+  [`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
+- **What is refused:** a store key in those lists, `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`. `serve` and `supervise` refuse to start on it under
+  **every** `[security].enforcement` setting, before they open the store, and the refusal names
+  the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in the
+  environment, and a secret in a Windows service's NSSM environment, are refused always. They also
+  refuse a store key in their own environment when they found their service but could not read
+  its lists, since the key most likely came from there. The DPAPI key file is the way in
+  ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)).
+- **`service_environment_secret`: another engine secret is in that list.** The entry names each
+  one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
+  signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
+  tokens and the AI key. The same ruling would refuse them. No protected way in exists for them
+  yet, so a refusal would leave a Windows service no way to start with one, and the entry names
+  them instead. Refusing them waits on that way in.
+- **`store_key_in_service_environment`: a store key reaches the service through its
+  environment.** It is named wherever the key came from, once the engine knows its service. The
+  machine-wide environment is readable by every local user too. A key in the service's own
+  lists refuses first, so the entry normally means the machine-wide environment.
+- **`service_environment_unobservable`: the engine could not finish the reading.** The entry
+  carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
+  service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
+  It starts unless the last case applies with a store key in its environment. Check the lists
+  yourself.
+- **How the engine finds its own service:** it walks up through the Python interpreter processes
+  above it. When the first other process is `nssm.exe`, it asks the Service Control Manager which
+  service runs there. When that process is anything else, such as a shell, the engine is not a
+  service, unless an `nssm.exe` sits further up. Then it cannot tell a wrapper NSSM starts from a
+  shell inside another NSSM service, and names `service_environment_unobservable`.
+- **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
+  for the engine's own process. `supervise` logs one WARNING for each entry at start.
+  `messagefoundry security show` is a separate process, so it reports none of them, and its scope
+  line says so. The reading is taken once, at start.
+- **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
+  list or the service's own `Environment` value, and from the machine-wide environment. Keep the
+  store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
+- **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
+  and a secret a connection reads through `env()`, whose name only your config knows.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -1705,6 +1751,7 @@ chapter was not part of the verification above.
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `interpreter_not_isolated` / `python_variables_reach_children` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
+| `service_environment_secret` / `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

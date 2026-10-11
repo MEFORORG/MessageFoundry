@@ -586,7 +586,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    BACKLOG #1904). Keep the retired key through the engine's first start after the rotation too. The
    secret-rotation watcher keys its fingerprints off the store key, and that start re-keys them. With
    the retired key in hand, a secret changed in the same window still reads as rotated. Without it,
-   the watcher keeps each secret's older date and logs a warning (BACKLOG #2242). The same command re-seals the uploaded-file store, and on a first key-enable it
+   the watcher keeps each secret's older date and logs a warning (BACKLOG #2242). Under the Windows
+   service that first start runs without it: the engine refuses a store key in the service's
+   environment lists (SERVICE.md, "Protect the store encryption key at rest"). The same command re-seals the uploaded-file store, and on a first key-enable it
    seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable
    value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
