@@ -1330,8 +1330,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         # BACKLOG #1149 (ASVS 7.5.2): a role write revokes the target's sessions, so on yourself it
-        # was a mass terminate on the login window. Refused before the body is checked, so a
-        # self-target is refused whatever roles it names.
+        # was a mass terminate on the login window. The guard runs before ``_validate_roles``, so a
+        # self-target naming a role that does not exist is still refused 400. It does not run before
+        # the body model. A body that fails ``RolesUpdateRequest`` is answered first, with no audit
+        # row: FastAPI answers 422 on the JSON plane, and the console route that builds the model
+        # renders "invalid input" with a 400.
         user = await service.store.get_user(user_id)
         await _refuse_if_self(
             request,

@@ -376,10 +376,6 @@ from typing import Any
 #: an older console omits ``request``, and a newer console passes it to an engine that lacks it.
 #: Re-derived on the tree merged with BACKLOG #2337; this item leaves the value below unchanged.
 #:
-#: BACKLOG #1149: three more ``AdminHandlers`` take ``request`` for the same row:
-#: ``admin_revoke_user_sessions``, ``set_user_roles`` and ``set_channel_scope``. The digest did not
-#: move, for the same reason, and the same TypeError skew applies to those three calls.
-#:
 #: BACKLOG #2612: ``SystemStatus`` gained ``log_forwarder``, a ``LogForwarderInfo`` the console's
 #: status page and health indicator render. A DTO the console reads by attribute, so it forces a
 #: bump. Re-derived on the tree merged with BACKLOG #2337, and again on the tree merged with vault
@@ -390,6 +386,10 @@ from typing import Any
 #: console imports ``client_ip`` and calls it with a ``Request`` or a ``WebSocket``, which both
 #: still fit, so no console call changed. The digest moved because a signature on the discovered
 #: surface did. Re-derived on the tree merged with BACKLOG #2612, so the value below covers both.
+#:
+#: BACKLOG #1149: three more ``AdminHandlers`` take ``request`` for the same row:
+#: ``admin_revoke_user_sessions``, ``set_user_roles`` and ``set_channel_scope``. The digest did not
+#: move, for the same reason, and the same TypeError skew applies to those three calls.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

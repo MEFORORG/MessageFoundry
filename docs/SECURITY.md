@@ -3897,8 +3897,9 @@ revoke + "sign out everywhere else". The console renders **no Revoke button on t
 so the list cannot leave the operator mid-request; *Sign out* is the console's way to end it. That is
 a property of the **page**, not of the API — `DELETE /me/sessions/{id}` checks ownership only, so it
 accepts the caller's own current session id and revokes it. The **Users** page has a **Revoke
-sessions** action for admin force-sign-out. It refuses the caller's own account (BACKLOG #1149); an
-operator ends their own sessions from the **Active sessions…** view instead.
+sessions** action for admin force-sign-out. It refuses the caller's own account (BACKLOG #1149). An
+operator ends their other sessions from the **Active sessions…** view instead, and the current one
+with *Sign out*, since that view cannot end it.
 
 **Signing in again ends the session the browser held (ASVS 7.2.4).** Each console sign-in leg (the
 password form, Windows SSO and federated sign-in) answers with a cookie that replaces the browser's
