@@ -309,7 +309,21 @@ def test_provision_admin_refuses_in_words_on_an_unusable_corpus(
     _tty(monkeypatch, "an-operator-chosen-passphrase", "an-operator-chosen-passphrase")
     bundled_corpus([])
     db = tmp_path / "provision.db"
-    assert main(["provision-admin", "--username", "opsadmin", "--db", str(db), "--json"]) == 1
+    assert (
+        main(
+            [
+                "provision-admin",
+                "--username",
+                "opsadmin",
+                "--email",
+                "ops@example.invalid",
+                "--db",
+                str(db),
+                "--json",
+            ]
+        )
+        == 1
+    )
     error = json.loads(capsys.readouterr().out)["error"]
     assert "password_check_breached = false" in error and "Reinstall" in error
     assert not db.exists(), "a refusal on the corpus left a store behind"

@@ -1110,14 +1110,17 @@ audit chain or be false.
 
 | Path | Today | Plan |
 |---|---|---|
-| MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or `serve --allow-insecure-bind`. | — |
+| MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or a per-connection `tls_hop_attested` with its mandatory reason. Under `[security].enforcement = warn`, `serve --allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) also permits it. Under the default `enforce` both are inert. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
 | Engine API ↔ console | **The engine always serves TLS** ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)) `[BUILT]`, loopback included. An operator certificate (`[api].tls_cert_file`, WP-13a) wins; with none set, the engine mints a self-signed placeholder on first run. Off loopback, `serve` refuses that placeholder. Only `[security].enforcement = warn` with `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) accepts it. So an exposed bind needs an operator certificate **or** a trusted reverse proxy that terminates TLS upstream (`tls_terminated_upstream` + `trusted_proxies`, WP-15). That proxy is the one topology where the engine itself serves plaintext: with no `tls_cert_file`, the proxy-to-engine hop is plaintext, the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]`. No LDAP referral is followed, so the bind credentials never leave this hop for a referred host; a referral refuses the sign-in (BACKLOG #2530, 2026-09-30). A multi-domain forest would need a global catalog or a search base in the bound controller's own domain. | — |
 | PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle, SQL Server ODBC 18.1+ `ServerCertificate` leaf-pin) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
 
-**Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without TLS in front
-of it. Bearer tokens and PHI would otherwise cross the network in cleartext.
+**Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without an operator
+certificate or a declared TLS-terminating proxy in front of it. On the self-signed placeholder, no
+client can tell the engine from an on-path attacker unless it pins that exact certificate. Behind a
+declared proxy with no operator certificate, the proxy-to-engine hop is plaintext, and securing it
+is the site's job (the Engine API row above).
 
 **DB-TLS CA trust + rotation `[BUILT — runbook]` (NIST SP 800-52r2; HIPAA §164.312(e)(1); CWE-295).**
 Validating the DB server certificate against a private/internal CA needs that CA trusted, and rotation
@@ -1127,10 +1130,13 @@ add-new-then-remove-old CA/cert rotation for both backends — is in
 [`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md#5-db-tls-trust-import-the-db-ca--rotate-certificates).
 Never remediate a chain-build failure with `TrustServerCertificate=true`.
 
-**Phase 2 transport design `[ROADMAP]`.** In-process API/WebSocket TLS (P2-1), MLLP-over-TLS (P1-4),
-and a reverse-proxy / forwarded-header alternative are designed in
-[ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Proposed* — build gated on a
-scheduled off-loopback exposure).
+**Phase 2 transport `[BUILT]`.** In-process API/WebSocket TLS (P2-1), MLLP-over-TLS (P1-4), and a
+reverse-proxy / forwarded-header alternative are built under
+[ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Accepted*). The Engine API row
+of the table above states the API hop's posture: the engine always serves TLS
+([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)),
+and a declared upstream terminator is the one exception. This paragraph read `[ROADMAP]`, designed
+and *Proposed* until 2026-10-10 (BACKLOG #1133).
 
 **Key-exchange parameters `[PARTIAL — the 1.2+ floor and the cipher validator are enforced; the group
 pin is INERT until Python 3.15]` (ASVS 11.6.2).** Every TLS context the engine
@@ -2292,7 +2298,7 @@ traceability:
 
 - **DB + `-wal`/`-shm` owner-only permissions on create** (`_secure_file`, §2) — **SQLite store only**; on SQL Server / Postgres the engine creates no database file and calls `_secure_file` never. Was P0-1.
 - **`dryrun`/`generate` redact bodies by default; `--show-phi` to opt in** (§7) — was P0-2.
-- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused (unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk)** (§10, [SECURITY.md](SECURITY.md)) — was P0-3.
+- **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused without an operator certificate (`[api].tls_cert_file`) or a declared TLS-terminating proxy** (§10, [SECURITY.md](SECURITY.md)) — was P0-3. Sign-in has no off switch. `serve --allow-insecure-bind` relaxes this refusal only under `[security].enforcement = warn`, and is inert under the default `enforce`. §4's Engine API row says what the engine then serves. This item read "unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk" until 2026-10-10 (BACKLOG #1133).
 - **At-rest body encryption (AES-256-GCM) + required volume encryption** (§3) — was P1-1.
 - **Pluggable at-rest key sourcing — the KeyProvider seam** (`[store].key_provider`,
   [store/keyprovider.py](../messagefoundry/store/keyprovider.py); §3) — built-in `auto`/`env`/`dpapi`
@@ -2305,6 +2311,8 @@ traceability:
 - **Retention/purge enforcement — `[retention]` body-null (keep metadata) + dead-letter window + WAL/VACUUM, audited; `audit_days` reserved/keep-forever by design** (§8) — was P1-2.
 - **Exception-path PHI redaction — the `safe_exc()` chokepoint (`redaction.py`) at every exception→`last_error`/`detail`/log site** (§7) — the security half of P1-3 (WP-6c). Structured-JSON logging + off-box (syslog/SIEM) forwarding + the cross-backend `audit_log` off-box tee are now **built** (sec-offbox-log #357/#361/#363), and **native RFC 5425 TLS-syslog shipped with ADR 0080** — the forwarding hop is gated on the shared posture gradient (§7).
 - **Outbound/egress allowlist — fail-closed `[egress]` (MLLP host:port + File dirs) enforced at config load/reload/start; webhook/SMTP host allowlists in `[alerts]`** (§4) — the data-plane half of P1-4 (WP-11c). MLLP-over-TLS is **built** (WP-13b, §4) — a non-loopback plaintext MLLP listener is refused at startup.
+- **TLS on the engine API, always on** (§4, the Engine API row; ADR 0172) — was P2-1. The P2 table
+  below listed it as remaining until 2026-10-10 (BACKLOG #1133).
 
 P0-4 (doc corrections) is this reconciliation; remaining stale claims in ARCHITECTURE/README are a
 separate follow-up.
@@ -2318,7 +2326,6 @@ separate follow-up.
 ### P2 — remote / Phase-2 (deferrable while strictly localhost; each flips to mandatory on remote exposure)
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
-| **P2-1** TLS on the engine API | Tokens + PHI cleartext over the network | §164.312(e) · SC-8 | M |
 | **P2-2** MFA for console/API auth — ✅ **Built (WP-14 TOTP and WP-14b passkeys, local and directory accounts)** | Single-factor auth (mitigated: `[security].require_mfa` is an **access gate on every authorized route**, and its shipped `require_mfa_scope` is `every_local_account`, not the Administrator role alone. Directory accounts are not exempt; [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states which sessions owe a factor) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
 | **P2-3** Network-segmentation guidance + periodic integrity checks | Lateral movement; tamper detection | §164.312(c) · SC-7/SI-7 | S–M |
 | **P2-4** Strict-parse CPU/time budget on the hl7apy path | Malformed input pinning a worker — message size/segment caps are built, but the opt-in strict parse itself has no time bound | NIST SC-5 (DoS; not a §164.312 safeguard) | S |

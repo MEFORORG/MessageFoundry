@@ -14,6 +14,8 @@
   under item (b) of Amendment A.
 - **Amended 2026-10-04:** Amendment C below. A repair of a row that already holds a notification
   address is refused unless `--email` is given (BACKLOG #2288).
+- **Amended 2026-10-10:** Amendment D below. `--email` is required on every run, by owner ruling
+  (BACKLOG #1138). It reverses Option 5.
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -140,7 +142,10 @@ holds. See Amendment A.*
   → `tests/test_provision_first_administrator.py::test_the_provision_is_audited`
 - **AC-9** — IF the supplied notification address is blank, THEN THE SYSTEM SHALL treat it as no
   address in every column and in the audit row.
-  → `tests/test_provision_first_administrator.py::test_a_blank_address_is_no_address_in_every_column_and_in_the_audit`
+  *(Retired 2026-10-10 by Amendment D. A blank address is now refused, by the command and by the
+  service, and nothing is written; see AC-17. Its test,
+  `test_a_blank_address_is_no_address_in_every_column_and_in_the_audit`, became
+  `test_a_blank_or_malformed_address_is_refused_and_writes_nothing`.)*
 
 **Two planted controls, recorded because a green suite is not evidence on its own.** Setting the
 credential with `must_change_password=True` — dropping the claim stamp — reds AC-1 and AC-7 and no
@@ -168,6 +173,7 @@ without that parameter the plant passes.
    address to get past it, which is worse than an empty column, and the PHI start gate is already the
    single authority on deliverability. The command warns and names the flag instead.
    *Amended 2026-10-04: Amendment C adds one narrower case and does not reopen this option.*
+   *Reversed 2026-10-10 by Amendment D, by owner ruling: `--email` is now required.*
 
 ## Consequences
 
@@ -321,6 +327,9 @@ cannot clear an address, and is audited. The gate's address branch names it. `--
 `provision-admin` stays optional, as Option 5 decided: a requirement tied to the gate cannot be
 evaluated honestly from the CLI, because the gate does not read the relay settings and the CLI cannot
 see the service's NSSM environment (the same trap BACKLOG #1905 fixed for the key).
+*Amended 2026-10-10 by Amendment D: `--email` is now required on every run, so `provision-admin` is
+no longer one of the two ways. The setter stays for the other one, and for a store an earlier build
+wrote.*
 
 **Rejected: refuse every `serve` that finds no enabled Administrator.** It duplicates the gate at the
 default and overrides the operator's posture everywhere else.
@@ -657,6 +666,7 @@ stored address.
 every run. There the cost of no address is an empty column, which the start gate already reports.
 Here the alternative is an address nobody chose, so the narrower rule does not reopen it. A fresh
 create and a repair of a row with no address still succeed without `--email`, and still warn.
+*Superseded 2026-10-10 by Amendment D: every run now needs `--email`.*
 
 **It does not strand a half-written provision.** A first run given `--email` that stopped
 after the create leaves its own address on the row. The same command, run again, carries the same `--email`,
@@ -666,3 +676,50 @@ blank stored address.
 
 The `docs/SECURITY.md` bullet under *Provisioning the first administrator* that said the account
 keeps the earlier holder's address with a warning is replaced there.
+
+## Amendment D (2026-10-10) -- `--email` is required
+
+Made by BACKLOG #1138, on an owner ruling of 2026-10-10: require email, and keep SMTP as the only
+push channel. **It reverses Option 5.** `provision-admin` now refuses to run without `--email`, so
+no Administrator it creates starts without the address its security notices go to.
+
+**Why Option 5's grounds no longer hold.** Option 5 feared a fake address typed to get past the
+flag, and left deliverability to the ADR 0167 start gate. The start gate still asks only whether
+some enabled Administrator has an address, so it cannot tell a fake one either. Engine PR 1639 had
+already made the address required where an administrator creates an account, and PR 1522 confines
+an account with no address at sign-in. The command was the one place left that made an account
+with no address. MessageFoundry has no deployments, so the change costs no migration.
+
+**What the command does now.**
+
+- The parser refuses a missing `--email`, so the refusal comes before the prompt and before any
+  open, and leaves no store behind (AC-15's ordering).
+- A blank or malformed `--email` is refused by `_require_single_mailbox`, the check `POST /users`
+  and `admin-set-notify-email` apply. A blank address is no longer read as none.
+- The missing-address WARNING is gone, and so is the `notify_email_set` key in the `--json` body,
+  which could only read true.
+- The IDE's Start flow asks for the address and refuses a blank one. Its probe passes a reserved
+  `.invalid` address, which nothing stores.
+
+**What it leaves alone.**
+
+- `AuthService.provision_first_administrator` still accepts no address, but checks one it is
+  given with `_require_single_mailbox` and refuses a blank or malformed one. That is the shape of
+  `create_local_user`, where the route requires the address and the service checks one when given.
+  The command is its only production caller.
+- Amendment C's service refusal stays. From the command it can no longer fire, because every run
+  carries `--email`, but it still guards any other caller of the service.
+- `admin-set-notify-email` stays. An enabled Administrator can still lack an address: a directory
+  account granted the role, or a store an earlier build wrote. The setter is the exit there.
+- No second push channel is built. Email over SMTP stays the only one, so an account on a site
+  with no mail relay is still reached only by the pull feed at `GET /me/security-events`.
+
+**New acceptance criterion.**
+
+- **AC-17** — IF `provision-admin` is run without `--email`, or with a blank or malformed one, THEN
+  THE SYSTEM SHALL refuse before prompting and SHALL leave no new store file.
+  → `tests/test_provision_first_administrator.py::test_cli_refuses_without_an_email_before_the_prompt_and_the_open`,
+  `::test_cli_refuses_a_blank_email_before_the_prompt_and_the_open` and
+  `::test_an_address_notices_could_not_be_sent_to_is_refused_before_the_prompt_and_the_open`,
+  with `::test_the_provisioned_administrator_carries_the_address_it_was_given` as the control. The
+  service half: `::test_a_blank_or_malformed_address_is_refused_and_writes_nothing`.
