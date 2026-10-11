@@ -364,6 +364,8 @@ async def test_routed_xform_exc_stop(store: MessageStore, monkeypatch: pytest.Mo
     assert outcome == (_ItemOutcome.STOPPED, None)
     assert mf.calls and mf.calls[0][0] == "rtd-1"
     assert mf.calls[0][1].startswith("handler error (transform stopped):")
+    # The delivery defaults with no cap: a STOP keeps the row queued (vault BACKLOG #3211).
+    assert mf.calls[0][2] == runner._delivery_defaults.model_copy(update={"max_attempts": None})
     assert cs.calls == [("IB", "handler ValueError on rtd-1")]
 
 
@@ -527,4 +529,6 @@ async def test_apply_transform_internal_error_stop(
     out = await runner._apply_transform_internal_error("IB", _routed_item(), ValueError("x"))
     assert out == (_ItemOutcome.STOPPED, None)
     assert mf.calls[0][1].startswith("handler error (transform stopped):")
+    # The delivery defaults with no cap: a STOP keeps the row queued (vault BACKLOG #3211).
+    assert mf.calls[0][2] == runner._delivery_defaults.model_copy(update={"max_attempts": None})
     assert cs.calls[0] == ("IB", "handler ValueError on rtd-1")

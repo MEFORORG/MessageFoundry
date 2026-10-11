@@ -544,6 +544,15 @@ def _without_cap(retry: RetryPolicy) -> RetryPolicy:
     return retry.model_copy(update={"max_attempts": None})
 
 
+class _EngineCause(Enum):
+    """Why a row dead-lettered at the retry cap when no peer raised anything, so there is no
+    exception class or code to log (vault BACKLOG #3211). Its own type, so it never equals a code a
+    peer sends. The value is the line's wording."""
+
+    NO_CONNECTOR = "found no running connector"
+    STORE_READ = "could not be read from the store before sending"
+
+
 class _RefusalLog:
     """The WARNING a permanent refusal writes after the delivery worker dead-letters it, throttled per
     (connection, refusal code) (BACKLOG #3043).
@@ -551,9 +560,9 @@ class _RefusalLog:
     A transient failure that ran out a finite ``max_attempts`` writes the same line, with
     ``exhausted=True`` (BACKLOG #3108). That flag is the key's third field (vault BACKLOG #3211), so
     those pairs do not share a window or a held count with permanent refusals of the same code, and
-    no code a peer sends can collide with them. A row dead-lettered with no running connector has
-    no exception and no code: its code is ``None``, which no peer can send either. Both kinds do
-    share the cross-pair cap below, which bounds the whole log, not one kind of line.
+    no code a peer sends can collide with them. A row dead-lettered with no exception from a peer
+    is keyed by its :class:`_EngineCause` in the code's place, which no peer can send either. All
+    kinds share the cross-pair cap below, which bounds the whole log, not one kind of line.
 
     **What the line may carry.** The connection, the outbox row id (and the message id where the
     caller has it), the exception's class name and its ``code``. Never ``str(exc)`` or
@@ -606,19 +615,19 @@ class _RefusalLog:
         self._max_lines = max_lines
         self._prune_at = max_pairs
         # (connection, code, exhausted) -> (when its last line was written, rows held back since then)
-        self._state: dict[tuple[str, str | None, bool], tuple[float, int]] = {}
+        self._state: dict[tuple[str, str | _EngineCause, bool], tuple[float, int]] = {}
         self._lines = 0  # lines written, across all pairs, since _lines_since
         self._lines_since = -math.inf
 
-    def held(self, name: str, code: str | None, *, exhausted: bool = False) -> int:
-        """How many rows the pair ``(name, code)`` has counted rather than logged since its last
-        line. 0 for a pair with nothing held, or none at all."""
+    def held(self, name: str, code: str | _EngineCause, *, exhausted: bool = False) -> int:
+        """How many rows the key ``(name, code, exhausted)`` has counted rather than logged since
+        its last line. 0 for a key with nothing held, or none at all."""
         return self._state.get((name, code, exhausted), (0.0, 0))[1]
 
     def warning(
         self,
         name: str,
-        exc: DeliveryError | None,
+        exc: DeliveryError | _EngineCause,
         rows: int,
         message: str,
         *args: object,
@@ -628,11 +637,12 @@ class _RefusalLog:
         """Log ``message % args`` at WARNING, followed by ``exc``'s class name and code, unless the
         pair ``(name, code)`` logged inside the window, in which case count its ``rows``. Call it
         AFTER the dead-letter write, so a line never claims a dead-letter that did not happen.
-        ``exc`` is ``None`` when no send was attempted; ``message`` then has to say why."""
+        ``exc`` is an :class:`_EngineCause` when no peer raised anything; ``message`` then says
+        why."""
         # getattr: a connector may raise a subclass that never set `code` (see _lane_stopping_fault),
         # and a plain DeliveryError has none. A missing code must not turn the dead-letter into an
         # AttributeError loop.
-        code = None if exc is None else str(getattr(exc, "code", "?"))
+        code = exc if isinstance(exc, _EngineCause) else str(getattr(exc, "code", "?"))
         key = (name, code, exhausted)
         now = self._clock()
         last, held = self._state.get(key, (-math.inf, 0))
@@ -651,7 +661,7 @@ class _RefusalLog:
         self._lines += 1
         self._state[key] = (now, 0)
         like = "like it"
-        if exc is not None:
+        if not isinstance(exc, _EngineCause):
             message += " (%s, code %r)"
             args = (*args, type(exc).__name__, code)
             like = "with this code"
@@ -7982,7 +7992,9 @@ class RegistryRunner:
             failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             failed = await self._mark_failed_and_arm(name, item.id, detail, retry)
-            self._note_retry_exhausted(name, None, failed, message_id=item.message_id)
+            self._note_retry_exhausted(
+                name, _EngineCause.NO_CONNECTOR, failed, message_id=item.message_id
+            )
             await self._delivery_failure_alert_checks(name)
             return _ItemOutcome.PROCESSED, failed.retry_at
         # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
@@ -8123,6 +8135,9 @@ class RegistryRunner:
             failed = await self._mark_failed_and_arm(name, item.id, str(exc), retry)
             retry_until = failed.retry_at
             self._note_store_read_fault(name, exc, 1, failed)
+            self._note_retry_exhausted(
+                name, _EngineCause.STORE_READ, failed, message_id=item.message_id
+            )
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             # Transport failure (connect/IO/timeout/unparseable ACK) — transient; retry
@@ -8346,7 +8361,7 @@ class RegistryRunner:
             failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             failed = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
-            self._note_retry_exhausted(name, None, failed, batch=True)
+            self._note_retry_exhausted(name, _EngineCause.NO_CONNECTOR, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
             return _ItemOutcome.PROCESSED, failed.retry_at
         # L1 batch twin — see the single-item path for the full rationale. Same reasoning, and the
@@ -8435,6 +8450,7 @@ class RegistryRunner:
             failed = await self._mark_batch_failed_and_arm(name, ids, str(exc), retry)
             retry_until = failed.retry_at
             self._note_store_read_fault(name, exc, len(ids), failed)
+            self._note_retry_exhausted(name, _EngineCause.STORE_READ, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             failed = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
@@ -9895,7 +9911,7 @@ class RegistryRunner:
     def _note_retry_exhausted(
         self,
         name: str,
-        exc: DeliveryError | None,
+        exc: DeliveryError | _EngineCause,
         failed: FailOutcome,
         *,
         batch: bool = False,
@@ -9904,14 +9920,14 @@ class RegistryRunner:
         """Write the content-free WARNING when a ``mark_failed`` (``message_id`` its row's message)
         or a ``mark_batch_failed`` (``batch``) just dead-lettered at a finite ``max_attempts``
         (BACKLOG #3108). Before that item the store wrote DEAD with no log line at all. Call it AFTER
-        that write, with what it returned. ``exc`` is the transient failure, or ``None`` when the
-        lane had no running connector, so nothing was sent.
+        that write, with what it returned. ``exc`` is the transient failure, or the
+        :class:`_EngineCause` when nothing was sent: no running connector, or a store read fault.
 
         The store reads the attempts and writes DEAD in one transaction, and its outcome says what
         it did (vault BACKLOG #3211). So the line names the row the store decided from and the
-        attempts it read there, with no read back of the row. Nothing else here can disagree with
-        the write: not a batch head that vanished, not a lease sweep that moved the attempts, not an
-        operator replay that landed after the write. Throttled with the permanent-refusal line,
+        attempts it read there, with no read back of the row. That closes at least three misses of
+        the read-back: a batch head that vanished, attempts a lease sweep moved, and an operator
+        replay that landed after the write. Throttled with the permanent-refusal line,
         under its own ``exhausted`` key."""
         if not failed.dead:
             return
@@ -9923,7 +9939,7 @@ class RegistryRunner:
             )
         else:
             subject, subject_args = "outbox row %s (message %s)", (failed.head_id, message_id)
-        cause = "failed" if exc is not None else "found no running connector"
+        cause = exc.value if isinstance(exc, _EngineCause) else "failed"
         self._refusal_log.warning(
             name,
             exc,
@@ -9940,9 +9956,12 @@ class RegistryRunner:
     def _note_store_read_fault(
         self, name: str, exc: _StoreReadFault, rows: int, failed: FailOutcome
     ) -> None:
-        """Log a pre-send store read fault AFTER its outcome is written, so the line says what
-        happened: re-pended, dead-lettered at the retry cap, or neither, which is a row that was
-        gone or a final write the H1 fence re-pended (vault BACKLOG #3211). Through a per-lane
+        """Log a pre-send store read fault AFTER its outcome is written, so the line says what the
+        store reported: a retry time, a dead-letter at the retry cap, or neither, which is a row
+        that was gone or a final write the H1 fence re-pended (vault BACKLOG #3211). A retry time
+        comes back even when the status term skipped a row already terminal (ADR 0157 Amendment A),
+        so "re-pended" is what the store scheduled, not proof the row is PENDING. The dead-letter
+        also writes the retry-cap line, which this per-run line's backoff cannot drop. Through a per-lane
         :class:`~messagefoundry.log_backoff.FailureRun`, because an UNORDERED lane can fail a whole
         backlog fast during a store outage and a line per row would be a flood (BACKLOG #1844)."""
         if failed.retry_at is not None:

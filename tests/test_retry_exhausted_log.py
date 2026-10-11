@@ -326,7 +326,7 @@ async def test_the_line_needs_no_status_read_after_the_write(
 ) -> None:
     # Item 2: a failed read-back used to mark the line "unconfirmed", and a throttled line lost
     # that note. The outcome comes from the write itself, so there is no read to fail.
-    caplog.set_level(logging.WARNING, logger=LOGGER)
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
     runner = _stepped_runner(store, _Fails(), RetryPolicy(max_attempts=1, **FAST))
     await _enqueue(store, 1)
 
@@ -337,6 +337,7 @@ async def test_the_line_needs_no_status_read_after_the_write(
     await runner._process_delivery_item(OUT, await _claim(store))
     (line,) = _exhausted_lines(caplog)
     assert "unconfirmed" not in line.getMessage()
+    _assert_no_token(caplog.records)
 
 
 async def test_a_batch_whose_first_member_vanished_still_logs(
@@ -497,6 +498,35 @@ async def test_a_store_read_fault_on_a_vanished_row_does_not_claim_a_dead_letter
     (line,) = [r for r in caplog.records if "before sending" in r.getMessage()]
     assert "dead-lettered" not in line.getMessage()
     assert "no retry scheduled" in line.getMessage()
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+async def test_a_store_read_fault_that_reaches_the_cap_writes_the_retry_cap_line(
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    batch: bool,
+) -> None:
+    # The store-read-fault arm's own line goes through a FailureRun, whose backoff drops most passes
+    # of a long run. A dead-letter there also writes the throttled retry-cap line.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Fails(), RetryPolicy(max_attempts=1, **FAST))
+    await _enqueue(store, 1)
+    item = await _claim(store)
+
+    async def fault(payload: str) -> str:
+        raise wiring_runner._StoreReadFault("attachment read failed")
+
+    monkeypatch.setattr(runner, "_hydrate_payload", fault)
+    if batch:
+        cfg = BatchConfig(max_count=2, max_wait_ms=1)
+        runner._batch[OUT] = cfg
+        await runner._process_delivery_batch(OUT, item, cfg)
+    else:
+        await runner._process_delivery_item(OUT, item)
+    assert await _status(store, item.id) == OutboxStatus.DEAD.value
+    (line,) = _exhausted_lines(caplog)
+    assert "could not be read from the store" in line.getMessage() and item.id in line.getMessage()
 
 
 def test_held_reports_the_rows_a_pair_holds() -> None:

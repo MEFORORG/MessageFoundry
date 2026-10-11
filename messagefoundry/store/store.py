@@ -1026,8 +1026,10 @@ class FailOutcome:
     comes back even when the status term skipped every row (ADR 0157 Amendment A), so it does not
     prove a row is PENDING. It is ``None`` on every other path.
 
-    ``dead`` is how many rows this call committed DEAD. It is 0 on the retry branch, for a vanished
-    row or an empty batch, and for a final write the H1 epoch fence rolled back and re-pended.
+    ``dead`` is how many rows this call's DEAD write covered: on SQLite, the rows it wrote under the
+    single writer; on Postgres and SQL Server, the rows the transaction read present before an
+    unfenced write, whose row count those backends do not read. It is 0 on the retry branch, for a
+    vanished row or an empty batch, and for a final write the H1 epoch fence rolled back.
 
     ``head_id`` and ``attempts`` name the row the store decided from, with the attempts it read
     there: the one row, or a batch's first member still present. Both are ``None`` when no row was
