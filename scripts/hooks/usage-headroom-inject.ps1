@@ -253,83 +253,93 @@ function Get-StewardFallback {
 
     $lines = @("  fallback source: the Steward's status.json at " + (Get-Folded $statusPath) +
         ". This is NOT a statusLine reading. It carries its own age and the Steward's own TTL.")
-    $unknown = {
-        param([string]$Why)
-        return $lines + "  fallback verdict: UNKNOWN -- $Why"
+    function Unknown([string]$Why) { return $lines + "  fallback verdict: UNKNOWN -- $Why" }
+
+    # THE STEWARD'S FILE FIRST. It is small, and a missing or foreign-schema file ends the read before
+    # the login record, which runs to 100 KB and more of project history, is parsed at all.
+    if (-not (Test-Path -LiteralPath $statusPath)) { return Unknown "the Steward has never written this file" }
+    $doc = Read-JsonDictionary $statusPath
+    if (-not $doc) { return Unknown "the file is present and nothing readable came out of it" }
+    if ([string]$doc.version -ne "3") {
+        return Unknown ("its schema version is '" + (Get-Folded $doc.version 20) + "', and this hook reads only version 3")
     }
 
-    # -AsHashtable IS REQUIRED, NOT STYLE. A real .claude.json carries project keys that differ only by
-    # case, and plain ConvertFrom-Json throws on them -- measured on this box's own login record, where
-    # it made every root read "no readable login record".
-    $login = $null
-    try { $login = Get-Content -LiteralPath $loginPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { }
+    $login = Read-JsonDictionary $loginPath
     if (-not $login) {
-        return & $unknown ("no readable login record at " + (Get-Folded $loginPath) + ", so no pool can be named")
+        return Unknown ("no readable login record at " + (Get-Folded $loginPath) + ", so no pool can be named")
     }
     $org = Get-Folded $login.oauthAccount.organizationUuid 80
     $acct = Get-Folded $login.oauthAccount.accountUuid 80
-    if (-not $org -and -not $acct) {
-        return & $unknown "the login record names no account, so no pool can be named"
-    }
+    if (-not $org -and -not $acct) { return Unknown "the login record names no account, so no pool can be named" }
     # watch.py's _cli_pool_selfcheck: a login record that disagrees with itself cannot name a pool.
     $billed = Get-Folded $login.cachedUsageUtilization.accountUuid 80
     if ($acct -and $billed -and $acct -ne $billed) {
-        return & $unknown ("the login record disagrees with itself (oauthAccount names account " +
-            $acct.Substring(0, [math]::Min(8, $acct.Length)) + ", cachedUsageUtilization names " +
-            $billed.Substring(0, [math]::Min(8, $billed.Length)) + "), so it cannot name this pool")
+        return Unknown ("the login record disagrees with itself (oauthAccount names account " +
+            (Get-Prefix $acct 8) + ", cachedUsageUtilization names " + (Get-Prefix $billed 8) +
+            "), so it cannot name this pool")
     }
     $key = if ($org) { $org } else { "acct:$acct" }
-    $pool = $key.Substring(0, [math]::Min(13, $key.Length))
+    $pool = Get-Prefix $key 13
 
-    if (-not (Test-Path -LiteralPath $statusPath)) { return & $unknown "the Steward has never written this file" }
-    $doc = $null
-    try { $doc = Get-Content -LiteralPath $statusPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { }
-    if ($doc -isnot [System.Collections.IDictionary]) { return & $unknown "the file is present and nothing readable came out of it" }
-    if ([string]$doc.version -ne "3") {
-        return & $unknown ("its schema version is '" + (Get-Folded $doc.version 20) + "', and this hook reads only version 3")
-    }
     $entry = $null
     if ($doc.pools -is [System.Collections.IDictionary]) { $entry = $doc.pools[$key] }
-    if ($entry -isnot [System.Collections.IDictionary]) { return & $unknown "the Steward has no entry for pool $pool, the login this config root records" }
-
+    if ($entry -isnot [System.Collections.IDictionary]) {
+        return Unknown "the Steward has no entry for pool $pool, the login this config root records"
+    }
     # The key matched; the entry must agree. An entry naming another account is refused, not read.
     $entryOrg = Get-Folded $entry.org 80
     $entryAcct = Get-Folded $entry.account 80
     if (($org -and $entryOrg -and $entryOrg -ne $org) -or ($acct -and $entryAcct -and $entryAcct -ne $acct)) {
-        return & $unknown "the entry under pool $pool names another account, so it was read and refused"
+        return Unknown "the entry under pool $pool names another account, so it was read and refused"
     }
 
-    $ts = $entry.ts -as [double]
-    $ttl = $entry.ttl -as [double]
-    if ($null -eq $ts -or -not [double]::IsFinite($ts)) { return & $unknown "the entry for pool $pool carries no read time" }
-    if ($null -eq $ttl -or -not [double]::IsFinite($ttl) -or $ttl -le 0) {
-        return & $unknown "the entry for pool $pool carries no TTL, so its freshness cannot be judged"
+    $ts = Get-Finite $entry.ts
+    $ttl = Get-Finite $entry.ttl
+    if ($null -eq $ts) { return Unknown "the entry for pool $pool carries no read time" }
+    if ($null -eq $ttl -or $ttl -le 0) {
+        return Unknown "the entry for pool $pool carries no TTL, so its freshness cannot be judged"
     }
     $ageSec = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 - $ts
-    # usage.ps1's skew allowance, so the two sources refuse a future date at the same point.
-    if ($ageSec -lt -120) { return & $unknown "the entry for pool $pool is dated in the FUTURE -- clock skew or a bad timestamp" }
+    # The same allowance as usage.ps1's `$age -lt -2` (minutes) in its window check, so the two sources
+    # refuse a future date at the same point. Nothing ties the two literals; change both together.
+    if ($ageSec -lt -120) { return Unknown "the entry for pool $pool is dated in the FUTURE -- clock skew or a bad timestamp" }
     $ageSec = [math]::Max(0.0, $ageSec)
     $ageMin = "{0:0.0}" -f ($ageSec / 60)
     $ttlMin = "{0:0.#}" -f ($ttl / 60)
     if ($ageSec -gt $ttl) {
-        return & $unknown ("the entry for pool $pool is $ageMin min old, past the Steward's own TTL of " +
+        return Unknown ("the entry for pool $pool is $ageMin min old, past the Steward's own TTL of " +
             "$ttlMin min, so it is not projected from")
     }
-    if ((Get-Folded $entry.kind 20) -ne "reading") {
-        return & $unknown "the Steward's own entry for pool $pool is not a reading"
-    }
+    if ((Get-Folded $entry.kind 20) -ne "reading") { return Unknown "the Steward's own entry for pool $pool is not a reading" }
 
     $lines += "  fallback verdict: READ, not graded here -- pool $pool, the login this config root records"
-    foreach ($w in @(@("5-hour", "5h"), @("weekly", "7d"))) {
-        $v = $entry.levels.($w[0]) -as [double]
-        $label = "  steward {0,-3}" -f $w[1]
-        if ($null -eq $v -or -not [double]::IsFinite($v)) {
-            $lines += "$label UNKNOWN -- the Steward's entry carries no $($w[0]) reading"
-            continue
-        }
+    foreach ($w in ([ordered]@{ "5-hour" = "5h"; "weekly" = "7d" }).GetEnumerator()) {
+        $v = Get-Finite $entry.levels.($w.Key)
+        $label = "  steward {0,-3}" -f $w.Value
+        if ($null -eq $v) { $lines += "$label UNKNOWN -- the Steward's entry carries no $($w.Key) reading"; continue }
         $lines += "$label {0,5:0.0}% used   [read {1} min ago by the Steward; its TTL is {2} min]" -f $v, $ageMin, $ttlMin
     }
     return $lines
+}
+
+# -AsHashtable IS REQUIRED, NOT STYLE. A real .claude.json carries project keys that differ only by
+# case, and plain ConvertFrom-Json throws on them -- measured on this box's own login record, where it
+# made every root read "no readable login record". Returns $null for anything but a JSON object.
+function Read-JsonDictionary([string]$Path) {
+    $d = $null
+    try { $d = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { }
+    if ($d -is [System.Collections.IDictionary]) { return $d }
+    return $null
+}
+
+function Get-Prefix([string]$Text, [int]$Length) { $Text.Substring(0, [math]::Min($Length, $Text.Length)) }
+
+# A number out of a file, or $null when it is absent, not numeric, NaN or infinite. Python's json.dump
+# writes NaN and Infinity, so the Steward's file can carry either.
+function Get-Finite($Value) {
+    $d = $Value -as [double]
+    if ($null -eq $d -or -not [double]::IsFinite($d)) { return $null }
+    return $d
 }
 
 # UNKNOWN IS STILL AN INJECTION. Exiting quietly on a failed read would leave the session with no

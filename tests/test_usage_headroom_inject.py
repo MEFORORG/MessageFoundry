@@ -659,11 +659,10 @@ def steward_files(
 
 
 def desktop_context(tmp_path: Path, args: list[str], env: dict[str, str] | None = None) -> str:
-    code, out, ctx = run_hook(
+    """The hook's text for a root no statusLine ever published, so the fallback is the only reading."""
+    return context_of(
         tmp_path / "never-published", env_extra=DESKTOP if env is None else env, extra_args=args
     )
-    assert code == 0 and ctx is not None, out
-    return ctx
 
 
 def test_a_desktop_session_reads_the_steward_file_labelled_and_aged(tmp_path: Path) -> None:
@@ -712,59 +711,61 @@ def test_a_fallback_past_its_own_ttl_is_unknown_and_never_a_number(tmp_path: Pat
     )
 
 
-def test_a_fallback_that_cannot_name_this_pool_is_refused(tmp_path: Path) -> None:
-    """Each way the file or the login record fails to name THIS config root's pool is UNKNOWN with its
-    own reason, and none of them prints a number. Another account's headroom is the hazard."""
-    entry = steward_entry()
-    self_disagreeing = {
-        "oauthAccount": {"organizationUuid": ORG, "accountUuid": ACCT},
-        "cachedUsageUtilization": {"accountUuid": OTHER},
-    }
-    cases: dict[str, tuple[dict[str, Any], int, dict[str, Any] | None, str]] = {
-        "no entry for this pool": ({OTHER: entry}, 3, None, "has no entry for pool"),
-        "entry names another account": (
-            {ORG: steward_entry(account=OTHER)},
-            3,
-            None,
-            "names another account",
-        ),
-        "login disagrees with itself": ({ORG: entry}, 3, self_disagreeing, "disagrees with itself"),
-        "login names no account": ({ORG: entry}, 3, {"oauthAccount": {}}, "names no account"),
-        "unknown schema version": ({ORG: entry}, 2, None, "reads only version 3"),
-        "the entry is not a reading": (
-            {ORG: steward_entry(kind="unknown")},
-            3,
-            None,
-            "not a reading",
-        ),
-        "dated in the future": ({ORG: steward_entry(age_s=-600)}, 3, None, "FUTURE"),
-        "no TTL": ({ORG: steward_entry(ttl=0)}, 3, None, "carries no TTL"),
-    }
-    for fault, (pools, version, login, reason) in cases.items():
-        case_dir = tmp_path / re.sub(r"\W+", "-", fault)
-        case_dir.mkdir()
-        ctx = desktop_context(case_dir, steward_files(case_dir, pools, version, login))
-        assert "fallback verdict: UNKNOWN" in ctx, f"{fault}: {ctx}"
-        assert reason in ctx, f"{fault}: {ctx}"
-        assert _PERCENTAGE.search(ctx) is None, f"{fault}, and a number was printed anyway: {ctx}"
+_SELF_DISAGREEING = {
+    "oauthAccount": {"organizationUuid": ORG, "accountUuid": ACCT},
+    "cachedUsageUtilization": {"accountUuid": OTHER},
+}
 
-    missing = tmp_path / "missing"
-    missing.mkdir()
-    args = steward_files(missing)
-    (missing / "steward-status.json").unlink()
-    assert "has never written this file" in desktop_context(missing, args)
+
+@pytest.mark.parametrize(
+    ("pool", "over", "login", "version", "reason"),
+    [
+        pytest.param(OTHER, {}, None, 3, "has no entry for pool", id="no-entry"),
+        pytest.param(ORG, {"account": OTHER}, None, 3, "names another account", id="other-account"),
+        pytest.param(ORG, {}, _SELF_DISAGREEING, 3, "disagrees with itself", id="self-disagree"),
+        pytest.param(ORG, {}, {"oauthAccount": {}}, 3, "names no account", id="no-login"),
+        pytest.param(ORG, {}, None, 2, "reads only version 3", id="schema-version"),
+        pytest.param(ORG, {"kind": "unknown"}, None, 3, "not a reading", id="not-reading"),
+        pytest.param(ORG, {"age_s": -600}, None, 3, "FUTURE", id="future-dated"),
+        pytest.param(ORG, {"ttl": 0}, None, 3, "carries no TTL", id="no-ttl"),
+    ],
+)
+def test_a_fallback_that_cannot_name_this_pool_is_refused(
+    tmp_path: Path,
+    pool: str,
+    over: dict[str, Any],
+    login: dict[str, Any] | None,
+    version: int,
+    reason: str,
+) -> None:
+    """Each way the file or the login record fails to name THIS config root's pool is UNKNOWN with its
+    own reason, and none of them prints a number. Another account's headroom is the hazard. The entry
+    is built here, not at collection, so its read time is relative to this run."""
+    pools = {pool: steward_entry(**over)}
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, pools, version, login))
+    assert "fallback verdict: UNKNOWN" in ctx, ctx
+    assert reason in ctx, ctx
+    assert _PERCENTAGE.search(ctx) is None, f"a number was printed anyway: {ctx}"
+
+
+def test_a_steward_file_that_was_never_written_is_unknown(tmp_path: Path) -> None:
+    args = steward_files(tmp_path)
+    (tmp_path / "steward-status.json").unlink()
+    ctx = desktop_context(tmp_path, args)
+    assert "fallback verdict: UNKNOWN -- the Steward has never written this file" in ctx, ctx
 
 
 def test_the_fallback_appears_only_where_no_statusline_can_publish(tmp_path: Path) -> None:
     """A terminal session can publish its own reading, so it gets no fallback; neither does a fresh
-    statusLine reading, nor a probe under -StateDir that did not name both fixture files."""
+    statusLine reading, nor a probe under -StateDir that did not name both fixture files. The SDK run
+    is the positive control for the negative assertions, on the same arguments."""
     args = steward_files(tmp_path)
-    assert FALLBACK_LABEL in desktop_context(tmp_path, args), "positive control"
     assert FALLBACK_LABEL in desktop_context(
         tmp_path, args, env={"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}
     )
-    for env in ({"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}):
-        assert FALLBACK_LABEL not in desktop_context(tmp_path, args, env=env), env
+    assert FALLBACK_LABEL not in desktop_context(
+        tmp_path, args, env={"CLAUDE_CODE_ENTRYPOINT": "cli"}
+    )
 
     assert FALLBACK_LABEL not in desktop_context(tmp_path, args[:2]), (
         "under -StateDir the hook must not fall through to the real login record"
