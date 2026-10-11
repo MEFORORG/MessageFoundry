@@ -463,11 +463,18 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed name under the project root the operator named."
     ),
     "messagefoundry/__main__.py::_serve": Site(
-        3,
+        2,
         GUARDED,
         "The store path is the operator's; the environment name passes the settings validator, "
-        "which allows no separator; the default settings file is a fixed name in the working "
-        "directory, checked before it steers anything (vault BACKLOG #2626).",
+        "which allows no separator.",
+        "messagefoundry/config/settings.py::_valid_environment_name",
+    ),
+    "messagefoundry/__main__.py::_supervise": Site(
+        1,
+        GUARDED,
+        "The value file each engine shard reads, built to check who can write it before any "
+        "starts (vault BACKLOG #2626); the environment name passes the settings validator, which "
+        "allows no separator.",
         "messagefoundry/config/settings.py::_valid_environment_name",
     ),
     "messagefoundry/__main__.py::_supervisor_forward_spool_dir": Site(2, OPERATOR, _STORE_PATH),

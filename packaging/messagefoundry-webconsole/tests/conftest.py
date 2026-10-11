@@ -93,22 +93,21 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[None]:
             "installed without functools.wraps over the call it replaced"
         )
 
+    # The one Windows seam, which the serve start check (vault BACKLOG #2626) reads through too.
     @functools.wraps(real)
-    def check_over_clean_readers(directory: Path) -> None:
-        wiring._enforce_windows_config_source(directory, probes)
-
-    # The serve start check's own seam (vault BACKLOG #2626 step 3), replaced the same way.
-    real_paths = inspect.unwrap(wiring._assert_trusted_paths_windows)
-
-    @functools.wraps(real_paths)
-    def paths_over_clean_readers(
-        paths: Sequence[Path], *, lead: str, refuse: Callable[[str], None]
+    def check_over_clean_readers(
+        paths: Sequence[Path],
+        *,
+        lead: str,
+        refuse: Callable[[str], None],
+        first_is_required: bool = False,
     ) -> None:
-        wiring._enforce_windows_paths(paths, probes, lead=lead, always_present=None, refuse=refuse)
+        wiring._enforce_windows_paths(
+            paths, probes, lead=lead, refuse=refuse, first_is_required=first_is_required
+        )
 
     patch = pytest.MonkeyPatch()
     patch.setattr(wiring, "_assert_safe_config_source_windows", check_over_clean_readers)
-    patch.setattr(wiring, "_assert_trusted_paths_windows", paths_over_clean_readers)
     try:
         yield
     finally:

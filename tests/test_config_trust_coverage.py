@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -25,24 +26,15 @@ from messagefoundry.config.settings import (
     INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
     SECURITY_ENFORCEMENT_ENV,
 )
-from messagefoundry.config.wiring import (
-    WiringError,
-    _WinConfigSourceProbes,
-    _WinPathSecurity,
-    config_source_trust_paths,
-    load_config,
-)
+from messagefoundry.config.wiring import WiringError, config_source_trust_paths, load_config
+
+#: Everyone, the principal the ``fake_windows_readers`` fixture grants write to.
+_EVERYONE = "S-1-1-0"
+
+#: The ``fake_windows_readers`` fixture: a predicate naming the writable paths in, paths read out.
+FakeReaders = Callable[[Callable[[Path], bool]], list[Path]]
 
 pytestmark = pytest.mark.usefixtures("real_config_source_readers")
-
-_SELF = "S-1-5-21-1-2-3-2002"
-_EVERYONE = "S-1-1-0"
-_ALLOW = 0x00
-_FULL = 0x10000000 | 0x40000000 | 0x1FF
-_MODIFY = 0x00000002 | 0x00000004 | 0x00000010 | 0x00010000
-
-_CLEAN = _WinPathSecurity(owner_sid=_SELF, aces=((_ALLOW, _FULL, _SELF),))
-_EVERYONE_WRITES = _WinPathSecurity(owner_sid=_SELF, aces=((_ALLOW, _MODIFY, _EVERYONE),))
 
 _CACHE_FILE = f"cfg.{sys.implementation.cache_tag}.pyc"
 
@@ -85,31 +77,14 @@ def test_a_bare_directory_lists_only_itself_and_its_modules(tmp_path: Path) -> N
     assert config_source_trust_paths(tmp_path) == [tmp_path, tmp_path / "cfg.py"]
 
 
-def _windows_readers(monkeypatch: pytest.MonkeyPatch, writable: str | None) -> list[Path]:
-    """Route the check down the Windows branch with fake readers. The path named ``writable``
-    grants Everyone write; every other path reads clean. Returns the paths read."""
-    import messagefoundry.config.wiring as wiring
-
-    seen: list[Path] = []
-
-    def _read_path(path: Path) -> _WinPathSecurity:
-        seen.append(path)
-        return _EVERYONE_WRITES if path.name == writable else _CLEAN
-
-    probes = _WinConfigSourceProbes(
-        self_sid=_SELF, read_path=_read_path, owner_in_admins=lambda _sid: False
-    )
-    monkeypatch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
-    monkeypatch.setattr("messagefoundry.config.wiring.sys.platform", "win32")
-    return seen
-
-
-def test_windows_reads_every_listed_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_windows_reads_every_listed_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
     """Positive control for the refusals below: a clean read of the whole tree loads."""
     monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
     _write_tree(tmp_path)
     expected = config_source_trust_paths(tmp_path)
-    seen = _windows_readers(monkeypatch, writable=None)
+    seen = fake_windows_readers(lambda _path: False)
     # The empty cache file is not a valid .pyc, so the source loader recompiles cfg.py.
     assert "o" in load_config(tmp_path).outbound
     assert seen == expected
@@ -119,11 +94,14 @@ def test_windows_reads_every_listed_path(tmp_path: Path, monkeypatch: pytest.Mon
     "member", ["__pycache__", _CACHE_FILE, "connections.toml", "codesets", "a.csv"]
 )
 def test_windows_refuses_a_writable_member(
-    member: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    member: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_windows_readers: FakeReaders,
 ) -> None:
     monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
     _write_tree(tmp_path)
-    _windows_readers(monkeypatch, writable=member)
+    fake_windows_readers(lambda path: path.name == member)
     with pytest.raises(WiringError, match="writable-by-others path") as excinfo:
         load_config(tmp_path)
     assert member in str(excinfo.value)
@@ -131,13 +109,16 @@ def test_windows_refuses_a_writable_member(
 
 
 def test_the_escape_downgrades_a_writable_cache_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fake_windows_readers: FakeReaders,
 ) -> None:
     """The new members go through the same refusal, so the clamped escape covers them too."""
     monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
     monkeypatch.setenv(SECURITY_ENFORCEMENT_ENV, "warn")
     _write_tree(tmp_path)
-    _windows_readers(monkeypatch, writable=_CACHE_FILE)
+    fake_windows_readers(lambda path: path.name == _CACHE_FILE)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
         assert "o" in load_config(tmp_path).outbound
     assert any(

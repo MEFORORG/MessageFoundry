@@ -7068,6 +7068,9 @@ def config_py_files(directory: Path) -> list[Path]:
     return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
 
 
+#: How every config-source refusal of a load begins.
+_CONFIG_SOURCE_LEAD = "refusing to load config from"
+
 #: The folder Python's source loader reads compiled modules from. A matching cache file there runs
 #: in place of the source beside it, so whoever can write it changes the code a load runs.
 _BYTECODE_CACHE_DIR = "__pycache__"
@@ -7752,9 +7755,9 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
     _enforce_windows_paths(
         config_source_trust_paths(directory),
         probes,
-        lead="refusing to load config from",
-        always_present=directory,
+        lead=_CONFIG_SOURCE_LEAD,
         refuse=_refuse_unsafe_config_source,
+        first_is_required=True,
     )
 
 
@@ -7763,14 +7766,14 @@ def _enforce_windows_paths(
     probes: _WinConfigSourceProbes,
     *,
     lead: str,
-    always_present: Path | None,
     refuse: Callable[[str], None],
+    first_is_required: bool = False,
 ) -> None:
     """Hand ``refuse`` a reason for each path in ``paths`` that does not read clean and pass the
     policy. Each message starts with ``lead``.
 
-    ``always_present`` is the one path a not-found read refuses outright. Any other path that is gone
-    by the time it is read is skipped, as below.
+    With ``first_is_required``, a not-found read of the first path refuses outright: that is the
+    config directory itself. Any other path that is gone by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -7792,14 +7795,14 @@ def _enforce_windows_paths(
         return
     if probes.self_sid is None:
         refuse(
-            f"{lead} {always_present or paths[0]}: this process's own user SID could "
-            f"not be read, so the owner of each path cannot be vetted; see docs/SERVICE.md"
+            f"{lead} {paths[0]}: this process's own user SID could not be read, so the owner "
+            f"of each path cannot be vetted; see docs/SERVICE.md"
         )
-    for path in paths:
+    for index, path in enumerate(paths):
         sec = probes.read_path(path)
         if (
             sec.status in _WIN_PATH_GONE_ERRORS
-            and path != always_present
+            and not (first_is_required and index == 0)
             and not os.path.lexists(path)
         ):
             continue
@@ -7841,16 +7844,32 @@ def _enforce_windows_paths(
             )
 
 
-def _assert_safe_config_source_windows(directory: Path) -> None:
-    """Windows NTFS-DACL/owner check mirroring the POSIX guard (SEC-003).
+def _assert_safe_config_source_windows(
+    paths: Sequence[Path],
+    *,
+    lead: str,
+    refuse: Callable[[str], None],
+    first_is_required: bool = False,
+) -> None:
+    """Windows NTFS-DACL/owner check mirroring the POSIX guard (SEC-003), over ``paths``.
 
     Reads the Win32 inputs through :func:`_win32_config_source_probes` and hands them to the pure
-    :func:`_enforce_windows_config_source`, which makes every decision, including what a failed read
-    means. All ctypes work stays behind the ``sys.platform == 'win32'`` guard so mypy/lint pass on the
-    Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`)."""
+    :func:`_enforce_windows_paths`, which makes every decision, including what a failed read means.
+    All ctypes work stays behind the ``sys.platform == 'win32'`` guard so mypy/lint pass on the
+    Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`).
+
+    **The one Windows seam.** The config load and the ``serve`` start check (vault BACKLOG #2626)
+    both read through it, so the test suites replace this one name with clean readers on win32,
+    where the checkout's own access list grants ``BUILTIN\\Users`` write."""
     if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
         return
-    _enforce_windows_config_source(directory, _win32_config_source_probes())
+    _enforce_windows_paths(
+        paths,
+        _win32_config_source_probes(),
+        lead=lead,
+        refuse=refuse,
+        first_is_required=first_is_required,
+    )
 
 
 def _win32_config_source_probes() -> _WinConfigSourceProbes:
@@ -8272,18 +8291,32 @@ def _assert_safe_config_source(directory: Path) -> None:
     no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
     if not directory.is_dir():
         return
-    if sys.platform == "win32":
-        _assert_safe_config_source_windows(directory)
-        return
-    if os.name != "posix":
-        return
     # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
     # writable/foreign-owned helper is just as much an injection vector (review M-21).
-    _enforce_posix_paths(
+    _check_trusted_paths(
         config_source_trust_paths(directory),
-        lead="refusing to load config from",
+        lead=_CONFIG_SOURCE_LEAD,
         refuse=_refuse_unsafe_config_source,
+        first_is_required=True,
     )
+
+
+def _check_trusted_paths(
+    paths: Sequence[Path],
+    *,
+    lead: str,
+    refuse: Callable[[str], None],
+    first_is_required: bool = False,
+) -> None:
+    """Hand ``refuse`` a reason for each path in ``paths`` the config-source policy would refuse:
+    the owner and DACL on Windows, the mode and owning uid on POSIX. Every caller of the policy, the
+    config load and the ``serve`` start check, comes through here."""
+    if sys.platform == "win32":
+        _assert_safe_config_source_windows(
+            paths, lead=lead, refuse=refuse, first_is_required=first_is_required
+        )
+    elif os.name == "posix":
+        _enforce_posix_paths(paths, lead=lead, refuse=refuse)
 
 
 def _enforce_posix_paths(
@@ -8335,51 +8368,30 @@ def _file_and_folder(files: Iterable[Path]) -> list[Path]:
     """Each file in ``files`` that exists, then the folder it sits in, each path once.
 
     The folder counts because whoever can write it can replace the file. A file that does not exist
-    is left out with its folder: the start reads nothing from it, and the start that does read it
-    checks it then."""
-    paths: list[Path] = []
-    for file in files:
-        if not file.is_file():
-            continue
-        for path in (file, file.parent):
-            if path not in paths:
-                paths.append(path)
-    return paths
-
-
-def _check_trusted_paths(
-    paths: Sequence[Path], *, lead: str, refuse: Callable[[str], None]
-) -> None:
-    """Hand ``refuse`` a reason for each path in ``paths`` the config-source policy would refuse."""
-    if sys.platform == "win32":
-        _assert_trusted_paths_windows(paths, lead=lead, refuse=refuse)
-    elif os.name == "posix":
-        _enforce_posix_paths(paths, lead=lead, refuse=refuse)
-
-
-def _assert_trusted_paths_windows(
-    paths: Sequence[Path], *, lead: str, refuse: Callable[[str], None]
-) -> None:
-    """The Windows arm of :func:`_check_trusted_paths`: the real readers, then the pure policy.
-
-    A separate seam from :func:`_assert_safe_config_source_windows`, for the same reason that one
-    exists: the test suites replace it with clean readers on win32, where the checkout's own access
-    list grants ``BUILTIN\\Users`` write."""
-    if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
-        return
-    _enforce_windows_paths(
-        paths, _win32_config_source_probes(), lead=lead, always_present=None, refuse=refuse
+    is left out with its folder, because nothing reads it. The value file is read again on every
+    reload, and each of those reads checks it again (``serve``'s ``env_values``), so one created
+    after the start is checked when it is first read."""
+    return list(
+        dict.fromkeys(
+            path
+            for file in files
+            if file.is_file()
+            for path in (file.absolute(), file.absolute().parent)
+        )
     )
 
 
-def assert_trusted_start_paths(files: Iterable[Path]) -> None:
+def assert_trusted_start_paths(
+    files: Iterable[Path], *, lead: str = "refusing to start from"
+) -> None:
     """Refuse a start that reads a settings file or value file another account could write.
 
     ``files`` are the settings file and the value file this start reads. Each one that exists is
     checked with the folder it sits in, by the config-source policy: on Windows the owner and DACL,
     on POSIX the mode and the owning uid. A refusal raises :class:`WiringError` through
     :func:`_refuse_unsafe_config_source`, so the clamped ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``
-    escape downgrades it exactly as it does a config refusal (vault BACKLOG #2599).
+    escape downgrades it exactly as it does a config refusal (vault BACKLOG #2599). Each message
+    starts with ``lead``, so a re-read of the value file on reload says what it refused.
 
     Neither file is code, but each one steers code: the settings file sets the posture, the DR hook
     command, the reload roots and the egress lists, and the value file feeds every ``env()`` lookup
@@ -8389,9 +8401,7 @@ def assert_trusted_start_paths(files: Iterable[Path]) -> None:
     **Not checked**, at least: the folders above each file's own folder, and a file named in the
     settings that the start reads later, such as a key, certificate or CRL file. Those have their
     own checks where they are read, or none."""
-    _check_trusted_paths(
-        _file_and_folder(files), lead="refusing to start from", refuse=_refuse_unsafe_config_source
-    )
+    _check_trusted_paths(_file_and_folder(files), lead=lead, refuse=_refuse_unsafe_config_source)
 
 
 def install_trust_paths() -> list[Path]:

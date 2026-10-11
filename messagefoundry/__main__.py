@@ -2341,6 +2341,86 @@ def _start_logging(
     return None
 
 
+def _read_environment_values(
+    env_file: Path, *, base_dir: Path, dir_name: str, environment: str
+) -> dict[str, Any]:
+    """This instance's environment values: ``env_file`` (``<base_dir>/<dir_name>/<environment>.toml``)
+    plus the ``MEFOR_VALUE_*`` environment. ``serve`` hands it to the Engine as the
+    ``env_values_provider``, so it runs at start and again on every reload."""
+    import os
+
+    from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
+    from messagefoundry.redaction import safe_exc
+
+    # Guarded HERE because this is the one site that knows the value file's PATH, and because this
+    # function is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
+    # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
+    # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
+    # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
+    # WiringError is the type both the serve gate and that route already understand, so
+    # raising it puts an unreadable value file in the same audited 422 arm as every other bad
+    # config. load_environment_values itself stays unguarded: its other callers are out of scope.
+    #
+    # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
+    # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
+    # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
+    # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
+    # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
+    # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
+    # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
+    # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
+    # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
+    # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
+    # keeps the exception type and bounds the length.
+    #
+    # Vault BACKLOG #2626 step 3: the start check vetted the value file once, but this function
+    # reads it again on every reload. So each read vets it again first, and a file edited or
+    # created after the start is not read unvetted. Outside the try below, because WiringError
+    # is a ValueError and that arm would wrap the refusal as a read failure.
+    assert_trusted_start_paths([env_file], lead="refusing to read environment values from")
+    try:
+        return load_environment_values(
+            base_dir=base_dir,
+            dir_name=dir_name,
+            environment=environment,
+            environ=os.environ,
+        )
+    except (ValueError, RecursionError, OSError) as exc:
+        # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
+        # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
+        # and RecursionError derives from RuntimeError). The serve gate catches WiringError
+        # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
+        # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
+        # an embedder's arbitrary callable, while this one wraps our own call into a function that
+        # returns a dict or raises.
+        refusal = safe_exc(exc)
+    # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
+    # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
+    # bytes on .object, so chaining either would carry every credential the file holds. `from None`
+    # would not do: it leaves __context__ set.
+    raise WiringError(f"could not read environment values from {env_file}: {refusal}")
+
+
+def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: str = "") -> bool:
+    """Vault BACKLOG #2626 step 3: True, with the reason printed, when another account could write
+    the settings file or the value file this start reads.
+
+    Both sit outside the config tree, which every load checks, and whoever can write either one
+    steers the service. The settings file is the one ``load_settings`` read for ``service_config``.
+    ``serve`` and ``supervise`` both call this, in the same place among their gates, so a fleet
+    whose engine shards would each refuse is refused before any is spawned; ``fleet`` says so."""
+    from messagefoundry.config.settings import settings_file_path
+    from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
+
+    try:
+        assert_trusted_start_paths([settings_file_path(service_config), env_file])
+    except WiringError as exc:
+        print(f"error: {exc}{f'. {fleet}' if fleet else ''}", file=sys.stderr)
+        return True
+    return False
+
+
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
     # because a script injected before the hook is in place runs. It is NOT first in the process:
@@ -2512,19 +2592,7 @@ def _serve(args: argparse.Namespace) -> int:
     env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
     env_file = env_base / settings.environments.dir / f"{env_name}.toml"
 
-    # Vault BACKLOG #2626 step 3: the settings file and the value file are read from outside the
-    # config tree, which every load checks. Whoever can write either one steers the service, so each
-    # gets the config-source check here, before anything acts on them. The settings file is the one
-    # load_settings read: --service-config, else ./messagefoundry.toml when it exists.
-    from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
-
-    settings_file = (
-        Path(service_config) if service_config is not None else cwd / _DEFAULT_SERVICE_TOML
-    )
-    try:
-        assert_trusted_start_paths([settings_file, env_file])
-    except WiringError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    if _start_files_refused(service_config, env_file):
         return 2
 
     # ADR 0118: [security].require_encryption_for_remote=false is the config-file twin of
@@ -4192,52 +4260,16 @@ def _serve(args: argparse.Namespace) -> int:
     # picks up edited values without a service restart (review M-23) — the anchor is fixed per process.
     import os
 
-    from messagefoundry.config.environments import load_environment_values
     from messagefoundry.config.wiring import WiringError
     from messagefoundry.redaction import safe_exc
 
-    def env_values() -> dict[str, Any]:
-        # Guarded HERE because this is the one site that knows the value file's PATH, and because this
-        # closure is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
-        # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
-        # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
-        # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
-        # WiringError is the type both the serve gate below and that route already understand, so
-        # raising it puts an unreadable value file in the same audited 422 arm as every other bad
-        # config. load_environment_values itself stays unguarded: its other callers are out of scope.
-        #
-        # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
-        # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
-        # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
-        # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
-        # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
-        # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
-        # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
-        # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
-        # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
-        # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
-        # keeps the exception type and bounds the length.
-        try:
-            return load_environment_values(
-                base_dir=env_base,
-                dir_name=settings.environments.dir,
-                environment=env_name,
-                environ=os.environ,
-            )
-        except (ValueError, RecursionError, OSError) as exc:
-            # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
-            # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
-            # and RecursionError derives from RuntimeError). The gate below now catches WiringError
-            # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
-            # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
-            # an embedder's arbitrary callable, while this one wraps our own call into a function that
-            # returns a dict or raises.
-            refusal = safe_exc(exc)
-        # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
-        # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
-        # bytes on .object, so chaining either would carry every credential the file holds. `from None`
-        # would not do: it leaves __context__ set.
-        raise WiringError(f"could not read environment values from {env_file}: {refusal}")
+    env_values = functools.partial(
+        _read_environment_values,
+        env_file,
+        base_dir=env_base,
+        dir_name=settings.environments.dir,
+        environment=env_name,
+    )
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
@@ -4791,6 +4823,24 @@ def _supervise(args: argparse.Namespace) -> int:
             "refusing to start the fleet.",
             file=sys.stderr,
         )
+        return 2
+    # Vault BACKLOG #2626 step 3: the settings-file and value-file check each engine shard's
+    # `serve` makes next, at the same place among its gates. Without it here, a file another
+    # account can write would refuse every engine shard, and the supervisor would only restart
+    # them. The value file is anchored as each engine shard anchors it: the forwarded
+    # --project-root, else [environments].base_dir.
+    from messagefoundry.config.environments import resolve_values_base_dir
+
+    env_file = (
+        resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd)
+        / settings.environments.dir
+        / f"{env_name}.toml"
+    )
+    if _start_files_refused(
+        service_config,
+        env_file,
+        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
+    ):
         return 2
     for startup_entry in startup_loosenings(startup):
         security_lines.append(startup_entry)

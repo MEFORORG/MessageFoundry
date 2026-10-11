@@ -808,7 +808,8 @@ def test_one_function_builds_the_command_line_of_a_python_child() -> None:
     would start without them. Two tray modules also name the executable. ``tray/branding.py`` reads
     it to place the branded launcher and to tell whether it is running under it.
     ``tray/autostart.py`` reads it to find ``pythonw.exe`` for the login command, which it then
-    builds with one of the two (vault BACKLOG #2822, #2837)."""
+    builds with one of the two (vault BACKLOG #2822, #2837). ``config/wiring.py`` reads it to check
+    who can write the interpreter the service runs, and starts nothing (vault BACKLOG #2626)."""
     names_the_interpreter = {
         rel
         for rel, source in _scanned_sources().items()
@@ -820,7 +821,12 @@ def test_one_function_builds_the_command_line_of_a_python_child() -> None:
             for node in ast.walk(ast.parse(source))
         )
     }
-    assert names_the_interpreter == {"childenv.py", "tray/autostart.py", "tray/branding.py"}
+    assert names_the_interpreter == {
+        "childenv.py",
+        "config/wiring.py",
+        "tray/autostart.py",
+        "tray/branding.py",
+    }
 
 
 def test_the_guard_reads_every_module_the_process_start_inventory_names() -> None:
