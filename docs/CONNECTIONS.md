@@ -2086,7 +2086,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `host` | str / `env()` | — (required) | SMTP server host. |
-| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain is not checked against `[egress].allowed_recipient_domains`. |
+| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain must be listed in `[egress].allowed_recipient_domains`, like a recipient's, because bounces and replies can carry the message body. |
 | `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. An entry with a line break is refused at load too. |
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
@@ -2115,8 +2115,8 @@ counts" in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) is the rule, a
 
 **The recipients are gated too, and that gate is deny-by-default.** `allowed_smtp` gates only the
 relay hop, so every address in `recipients` must also sit in a domain listed in
-`[egress].allowed_recipient_domains`. An empty list refuses every `Email()` destination. The
-matching rules are in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress).
+`[egress].allowed_recipient_domains`. So must the `sender`'s domain, since bounces go there. An
+empty list refuses every `Email()` destination. The matching rules are in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress).
 
 Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
