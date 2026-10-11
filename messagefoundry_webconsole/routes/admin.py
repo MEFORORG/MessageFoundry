@@ -379,7 +379,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         roles = [v for k, v in pairs if k == "roles"]
         try:
             body = RolesUpdateRequest(roles=roles)
-            await admin.set_user_roles(user_id, body=body, service=service, identity=identity)
+            await admin.set_user_roles(
+                user_id, body=body, request=request, service=service, identity=identity
+            )
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
@@ -496,7 +498,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     else None
                 ),
             )
-            await admin.set_channel_scope(user_id, body=body, service=service, identity=identity)
+            await admin.set_channel_scope(
+                user_id, body=body, request=request, service=service, identity=identity
+            )
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
@@ -791,7 +795,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
     ) -> Response:
         assert_same_origin(request)
-        await admin.admin_revoke_user_sessions(user_id, service=service, identity=identity)
+        try:
+            await admin.admin_revoke_user_sessions(
+                user_id, request=request, service=service, identity=identity
+            )
+        except HTTPException as exc:
+            # The self-target refusal (BACKLOG #1149) renders on the user page, as delete's does.
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise
+            return await _user_detail(
+                user_id, service, identity, error=str(exc.detail), status_code=exc.status_code
+            )
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
 
     @app.post("/ui/users/{user_id}/delete")

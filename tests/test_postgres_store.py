@@ -934,6 +934,14 @@ async def test_startup_attestation_tamper_evidence_chains_and_tees(
 async def test_security_events_for_user_scopes_to_actor(store) -> None:
     # The /me/security-events source on the real backend: only the target actor's auth.* rows,
     # newest-first, honoring limit; other actors' rows and non-auth.* rows excluded.
+    # The feed starts at the account's created_at (BACKLOG #1152), so alice's account comes first.
+    await store.create_user(
+        user_id="u-alice",
+        username="alice",
+        auth_provider="local",
+        password_generated=False,
+        now=1.0,
+    )
     await store.record_audit("auth.login_success", actor="alice", detail="1")
     await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
     await store.record_audit("message_view", actor="alice", detail="x")  # not auth.*

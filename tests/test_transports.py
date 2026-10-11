@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import inspect
 import logging
 import os
 import re
@@ -1641,6 +1642,41 @@ async def test_file_source_quarantines_decompression_bomb(tmp_path: Path) -> Non
         await task
     assert received == []  # never emitted
     assert (inbox / ".error" / "bomb.hl7.gz").exists()
+
+
+async def test_file_source_quarantines_a_stream_over_the_gzip_member_cap(tmp_path: Path) -> None:
+    # BACKLOG #1129: the gunzip applies the codec's default member cap. The first member is a real
+    # ADT and the rest inflate to nothing, so without the cap the drop would gunzip to that ADT and
+    # be emitted. Over the cap, the ORIGINAL file goes to .error and nothing is emitted.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    cap = inspect.signature(gzip_decompress).parameters["max_members"].default
+    drop = gzip_compress(ADT.encode("utf-8")) + gzip_compress(b"") * cap
+    (inbox / "members.hl7.gz").write_bytes(drop)
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.gz",
+                "poll_seconds": 0.01,
+                "decompress": "gzip",
+            },
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: (inbox / ".error" / "members.hl7.gz").exists())
+    finally:
+        await src.stop()
+        await task
+    assert received == []
 
 
 async def test_file_source_quarantines_corrupt_archive(tmp_path: Path) -> None:

@@ -533,6 +533,11 @@ def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
         )
     )
     monkeypatch.setattr("messagefoundry.api.app.startup_posture", lambda: hardened)
+    # Vault BACKLOG #2595: and not a Windows service, whatever process runs pytest.
+    from messagefoundry.serviceenv import ServiceEnvPosture, ServiceEnvStatus
+
+    not_a_service = ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE)
+    monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: not_a_service)
 
 
 @pytest.fixture

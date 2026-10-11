@@ -4928,9 +4928,22 @@ def _connection_event_where(
 def _security_events_where(username: str, until: float | None) -> tuple[str, list[Any]]:
     """The ``?`` ``WHERE`` text and values for one user's security-event page and its total (BACKLOG
     #2438): the ``auth.*`` actions recorded under their own name, at or before ``until`` when a
-    pager pins one. SQLite and SQL Server share it, so the page and its total count one set."""
-    params: list[Any] = [username]
-    clause = " WHERE actor = ? AND action LIKE 'auth.%'"
+    pager pins one. SQLite and SQL Server share it, so the page and its total count one set.
+
+    The rows start at the account's own ``created_at`` (BACKLOG #1152). ``actor`` is a reusable
+    username, and a failed sign-in is recorded under the name that was tried, whether or not an
+    account holds it. Without the bound, on a first deployment an account would read rows written
+    before it existed: a failed sign-in against its name, or a deleted account's history under the
+    same name. With no account by that name the subquery is NULL and no row matches. The bound is
+    inclusive because a directory account's birth row is written with ``created_at`` as its own
+    ``ts``. It is a read filter, so the hash-chained ``audit_log`` is untouched. It does not cover a row that keeps its ``created_at``
+    while its name or holder changes: a directory rename onto the name, or a ``provision-admin``
+    repair of an existing row. Rows under the name from before either change still show."""
+    params: list[Any] = [username, username]
+    clause = (
+        " WHERE actor = ? AND action LIKE 'auth.%'"
+        " AND ts >= (SELECT created_at FROM users WHERE username = ?)"
+    )
     if until is not None:
         clause += " AND ts <= ?"
         params.append(until)
@@ -5862,8 +5875,14 @@ class MessageStore:
         audit_mac_fn: Callable[[bytes], str] | None = None,
         message_events: str = "all",
         read_only: bool = False,
+        secure_delete: bool = True,
     ) -> MessageStore:
         """Open (and, unless ``read_only``, create, schema-ensure and migrate) the store at ``path``.
+
+        ``secure_delete`` (vault BACKLOG #2619) sets ``PRAGMA secure_delete`` on the writer
+        connection. On, SQLite overwrites the bytes of a deleted row or a NULLed body with zeros, so a
+        retention purge and a consumed queue row leave no copy in the file's free space. The knob,
+        its default and its cost are ``[store].secure_delete`` in ``docs/CONFIGURATION.md``.
 
         ``read_only`` (BACKLOG #1780) is for a caller that means *inspect this store*. The file is
         opened through a ``mode=ro`` URI, so SQLite itself refuses to create it or write to it. No
@@ -5906,6 +5925,8 @@ class MessageStore:
                 # win vs FULL. `sync` is validated above, so this f-string can't inject. FULL is
                 # available for the paranoid (every commit fsynced) via [store] synchronous = "full".
                 await db.execute(f"PRAGMA synchronous={sync}")
+                # Per connection, and only the writer deletes: the read pool is query_only.
+                await db.execute(f"PRAGMA secure_delete={'ON' if secure_delete else 'OFF'}")
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
             if read_only:
@@ -14202,34 +14223,45 @@ class MessageStore:
                 del self._state_cache[ck]
         return len(purged_keys)
 
-    async def wal_checkpoint(self) -> None:
+    async def wal_checkpoint(self) -> bool:
         """Force a full WAL checkpoint + truncate (``PRAGMA wal_checkpoint(TRUNCATE)``) so the ``-wal``
         sidecar — which holds recently-written PHI outside any app-level cipher — doesn't grow
         unbounded between SQLite's own ~1000-page auto-checkpoints. Runs outside a transaction.
 
-        The guard's entry rollback is what ensures that, so the ``_commit()`` below has no
-        transaction to commit. Taken bare, that commit made any transaction another block had
-        abandoned durable (BACKLOG #1803). It stays for its other effect: it is one more call on the
-        connection's worker, and aiosqlite keeps the previous call's result alive until the next
-        call runs, so an undrained cursor from the last writer is released before the checkpoint.
-        The PRAGMA's own cursor is drained and closed for the same reason, so it cannot leave a
+        The guard's entry rollback is what ensures that, so the ``_commit()`` in
+        :meth:`_checkpoint_wal_locked` has no transaction to commit. Taken bare, that commit made
+        any transaction another block had abandoned durable (BACKLOG #1803). It stays for its other
+        effect: it is one more call on the connection's worker, and aiosqlite keeps the previous
+        call's result alive until the next call runs, so an undrained cursor from the last writer is
+        released before the checkpoint.
+        The PRAGMA's own cursor is read and closed for the same reason, so it cannot leave a
         statement in progress for the next caller, such as :meth:`vacuum`.
 
         While a :meth:`snapshot_to` copy runs, this checkpoints PASSIVE instead (BACKLOG #1937). The
         copy's read transaction pins the WAL, so TRUNCATE would wait out the writer's busy timeout
         (measured 5.5 s) under the store lock, stalling every write, and then still fail to truncate.
         PASSIVE folds what it can without waiting. The WAL is truncated by the next checkpoint that
-        finds no copy running, which may be the next retention pass or the next snapshot. This method
-        reports neither mode's outcome, so a caller cannot tell a truncated WAL from a busy one; that
-        was already true of a TRUNCATE that found a reader."""
+        finds no copy running, which may be the next retention pass or the next snapshot.
+
+        Returns ``True`` only when a TRUNCATE ran and SQLite reported it not busy, so the ``-wal``
+        file is empty (vault BACKLOG #2619). ``False`` means it was left as it was: a TRUNCATE gave
+        up after the busy timeout because a reader still held the WAL, or the PASSIVE above ran. The
+        PRAGMA's first column is that busy flag; the caller decides what to say about it."""
         async with _writer_guard(self._db, self._lock):
-            await self._commit()
-            if self._snapshot_copies:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            else:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            await cur.fetchall()
-            await cur.close()
+            return await self._checkpoint_wal_locked()
+
+    async def _checkpoint_wal_locked(self) -> bool:
+        """The checkpoint :meth:`wal_checkpoint` and :meth:`snapshot_to` share, run under the writer
+        guard they hold. PASSIVE while a snapshot copy runs, else TRUNCATE; the return is
+        :meth:`wal_checkpoint`'s."""
+        await self._commit()
+        passive = bool(self._snapshot_copies)
+        mode = "PASSIVE" if passive else "TRUNCATE"
+        cur = await self._db.execute(f"PRAGMA wal_checkpoint({mode})")
+        # One row of (busy, log frames, checkpointed frames). No row is not a clean result.
+        row = await cur.fetchone()
+        await cur.close()
+        return not passive and row is not None and row[0] == 0
 
     async def vacuum(self) -> None:
         """Rebuild the database file to reclaim space freed by purges (SQLite ``VACUUM``). VACUUM holds
@@ -14304,22 +14336,15 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             # Fold the committed WAL frames into the main DB and truncate the -wal file. The copy's
             # consistency does not depend on this, since its read transaction sees the WAL either way.
-            # It stays for the WAL's sake: on a default config (no retention checkpoint cadence) this is
-            # the one regular TRUNCATE that shrinks the PHI-bearing -wal. It waits only for readers
-            # already in a transaction, as retention's does (BACKLOG #1937). During another snapshot's
-            # copy it would wait out the busy timeout, so it defers to the same PASSIVE rule.
-            # The guard's entry rollback leaves no open transaction to block the checkpoint, so this
-            # commit commits nothing; taken bare, it made another block's abandoned work durable
-            # (BACKLOG #1803). It stays because it is one more call on the connection's worker, which
-            # releases the result aiosqlite kept from the previous call. The PRAGMA's cursor is drained
-            # and closed so it leaves no statement in progress for the next writer.
-            await self._commit()
-            if self._snapshot_copies:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            else:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            await cur.fetchall()
-            await cur.close()
+            # It stays for the WAL's sake: with the retention cadence off, this is the one regular
+            # TRUNCATE that shrinks the PHI-bearing -wal. It waits only for readers already in a
+            # transaction, as retention's does (BACKLOG #1937). During another snapshot's copy it
+            # would wait out the busy timeout, so it defers to the same PASSIVE rule. It is the same
+            # checkpoint as `wal_checkpoint`, including the bare commit (BACKLOG #1803) and the
+            # closed cursor. Its result is not reported here, because the copy is correct either way.
+            # With the retention cadence on, a pass that cannot truncate logs it (vault BACKLOG
+            # #2619). With the cadence off, nothing reports an untruncated -wal file.
+            await self._checkpoint_wal_locked()
         # The copy, OFF the writer lock (BACKLOG #1937). Counted before the read transaction can open,
         # so a retention checkpoint that lands during the copy runs PASSIVE (see `wal_checkpoint`).
         self._snapshot_copies += 1
