@@ -1993,7 +1993,16 @@ _REMINDER_MARK_PAGE: Final = 50
 #: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
 SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
 SelfTargetOp = Literal[
-    "password_reset", "mfa_reset", "federated_bind", "federated_unbind", "disable", "delete"
+    "password_reset",
+    "mfa_reset",
+    "federated_bind",
+    "federated_unbind",
+    "disable",
+    "delete",
+    # BACKLOG #1149 (ASVS 7.5.2): each of these revokes the target's sessions on the login window.
+    "revoke_sessions",
+    "set_roles",
+    "channel_scope",
 ]
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
@@ -10794,7 +10803,11 @@ class AuthService:
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
         """Replace an account's roles. Raises :class:`LastAdministratorRefused`, having written
         nothing, when that would take Administrator from the last enabled administrator; the check
-        and the write are one store transaction (vault BACKLOG #2779). Self-target is allowed."""
+        and the write are one store transaction (vault BACKLOG #2779).
+
+        This method does not refuse a self-target; ``PUT /users/{id}/roles`` does (BACKLOG #1149),
+        so behind that route the last-administrator check is a second line, as on disable and
+        delete."""
         user = await self._store.get_user(user_id)  # for the notification address
         if not await self._store.remove_unless_last_admin(
             user_id,

@@ -3,8 +3,8 @@
 """Vault BACKLOG #3260 on the JSON plane: each self-target refusal writes its own audit row.
 
 Before this, the step-up gate's ``auth.permission_granted`` was the attempt's only row, so the
-refusal itself went unrecorded. Each of the six admin routes that refuse the caller's own account
-now writes ``auth.self_target_refused``, naming the actor and the caller's stored id. The console
+refusal itself went unrecorded. Each admin route that refuses the caller's own account now
+writes ``auth.self_target_refused``, naming the actor and the caller's stored id. The console
 plane, and the case-spelling bypass of vault BACKLOG #3259, are pinned in
 ``packaging/messagefoundry-webconsole/tests/test_ui_self_target_guard.py``.
 """
@@ -60,6 +60,11 @@ ROUTES: list[tuple[str, str, str, str | None, Any, str]] = [
     ),
     ("disable", "PATCH", "", "admin_user_update", {"disabled": True}, "cannot disable your own"),
     ("delete", "DELETE", "", None, None, "cannot delete your own"),
+    # BACKLOG #1149 (ASVS 7.5.2): each of these revokes the target's sessions, so aimed at yourself
+    # it would be a mass terminate on the login window alone.
+    ("revoke_sessions", "DELETE", "/sessions", None, None, "self-service session controls"),
+    ("set_roles", "PUT", "/roles", None, {"roles": ["viewer"]}, "your own roles"),
+    ("channel_scope", "PUT", "/channel-scope", None, {"channels": ["*"]}, "your own channel scope"),
 ]
 
 
@@ -88,8 +93,13 @@ async def test_each_self_target_refusal_writes_its_own_audit_row(
         tok = (await _login(c, "root")).json()["token"]
         r, tok = await _reauth(c, tok, purpose=purpose)
         assert r.status_code == 200, r.text
+        roles_before = await engine.store.get_user_role_ids(me.id)
         r = await c.request(method, f"/users/{me.id}{suffix}", json=body, headers=_auth(tok))
+        # A backstop: a refusal that let the write through would have revoked this session.
+        still = await c.get("/auth/me", headers=_auth(tok))
     assert r.status_code == 400, r.text
+    assert still.status_code == 200, "the refused request ended the caller's session"
+    assert await engine.store.get_user_role_ids(me.id) == roles_before
     assert words in r.json()["detail"]
     rows = await engine.store.list_audit(action="auth.self_target_refused", limit=10)
     assert len(rows) == 1, "one refusal, one audit row"
@@ -99,7 +109,20 @@ async def test_each_self_target_refusal_writes_its_own_audit_row(
     assert json.loads(str(rows[0]["detail"])) == {"op": op, "user_id": me.id}
 
 
-async def test_another_account_writes_no_refusal_row(engine: Engine) -> None:
+@pytest.mark.parametrize(
+    ("method", "suffix", "body"),
+    [
+        ("DELETE", "", None),
+        # BACKLOG #1149: the three routes it closed to the caller still act on another account, on
+        # the same login window.
+        ("DELETE", "/sessions", None),
+        ("PUT", "/roles", {"roles": ["operator"]}),
+        ("PUT", "/channel-scope", {"channels": ["*"]}),
+    ],
+)
+async def test_another_account_writes_no_refusal_row(
+    engine: Engine, method: str, suffix: str, body: Any
+) -> None:
     """The control: the same route on another account is not a refusal, so it writes no such row."""
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
@@ -109,6 +132,6 @@ async def test_another_account_writes_no_refusal_row(engine: Engine) -> None:
     async with _client(engine, service) as c:
         tok = (await _login(c, "root")).json()["token"]
         _r, tok = await _reauth(c, tok)
-        r = await c.delete(f"/users/{other.id}", headers=_auth(tok))
+        r = await c.request(method, f"/users/{other.id}{suffix}", json=body, headers=_auth(tok))
     assert r.status_code == 200, r.text
     assert await engine.store.list_audit(action="auth.self_target_refused", limit=10) == []

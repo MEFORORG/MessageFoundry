@@ -1296,11 +1296,27 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/users/{user_id}/sessions", response_model=SimpleMessage)
     async def admin_revoke_user_sessions(
         user_id: ResourceId,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        """Force-sign-out: revoke all of a user's sessions (e.g. after a compromise or offboarding)."""
-        if await service.store.get_user(user_id) is None:
+        """Force-sign-out: revoke all of a user's sessions (e.g. after a compromise or offboarding).
+
+        Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2). This route takes the login
+        window, so on yourself it would end every session you hold with no fresh proof. The
+        self-service ``DELETE /me/sessions`` does that behind a single-use ``session_terminate``
+        grant instead."""
+        target = await service.store.get_user(user_id)
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            target,
+            op="revoke_sessions",
+            detail="use the self-service session controls for your own account",
+        )
+        if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
         revoked = await service.revoke_sessions_for_user(user_id, actor=identity.username)
         return SimpleMessage(detail=f"revoked {revoked} session(s)")
@@ -1309,11 +1325,24 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def set_user_roles(
         user_id: ResourceId,
         body: RolesUpdateRequest,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        await _validate_roles(service, body.roles)
+        # BACKLOG #1149 (ASVS 7.5.2): a role write revokes the target's sessions, so on yourself it
+        # was a mass terminate on the login window. Refused before the body is checked, so a
+        # self-target is refused whatever roles it names.
         user = await service.store.get_user(user_id)
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            user,
+            op="set_roles",
+            detail="another administrator must change your own roles",
+        )
+        await _validate_roles(service, body.roles)
         if user is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
         if _externally_managed(user.auth_provider):
@@ -1609,6 +1638,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def set_channel_scope(
         user_id: ResourceId,
         body: ChannelScope,
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
@@ -1619,7 +1649,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         Saving over a directory scope needs ``expected_source: "ad"``, and a stale or mismatched
         ``expected_source`` answers 409 (BACKLOG #2098); :meth:`AuthService.set_channel_scope` says
-        why."""
+        why.
+
+        Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2): the write revokes the
+        target's sessions, as the role write does."""
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            op="channel_scope",
+            detail="another administrator must change your own channel scope",
+        )
         try:
             await service.set_channel_scope(
                 user_id,
