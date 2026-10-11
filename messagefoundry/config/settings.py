@@ -105,6 +105,7 @@ from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
 from messagefoundry.service_status import is_safe_service_name
+from messagefoundry.serviceenv import ServiceEnvPosture, service_env_loosenings
 from messagefoundry.startupcode import StartupPosture, startup_loosenings
 
 __all__ = [
@@ -621,6 +622,13 @@ class StoreSettings(_Section):
     # --- SQLite (default backend) -------------------------------------------
     path: str = "messagefoundry.db"
     synchronous: SqliteSync = SqliteSync.NORMAL
+    # PRAGMA secure_delete on the writer connection (vault BACKLOG #2619). ON zeroes the bytes of a
+    # deleted row or a purged body, so a retention purge or a consumed queue row leaves no copy in the
+    # file's free space. Default ON. The cost is extra write I/O for each page a delete frees; turning
+    # it off is a throughput choice that leaves purged bytes readable in the file, and a LOOSENING
+    # that security_loosenings() names on a file-backed store. SQLite only: the server backends
+    # ignore it, and how a server database reuses freed space is the DBA's.
+    secure_delete: bool = True
     # App-side group-commit (ADR 0055, SQLite only). When > 0, the SQLite store runs a dedicated
     # committer coroutine that COALESCES the grouped stage-handoff mutations (enqueue_ingress,
     # route_handoff, transform_handoff, mark_done, complete_with_response, dead_letter_now, mark_failed)
@@ -2569,8 +2577,10 @@ class RetentionSettings(_Section):
     survives; its PHI *columns* do not. Tiers that carry nothing but PHI and back no count (transform
     state, connection events) are DELETEd outright instead.
 
-    One knob here is default-ON rather than off: ``min_free_disk_mb``, the low-disk storage floor
-    (BACKLOG #290). It refuses a ``serve`` start and warns at runtime; it never purges anything.
+    Two knobs here are default-ON rather than off. ``min_free_disk_mb``, the low-disk storage floor
+    (BACKLOG #290), refuses a ``serve`` start and warns at runtime; it never purges anything.
+    ``wal_checkpoint_seconds`` truncates the SQLite ``-wal`` file once an hour, so a purged body
+    does not outlive the purge there (vault BACKLOG #2619).
     """
 
     # Past N days, null inbound bodies (raw/summary/error/metadata) of fully-resolved messages,
@@ -2671,10 +2681,12 @@ class RetentionSettings(_Section):
     # non-interruptible. 0 = off (the default — no cap, byte-identical to the pre-#121 pass); recommend
     # ~14400 (4h, the Corepoint default off-peak ceiling) when enabled.
     max_pass_seconds: float = 0.0
-    # PRAGMA wal_checkpoint(TRUNCATE) cadence in seconds (SQLite). 0 = off — rely on SQLite's
-    # auto-checkpoint. Evaluated once per purge pass, so a value below purge_interval_seconds is
-    # effectively rounded up to it.
-    wal_checkpoint_seconds: float = 0.0
+    # PRAGMA wal_checkpoint(TRUNCATE) cadence in seconds (SQLite). Default 3600, ON (vault BACKLOG
+    # #2619): SQLite's own auto-checkpoint reuses the -wal file but never shrinks it, so frames that
+    # still hold a purged body stay on disk past the write point. TRUNCATE empties the file, and the
+    # pass runs it after its purges. 0 = off — rely on auto-checkpoint. Evaluated once per purge
+    # pass, so a value below purge_interval_seconds is effectively rounded up to it.
+    wal_checkpoint_seconds: float = 3600.0
     # Daily local clock time "HH:MM" at which to run VACUUM (SQLite; reclaims space freed by purges).
     # "" = off. A daily off-peak time, not a cron expression, to avoid a new dependency — VACUUM holds
     # a write lock on the whole DB while it runs, so it is off by default and meant for a quiet window.
@@ -8487,6 +8499,7 @@ def security_loosenings(
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
     startup: StartupPosture | None,
+    service_env: ServiceEnvPosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -8495,7 +8508,8 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
-    ``[store].allow_unmarked_ciphertext`` (#1169),
+    ``[store].allow_unmarked_ciphertext`` (#1169), ``[store].secure_delete`` on a file-backed
+    SQLite store (vault BACKLOG #2619),
     ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
     bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
@@ -8521,7 +8535,8 @@ def security_loosenings(
     ``update_url_form="path"`` (vault BACKLOG #2571) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
     the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
-    interpreter (vault BACKLOG #2701), and
+    interpreter (vault BACKLOG #2701), the OBSERVED environment of its own Windows service (vault
+    BACKLOG #2595), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
@@ -8600,6 +8615,13 @@ def security_loosenings(
     isolated mode, the start-up code (``.pth`` import lines, ``sitecustomize``) it does not know,
     and whether the engine's own account can write the directories that code is read from.
     ``None`` has the meaning it has for ``remote_debug``, for the same reason.
+
+    ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
+    :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
+    Windows service, which engine secrets that service's registry-held environment list names,
+    and whether a store key reaches it through its environment. A store key in that list refuses
+    the start, so this registry names only what does not refuse. ``None`` has the meaning it has
+    for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -8841,6 +8863,23 @@ def security_loosenings(
                 "anyone who can write [store].uploads_dir, with no store access at all, can drop a "
                 "sidecar with a chosen uploader and have it listed, browsed and resent "
                 "(no effect without a store key)",
+            )
+        )
+    # Vault BACKLOG #2619. Off, SQLite leaves what a delete frees in the file as it was, so a purge
+    # blanks a body without removing it. Only a file-backed SQLite store has such a file: the server
+    # backends ignore the switch, and an in-memory store leaves nothing behind.
+    if (
+        not store.secure_delete
+        and store.backend is StoreBackend.SQLITE
+        and store.path != ":memory:"
+    ):
+        out.append(
+            (
+                "secure_delete",
+                "a deleted row or a retention-purged body is NOT overwritten in the SQLite file -- "
+                "its old bytes stay in the file's free space, readable by anyone who can read the "
+                "file (and, for a sealed body, holds the key), until SQLite reuses the page or a "
+                "VACUUM rebuilds the file",
             )
         )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
@@ -9241,6 +9280,11 @@ def security_loosenings(
     # kind of observation, with its wording beside its reader for the same reason.
     if startup is not None:
         out.extend(startup_loosenings(startup))
+    # --- the engine PROCESS's own Windows service environment (vault BACKLOG #2595, #2601;
+    # key-custody slice S2a). A store key reaching a service through its environment, an engine
+    # secret in the service's registry-held NSSM list, and a list that could not be read.
+    if service_env is not None:
+        out.extend(service_env_loosenings(service_env))
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

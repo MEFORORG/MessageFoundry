@@ -70,6 +70,7 @@ section reference.
 | Production tier | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
+| | `[store].secure_delete` | `true` (*conditional* — a loosening only on a file-backed SQLite store; `false` leaves a purged body's bytes in the file) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].ad_connect_timeout`, `ad_receive_timeout` | `10` s / `10` s (*conditional* — a loosening only once `ad_enabled`; a timeout above `10` s is named. The load refuses `0`, a negative, `inf`, `NaN` and anything above `3600`) |
@@ -106,7 +107,7 @@ section reference.
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
-`[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
+`[store].allow_unmarked_ciphertext`, `[store].secure_delete`, `[auth].ad_session_recheck_seconds`,
 `[auth].ad_allow_insecure_ldap`, `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
 `[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
 `[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
@@ -570,6 +571,21 @@ This section is kept rather than deleted, because the claim it used to make is t
   (owner ruling 2026-09-23), alerting under its own subject `upload-cipher`. With this on, it is served as plaintext instead. Under
   `cipher_provider = "vault_transit"` uploads pass through either way; [PHI.md](PHI.md) §3 says why.
 - **Not covered either way:** the DIRECT S/MIME connector's enveloped body.
+
+### `[store].secure_delete = false` — a purged body's bytes stay in the SQLite file
+- **What you lose:** SQLite stops overwriting what a delete frees. A retention purge blanks a body,
+  and a consumed queue row is deleted, but the old bytes stay in the file's free space. Anyone who can
+  read the file can carve them out until SQLite reuses the page or a `VACUUM` rebuilds the file. On a
+  keyed store a sealed body stays sealed, so reading it also needs the key (vault BACKLOG #2619).
+- **When acceptable:** a throughput measurement, or a store whose file nobody but the engine's own
+  account can read and that is never copied off the machine. The cost of leaving it on is extra write
+  I/O for each page a delete frees; `docs/CONFIGURATION.md` gives one measurement.
+- **Compensating controls:** the store file's ACL; `[store].encryption_key`, which keeps a sealed
+  body sealed in free space too; a scheduled `[retention].vacuum_at`, which rebuilds the file.
+- **Reported only on a file-backed SQLite store.** The server backends ignore the switch, and an
+  in-memory store has no file, so `security_loosenings()` names neither.
+- **Reversible:** yes, from the next open. Pages freed while it was off keep their bytes until SQLite
+  reuses them or a `VACUUM` runs.
 
 ### `[secret_rotation].enforce_store_key_expiry = false` — the store DEK's calendar expiry stops the engine no more
 - **What you lose:** the **hard stop** on a calendar-expired data-encryption key. With it on, a DEK past
@@ -1663,6 +1679,52 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
   supervisor starts it with `-P`, not `-I`.
 
+### `service_environment_secret`, `store_key_in_service_environment` and `service_environment_unobservable`: secrets in the Windows service's environment
+
+> **OBSERVATIONS, not switches.** No setting declares them. They follow from where the engine's
+> Windows service gets its environment. Vault BACKLOG #2595 and #2601.
+- **What they are about:** a Windows service's environment lists live in its registry key:
+  NSSM's `AppEnvironmentExtra` and `AppEnvironment` under `Parameters`, and the service's own
+  `Environment` value. Who can read that key, and how that was measured, is stated once in
+  [`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
+- **What is refused:** a store key in those lists, `MEFOR_STORE_ENCRYPTION_KEY` or
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`. `serve` and `supervise` refuse to start on it under
+  **every** `[security].enforcement` setting, before they open the store, and the refusal names
+  the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in the
+  environment, and a secret in a Windows service's NSSM environment, are refused always. They also
+  refuse a store key in their own environment when they found their service but could not read
+  its lists, since the key most likely came from there. The DPAPI key file is the way in
+  ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)).
+- **`service_environment_secret`: another engine secret is in that list.** The entry names each
+  one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
+  signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
+  tokens and the AI key. The same ruling would refuse them. No protected way in exists for them
+  yet, so a refusal would leave a Windows service no way to start with one, and the entry names
+  them instead. Refusing them waits on that way in.
+- **`store_key_in_service_environment`: a store key reaches the service through its
+  environment.** It is named wherever the key came from, once the engine knows its service. The
+  machine-wide environment is readable by every local user too. A key in the service's own
+  lists refuses first, so the entry normally means the machine-wide environment.
+- **`service_environment_unobservable`: the engine could not finish the reading.** The entry
+  carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
+  service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
+  It starts unless the last case applies with a store key in its environment. Check the lists
+  yourself.
+- **How the engine finds its own service:** it walks up through the Python interpreter processes
+  above it. When the first other process is `nssm.exe`, it asks the Service Control Manager which
+  service runs there. When that process is anything else, such as a shell, the engine is not a
+  service, unless an `nssm.exe` sits further up. Then it cannot tell a wrapper NSSM starts from a
+  shell inside another NSSM service, and names `service_environment_unobservable`.
+- **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
+  for the engine's own process. `supervise` logs one WARNING for each entry at start.
+  `messagefoundry security show` is a separate process, so it reports none of them, and its scope
+  line says so. The reading is taken once, at start.
+- **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
+  list or the service's own `Environment` value, and from the machine-wide environment. Keep the
+  store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
+- **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
+  and a secret a connection reads through `env()`, whose name only your config knows.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -1720,6 +1782,7 @@ chapter was not part of the verification above.
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `interpreter_not_isolated` / `python_variables_reach_children` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
+| `service_environment_secret` / `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

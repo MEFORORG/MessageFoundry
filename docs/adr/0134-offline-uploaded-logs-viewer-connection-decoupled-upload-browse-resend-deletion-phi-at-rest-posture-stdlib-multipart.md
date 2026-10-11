@@ -64,8 +64,11 @@ access, and injects a resent message through a **distinct ingest path** — neve
 3. **Step-up + audit on every access; never log bodies.** Upload, browse, resend and delete each require
    a **deny-by-default permission** (`files:upload` / `files:browse` / `files:delete`, granted to
    OPERATOR + administrator) and write an audit row (`upload.create` / `upload.browse` / `upload.resend` /
-   `upload.delete`) carrying **metadata only** — file_id, filename, size, message count, and for browse the
-   search-needle **shape** (never its value, reusing the ADR 0046 `_needle_shape`). Browse (which decrypts
+   `upload.delete`) carrying **metadata only** — file_id, size, message count, and for browse the
+   search-needle **shape** (never its value, reusing the ADR 0046 `_needle_shape`). **CORRECTED
+   2026-10-10 (vault BACKLOG #2619):** this list included the filename. No upload audit row carries it
+   now, because `audit_log.detail` is plaintext and kept and an operator-chosen name can hold a patient
+   identifier. Browse (which decrypts
    and returns PHI bodies) additionally requires **step-up** re-auth and `enforce_phi_read_hop`
    ([ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)), the same posture
    as content search. No body ever reaches the log at INFO+.
@@ -112,8 +115,9 @@ this same subsystem (no separate ADR number):
   a mismatch raises `UploadPathError` (404), never touching the filesystem. This same guard fronts browse,
   read and resend — every route that takes a `file_id`.
 - **Deny-by-default + audit.** Delete requires `files:delete` (+ console step-up) and writes an
-  `upload.delete` audit row (actor + file_id + filename + size) **after** the removal, so the destructive
-  action is attributable in the tamper-evident chain.
+  `upload.delete` audit row (actor + file_id + size) **after** the removal, so the destructive
+  action is attributable in the tamper-evident chain. The row carried the filename until 2026-10-10
+  (vault BACKLOG #2619).
 
 ## Acceptance Criteria
 

@@ -220,14 +220,13 @@ One swaps the primary checkout onto another branch. The other points a git comma
 that is not yours. It fires when
 you try to write inside the primary checkout, so write inside your own worktree, by absolute path.
 
-### Stage explicit paths, though nothing enforces that today
+### Stage explicit paths; a guard catches only the common blanket spellings
 
-Nothing blocks `git add -A`, `git add .`, or `git commit -a`. The blanket-stage guard is written and
-fully tested, and no settings file in this repository wires it.
-`tests/test_claude_settings_contract.py` records that under `_KNOWN_UNWIRED` as BACKLOG #1339.
-What wiring waits on is in
-[`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), *What wiring waits on*.
-Treat this as a rule with no enforcement behind it.
+`.claude/settings.json` wires the blanket-stage guard for the Bash and PowerShell tools (BACKLOG
+#1339). It denies the common spellings of `git add -A`, `git add .` and `git commit -a`, and it is a
+best-effort check: [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md) lists
+at least the forms it lets through. Stage by explicit path anyway. A command that passes the guard
+is not thereby scoped.
 
 ### Required contexts refuse the merge, not you
 
