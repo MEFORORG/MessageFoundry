@@ -432,12 +432,11 @@ in-flight rows stranded.
 >   two together. They run under the coordinator's lock, so an anchor on a share that stopped
 >   answering used to hold every later activate and release too. One that does not answer in time
 >   is an abort like any refusal. Its reason says the preflight stopped it, not that a bind
->   failed. The bound stops the wait, not the read: the thread reading the share stays blocked until
->   the share answers. The preflight that timed out is left to finish, so its audit rows can land
->   after the abort's. While its read is blocked, the next activation's preflight is refused as an
->   abort and starts no read. So retried DR preflights do not pile threads onto a dead share. That
->   retry still runs steps 1 to 3 first, the takeover hook included. The guard covers only this
->   preflight: at least an operator reload's own anchor reads can still each block a thread.
+>   failed. The timeout cancels the preflight, which frees the lock but not the read. A read blocked
+>   on the share sits in a default-executor thread that no cancel can stop, so that thread may stay
+>   stuck until the share answers. Nothing refuses a retry while it is stuck. Each retry against the
+>   same dead share can strand one more thread, and enough of them could use up the default
+>   executor.
 > - The reload after them is not bounded. Cancelling it partway rolls back a takeover the VIP has
 >   already moved for. A lane's first build is isolated to that lane, as the #3263 amendment says.
 >   So the reload's own reads still have no bound: at least each outbound and FTPS poller CA
@@ -448,10 +447,9 @@ in-flight rows stranded.
 >   The deeper fix splits the reload into a prepare step before the hook and an apply step after
 >   it. It is not built.
 > - Every abort row of an activation names the `dr_seed` marker that attempt wrote, as
->   `seed_segment`. It also records `vip_hook_ran`, which says the takeover hook's process started.
->   On Windows that is once the hook is resumed into its job. A hook that could not be started
->   reads false. One that started and then failed or was killed reads true, because it may still
->   have moved the address. The marker stays, as audit rows do, and a retry writes its own, so each
+>   `seed_segment`. It also records `vip_hook_ran`. The `takeover_hook` row of
+>   [CONFIGURATION.md](../CONFIGURATION.md) says what it and the reason record when the hook never
+>   started, exits non-zero, or times out. The marker stays, as audit rows do, and a retry writes its own, so each
 >   attempt's fork point is recorded. When the hook ran before an abort, at step 3 or step 4, the
 >   reason says the VIP may have moved to this box. An interrupted reload with no hook says the
 >   same, because the reload may have bound a listener first. An activation cut off in the

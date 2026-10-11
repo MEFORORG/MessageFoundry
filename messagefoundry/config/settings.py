@@ -6196,9 +6196,11 @@ class DrSettings(_Section):
     # "failed"). An unknown value fails config load.
     priority_threshold: Priority = Priority.CRITICAL
     # acquire-VIP-or-abort (ADR 0048): an OPTIONAL operator command run before binding the priority
-    # listeners — exit 0 / success = "VIP acquired", any non-zero / timeout = "not acquired" (activation
-    # ABORTS). For an ADR-0047 LB topology the passive LB is the fence and this is belt-and-braces only;
-    # "" (the default) = no hook (rely on the passive LB). Whitespace-only is rejected at load.
+    # listeners. Exit 0 = "VIP acquired"; anything else ABORTS activation. What the abort row says
+    # for a hook that never started, exited non-zero, or timed out is in the takeover_hook row of
+    # docs/CONFIGURATION.md (vault BACKLOG #3094). For an ADR-0047 LB topology the passive LB is
+    # the fence and this is belt-and-braces only; "" (the default) = no hook (rely on the passive
+    # LB). Whitespace-only is rejected at load.
     takeover_hook: str = ""
     # The symmetric release command run on POST /dr/release (release the VIP back to the recovered
     # primary). "" = no hook. Whitespace-only is rejected at load.

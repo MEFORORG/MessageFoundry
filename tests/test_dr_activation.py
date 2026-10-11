@@ -97,8 +97,9 @@ async def test_acquire_vip_hook_success_activates(tmp_path: Path) -> None:
 
 
 async def test_acquire_vip_or_abort_records_audit(tmp_path: Path) -> None:
-    # AC-6: a takeover_hook that FAILS (non-zero) = "VIP not acquired" → abort, no priority listener
-    # bound (the run-profile never activated), stays passive, records dr_activation_aborted.
+    # AC-6: a takeover_hook that FAILS (non-zero) → abort, no priority listener bound (the
+    # run-profile never activated), stays passive, records dr_activation_aborted. What that row
+    # says about the VIP is in the takeover_hook row of docs/CONFIGURATION.md.
     store, archive, ss = await _seed(tmp_path)
     try:
         coord, state = _coord(store, ss, seed_archive=archive, takeover_hook=_FAIL_HOOK)
@@ -114,7 +115,9 @@ async def test_acquire_vip_or_abort_records_audit(tmp_path: Path) -> None:
 
 
 async def test_vip_hook_timeout_aborts(tmp_path: Path) -> None:
-    # A hook that exceeds takeover_timeout_seconds = "not acquired" → abort (no hang).
+    # A hook that exceeds takeover_timeout_seconds is killed and the activation aborts (no hang).
+    # It started, so its abort row says the VIP may have moved; the takeover_hook row of
+    # docs/CONFIGURATION.md says what each hook outcome records (vault BACKLOG #3094).
     #
     # THE BUDGET IS 3.0s AND NOT 0.3s, AND THAT IS THE WHOLE POINT OF THIS COMMENT.
     # `takeover_timeout_seconds` bounds TWO things, not one: the VIP takeover hook this test is

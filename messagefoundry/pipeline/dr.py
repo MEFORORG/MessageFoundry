@@ -119,12 +119,6 @@ class DrActivationError(RuntimeError):
         self.kind = kind
 
 
-class DrPreflightBusyError(RuntimeError):
-    """A DR activation's trust-anchor preflight was refused because an earlier one that timed out
-    is still reading. The engine starts no new read while one is stuck on a share that does not
-    answer, so retries cannot use up the default executor's threads (vault BACKLOG #3094)."""
-
-
 @dataclass(frozen=True)
 class DrResult:
     """The PHI-free outcome of an activate/release — returned for the API response + tests. Paths,
@@ -441,8 +435,8 @@ class DrCoordinator:
             await self._activate_profile()
         except Exception as exc:
             self._active = False
-            # A preflight that refused, timed out, or found an earlier one still reading bound
-            # nothing, so its reason must not say a bind failed (vault BACKLOG #3094).
+            # A preflight that refused or timed out bound nothing, so its reason must not say a
+            # bind failed (vault BACKLOG #3094).
             reason = (
                 "DR activation stopped at its trust-anchor preflight, before any listener was bound"
                 if progress.in_preflight
@@ -1213,10 +1207,10 @@ class DrCoordinator:
         ("VIP acquired"/"VIP released"); any non-zero or a timeout is a failure. On the **takeover** phase
         a failure ABORTS activation (acquire-VIP-or-abort) + records ``dr_activation_aborted``; on the
         **release** phase a failure is logged but does not block the hand-back (the passive LB still moves
-        the VIP when intake unbinds — the hook is belt-and-braces). For a takeover, returns whether
-        the hook's process started, and records that on the running attempt at the moment
-        :attr:`_ActivationProgress.hook_ran` names (vault BACKLOG #3094). For a release, returns
-        whether a hook was invoked. ``""`` = no hook (rely on the passive ADR-0047 LB)."""
+        the VIP when intake unbinds — the hook is belt-and-braces). Returns whether a hook was invoked.
+        A takeover records whether the hook's process started on the running attempt, at the
+        moment :attr:`_ActivationProgress.hook_ran` names (vault BACKLOG #3094). ``""`` = no hook
+        (rely on the passive ADR-0047 LB)."""
         if not command:
             return False
         started = False
@@ -1263,9 +1257,7 @@ class DrCoordinator:
                 log.warning(
                     "DR release: %s — continuing hand-back (passive LB moves the VIP)", reason
                 )
-        # A release keeps its old meaning, "invoked": a release hook a timeout cut off while it
-        # started is left to run, so it may still move the address.
-        return started if phase == "takeover" else True
+        return True
 
     async def _record_aborted(
         self,

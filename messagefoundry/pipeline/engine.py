@@ -64,7 +64,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.crl_reload import CrlReloadRunner
-from messagefoundry.pipeline.dr import DrCoordinator, DrPreflightBusyError
+from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
@@ -462,10 +462,6 @@ class Engine:
         # manual, audited activate/release: cold-seed restore-verify (fail-closed) → new audit-chain
         # segment → acquire-VIP-or-abort → serve under the DR run-profile. None until first accessed.
         self._dr_coordinator: DrCoordinator | None = None
-        # A DR activation's trust-anchor preflight that timed out, left to finish because its read
-        # is blocked in a thread no cancel can stop. A new one is refused while it runs (vault
-        # BACKLOG #3094).
-        self._dr_preflight_left: asyncio.Task[None] | None = None
         # [reference] enforcement (ADR 0006). None (embedding/tests) → default settings; the reference
         # sync runner is a no-op when the graph declares no reference sets.
         self._reference_settings = reference_settings
@@ -902,18 +898,16 @@ class Engine:
 
         They read trust-anchor files, which may sit on a share at the failed site, and they run
         under the coordinator's lock, so with no bound a share that stops answering held every
-        later activate and release too. A timeout raises ``TimeoutError``, which the caller rolls
-        back like any refusal. The reload that follows is not bounded here. Cancelling it partway
-        rolls back a takeover the VIP has already moved for, and the runner gives each lane's first
-        build its own isolation (ADR 0048, the vault BACKLOG #3263 amendment).
+        later activate and release too. A timeout cancels them and raises ``TimeoutError``, which
+        the caller rolls back like any refusal. The reload that follows is not bounded here.
+        Cancelling it partway rolls back a takeover the VIP has already moved for, and the runner
+        gives each lane's first build its own isolation (ADR 0048, the vault BACKLOG #3263
+        amendment).
 
-        A preflight that times out is left to finish, not cancelled. Its read is blocked in a
-        default-executor thread, which a cancel cannot stop, and would leave with nothing tracking
-        it. While it runs, a new DR preflight raises :class:`DrPreflightBusyError` and starts no
-        thread, so retries against a share that does not answer cannot use up the executor. Once
-        its read returns, it finishes the check it was in, and its audit rows can land after the
-        abort's; it starts no check past its bound. An activation cancelled while its preflight runs
-        cancels the preflight, as before, and a read it was blocked in is not tracked.
+        The cancel frees the lock, not the read. A read blocked on a share that does not answer
+        sits in a default-executor thread, which a cancel cannot stop, so that thread may stay
+        stuck. Each retry against the same dead share can strand one more, and enough of them
+        could use up the default executor.
 
         It tells the coordinator while it runs (:meth:`DrCoordinator.note_profile_preflight`), so
         an abort here says the preflight stopped the activation and makes no claim that a listener
@@ -921,56 +915,20 @@ class Engine:
         coord = self._dr_coordinator
         if coord is not None:
             coord.note_profile_preflight(True)
-        left = self._dr_preflight_left
-        if left is not None and not left.done():
-            raise DrPreflightBusyError(
-                "an earlier trust-anchor preflight timed out and is still reading; check the share "
-                "the trust anchors are on, and retry once that read returns"
-            )
         timeout = self._dr_settings.takeover_timeout_seconds
-        deadline = asyncio.get_running_loop().time() + timeout
-        task = asyncio.ensure_future(self._dr_preflight_checks(registry, deadline))
+        bound = asyncio.timeout(timeout)
         try:
-            done, _pending = await asyncio.wait({task}, timeout=timeout)
-        except BaseException:
-            task.cancel()
-            task.add_done_callback(self._dr_preflight_ended)
-            raise
-        if not done:
-            self._dr_preflight_left = task
-            task.add_done_callback(self._dr_preflight_ended)
-            raise TimeoutError(f"the trust-anchor preflight did not answer within {timeout:g}s")
-        if task.cancelled():
-            # Cancelled by something other than this caller, whose own cancellation is handled
-            # above. Read as a refusal, never as this activation being cancelled.
-            raise RuntimeError("the trust-anchor preflight was cancelled")
-        task.result()  # re-raise its refusal, including a TimeoutError of its own
+            async with bound:
+                await self.preflight_settings()
+                await self.preflight_registry(registry)
+        except TimeoutError as exc:
+            if not bound.expired():
+                raise  # a TimeoutError from inside the preflight is its own error
+            raise TimeoutError(
+                f"the trust-anchor preflight did not answer within {timeout:g}s"
+            ) from exc
         if coord is not None:
             coord.note_profile_preflight(False)
-
-    async def _dr_preflight_checks(self, registry: Registry, deadline: float) -> None:
-        """The two trust-anchor preflights :meth:`_dr_preflight` bounds. Past ``deadline`` the
-        caller has stopped waiting, so one left to finish refuses rather than start the second
-        read nobody waits for. The loop clock decides, not whether the caller has recorded the
-        timeout yet, which can come a loop turn later. It raises rather than returns, so a caller
-        that has not yet seen its timeout never reads a skipped check as passed."""
-        await self.preflight_settings()
-        if asyncio.get_running_loop().time() >= deadline:
-            raise TimeoutError("the trust-anchor preflight ran past its bound")
-        await self.preflight_registry(registry)
-
-    def _dr_preflight_ended(self, task: asyncio.Task[None]) -> None:
-        """Log how a DR preflight the activation stopped waiting for ended, so its error is read
-        rather than reported as never retrieved, and stop holding it (vault BACKLOG #3094)."""
-        if self._dr_preflight_left is task:
-            self._dr_preflight_left = None
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            log.warning("DR: a trust-anchor preflight left to finish failed: %s", safe_exc(exc))
-        else:
-            log.info("DR: a trust-anchor preflight left to finish has returned")
 
     async def _dr_config_drift(self) -> dict[str, object]:
         """The provenance fields a DR activation records: the activated graph's digest, and whether
@@ -3033,11 +2991,6 @@ class Engine:
     async def stop(self) -> None:
         """Stop the retention task + the wired graph, then close the store."""
         log.info("engine stopping")
-        # A DR preflight left to finish must not write audit rows to a store this closes. Its read
-        # stays blocked in its thread; only the rest of its checks is stopped.
-        if self._dr_preflight_left is not None:
-            self._dr_preflight_left.cancel()
-            self._dr_preflight_left = None
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
