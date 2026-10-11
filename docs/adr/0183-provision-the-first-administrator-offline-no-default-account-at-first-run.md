@@ -216,7 +216,7 @@ re-measurement. See Amendment A.*
 
 ## To resolve on acceptance
 
-- [ ] Whether the wider refusal (no enabled administrator, rather than an empty table) should also
+- [x] Whether the wider refusal (no enabled administrator, rather than an empty table) should also
       subsume BACKLOG #1236's recovery affordance, or the two stay separate commands.
 - [x] Whether `scripts/` is inside this cell's corpus. The method names three artifacts while the
       ASVS verifier scans four roots, and `scripts/dev/sqlserver-docker.ps1` carries a hard-coded
@@ -229,6 +229,12 @@ boxes stay open.*
 ticked. Its premise, that the method names three artifacts, no longer holds: see
 `docs/ASVS-ASSESSMENT-METHOD.md` section 2 for the current scope, and the note under item (b) of
 Amendment A. This note says nothing about the first item.*
+
+*Amended 2026-10-11 (BACKLOG #2304): the first item is decided, so its box is ticked. Amendment A's
+recommendation on item (a) is adopted: `provision-admin` and the #1236 lockout recovery stay separate
+commands, and the overlap is recorded there. No build follows. Seat decision under owner delegation
+2026-10-08, not an owner ruling; vault `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section
+"#2304 (batch 240)".*
 
 ## Amendment A (2026-09-23) — the default account is retired, by owner ruling
 
