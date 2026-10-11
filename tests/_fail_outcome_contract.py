@@ -27,7 +27,7 @@ async def assert_fail_outcomes(store: Any) -> None:
     """Drive both calls through every branch on ``store`` and pin the outcome each returns."""
     run = uuid4().hex[:8]
     single, batch = f"OB_FAIL_{run}", f"OB_BATCH_{run}"
-    await store.enqueue_message(
+    mid = await store.enqueue_message(
         channel_id=f"IB_{run}",
         raw=_RAW,
         deliveries=[(single, "p"), (batch, "q")],
@@ -44,7 +44,7 @@ async def assert_fail_outcomes(store: Any) -> None:
     (again,) = await store.claim_ready(now=2000.0, destination_name=single)
     assert again.id == row.id
     assert await store.mark_failed(row.id, "transient", capped, now=2000.0) == FailOutcome(
-        dead=1, head_id=row.id, attempts=2
+        dead=1, head_id=row.id, attempts=2, dead_messages=(mid,)
     )
     # A late retry on the row that is already DEAD keeps its state: a retry time, nothing dead.
     late = await store.mark_failed(row.id, "late", RetryPolicy(max_attempts=None), now=3000.0)
@@ -59,4 +59,4 @@ async def assert_fail_outcomes(store: Any) -> None:
     outcome = await store.mark_batch_failed(
         [f"gone-{run}", member.id], "envelope failed", RetryPolicy(max_attempts=1), now=4000.0
     )
-    assert outcome == FailOutcome(dead=1, head_id=member.id, attempts=1)
+    assert outcome == FailOutcome(dead=1, head_id=member.id, attempts=1, dead_messages=(mid,))

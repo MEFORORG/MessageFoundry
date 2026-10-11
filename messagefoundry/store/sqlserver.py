@@ -9286,7 +9286,9 @@ class SqlServerStore:
                 if status == OutboxStatus.DEAD.value:
                     await self._maybe_finalize(cur, message_id, now)
                     await self._commit(conn)
-                    return FailOutcome(dead=1, head_id=outbox_id, attempts=attempts)
+                    return FailOutcome(
+                        dead=1, head_id=outbox_id, attempts=attempts, dead_messages=(message_id,)
+                    )
                 await self._commit(conn)
                 return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
             except Exception:
@@ -9401,6 +9403,7 @@ class SqlServerStore:
                     dead=0 if retrying else changed,
                     head_id=present[0][0],
                     attempts=head_attempts,
+                    dead_messages=tuple(finalize),  # filled on the DEAD branch only
                 )
             except Exception:
                 await conn.rollback()

@@ -441,12 +441,16 @@ async def test_an_outbound_that_never_started_logs_its_dead_letter(
     assert_no_token(caplog.records)
 
 
+# What every STOP dead-letter line says, and no other line does.
+_STOP_SAID = "so the stop dead-lettered"
+
+
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
 async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
     store: MessageStore, caplog: pytest.LogCaptureFixture, batch: bool
 ) -> None:
     # Item 5: the STOP arm's mark_failed dead-letters at a finite cap, which bounds a STOP and
-    # re-arm loop. A line says so and names what to replay; InternalErrorPolicy states how. The
+    # re-arm loop. A line says so and names what to replay; docs/USER-GUIDE.md states how. The
     # batch is drawn from two messages, so the line has to name both.
     caplog.set_level(logging.WARNING, logger=LOGGER)
     for cap, status in ((2, OutboxStatus.PENDING), (1, OutboxStatus.DEAD)):
@@ -470,7 +474,7 @@ async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
         assert outcome is wiring_runner._ItemOutcome.STOPPED
         rows = [r for m in mids for r in await store.outbox_for(m)]
         assert [r["status"] for r in rows] == [status.value] * len(mids)
-        said = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
+        said = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
         if status is OutboxStatus.PENDING:
             assert said == []  # below the cap the stop re-pends and says nothing more
             for r in rows:
@@ -479,12 +483,15 @@ async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
         (line,) = said
         text = line.getMessage()
         if batch:
-            assert f"the head row {item.id} of a batch of 2" in text
-            assert "after 1 attempt(s) of its own" in text
-            assert f"2 message(s): {mids[0]}, {mids[1]};" in text
-            assert "replay them from the dead-letter queue, or replay each message" in text
+            assert (
+                f"batch row {item.id}, the first one still present, had made 1 attempt(s)" in text
+            )
+            assert "dead-lettered all 2 row(s) still present, whatever their own attempts" in text
+            assert f"they belong to 2 message(s), {mids[0]}, {mids[1]};" in text
+            assert "the dead-letter queue lists every one: replay them from there" in text
         else:
-            assert f"row {item.id} (message {mids[0]})" in text
+            assert f"row {item.id} (message {mids[0]}) had made 1 attempt(s)" in text
+            assert "at or past its retry cap" in text
             assert f"replay it from the dead-letter queue, or replay message {mids[0]}" in text
         # Both recoveries the line names hold for an outbound row: the dead-letter queue lists it,
         # and replaying each named message re-queues its row.
@@ -538,7 +545,7 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
 ) -> None:
     # Item 5, the router and transform STOP arms, which take the cap from the delivery defaults.
     # Their dead row is an ingress or routed row, which the dead-letter queue never lists; the line
-    # says so and names the message to replay. InternalErrorPolicy states the recovery once.
+    # says so and names the message to replay. docs/USER-GUIDE.md states the recovery once.
     caplog.set_level(logging.WARNING, logger=LOGGER)
     runner = RegistryRunner(
         Registry(),
@@ -555,7 +562,7 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
     )
     outcome, _ = await apply("c1", item, RuntimeError("bug"))
     assert outcome is wiring_runner._ItemOutcome.STOPPED
-    said = [r for r in caplog.records if "rather than keeping it queued" in r.getMessage()]
+    said = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
     if cap == 2:
         assert await _status(store, item.id) == OutboxStatus.PENDING.value
         assert said == []
@@ -563,9 +570,9 @@ async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
     assert await _status(store, item.id) == OutboxStatus.DEAD.value
     (line,) = said
     text = line.getMessage()
-    assert f"{stage} worker 'c1': row {item.id} (message {mid})" in text
-    assert "it is not in the dead-letter queue, which lists outbound rows only" in text
-    assert f"replaying message {mid} re-queues it" in text
+    assert f"{stage} worker 'c1': row {item.id} (message {mid}) had made 1 attempt(s)" in text
+    assert "the dead-letter queue lists outbound rows only, so it is not there" in text
+    assert f"replay message {mid} to re-queue it" in text
     assert "ERROR" not in text and "replay it from the dead-letter queue" not in text
     # Both claims hold in every shape, the two-handler one included: the view does not list the
     # row, and replaying the message re-queues it (with any sibling still PENDING).
@@ -635,3 +642,110 @@ def test_held_reports_the_rows_a_pair_holds() -> None:
     assert log.held("a", "AR") == 3
     assert log.held("a", "AR", exhausted=True) == 4
     assert log.held("b", "AR") == 0
+
+
+async def test_a_stop_on_a_batch_dead_letters_members_below_the_cap(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # mark_batch_failed decides from the first member still present. Here that member is past the
+    # cap and the second is below it: both are dead-lettered, and the line says so.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=2, **FAST))
+    runner._internal_error[OUT] = InternalErrorPolicy.STOP
+    cfg = BatchConfig(max_count=2, max_wait_ms=1)
+    runner._batch[OUT] = cfg
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
+        )
+        for n in (1, 2)
+    ]
+    (first,) = await store.outbox_for(mids[0])
+    await store._db.execute("UPDATE queue SET attempts=5 WHERE id=?", (first["id"],))
+    await store._db.commit()
+    head = await _claim(store)
+    assert head.id == first["id"] and head.attempts == 6
+    outcome, _ = await runner._process_delivery_batch(OUT, head, cfg)
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    rows = [r for m in mids for r in await store.outbox_for(m)]
+    assert [(r["status"], r["attempts"]) for r in rows] == [
+        (OutboxStatus.DEAD.value, 6),
+        (OutboxStatus.DEAD.value, 1),  # one attempt, below the cap of 2, and dead all the same
+    ]
+    (line,) = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
+    text = line.getMessage()
+    assert f"batch row {head.id}, the first one still present, had made 6 attempt(s)" in text
+    assert "all 2 row(s) still present, whatever their own attempts" in text
+
+
+async def test_a_stop_on_a_batch_neither_counts_nor_names_a_vanished_member(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The line counts and names what the store wrote, not the rows the arm handed it.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=1, **FAST))
+    runner._internal_error[OUT] = InternalErrorPolicy.STOP
+    cfg = BatchConfig(max_count=3, max_wait_ms=1)
+    runner._batch[OUT] = cfg
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
+        )
+        for n in (1, 2, 3)
+    ]
+    real = store.mark_batch_failed
+
+    async def vanish_then_fail(ids: list[str], error: str, retry: RetryPolicy) -> FailOutcome:
+        assert len(ids) == 3
+        await store._db.execute("DELETE FROM queue WHERE id=?", (ids[2],))
+        await store._db.commit()
+        return await real(ids, error, retry)
+
+    monkeypatch.setattr(store, "mark_batch_failed", vanish_then_fail)
+    outcome, _ = await runner._process_delivery_batch(OUT, await _claim(store), cfg)
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    (line,) = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
+    text = line.getMessage()
+    assert "all 2 row(s) still present" in text
+    assert f"they belong to 2 message(s), {mids[0]}, {mids[1]};" in text
+    assert mids[2] not in text
+
+
+def test_a_stop_line_names_the_first_ten_messages_and_counts_them_all(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Item 7: the overflow branch. Twelve messages: the line counts twelve and names ten.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    messages = tuple(f"msg-{n:02d}" for n in range(12))
+    failed = FailOutcome(dead=12, head_id="row-0", attempts=3, dead_messages=messages)
+    wiring_runner._note_stop_dead_letter("delivery worker", OUT, failed, Stage.OUTBOUND.value)
+    (line,) = caplog.records
+    text = line.getMessage()
+    assert "they belong to 12 message(s), the first 10: " + ", ".join(messages[:10]) + ";" in text
+    assert "msg-10" not in text and "msg-11" not in text
+    assert "the dead-letter queue lists every one" in text
+
+
+def test_a_stop_line_for_several_rows_takes_its_recovery_from_the_stage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Item 7: the batch branch reads the stage it is handed, not a hardcoded outbound text. A batch
+    # is outbound-only today; this pins that a non-outbound stage never points at the dead-letter
+    # queue.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    failed = FailOutcome(dead=2, head_id="row-0", attempts=1, dead_messages=("m1", "m2"))
+    wiring_runner._note_stop_dead_letter("transform worker", "c1", failed, Stage.ROUTED.value)
+    (line,) = caplog.records
+    text = line.getMessage()
+    assert "the dead-letter queue lists outbound rows only, so they are not there" in text
+    assert "replay each message to re-queue them" in text
+    assert "lists every one" not in text
+
+
+def test_a_stop_line_writes_nothing_when_nothing_was_dead_lettered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    for failed in (FailOutcome(retry_at=5.0, head_id="r", attempts=1), FailOutcome()):
+        wiring_runner._note_stop_dead_letter("delivery worker", OUT, failed, Stage.OUTBOUND.value)
+    assert caplog.records == []

@@ -1035,12 +1035,16 @@ class FailOutcome:
     there: the one row, or a batch's first member still present. Both are ``None`` when no row was
     present, and on Postgres and SQL Server also when the H1 fence rolled back a DEAD write on a row
     that was present. They can differ from what the claim returned: a lease sweep can re-pend a row under a
-    slow send, and a second claim then spends another attempt."""
+    slow send, and a second claim then spends another attempt.
+
+    ``dead_messages`` holds the message ids of the rows that ``dead`` counts, each once, in the order
+    the call was handed the rows. So a vanished member is neither counted nor named."""
 
     retry_at: float | None = None
     dead: int = 0
     head_id: str | None = None
     attempts: int | None = None
+    dead_messages: tuple[str, ...] = ()
 
 
 class ClaimAbortPhase(StrEnum):
@@ -9755,6 +9759,7 @@ class MessageStore:
                 dead=0 if retrying else 1,
                 head_id=outbox_id,
                 attempts=attempts,
+                dead_messages=() if retrying else (row["message_id"],),
             )
             if retrying and cur.rowcount == 0:
                 raise _AbortMember(None)  # zero-mutation exit, as the other no-op paths
@@ -9847,6 +9852,7 @@ class MessageStore:
                 dead=0 if retrying else changed,
                 head_id=present[0][0],
                 attempts=head_attempts,
+                dead_messages=tuple(finalize),  # filled on the DEAD branch only, in handed order
             )
             if not changed:
                 raise _AbortMember(None)  # every member was skipped: a zero-mutation exit

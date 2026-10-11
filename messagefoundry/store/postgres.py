@@ -5550,7 +5550,12 @@ class PostgresStore:
                 )
                 if status == OutboxStatus.DEAD.value:
                     await self._maybe_finalize_message(conn, row["message_id"], now)
-                    return FailOutcome(dead=1, head_id=outbox_id, attempts=attempts)
+                    return FailOutcome(
+                        dead=1,
+                        head_id=outbox_id,
+                        attempts=attempts,
+                        dead_messages=(row["message_id"],),
+                    )
                 return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)
@@ -5651,6 +5656,7 @@ class PostgresStore:
                     dead=0 if retrying else changed,
                     head_id=present[0][0],
                     attempts=head_attempts,
+                    dead_messages=tuple(finalize),  # filled on the DEAD branch only
                 )
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)
