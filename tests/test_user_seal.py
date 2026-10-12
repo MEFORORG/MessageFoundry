@@ -149,14 +149,19 @@ def test_a_role_write_refuses_an_added_role_with_no_roles_row() -> None:
     assert existing_roles_only(current, changed, ["viewer", "custom:gone"]) is changed
 
 
-def test_a_role_row_left_behind_by_a_deleted_role_is_dropped_not_written_back() -> None:
+def test_a_role_row_left_behind_by_a_deleted_role_is_dropped_not_written_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """BACKLOG #2592: a held id with no ``roles`` row grants nothing, so the next role write drops
-    it rather than refusing the account's every role change. The added id still goes through."""
+    it, and logs the drop, rather than refusing the account's every role change. The added id
+    still goes through."""
     current = _with_roles("viewer", "custom:gone")
     changed = _with_roles("viewer", "custom:gone", "operator")
-    kept = existing_roles_only(current, changed, ["viewer", "operator"])
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+        kept = existing_roles_only(current, changed, ["viewer", "operator"])
     assert kept.role_ids == ("operator", "viewer")
     assert kept.row == changed.row
+    assert "dropped 1 role row" in caplog.text
 
 
 async def test_the_user_row_matches_the_users_table(keyed: tuple[MessageStore, Path]) -> None:

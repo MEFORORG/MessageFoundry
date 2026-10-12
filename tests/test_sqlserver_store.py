@@ -768,6 +768,12 @@ async def test_auth_users_roles_sessions(store) -> None:
 
     await store.set_ad_group_role_map([("CN=Ops,DC=x", "operator")])
     assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
+    # BACKLOG #2592: this map has no role foreign key, so it can name a deleted role. That id is
+    # not handed to a sign-in, whose role write would refuse it; the live role still is.
+    await store.set_ad_group_role_map(
+        [("CN=Ops,DC=x", "operator"), ("CN=Ops,DC=x", "custom:no-such-role")]
+    )
+    assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
 
     await store.record_login_failure("u1", failed_attempts=2, locked_until=500.0, now=10.0)
     assert (await store.get_user("u1")).locked_until == 500.0

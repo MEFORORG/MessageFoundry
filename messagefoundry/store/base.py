@@ -2427,8 +2427,11 @@ class AuthStore(Protocol):
         now: float | None = None,
     ) -> None:
         """Replace the account's roles with ``role_ids``. Raises ``UnknownRoleError``, writing
-        nothing, when an id the account does not already hold has no ``roles`` row; a held id with
-        no row is dropped (BACKLOG #2592, ``store.existing_roles_only``)."""
+        nothing, when an id the account does not already hold has no ``roles`` row as the write
+        reads it; a role deleted after that read fails the ``user_roles`` foreign key instead, with
+        the driver's integrity error. A held id with no row is dropped (BACKLOG #2592,
+        ``store.existing_roles_only``). :meth:`remove_unless_last_admin` with ``SET_ROLES`` does
+        the same."""
         ...
 
     async def remove_unless_last_admin(

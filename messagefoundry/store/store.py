@@ -2820,9 +2820,10 @@ def without_role(role_id: str) -> UserChange:
 class UnknownRoleError(LookupError):
     """A role write named a role id with no ``roles`` row; nothing was written (BACKLOG #2592).
 
-    Raised by each backend's ``_write_user`` for an id the write ADDS, the way the ``user_roles``
-    foreign key refuses it on every backend: so a role deleted between a caller's check and the
-    write is not granted, and its id is never sealed into a record."""
+    Raised by each backend's ``_write_user`` for an id the write ADDS whose role was gone when the
+    write read the ``roles`` table, so a role deleted after a caller's own check is not granted. A
+    delete that commits after that read is refused instead by the ``user_roles`` foreign key, which
+    every backend has, as the driver's integrity error. Either way no record seals the id."""
 
     def __init__(self, role_ids: Sequence[str]) -> None:
         self.role_ids = tuple(role_ids)
@@ -2843,9 +2844,14 @@ def existing_roles_only(
     added = [r for r in changed.role_ids if r not in held and r not in current.role_ids]
     if added:
         raise UnknownRoleError(added)
-    if all(r in held for r in changed.role_ids):
+    kept = tuple(g for g in changed.roles if g.role_id in held)
+    if len(kept) == len(changed.roles):
         return changed
-    return replace(changed, roles=tuple(g for g in changed.roles if g.role_id in held))
+    log.warning(
+        "a role write dropped %d role row(s) whose role no longer exists (BACKLOG #2592)",
+        len(changed.roles) - len(kept),
+    )
+    return replace(changed, roles=kept)
 
 
 # PHI-at-rest encryption is the store's `_cipher` (messagefoundry.store.crypto): identity when no
@@ -14131,9 +14137,9 @@ class MessageStore:
             # BACKLOG #2592: each holder's record is re-sealed without the role. A holder whose
             # record fails its seal is refused on every read already; only its own row of this role
             # is deleted, which needs no key and re-seals nothing. No bulk delete: it would leave a
-            # sealed record naming a row it no longer has. A holder that appears after the read is
-            # not possible here, where one writer runs at a time; on the server backends the
-            # `user_roles` foreign key makes the role delete below fail instead.
+            # sealed record naming a row it no longer has. A holder that appears after the read,
+            # from another process, keeps its row; the `user_roles` foreign key, which every backend
+            # has (foreign_keys=ON here), then makes the role delete below fail.
             cur = await self._db.execute(
                 "SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)
             )

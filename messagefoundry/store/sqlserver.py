@@ -2178,6 +2178,10 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('fk_user_roles_role','F') IS NULL
         ALTER TABLE user_roles WITH NOCHECK
             ADD CONSTRAINT fk_user_roles_role FOREIGN KEY (role_id) REFERENCES roles(id)""",
+    # The key's check on a role delete, and that delete's holder read, seek this index rather than
+    # scan every account's role rows under locking reads.
+    """IF INDEXPROPERTY(OBJECT_ID('user_roles'),'ix_user_roles_role','IndexID') IS NULL
+        CREATE INDEX ix_user_roles_role ON user_roles(role_id)""",
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
         ad_group NVARCHAR(256) NOT NULL, role_id NVARCHAR(64) NOT NULL,
         CONSTRAINT pk_ad_group_role_map PRIMARY KEY (ad_group, role_id))""",
@@ -12898,8 +12902,12 @@ class SqlServerStore:
         if not normalized:
             return set()
         placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
+        # BACKLOG #2592: joined to roles, because this backend's map has no role foreign key and can
+        # hold a deleted role's id. The user write path refuses such an id, which would refuse the
+        # sign-in; SQLite and Postgres refuse the map row itself.
         rows = await self._fetchall(
-            f"SELECT DISTINCT role_id FROM ad_group_role_map WHERE ad_group IN ({placeholders})",
+            "SELECT DISTINCT m.role_id FROM ad_group_role_map m JOIN roles r ON r.id = m.role_id"
+            f" WHERE m.ad_group IN ({placeholders})",
             tuple(normalized),
         )
         return {str(r["role_id"]) for r in rows}
