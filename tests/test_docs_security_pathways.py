@@ -1926,22 +1926,21 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     def owes(
         provider: str, scope: str, roles: frozenset[Role], *, on: bool, enrolled: bool
     ) -> bool:
-        async def role_ids(_user_id: object) -> list[str]:
-            return [r.value for r in roles]
-
         async def second_factor(_user: object) -> bool:
             return enrolled
 
         fake = SimpleNamespace(
             _settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope),
-            _store=SimpleNamespace(get_user_role_ids=role_ids),
             _second_factor_enrolled=second_factor,
         )
         fake._mfa_required_for = functools.partial(
             AuthService._mfa_required_for,
             fake,  # type: ignore[arg-type]
         )
-        account = SimpleNamespace(id="u1", auth_provider=provider)
+        # The roles ride on the checked account record (BACKLOG #2592), not a second store read.
+        account = SimpleNamespace(
+            id="u1", auth_provider=provider, role_ids=tuple(r.value for r in roles)
+        )
         return bool(
             asyncio.run(
                 AuthService._unverified_session_owes_factor(
@@ -2322,7 +2321,10 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
         on: bool = True,
     ) -> bool:
         """``_mfa_satisfied_hash`` for one session, on a stand-in self that supplies every read."""
-        account = SimpleNamespace(id="u1", auth_provider=provider)
+        # The roles ride on the checked account record (BACKLOG #2592), not a second store read.
+        account = SimpleNamespace(
+            id="u1", auth_provider=provider, role_ids=tuple(r.value for r in roles)
+        )
         session = SimpleNamespace(
             user_id="u1",
             revoked_at=None,
@@ -2333,19 +2335,17 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
             # The service's one session loader (BACKLOG #2592), which checks the row's seal.
             return session
 
-        async def get_user(_user_id: str) -> object:
+        async def load_user(_user_id: str) -> object:
+            # The service's user loader (BACKLOG #2592), which checks the account's seal.
             return account
-
-        async def role_ids(_user_id: object) -> list[str]:
-            return [r.value for r in roles]
 
         async def second_factor(_user: object) -> bool:
             return enrolled
 
         fake = SimpleNamespace(
             _settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope),
-            _store=SimpleNamespace(get_user=get_user, get_user_role_ids=role_ids),
             _load_session=load_session,
+            _load_user=load_user,
             _second_factor_enrolled=second_factor,
         )
         fake._mfa_required_for = functools.partial(

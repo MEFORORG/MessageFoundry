@@ -7831,7 +7831,7 @@ class MessageStore:
             # BACKLOG #2592: the passkey digest and the account's integrity seal. An existing row
             # gets an empty seal, which a keyed store refuses like a wrong one: a blank seal is
             # exactly what a row inserted outside the store has, so nothing here seals it.
-            # `_report_unsealed_users` names the count at open.
+            # `report_unsealed_users` names the count at open.
             ("cred_digest", "TEXT NOT NULL DEFAULT ''"),
             ("authz_seal", "TEXT NOT NULL DEFAULT ''"),
         ):

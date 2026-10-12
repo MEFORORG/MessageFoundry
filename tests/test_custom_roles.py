@@ -66,7 +66,8 @@ async def _make_user(service: AuthService, username: str, *role_ids: str) -> str
 
 
 async def _identity_for(service: AuthService, store: MessageStore, user_id: str) -> Identity:
-    user = await store.get_user(user_id)
+    # Through the service's loader: the identity build takes the checked record (BACKLOG #2592).
+    user = await service._load_user(user_id)
     assert user is not None
     return await service._build_identity(user)
 
@@ -227,7 +228,7 @@ async def test_custom_role_grants_exact_subset() -> None:
         )
         assert role.id.startswith(CUSTOM_ROLE_ID_PREFIX)
         user_id = await _make_user(service, "lab", role.id)
-        user = await store.get_user(user_id)
+        user = await service._load_user(user_id)
         assert user is not None
         identity = await service._build_identity(user)
         assert identity.permissions == frozenset(

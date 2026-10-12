@@ -3064,7 +3064,7 @@ async def _login_writes(
             )
         service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
         await service.initialize()
-        user = await store.get_user("u")
+        user = await service._load_user("u")  # the checked record (BACKLOG #2592)
         assert user is not None
         roles = frozenset({Role.ADMINISTRATOR}) if administrator else frozenset()
         after = await service._sync_ad_channel_scope(user, roles, [f"cn=ch-{c}" for c in mapped])

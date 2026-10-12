@@ -1415,11 +1415,11 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
 async def test_set_password_claim_stamp_round_trip(store) -> None:
     """BACKLOG #1245 ``users.password_claimed_at`` on the real Postgres backend.
 
-    ``password_claim_set`` is shared by all three backends, so the SQL TEXT of the claim term is
-    single-sourced — but the ARGUMENT BINDING around it is hand-written per backend and nothing
-    else on this leg executes ``set_password`` at all. Here the term reuses ``$2`` (already
-    ``now``) so the argument list is unchanged; a regression that renumbered it would bind the
-    wrong value into the column while the shared helper still produced correct-looking SQL.
+    The claim rule is ``store.password_change``, shared by all three backends since BACKLOG #2592,
+    and the write is the sealed user record's one whole-row statement -- but its ARGUMENT BINDING
+    is spelled per backend and nothing else on this leg executes ``set_password`` at all. A
+    regression that renumbered a ``$n`` would bind the wrong value into a column while the shared
+    rule still computed the right record.
 
     Every assertion below compares against the EXACT timestamp passed, never merely ``is not
     None``: a mis-bound placeholder that landed the ``must_change_password`` flag in the column
@@ -5114,6 +5114,41 @@ async def test_session_seal_contract(store) -> None:
             )
         await assert_session_seal_contract(keyed, raw)
         assert_session_columns({str(r["column_name"]) for r in rows})
+    finally:
+        await keyed.close()
+
+
+async def test_user_seal_contract(store) -> None:
+    """BACKLOG #2592: the sealed user record, the same contract the SQLite suite runs, on a keyed
+    handle, with the round trip that pins the canonical bytes (AC-19). ``raw`` runs each statement
+    on a pooled connection, outside the store's helpers. The fixture truncates the user tables on
+    the next entry; the contract deletes the one custom role it makes."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._session_seal_contract import dollar_placeholders
+    from tests._user_seal_contract import (
+        assert_user_columns,
+        assert_user_record_round_trips,
+        assert_user_seal_contract,
+    )
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'users'"
+            )
+        assert_user_columns({str(r["column_name"]) for r in rows})
+        await assert_user_record_round_trips(keyed)
+        await assert_user_seal_contract(keyed, raw)
     finally:
         await keyed.close()
 

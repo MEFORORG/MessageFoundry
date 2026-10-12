@@ -139,6 +139,7 @@ from messagefoundry.store.store import (
     _SESSION_NOT_AHEAD_SQL,
     _SQL_ADMIN_GUARD_COUNTS,
     _USER_ROLE_INSERT,
+    _USER_ROLES_CLEAR,
     _WEBAUTHN_INSERT,
     AUDIT_KEY_EPOCH_ACTION,
     NOT_DEPLOYED_EVENT,
@@ -11959,10 +11960,11 @@ class SqlServerStore:
         if not await cur.fetchall():
             return None
         if updated.roles != current.roles:
-            await cur.execute("DELETE FROM user_roles WHERE user_id=?", (current.row.id,))
+            await cur.execute(_USER_ROLES_CLEAR, (current.row.id,))
             for grant in updated.roles:
                 await cur.execute(
                     _USER_ROLE_INSERT,
+                    _USER_ROLES_CLEAR,
                     (current.row.id, grant.role_id, grant.assigned_at, grant.assigned_by),
                 )
         return updated
