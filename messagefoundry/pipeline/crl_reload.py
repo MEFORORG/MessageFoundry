@@ -173,8 +173,8 @@ LAPSES_FIRST = (
 #: that names the CA's key and is not signed by it. It loads any other with a warning, and the
 #: handshake then decides.
 BAD_SIGNATURE = (
-    "Fix the file: give a CRL the hop's CA signed. A restart does not apply this file. A start "
-    "refuses it where the CRL names that CA's key. Otherwise a start loads it with a warning, and "
+    "Fix the file: give a CRL the hop's CA signed. A restart is not the fix. Where the CRL names "
+    "that CA's key, a start refuses the file too. Otherwise a start loads it with a warning, and "
     "the handshakes that CRL judges can then fail"
 )
 NO_ISSUER = (

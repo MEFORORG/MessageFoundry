@@ -24,7 +24,7 @@ from typing import Literal
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, padding, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
 from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -416,22 +416,29 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
 
     OpenSSL checks a CRL's signature at the handshake, not when it loads the file. This is the
     engine's own check, for a start (``harden_crl_check``) and for the running-hop reload
-    (:func:`crl_signature_refusal`). A CA that does not parse, or whose names do not, is ignored:
-    it cannot be shown to be an issuer, and a system trust store may hold one. ``pem`` must be
-    bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
+    (:func:`crl_signature_refusal`). A CA that ``cryptography`` cannot read is ignored
+    (:data:`_UNREADABLE_CA`): it cannot be shown to be an issuer, and a trust store may hold one
+    that OpenSSL loads. Before vault BACKLOG #2905 such a CA raised out of the reload's check,
+    which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
+    block that does not parse raises ``ValueError``."""
     cas: list[tuple[x509.Name, x509.Certificate]] = []
     for der in ca_ders:
         try:
             ca = x509.load_der_x509_certificate(der)
-            _ = ca.issuer  # read here: a bad name must not raise from the middle of a judgment
             cas.append((ca.subject, ca))
-        except ValueError:
+        except _UNREADABLE_CA:
             continue
     blocks = list(_crl_blocks(pem))
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
         where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
         yield CrlSignature(where, _signature_state(crl, cas))
+
+
+#: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
+#: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
+#: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
+_UNREADABLE_CA = (ValueError, x509.InvalidVersion, x509.UnsupportedGeneralNameType)
 
 
 def _signature_state(
@@ -443,7 +450,13 @@ def _signature_state(
     named = False  # the CRL names some fitting CA's key
     unchecked = False
     for subject, ca in cas:
-        if subject != issuer or (names_key := _akid_fit(crl, ca)) is None:
+        if subject != issuer:
+            continue
+        try:
+            names_key = _akid_fit(crl, ca)
+        except _UNREADABLE_CA:
+            continue  # its extensions or its issuer name do not read: not shown to fit
+        if names_key is None:
             continue
         fitting = True
         named = named or names_key
@@ -552,6 +565,17 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
     return None  # the key accepts what ``is_signature_valid`` refused: no proof either way
 
 
+_DSA_SIGNATURES = frozenset(
+    {
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA1,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA224,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA256,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA384,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA512,
+    }
+)
+
+
 def _verify_with(key: object, crl: x509.CertificateRevocationList) -> None:
     """Verify ``crl``'s signature with ``key`` itself. Raises ``InvalidSignature`` when it fails,
     and ``UnsupportedAlgorithm`` when the key and the signature are not a pair this can check."""
@@ -572,6 +596,8 @@ def _verify_with(key: object, crl: x509.CertificateRevocationList) -> None:
         and algorithm == x509.SignatureAlgorithmOID.ED25519
     ) or (isinstance(key, ed448.Ed448PublicKey) and algorithm == x509.SignatureAlgorithmOID.ED448):
         key.verify(signature, signed)
+    elif isinstance(key, dsa.DSAPublicKey) and digest is not None and algorithm in _DSA_SIGNATURES:
+        key.verify(signature, signed, digest)
     else:
         raise UnsupportedAlgorithm(
             "the CA key and the CRL's signature are not a pair this can check"

@@ -32,11 +32,11 @@ from pathlib import Path
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
-from messagefoundry.config import loaded_crls, tls_policy
+from messagefoundry.config import loaded_crls
 from messagefoundry.config.tls_policy import (
     TrustAnchor,
     build_verifying_client_context,
@@ -54,7 +54,7 @@ _SETTING = "[tls].crl_file"
 #: An issuer no hop in this file lists.
 _OTHER_NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
 
-_CaKey = ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey
+_CaKey = ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey | dsa.DSAPrivateKey
 
 
 def _ca(key: _CaKey, signer: _CaKey, *, name: x509.Name = _NAME) -> x509.Certificate:
@@ -75,13 +75,14 @@ def _crl(
     names: _CaKey | None,
     revoke: int | None = None,
     name: x509.Name = _NAME,
+    age: datetime.timedelta = _DAY,
 ) -> bytes:
-    """A CRL from ``name`` in effect now, signed by ``signer``. Its key identifier is that of
-    ``names``, or it carries none. ``revoke`` is a serial number to list."""
+    """A CRL from ``name`` issued ``age`` ago, signed by ``signer``. Its key identifier is that
+    of ``names``, or it carries none. ``revoke`` is a serial number to list."""
     builder = (
         x509.CertificateRevocationListBuilder()
         .issuer_name(name)
-        .last_update(_NOW - _DAY)
+        .last_update(_NOW - age)
         .next_update(_NOW + 30 * _DAY)
         .add_extension(x509.CRLNumber(1), False)
     )
@@ -151,7 +152,6 @@ def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     before it. Restored after the test."""
     monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary())
     monkeypatch.setattr(loaded_crls, "_UNCONFIRMED", {})
-    tls_policy._judged_crl_signatures.cache_clear()
 
 
 @pytest.fixture
@@ -296,10 +296,12 @@ def test_two_cas_with_one_subject(
 
 
 @pytest.mark.parametrize(("listed", "signer", "names", "state"), _TWIN_CASES)
-def test_the_reload_verdict_is_what_it_was(
+def test_the_reload_flag_follows_the_states(
     twins: _Twins, listed: str, signer: str, names: str | None, state: str
 ) -> None:
-    # The reload's flag is wider than what a start refuses, on purpose: it is unchanged.
+    # The reload's flag is wider than what a start refuses, on purpose. This pins the flag to
+    # the states. That it equals what the reload returned before this change rests on the
+    # older tests in tests/test_crl_reload.py, which pass unchanged.
     verdict = crl_signature_refusal(twins.write_crl(signer, names), _ders(twins.ca_file(listed)))
     expected = {"verified": None, "unlisted": False}.get(state, True)
     assert (verdict if verdict is None else verdict[1]) == expected
@@ -480,3 +482,76 @@ def test_the_warning_describes_three_crls_and_counts_the_rest(
     (line,) = _warnings(caplog)
     assert "5 of the 5 CRL(s)" in line and "and 2 more" in line
     assert "mefor-2905-unlisted-2" in line and "mefor-2905-unlisted-3" not in line
+
+
+# --- round-one review repairs -------------------------------------------------------------------
+
+
+def test_a_badly_signed_copy_refuses_beside_a_newer_good_crl_that_openssl_would_use(
+    twins: _Twins,
+) -> None:
+    # Each CRL is judged on its own, as the expired-CRL refusal judges them. So this file refuses
+    # at start although OpenSSL picks the newer CRL and its handshake passes. The refusal says to
+    # remove the bad copy.
+    twins.crl.write_bytes(
+        _crl(twins.stranger, names=twins.new_key, age=3 * _DAY)
+        + _crl(twins.new_key, names=twins.new_key, age=_DAY)
+    )
+    # Control: with the engine's checks left out, the handshake passes.
+    _handshake(_raw_hop(twins.new_ca, twins.crl), twins.server(sends_renewed=False))
+
+    with pytest.raises(ValueError, match="remove this CRL if a good one") as refused:
+        twins.hop("new")
+    assert "CRL block 1 of 2" in str(refused.value)
+
+
+def test_a_forged_dsa_crl_that_names_the_cas_key_is_proven_bad() -> None:
+    key = dsa.generate_private_key(key_size=2048)
+    ca = _ca(key, key).public_bytes(serialization.Encoding.DER)
+
+    good = _crl(key, names=key)
+    forged = _crl(dsa.generate_private_key(key_size=2048), names=key)
+
+    assert [s.state for s in judge_crl_signatures(good, [ca])] == ["verified"]
+    assert [s.state for s in judge_crl_signatures(forged, [ca])] == ["bad"]
+
+
+def test_a_ca_cryptography_cannot_read_is_skipped_alone(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Both CAs have the CRL's issuer name. Reading the old one's extensions raises an error that
+    # is not a ``ValueError``. It is skipped, and the new CA still verifies the CRL.
+    real = pki_module._akid_fit
+    old = x509.load_pem_x509_certificate(twins.old_ca.read_bytes())
+
+    def fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
+        if ca == old:
+            raise x509.UnsupportedGeneralNameType("x400Address is not supported")
+        return real(crl, ca)
+
+    monkeypatch.setattr(pki_module, "_akid_fit", fit)
+    pem = twins.write_crl("new", "new")
+
+    judged = list(judge_crl_signatures(pem, _ders(twins.both)))
+    assert [signature.state for signature in judged] == ["verified"]
+    # Control: with only the unreadable CA listed, no CA fits.
+    assert [s.state for s in judge_crl_signatures(pem, _ders(twins.old_ca))] == ["unlisted"]
+
+
+def test_a_judgment_that_fails_warns_once_and_does_not_stop_the_start(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
+        raise RuntimeError("a defect in the check")
+
+    monkeypatch.setattr(pki_module, "_verifies", broken)
+    twins.write_crl("stranger", "new")  # proven bad, were the judgment to finish
+    with caplog.at_level("WARNING"):
+        hops = [twins.hop("new"), twins.hop("new")]
+
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+    logged = [
+        r.getMessage() for r in caplog.records if "could not check the signatures" in r.getMessage()
+    ]
+    assert len(logged) == 1 and "RuntimeError" in logged[0]
+    assert logged[0].startswith(f"{_SETTING} ({str(twins.crl)!r})")

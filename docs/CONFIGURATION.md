@@ -1802,7 +1802,7 @@ issuer. The engine applies a replaced file only when all three of these hold:
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
 what to do. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
-CRL fails its signature check under rule 2 needs fixing too, and a restart does not apply it. A start
+CRL fails its signature check under rule 2 needs fixing too, and a restart is not the fix. A start
 refuses it when the CRL names the CA's key and that key did not sign it. Otherwise a start loads it
 with a warning, and the handshakes that CRL judges can fail. The next paragraphs say which is which.
 A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
@@ -1813,9 +1813,13 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
 the file in one case only: the CRL names a listed CA's key by its key identifier, and that key did
-not sign the CRL. Such a CRL fails the handshakes it judges with `CRL signature failure`, an error
-that does not name the file. The refusal names the setting, the file and the CRL. Give the setting
-the CRL that CA signed. No setting turns this check off, as for an expired CRL.
+not sign the CRL. A handshake that OpenSSL judges by such a CRL fails with `CRL signature failure`,
+an error that does not name the file. The refusal names the setting, the file and the CRL. Give the
+setting the CRL that CA signed. No setting turns this check off, as for an expired CRL.
+
+Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
+the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
+such a file was measured to pass its handshakes. Remove the bad copy.
 
 Anything short of that proof loads, and the engine logs one WARNING for the file. At least these
 three cases warn:
@@ -1827,6 +1831,8 @@ three cases warn:
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
 - The engine cannot check the signature with the listed CA's key.
+
+If the check itself fails, the engine logs a WARNING that says so, and loads the file.
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. The
 WARNING is logged once per engine process for each version of the file. A hop whose CA list gives a
@@ -1841,8 +1847,10 @@ name does not verify, whether or not the CRL names a key.
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound
 connection is isolated: that lane is marked failed and alerted, and the rest of the graph starts.
 `check`, a live reload, a promote and a connection upsert build every connection before they change
-anything, so one refusal there blocks the whole change. `[tls].crl_file` reaches every outbound TLS
-hop, so one badly signed CRL in that file refuses each of them.
+anything, so one refusal there blocks the whole change. `[tls].crl_file` is shared. One badly signed
+CRL in it refuses each hop that loads the file and lists the CA whose key the CRL names. At least
+two kinds of hop are not refused. A loopback hop loads no CRL. A hop whose own CA list lacks that CA
+only warns.
 
 **A CRL that is not in effect yet is the exception: wait.** The engine applies it once it takes effect.
 Do not restart before then. A start refuses a file whose only CRL for some issuer is not in effect yet,

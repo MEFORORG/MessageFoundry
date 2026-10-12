@@ -76,7 +76,7 @@ MIRRORED_CONNECTION_SETTING = "connection_name"
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from messagefoundry.pki import CrlBlock, CrlFacts, CrlSignature
+    from messagefoundry.pki import CrlBlock, CrlFacts
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
@@ -579,23 +579,52 @@ def _check_crl_signatures(
     **Everything short of proof loads, with one warning.** That covers a CRL that names no key, a
     key the engine cannot check with, and an issuer the hop does not list. The last is the usual
     case in a two-tier PKI, where the peer sends the intermediate that issued the CRL, so it must
-    not log per hop. The warning is one line for the file, logged once per process for each
-    version of the file (:func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature`).
+    not log per hop. The warning is one line for the file, and
+    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` says how often it is
+    logged. A judgment that fails for any other reason warns the same way: this is a diagnosis,
+    and a certificate in the hop's store that ``cryptography`` cannot read must not stop a start.
+
+    **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
+    copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
+    would choose. Measured 2026-10-12: that file passes its handshakes. The fix is to remove the
+    bad copy, and the refusal says so.
+
+    Nothing is cached. Measured 2026-10-12 on Windows, CPython 3.14.6: 2.2 ms for 89 system
+    roots and one small CRL, per context. The Postgres store pays that per connection, beside a
+    context build measured at about 9 ms.
 
     There is no setting that turns this off and none that widens it, as for the expired-CRL
     refusal in :func:`judge_crl_bytes`."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
+    from messagefoundry.pki import judge_crl_signatures
 
-    judged = _judged_crl_signatures(pem, tuple(anchors))
+    fingerprint = crl_fingerprint(pem)
+    try:
+        judged = list(judge_crl_signatures(pem, anchors))
+    except Exception as exc:
+        # Not a verdict on the file, and not proof: the judgment itself failed. Broad on purpose.
+        # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
+        # that with exception types of its own. The handshake still checks every signature.
+        if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
+            logger.warning(
+                "%s: the engine could not check the signatures of the CRL(s) in this file at "
+                "start (%s). That is not a verdict on the file. It is loaded and revocation "
+                "checking is on, and OpenSSL checks each signature at the handshake",
+                label,
+                type(exc).__name__,
+                exc_info=True,
+            )
+        return
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
             f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
-            "key does not verify the CRL's signature. Loaded, it would make every handshake it "
-            "judges fail with 'CRL signature failure'. Give this setting the CRL that CA signed"
+            "key does not verify the CRL's signature. A handshake OpenSSL judges by this CRL "
+            "fails with 'CRL signature failure'. Give this setting the CRL that CA signed, or "
+            "remove this CRL if a good one from that issuer is already in the file"
         )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)
-    if not unconfirmed or not first_unconfirmed_signature(crl_file, crl_fingerprint(pem), finding):
+    if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):
         return
     shown = "; ".join(
         f"{signature.where}: {_UNCONFIRMED_SIGNATURE[signature.state]}"
@@ -607,27 +636,12 @@ def _check_crl_signatures(
         "%s: the engine could not confirm at start that a CA this hop lists signed %d of the %d "
         "CRL(s) in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
         "checks each signature at the handshake. If peers are then refused with 'CRL signature "
-        "failure' or 'unable to get certificate CRL', check this file first. Logged once for "
-        "this version of the file",
+        "failure' or 'unable to get certificate CRL', check this file first",
         label,
         len(unconfirmed),
         len(judged),
         shown,
     )
-
-
-@functools.lru_cache(maxsize=16)
-def _judged_crl_signatures(pem: bytes, anchors: tuple[bytes, ...]) -> tuple[CrlSignature, ...]:
-    """:func:`~messagefoundry.pki.judge_crl_signatures` for one file against one CA list, kept.
-
-    The verdict depends on those bytes alone, and :func:`harden_crl_check` runs once per TLS
-    context. The Postgres store builds a context per connection, so without this each connection
-    would parse the hop's whole CA list and verify every CRL again. Measured 2026-10-12 on
-    Windows, CPython 3.14.6: 2.2 ms for 89 system roots and one small CRL. A hit costs the hash
-    and comparison of the bytes. It keeps at most 16 files with their CA lists."""
-    from messagefoundry.pki import judge_crl_signatures
-
-    return tuple(judge_crl_signatures(pem, anchors))
 
 
 class _CrlStagingFailed(OSError, ValueError):
