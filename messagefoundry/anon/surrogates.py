@@ -605,7 +605,7 @@ def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ..
 #: nobody thought of: an embedded document (``ED``, an OBX-5 base64 payload — ADR 0028 §7), a
 #: reference pointer (``RP``), a vendor Z-type, or an OBX with no OBX-2 at all. Under a blocklist an
 #: ED document would reach a fixture un-redacted on first use; under the allowlist it is redacted.
-_NUMERIC_OBX_TYPES = frozenset({"NM", "SN", "TM"})
+#: The numeric types are the keys of ``_NUMERIC_OBX_GRAMMAR`` below: ``NM``, ``SN`` and ``TM``.
 #: A date-typed OBX-5 (a last menstrual period, a collection time) is a date like any other, so it
 #: is NOT preserved: it takes the ``DATE`` kind, which keeps the year only (BACKLOG #2330). ``DTM``
 #: is not listed, so a value declared ``DTM`` stays redacted whole.
@@ -619,11 +619,38 @@ _CODED_ELEMENT_OBX_TYPES = frozenset({"CE", "CWE"})
 #: and fails closed on one that is not conformant.
 _CODED_ELEMENT_TEXT_COMPONENTS = (2, 5, 9)
 
-#: The characters a conformant NM/SN/TM subcomponent is drawn from: digits, sign, decimal point,
-#: and the comparator / range / timezone-offset punctuation. No letters and no whitespace, so prose
-#: cannot pass. Separators are excluded because the value is split on the message's OWN separators
-#: (read from MSH) before a part is matched — this class never sees one.
-_NUMERIC_OBX_VALUE: re.Pattern[str] = re.compile(r"[0-9+\-.:/<>=]*")
+#: One grammar per numeric value type (BACKLOG #2961). One character class used to serve all three,
+#: and any run of digits and marks fitted it, so ``123-45-6789`` under ``NM`` was kept whole. A
+#: grammar says what the type IS, so a shape nobody listed is refused too. ASCII ``[0-9]``, never
+#: ``\d``, which also matches the digits of other scripts.
+_COMPARATOR = r"(?:<=|>=|<>|[<>=])"
+#: An HL7 NM: an optional sign, digits, and at most one decimal point.
+_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+#: An HL7 TM, ``HH[MM[SS[.S[S[S[S]]]]]][+/-ZZZZ]``, with every group in range. The ranges matter: an
+#: eight-digit date is not a time of day, and it does not fit.
+_TIME_OF_DAY = r"""
+    (?:[01][0-9]|2[0-3])                    # hour
+    (?:[0-5][0-9]                           # minute
+      (?:[0-5][0-9]                         # second
+        (?:\.[0-9]{1,4})?                   # fraction, only after the seconds
+      )?)?
+    (?:[+-](?:0[0-9]|1[0-4])[0-5][0-9])?    # offset, -1200 to +1400 at the widest
+"""
+#: What each COMPONENT of a preserved numeric value must match, by position. A value with more
+#: components than its type has is refused. ``NM`` takes a leading comparator because ``<5`` under
+#: ``NM`` is a common sender habit and carries no identifier. ``SN`` is comparator, number,
+#: separator or suffix, number, so ``>^100`` and ``^1^:^128`` fit and a bare ``123-45-6789`` in the
+#: comparator's place does not.
+_NUMERIC_OBX_GRAMMAR: dict[str, tuple[re.Pattern[str], ...]] = {
+    "NM": (re.compile(_COMPARATOR + "?" + _NUMBER),),
+    "SN": (
+        re.compile(_COMPARATOR),
+        re.compile(_NUMBER),
+        re.compile(r"[-+/.:]"),
+        re.compile(_NUMBER),
+    ),
+    "TM": (re.compile(_TIME_OF_DAY, re.VERBOSE),),
+}
 
 
 def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
@@ -636,6 +663,23 @@ def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
         for comp in _components(rep, seps)
         for sub in comp.split(seps.subcomponent)
     )
+
+
+def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps: Seps) -> bool:
+    """True if every repetition of ``value`` fits ``grammar``, component by component. An empty
+    component is legal, because an ``SN`` leaves out the parts it does not use. A subcomponent
+    separator is refused outright: no numeric type has subcomponents, and under a message that
+    declares an odd separator the patterns alone would not see one."""
+    for rep in value.split(seps.repetition):
+        comps = _components(rep, seps)
+        if len(comps) > len(grammar):
+            return False
+        # Not strict: a value may stop short of its type's last component (``>^100`` has two).
+        for comp, pattern in zip(comps, grammar, strict=False):
+            part = comp.strip()
+            if seps.subcomponent in comp or (part and pattern.fullmatch(part) is None):
+                return False
+    return True
 
 
 def _is_bare_token(part: str) -> bool:
@@ -667,19 +711,19 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
       falls straight through to ``False``; and
     * the value must LOOK like the type it claims. A declared type is never taken on trust, because
       an OBX labelled ``NM`` whose OBX-5 carries a sentence is exactly the narrative the ``FREETEXT``
-      rule exists to redact. Numeric and time-of-day values are matched against their character
-      class; a coded value must be a bare token; a coded ELEMENT must additionally carry no text
-      component.
+      rule exists to redact. A numeric or time-of-day value must fit the grammar of its own type,
+      so an identifier written with dashes or dots is refused (BACKLOG #2961); a coded value must be
+      a bare token; a coded ELEMENT must additionally carry no text component.
+
+    A grammar cannot tell a number from an identifier written as a number: an undashed nine or ten
+    digit run is a valid ``NM`` and is kept. ``docs/PHI.md`` section 9 names that gap.
 
     A date type (``DT``, ``TS``) is never preserved. :func:`obx5_kind` says what it gets instead.
     """
     declared = (value_type or "").strip().upper()
     text = value or ""
-    if declared in _NUMERIC_OBX_TYPES:
-        return all(
-            _NUMERIC_OBX_VALUE.fullmatch(part.strip()) is not None
-            for part in _obx5_parts(text, seps)
-        )
+    if (grammar := _NUMERIC_OBX_GRAMMAR.get(declared)) is not None:
+        return _fits_numeric_grammar(grammar, text, seps)
     if declared in _CODED_OBX_TYPES:
         return all(_is_bare_token(part) for part in _obx5_parts(text, seps))
     if declared in _CODED_ELEMENT_OBX_TYPES:
