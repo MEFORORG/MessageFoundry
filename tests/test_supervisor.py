@@ -824,19 +824,22 @@ async def test_supervise_names_two_crash_looped_engine_shards_past_the_log_redac
     monkeypatch.setattr(supervisor_mod, "preflight_shard_config", _loads)
     monkeypatch.setattr(supervisor_mod, "Supervisor", _supervisor)
 
-    with caplog.at_level(logging.ERROR, logger=supervisor_mod.__name__):
+    with caplog.at_level(logging.INFO, logger=supervisor_mod.__name__):
         task = asyncio.create_task(supervise("cfg", install_signal_handlers=False, **_DISCOVERY))
         try:
             for _ in range(400):
                 if built and built[0].crash_looped == set(names):
                     break
                 await asyncio.sleep(0)
-            assert built[0].crash_looped == set(names)
+            assert built and built[0].crash_looped == set(names)
+            if not survivor:
+                # Every engine shard is down, so supervise returns by itself.
+                await asyncio.wait_for(task, timeout=5.0)
         finally:
             # With one engine shard alive supervise runs on, so the cancel stands in for the signal
-            # handler. With none alive it has returned by itself and the cancel does nothing.
-            if survivor:
-                task.cancel()
+            # handler. It also stops the task when an assert above failed, so that failure is the
+            # one reported. It does nothing to a task that has returned.
+            task.cancel()
             code = await asyncio.wait_for(task, timeout=5.0)
     assert code == (0 if survivor else 1)
     closing = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR][-1]
@@ -844,6 +847,12 @@ async def test_supervise_names_two_crash_looped_engine_shards_past_the_log_redac
     logged = redaction.redact(closing)
     assert all(name in logged for name in names), logged
     assert " / ".join(sorted(names)) in logged
+    # The opening line joins `name->:port` pairs with a comma, and passes: a port number sits
+    # before each comma, so no two names meet around one. Without the ports it would be scrubbed.
+    opening = redaction.redact(
+        next(r.getMessage() for r in caplog.records if r.getMessage().startswith("supervising "))
+    )
+    assert all(spec.shard in opening for spec in specs), opening
 
 
 # --- the pre-flight: a config must load the way an engine shard will load it (vault BACKLOG #2587) -------

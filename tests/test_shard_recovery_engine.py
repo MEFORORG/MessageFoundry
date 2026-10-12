@@ -28,8 +28,10 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import redaction
+from messagefoundry.api.app import _REFUSAL_LOG_LIMIT
 from messagefoundry.config.settings import BackupSettings, DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError, load_config
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
@@ -336,7 +338,7 @@ async def test_the_reload_refusal_names_engine_shards_past_the_log_redaction(
     """The reload route logs this refusal through ``safe_exc``, and that PHI pass takes two
     capitalized words around a comma for a family-comma-given name. Joined with a comma the two
     sets reached the log as ``([redacted] -> [redacted],WEST)`` (vault BACKLOG #3227), so they join
-    with `` / ``."""
+    with `` / ``. The route's log prefix is not rebuilt here."""
     east, north, west = names
     two = _write_cfg(tmp_path / "cfg_two", tmp_path, [east, west])
     three = _write_cfg(tmp_path / "cfg_three", tmp_path, [east, north, west])
@@ -353,7 +355,11 @@ async def test_the_reload_refusal_names_engine_shards_past_the_log_redaction(
             await eng.reload(three)
     finally:
         await eng.stop()
-    logged = redaction.safe_exc(refused.value, limit=8192)
+    # What the reload route passes to the log, at the route's own limit, and then the PHI pass the
+    # log handler runs over the line.
+    logged = redaction.redact(
+        scrub_log_argument(redaction.safe_exc(refused.value, limit=_REFUSAL_LOG_LIMIT))
+    )
     assert all(name in logged for name in names), logged
     assert f"({east} / {west} -> {east} / {north} / {west})" in logged
 
