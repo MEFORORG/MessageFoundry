@@ -23,6 +23,7 @@ why an unqualified name would not be safe here.
 from __future__ import annotations
 
 import ctypes
+import ntpath
 import re
 import subprocess
 import sys
@@ -306,22 +307,57 @@ def uninstall_script_path() -> Path | None:
     return script if script.exists() else None
 
 
-def _install_params(script_path: str, environment: str) -> str:
+#: Characters Windows refuses in a path, plus the quote the elevated command line wraps each path in.
+_UNSAFE_PATH_CHARS = frozenset('"<>|?*')
+
+
+def _safe_install_path(path: str, what: str) -> str:
+    """``path`` unchanged when it can be quoted into the elevated installer's command line, else
+    raise :class:`ValueError`.
+
+    It must be absolute: the elevated child starts in the system directory, so a relative path
+    would name a folder there. It must hold no quote, no character Windows refuses in a path, and no
+    control character, so it cannot end its quoted argument. It must not end in a slash, because the
+    command-line parser reads a backslash before the closing quote as an escaped quote."""
+    if (
+        not ntpath.isabs(path)
+        or path.endswith(("\\", "/"))
+        or any(ch in _UNSAFE_PATH_CHARS or ord(ch) < 32 for ch in path)
+    ):
+        raise ValueError(f"unsafe {what} path {path!r}: it must be an absolute Windows path")
+    return path
+
+
+def _install_params(
+    script_path: str, environment: str, *, config: str, service_config: str | None = None
+) -> str:
     """Build the argument string for the elevated installer launch.
 
     ``environment`` is the active environment the service will run as (``serve --env``); it is
     interpolated into an elevated command line, so reject anything that isn't a plain environment
-    name (raises :class:`ValueError`). Validation runs on every platform so it is unit-testable."""
+    name (raises :class:`ValueError`). ``config`` and ``service_config`` become the installer's
+    ``-Config`` and ``-ServiceConfig``, and :func:`_safe_install_path` vets each the same way.
+    Validation runs on every platform so it is unit-testable."""
     if not is_safe_environment(environment):
         raise ValueError(f"unsafe environment name {environment!r}")
-    return f'-NoExit -ExecutionPolicy Bypass -File "{script_path}" -Environment "{environment}"'
+    params = (
+        f'-NoExit -ExecutionPolicy Bypass -File "{script_path}" -Environment "{environment}"'
+        f' -Config "{_safe_install_path(config, "config")}"'
+    )
+    if service_config is not None:
+        params += f' -ServiceConfig "{_safe_install_path(service_config, "service config")}"'
+    return params
 
 
-def install_service(script_path: str, environment: str) -> ServiceControlOutcome:
+def install_service(
+    script_path: str, environment: str, *, config: str, service_config: str | None = None
+) -> ServiceControlOutcome:
     """Run the install script elevated in a *visible* PowerShell window (one-time setup, so the
     operator can read the output / 'next steps' and any errors). ``environment`` is the active
-    environment the service runs as (ADR 0017 — install-service.ps1 requires it). Raises
-    :class:`ValueError` for an unsafe environment name (it runs elevated).
+    environment the service runs as (ADR 0017 — install-service.ps1 requires it), and ``config``
+    the config directory it loads (the installer requires that too, vault BACKLOG #2626).
+    ``service_config`` names the settings file, when given. Raises :class:`ValueError` for an
+    unsafe environment name, and on Windows for an unsafe path (it runs elevated).
 
     Returns :data:`~ServiceControlOutcome.UNSUPPORTED` off Windows,
     :data:`~ServiceControlOutcome.FAILED` when the elevated launch did not happen, and
@@ -335,9 +371,13 @@ def install_service(script_path: str, environment: str) -> ServiceControlOutcome
     PowerShell 5.1, the host the installer is written for (:func:`_system_exe`). Starting the child
     in the system directory is safe for the installer, which derives its repo root from
     ``$PSScriptRoot`` rather than from the working directory."""
-    params = _install_params(script_path, environment)  # validates env on every platform
+    # The environment name is vetted on every platform. The paths are vetted as Windows paths, so
+    # only where they are one: elsewhere the answer is UNSUPPORTED, not a path error.
+    if not is_safe_environment(environment):
+        raise ValueError(f"unsafe environment name {environment!r}")
     if sys.platform != "win32":
         return ServiceControlOutcome.UNSUPPORTED
+    params = _install_params(script_path, environment, config=config, service_config=service_config)
     launched = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",
