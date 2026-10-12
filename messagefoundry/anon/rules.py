@@ -272,9 +272,9 @@ def _forget_warnings() -> None:
 
 #: The header segments. Fields 1 and 2 of each hold delimiters: the field separator and the
 #: encoding characters. So field N of a header line sits at split index N-1, one lower than in
-#: any other segment, and the engine's parser numbers all three that way. Every place in this
-#: package that numbers a field reads this one set, so a rule, the leak-check and the refusal
-#: below count the same field (BACKLOG #2998).
+#: any other segment. The leak-check, the tee adapter and the refusal below read this set. The
+#: engine adapter does NOT: it gets the same numbering from the parser's own list of header ids,
+#: so a change here alone moves the check and the tee away from the engine (BACKLOG #2998).
 HEADER_SEGMENTS: frozenset[str] = frozenset({"MSH", "FHS", "BHS"})
 
 #: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
@@ -322,8 +322,8 @@ def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
     if named:
         raise AnonError(
             f"a rule names {', '.join(named)}, which no rule can rewrite: field 0 is the "
-            "segment id, and fields 1 and 2 of MSH, BHS and FHS hold delimiters. Repair or "
-            "remove a line that carries data there. Refusing to emit"
+            "segment id, and fields 1 and 2 of a header segment (MSH/BHS/FHS) hold delimiters. "
+            "Repair or remove a line that carries data there. Refusing to emit"
         )
 
 
@@ -441,7 +441,8 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     if unwritable:
         raise RuleError(
             f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, which no rule can "
-            "rewrite: fields 1 and 2 of MSH, BHS and FHS hold delimiters. Remove the rule"
+            "rewrite: fields 1 and 2 of a header segment (MSH/BHS/FHS) hold delimiters. Remove "
+            "the rule"
         )
     # Field addresses and kinds only, never a value.
     _warn_once(

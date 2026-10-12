@@ -460,8 +460,9 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     )
     if has_unreachable_line(text, mapped_paths):
         raise AnonError(
-            "message has a line no rule can reach (a malformed segment id) — refusing to emit; "
-            "repair the line, then retry"
+            "message has a line no rule can reach (a malformed segment id, or a header line with "
+            "no separator after its encoding characters) — refusing to emit; repair the line, "
+            "then retry"
         )
     return text
 
