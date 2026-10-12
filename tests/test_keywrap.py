@@ -1000,6 +1000,7 @@ def test_an_encrypted_part_this_engine_does_not_open_is_refused(
     with pytest.raises(KeyWrapRefused) as refused:
         pki.load_pkcs12(bundle, passphrase)
     assert why in str(refused.value) and "does not open it" in str(refused.value)
+    _assert_no_chain(refused.value)
 
 
 def test_an_encrypted_part_that_does_not_parse_is_refused_by_both_steps(
@@ -1017,8 +1018,9 @@ def test_an_encrypted_part_that_does_not_parse_is_refused_by_both_steps(
     bundle = pfx_of(part, passphrase=passphrase)
     outside = _p12_refusal(bundle)
     assert outside is not None and "cannot read" in outside
-    with pytest.raises(KeyWrapRefused, match="cannot read"):
+    with pytest.raises(KeyWrapRefused, match="cannot read") as refused:
         keywrap.pkcs12_encrypted_parts(bundle, setting="s")
+    _assert_no_chain(refused.value)
 
 
 @pytest.mark.parametrize(
@@ -1055,8 +1057,11 @@ def test_the_hand_over_judges_the_floor_itself(material: Material) -> None:
     bundle = pfx_of(part, passphrase=passphrase)
     outside = _p12_refusal(bundle)
     assert outside is not None and "2048 iterations" in outside
-    with pytest.raises(KeyWrapRefused, match="has an encrypted part that is wrapped with .* 2048"):
+    with pytest.raises(
+        KeyWrapRefused, match="has an encrypted part that is wrapped with .* 2048"
+    ) as refused:
         keywrap.pkcs12_encrypted_parts(bundle, setting="s")
+    _assert_no_chain(refused.value)
 
 
 def test_a_wrong_passphrase_on_an_encrypted_part_fails_without_echoing_it(
@@ -1084,6 +1089,14 @@ def test_decrypted_contents_that_do_not_parse_point_at_the_passphrase() -> None:
         keywrap.refuse_weak_pkcs12_contents(b"\x30\x05\x01", setting="s", unlock_setting="U")
     text = str(refused.value)
     assert "can read" in text and "check U" in text and "Re-export" not in text
+    _assert_no_chain(refused.value)
+
+
+def _assert_no_chain(refusal: BaseException) -> None:
+    # The refusals are raised after their handlers end, so both chain links are empty and nothing
+    # is left for a chain walker (BACKLOG #1796). This pins the chain only: the refusal's own
+    # traceback still reaches the frames that hold the bundle or the decrypted contents.
+    assert refusal.__cause__ is None and refusal.__context__ is None
 
 
 def _rsa_pem(bits: int, fmt: serialization.PrivateFormat, *, encrypted: bool = False) -> str:

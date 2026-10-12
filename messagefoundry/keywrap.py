@@ -858,29 +858,33 @@ def pkcs12_encrypted_parts(pfx: bytes, *, setting: str) -> list[Pkcs12EncryptedP
     than AES-CBC, a content type other than Data, a keyLength that disagrees with the cipher, and
     a part it cannot parse. Failing closed, because the keys inside such a part could not be
     checked."""
+    # Each handler keeps only the refusal text, and the raise comes after the handlers end, so the
+    # refusal has no chain (the shape BACKLOG #1796 asks for). That empties the chain, not the
+    # traceback: this frame's ``pfx`` stays on the refusal's own traceback either way.
+    refusal: str | None = None
+    parts: list[Pkcs12EncryptedPart] = []
     try:
         _, infos = _pfx_layout(pfx)
         if infos is None:
             raise _Malformed
-        parts = []
         for info in infos:
             info_type, info_value = _content_info(pfx, info)
             if info_type == _PKCS7_ENCRYPTED_DATA:
                 parts.append(_encrypted_part(pfx, info_value))
     except _WeakPart as weak:
-        raise KeyWrapRefused(
-            f"{setting}: the bundle has an encrypted part that {weak}. It is refused. {_REEXPORT}"
-        ) from None
+        refusal = f"has an encrypted part that {weak}. It is refused. {_REEXPORT}"
     except _CannotOpen as why:
-        raise KeyWrapRefused(
-            f"{setting}: the bundle has an encrypted part with {why}, so this engine does not "
-            f"open it to check the keys inside it. It is refused. {_REEXPORT}"
-        ) from None
+        refusal = (
+            f"has an encrypted part with {why}, so this engine does not open it to check the "
+            f"keys inside it. It is refused. {_REEXPORT}"
+        )
     except _Malformed:
-        raise KeyWrapRefused(
-            f"{setting}: the bundle has an encrypted part this engine cannot read, so it cannot "
-            f"open it to check the keys inside it. It is refused. {_REEXPORT}"
-        ) from None
+        refusal = (
+            "has an encrypted part this engine cannot read, so it cannot open it to check the "
+            f"keys inside it. It is refused. {_REEXPORT}"
+        )
+    if refusal is not None:
+        raise KeyWrapRefused(f"{setting}: the bundle {refusal}")
     return parts
 
 
@@ -891,23 +895,25 @@ def refuse_weak_pkcs12_contents(safe_contents: bytes, *, setting: str, unlock_se
     Contents that do not parse as one DER SafeContents are refused too. A wrong passphrase usually
     fails before this, at the padding, but now and then it leaves valid padding and lands here. So
     that text names ``unlock_setting`` first, and offers no re-export: the bundle may be fine."""
-    problem: str | None = None
+    # As in pkcs12_encrypted_parts: the handler keeps only the refusal text and the raise comes
+    # after it, so the refusal has no chain (BACKLOG #1796). ``safe_contents`` stays on the
+    # refusal's own traceback either way.
+    refusal: str | None = None
     try:
         whole = _read_tlv(safe_contents, 0, len(safe_contents))
         if whole.end != len(safe_contents):
             raise _Malformed
         _, problem = _bags_problem(safe_contents, whole, 0)
+        if problem is not None:
+            refusal = f"the bundle has an encrypted part that {problem}. It is refused. {_REEXPORT}"
     except _Malformed:
-        raise KeyWrapRefused(
-            f"{setting}: an encrypted part of the bundle did not decrypt to anything this engine "
-            f"can read, so the keys inside it cannot be checked. It is refused. The likely cause "
-            f"is a wrong passphrase: check {unlock_setting}"
-        ) from None
-    if problem is not None:
-        raise KeyWrapRefused(
-            f"{setting}: the bundle has an encrypted part that {problem}. It is refused. "
-            f"{_REEXPORT}"
+        refusal = (
+            "an encrypted part of the bundle did not decrypt to anything this engine can read, so "
+            "the keys inside it cannot be checked. It is refused. The likely cause is a wrong "
+            f"passphrase: check {unlock_setting}"
         )
+    if refusal is not None:
+        raise KeyWrapRefused(f"{setting}: {refusal}")
 
 
 # --- SSH keys -----------------------------------------------------------------------------------
