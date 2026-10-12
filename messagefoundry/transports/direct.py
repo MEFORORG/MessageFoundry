@@ -63,7 +63,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, paddin
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -325,15 +325,16 @@ class DirectDestination(DestinationConnector):
         password = s.get("password")
         self.username: str | None = str(username) if username else None
         self.password: str | None = str(password) if password else None
-        self.use_tls = bool(s.get("use_tls", True))
+        # An explicit None takes each default, not off (vault BACKLOG #3230).
+        self.use_tls = bool_setting(s, "use_tls", default=True)
         # #323: server-certificate verification on the TLS hop, kept byte-identical to
         # EmailDestination's spelling. This connector's TLS and AUTH handling is a copy of that
         # connector's, so the two must not drift; its envelope check is imported from
         # transports/email.py (checked_envelope, vault BACKLOG #2870).
-        self.tls_verify = bool(s.get("tls_verify", True))
+        self.tls_verify = bool_setting(s, "tls_verify", default=True)
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
-        self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
+        self.tls_check_hostname = bool_setting(s, "tls_check_hostname", default=True)
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="Direct destination"
         )

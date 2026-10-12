@@ -45,7 +45,7 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -82,6 +82,7 @@ from messagefoundry.transports.rest import (
     http_family_trust_anchor,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
+    refuse_credential_over_unverified_tls,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
@@ -269,7 +270,8 @@ class DicomWebDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        if bool(s.get("verify_tls", True)):
+        # An explicit None takes the default, not off (vault BACKLOG #3230).
+        if bool_setting(s, "verify_tls", default=True):
             # #1180 (ADR 0093): the client trust anchor for this STOW-RS hop.
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
@@ -298,6 +300,14 @@ class DicomWebDestination(DestinationConnector):
             )
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
+            refuse_credential_over_unverified_tls(
+                ConnectorType.DICOMWEB,
+                s,
+                self._headers,
+                scheme=scheme,
+                connector="DICOMweb destination",
+                connection=config.name,
+            )
             guard = refuse_verify_off(
                 scheme,
                 self.base_url,

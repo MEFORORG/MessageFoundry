@@ -60,7 +60,7 @@ from email.message import EmailMessage
 from email.utils import getaddresses, parseaddr
 from typing import Any
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -329,13 +329,14 @@ class EmailDestination(DestinationConnector):
         password = s.get("password")
         self.username: str | None = str(username) if username else None
         self.password: str | None = str(password) if password else None
-        self.use_tls = bool(s.get("use_tls", True))
+        # An explicit None takes each default, not off (vault BACKLOG #3230).
+        self.use_tls = bool_setting(s, "use_tls", default=True)
         # #323: server-certificate verification on the TLS hop. Defaults ON — smtplib's own default is
         # an UNVERIFIED context, so before this the encrypted session was unauthenticated.
-        self.tls_verify = bool(s.get("tls_verify", True))
+        self.tls_verify = bool_setting(s, "tls_verify", default=True)
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
-        self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
+        self.tls_check_hostname = bool_setting(s, "tls_check_hostname", default=True)
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="Email destination"
         )

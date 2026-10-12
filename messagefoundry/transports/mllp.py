@@ -34,7 +34,13 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    ContentType,
+    Destination,
+    Source,
+    bool_setting,
+)
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -655,8 +661,9 @@ def _mllp_ssl_context(
     # 0092 decision 2): the escape is CLAMPED to non production-PHI (weakened_tls_escape_permitted_here),
     # so tls_verify=false can no longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance —
     # matching the plaintext-MLLP InsecureHopGuard. Off the construction gate (unstamped) the escape is
-    # refused since vault BACKLOG #2354; it used to be honoured there unclamped.
-    verify = bool(s.get("tls_verify", True))
+    # refused since vault BACKLOG #2354; it used to be honoured there unclamped. An explicit None takes
+    # the default, not off (vault BACKLOG #3230).
+    verify = bool_setting(s, "tls_verify", default=True)
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "MLLP tls_verify=false disables server-certificate verification (MITM risk). Use a trusted "
@@ -679,7 +686,7 @@ def _mllp_ssl_context(
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
-        ctx.check_hostname = bool(s.get("tls_check_hostname", True))
+        ctx.check_hostname = bool_setting(s, "tls_check_hostname", default=True)
         if not ctx.check_hostname:  # ASVS 12.3.2: a recorded loosening, never a silent one
             warn_hostname_check_off(
                 connector="MLLP destination", name=name, host=str(s.get("host", "127.0.0.1"))

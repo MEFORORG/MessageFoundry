@@ -62,6 +62,7 @@ from typing import Any, NamedTuple
 from messagefoundry.config.models import (
     ConnectorType,
     Destination,
+    bool_setting,
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import EgressSettings
@@ -116,6 +117,7 @@ from messagefoundry.transports.rest import (
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
+    refuse_credential_over_unverified_tls,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
@@ -890,7 +892,9 @@ class FhirDestination(DestinationConnector):
                 connection=config.name,
             )
 
-        if bool(s.get("verify_tls", True)):
+        # An explicit None takes the default, not off (vault BACKLOG #3230).
+        verify = bool_setting(s, "verify_tls", default=True)
+        if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
@@ -911,6 +915,14 @@ class FhirDestination(DestinationConnector):
                 self._opener = _NO_REDIRECT_OPENER
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
+            refuse_credential_over_unverified_tls(
+                ConnectorType.FHIR,
+                s,
+                self._headers,
+                scheme=scheme,
+                connector="FHIR destination",
+                connection=config.name,
+            )
             guard = refuse_verify_off(
                 scheme,
                 self.base_url,
@@ -942,7 +954,7 @@ class FhirDestination(DestinationConnector):
                 # cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
-        if bool(s.get("verify_tls", True)):
+        if verify:
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the FHIR-server cert but does
             # no OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless
             # revocation is attested or this hop's own opener checks a CRL (composes with #200).
@@ -1608,7 +1620,20 @@ class FhirLookupExecutor:
             enforce_outbound_length_limits(url, headers)
             self._headers[cname] = headers
             self._token[cname] = token
-            if bool(s.get("verify_tls", True)):
+            # An explicit None takes the default, not off (vault BACKLOG #3230).
+            verify = bool_setting(s, "verify_tls", default=True)
+            if not verify:
+                # Ahead of the verify-off arm's escape check, as on the destinations.
+                refuse_credential_over_unverified_tls(
+                    ConnectorType.FHIR,
+                    s,
+                    headers,
+                    scheme=scheme,
+                    connector=f"FhirLookup {cname!r}",
+                    connection=label,
+                    lookup=True,
+                )
+            if verify:
                 # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
                 # server is the most on-point instance of 12.3.4's condition in the product, and it
                 # could not name an anchor at all.

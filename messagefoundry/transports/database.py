@@ -59,6 +59,7 @@ from messagefoundry.config.models import (
     ConnectorType,
     Destination,
     Source,
+    bool_setting,
     check_db_connect_timeout,
     hop_attestation_from_settings,
 )
@@ -196,7 +197,7 @@ def _build_dsn(
     only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
     shape test on text. The control that actually refuses a write is the privilege of the account this
     DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
-    encrypt = bool(s.get("encrypt", True))
+    encrypt = bool_setting(s, "encrypt", default=True)  # None is the default (vault BACKLOG #3230)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
         attested=attested, posture=current_hop_posture()
@@ -831,8 +832,8 @@ def _build_connection(
     only, since the SQL Server preset refuses rather than warns."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
-        weakened = bool(s.get("trust_server_certificate", False)) or not bool(
-            s.get("encrypt", True)
+        weakened = bool(s.get("trust_server_certificate", False)) or not bool_setting(
+            s, "encrypt", default=True
         )
         return (
             _build_dsn(s, read_only=read_only, attested=attested, connection=connection),

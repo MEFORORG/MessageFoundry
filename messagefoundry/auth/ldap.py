@@ -36,11 +36,9 @@ from urllib.parse import urlsplit
 from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
-    INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
     is_ldaps_address,
     split_kerberos_spn,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.redaction import safe_name
@@ -858,39 +856,21 @@ class LdapAuthenticator:
         spec = ad_anchor_spec(settings)
         if self._ldaps and spec is not None:
             self._ca_certs_data = verified_anchor_cadata(spec, enforcing=enforcing)
-        # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
-        # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
-        # so current_hop_posture() would be None here; the posture must be passed explicitly or the
-        # escape below is refused. None (a direct/test/embedding construction) FAILS CLOSED: the escape
-        # is not permitted (vault BACKLOG #2354). CORRECTED: this read that None *"falls back to the
-        # unclamped escape -- byte-identical to the pre-#329 bare read"*; weakened_tls_escape_permitted
-        # stopped doing that in engine PR 1886.
-        self._posture = posture
-        # A disabled-cert-verification posture (ad_tls_verify=false over LDAPS) would make the service-
-        # account and user binds MITM-able on first deployment, so it REFUSES at startup unless the
-        # operator sets the explicit MEFOR_ALLOW_INSECURE_TLS dev escape (ASVS 12.3.2). #329 routes that
-        # escape through the ADR-0092 clamp (weakened_tls_escape_permitted): under an enforcing-PHI
-        # posture the escape is INERT, so it can never silence this refusal on such an instance — the
-        # blunt env var no longer buys verify-off there. With the escape permitted (a known, non-enforcing
-        # posture; an unstamped one now refuses), we still warn loudly once at startup.
+        # Every LDAPS bind carries a password: the service account's (required above) and then the
+        # user's. With ad_tls_verify=false the engine would hand both to whichever peer answered, so it
+        # is refused, with no escape and in every posture (vault BACKLOG #3230; the rule is stated in
+        # docs/SECURITY-LOOSENING.md). Until then MEFOR_ALLOW_INSECURE_TLS released it at
+        # [security].enforcement = warn (#329).
         if self._ldaps and not settings.ad_tls_verify:
-            if not weakened_tls_escape_permitted(self._posture):
-                raise LdapError(
-                    "ad_tls_verify=false disables LDAPS certificate verification (MITM risk). Use a "
-                    f"trusted CA via ad_tls_ca_cert_file, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
-                    "instance at [security].enforcement = warn to explicitly allow it for a "
-                    "trusted-network dev/test bind (the override has no effect while enforcing, the "
-                    "default, or with no posture)."
-                )
-            logger.warning(
-                "LDAPS certificate verification for AD is DISABLED (ad_tls_verify=false, permitted by "
-                "%s at [security].enforcement = warn) — the service-account and user binds are "
-                "exposed to MITM; do not use in production.",
-                INSECURE_TLS_ESCAPE_ENV,
+            raise LdapError(
+                "ad_tls_verify=false would send the AD service-account and user passwords to an "
+                "LDAPS peer whose certificate is not verified; refused, with no escape. Leave "
+                "ad_tls_verify on (the default). For a directory whose certificate comes from a "
+                "private or self-signed CA, pin that CA with ad_tls_ca_cert_file."
             )
         # BACKLOG #1317, #2494. The engine builds this hop's TLS context (ASVS 12.1.2): narrowed to the
         # approved suites at TLS 1.2 and, where the interpreter allows it, TLS 1.3, then asserted.
-        # Verification-off is refused/warned above; this is the separate question of whether the
+        # Verification-off is refused above; this is the separate question of whether the
         # traffic is ENCRYPTED and the peer AUTHENTICATED at all. NarrowedTls builds and asserts that
         # context once here, so a bad one fails app startup (AuthService builds this eagerly), and
         # again for every connection. One Tls serves every Server: ldap3.Tls holds only settings.
@@ -902,7 +882,7 @@ class LdapAuthenticator:
             from messagefoundry.auth.ldap_tls import NarrowedTls  # lazy: it imports ldap3
 
             self._tls = NarrowedTls(
-                validate=ssl.CERT_REQUIRED if settings.ad_tls_verify else ssl.CERT_NONE,
+                validate=ssl.CERT_REQUIRED,  # ad_tls_verify=false is refused above
                 ca_certs_data=self._ca_certs_data,
                 connector=_LDAPS_CONNECTOR,
             )

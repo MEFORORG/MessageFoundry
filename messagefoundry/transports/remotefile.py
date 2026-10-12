@@ -7,14 +7,18 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
 - ``sftp`` — SSH file transfer (paramiko, the ``[sftp]`` extra — lazily imported, so installs that
   never use SFTP skip it). **Host-key verification is ON by default**; an unknown key is refused
   unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and logged loudly when it is),
-  mirroring the SQL Server backend's weakened-TLS posture.
+  mirroring the SQL Server backend's weakened-TLS posture. The escape never reaches a ``password``
+  login.
 - ``ftp`` — plain FTP (stdlib ``ftplib``). Cleartext: credentials over plain ``ftp`` are **refused**
-  outright, with no escape (use ``ftps``/``sftp``; vault BACKLOG #2636).
+  (use ``ftps``/``sftp``).
 - ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted. **The
   server certificate and hostname are verified by default** (a verifying :class:`ssl.SSLContext`, not
   ftplib's no-verify stdlib fallback); ``tls_verify=false`` drops verification only when the explicit
   escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture,
-  and only on an anonymous hop: with a credential it is refused outright (vault BACKLOG #2636).
+  and only on an anonymous hop.
+
+Each credential refusal above follows one rule, stated once in docs/SECURITY-LOOSENING.md, *No
+escape sends a credential to an unverified peer*.
 
 **Destination** uploads each payload to ``remote_dir``/``filename`` (``{HL7-path}`` placeholders
 resolved via :func:`render_filename`). The write goes to a temp name then a **rename** to the final
@@ -79,6 +83,7 @@ from messagefoundry.config.models import (
     ContentType,
     Destination,
     Source,
+    bool_setting,
     flag_from_settings,
     remote_file_protocol,
 )
@@ -641,16 +646,13 @@ def _ftps_ssl_context(
     does not take that key, so ``connections.toml`` cannot set it either, but a hand-built
     ``ConnectionSpec`` can, and this context honours it, so the warning lives here.
 
-    With a ``username`` or ``password`` set, both ``tls_verify=false`` and ``tls_check_hostname=false``
-    are refused outright, with no escape (vault BACKLOG #2636, mirroring the SMTP credential arms of
-    #323 and #1314). The escape governs only an anonymous hop."""
-    verify = bool(settings.get("tls_verify", True))
-    # Vault BACKLOG #2636: the FTPS twin of the two SMTP credential arms (#323 and #1314, in email.py
-    # and direct.py). ABSOLUTE and keyed on no escape: the escape below may govern the BODY posture
-    # of an anonymous hop, never the CREDENTIAL, because login() hands the credential to whichever
-    # peer the session reached. Keyed on either half, as the plain-ftp credential guard is. Checked
-    # BEFORE the escape arm, unlike SMTP, so a credentialed hop is never told to set an escape that
-    # cannot unlock it.
+    A ``username`` or ``password`` with either check off is refused (vault BACKLOG #2636). The rule
+    is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified
+    peer*."""
+    # An explicit None takes the default, not off (vault BACKLOG #3230).
+    verify = bool_setting(settings, "tls_verify", default=True)
+    # Keyed on either half, as the plain-ftp credential guard is. Checked BEFORE the escape arm, so a
+    # credentialed hop is never told to set an escape that cannot unlock it.
     has_credential = bool(settings.get("username") or settings.get("password"))
     if not verify and has_credential:
         # No chain and no name: an on-path peer presenting any certificate captures the login.
@@ -659,7 +661,7 @@ def _ftps_ssl_context(
             "TLS session (tls_verify=false); refused -- credentials require a verified TLS session. "
             "Leave tls_verify on (the default) with a trusted CA (tls_ca_file), or use sftp."
         )
-    check_hostname = bool(settings.get("tls_check_hostname", True))
+    check_hostname = bool_setting(settings, "tls_check_hostname", default=True)
     if not check_hostname and has_credential:
         # The chain IS verified (the arm above refused the rest), but with the name check off any
         # certificate chaining to the anchor is accepted whatever host it names -- on the system
@@ -1595,12 +1597,35 @@ def _sftp_rsa_bits(private_key: object) -> int | None:
     return key.key_size if isinstance(key, rsa.RSAPrivateKey) else None
 
 
+class _RefuseUnknownHostKey:
+    """The missing-host-key policy for an SFTP login that sends a ``password`` (vault BACKLOG #3230).
+
+    It refuses, as paramiko's ``RejectPolicy`` does, but names the connection and the fix. paramiko
+    reads a policy by its ``missing_host_key`` method alone, so this need not subclass its
+    ``MissingHostKeyPolicy``, and paramiko stays a lazy import. The refusal runs before
+    authentication, so the password is never sent to the unknown server."""
+
+    def __init__(self, paramiko: Any, *, name: str) -> None:
+        self._error: type[Exception] = paramiko.SSHException
+        self._name = name
+
+    def missing_host_key(self, client: object, hostname: str, key: object) -> None:
+        raise self._error(
+            f"{hop_name_prefix(self._name)}REMOTEFILE sftp would send its password to {hostname!r}, "
+            "whose host key is not in known_hosts; refused, with no escape. Add the server's host "
+            "key to the file the known_hosts setting names, or to the system known_hosts."
+        )
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
-    explicit dev escape is set, in which case ``AutoAddPolicy`` is used and a warning is logged."""
+    explicit dev escape is set, in which case ``AutoAddPolicy`` is used and a warning is logged. A
+    login that sends a ``password`` never takes the escape (vault BACKLOG #3230): its unknown host
+    key is refused by :class:`_RefuseUnknownHostKey`, whatever the posture."""
 
-    def __init__(self, settings: dict[str, Any]) -> None:
+    def __init__(self, settings: dict[str, Any], *, name: str = "") -> None:
+        self._name = name
         self._host = str(settings["host"])
         self._port = int(settings.get("port", 22))
         self._user = settings.get("username")
@@ -1621,7 +1646,9 @@ class _SftpClient(_RemoteClient):
         # enforcing-PHI posture the escape is INERT — the accept-unknown policy then stays RejectPolicy
         # and an unknown host key is refused at connect (:392-394), as today. Off the construction gate
         # (posture unstamped) the escape is refused since vault BACKLOG #2354 (it used to be unclamped).
-        self._accept_unknown = weakened_tls_escape_permitted_here()
+        # A password login is outside the escape altogether (vault BACKLOG #3230): AutoAddPolicy would
+        # hand the password to whichever server answered. A key-only login keeps the escape.
+        self._accept_unknown = not self._password and weakened_tls_escape_permitted_here()
         if self._accept_unknown:
             logger.warning(
                 "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "
@@ -1695,9 +1722,15 @@ class _SftpClient(_RemoteClient):
             client.load_host_keys(str(self._known_hosts))
         # RejectPolicy (default-secure): an unknown host key raises rather than being trusted. Only
         # fall back to AutoAddPolicy behind the explicit insecure escape (set in __init__, logged).
-        client.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy() if self._accept_unknown else paramiko.RejectPolicy()
-        )
+        # A password login refuses with text that names the connection and the fix.
+        policy: object
+        if self._accept_unknown:
+            policy = paramiko.AutoAddPolicy()
+        elif self._password:
+            policy = _RefuseUnknownHostKey(paramiko, name=self._name)
+        else:
+            policy = paramiko.RejectPolicy()
+        client.set_missing_host_key_policy(policy)
         pkey = self._load_key(paramiko)
         # Constrain the MAC proposal to the approved set (BACKLOG #1171), and the cipher proposal to
         # its own approved set. Both are passed on every connect, not behind a setting: a control an
@@ -1957,7 +1990,7 @@ def _make_client(
     verify)."""
     protocol = remote_file_protocol(settings)
     if protocol == "sftp":
-        return _SftpClient(settings)
+        return _SftpClient(settings, name=name)
     if protocol == "ftp":
         return _FtpClient(settings, tls=False)
     if protocol == "ftps":
@@ -2035,12 +2068,9 @@ def _validate_common(
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):
-        # Plain FTP puts the credential itself on the wire in the clear. Vault BACKLOG #2636: ABSOLUTE,
-        # keyed on no escape and no posture, as the SMTP cleartext-credential arm is (email.py,
-        # direct.py) and as the two FTPS credential arms in _ftps_ssl_context are. This was clamped
-        # (#200, ADR 0092 decision 2) and the escape released it on a non-enforcing instance, which
-        # left the cleartext rung weaker than the verify-off FTPS rung above it. Keyed on either half.
-        # The anonymous plain-ftp hop is governed by the hop guard below and is unchanged.
+        # Plain FTP puts the credential itself on the wire in the clear (vault BACKLOG #2636; the rule
+        # is in docs/SECURITY-LOOSENING.md). Keyed on either half. The anonymous plain-ftp hop is
+        # governed by the hop guard below.
         raise ValueError(
             f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in CLEARTEXT; "
             "refused -- credentials require an encrypted, verified session. Use ftps (tls=True) or "
