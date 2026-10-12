@@ -201,6 +201,7 @@ from messagefoundry.store import (
     StreamingAttachmentsUnsupported,
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
+from messagefoundry.store.cell_tag import CellTagError, report_cell_tag_failure
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
@@ -9346,6 +9347,15 @@ class RegistryRunner:
             result = await self._fused_transform_and_handoff(name, ic, item)
             if result.xform_exc is not None:  # CONTENT: a handler raise → internal-error policy
                 return await self._apply_transform_internal_error(name, item, result.xform_exc)
+            if isinstance(result.handoff_exc, CellTagError):
+                # BACKLOG #2593: the message's own metadata cell failed its row tag. The sync
+                # handoff rolled back and the alert was raised at the read; dead-letter the row
+                # (message ERROR) and audit it, as the async transform_handoff does, rather than
+                # re-pend a row that would fail the same way until the inbound stopped.
+                await self.store.dead_letter_now(item.id, str(result.handoff_exc))
+                # record_audit lives on AuditStore, which every shipped backend implements.
+                await report_cell_tag_failure(cast(AuditStore, self.store), result.handoff_exc)
+                return _ItemOutcome.PROCESSED, None
             if result.handoff_exc is not None:  # INFRA: acquire/handoff fault → propagate → T17
                 raise result.handoff_exc
             # LOOP-side publish of the committed transform-state (the sync twin never mutates the

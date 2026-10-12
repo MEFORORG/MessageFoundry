@@ -7513,8 +7513,9 @@ class MessageStore:
         ``updated_at``. Every other row is dropped, because nobody could list, recall or delete it.
         That includes rows of ``system``, the no-auth identity: its id equals its username, but so
         would a deleted account's that was named ``system``, and the two cannot be told apart.
-        ``criteria`` is sealed against the preset ``id``, which does not change, so no cell is
-        re-encrypted. The rename carries the unique index along with the column. Runs in the open's
+        ``criteria`` is sealed against the preset ``id`` AND its owner (BACKLOG #2593), and this
+        rewrites the owner, so a cell sealed before it no longer opens: its recall is refused and the
+        row still lists. No store has deployed, so nothing re-seals it. The rename carries the unique index along with the column. Runs in the open's
         migration transaction, so a refused open rolls all of it back."""
         await db.execute(
             "DELETE FROM search_presets"

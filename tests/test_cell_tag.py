@@ -102,8 +102,6 @@ def test_open_message_cell_refuses_a_moved_cell_and_alerts() -> None:
 
 
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
-#: Backends not yet moved onto the builders in this branch's earlier commits.
-_UNCONVERTED = {"sqlserver.py"}
 
 
 def _literal_cells(path: pathlib.Path, tables: set[str]) -> int:
@@ -122,14 +120,16 @@ def _literal_cells(path: pathlib.Path, tables: set[str]) -> int:
 
 def test_one_builder_builds_every_message_and_preset_tag() -> None:
     """No store module builds a message cell's or a preset's associated data except through the
-    builders: the only ``cell_aad`` literal for either table is the builders' own frame."""
+    builders, whose own ``cell_aad`` frame names the table by variable, not by literal."""
     counts = {
         p.name: n
         for p in sorted(_STORE_DIR.rglob("*.py"))
-        if p.name not in _UNCONVERTED and (n := _literal_cells(p, {"messages", "search_presets"}))
+        if (n := _literal_cells(p, {"messages", "search_presets"}))
     }
     assert counts == {}, counts
-    for backend in {"store.py", "postgres.py", "sqlserver.py"} - _UNCONVERTED:
+    # Positive control: the same instrument finds the literal cells another table still uses.
+    assert _literal_cells(_STORE_DIR / "store.py", {"queue"}) > 0
+    for backend in ("store.py", "postgres.py", "sqlserver.py"):
         source = (_STORE_DIR / backend).read_text(encoding="utf-8")
         assert "message_cell_aad(" in source and "preset_criteria_aad(" in source, backend
 

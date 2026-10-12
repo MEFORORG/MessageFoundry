@@ -84,6 +84,20 @@ from messagefoundry.store.base import (
     warm_pool_target,
     warn_stale_schema_read_only,
 )
+from messagefoundry.store.cell_tag import (
+    CellTagError,
+    audits_cell_tag,
+    dead_letters_on_cell_tag,
+    is_row_tagged,
+    message_cell_aad,
+    open_message_cell,
+    open_preset_criteria,
+    preset_criteria_aad,
+    report_cell_tag_failure,
+    row_tag_aad,
+    row_tag_columns,
+    withhold_message_cells,
+)
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -706,7 +720,8 @@ _SQL_SELECT_MESSAGE_STATUS: Final[str] = (
 )
 _SQL_UPDATE_MESSAGE_STATUS: Final[str] = "UPDATE messages SET status=? WHERE id=?"
 _SQL_SELECT_MESSAGE_EXISTS: Final[str] = "SELECT 1 FROM messages WHERE id=?"
-_SQL_SELECT_METADATA: Final[str] = "SELECT metadata FROM messages WHERE id=?"
+# The channel rides along because the metadata cell is bound to it (BACKLOG #2593).
+_SQL_SELECT_METADATA: Final[str] = "SELECT channel_id, metadata FROM messages WHERE id=?"
 _SQL_UPDATE_METADATA: Final[str] = (
     "UPDATE messages SET metadata=? WHERE id=?"  # SetMeta merge (#150)
 )
@@ -3438,7 +3453,15 @@ class SqlServerStore:
             ("queue", "last_error"),
             ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed, nullable
         ):
-            total += await self._seal_surface(table, column, like, aad_cols=("id",))
+            # A message cell binds its channel and a preset's criteria its owner (#2593).
+            total += await self._seal_surface(
+                table,
+                column,
+                like,
+                aad_cols=row_tag_columns(table, column),
+                key_cols=("id",),
+                aad_of=partial(row_tag_aad, table, column),
+            )
         # `queue.payload` binds the row's routing fields, not its id alone (BACKLOG #2593).
         total += await self._seal_surface(
             "queue",
@@ -5076,12 +5099,20 @@ class SqlServerStore:
                         source_type,
                         control_id,
                         message_type,
-                        self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                        self._cipher.encrypt(
+                            raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                        ),
                         status,
                         None,
                         # EF-3: MRN/name is PHI — ciphered at rest
-                        self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                        self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        self._enc(
+                            summary,
+                            aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id),
+                        ),
+                        self._enc(
+                            metadata,
+                            aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                        ),
                         MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
                         None,
                     ),
@@ -5305,11 +5336,16 @@ class SqlServerStore:
                     "passthrough",
                     None,
                     None,
-                    self._cipher.encrypt(body, aad=cell_aad("messages", "raw", new_mid)),
+                    self._cipher.encrypt(
+                        body, aad=message_cell_aad("raw", message_id=new_mid, channel_id=pt_channel)
+                    ),
                     MessageStatus.RECEIVED.value,
                     None,
                     None,
-                    self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    self._enc(
+                        child_meta,
+                        aad=message_cell_aad("metadata", message_id=new_mid, channel_id=pt_channel),
+                    ),
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
@@ -5391,11 +5427,16 @@ class SqlServerStore:
                     "passthrough",
                     None,
                     None,
-                    self._cipher.encrypt(body, aad=cell_aad("messages", "raw", new_mid)),
+                    self._cipher.encrypt(
+                        body, aad=message_cell_aad("raw", message_id=new_mid, channel_id=pt_channel)
+                    ),
                     MessageStatus.RECEIVED.value,
                     None,
                     None,
-                    self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    self._enc(
+                        child_meta,
+                        aad=message_cell_aad("metadata", message_id=new_mid, channel_id=pt_channel),
+                    ),
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
@@ -5551,12 +5592,25 @@ class SqlServerStore:
                             source_type,
                             control_id,
                             message_type,
-                            self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                            self._cipher.encrypt(
+                                raw,
+                                aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id),
+                            ),
                             MessageStatus.RECEIVED.value,
                             None,
                             # EF-3: MRN/name is PHI — ciphered at rest
-                            self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                            self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                            self._enc(
+                                summary,
+                                aad=message_cell_aad(
+                                    "summary", message_id=mid, channel_id=channel_id
+                                ),
+                            ),
+                            self._enc(
+                                metadata,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=mid, channel_id=channel_id
+                                ),
+                            ),
                             origin.value,  # vault BACKLOG #2615: plain by design
                             origin_actor,
                         ),
@@ -5861,6 +5915,7 @@ class SqlServerStore:
             _close_sync_cursor(cur)
         return True
 
+    @dead_letters_on_cell_tag
     async def transform_handoff(
         self,
         *,
@@ -5955,14 +6010,21 @@ class SqlServerStore:
                 # depth 0).
                 # Read the message's current metadata ONCE if either PT re-ingress or SetMeta needs it.
                 pmeta_dec: str | None = None
+                # Bound to the message row's own channel (BACKLOG #2593); a cell that fails that
+                # tag raises CellTagError, and the decorator dead-letters the routed row.
+                msg_channel = channel_id
                 if pt_deliveries or meta_ops:
                     await cur.execute(_SQL_SELECT_METADATA, (message_id,))
                     prow = await cur.fetchone()
-                    pmeta_dec = (
-                        self._dec(prow[0], aad=cell_aad("messages", "metadata", message_id))
-                        if prow
-                        else None
-                    )
+                    if prow is not None:
+                        msg_channel = str(prow[0])
+                        pmeta_dec = open_message_cell(
+                            self._cipher,
+                            "metadata",
+                            prow[1],
+                            message_id=message_id,
+                            channel_id=msg_channel,
+                        )
                 if pt_deliveries:
                     parent_meta = _parent_meta_from_row(pmeta_dec)
                     for pt_name, body in pt_deliveries:
@@ -5986,7 +6048,12 @@ class SqlServerStore:
                     await cur.execute(
                         _SQL_UPDATE_METADATA,
                         (
-                            self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                            self._enc(
+                                merged,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=message_id, channel_id=msg_channel
+                                ),
+                            ),
                             message_id,
                         ),
                     )
@@ -6150,14 +6217,21 @@ class SqlServerStore:
             for dest_name, payload in deliveries:
                 self._insert_outbound_sync(cur, message_id, channel_id, dest_name, payload, now)
             pmeta_dec: str | None = None
+            # Bound to the message row's own channel (BACKLOG #2593). A cell that fails that tag
+            # raises CellTagError after the rollback below; the fused caller dead-letters the row.
+            msg_channel = channel_id
             if pt_deliveries or meta_ops:
                 cur.execute(_SQL_SELECT_METADATA, (message_id,))
                 prow = cur.fetchone()
-                pmeta_dec = (
-                    self._dec(prow[0], aad=cell_aad("messages", "metadata", message_id))
-                    if prow
-                    else None
-                )
+                if prow is not None:
+                    msg_channel = str(prow[0])
+                    pmeta_dec = open_message_cell(
+                        self._cipher,
+                        "metadata",
+                        prow[1],
+                        message_id=message_id,
+                        channel_id=msg_channel,
+                    )
             if pt_deliveries:
                 parent_meta = _parent_meta_from_row(pmeta_dec)
                 for pt_name, body in pt_deliveries:
@@ -6180,7 +6254,12 @@ class SqlServerStore:
                 cur.execute(
                     _SQL_UPDATE_METADATA,
                     (
-                        self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                        self._enc(
+                            merged,
+                            aad=message_cell_aad(
+                                "metadata", message_id=message_id, channel_id=msg_channel
+                            ),
+                        ),
                         message_id,
                     ),
                 )
@@ -6642,7 +6721,11 @@ class SqlServerStore:
                 )
                 row = await cur.fetchone()
                 effective_id = str(row[0]) if row is not None else preset_id
-                enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
+                # Bound to the row id and its owner (BACKLOG #2593).
+                enc = self._enc(
+                    criteria,
+                    aad=preset_criteria_aad(preset_id=effective_id, owner_user_id=owner_user_id),
+                )
                 if row is not None:
                     await cur.execute(
                         "UPDATE search_presets SET criteria=?, updated_at=? WHERE id=?",
@@ -6669,6 +6752,7 @@ class SqlServerStore:
             (owner_user_id,),
         )
 
+    @audits_cell_tag
     async def get_search_preset(
         self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
@@ -6679,8 +6763,10 @@ class SqlServerStore:
         )
         if row is None:
             return None
-        row["criteria"] = self._dec(
-            row["criteria"], aad=cell_aad("search_presets", "criteria", preset_id)
+        # Bound to the row id and its owner (BACKLOG #2593): a preset moved to another owner outside
+        # the store refuses here.
+        row["criteria"] = open_preset_criteria(
+            self._cipher, row["criteria"], preset_id=preset_id, owner_user_id=owner_user_id
         )
         # #306: stamp last-USED, best-effort and AFTER the read — a usage hint must never fail the
         # recall it annotates (SQLite parity). The returned dict carries the PRE-stamp value.
@@ -7034,8 +7120,42 @@ class SqlServerStore:
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref or a re-ingress that
         would exceed ``correlation_depth_cap`` is dead-lettered (and the token still consumed). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
-        child."""
-        now = time.time() if now is None else now
+        child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
+        corrupt ref, and the failure is audited once the transaction has closed."""
+        tag_failures: list[CellTagError] = []
+        try:
+            return await self._ingress_handoff_txn(
+                response_row_id=response_row_id,
+                loopback_channel_id=loopback_channel_id,
+                correlation_depth_cap=correlation_depth_cap,
+                control_id=control_id,
+                message_type=message_type,
+                summary=summary,
+                peek_failed=peek_failed,
+                peek_error=peek_error,
+                now=time.time() if now is None else now,
+                tag_failures=tag_failures,
+            )
+        finally:
+            for failure in tag_failures:
+                await report_cell_tag_failure(self, failure)
+
+    async def _ingress_handoff_txn(
+        self,
+        *,
+        response_row_id: str,
+        loopback_channel_id: str,
+        correlation_depth_cap: int,
+        control_id: str | None,
+        message_type: str | None,
+        summary: str | None,
+        peek_failed: bool,
+        peek_error: str | None,
+        now: float,
+        tag_failures: list[CellTagError],
+    ) -> bool:
+        """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
+        ``tag_failures`` for the caller to audit."""
         # ADR 0157 C1: both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
         # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
@@ -7054,17 +7174,13 @@ class SqlServerStore:
                     return False  # already consumed by a committed prior run (idempotent no-op)
                 work_row = dict(zip((*QUEUE_TAG_COLUMNS, "payload"), wr, strict=True))
                 origin_id = work_row["message_id"]
-                # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
-                try:
-                    ref = (
-                        self._cipher.decrypt(work_row["payload"], aad=queue_row_aad(work_row)) or ""
-                    )
-                    origin_msg_id, dest, seq_s = ref.split("\x1f")
-                    seq = int(seq_s)
-                except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+
+                async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                    # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction
+                    # and CONSUME it (status flipped), never re-loop.
                     await self._exec_terminal(
                         cur,
-                        "ingress_handoff(corrupt-ref)",
+                        label,
                         (response_row_id,),
                         "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
                         + output
@@ -7073,8 +7189,7 @@ class SqlServerStore:
                         (
                             OutboxStatus.DEAD.value,
                             self._enc(  # H4
-                                "re-ingress work-row reference is corrupt/unparseable",
-                                aad=cell_aad("queue", "last_error", response_row_id),
+                                error, aad=cell_aad("queue", "last_error", response_row_id)
                             ),
                             now,
                             now,
@@ -7083,10 +7198,24 @@ class SqlServerStore:
                         ),
                         checked=bool(guard),
                     )
-                    await self._event(cur, origin_id, "dead", None, "re-ingress ref corrupt", now)
+                    await self._event(cur, origin_id, "dead", None, event_detail, now)
                     await self._maybe_finalize(cur, origin_id, now)  # preceded by step-1 SELECT
                     await self._commit(conn)
-                    return True  # CONSUME (status flipped), never re-loop
+                    return True
+
+                # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
+                try:
+                    ref = (
+                        self._cipher.decrypt(work_row["payload"], aad=queue_row_aad(work_row)) or ""
+                    )
+                    origin_msg_id, dest, seq_s = ref.split("\x1f")
+                    seq = int(seq_s)
+                except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                    return await _consume_dead(
+                        "ingress_handoff(corrupt-ref)",
+                        "re-ingress work-row reference is corrupt/unparseable",
+                        "re-ingress ref corrupt",
+                    )
                 # (3) Read the immutable artifact body.
                 await cur.execute(
                     "SELECT body FROM response"
@@ -7102,14 +7231,31 @@ class SqlServerStore:
                     else ""
                 ) or ""
                 # (4) Correlation lineage from the origin's metadata (parse once).
-                await cur.execute("SELECT metadata FROM messages WHERE id=?", (origin_id,))
-                mrow = await cur.fetchone()
-                # EF-3: metadata ciphered at rest, bound to the origin message's cell
-                meta_json = (
-                    self._dec(mrow[0], aad=cell_aad("messages", "metadata", origin_id))
-                    if mrow
-                    else None
+                await cur.execute(
+                    "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
                 )
+                mrow = await cur.fetchone()
+                # EF-3: metadata ciphered at rest, bound to the origin message's cell and its
+                # channel (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+                try:
+                    meta_json = (
+                        open_message_cell(
+                            self._cipher,
+                            "metadata",
+                            mrow[1],
+                            message_id=origin_id,
+                            channel_id=mrow[0],
+                        )
+                        if mrow
+                        else None
+                    )
+                except CellTagError as err:
+                    tag_failures.append(err)  # audited once the transaction has closed
+                    return await _consume_dead(
+                        "ingress_handoff(origin-tag)",
+                        str(err),
+                        "re-ingress origin failed its integrity tag",
+                    )
                 loaded = json.loads(meta_json) if meta_json else {}
                 origin_meta = loaded if isinstance(loaded, dict) else {}
                 child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
@@ -7167,7 +7313,12 @@ class SqlServerStore:
                             "reingress",
                             control_id,
                             message_type,
-                            self._cipher.encrypt(body, aad=cell_aad("messages", "raw", new_mid)),
+                            self._cipher.encrypt(
+                                body,
+                                aad=message_cell_aad(
+                                    "raw", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
+                            ),
                             MessageStatus.ERROR.value
                             if peek_failed
                             else MessageStatus.RECEIVED.value,
@@ -7176,11 +7327,23 @@ class SqlServerStore:
                                 (peek_error or "re-ingress body failed HL7 peek")
                                 if peek_failed
                                 else None,
-                                aad=cell_aad("messages", "error", new_mid),
+                                aad=message_cell_aad(
+                                    "error", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
                             ),
                             # EF-3: MRN/name is PHI — ciphered at rest
-                            self._enc(summary, aad=cell_aad("messages", "summary", new_mid)),
-                            self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                            self._enc(
+                                summary,
+                                aad=message_cell_aad(
+                                    "summary", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
+                            ),
+                            self._enc(
+                                child_meta,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
+                            ),
                             MessageOrigin.REINGRESS.value,  # vault BACKLOG #2615: plain by design
                             None,
                         ),
@@ -7632,6 +7795,17 @@ class SqlServerStore:
             ("queue", "last_error"),
             ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed
         ):
+            if is_row_tagged(table, column):
+                # A message cell or a preset's criteria rebinds its row tag (BACKLOG #2593).
+                total += await self._reencrypt_tagged_to_active(
+                    active_like,
+                    batch,
+                    table=table,
+                    column=column,
+                    select=", ".join(row_tag_columns(table, column)),
+                    aad_of=partial(row_tag_aad, table, column),
+                )
+                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (?) id, {column} AS v FROM {table}"
@@ -7662,7 +7836,14 @@ class SqlServerStore:
                 await self._charge_bound_batch()
                 total += len(rows)
         # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
-        total += await self._reencrypt_queue_payload_to_active(active_like, batch)
+        total += await self._reencrypt_tagged_to_active(
+            active_like,
+            batch,
+            table="queue",
+            column="payload",
+            select=QUEUE_TAG_SELECT,
+            aad_of=queue_row_aad,
+        )
         # `state` has a composite PK (namespace, [key]) — its own pass (can't ride the id-keyed loop
         # above). transform_handoff writes state.value encrypted, so a rotation MUST rotate it too or a
         # later retired-key drop silently loses all transform cross-message state (review HIGH).
@@ -7835,21 +8016,28 @@ class SqlServerStore:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
-    async def _reencrypt_queue_payload_to_active(self, active_like: str, batch: int) -> int:
-        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
-        (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
-        selected so the decrypt and the encrypt share one tag.
-        A cell that does not open under its own tag with a key this process holds
-        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
-        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
-        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
-        ``id``, since a skipped row still matches the marker filter."""
+    async def _reencrypt_tagged_to_active(
+        self,
+        active_like: str,
+        batch: int,
+        *,
+        table: str,
+        column: str,
+        select: str,
+        aad_of: Callable[[dict[str, Any]], bytes],
+    ) -> int:
+        """Re-seal an id-keyed cell whose tag binds more than the row id under the active key,
+        rebinding each row's tag (``queue.payload``'s routing tag, a message cell's channel, a
+        preset's owner; BACKLOG #2593). The SQLite twin documents it: ``select`` names the tag's
+        columns, ``id`` among them; a cell that fails its own tag under a held key is left and counted
+        in a WARNING; any other failure still stops the rotation; pages by ``id``. All identifiers are
+        code constants."""
         total = skipped = 0
         after = ""
         while True:
             rows = await self._fetchall(
-                f"SELECT TOP (?) {QUEUE_TAG_SELECT}, payload FROM queue"
-                " WHERE payload NOT LIKE ? AND payload <> '' AND id > ? ORDER BY id",
+                f"SELECT TOP (?) {select}, {column} AS v FROM {table}"
+                f" WHERE {column} NOT LIKE ? AND {column} <> '' AND id > ? ORDER BY id",
                 (batch, active_like, after),
             )
             if not rows:
@@ -7858,16 +8046,18 @@ class SqlServerStore:
             updates: list[tuple[str, str]] = []
             for r in rows:
                 try:
-                    updates.append((self._reencrypt_value(r["payload"], queue_row_aad(r)), r["id"]))
+                    updates.append((self._reencrypt_value(r["v"], aad_of(r)), r["id"]))
                 except CipherError:
-                    if not is_tag_failure(self._cipher, r["payload"]):
+                    if not is_tag_failure(self._cipher, r["v"]):
                         raise
                     skipped += 1
             if updates:
                 async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
                         for enc, rid in updates:
-                            await cur.execute("UPDATE queue SET payload=? WHERE id=?", (enc, rid))
+                            await cur.execute(
+                                f"UPDATE {table} SET {column}=? WHERE id=?", (enc, rid)
+                            )
                         await self._commit(conn)
                     except Exception:
                         await conn.rollback()
@@ -7876,9 +8066,11 @@ class SqlServerStore:
                 total += len(updates)
         if skipped:
             log.warning(
-                "rotation left %d queue row(s) whose payload does not open under its own tag"
-                " under a held key; no claim or read opens them (BACKLOG #2593)",
+                "rotation left %d %s.%s value(s) that do not open under their own row's tag"
+                " under a held key; no read opens them (BACKLOG #2593)",
                 skipped,
+                table,
+                column,
             )
         return total
 
@@ -8047,12 +8239,19 @@ class SqlServerStore:
         docs = 0
         reclaimed = 0
         updates: list[tuple[str, float, str]] = []
+        failures: list[CellTagError] = []
         for row in rows:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue
             try:
-                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+                raw = open_message_cell(
+                    self._cipher,
+                    "raw",
+                    row["raw"],
+                    message_id=row["id"],
+                    channel_id=row["channel_id"],
+                )
             except CipherError as exc:
                 # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
                 # must not abort the whole retention pass. The row is left exactly as found; the
@@ -8062,7 +8261,10 @@ class SqlServerStore:
                     row["id"],
                     exc,
                 )
+                if isinstance(exc, CellTagError):  # BACKLOG #2593: audited below
+                    failures.append(exc)
                 continue
+            assert raw is not None  # raw is NOT NULL
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,
@@ -8073,7 +8275,12 @@ class SqlServerStore:
                 continue
             updates.append(
                 (
-                    self._cipher.encrypt(new_raw, aad=cell_aad("messages", "raw", row["id"])),
+                    self._cipher.encrypt(
+                        new_raw,
+                        aad=message_cell_aad(
+                            "raw", message_id=row["id"], channel_id=row["channel_id"]
+                        ),
+                    ),
                     now,
                     row["id"],
                 )
@@ -8092,6 +8299,8 @@ class SqlServerStore:
                 except Exception:
                     await conn.rollback()
                     raise
+        for err in failures:
+            await report_cell_tag_failure(self, err)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
         )
@@ -8327,13 +8536,24 @@ class SqlServerStore:
                         source_type,
                         control_id,
                         message_type,
-                        self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                        self._cipher.encrypt(
+                            raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                        ),
                         status.value,
                         # H4: error may embed raw HL7 fragments — ciphered at rest
-                        self._enc(error, aad=cell_aad("messages", "error", mid)),
+                        self._enc(
+                            error,
+                            aad=message_cell_aad("error", message_id=mid, channel_id=channel_id),
+                        ),
                         # EF-3: MRN/name is PHI — ciphered at rest
-                        self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                        self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        self._enc(
+                            summary,
+                            aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id),
+                        ),
+                        self._enc(
+                            metadata,
+                            aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                        ),
                         MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
                         None,
                     ),
@@ -10318,6 +10538,7 @@ class SqlServerStore:
             outbox_id=row["outbox_id"],
         )
 
+    @audits_cell_tag
     async def resend_to(
         self,
         *,
@@ -10421,8 +10642,12 @@ class SqlServerStore:
                                 f"message {message_id} edited body is empty -- cannot resend"
                             )
                         # Correlate the child to the origin (mirrors `reingress`).
-                        raw_meta = self._dec(
-                            mrow[3], aad=cell_aad("messages", "metadata", message_id)
+                        raw_meta = open_message_cell(
+                            self._cipher,
+                            "metadata",
+                            mrow[3],
+                            message_id=message_id,
+                            channel_id=src_channel,
                         )
                         try:
                             parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -10453,13 +10678,19 @@ class SqlServerStore:
                                 None,
                                 mrow[2],  # message_type
                                 self._cipher.encrypt(
-                                    body, aad=cell_aad("messages", "raw", child_mid)
+                                    body,
+                                    aad=message_cell_aad(
+                                        "raw", message_id=child_mid, channel_id=src_channel
+                                    ),
                                 ),
                                 MessageStatus.ROUTED.value,
                                 None,
                                 None,
                                 self._enc(
-                                    child_meta, aad=cell_aad("messages", "metadata", child_mid)
+                                    child_meta,
+                                    aad=message_cell_aad(
+                                        "metadata", message_id=child_mid, channel_id=src_channel
+                                    ),
                                 ),
                                 MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
                                 actor,
@@ -10602,6 +10833,7 @@ class SqlServerStore:
                 await self._rollback_or_discard(conn)
                 raise
 
+    @audits_cell_tag
     async def reingress(
         self,
         *,
@@ -10664,8 +10896,12 @@ class SqlServerStore:
                         await self._append_operator_audit(cur, written, audit, outcome)
                         await self._commit(conn)
                         return outcome
-                    raw_meta = self._dec(
-                        metadata_ciphertext, aad=cell_aad("messages", "metadata", origin_message_id)
+                    raw_meta = open_message_cell(
+                        self._cipher,
+                        "metadata",
+                        metadata_ciphertext,
+                        message_id=origin_message_id,
+                        channel_id=channel_id,
                     )
                     try:
                         parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -10697,12 +10933,20 @@ class SqlServerStore:
                                 source_type,
                                 None,
                                 message_type,
-                                self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", new_mid)),
+                                self._cipher.encrypt(
+                                    raw,
+                                    aad=message_cell_aad(
+                                        "raw", message_id=new_mid, channel_id=channel_id
+                                    ),
+                                ),
                                 MessageStatus.RECEIVED.value,
                                 None,
                                 None,
                                 self._enc(
-                                    child_meta, aad=cell_aad("messages", "metadata", new_mid)
+                                    child_meta,
+                                    aad=message_cell_aad(
+                                        "metadata", message_id=new_mid, channel_id=channel_id
+                                    ),
                                 ),
                                 MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
                                 actor,
@@ -10888,32 +11132,39 @@ class SqlServerStore:
 
     # --- read helpers --------------------------------------------------------
 
+    @audits_cell_tag
     async def get_message(self, message_id: str) -> dict[str, Any] | None:
         record = await self._fetchone("SELECT * FROM messages WHERE id=?", (message_id,))
         if record is not None:
-            mid = record["id"]
-            # decrypt the body for display, bound to the messages cell (ASVS 11.3.3)
-            record["raw"] = self._cipher.decrypt(
-                record["raw"], aad=cell_aad("messages", "raw", mid)
-            )
-            # H4: error may embed raw HL7 fragments
-            record["error"] = self._dec(record["error"], aad=cell_aad("messages", "error", mid))
-            # EF-3: MRN/name PHI, ciphered at rest
-            record["summary"] = self._dec(
-                record["summary"], aad=cell_aad("messages", "summary", mid)
-            )
-            record["metadata"] = self._dec(  # EF-3
-                record["metadata"], aad=cell_aad("messages", "metadata", mid)
-            )
+            # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, H4), summary
+            # and metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3,
+            # BACKLOG #2593), so a cell that fails that tag refuses the whole read.
+            for column in ("raw", "error", "summary", "metadata"):
+                record[column] = open_message_cell(
+                    self._cipher,
+                    column,
+                    record[column],
+                    message_id=record["id"],
+                    channel_id=record["channel_id"],
+                )
         return record
 
+    @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
         # #68: decrypt ONLY the metadata column (never the raw PHI body) for the delivery worker's
         # per-message dynamic headers. Off the perf-critical claim path; read only for opted-in outbounds.
-        record = await self._fetchone("SELECT metadata FROM messages WHERE id=?", (message_id,))
+        record = await self._fetchone(
+            "SELECT channel_id, metadata FROM messages WHERE id=?", (message_id,)
+        )
         if record is None:
             return None
-        return self._dec(record["metadata"], aad=cell_aad("messages", "metadata", message_id))
+        return open_message_cell(
+            self._cipher,
+            "metadata",
+            record["metadata"],
+            message_id=message_id,
+            channel_id=record["channel_id"],
+        )
 
     async def list_messages(
         self,
@@ -10946,12 +11197,20 @@ class SqlServerStore:
             " ORDER BY received_at DESC, id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
+        # error (H4) and summary/metadata (EF-3) open under the row's tag (BACKLOG #2593). A row that
+        # fails still lists by its plaintext columns with its cells withheld, alerted and audited.
+        failures: list[CellTagError] = []
         for r in rows:
-            mid = r["id"]
-            r["error"] = self._dec(r["error"], aad=cell_aad("messages", "error", mid))  # H4
-            # EF-3: summary/metadata ciphered at rest
-            r["summary"] = self._dec(r["summary"], aad=cell_aad("messages", "summary", mid))
-            r["metadata"] = self._dec(r["metadata"], aad=cell_aad("messages", "metadata", mid))
+            withhold_message_cells(
+                self._cipher,
+                r,
+                ("error", "summary", "metadata"),
+                message_id=r["id"],
+                channel_id=r["channel_id"],
+                failures=failures,
+            )
+        for err in failures:
+            await report_cell_tag_failure(self, err)
         return rows
 
     async def count_messages(
@@ -11006,14 +11265,23 @@ class SqlServerStore:
             "  ORDER BY received_at DESC, id DESC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY)",
             (*params, spec.fetch_limit),
         )
-        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
+        failures: list[CellTagError] = []
+        result = await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit, failures)
+        for err in failures:
+            await report_cell_tag_failure(self, err)
+        return result
 
     def _scan_rows(
-        self, spec: SearchSpec, candidates: list[dict[str, Any]], limit: int
+        self,
+        spec: SearchSpec,
+        candidates: list[dict[str, Any]],
+        limit: int,
+        failures: list[CellTagError],
     ) -> MessageSearchResult:
         """Off-loop decrypt+match loop (mirrors ``MessageStore._scan_rows``). Bounded by
         ``spec.scan_limit`` decrypts and ``limit`` matches; returns metadata-only rows (the decrypted
-        ``raw`` is dropped, so the PHI surface equals ``list_messages``)."""
+        ``raw`` is dropped, so the PHI surface equals ``list_messages``). A candidate whose cells fail
+        the row's tag is left out, and its error goes to ``failures`` (BACKLOG #2593)."""
         out: list[dict[str, Any]] = []
         scanned = 0
         truncated = False
@@ -11022,20 +11290,26 @@ class SqlServerStore:
                 truncated = True
                 break
             scanned += 1
-            cid = cand["id"]
-            raw = self._dec(cand.get("raw"), aad=cell_aad("messages", "raw", cid))
-            summary = self._dec(cand.get("summary"), aad=cell_aad("messages", "summary", cid))
-            if row_matches(spec, raw=raw, summary=summary):
-                d = dict(cand)
-                d["error"] = self._dec(d.get("error"), aad=cell_aad("messages", "error", cid))
-                d["summary"] = self._dec(d.get("summary"), aad=cell_aad("messages", "summary", cid))
-                d["metadata"] = self._dec(
-                    d.get("metadata"), aad=cell_aad("messages", "metadata", cid)
+            d = dict(cand)
+            stored_raw = d.pop("raw", None)
+
+            def opened(column: str, stored: str | None, d: dict[str, Any] = d) -> str | None:
+                return open_message_cell(
+                    self._cipher, column, stored, message_id=d["id"], channel_id=d["channel_id"]
                 )
-                d.pop("raw", None)
-                out.append(d)
-                if len(out) >= limit:
-                    break
+
+            try:
+                d["summary"] = opened("summary", d.get("summary"))
+                if not row_matches(spec, raw=opened("raw", stored_raw), summary=d["summary"]):
+                    continue
+                d["error"] = opened("error", d.get("error"))
+                d["metadata"] = opened("metadata", d.get("metadata"))
+            except CellTagError as err:
+                failures.append(err)
+                continue
+            out.append(d)
+            if len(out) >= limit:
+                break
         return MessageSearchResult(rows=out, scanned=scanned, matched=len(out), truncated=truncated)
 
     async def list_dead(
@@ -11051,20 +11325,30 @@ class SqlServerStore:
         rows = await self._fetchall(
             "SELECT o.id AS outbox_id, o.message_id, o.channel_id, o.destination_name,"
             " o.attempts, o.last_error, o.updated_at,"
-            " m.control_id, m.message_type, m.received_at, m.summary"
+            " m.control_id, m.message_type, m.received_at, m.summary,"
+            " m.channel_id AS message_channel_id"
             f" FROM queue o JOIN messages m ON m.id = o.message_id{where}"
             " ORDER BY o.updated_at DESC, o.id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
+        failures: list[CellTagError] = []
         for r in rows:
             # Mixed-table join: last_error is queue's (o.id → outbox_id), summary is the messages
-            # row's (keyed by message_id) — each binds to its own cell (ASVS 11.3.3).
+            # row's (keyed by message_id and bound to the message's own channel, BACKLOG #2593) —
+            # each binds to its own cell (ASVS 11.3.3).
             r["last_error"] = self._dec(
                 r["last_error"], aad=cell_aad("queue", "last_error", r["outbox_id"])
             )
-            r["summary"] = self._dec(
-                r["summary"], aad=cell_aad("messages", "summary", r["message_id"])
+            withhold_message_cells(
+                self._cipher,
+                r,
+                ("summary",),
+                message_id=r["message_id"],
+                channel_id=r.pop("message_channel_id"),
+                failures=failures,
             )
+        for err in failures:
+            await report_cell_tag_failure(self, err)
         return rows
 
     async def count_dead(

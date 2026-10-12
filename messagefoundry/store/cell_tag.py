@@ -280,7 +280,6 @@ class _AuditSink(Protocol):
         detail: str | None = None,
         client: str | None = None,
         now: float | None = None,
-        expect_prev: str | None = None,
     ) -> None: ...
 
 
