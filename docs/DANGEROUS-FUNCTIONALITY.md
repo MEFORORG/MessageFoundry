@@ -652,6 +652,7 @@ or compression library:
   in memory. A trial pass that keeps no output checks the byte ceiling, and for gzip the member
   cap, before the real decompression starts (BACKLOG #1129). The File
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
+  A connection with `decompress=` set and that ceiling off logs one warning when it is built.
   Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
   A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
   after the archive. Each member's name must be a safe relative path, and its bytes must match the
