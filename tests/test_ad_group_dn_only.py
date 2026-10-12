@@ -542,6 +542,7 @@ def test_the_sql_server_group_map_keys_fit_the_api_widths() -> None:
         ("/ad-group-map", "role", Role.OPERATOR.value),
         ("/ad-group-scope-map", "channel", "C" * 256),
     ],
+    ids=["role-map", "scope-map"],
 )
 async def test_a_dn_at_the_width_maps_and_one_past_it_is_a_4xx(
     engine: Engine, path: str, field: str, value: str
