@@ -1197,6 +1197,33 @@ def test_a_narrowed_list_is_named_beside_its_loosened_limits() -> None:
     assert _names(approvals=loose) == [_OPS, "min_dwell_seconds", "expiry_hours"]
 
 
+def test_the_docs_quote_the_default_held_operations() -> None:
+    """The guide and the settings reference restate the default list, and the registry follows the
+    field. So both are tied to the field here: a default that moves reds this. The last assertion
+    of each pair is the control, a longer list the row must not already hold."""
+    docs = Path(__file__).parents[1] / "docs"
+    quoted = "`[" + ", ".join(f'"{op}"' for op in _DEFAULT_HELD) + "]`"
+    longer = quoted.replace("]`", ', "config_reload"]`')
+    guide = (docs / "SECURITY-LOOSENING.md").read_text("utf-8")
+    rows = {
+        "guide": next(
+            line for line in guide.splitlines() if line.startswith("| | `[approvals].operations`")
+        ),
+        "reference": next(
+            line
+            for line in (docs / "CONFIGURATION.md").read_text("utf-8").splitlines()
+            if line.startswith("| `operations` | list[str] |")
+        ),
+    }
+    for where, row in rows.items():
+        assert quoted in row, where
+        assert longer not in row, where
+    entry = guide.split("### `[approvals].operations` without a default operation", 1)[1]
+    entry = entry.split("\n### ", 1)[0]
+    for op in _DEFAULT_HELD:
+        assert f"`{op}`" in entry, op
+
+
 @pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
 def test_serve_names_a_narrowed_operations_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

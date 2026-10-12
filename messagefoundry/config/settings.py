@@ -8325,9 +8325,12 @@ def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]
     operation the default leaves out (``config_reload``) holds more and is not named, and it does
     not make up for a default one left out.
 
-    **Not covered:** ``approve`` checks neither ``enabled`` nor ``operations``, and each request
-    keeps the deadline stamped when it was made. A request left pending when dual control is turned
-    off can still be released under the current dwell, and nothing here names that."""
+    **A request already held.** ``ApprovalGate.approve`` refuses a request whose operation is no
+    longer held (409, ``approval.no_longer_gated``), whether dual control was turned off or the
+    operation left the list. So narrowing the list releases nothing already held; it changes what
+    the NEXT call does. Each request keeps the deadline stamped when it was made. This paragraph
+    said until vault BACKLOG #3123 that ``approve`` checked neither setting, which the gate no
+    longer bears out."""
     out: list[tuple[str, str]] = []
     if not approvals.enabled:
         return out
@@ -8618,7 +8621,8 @@ def security_loosenings(
 
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
-    it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
+    it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489) and the
+    held list (vault BACKLOG #3123).
     ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302).
 
