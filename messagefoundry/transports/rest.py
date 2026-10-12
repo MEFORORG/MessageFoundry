@@ -1742,6 +1742,26 @@ def proxy_auth_handler_from_settings(
     )
 
 
+def _refuse_a_static_proxy_header(headers: object) -> None:
+    """Refuse a static ``Proxy-Authorization`` in ``headers`` on a connection that has its own proxy
+    credential (vault BACKLOG #3443).
+
+    That connection's proxy handler admits a caller-set header, and the admission cannot tell its
+    own header from a static one. Under Digest the connection sets no header of its own, so the
+    static one would cross a cleartext proxy leg on the connection's admission. Under Basic it
+    would be silently replaced. Refused rather than dropped, so the operator sees the conflict.
+    Names the key, never its value."""
+    if not isinstance(headers, Mapping):
+        return
+    for key in headers:
+        if str(key).strip().lower() == "proxy-authorization":
+            raise ValueError(
+                f"headers sets {str(key)[:64]!r} and the connection also sets proxy_user and "
+                "proxy_password. Remove the static header: the proxy credential comes from "
+                "proxy_user, proxy_password and proxy_auth_type only (vault BACKLOG #3443)"
+            )
+
+
 def proxy_url_sends_userinfo(proxy_url: object) -> bool:
     """Does this ``proxy_url`` put a credential of its own on the wire (BACKLOG #1182)?
 
@@ -1840,6 +1860,8 @@ def proxy_config_from_settings(
         cleartext_reason=cleartext_reason,
         connection=connection,
     )
+    if auth_header or digest is not None:
+        _refuse_a_static_proxy_header(s.get("headers"))
     return ProxyConfig(
         proxies=(("http", proxy_url), ("https", proxy_url)),
         use_default=False,

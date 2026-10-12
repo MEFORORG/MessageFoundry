@@ -19,7 +19,8 @@ docstring used to list as outside the check:
   did not verify the proxy: ``verify_tls=false``, ``tls_allow_expired``, or no host name check.
 
 It also pins #3442: a connection whose target urllib's own bypass list names attaches no header,
-so that send goes direct and is not refused.
+so that send goes direct and is not refused. And #3443: a static ``Proxy-Authorization`` beside the
+connection's own proxy credential is refused at build, so it cannot ride that admission.
 
 Each refusal is read on the wire, at a loopback socket that records what reaches it, as well as in
 the result. Each has a control in the other polarity.
@@ -422,6 +423,64 @@ def test_control_a_host_on_no_bypass_list_still_reaches_the_proxy_with_its_heade
     assert len(proxy.cleartext) == 1
     assert proxy.cleartext[0].startswith(b"POST http://partner.example.test/x ")
     assert f"Proxy-Authorization: {_HEADER}\r\n".encode() in proxy.cleartext[0]
+
+
+# --- #3443: a static Proxy-Authorization beside the connection's own proxy credential -----------
+
+_OFF_BOX_HTTP_PROXY = "http://proxy.example.com:3128"
+_STATIC = "Basic c3RhdGljOnN0YXRpYw=="
+
+
+def _declared_proxied_rest(**extra: Any) -> RestDestination:
+    """A cleartext target through an off-box cleartext proxy, both crossed by ADR 0153's
+    ``cleartext_accepted``, so the guard admits a ``proxy_user`` credential."""
+    return _rest(_HTTP_TARGET, accepted=True, proxy_url=_OFF_BOX_HTTP_PROXY, **extra)
+
+
+@pytest.mark.parametrize("key", ["Proxy-Authorization", "proxy-authorization"])
+@pytest.mark.parametrize("auth_type", ["digest", "basic"])
+def test_a_static_proxy_header_beside_proxy_user_is_refused_at_build(
+    key: str, auth_type: str
+) -> None:
+    """The handler's admission cannot tell the connection's own header from a static one. Under
+    Digest the connection sets none, so the static header would cross the cleartext proxy leg on
+    that admission; under Basic it would be silently replaced. Both refuse to build, naming the
+    key and never its value (vault BACKLOG #3443)."""
+    with pytest.raises(ValueError, match="vault BACKLOG #3443") as raised:
+        _declared_proxied_rest(
+            proxy_user="u5er",
+            proxy_password="pa55w0rd",
+            proxy_auth_type=auth_type,
+            headers={key: _STATIC, "X-Trace": "t1"},
+        )
+    text = str(raised.value)
+    assert repr(key) in text
+    for part in (_STATIC, "u5er", "pa55w0rd"):
+        assert part not in text, part
+
+
+def test_control_digest_with_no_static_proxy_header_builds_and_is_admitted() -> None:
+    """Digest's own reactive handler is untouched: the connection builds with other static headers,
+    sets no pre-emptive header, and its proxy handler carries the admission."""
+    dest = _declared_proxied_rest(
+        proxy_user="u5er",
+        proxy_password="pa55w0rd",
+        proxy_auth_type="digest",
+        headers={"X-Trace": "t1"},
+    )
+    assert "Proxy-Authorization" not in dest._headers
+    assert dest._headers["X-Trace"] == "t1"
+    assert _proxy_handler(dest).caller_header_admitted is True
+    opened = dest._opener.handlers  # type: ignore[attr-defined]
+    assert any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in opened)
+
+
+def test_control_a_static_proxy_header_with_no_proxy_user_builds_unadmitted() -> None:
+    """With no credential of the connection's own there is no admission to ride. The connection
+    builds, and the send-time rule refuses the static header on the cleartext leg (#3416)."""
+    dest = _declared_proxied_rest(headers={"Proxy-Authorization": _STATIC})
+    assert _proxy_handler(dest).caller_header_admitted is False
+    _send_refused(dest, "#3416")
 
 
 class _Redirector:

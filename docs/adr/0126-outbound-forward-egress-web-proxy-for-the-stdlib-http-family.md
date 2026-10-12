@@ -308,6 +308,11 @@ send-time rule (vault BACKLOG #3417, #3418), with its one exception for a creden
 admitted, is stated once on `ProxyCredentialsRefusedError` in
 [`transports/bounded_read.py`](../../messagefoundry/transports/bounded_read.py).
 
+That exception admits a connection's header, not one header. So a connection with `proxy_user`
+that also writes a `Proxy-Authorization` into its static `headers` is refused when it is built.
+Under Digest the static header would otherwise cross the cleartext leg on that admission (vault
+BACKLOG #3443).
+
 ## Deviations from the phase doc
 
 - **Proxy-auth dispatch lives in `transports/rest.py`, not `transports/http_auth.py`.** `smart.py`'s token
