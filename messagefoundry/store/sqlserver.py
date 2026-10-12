@@ -40,6 +40,7 @@ import threading
 import time
 from collections.abc import (
     AsyncIterator,
+    Awaitable,
     Callable,
     Collection,
     Iterable,
@@ -97,7 +98,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
-    report_unmarked,
+    report_sealed_surface,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -500,6 +501,45 @@ def _is_transient_write_conflict(exc: BaseException) -> bool:
 # bounded retry-with-backoff is safe and no-double-count. Backoff is per-1-based-attempt.
 _CIPHER_MERGE_ATTEMPTS = 5
 _CIPHER_MERGE_BACKOFF = 0.05
+
+
+async def _retry_idempotent_merge[T](
+    op: Callable[[], Awaitable[T]], *, on_retry: Callable[[], Awaitable[None]] | None = None
+) -> T:
+    """Run an IDEMPOTENT insert-if-absent MERGE, retrying a transient write conflict with backoff.
+
+    Only for a statement a re-run cannot double-apply; an increment such as
+    :meth:`SqlServerStore.add_cipher_invocations` needs its own no-double-count guard instead.
+    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back."""
+    for attempt in range(1, _CIPHER_MERGE_ATTEMPTS + 1):
+        try:
+            return await op()
+        except Exception as exc:
+            if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS:
+                raise
+            log.debug(
+                "insert-if-absent MERGE hit a %s, attempt %d of %d; retrying",
+                "lock timeout (HYT00)" if "HYT00" in str(exc) else "deadlock (1205)",
+                attempt,
+                _CIPHER_MERGE_ATTEMPTS,
+            )
+        if on_retry is not None:
+            await on_retry()
+        await asyncio.sleep(_CIPHER_MERGE_BACKOFF * attempt)
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
+# BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. HOLDLOCK makes the
+# insert-if-absent safe under concurrent opens, as for `store_salt`. The OUTPUT row says whether this
+# statement wrote the marker; `cursor.rowcount` can read -1 here.
+_MERGE_KEYED_MARKER = (
+    "MERGE keyed_surface WITH (HOLDLOCK) AS t"
+    " USING (SELECT ? AS surface_table, ? AS surface_column, ? AS keyed_at) AS s"
+    " ON t.surface_table = s.surface_table AND t.surface_column = s.surface_column"
+    " WHEN NOT MATCHED THEN INSERT (surface_table, surface_column, keyed_at)"
+    " VALUES (s.surface_table, s.surface_column, s.keyed_at)"
+    " OUTPUT inserted.surface_table;"
+)
 
 
 # The lane column is NVARCHAR(256); a longer requested lane name can never match a real lane. On
@@ -1920,6 +1960,15 @@ _SCHEMA: list[str] = [
         id INT NOT NULL PRIMARY KEY CHECK (id = 1),
         salt VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
         created_at FLOAT NOT NULL)""",
+    # The keyed-surface marker (BACKLOG #3383) -- see the SQLite `_SCHEMA` and
+    # `MessageStore._encrypt_existing_rows` for when a row is written and what it decides. One row per
+    # cipher-covered (table, column); never deleted by the engine. BIN2 so the code-constant names
+    # compare byte for byte. 128 is a SQL Server identifier's maximum length. Non-secret.
+    """IF OBJECT_ID('keyed_surface','U') IS NULL CREATE TABLE keyed_surface (
+        surface_table NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        surface_column NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        keyed_at FLOAT NOT NULL,
+        PRIMARY KEY (surface_table, surface_column))""",
     # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
     # at most, written only by `store attest-transit-bound` with its audit row in the same
     # transaction. BIN2 on key_name, because Transit key names compare case-sensitively, byte for
@@ -3401,9 +3450,10 @@ class SqlServerStore:
 
     async def _encrypt_existing_rows(self) -> None:
         """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1),
-        one (table, column) surface at a time, each in ONE transaction. A surface that already holds
-        ciphertext is SEALED and its unmarked values are refused at read, not sealed (BACKLOG #1169).
-        The SQLite twin documents why; :meth:`_seal_surface` carries the mechanics."""
+        one (table, column) surface at a time, each in ONE transaction. A surface with its
+        ``keyed_surface`` marker, or one that already holds ciphertext, is SEALED and its unmarked
+        values are refused at read, not sealed (BACKLOG #1169, #3383). The SQLite twin documents why
+        and when the marker is written; :meth:`_seal_surface` carries the mechanics."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -3521,50 +3571,74 @@ class SqlServerStore:
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
 
-        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
-        surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
-        11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD
-        from the row instead (the queue payload's routing tag, BACKLOG #2593). Every identifier is a code
-        constant and is bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is
-        a parameter.
+        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: decide whether
+        the surface is sealed (its ``keyed_surface`` marker, or a marked value; BACKLOG #3383),
+        reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
+        every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
+        ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
+        (the queue payload's routing tag, BACKLOG #2593). Every identifier is a code constant and is
+        bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
-        transaction opens, because a reservation must commit independently of the seal it covers."""
+        transaction opens, because a reservation must commit independently of the seal it covers.
+        An engine shard's peer can still key the surface in between. So the marker MERGE is the seal
+        transaction's FIRST statement (:meth:`_claim_keyed_surface`): HOLDLOCK makes it wait on a
+        peer's uncommitted marker, and a committed one makes it insert nothing, and then this open
+        seals nothing."""
         keys = key_cols if key_cols is not None else aad_cols
         # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so `N' ' <> N''` is
         # FALSE and a whitespace-only value would be skipped here and then refused forever at read,
         # where the cipher treats only a true '' as blank.
         pending_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
-        row = await self._fetchone(
-            f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}", (like,)
-        )
-        pending = int(row["n"]) if row is not None else 0
-        if not pending:
+        count_sql = f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}"
+        strict = not allows_unmarked(self._cipher)
+        keyed = await self._surface_keyed(table, column)
+        pending = await self._count_unmarked(count_sql, like)
+        is_sealed = keyed
+        if pending and strict and not keyed:
+            is_sealed = await self._surface_holds_ciphertext(table, column, like)
+            if is_sealed:
+                # As on SQLite: a peer may have sealed the rows between the count and the probe,
+                # so count again rather than report its legitimate seal as a plant.
+                pending = await self._count_unmarked(count_sql, like)
+        if not pending or (strict and is_sealed):
+            if pending:
+                report_sealed_surface(log, self._cipher, table, column, pending)
+            if not keyed:
+                await self._mark_surface_keyed(table, column)
             return 0
-        if not allows_unmarked(self._cipher):
-            marked = await self._fetchone(
-                f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
-            )
-            if marked is not None:
-                log.warning(
-                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
-                    "sealed and every read of them is refused (a stripped marker or a planted row). "
-                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
-                    table,
-                    column,
-                    pending,
-                )
-                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
-                # invisible except in the log. Names the cell only (BACKLOG #1169).
-                report_unmarked(self._cipher, table, column)
-                return 0
         await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
         select_cols = ", ".join(f"[{c}]" for c in dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"[{c}]=?" for c in keys)
         sealed = 0
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                if not await self._claim_keyed_surface(conn, cur, table, column) and strict:
+                    # A peer keyed this surface after the reads above, so it sealed the legacy
+                    # rows. Count what it left unmarked, then end the transaction: the MERGE
+                    # changed nothing.
+                    left = 0
+                    try:
+                        await cur.execute(count_sql, (like,))
+                        counted = await cur.fetchone()
+                        left = int(counted[0]) if counted is not None else 0
+                    except Exception as exc:
+                        # A diagnostic count must not fail the open. The next open's sweep counts
+                        # again and reports anything left.
+                        if not _is_transient_write_conflict(exc):
+                            raise
+                        log.warning(
+                            "could not recount %s.%s after another process keyed it (%s); the "
+                            "next open reports anything left unmarked",
+                            table,
+                            column,
+                            type(exc).__name__,
+                        )
+                    await conn.rollback()
+                    log.debug("cipher column %s.%s was keyed by another process", table, column)
+                    if left:
+                        report_sealed_surface(log, self._cipher, table, column, left)
+                    return 0
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
                     # connection sees its own uncommitted UPDATEs: a sealed row stops matching.
@@ -3602,6 +3676,51 @@ class SqlServerStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()
         return sealed
+
+    async def _surface_keyed(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""
+        row = await self._fetchone(
+            "SELECT 1 AS x FROM keyed_surface WHERE surface_table = ? AND surface_column = ?",
+            (table, column),
+        )
+        return row is not None
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
+        """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
+        row = await self._fetchone(
+            f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
+        )
+        return row is not None
+
+    async def _count_unmarked(self, count_sql: str, like: str) -> int:
+        """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``like``."""
+        row = await self._fetchone(count_sql, (like,))
+        return int(row["n"]) if row is not None else 0
+
+    async def _mark_surface_keyed(self, table: str, column: str) -> None:
+        """Write ``table.column``'s marker in its own transaction, unless it exists.
+
+        Every engine shard's open marks every surface, so these MERGEs collide by design. A lock
+        timeout or a deadlock leaves nothing committed, and the MERGE is idempotent, so it retries
+        as :meth:`_ensure_store_salt` does."""
+
+        async def merge() -> None:
+            await self._execute_output(_MERGE_KEYED_MARKER, (table, column, time.time()))
+
+        await _retry_idempotent_merge(merge)
+
+    async def _claim_keyed_surface(self, conn: Any, cur: Any, table: str, column: str) -> bool:
+        """Write ``table.column``'s marker as the FIRST statement of the seal's transaction, unless it
+        exists. Returns whether THIS call wrote it; the caller commits or rolls back.
+
+        Retried like :meth:`_mark_surface_keyed`. A deadlock victim's transaction is already gone,
+        and nothing came before this statement, so the rollback and the re-issue lose nothing."""
+
+        async def merge() -> bool:
+            await cur.execute(_MERGE_KEYED_MARKER, (table, column, time.time()))
+            return bool(await cur.fetchall())
+
+        return await _retry_idempotent_merge(merge, on_retry=conn.rollback)
 
     @staticmethod
     async def _ensure_database_options(
@@ -11342,20 +11461,17 @@ class SqlServerStore:
         Those concurrent opens can make a MERGE time out or lose a deadlock, as the invocation MERGE's
         can. Unlike that one, this statement is idempotent -- a re-run after a row exists inserts
         nothing -- so it retries without needing a no-double-count guard."""
-        for attempt in range(_CIPHER_MERGE_ATTEMPTS):
-            try:
-                await self._execute(
-                    "MERGE store_salt WITH (HOLDLOCK) AS t"
-                    " USING (SELECT 1 AS id, ? AS salt, ? AS created_at) AS s ON t.id = s.id"
-                    " WHEN NOT MATCHED THEN INSERT (id, salt, created_at)"
-                    " VALUES (s.id, s.salt, s.created_at);",
-                    (candidate, time.time()),
-                )
-                break
-            except Exception as exc:
-                if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS - 1:
-                    raise
-            await asyncio.sleep(_CIPHER_MERGE_BACKOFF * (attempt + 1))
+
+        async def merge() -> None:
+            await self._execute(
+                "MERGE store_salt WITH (HOLDLOCK) AS t"
+                " USING (SELECT 1 AS id, ? AS salt, ? AS created_at) AS s ON t.id = s.id"
+                " WHEN NOT MATCHED THEN INSERT (id, salt, created_at)"
+                " VALUES (s.id, s.salt, s.created_at);",
+                (candidate, time.time()),
+            )
+
+        await _retry_idempotent_merge(merge)
         row = await self._fetchone("SELECT salt FROM store_salt WHERE id = 1")
         if row is None:  # the MERGE above ran, so only a concurrent delete reaches here
             raise RuntimeError("store_salt has no row after an insert-if-absent")

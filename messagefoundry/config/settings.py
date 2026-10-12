@@ -746,8 +746,9 @@ class StoreSettings(_Section):
     aad_bind: bool = True
     # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
     # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
-    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
-    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # seals legacy plaintext only on a (table, column) surface that is still unsealed: not yet
+    # recorded in `keyed_surface` and holding no ciphertext (BACKLOG #3383). So a non-blank unmarked
+    # value on a sealed surface is a stripped marker or a planted row -- the cipher
     # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
     # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
     # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
