@@ -2654,6 +2654,7 @@ def File(
     decompress: Literal["gzip"]
     | None = None,  # inbound: "gzip" gunzips each drop before the sniff/scan/split
     max_decompressed_bytes: int | None = 64 * 1024 * 1024,  # inbound: decompression-bomb ceiling
+    max_decompressed_members: int = 1024,  # inbound: gzip members one drop may hold (no off switch)
 ) -> ConnectionSpec:
     """A File endpoint. Inbound polls ``directory`` for ``pattern``; outbound writes ``filename``
     (atomically). ``encoding`` is the file charset (outbound). ``max_file_bytes`` mirrors
@@ -2687,7 +2688,9 @@ def File(
     body and appends ``.gz`` to the rendered name. Inbound ``decompress="gzip"`` gunzips each dropped
     file **before** the HL7 sniff, the pre-ingest AV scan, and the batch split; ``max_decompressed_bytes``
     (default 64 MiB, None/0 disables) caps the *decompressed* size — a decompression-bomb guard the
-    compressed-only ``max_file_bytes`` cannot provide. A corrupt/oversized archive is moved to
+    compressed-only ``max_file_bytes`` cannot provide. ``max_decompressed_members`` (default 1024)
+    caps how many gzip members one drop may hold, and cannot be turned off; raise it for a BGZF feed,
+    which is one member per 64 KiB block. A corrupt/oversized archive is moved to
     ``.error`` (never accept-and-dropped). Multi-entry zip / raw deflate stay Handler-composed via
     ``messagefoundry.parsing.compression``."""
     settings: dict[str, Any] = {
@@ -2709,6 +2712,7 @@ def File(
         "compress": compress,
         "decompress": decompress,
         "max_decompressed_bytes": max_decompressed_bytes,
+        "max_decompressed_members": max_decompressed_members,
     }
     if credential_username is not None or credential_password is not None:
         # A share credential is being configured — the password is a secret and must never be inline

@@ -81,6 +81,7 @@ __all__ = [
     "_content_matches_declared",
     "_looks_like_hl7",
     "DEFAULT_MAX_DECOMPRESSED_BYTES",
+    "DEFAULT_MAX_DECOMPRESSED_MEMBERS",
 ]
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,18 @@ SETTLE_MISS_LIMIT = 3
 # Because the batch split, the sniff, and every downstream stage run on the decompressed bytes, bounding
 # the decompressed output also bounds post-split expansion. None/0 (in any spelling) disables the cap.
 DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# When `decompress="gzip"` is set, this caps how many gzip members one drop may hold (BACKLOG #1129).
+# The same figure as `gzip_decompress`'s `max_members` default, pinned by a test. A BGZF file (the
+# blocked gzip that genomics tools write) is one member per 64 KiB block, so a drop near the
+# decompressed-byte ceiling trips this cap first; an operator raises it per connection. The codec's
+# member cap cannot be turned off, so neither can this one: None and "" take the default, and zero in
+# any spelling is refused at build.
+DEFAULT_MAX_DECOMPRESSED_MEMBERS = 1024
+_MEMBER_CAP_OFF_HINT = (
+    "the gzip member cap cannot be switched off; leave it unset or None for the default of "
+    f"{DEFAULT_MAX_DECOMPRESSED_MEMBERS} members, or raise it"
+)
 
 # How long FileSource.stop() waits for the poll task before it gives up on a blocked share call
 # (BACKLOG #1620). A dead SMB/UNC share blocks each call for the OS redirector's timeout, tens of
@@ -327,6 +340,30 @@ def _validate_compression(value: object, knob: str) -> str | None:
     raise ValueError(
         f"file connector {knob}={value!r} is not supported (allowed: {supported}, or omit for none)"
     )
+
+
+def _member_cap(value: object) -> int:
+    """Read ``max_decompressed_members`` (BACKLOG #1129): a positive count of gzip members.
+
+    Unset, ``None`` and ``""`` (an env var set but empty) take :data:`DEFAULT_MAX_DECOMPRESSED_MEMBERS`.
+    Zero is refused in every spelling rather than read as "off", because ``gzip_decompress`` has no
+    off switch for its member cap, and silently substituting the default would hide that from an
+    operator who wrote 0 meaning "no cap". This is the ``max_header_bytes`` rule on the HTTP source."""
+    if value is None or value == "":
+        return DEFAULT_MAX_DECOMPRESSED_MEMBERS
+    cap = positive_cap(
+        value,
+        int,
+        knob="max_decompressed_members",
+        transport="file source",
+        off_hint=_MEMBER_CAP_OFF_HINT,
+    )
+    if cap is None:  # zero, in some spelling
+        raise ValueError(
+            f"file source max_decompressed_members={value!r} must be above zero "
+            f"({_MEMBER_CAP_OFF_HINT})"
+        )
+    return cap
 
 
 def _probe_dir_writable(directory: Path) -> None:
@@ -691,6 +728,8 @@ class FileSource(SourceConnector):
             knob="max_decompressed_bytes",
             transport="file source",
         )
+        # Caps the gzip members in one drop (BACKLOG #1129). Only consulted when `decompress` is set.
+        self.max_decompressed_members: int = _member_cap(s.get("max_decompressed_members"))
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
         self.error_dir = self.directory / s.get("error_subdir", ".error")
         self._handler: InboundHandler | None = None
@@ -1004,7 +1043,10 @@ class FileSource(SourceConnector):
                 # decompressed body — it is PHI).
                 try:
                     raw = await asyncio.to_thread(
-                        gzip_decompress, raw, max_output_bytes=self.max_decompressed_bytes
+                        gzip_decompress,
+                        raw,
+                        max_output_bytes=self.max_decompressed_bytes,
+                        max_members=self.max_decompressed_members,
                     )
                 except CompressionError as exc:
                     logger.warning(

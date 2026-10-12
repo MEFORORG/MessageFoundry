@@ -908,7 +908,7 @@ figure stops matching the constant named beside it.
 
 | Surface | Permitted type | Extension | Maximum size | Unpacked size |
 |---|---|---|---|---|
-| `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB |
+| `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB, and `max_decompressed_members`, default `DEFAULT_MAX_DECOMPRESSED_MEMBERS` = 1,024 |
 | `remotefile`: SFTP or FTP drop directory, `Sftp(...)` / `Ftp(...)` ([Remote file](#remote-file--sftp--ftp)) | as for `file` | chosen by `pattern` (default `*.hl7`) | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB, charged against the listed size and again against the bytes read | no unpacking on intake; the connector has no `decompress` setting |
 | `dimse`: DICOM C-STORE SCP, an inbound `DICOM(...)`; its size, peer and TLS settings are under [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025) | DICOM objects in the SCP's accepted presentation contexts | not applicable; objects arrive over DIMSE | `max_object_bytes`, default `DEFAULT_MAX_OBJECT_BYTES` = 128 MiB (`transports/dicom.py`), charged before decode | a Deflated Explicit VR LE object is inflated in bounded memory before decode, capped at the lesser of `max_object_bytes` and `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Setting `max_object_bytes` to `0` or `None` does not remove either cap; the DICOM section says what it does instead |
 | `http`: web-service listener, `Http(...)` ([HTTP](#http-web-service-listener--http-inbound-only-adr-0023)) | the inbound's declared `content_type` | not applicable; a request body | `max_body_bytes`, default `DEFAULT_MAX_BODY_BYTES` = 16 MiB (`transports/http_listener.py`); headers `DEFAULT_MAX_HEADER_BYTES` = 64 KiB | no unpacking on intake. The listener decodes no `Content-Encoding` and no transfer coding. It refuses a body whose `Transfer-Encoding` is exactly `chunked`, and reads any other body as sent, up to the cap |
@@ -949,7 +949,16 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
   name or content fails the checks in `parsing/sniff.py`. `gzip_decompress` caps the number of gzip
   members at `max_members`, default 1024 (BACKLOG #1129). A gzip stream has no member list to read
   first. So the codec counts each member as it starts, and refuses the one past the cap before it
-  inflates. A Handler is ordinary Python, though, and can unpack with any library instead, such as
+  inflates. Each decompressor checks its caps in a trial pass before the real one (BACKLOG #1129).
+  The trial pass inflates the whole input in bounded chunks, keeps none of the output, and refuses a
+  stream the moment it would pass the byte ceiling or the member cap. Only a stream it admits is
+  inflated again for real, so an over-cap stream is refused with no output kept. The cost is that an
+  admitted stream is inflated twice. That is less than double the time, because the real pass also
+  copies its output; [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)
+  records a measurement. The trial pass is skipped
+  only where it has nothing to refuse: with `max_output_bytes=None` on `deflate_decompress`,
+  `deflate_decompress_with_tail` and `zip_decompress`. `gzip_decompress` always runs it, because its
+  member cap cannot be turned off. A Handler is ordinary Python, though, and can unpack with any library instead, such as
   `gzip` or `zipfile` directly. The engine then sets no bound, and the Handler author owns the
   unpacked-size limit.
 
@@ -1087,9 +1096,15 @@ its own policy block below):
   `decompress="gzip"` is enabled it gunzips each drop **before** the content sniff, the AV scan, and the
   batch split (so all three see the real bytes), and `max_decompressed_bytes` (default 64 MiB) caps the
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
-  provide (ASVS 5.2.3). The gunzip also refuses a drop of more gzip members than `gzip_decompress`'s
-  `max_members` default (see *Unpacking a payload* above), with no per-connection setting. Members
-  that inflate to nothing pass any byte ceiling, so the member count is its own limit. A corrupt,
+  provide (ASVS 5.2.3). The gunzip also refuses a drop of more gzip members than
+  `max_decompressed_members` (default 1024, BACKLOG #1129). Members that inflate to nothing pass any
+  byte ceiling, so the member count is its own limit. A BGZF file, the blocked gzip that genomics
+  tools write, is one member per 64 KiB block. So a BGZF drop near the 64 MiB byte ceiling trips the
+  member cap first, and a site with that feed raises `max_decompressed_members` for that connection.
+  The member cap cannot be turned off: unset or `None` takes the default, and `0` in any spelling is
+  refused when the connection is built. Both caps are checked in a trial pass that keeps no output,
+  before the real gunzip runs (see *Unpacking a payload* above), so each admitted drop is inflated
+  twice. A corrupt,
   over-ceiling or over-cap archive is **quarantined to `.error`, never accept-and-dropped**, and the
   decompressed body is never logged. Multi-entry zip stays Handler-composed.
 - **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize file, or one
