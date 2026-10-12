@@ -60,7 +60,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import IO, Protocol
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -151,7 +151,8 @@ class RigAdminError(RuntimeError):
 
 class RigUnreachable(RigAdminError):
     """The engine gave no usable answer: it is down, killed or still starting, or its answer
-    broke off, or ran or claimed to run past :data:`MAX_API_REPLY_BYTES`."""
+    broke off, stalled, redirected elsewhere, or ran or claimed to run past
+    :data:`MAX_API_REPLY_BYTES`."""
 
 
 class RigSignInRefused(RigAdminError):
@@ -380,6 +381,25 @@ def _context(cacert: str | None) -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cacert)
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect (BACKLOG #1127). urllib's own handler reads a 3xx body with no limit and
+    carries the ``Authorization`` header to wherever ``Location`` points, which gets around both the
+    reply cap and :func:`_checked_base`. Declining here, before ``Location`` is even parsed, makes
+    urllib raise the 3xx as an ``HTTPError``, which :func:`_call` refuses unread."""
+
+    def http_error_302(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+    ) -> None:
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
 def _read_bounded(reply: _Readable) -> bytes:
     """The whole answer ``reply`` holds, refused once it passes :data:`MAX_API_REPLY_BYTES`.
 
@@ -416,22 +436,35 @@ def _call(
     body: Mapping[str, object] | None = None,
     bearer: str | None = None,
 ) -> tuple[int, bytes]:
-    """One request. Returns ``(status, body)`` for any HTTP answer; raises when there is none."""
+    """One request. Returns ``(status, body)`` for any 2xx, 4xx or 5xx answer.
+
+    Raises :class:`RigUnreachable` when there is no usable answer: no connection, a body that breaks
+    off or stalls, on a refusal as on a success, or a redirect, which is never followed."""
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         request.add_header("Content-Type", "application/json")
     if bearer:
         request.add_header("Authorization", f"Bearer {bearer}")
+    # The context is passed on every call. A loopback http URL makes no handshake and ignores it.
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_context(cacert)), _RefuseRedirect()
+    )
     try:
-        # The context is passed on every call. A loopback http URL makes no handshake and ignores it.
-        with urllib.request.urlopen(
-            request, context=_context(cacert), timeout=_HTTP_TIMEOUT_S
-        ) as reply:
-            return int(reply.status), _read_bounded(reply)
-    except urllib.error.HTTPError as exc:
-        with exc:  # closes the socket on a refusal too, which reading to the end used to do
-            return int(exc.code), _read_bounded(exc)
+        try:
+            reply = opener.open(request, timeout=_HTTP_TIMEOUT_S)
+        except urllib.error.HTTPError as exc:
+            # A refusal is still an answer. Its body is read below, inside the outer guard, so a
+            # refusal that breaks off is no answer, as a success that breaks off is.
+            reply = exc
+        with reply:  # closes the socket on a refusal too
+            status = int(reply.status)
+            if 300 <= status < 400:
+                # The status only: the Location names a host, and callers log this.
+                raise RigUnreachable(
+                    f"the engine answered with a redirect (HTTP {status}), never followed"
+                )
+            return status, _read_bounded(reply)
     except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
         # The reason only: an exception's text can carry the address, and callers log this.
         raise RigUnreachable(f"the engine did not answer ({type(exc).__name__})") from None
