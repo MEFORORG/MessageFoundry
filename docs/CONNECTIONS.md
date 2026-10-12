@@ -1518,32 +1518,27 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 `bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
 by this rule. It has its own, below.
 
-**A web-proxy credential crosses the network only inside TLS that fully verifies the proxy
-(vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That holds for a user and password in a proxy
-URL and for `proxy_user` and `proxy_password`. The proxy may come from `proxy_url`, from
+**Engine openers refuse a web-proxy credential on the legs where it could be read on the way
+(vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That covers a user and password in a proxy URL
+and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. A request that would send one in cleartext, a `CONNECT` included, is refused. So is one
-that would go direct with it, and one whose TLS to the proxy does not verify. Writing the proxy
-`https://` does not help by itself, because urllib sends a `CONNECT`, with the credential, before
-any TLS.
-The error names no part of the proxy URL, and `[security].enforcement` does not relax it.
+broker. The error names no part of the proxy URL. Which legs are refused, and the one exception
+for a `proxy_user` credential its connection admitted when it was built, are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
+a leg it lets through and what it does not check.
 
-A credential in a connection's own `proxy_url` is not checked when the connection is built. Its
-sends are refused under the rule above, on at least every leg that would carry it to the proxy in
-cleartext. A send that goes direct carries no credential from the URL, so it is not refused. With `[security].require_nonstatic_credentials` on, `serve` refuses
-a credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
+A credential in a connection's own `proxy_url` is not checked when the connection is built, so its
+sends meet the rule above. With `[security].require_nonstatic_credentials` on, `serve` refuses a
+credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
 the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is checked when
-the connection is built, for a proxy written either way. It is refused there unless the proxy is on
-the box or the connection declares `cleartext_accepted` or `tls_hop_attested`. That build-time check follows the
-posture, so under `[security].enforcement = warn` it logs a WARNING and the connection builds. A
-credential it lets through may cross in cleartext at send; it still never goes direct or over TLS
-that does not verify. A credential from a proxy URL has no such way across. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names
-skips the connection's `proxy_url` and still follows a proxy from the environment.
+the connection is built, for a proxy written either way. It is refused there unless the proxy is
+on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`. That check
+follows the posture, so under `[security].enforcement = warn` it logs a WARNING and the connection
+builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
+connection's `proxy_url` and still follows a proxy from the environment.
 
-The rule, an example of a leg it lets through, and what it does not check are stated once, on
-[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). Which legs reach
-the proxy with no TLS is in
+Which legs reach the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
 out of the proxy URL.
 
