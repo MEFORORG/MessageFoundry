@@ -2011,8 +2011,9 @@ these cases:
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
-| A dashed SSN (`NNN-NN-NNNN`) appears | Fields no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears | Fields no rule maps |
+| The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
+| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from: the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2021,6 +2022,14 @@ these cases:
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
 case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+
+**A shape split across fields by the message's own field separator passes.** The detectors read
+one field at a time, after the message is split on the separator its header declares. Under a
+field separator of `-`, at least the lines `ZZZ-1-123-45-6789` and `ZZZ-1-555-555-0100` would
+pass `anonymize_checked` on both anonymizers: the message itself cuts each value into three
+fields. Under `|`, the same two values are refused. With `require_full_coverage` on, such a
+message is refused only because nobody decided the `ZZZ` fields. A `keep` on each of them would
+let it through.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
 `KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
@@ -2051,6 +2060,12 @@ A bare id from a later HL7 version than MSH-12 names is refused too: `SFT` came 
 bare `SFT` in a 2.3 message is not an empty segment. That holds for a line ahead of the header
 too. Both anonymizers judge every line against the version in the header's own MSH-12.
 
+`anonymize_checked` judges a bare line by the HL7 version of its input, so a rule on `MSH-12`
+does not change which bare line passes. A caller that runs `anonymize` and then `leak_check` or
+`leak_report` itself must pass `version=message_version(raw)` to get the same answer. Without
+it, the check reads the surrogate version the rule wrote, and can refuse a line that passed on
+the way in (vault BACKLOG #3004).
+
 A line holding only whitespace or control characters is dropped before anything else runs.
 
 **An `MSH`, `FHS` or `BHS` line with fewer than three split fields is refused,** whether it comes
@@ -2077,7 +2092,9 @@ an overlay maps one. A rule for a `BHS` or `FHS` field lands on the same field o
 the tee, and the leak-check counts that field (vault BACKLOG #2998).
 
 A rule that would rewrite field 1 or 2 of `MSH`, `BHS` or `FHS` is refused, because those
-fields hold delimiters. A `keep` on any of them is allowed, because it rewrites nothing. A rule
+fields hold delimiters. An overlay with such a rule is refused when it loads, with one error
+that names the file and the field (vault BACKLOG #2997). A rule set built in code is refused at
+each message. A `keep` on any of them is allowed, because it rewrites nothing. A rule
 for field 0 of any segment, which is the segment id, is refused whatever its kind: `PID-0` is not
 a whole-field address, so the rule is refused when it is built or loaded (BACKLOG #2330). A later
 MSH line that carries data where `MSH-2` belongs cannot be scrubbed by a rule. Repair or remove
@@ -2099,12 +2116,15 @@ that line.
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on the clean path
 and on a leak-check refusal, and inside the `LeakError`. A message the anonymizer refuses with
-`AnonError` (no parseable MSH, or a line no rule can reach) gets no report, and the
-`anonymize-captures` coverage line does not count it. `python -m tee anonymize-captures` logs it at INFO once per
-run, after it has checked the captures, with a count per address. A quieter `--log-level` does not
-hide it: the line is then printed plain to stderr. It says the denylist tables were live only when
-they loaded and passed the floor check on every message. Read that list before you share
-a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
+`AnonError` gets no report and is not in the coverage count. The `anonymize-captures` summary
+gives the number of such messages apart from that count (vault BACKLOG #3004). It cannot say
+which cause applies to each, and the `error:` line that ends the run repeats the number.
+
+`python -m tee anonymize-captures` logs the summary at INFO once per run, after it has checked
+the captures, with a count per address. A quieter `--log-level` does not hide it: the line is
+then printed plain to stderr. It says the denylist tables were live only when they loaded and
+passed the floor check on every message. Read that list before you share a dataset. Map any
+field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### Dates and locations: mapped, and still NOT Safe Harbor de-identified
 
@@ -2237,8 +2257,20 @@ lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.
 
-**The tee reads the overlay once, before the first message.** An overlay it cannot read or parse,
-or one that breaks the schema, refuses the whole run with one `error:` line and writes no dataset.
+**An overlay can also point a default field at a different kind, and that can leave part of the
+field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
+rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
+the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check counts such a field
+as scrubbed and does not scan what is left, so a clean return does not clear it. `load_rules`
+logs one WARNING line for each such field, under the same once-per-set rule as a keep. The line
+names the field, the default kind and the new kind. `python -m tee anonymize-captures` prints
+one `warning:` line that lists them. A retarget to the same kind does not warn, and neither does
+a `drop`. Nothing refuses the retarget (vault BACKLOG #3000).
+
+**The tee checks the salt and reads the overlay once, before it reads the store.** A salt the
+keyer refuses, an overlay it cannot read or parse, or one that breaks the schema, refuses the
+whole run with one `error:` line and writes no dataset. That holds even when the store has no
+captured bodies (vault BACKLOG #3003).
 
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
