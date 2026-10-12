@@ -195,7 +195,7 @@ class ReconcilePlan:
     #: abort — see :func:`plan_pass`.
     strikes: Mapping[str, int] = field(default_factory=dict)
     #: Candidates this pass judged, asked or not. Excludes the per-pass budget remainder. An UNKEYED
-    #: row counts here, because it can revoke, so the breaker's denominator starts from this.
+    #: row counts here, because it can revoke. This is the breaker's denominator (``judged``).
     probed: int = 0
     #: Probes this pass actually sent to the directory: ``probed`` less its UNKEYED rows (BACKLOG
     #: #2434). An outage and a pass of referrals only are judged over these, and the outage's log
@@ -260,15 +260,13 @@ class ReconcilePlan:
 
     @property
     def judged(self) -> int:
-        """The probes the mass-revoke breaker judged: every probe except the held ones (ADR 0195
-        rule item 7). The breaker's decision and the ceiling an operator is told both use this.
+        """The mass-revoke breaker's denominator: every probe of the pass. The breaker's decision and
+        the ceiling an operator is told both use this, so a change to the rule lands here once.
 
-        A referred probe stays in (BACKLOG #2538), as an unavailable one always has. Left out, a
-        referring group search base, which refers every enabled account, would leave only the
-        accounts that can strike, so more than ``max_absolute`` genuine disables at once would trip
-        the breaker on every pass and offboarding would stop. Kept in, the cost is that referrals dilute the
-        fraction a wave of false absences must exceed, as outages already do."""
-        return self.probed - len(self.held)
+        Held probes stay in (ADR 0195 amendment 2026-10-11, BACKLOG #2138, a seat decision under
+        owner delegation 2026-10-08, not an owner ruling), and so do referred ones (BACKLOG #2538).
+        The amendment says why, and what the dilution costs."""
+        return self.probed
 
 
 def _scope_fields(scope: ScopeInput | None, decision: ScopeDecision | None) -> dict[str, Any]:
@@ -502,8 +500,7 @@ def plan_pass(
         undetermined=undetermined,
         readable=readable,
     )
-    # Held probes are left out of the breaker's denominator (rule item 7): it judges only what the
-    # pass could still revoke. Referred ones stay in; ReconcilePlan.judged says why.
+    # Held and referred probes both stay in the breaker's denominator; ReconcilePlan.judged says why.
     if breaker_tripped(
         revoke_count=len(revocations),
         probed=plan.judged,

@@ -6897,18 +6897,19 @@ class AuthService:
                 detail=_json({"reason": plan.aborted, "asked": plan.asked}),
             )
             return
-        # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
-        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row. A
-        # pass of referrals only never reaches here: it is not a trip (BACKLOG #2538).
+        # The ceiling is taken over the breaker's own denominator, which counts held probes (ADR
+        # 0195 amendment 2026-10-11, BACKLOG #2138). A pass of referrals only never reaches here: it
+        # is not a trip (BACKLOG #2538).
         ceiling = reconcile.breaker_ceiling(
             probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
             max_fraction=self._settings.ad_session_revoke_max_fraction,
         )
+        held_note = f" ({len(plan.held)} of them held)" if plan.held else ""
         self._reconcile_alert = (
             f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
             f"revoked more than {ceiling} of the {plan.judged} signed-in directory principals it "
-            f"judged ({len(plan.held)} held account(s) left out). No "
+            f"probed{held_note}. No "
             f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
             f"ad_bind_dn service account's read rights."
         )
@@ -6921,7 +6922,6 @@ class AuthService:
                 {
                     "reason": plan.aborted,
                     "probed": plan.probed,
-                    "judged": plan.judged,
                     "ceiling": ceiling,
                 }
             ),
@@ -7262,8 +7262,11 @@ class AuthService:
 
         Deadlines and values are carried, never refreshed: a rotation must not extend anything.
         """
+        # Constant-time (ASVS 11.2.4, BACKLOG #1167): `h` and `old_hash` are session token hashes,
+        # and `==` stops at the first differing character. The two `.pop(old_hash)` calls below are
+        # dict lookups, not comparisons (Manager decision 2026-10-10, M1; see ChallengeCache.put).
         for (h, action), deadline in list(self._action_step_up_grants.items()):
-            if h == old_hash:
+            if constant_time_equal(h, old_hash):
                 del self._action_step_up_grants[(h, action)]
                 self._action_step_up_grants[(new_hash, action)] = deadline
         self._webauthn_challenges.rekey(old_hash, new_hash)
@@ -9799,6 +9802,12 @@ class AuthService:
                 # can't advance the high-water mark past now and lock the user out of their own next
                 # legitimate code.
                 if await self._store.consume_totp_step(user.id, matched_step):
+                    # ASVS 11.2.4 discharge (BACKLOG #1167; Manager decision 2026-10-10, M2, taken
+                    # under the owner's standing driver rule and not an owner ruling). This return
+                    # skips the recovery-code walk, so a success is faster than a failure. The
+                    # timing tells the caller only that the code was right, which the response
+                    # already says. Running every argon2id slot on each success would hide nothing.
+                    # This is the success path only; a refused TOTP still pays the walk, below.
                     return True
                 # ASVS 11.2.4 (BACKLOG #1167, ADR 0170 amendment). The step was already consumed:
                 # a replay, or a second use inside the same step. Returning here cost no argon2

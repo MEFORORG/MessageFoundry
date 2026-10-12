@@ -147,6 +147,7 @@ from messagefoundry.auth.service import (
     UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from messagefoundry.store.store import SessionRecord, UserRecord
 
@@ -190,7 +191,8 @@ def _session_info(session: SessionRecord, current_token_hash: str) -> SessionInf
         last_used_at=session.last_used_at,
         expires_at=session.expires_at,
         client=session.client,
-        current=session.token_hash == current_token_hash,
+        # Constant-time (ASVS 11.2.4, BACKLOG #1167): both sides are session token hashes.
+        current=constant_time_equal(session.token_hash, current_token_hash),
     )
 
 

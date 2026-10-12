@@ -200,7 +200,7 @@ async def test_the_warning_is_throttled_per_connection_and_code_and_reports_what
         await _until_dead(store, 3)
         # Wait until rows 2 and 3 are counted, or a clock moved early would let row 3 log itself.
         await until(
-            lambda: runner._refusal_log._state.get((OUT, "AR"), (0.0, 0))[1] == 2,
+            lambda: runner._refusal_log.held(OUT, "AR") == 2,
             "two held rows",
         )
         # Every refused row was still dead-lettered: only the log line is throttled.
@@ -408,6 +408,7 @@ def test_the_table_forgets_only_pairs_that_carry_nothing(
     refusals.warning("c", _nak("AR"), 1, "refused on %s", "c")
     now[0] = 60.0  # every window has closed; the table is full, so this line prunes
     refusals.warning("d", _nak("AR"), 1, "refused on %s", "d")
-    assert set(refusals._state) == {("a", "AR"), ("d", "AR")}  # b and c held nothing
+    # The private table, on purpose: held() reads 0 for a pair forgotten and for one kept empty.
+    assert set(refusals._state) == {("a", "AR", False), ("d", "AR", False)}  # b, c held nothing
     refusals.warning("a", _nak("AR"), 1, "refused on %s", "a")
     assert "(5 more row(s) refused with this code" in caplog.records[-1].getMessage()

@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.crypto import (
     STORE_SALT_BYTES,
@@ -408,7 +409,10 @@ def decrypt_stream(
     _validate_key(key)
     header = read_header(src)
     expected_kid = key_fingerprint(key)
-    if header.key_id != expected_kid:
+    # Constant-time (ASVS 11.2.4, BACKLOG #1167). `expected_kid` is a one-way fingerprint of the key
+    # and is public (the header carries it, and the refusal below prints it), so this hides no
+    # secret. It keeps a short-circuit `!=` off a key-derived value, which is what 11.2.4 asks.
+    if not constant_time_equal(header.key_id, expected_kid):
         raise BackupKeyMismatch(
             f"the resolved store key (key_id={expected_kid}) does not match the archive's key "
             f"(key_id={header.key_id}); the DR site must hold the same DEK to restore (ADR 0049)"
@@ -434,9 +438,17 @@ def decrypt_stream(
                 f"{_TAG_BYTES}..{max_ctlen} for a {header.chunk_size}-byte chunk)"
             )
         ct = _read_exact(src, ctlen, "frame ciphertext")
-        # We don't know up front whether this is the final frame, so try the final-flag AAD first
-        # (the common case for the last frame) and fall back to the non-final AAD. Exactly one matches
-        # for an authentic frame; if neither does, the frame is corrupt/tampered/wrong-key — fail closed.
+        # We don't know up front whether this is the final frame, so try the non-final AAD first
+        # (every frame but the last) and fall back to the final-flag AAD. Exactly one matches for an
+        # authentic frame; if neither does, the frame is corrupt/tampered/wrong-key — fail closed.
+        #
+        # ASVS 11.2.4 discharge (BACKLOG #1167): the `break` below is a short-circuit, and it is left
+        # on purpose. The two tries differ ONLY in the final flag, so the try count says whether this
+        # frame was the archive's last. That is public framing: the archive ends right after it, and
+        # `src.read(1)` below refuses any byte that follows. A frame that fails takes both tries
+        # every time. The key and the plaintext never steer the count, and each tag check is
+        # constant-time inside `cryptography`. A forced second try would double the AEAD work over
+        # the whole archive to hide where the file ends.
         plaintext: bytes | None = None
         this_final = False
         for final_try in (False, True):
