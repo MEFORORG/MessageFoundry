@@ -37,6 +37,21 @@ Two invariants shape the surface:
   one type, :class:`CompressionError` (a ``ValueError``), whose message names the codec and the byte
   ceiling only — **never any decompressed content** (it is PHI).
 
+  A **trial pass** runs ahead of the real one (BACKLOG #1129). It inflates the whole input in
+  bounded chunks, keeps none of the output, and counts the bytes, and for gzip the members. It
+  raises the same error the real pass would, at the moment a cap would be crossed. So an over-cap
+  stream is refused before the real decompression starts, and keeps no output at all. Only a stream
+  the trial pass admits is inflated again for real. The owner ruled on 2026-10-11 that a bounded
+  inflate that discards its output counts as a check made before uncompressing. The DICOM deflate
+  guard,
+  :func:`messagefoundry.parsing.dicom._inflate.guard_part10_deflate`, does the same before
+  ``dcmread``. The cost is a second inflate of every stream the trial pass admits. That is less
+  than double, because the real pass also copies its output; ADR 0123 records a measurement. The
+  pass is skipped only where it has nothing to refuse: :func:`deflate_decompress`,
+  :func:`deflate_decompress_with_tail` and :func:`zip_decompress` called with no byte ceiling. The
+  zip member count is read from the central directory before either pass, and the gzip member cap
+  cannot be turned off, so :func:`gzip_decompress` always runs it.
+
   Why a required keyword rather than a safer default (BACKLOG #1237): a default is a value the author
   never had to think about. A parameter with **no default** is a gate that refuses when the
   precondition is absent, which is a different construct from a stricter default and the reason this
@@ -157,12 +172,26 @@ def gzip_decompress(data: bytes, *, max_output_bytes: int | None, max_members: i
     than stdlib ``gzip`` checks them: a reserved flag bit set, or a header CRC that does not match, is
     refused, as RFC 1952 requires. Stdlib ``gzip`` ignores both. An empty input decompresses to
     ``b""``. A corrupt or truncated stream, an over-ceiling size or too many members raises
-    :class:`CompressionError`."""
+    :class:`CompressionError`.
+
+    Both caps are checked by a trial pass that keeps no output before the real pass runs; see the
+    module docstring. The member cap cannot be off, so the trial pass always runs here."""
     _check_ceiling(max_output_bytes)
     _check_count("max_members", max_members)
     # The members are walked by offset into one view, so no member copies the rest of the input.
     # A bytes view exports nothing a caller could need to resize; any other input is copied once.
     view = memoryview(data if isinstance(data, bytes) else bytes(data))
+    _gzip_members(view, max_output_bytes, max_members, keep_output=False)
+    # One member, the common case, joins without a copy.
+    return b"".join(_gzip_members(view, max_output_bytes, max_members, keep_output=True))
+
+
+def _gzip_members(
+    view: memoryview, max_output_bytes: int | None, max_members: int, *, keep_output: bool
+) -> list[bytes]:
+    """Walk every member of a gzip stream, and return each member's output, or ``b""`` per member
+    when ``keep_output`` is false. Raises :class:`CompressionError` for any of the refusals
+    :func:`gzip_decompress` lists."""
     parts: list[bytes] = []
     total = 0
     position = 0
@@ -178,13 +207,13 @@ def gzip_decompress(data: bytes, *, max_output_bytes: int | None, max_members: i
             wbits=_GZIP_WBITS,
             label="gzip",
             produced_before=total,
+            keep_output=keep_output,
         )
         parts.append(result.output)
         total += result.produced
         after = _NOT_GZIP_PADDING.search(view, position + result.end)
         position = after.start() if after else len(view)
-    # One member, the common case, joins without a copy.
-    return b"".join(parts)
+    return parts
 
 
 def deflate_compress(data: bytes, *, level: int = 6) -> bytes:
@@ -206,10 +235,13 @@ def deflate_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
     stream, an over-ceiling size, or any bytes after the end of the stream raise
     :class:`CompressionError` (BACKLOG #1964). Stdlib :func:`zlib.decompress` ignores such bytes. This
     refuses them, so no part of the input is dropped without a word. When other data follows the
-    stream by design, use :func:`deflate_decompress_with_tail`, which hands it back."""
+    stream by design, use :func:`deflate_decompress_with_tail`, which hands it back.
+
+    With a ceiling, a trial pass that keeps no output refuses an over-ceiling stream before the real
+    pass runs; see the module docstring."""
     # Refused rather than ignored: returning the first stream would drop the rest of the input
     # without a word, which is accept-and-drop (BACKLOG #1964).
-    return _inflate_zlib(data, max_output_bytes, trailing="refuse").output
+    return _inflate_zlib_after_trial(data, max_output_bytes, trailing="refuse").output
 
 
 def deflate_decompress_with_tail(
@@ -229,9 +261,22 @@ def deflate_decompress_with_tail(
     or an over-ceiling size raises :class:`CompressionError`. The tail is returned unread, so the
     caller decides what it may hold. A caller that walks several streams calls this once per stream,
     and owns the bound on how many it takes. Each call copies the tail, so that walk costs time in
-    proportion to the number of streams times the input size."""
-    result = _inflate_zlib(data, max_output_bytes, trailing="stop")
+    proportion to the number of streams times the input size.
+
+    With a ceiling, a trial pass that keeps no output refuses an over-ceiling stream before the real
+    pass runs; see the module docstring."""
+    result = _inflate_zlib_after_trial(data, max_output_bytes, trailing="stop")
     return result.output, bytes(data[result.end :])
+
+
+def _inflate_zlib_after_trial(
+    data: bytes, max_output_bytes: int | None, *, trailing: TrailingRule
+) -> InflateResult:
+    """:func:`_inflate_zlib` on one zlib stream, behind a trial pass that keeps no output (BACKLOG
+    #1129). With no ceiling the trial pass has nothing to refuse, so it is skipped."""
+    if max_output_bytes is not None:
+        _inflate_zlib(data, max_output_bytes, trailing=trailing, keep_output=False)
+    return _inflate_zlib(data, max_output_bytes, trailing=trailing, keep_output=True)
 
 
 def _inflate_zlib(
@@ -239,6 +284,7 @@ def _inflate_zlib(
     max_output_bytes: int | None,
     *,
     trailing: TrailingRule,
+    keep_output: bool,
     wbits: int = _ZLIB_WBITS,
     label: str = "deflate",
     produced_before: int = 0,
@@ -246,7 +292,9 @@ def _inflate_zlib(
     """The codec's rules over the shared loop (BACKLOG #1977): its one error type, and a truncated
     stream is an error. It inflates ONE stream: a zlib stream, or one gzip member, since a gzip
     stream's members and NUL padding are walked by :func:`gzip_decompress`. ``produced_before`` is
-    the output earlier members already produced, so a ceiling error names the caller's ceiling."""
+    the output earlier members already produced, so a ceiling error names the caller's ceiling.
+    ``keep_output=False`` is the trial pass: it counts and refuses exactly as the real pass does, and
+    returns an empty ``output``."""
     _check_ceiling(max_output_bytes)
     try:
         result = bounded_inflate(
@@ -254,7 +302,7 @@ def _inflate_zlib(
             zlib.decompressobj(wbits=wbits),
             max_output_bytes=max_output_bytes,
             trailing=trailing,
-            keep_output=True,
+            keep_output=keep_output,
             exact_ceiling=True,
         )
     except InflateCeilingExceeded as exc:
@@ -345,8 +393,13 @@ def zip_decompress(
 
     ``max_entries`` caps the member count (a many-entry archive is a bomb axis too). ``max_output_bytes``
     caps the **total** decompressed size across all members, enforced with per-member bounded reads so a
-    lying central-directory size cannot force full expansion. A corrupt archive, too many members, an
-    over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption, a
+    lying central-directory size cannot force full expansion. With a ceiling, a trial pass reads every
+    member that way and keeps nothing, so an over-ceiling archive is refused before any member is kept;
+    see the module docstring. Every member name is checked before either pass reads a byte. Content
+    is checked only in the real pass. So an archive over the ceiling is refused for the ceiling,
+    even when a member's content would be refused too. An archive refused for its content costs
+    one trial inflate first, which the byte ceiling bounds. A corrupt
+    archive, too many members, an over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption, a
     compression method, a format version) raises :class:`CompressionError`, which names a member by
     its position and never by its filename. Duplicate file member names also refuse the whole
     archive, since the returned mapping cannot preserve repeated names. So do two members that share
@@ -373,7 +426,6 @@ def zip_decompress(
     _check_ceiling(max_output_bytes)
     _check_count("max_entries", max_entries)
     result: dict[str, bytes] = {}
-    total = 0
     position = 0
     failure: str | None = None
     try:
@@ -390,31 +442,32 @@ def zip_decompress(
                 raise CompressionError(
                     f"zip archive has {len(names)} members, over the {max_entries}-member cap"
                 )
-            file_names = [info.filename for info in zf.infolist() if not info.is_dir()]
-            if len(set(file_names)) != len(file_names):
+            members = [
+                (number, info)
+                for number, info in enumerate(zf.infolist(), start=1)
+                if not info.is_dir()
+            ]
+            if len({info.filename for _, info in members}) != len(members):
                 raise CompressionError("zip archive contains duplicate member names")
-            for position, info in enumerate(zf.infolist(), start=1):
-                if info.is_dir():
-                    continue
-                # Name first, BEFORE a single byte is read: a traversal name is refused for what it is,
-                # not for what it expands to, and refusing early spends nothing on a hostile archive.
+            # Names, BEFORE a single byte is read: a traversal name is refused for what it is, not
+            # for what it expands to, and refusing early spends nothing on a hostile archive.
+            for position, info in members:
                 name_reason = archive_member_name_reason(info.filename)
                 if name_reason is not None:
                     raise CompressionError(f"zip archive member {position} refused: {name_reason}")
-                with zf.open(info, "r") as member:
-                    chunks = bytearray()
-                    while True:
-                        block = member.read(_CHUNK)
-                        if not block:
-                            break
-                        chunks += block
-                        total += len(block)
-                        if max_output_bytes is not None and total > max_output_bytes:
-                            raise CompressionError(
-                                f"zip archive decompresses beyond the {max_output_bytes}-byte ceiling "
-                                "(possible decompression bomb)"
-                            )
-                body = bytes(chunks)
+            # With a ceiling, a trial pass reads every member and keeps nothing, so an archive
+            # over it is refused before any member is kept (BACKLOG #1129). The member count was
+            # read from the central directory above, so with no ceiling there is nothing to try.
+            if max_output_bytes is not None:
+                total = 0
+                # `position` is read by the except arms below, which name a corrupt member.
+                for position, info in members:  # noqa: B007
+                    _, total = _read_zip_member(
+                        zf, info, max_output_bytes, total, keep_output=False
+                    )
+            total = 0
+            for position, info in members:
+                body, total = _read_zip_member(zf, info, max_output_bytes, total, keep_output=True)
                 content_reason = archive_member_content_reason(info.filename, body)
                 if content_reason is not None:
                     raise CompressionError(
@@ -448,6 +501,33 @@ def zip_decompress(
         where = f"zip archive member {position}" if position else "zip archive"
         raise CompressionError(f"{where} {failure}")
     return result
+
+
+def _read_zip_member(
+    zf: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    max_output_bytes: int | None,
+    produced_before: int,
+    *,
+    keep_output: bool,
+) -> tuple[bytes, int]:
+    """Read one member in bounded chunks. Returns its bytes, or ``b""`` when ``keep_output`` is
+    false, and the archive's running output total after it. Raises :class:`CompressionError` the
+    moment the total passes ``max_output_bytes``, and before that chunk is kept."""
+    # A list joined once builds the member's bytes in one copy; a bytearray would need a second.
+    kept: list[bytes] = []
+    total = produced_before
+    with zf.open(info, "r") as member:
+        while block := member.read(_CHUNK):
+            total += len(block)
+            if max_output_bytes is not None and total > max_output_bytes:
+                raise CompressionError(
+                    f"zip archive decompresses beyond the {max_output_bytes}-byte ceiling "
+                    "(possible decompression bomb)"
+                )
+            if keep_output:
+                kept.append(block)
+    return b"".join(kept), total
 
 
 def _zip_overlap_reason(zf: zipfile.ZipFile) -> str | None:

@@ -25,7 +25,6 @@ from harness.load.profile import LoadProfile
 from harness.load.report import PhaseRecord, RunReport, build_report
 from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
-from messagefoundry.apiclient import ApiError
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.25  # let final ACKs/arrivals settle before the final engine sample
@@ -79,6 +78,9 @@ async def run_load(
     try:
         await sink.start()
         await poller.open()
+        # Measure what a sample costs the engine while it is idle, before the baseline, so the
+        # report can take the poller's own commits off txn/msg (vault BACKLOG #2794).
+        await poller.calibrate()
         if not skip_preflight:
             await _preflight(
                 poller, profile
@@ -182,20 +184,10 @@ async def _preflight(poller: EnginePoller, profile: LoadProfile) -> None:
         raise PreflightError(
             "engine is not reachable for metrics — check --engine and that the engine is running"
         )
-    ports = await asyncio.to_thread(_engine_ports, poller)
+    ports = await asyncio.to_thread(poller.served_ports)
     missing = sorted({t.port for t in profile.targets} - ports)
     if missing:
         raise PreflightError(
             f"engine is not serving inbound port(s) {missing} — did you serve harness/config/load "
             f"(with matching MEFOR_LOAD_*_PORT)? engine ports seen: {sorted(ports)}"
         )
-
-
-def _engine_ports(poller: EnginePoller) -> set[int]:
-    client = poller.client
-    if client is None:
-        return set()
-    try:
-        return {r.port for r in client.connections() if r.port}
-    except ApiError:
-        return set()

@@ -48,6 +48,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     hop_name_prefix,
 )
+from messagefoundry.transports.base import float_setting
 from messagefoundry.transports.rest import (
     HttpAuthError,
     ProxyConfig,
@@ -265,8 +266,16 @@ def oauth2_cc_provider_from_settings(
         scope=(str(s["oauth2_scope"]) if s.get("oauth2_scope") else None),
         auth_style=str(s.get("oauth2_auth_style", "basic")),
         audience=(str(s["oauth2_audience"]) if s.get("oauth2_audience") else None),
-        expiry_skew_seconds=float(s.get("oauth2_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW)),
-        timeout_seconds=float(s.get("oauth2_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT)),
+        expiry_skew_seconds=float_setting(
+            s.get("oauth2_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW),
+            knob="oauth2_expiry_skew_seconds",
+            transport="OAuth2",
+        ),
+        timeout_seconds=float_setting(
+            s.get("oauth2_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
+            knob="oauth2_timeout_seconds",
+            transport="OAuth2",
+        ),
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / FhirLookup do). Default False → the hop
         # decides purely on posture.

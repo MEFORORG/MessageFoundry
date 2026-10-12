@@ -308,9 +308,10 @@ class RecordingStub:
                 # took ownership" stand-in (claim_fifo_heads only claims PENDING, so it is not re-claimed).
                 return LaneItemResult(LaneResultKind.RESOLVED)
             if kind == "RETRY":
-                nxt = await self._store.mark_failed(
+                failed = await self._store.mark_failed(
                     item.id, "retry", RetryPolicy(), now=self._clock()
                 )
+                nxt = failed.retry_at
                 assert nxt is not None  # default RetryPolicy retries forever → always a float
                 self.last_retry_until[lane] = nxt
                 return LaneItemResult(LaneResultKind.RETRY, retry_until=nxt)

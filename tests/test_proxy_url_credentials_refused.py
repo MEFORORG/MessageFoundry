@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A proxy URL that carries credentials is refused unless written ``https://`` (vault BACKLOG #2572).
+"""A proxy URL credential never reaches a proxy in cleartext (vault BACKLOG #2572, #3410).
 
 urllib turns a user and a password in a proxy URL into a ``Proxy-Authorization: Basic`` header. To a
 proxy reached over plain TCP that header crosses the network in cleartext. The Vault hop has refused
@@ -18,13 +18,17 @@ proxy written ``https://``, because the controls below depend on it:
   credential header in cleartext. ``http.client`` has no TLS leg to a proxy.
 * For an ``http`` target on an opener that also maps ``https`` to a proxy, the same happens. urllib
   re-enters the opener with the request re-addressed to the proxy, and the ``https`` entry then
-  tunnels to the proxy itself.
-* Only an ``http`` target on an opener with no ``https`` proxy starts TLS first.
+  tunnels to the proxy itself. It does not when urllib's bypass list matches the proxy's own host.
+* An ``http`` target on an opener with no ``https`` proxy starts TLS first. So does that
+  bypass-list case. The ``no_ambient_proxy`` fixture turns bypass off, so its test sets
+  ``NO_PROXY`` itself.
 
-So the one accepted control for a credentialed ``https://`` proxy is that last shape, and its test
-reads the wire as well as the result. **No test here asserts that a credentialed** ``https://``
-**proxy is accepted for an** ``https`` **target.** That shape is not refused by this change, and it
-is not safe. If a later CPython opens TLS to a proxy, the measurement goes red and says so.
+The rule the engine applies is stated once, on ``ProxyCredentialsRefusedError``. These tests pin
+at least the legs above, and they read the wire as well as the result. The cleartext legs are
+refused (vault BACKLOG #3410). So is the same leak across two DIFFERENT proxies. urllib keeps the
+first proxy's header when it hands the request on, and the second proxy got it in a cleartext
+``CONNECT``. The two-proxy section below runs two recording sockets at once. If a later CPython
+opens TLS to a proxy, the measurement goes red and says so.
 
 Synthetic data only: the credentials are made up and every host name is reserved.
 """
@@ -36,8 +40,6 @@ import base64
 import contextlib
 import copy
 import pickle
-import socket
-import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -57,6 +59,7 @@ from messagefoundry.transports.bounded_read import (
 )
 from messagefoundry.transports.rest import RestDestination
 from tests._egress_policy import permitting
+from tests._wire_proxy import _WireProxy
 
 _USER = "u5er"
 _PASSWORD = "pa55w0rd"  # nosec B105 - a made-up test value, not a credential
@@ -99,73 +102,6 @@ def _assert_fixed_refusal(exc: BaseException) -> None:
 
 
 # --- the measurement: what urllib sends before any TLS -------------------------------------------
-
-
-class _WireProxy:
-    """A loopback socket that records, per connection, what arrived before any TLS.
-
-    ``cleartext`` holds each request head that arrived in the clear. ``tls_first`` counts the
-    connections whose first byte was a TLS handshake record, so nothing preceded it. A ``CONNECT``
-    is answered 200, and ``tls_after_connect`` counts the tunnels the client then started TLS in.
-    """
-
-    def __init__(self) -> None:
-        self.cleartext: list[bytes] = []
-        self.tls_first = 0
-        self.tls_after_connect = 0
-        self._listener = socket.socket()
-        self._listener.bind(("127.0.0.1", 0))
-        self._listener.listen(4)
-        # So a test that stalls fails in seconds rather than hanging the serving thread.
-        self._listener.settimeout(5)
-        self.address = f"127.0.0.1:{self._listener.getsockname()[1]}"
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    @property
-    def connections(self) -> int:
-        return len(self.cleartext) + self.tls_first
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                conn, _ = self._listener.accept()
-            except TimeoutError:
-                continue  # idle, not closed: a slow test must still find the proxy serving
-            except OSError:
-                return
-            conn.settimeout(5)
-            # Suppressed: the client hung up. What was recorded stands.
-            with conn, contextlib.suppress(OSError):
-                self._record(conn)
-
-    def _record(self, conn: socket.socket) -> None:
-        head = conn.recv(8192)
-        if head[:1] == b"\x16":
-            self.tls_first += 1
-            return
-        while head and b"\r\n\r\n" not in head:
-            more = conn.recv(8192)
-            if not more:
-                break
-            head += more
-        self.cleartext.append(head)
-        if head.startswith(b"CONNECT "):
-            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            if conn.recv(16)[:1] == b"\x16":
-                self.tls_after_connect += 1
-        else:
-            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-
-    def __enter__(self) -> _WireProxy:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        # shutdown wakes a blocked accept() on Linux, where close() alone does not.
-        with contextlib.suppress(OSError):
-            self._listener.shutdown(socket.SHUT_RDWR)
-        self._listener.close()
-        self._thread.join(timeout=10)
 
 
 def _open_and_discard(opener: urllib.request.OpenerDirector, url: str) -> None:
@@ -221,8 +157,8 @@ def test_measured_urllib_sends_these_proxy_credentials_in_cleartext(
 
 
 def test_measured_urllib_opens_tls_first_for_an_http_target_with_no_https_proxy() -> None:
-    """The one shape in which a proxy written ``https://`` gets a TLS session before anything
-    else. Measured on plain urllib and on the engine's opener, where it is also not refused."""
+    """A proxy written ``https://`` gets a TLS session before anything else on this leg.
+    Measured on plain urllib and on the engine's opener, where it is also not refused."""
     for build in (urllib.request.build_opener, build_strict_opener):
         with _WireProxy() as proxy:
             value = f"https://{_CRED}@{proxy.address}"
@@ -231,14 +167,46 @@ def test_measured_urllib_opens_tls_first_for_an_http_target_with_no_https_proxy(
         assert proxy.tls_first == 1
 
 
+def test_an_http_target_reaches_a_bypassed_https_proxy_over_tls_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One proxy written ``https://`` for both schemes, and ``NO_PROXY`` names the proxy's own
+    host. Plain urllib and the engine's opener both send the ``http`` request to the proxy over
+    TLS: one connection, TLS first, no cleartext request head (vault BACKLOG #3410). The control is
+    the engine's opener with no bypass list, which is refused before it dials."""
+    with _WireProxy() as proxy:
+        value = f"https://{_CRED}@{proxy.address}"
+        opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
+        with pytest.raises(ProxyCredentialsRefusedError) as raised:
+            opener.open(_HTTP_TARGET, timeout=5)
+    assert proxy.connections == 0
+    _assert_fixed_refusal(raised.value)
+
+    for build in (urllib.request.build_opener, build_strict_opener):
+        with _WireProxy() as proxy:
+            monkeypatch.delenv("NO_PROXY", raising=False)  # the previous pass set it
+            value = f"https://{_CRED}@{proxy.address}"
+            opener = build(urllib.request.ProxyHandler({"http": value, "https": value}))
+            # Set after the build, so the pass shows the bypass list is read at send time.
+            monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
+            _open_and_discard(opener, _HTTP_TARGET)
+        assert proxy.connections == 1
+        assert proxy.tls_first == 1
+        assert proxy.cleartext == []
+
+
 # --- the refusal, on the wire --------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("target", [_HTTP_TARGET, _HTTPS_TARGET])
-@pytest.mark.parametrize("proxy_form", ["http://{cred}@{address}", "{cred}@{address}"])
+@pytest.mark.parametrize(
+    "proxy_form", ["http://{cred}@{address}", "{cred}@{address}", "https://{cred}@{address}"]
+)
 def test_a_credentialed_cleartext_proxy_is_refused_before_anything_is_sent(
     target: str, proxy_form: str
 ) -> None:
+    """With one proxy for both schemes, and no bypass list naming it, every leg is cleartext,
+    ``https://`` included: the first two measured shapes above (vault BACKLOG #3410)."""
     with _WireProxy() as proxy:
         value = proxy_form.format(cred=_CRED, address=proxy.address)
         opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
@@ -254,7 +222,7 @@ def test_control_without_the_check_the_credentials_cross_in_cleartext(
 ) -> None:
     """Mutation control: the same opener and proxy, with the reading behind the refusal undone."""
     monkeypatch.setattr(
-        bounded_read, "_sends_cleartext_proxy_credentials", lambda req, proxy: False
+        bounded_read, "_sends_cleartext_proxy_credentials", lambda req, proxy, proxies: False
     )
     with _WireProxy() as proxy:
         value = f"http://{_CRED}@{proxy.address}"
@@ -274,6 +242,105 @@ def test_control_a_cleartext_proxy_with_no_credentials_is_still_used() -> None:
     assert len(proxy.cleartext) == 1
     assert proxy.cleartext[0].startswith(b"GET http://partner.example.test/x ")
     assert b"Proxy-Authorization" not in proxy.cleartext[0]
+
+
+# --- two DIFFERENT proxies (vault BACKLOG #3410): each case records at both sockets ---------------
+
+
+def _two_proxy_opener(
+    a: _WireProxy,
+    b: _WireProxy,
+    *,
+    credentialed: str,
+    a_form: str = "https://{cred}@{address}",
+    b_form: str = "http://{address}",
+) -> urllib.request.OpenerDirector:
+    """An opener mapping ``credentialed`` (``http`` or ``https``) to proxy A, written ``a_form``
+    with the credential, and the other scheme to proxy B, written ``b_form`` with none."""
+    other = "https" if credentialed == "http" else "http"
+    proxies = {
+        credentialed: a_form.format(cred=_CRED, address=a.address),
+        other: b_form.format(address=b.address),
+    }
+    return build_strict_opener(urllib.request.ProxyHandler(proxies))
+
+
+@pytest.mark.parametrize("a_form", ["https://{cred}@{address}", "http://{cred}@{address}"])
+@pytest.mark.parametrize(
+    ("credentialed", "target", "b_form"),
+    [
+        # The reproduction: B got CONNECT with A's credential before the change.
+        pytest.param("http", _HTTP_TARGET, "http://{address}", id="http-target-plain-b"),
+        pytest.param("http", _HTTP_TARGET, "https://{address}", id="http-target-https-b"),
+        # The reverse order: urllib would tunnel to A with the header before any TLS.
+        pytest.param("https", _HTTPS_TARGET, "http://{address}", id="https-target"),
+    ],
+)
+def test_two_proxies_a_credential_reaches_neither_proxy_in_cleartext(
+    credentialed: str, target: str, b_form: str, a_form: str
+) -> None:
+    with _WireProxy() as a, _WireProxy() as b:
+        opener = _two_proxy_opener(a, b, credentialed=credentialed, a_form=a_form, b_form=b_form)
+        with pytest.raises(ProxyCredentialsRefusedError) as raised:
+            opener.open(target, timeout=5)
+    assert a.connections == 0
+    assert b.connections == 0
+    _assert_fixed_refusal(raised.value)
+
+
+def test_control_two_proxies_without_the_header_check_the_second_proxy_gets_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation control for the reproduction: with the header reading undone, the check sees only
+    each proxy's own URL, and the old leak comes back on the wire."""
+    monkeypatch.setattr(bounded_read, "_proxy_url_credentials", lambda proxies: set())
+    with _WireProxy() as a, _WireProxy() as b:
+        _open_and_discard(_two_proxy_opener(a, b, credentialed="http"), _HTTP_TARGET)
+    assert a.connections == 0
+    assert len(b.cleartext) == 1
+    assert b.cleartext[0].startswith(b"CONNECT 127.0.0.1:")
+    assert b"Proxy-Authorization: Basic " + _BASIC + b"\r\n" in b.cleartext[0]
+
+
+def test_the_header_urllib_makes_is_the_one_the_check_matches() -> None:
+    """The header check matches a carried header against what urllib would make from each proxy
+    URL. Pinned against urllib's own ProxyHandler, so a CPython that built the header another way
+    goes red here rather than letting a carried credential through unmatched."""
+    proxies = {
+        "http": f"https://{_USER}:pa55%2Fw0rd@{_PROXY_HOST}",
+        "https": f"http://{_PROXY_HOST}",
+    }
+    req = urllib.request.Request(_HTTP_TARGET)
+    # It then hands the request back to its opener, and an unattached handler has none.
+    with contextlib.suppress(AttributeError):
+        urllib.request.ProxyHandler(proxies).proxy_open(req, proxies["http"], "http")
+    made = req.get_header("Proxy-authorization")
+    assert made is not None
+    assert bounded_read._proxy_url_credentials(proxies) == {made}
+
+
+@pytest.mark.parametrize(
+    ("credentialed", "target", "request_line"),
+    [
+        pytest.param(
+            "http", _HTTPS_TARGET, b"CONNECT partner.example.test:443 ", id="https-target-to-b"
+        ),
+        pytest.param(
+            "https", _HTTP_TARGET, b"GET http://partner.example.test/x ", id="http-target-to-b"
+        ),
+    ],
+)
+def test_control_two_proxies_a_request_that_reaches_only_the_plain_proxy_is_sent(
+    credentialed: str, target: str, request_line: bytes
+) -> None:
+    """Both orders, for the target the credentialed proxy does not serve. That request goes to B
+    alone and carries no credential, so it is sent."""
+    with _WireProxy() as a, _WireProxy() as b:
+        _open_and_discard(_two_proxy_opener(a, b, credentialed=credentialed), target)
+    assert a.connections == 0
+    assert len(b.cleartext) == 1
+    assert b.cleartext[0].startswith(request_line)
+    assert b"Proxy-Authorization" not in b.cleartext[0]
 
 
 # --- the refusal, by source and by shape (no socket is opened below) -----------------------------
@@ -410,7 +477,7 @@ def test_control_without_the_check_an_at_sign_after_a_path_moves_the_proxy_host(
     urllib dials the host after the ``@`` and sends it a credential header. The check reads the
     value with urllib's own parser, so it judges the proxy urllib would dial."""
     monkeypatch.setattr(
-        bounded_read, "_sends_cleartext_proxy_credentials", lambda req, proxy: False
+        bounded_read, "_sends_cleartext_proxy_credentials", lambda req, proxy, proxies: False
     )
     value = f"http://127.0.0.1:3128/x@{_PROXY_HOST}"
     dialled = _dial(build_strict_opener(urllib.request.ProxyHandler({"http": value})), _HTTP_TARGET)
@@ -450,6 +517,35 @@ def test_a_host_on_the_bypass_list_is_dialled_direct_and_not_refused(
     assert dialled.host == "partner.example.test"
     assert dialled.proxy_header is None
     _refused(opener, "http://other.example.test/x")
+
+
+def test_a_proxy_url_credential_copied_onto_a_new_request_is_refused_at_a_plain_proxy(
+    recorded: None,
+) -> None:
+    """urllib's redirect handler copies a request's headers, the minted proxy header included, onto
+    the new request. That request reaches a proxy with no credential in its own URL, and the check
+    reads the header (vault BACKLOG #3410)."""
+    opener = build_strict_opener(
+        urllib.request.ProxyHandler(
+            {"http": f"https://{_CRED}@{_PROXY_HOST}", "https": f"http://{_PROXY_HOST}"}
+        )
+    )
+    copied = {"Proxy-authorization": "Basic " + _BASIC.decode()}
+    with pytest.raises(ProxyCredentialsRefusedError) as caught:
+        opener.open(urllib.request.Request(_HTTPS_TARGET, headers=copied), timeout=1)
+    _assert_fixed_refusal(caught.value)
+
+
+def test_control_a_proxy_header_the_caller_set_is_not_this_checks(recorded: None) -> None:
+    """A header no proxy URL in the opener would make, such as the one ``proxy_user`` builds, is
+    judged when the connection is built, by the posture-keyed guard. This check leaves it alone."""
+    opener = build_strict_opener(urllib.request.ProxyHandler({"https": f"http://{_PROXY_HOST}"}))
+    own = "Basic " + base64.b64encode(b"other:value").decode()
+    request = urllib.request.Request(_HTTPS_TARGET, headers={"Proxy-Authorization": own})
+    with pytest.raises(_Dialled) as dialled:
+        opener.open(request, timeout=1)
+    assert dialled.value.host == _PROXY_HOST
+    assert dialled.value.proxy_header == own
 
 
 def test_the_refusal_is_a_urlerror_that_copies_and_pickles(recorded: None) -> None:

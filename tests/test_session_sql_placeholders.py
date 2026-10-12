@@ -75,19 +75,69 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
 # --- SQL Server --------------------------------------------------------------
 
 
+# BACKLOG #2592: a session write reads the row first, verifies it and rewrites it. So the fakes answer
+# that read with one live, unsealed row, which the store accepts with no sealer, and the rewrite then
+# runs and is recorded like every other statement.
+_SESSION_COLUMNS = (
+    "token_hash",
+    "user_id",
+    "created_at",
+    "expires_at",
+    "last_used_at",
+    "revoked_at",
+    "client",
+    "reauth_at",
+    "mfa_verified_at",
+    "auth_mechanism",
+    "idp_auth_time",
+    "user_epoch",
+    "seal",
+)
+_LIVE_SESSION = (
+    _HASH,
+    "u",
+    _NOW - 60,
+    _NOW + 60,
+    _NOW - 30,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    0,
+    "",
+)
+
+
+def _reads_session_row(sql: str) -> bool:
+    return sql.startswith("SELECT * FROM sessions")
+
+
 class _MssqlCursor:
-    """Records each statement. Reports one affected row and no result rows, which every session
-    method accepts."""
+    """Records each statement. Reports one affected row; answers a session row read with one live
+    row, an account epoch read with 0, and everything else with no result rows."""
 
     def __init__(self, seen: list[tuple[str, tuple[Any, ...]]]) -> None:
         self._seen = seen
         self.rowcount = 1
         self.description: list[tuple[str]] = [("token_hash",)]
+        self._last = ""
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         self._seen.append((sql, tuple(params)))
+        self._last = sql
+        if _reads_session_row(sql):
+            self.description = [(c,) for c in _SESSION_COLUMNS]
 
     async def fetchall(self) -> list[Any]:
+        if _reads_session_row(self._last):
+            return [_LIVE_SESSION]
+        if self._last.startswith("SELECT session_epoch"):
+            return [(0,)]
+        return self._other_rows()
+
+    def _other_rows(self) -> list[Any]:
         return []
 
     async def close(self) -> None:
@@ -115,6 +165,7 @@ def _mssql_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     store._settings = StoreSettings(command_timeout=0)
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
+    store._row_sealer = None  # keyless: the write helper rewrites the row with an empty seal
 
     @asynccontextmanager
     async def _acquire() -> AsyncIterator[_MssqlConn]:
@@ -141,7 +192,7 @@ def _nocount_store(seen: list[tuple[str, tuple[Any, ...]]], output_rows: list[An
     store = _mssql_store(seen)
 
     class _NoCountCursor(_MssqlCursor):
-        async def fetchall(self) -> list[Any]:
+        def _other_rows(self) -> list[Any]:
             return output_rows
 
     class _NoCountConn(_MssqlConn):
@@ -169,7 +220,8 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _nocount_store(seen, output_rows)
     assert await store.rotate_session(_HASH, new_token_hash=_OTHER) is bool(output_rows)
-    assert "OUTPUT inserted.token_hash" in seen[0][0]
+    # The read comes first (BACKLOG #2592); the rewrite is the statement that reports.
+    assert "OUTPUT inserted.token_hash" in seen[-1][0]
 
 
 @pytest.mark.parametrize("revoked", [0, 3])
@@ -179,15 +231,25 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _nocount_store(seen, [(f"{n:064x}",) for n in range(revoked)])
     assert await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW) == revoked
-    assert "OUTPUT inserted.token_hash" in seen[0][0]
+    # The account's epoch is raised first (BACKLOG #2592); the sweep is the statement that counts.
+    assert "OUTPUT inserted.token_hash" in seen[1][0]
 
 
 async def test_sqlserver_supersede_returns_the_output_row_by_column_name() -> None:
     """``supersede_session`` reads its ``OUTPUT inserted.*`` row through ``_execute_output``
     (BACKLOG #2283), which pairs each value with its column name. Read by position instead, a
     reordered column list would fill the record from the wrong columns."""
-    columns = ("user_id", "token_hash", "revoked_at", "expires_at", "created_at", "last_used_at")
-    row = ("u", _HASH, _NOW, _NOW + 60, _NOW - 60, _NOW - 30)
+    columns = (
+        "user_id",
+        "token_hash",
+        "revoked_at",
+        "expires_at",
+        "created_at",
+        "last_used_at",
+        "seal",
+        "user_epoch",
+    )
+    row = ("u", _HASH, _NOW, _NOW + 60, _NOW - 60, _NOW - 30, "", 0)
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _mssql_store(seen)
 
@@ -256,6 +318,10 @@ class _PgConn:
 
     async def fetchrow(self, sql: str, *args: Any) -> Any:
         self._seen.append((sql, args))
+        if _reads_session_row(sql):
+            return dict(zip(_SESSION_COLUMNS, _LIVE_SESSION, strict=True))
+        if sql.startswith("SELECT session_epoch"):
+            return {"session_epoch": 0}
         return None
 
     def transaction(self) -> Any:
@@ -282,6 +348,7 @@ def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     store: Any = PostgresStore.__new__(PostgresStore)
     store._settings = StoreSettings()
     store._acquire_wait = AcquireWaitHistogram()
+    store._row_sealer = None  # keyless: the write helper rewrites the row with an empty seal
 
     @asynccontextmanager
     async def _timed_acquire(*, record: bool = True) -> AsyncIterator[_PgConn]:
@@ -289,15 +356,13 @@ def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
 
     store._timed_acquire = _timed_acquire
 
-    async def _execute_after_commit(sql: str, *args: Any) -> int:
+    @asynccontextmanager
+    async def _after_commit_txn() -> AsyncIterator[_PgConn]:
         # The one sanctioned unbounded borrow, for the two writes that follow a committed one
-        # (BACKLOG #2283). Recorded like every other statement, and counted from the status tag
-        # the way the real helper counts it.
-        from messagefoundry.store.postgres import _rowcount
+        # (BACKLOG #2283). Its statements are recorded like every other.
+        yield _PgConn(seen)
 
-        return _rowcount(await _PgConn(seen).execute(sql, *args))
-
-    store._execute_after_commit = _execute_after_commit
+    store._after_commit_txn = _after_commit_txn
     # Any other borrow that bypasses the bounded helper reaches this and fails with a message naming
     # the bypass, rather than with a bare AttributeError.
     store._pool = _NoPool()

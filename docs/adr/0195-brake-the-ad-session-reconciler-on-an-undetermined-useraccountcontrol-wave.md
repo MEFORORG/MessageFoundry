@@ -17,6 +17,28 @@
   second read. No client sees the difference. The reconciler's new UNKEYED outcome, for an id-less
   row it does not probe, is deliberately not UNDETERMINED, so it never moves this rule's hold (ADR
   0184 amendment 2026-10-06).
+- **Amendment 2026-10-11 (BACKLOG #2138). A seat decision under owner delegation 2026-10-08, not
+  an owner ruling.** Rule item 7's last sentence no longer holds and is kept as the record: held
+  probes now stay in the mass-revoke breaker's probed count. Left out, more than
+  `ad_session_revoke_max` genuine revocations beside a hold tripped the breaker whenever they also
+  exceeded `ad_session_revoke_max_fraction` of the probes that were not held. Where most probed
+  accounts were held, that was every pass while the hold stood. So genuine disables and deletions
+  went unrevoked, and the breaker alerted the whole time. Counted in, the breaker judges
+  revocations against every principal the pass probed. Unreachable probes were always counted, and
+  referred ones have been since BACKLOG #2538.
+  **The cost: a hold weakens the breaker in proportion to its size.** That holds for every
+  revocation the breaker counts: absences, disables, and role and scope changes alike. A wave now
+  trips it only while its revocations exceed 0.34 (the default fraction) of every probe, held ones
+  included. 30 absences beside 40 held accounts and nothing else still trip it (30 is more than
+  0.34 of 70). 30 absences beside 60 held and 10 present do not (30 is not more than 0.34 of 100),
+  and the old rule aborted that pass (30 is more than 0.34 of 40). **Not measured:** how often one
+  directory fault makes both a hold and a false wave. One access change could lose read on
+  `userAccountControl` for some accounts and on the entries, or on `memberOf` (ADR 0198), for
+  others. Such a fault would now revoke the false wave once its strikes reach
+  `ad_session_recheck_strikes`, or at once for a role or scope change. The `auth.ad_reconcile_aborted` row
+  drops its `judged` key, which would now always equal `probed`. `ReconcilePlan.judged` carries the
+  rule. `tests/test_ad_session_reconcile.py::test_held_probes_stay_in_the_breakers_count` pins it,
+  and `::test_a_hold_now_lets_a_false_absence_wave_under_the_breaker` pins the cost.
 - **Related:** [ADR 0079](0079-kerberos-idp-session-coordination.md) (mechanism 2, the directory
   session reconciler, and its mass-revoke breaker) · [CLAUDE.md](../../CLAUDE.md) section 0 (not
   deployed) and section 11 (SDS-3.6, SDS-3.7) · BACKLOG #1639 (the fail-closed read this follows) ·
@@ -221,7 +243,8 @@ at one.
    before it is revoked. That covers an access change that is still replicating. The existing breaker
    keeps strikes on abort to stop its alert flickering. That reason does not apply here, because the
    hold does not read strikes. Every other probe plans as today. The mass-revoke breaker then judges
-   what remains, with held probes left out of its probed count.
+   what remains, with held probes left out of its probed count. *Amended 2026-10-11, see the
+   amendment of that date in the header: held probes now stay in that count.*
 8. **When not held**, a single `UNDETERMINED` probe strikes and revokes exactly as `ABSENT` does, and
    counts against the mass-revoke breaker's budget.
 9. **Operator signal.** Every pass that holds writes its own audit row and raises its own alert type.

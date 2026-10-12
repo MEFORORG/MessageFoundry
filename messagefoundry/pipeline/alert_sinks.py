@@ -1076,16 +1076,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def approval_approver_provenance(
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
-        # BACKLOG #315: a release went ahead with an approver account that changed after the request.
-        # `approval:<id>` stands in for "connection", so each flagged release is its own instance
-        # (the key's grammar is on AlertSink). The slugs land in the reason column. No PHI.
+        # BACKLOG #315, #2125: a release or a resolve went ahead with an account that changed after
+        # the request. `approval:<id>` (a release) or `approval:<id>:resolve` stands in for
+        # "connection", so each flagged act is its own instance (the key's grammar is on
+        # AlertSink). The slugs land in the reason column. No PHI.
         self._emit(
             {
                 "type": "approval_approver_provenance",
                 "connection": name,
                 "operation": operation,
                 "changed": list(changed),
-                "reason": "approver account changed after the request: " + ", ".join(changed),
+                # "acting": the approver on a release, the resolver on a resolve. The key says which.
+                "reason": "acting account changed after the request: " + ", ".join(changed),
             }
         )
 

@@ -63,6 +63,7 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
+from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdminRemoval,
@@ -78,6 +79,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    FailOutcome,
     FederatedUnbind,
     LatencyHistogram,
     LockoutCounter,
@@ -826,12 +828,15 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
-    ) -> float | None:
+    ) -> FailOutcome:
         """Reschedule one outbox row with exponential backoff, or dead-letter it once a finite
-        ``max_attempts`` is exhausted. Returns the row's new ``next_attempt_at`` (epoch seconds) when
-        it was RESCHEDULED — the runner arms a per-lane retry wake at that time (WS-C: with the long
-        idle backstop, the retry re-claim no longer rides a short poll) — and ``None`` when the row
-        dead-lettered or no longer exists (nothing to re-claim).
+        ``max_attempts`` is exhausted. Returns a :class:`FailOutcome` read inside the write (vault
+        BACKLOG #3211). Its ``retry_at`` is the row's new ``next_attempt_at`` (epoch seconds) on the
+        retry branch: the runner arms a per-lane retry wake at that time (WS-C: with the long idle
+        backstop, the retry re-claim no longer rides a short poll). Its ``dead`` is 1 when this call
+        dead-lettered the row, and it names the row with the attempts the store read there. A row
+        that no longer exists returns an empty outcome, and so does a final write the H1 fence
+        rolled back.
 
         The retry branch re-pends a row only while it is ``inflight`` or ``pending`` (ADR 0157
         Amendment A, BACKLOG #2078, #2348, widened by owner ruling 2026-09-29). So a row a lease sweep
@@ -856,12 +861,15 @@ class QueueStore(StoreLifecycle, Protocol):
         error: str,
         retry: RetryPolicy,
         now: float | None = None,
-    ) -> float | None:
+    ) -> FailOutcome:
         """Re-pend (or dead-letter) N outbound rows that FAILED **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to every member, so all N re-pend to the same ``next_attempt_at`` (re-claimed
-        as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. Returns
-        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered. On the
+        as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. The
+        head is the first member still present, and the returned :class:`FailOutcome` names it, with
+        the shared ``next_attempt_at`` as ``retry_at`` when rescheduled and the members written DEAD
+        as ``dead``. An empty or wholly vanished batch returns an empty outcome, and so does a final
+        write the H1 fence rolled back. On the
         retry branch a terminal member (neither ``inflight`` nor ``pending``) is skipped, event and
         all, as in
         :meth:`mark_failed`, and the shared retry time is returned even when every member was
@@ -2589,6 +2597,17 @@ class AuthStore(Protocol):
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
     # --- sessions ------------------------------------------------------------
+    def row_sealer(self) -> RowSealer | None:
+        """The sealer this store writes authority-row integrity seals with, or ``None`` when its
+        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG #2592).
+
+        The store writes the seals: every session write that changes a sealed column goes through
+        one helper per backend, which verifies the row it read before it re-seals it and raises
+        :class:`~messagefoundry.store.row_seal.RowSealError` rather than re-seal a row that fails.
+        A revoke blanks the seal, which needs no key. :class:`AuthService` checks the seals, in its
+        one session loader; the store's readers return rows unchecked."""
+        ...
+
     async def create_session(
         self,
         *,

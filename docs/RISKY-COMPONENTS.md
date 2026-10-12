@@ -215,6 +215,21 @@ core closure. The same criterion applies.
 On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `QtGui`, `QtNetwork` and
 `QtWidgets`. All four ship in `pyside6-essentials`. That split decides the tables below.
 
+A test holds that list to the code: `test_the_harness_imports_exactly_the_qt_modules_the_page_lists`
+in `tests/test_risky_component_designation.py`. It walks every import statement under `harness/`.
+It fails when one names a Qt module that this list leaves out. It also fails when a listed module
+is no longer imported. It refuses `import PySide6` and `from PySide6 import`, since neither names a
+module it can read. A change that adds a module to this list turns the test green again. So whoever
+adds one must also change the sentence on `pyside6-essentials`, which the test holds to the count,
+and read the `pyside6-addons` row again.
+
+The test misses at least these:
+
+- an import built at run time
+- a Qt import in code outside `harness/`
+- a Qt module that a dependency or a Qt plugin loads
+- which wheel ships each module
+
 ### Designated
 
 | Component | Tier | Why | Native |
@@ -227,7 +242,7 @@ On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `Qt
 | Component | Why not |
 |---|---|
 | `pyside6` | a metadistribution: the `PySide6` package initialiser, two small version and configuration modules, and typing stubs. It parses no input, and it exists to pull in the other three. It ships no compiled file. The survey further down listed the pinned Linux x86_64 and Windows amd64 wheels and found none in either |
-| `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again |
+| `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again. The test named above fails on a static import of one under `harness/` until the module joins the list above |
 
 So 2 plus 2 is 4, and 35 plus 4 is 39.
 
@@ -420,10 +435,12 @@ owed no route. Lines copied into a wheel's own module are not counted.
 **This page's criterion.** A wheel that is not designated is owed a route when it carries another
 project's code, compiled or source. A wheel that carries only another project's data is listed below
 with what it carries. It is owed no route, because data holds another project's tables and none of
-its logic. That holds where the tables are kept as generated Python modules too. That line is this
-page's choice, and a reader can draw it elsewhere: data still decides things, as a list of root
-certificates decides what is trusted. A wheel whose answer is not established, for any form, is
-treated as carrying code.
+its logic. For a wheel that is not designated, that no-route line rests on an owner ruling of
+2026-10-06. That ruling is about wheels that carry only another project's data, and the maintainers'
+private security records hold it. The reason given here is this page's own. The ruling names code,
+compiled or source, and data, but not tables kept as generated Python modules. This page counts them
+as data. That part is this page's choice, and a reader can draw it elsewhere. A wheel whose answer
+is not established, for any form, is treated as carrying code.
 
 **Another project's compiled code: found in 9 of 41. Not found in 32. Not established: 0. 9 plus 32
 plus 0 is 41.**

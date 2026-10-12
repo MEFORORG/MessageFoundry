@@ -27,7 +27,7 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
-from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
@@ -3791,13 +3791,20 @@ async def test_schema_fastpath_skips_and_reruns(store) -> None:
 
 
 async def test_mark_failed_returns_reschedule_time(store) -> None:
-    """WS-C: the runner arms the per-lane retry wake on mark_failed's returned next_attempt_at —
-    rescheduled → the epoch time; dead-lettered/missing → None (parity with the SQLite backend)."""
+    """WS-C: the runner arms the per-lane retry wake on the ``retry_at`` mark_failed returns:
+    the epoch time when rescheduled, and a missing row writes nothing (parity with SQLite)."""
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     item = (await store.claim_ready(now=200.0))[0]
-    next_at = await store.mark_failed(item.id, "transient", RetryPolicy(), now=1000.0)
+    next_at = (await store.mark_failed(item.id, "transient", RetryPolicy(), now=1000.0)).retry_at
     assert next_at == 1005.0  # attempts=1 → backoff 5.0 * 2**0
-    assert await store.mark_failed("no-such-row", "x", RetryPolicy(), now=1000.0) is None
+    assert (await store.mark_failed("no-such-row", "x", RetryPolicy(), now=1000.0)) == FailOutcome()
+
+
+async def test_mark_failed_and_mark_batch_failed_say_what_they_did(store) -> None:
+    """Vault BACKLOG #3211 on this backend: each call returns a FailOutcome read inside its write."""
+    from tests._fail_outcome_contract import assert_fail_outcomes
+
+    await assert_fail_outcomes(store)
 
 
 # --- #149 Phase 4: streaming attachment substrate parity (ADR 0105) ------------------------------
@@ -5407,6 +5414,75 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+async def test_session_seal_contract(store) -> None:
+    """BACKLOG #2592: session-row integrity seals, the same contract the SQLite suite runs, on a
+    keyed handle. ``raw`` runs each statement on a pooled connection, outside the store's helpers.
+    The fixture clears the session and user tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._session_seal_contract import assert_session_columns, assert_session_seal_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        async def columns() -> set[str]:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(
+                    "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('sessions')"
+                )
+                return {str(r[0]) for r in await cur.fetchall()}
+
+        await assert_session_seal_contract(keyed, raw)
+        assert_session_columns(await columns())
+    finally:
+        await keyed.close()
+
+
+async def test_queue_tag_contract(store) -> None:
+    """BACKLOG #2593: the queue payload's routing tag, the same contract the SQLite suite runs, on a
+    keyed handle under the cell-bound writer. ``raw`` and ``fetch`` run on pooled connections,
+    outside the store's helpers. The ``store`` fixture clears the queue tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._queue_tag_contract import assert_queue_tag_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store,
+        cipher=make_cipher(generate_key(), write_v2=True),
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                names = [c[0] for c in cur.description]
+                rows = [dict(zip(names, r, strict=True)) for r in await cur.fetchall()]
+                await conn.commit()
+                return rows
+
+        await assert_queue_tag_contract(
+            keyed, raw, fetch, store_once=False, claim_reads_body_ref=False
+        )
+    finally:
+        await keyed.close()
 
 
 async def test_session_supersession_contract(store) -> None:

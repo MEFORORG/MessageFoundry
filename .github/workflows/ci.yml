@@ -9,9 +9,9 @@ on:
   #
   # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
   # That was true when the trigger landed on 2026-08-26 and became false once a queue was
-  # configured; corrected 2026-09-03, after PR 754 merged through the queue. BACKLOG #340 carries
-  # the measurements and STAYS OPEN -- a live queue is not that item being finished, and who
-  # enabled the queue is recorded nowhere.
+  # configured; corrected 2026-09-03, after PR 754 merged through the queue. Vault BACKLOG #340
+  # carries the measurements; the owner chose on 2026-10-08 to close it, and cla.yml's header
+  # names one residual accepted. Who enabled the queue is recorded nowhere.
   merge_group:
   push:
     branches: [main]
@@ -1086,7 +1086,7 @@ jobs:
       # run (docs-only PRs, a deselecting -k), and a missing diagnostic must never redden a leg.
       - name: Upload connscale readings
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: connscale-readings-${{ matrix.os }}-py${{ matrix.python-version }}
           path: out/connscale/
@@ -2161,7 +2161,7 @@ jobs:
       # count -- under `--dist loadfile` no shard finishes faster than its single largest file.
       - name: Upload the tier's junit
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tooling-junit-${{ matrix.os }}
           path: tooling-junit.xml
@@ -2202,7 +2202,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           cache: npm
@@ -3616,7 +3616,7 @@ jobs:
 
       - name: Upload load report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: load-report
           path: out/load/
@@ -3843,7 +3843,7 @@ jobs:
 
       - name: Upload load report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: load-report-sqlserver
           path: out/load/
@@ -4707,7 +4707,7 @@ jobs:
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
           path: |
@@ -4718,7 +4718,7 @@ jobs:
 
       - name: Upload service logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
           path: C:\ProgramData\MessageFoundry\logs\

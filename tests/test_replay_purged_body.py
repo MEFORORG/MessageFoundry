@@ -12,8 +12,8 @@ message flipped from ``ERROR`` to ``PROCESSED`` on the strength of a zero-byte f
 
 1. all three purge paths write a *literal* ``payload=''``;
 2. a real body goes through ``self._cipher.encrypt``, so on a keyed store it is never ``''``;
-3. a store-once row carries a non-NULL ``body_ref`` — its ``''`` inline payload is a deref sentinel,
-   not an erasure, and the purge nulls the ref before it blanks the row.
+3. a store-once row carries a non-NULL ``body_ref``, and its payload holds that reference sealed
+   (BACKLOG #2593; it was a blank deref sentinel before). The purge nulls the ref and blanks the row.
 
 The store already agreed with that predicate in one place: ``_attachment_still_referenced_sql`` calls a
 row a *live holder* when ``payload <> '' OR body_ref IS NOT NULL``, and releases the streaming
@@ -278,14 +278,15 @@ async def test_replay_dead_returns_zero_when_every_dead_row_is_erased(store: Mes
 # --- the store-once arm: ``payload=''`` with a live ``body_ref`` is NOT erased --
 
 
-async def test_a_store_once_row_still_replays_because_its_body_ref_is_live(
+async def test_a_store_once_row_still_replays_until_it_is_purged(
     store: MessageStore,
 ) -> None:
-    """The ``body_ref IS NOT NULL`` arm is load-bearing, and dropping it breaks EVERY fanned-out feed.
+    """A store-once delivery replays until retention purges it.
 
-    A store-once delivery keeps its single body in ``shared_body`` and stores ``payload=''`` inline as a
-    deref sentinel. On ``payload=''`` alone the guard would refuse every one of them. The purge nulls
-    ``body_ref`` *before* it blanks the row, so the two states stay distinguishable.
+    It keeps its single body in ``shared_body``, and its own ``payload`` holds that body's key, sealed
+    under the row's tag (BACKLOG #2593). Before that change the payload was a blank deref sentinel and
+    only the ``body_ref IS NOT NULL`` arm kept the row replayable. The purge nulls ``body_ref`` and
+    blanks the payload together, so a purged row is still told apart.
     """
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=0.0)
     item = await store.claim_next_fifo("IB", stage=Stage.INGRESS.value, now=0.0)
@@ -300,7 +301,7 @@ async def test_a_store_once_row_still_replays_because_its_body_ref_is_live(
     )
     routed = await store.claim_next_fifo("IB", stage=Stage.ROUTED.value, now=0.0)
     assert routed is not None
-    # One identical body to two destinations => one shared_body row, two body_refs, two '' payloads.
+    # One identical body to two destinations => one shared_body row, two body_refs, two sealed refs.
     await store.transform_handoff(
         routed_id=routed.id,
         message_id=mid,
@@ -314,7 +315,7 @@ async def test_a_store_once_row_still_replays_because_its_body_ref_is_live(
         await store.mark_done(outbox_id, now=0.0)
     for outbox_id in rows.values():
         state = await _row(store, outbox_id)
-        assert state["payload"] == "" and state["body_ref"] is not None  # the trap state
+        assert state["payload"] != "" and state["body_ref"] is not None  # the sealed reference
 
     # Unpurged: both store-once rows are still replayable.
     assert await store.replay(mid, now=1.0) == 2

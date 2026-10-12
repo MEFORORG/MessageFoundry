@@ -11,10 +11,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from harness.load.enginepoll import EnginePoller, EngineSample
+import httpx
+import pytest
+
+from harness.load.enginepoll import EnginePoller, EngineSample, PollerCalibration
 from harness.load.metrics import Counters, Histogram
 from harness.load.profile import load_profile_text
 from harness.load.report import PhaseRecord, _spreadsheet_safe, build_report, compare_to_baseline
+from messagefoundry.apiclient import ApiError
 
 _PROFILE = """
 [load]
@@ -58,8 +62,11 @@ def _poller(
     backlog: int = 0,
     committed_txns: int = 0,
     body_copies: int = 0,
+    poller_requests: int = 0,
+    calibration: PollerCalibration | None = None,
 ) -> EnginePoller:
     p = EnginePoller("http://x", None, origin=0.0)
+    p._calibration = calibration
     base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, "wal", "normal", 1.0)
     # ``committed_txns``/``body_copies`` are the FINAL readings; the baseline stays 0, so the run delta
     # == the value passed (#207). Left 0 (the default) they exercise the Postgres "unwired counter"
@@ -81,6 +88,7 @@ def _poller(
         11.0,
         committed_txns=committed_txns,
         body_copies=body_copies,
+        poller_requests=poller_requests,
     )
     p._samples.extend([base, final])
     return p
@@ -173,8 +181,8 @@ def test_json_is_metrics_only_no_phi() -> None:
         profile, "http://x", _records(sent, sent), counters, _poller(sent, 300), 2.0
     )
     text = report.to_json()
-    # 2→3: engine_side gained body_copies + copies_per_message (#207 loose end 2, ADR 0141).
-    assert '"schema_version": 4' in text
+    # 4 to 5: engine_side gained the poller's own cost (vault BACKLOG #2794).
+    assert '"schema_version": 5' in text
     # No raw HL7 / control ids / PHI tokens ever reach the artifact.
     for forbidden in ("MSH|", "PID|", "\r", "MEFOR", "^~"):
         assert forbidden not in text
@@ -368,3 +376,213 @@ def test_engine_poller_parses_sample_from_client() -> None:
     assert sample.in_pipeline == 4  # taken straight from /stats, not derived from outbox_by_status
     assert sample.db_size_bytes == 4096
     assert sample.synchronous == "normal"  # B7: the durability mode rides through the sample
+
+
+# --- vault BACKLOG #2794: the poller's own commits, measured and taken off -------------------------
+
+
+def _engine_side(report: Any) -> dict[str, Any]:
+    engine_side = report.to_json_dict()["engine_side"]
+    assert isinstance(engine_side, dict)
+    return engine_side
+
+
+def test_poller_removed_txn_per_message_sits_beside_the_raw_figure() -> None:
+    # 105 messages that cost 735 pipeline commits (7.0/msg), plus 60 poller requests at a measured
+    # 6 commits per 3-request sample: 120 more. The raw figure keeps them; the second one does not.
+    profile = load_profile_text(_PROFILE)
+    sent = 105
+    counters = Counters(sent=sent, acked=sent, sink_received=300)
+    poller = _poller(
+        read=sent,
+        written=300,
+        committed_txns=735 + 120,
+        poller_requests=60,
+        calibration=PollerCalibration(6, 3),
+    )
+    report = build_report(profile, "http://x", _records(sent, sent), counters, poller, 2.0)
+    assert report.engine.txn_per_message_measured == pytest.approx(855 / 105)
+    assert report.engine.txn_per_message_poller_removed == pytest.approx(7.0)
+    engine_side = _engine_side(report)
+    assert engine_side["committed_txns"] == 855
+    assert engine_side["poller_samples"] == 2
+    assert engine_side["poller_requests"] == 60
+    assert engine_side["poller_renewals"] == 0
+    assert engine_side["poller_requests_per_sample"] == 3
+    assert engine_side["poller_commits_per_sample_measured"] == 6
+    assert engine_side["txn_per_message_poller_removed"] == 7.0
+    console = report.render_console()
+    assert "txn/msg (measured): 8.14/msg" in console
+    assert "txn/msg (engine, poller removed): 7.00/msg" in console
+    assert (
+        "60 poller requests x 6 commits per 3-request sample measured at idle = 120 commits removed"
+        in console
+    )
+
+
+@pytest.mark.parametrize(
+    ("committed_txns", "calibration", "per_sample", "note"),
+    [
+        (855, None, None, "the poller was not calibrated"),
+        (
+            855,
+            PollerCalibration(None, note="an engine did not answer a calibration sample"),
+            None,
+            "an engine did not answer a calibration sample",
+        ),
+        # An unwired counter (PostgreSQL, vault BACKLOG #2643) calibrates to a flat 0 as well. That
+        # 0 is no evidence the poller is free, so it is not published as a measured cost.
+        (0, PollerCalibration(0, 3), None, "the raw figure is not measured"),
+        # An idle engine busy with its own work overstates the poller; nothing left is not 0/msg.
+        # The calibration itself was taken, so its figure is still published.
+        (120, PollerCalibration(6, 3), 6, "is not below committed_txns (120)"),
+        # A calibration with no request count cannot be turned into a rate.
+        (855, PollerCalibration(6), None, "the calibration counted no requests"),
+    ],
+)
+def test_poller_removed_renders_not_measured_never_a_guess(
+    committed_txns: int, calibration: PollerCalibration | None, per_sample: int | None, note: str
+) -> None:
+    profile = load_profile_text(_PROFILE)
+    sent = 105
+    counters = Counters(sent=sent, acked=sent, sink_received=300)
+    poller = _poller(
+        read=sent,
+        written=300,
+        committed_txns=committed_txns,
+        poller_requests=60,
+        calibration=calibration,
+    )
+    report = build_report(profile, "http://x", _records(sent, sent), counters, poller, 2.0)
+    assert report.engine.txn_per_message_poller_removed is None
+    engine_side = _engine_side(report)
+    assert engine_side["txn_per_message_poller_removed"] is None
+    assert engine_side["poller_commits_per_sample_measured"] == per_sample
+    console = report.render_console()
+    assert "txn/msg (engine, poller removed): not measured (" in console
+    assert note in console
+    assert "0.00/msg" not in console
+
+
+class _CommittingClient:
+    """A fake EngineClient whose engine commits ``per_request`` transactions for every request it
+    answers, BEFORE the handler runs, the way the session stamp and grant audit do. Its /stats
+    reply therefore already counts the /stats request itself."""
+
+    def __init__(self, per_request: int) -> None:
+        self.per_request = per_request
+        self.committed = 0
+
+    def _answer(self) -> None:
+        self.committed += self.per_request
+
+    def stats(self) -> Any:
+        self._answer()
+        return SimpleNamespace(outbox_by_status={}, in_pipeline=0, committed_txns=self.committed)
+
+    def connections(self) -> list[Any]:
+        self._answer()
+        return [SimpleNamespace(read=0, written=None, errored=0, queue_depth=None, port=2600)]
+
+    def status(self) -> Any:
+        self._answer()
+        return SimpleNamespace(
+            db=SimpleNamespace(size_bytes=0, journal_mode="wal", synchronous="normal"),
+            engine=SimpleNamespace(uptime_seconds=1.0),
+        )
+
+
+def _committing_poller(shards: int, per_request: int) -> EnginePoller:
+    urls = [f"http://shard-{i}" for i in range(shards)]
+    poller = EnginePoller(urls, None, origin=0.0)
+    clients: list[Any] = [_CommittingClient(per_request) for _ in urls]
+    poller._clients = clients
+    return poller
+
+
+@pytest.mark.parametrize(("shards", "per_request"), [(1, 2), (3, 2), (2, 1)])
+def test_calibration_measures_the_sample_cost_per_shard_and_audit_setting(
+    shards: int, per_request: int
+) -> None:
+    # Two commits a request with the grant audit on, one with it off; three requests per shard.
+    poller = _committing_poller(shards, per_request)
+    calibration = poller._calibrate_sync()
+    assert calibration == PollerCalibration(3 * shards * per_request, 3 * shards)
+    assert poller.calibration is calibration
+    assert poller.samples == []  # neither calibration sample is the run's baseline
+
+
+def test_calibration_that_cannot_sample_is_not_measured() -> None:
+    poller = EnginePoller("http://x", None, origin=0.0)
+    poller._clients = []
+    calibration = poller._calibrate_sync()
+    assert calibration.commits_per_sample is None
+    assert calibration.note == "no two calibration samples in a row were answered"
+
+
+def test_poller_requests_cover_the_same_window_as_committed_txns() -> None:
+    # The served-ports read between two samples is the poller's too, so it must be counted, and
+    # the count must be cut at each shard's /stats read exactly as committed_txns is.
+    poller = _committing_poller(3, 2)
+    first = poller._sample_sync()
+    assert poller.served_ports() == {2600}
+    second = poller._sample_sync()
+    assert first is not None and second is not None
+    requests = second.poller_requests - first.poller_requests
+    assert requests == 3 * 3 + 1
+    assert second.committed_txns - first.committed_txns == 2 * requests
+
+
+def _chained(cause: BaseException) -> ApiError:
+    try:
+        raise ApiError("could not reach engine") from cause
+    except ApiError as exc:
+        return exc
+
+
+@pytest.mark.parametrize(
+    ("error", "counted"),
+    [
+        # The engine replied, whatever it then committed.
+        (ApiError("refused", status=401), True),
+        (ApiError("server error", status=500), True),
+        # The engine replied and the client could not decode it; the client chains nothing.
+        (ApiError("invalid response from engine: not JSON"), True),
+        # The request was sent and the reply was late.
+        (_chained(httpx.ReadTimeout("late")), True),
+        # The request never arrived.
+        (_chained(httpx.ConnectError("refused")), False),
+        (_chained(httpx.ConnectTimeout("no route")), False),
+    ],
+)
+def test_a_failed_request_counts_only_when_it_reached_the_engine(
+    error: ApiError, counted: bool
+) -> None:
+    poller = EnginePoller("http://x", None, origin=0.0)
+
+    def call() -> None:
+        raise error
+
+    with pytest.raises(ApiError):
+        poller._counted(0, call)
+    assert poller._requests == [1 if counted else 0]
+
+
+def test_calibration_keeps_the_cheapest_pair() -> None:
+    # The engine's own idle work lands in one pair; it can only add commits, so the cheapest pair
+    # is the poller alone.
+    poller = _committing_poller(1, 2)
+    client: Any = poller._clients[0]
+    real_stats = client.stats
+    calls = 0
+
+    def stats_with_one_background_commit() -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            client.committed += 1
+        return real_stats()
+
+    client.stats = stats_with_one_background_commit
+    calibration = poller._calibrate_sync()
+    assert calibration == PollerCalibration(6, 3)

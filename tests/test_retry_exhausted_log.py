@@ -13,15 +13,19 @@ partner's reject reason can, so logging ``str(exc)`` or ``safe_exc(exc)`` would 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
-from messagefoundry.config.models import BatchConfig, ConnectorType, RetryPolicy
+from messagefoundry.config.models import (
+    BatchConfig,
+    ConnectorType,
+    InternalErrorPolicy,
+    RetryPolicy,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -30,8 +34,16 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
-from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store import (
+    FailOutcome,
+    MessageStatus,
+    MessageStore,
+    OutboxItem,
+    OutboxStatus,
+    Stage,
+)
 from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
 from tests._refusal_log_capture import TOKEN, assert_no_token, until
 
@@ -59,15 +71,20 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 
 class _Fails:
-    """A connector whose every send fails transiently, with the payload's token in the error text."""
+    """A connector whose every send fails transiently, with the payload's token in the error text.
+    ``before_raise`` runs first, so a test can change the store under the in-flight send, as a lease
+    sweep or an operator can (vault BACKLOG #3211)."""
 
-    def __init__(self, transient_nak: bool = False) -> None:
+    def __init__(self, transient_nak: bool = False, before_raise: Any = None) -> None:
         self.transient_nak = transient_nak
+        self.before_raise = before_raise
         self.calls = 0
 
     async def send(self, payload: str) -> None:
         self.calls += 1
         assert TOKEN in payload
+        if self.before_raise is not None:
+            await self.before_raise()
         if self.transient_nak:
             raise NegativeAckError(f"try later, patient {TOKEN}", code="AE", permanent=False)
         raise DeliveryError(_TRANSPORT_TEXT)
@@ -136,7 +153,7 @@ async def test_the_real_worker_logs_once_when_max_attempts_dead_letters_a_row(
     runner._destinations[OUT] = cast(DestinationConnector, dest)
     (inbox / "a.hl7").write_bytes(_adt(1).encode("utf-8"))
     try:
-        # Wait on the line, not the DEAD row: the line follows the dead-letter, after a read.
+        # Wait on the line, not the DEAD row: the line follows the dead-letter write.
         await until(lambda: len(_exhausted_lines(caplog)) == 1, "the retry-cap line")
     finally:
         await runner.stop()
@@ -153,11 +170,14 @@ async def test_the_real_worker_logs_once_when_max_attempts_dead_letters_a_row(
     _assert_no_token(caplog.records)
 
 
-def _stepped_runner(store: MessageStore, connector: object, retry: RetryPolicy) -> RegistryRunner:
+def _stepped_runner(
+    store: MessageStore, connector: object | None, retry: RetryPolicy
+) -> RegistryRunner:
     runner = RegistryRunner(
         Registry(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
-    runner._destinations[OUT] = cast(DestinationConnector, connector)
+    if connector is not None:  # None: an outbound with no running connector
+        runner._destinations[OUT] = cast(DestinationConnector, connector)
     runner._retry[OUT] = retry
     runner._simulate[OUT] = False
     return runner
@@ -250,53 +270,491 @@ def test_an_exhausted_line_does_not_share_a_window_with_a_permanent_refusal(
     assert "(4 more row(s) dead-lettered at the retry cap with this code" in (
         caplog.records[-1].getMessage()
     )
+    # The exhausted flag is a key field, not a code prefix (vault BACKLOG #3211): a peer's permanent
+    # code spelled "exhausted:AE" keeps its own window.
+    log.warning("a", NegativeAckError("x", code="exhausted:AE", permanent=True), 1, "spelled")
+    assert caplog.records[-1].getMessage().split(" (")[0] == "spelled"
 
 
-async def test_a_none_the_store_did_not_turn_into_dead_writes_nothing(
-    store: MessageStore, caplog: pytest.LogCaptureFixture
-) -> None:
-    # mark_failed returns None for a dead-lettered row, a vanished one, and (Postgres and SQL
-    # Server) a final write the H1 fence rolled back and re-pended. Only the first may log.
+def test_an_outcome_with_nothing_dead_writes_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    # The store's outcome decides the line (vault BACKLOG #3211). A re-pend, a vanished row, an
+    # empty batch and a final write the H1 fence rolled back all report nothing dead, so none logs.
     caplog.set_level(logging.WARNING, logger=LOGGER)
-    retry = RetryPolicy(max_attempts=2, **FAST)
-    runner = _stepped_runner(store, _Fails(), retry)
+    runner = _stepped_runner(cast(MessageStore, None), _Fails(), RetryPolicy(max_attempts=2))
     exc = DeliveryError("x")
-    await _enqueue(store, 1)
-    claimed = await store.claim_next_fifo(OUT, now=1e12)
-    assert claimed is not None and claimed.attempts == 1
-    at_cap = dataclasses.replace(claimed, attempts=2)  # as the store would see it on attempt 2
-    gone = dataclasses.replace(at_cap, id="gone", message_id="gone")
-
-    await runner._note_retry_exhausted(OUT, exc, retry, None, [claimed])  # below the cap
-    await runner._note_retry_exhausted(OUT, exc, retry, None, [], batch=True)  # an empty batch
-    await runner._note_retry_exhausted(OUT, exc, retry, 123.0, [at_cap])  # re-pended: no read
-    await runner._note_retry_exhausted(OUT, exc, retry, None, [gone])  # vanished at the cap
-    await runner._note_retry_exhausted(OUT, exc, retry, None, [at_cap])  # fenced: still INFLIGHT
+    for outcome in (FailOutcome(retry_at=123.0, head_id="r", attempts=1), FailOutcome()):
+        runner._note_retry_exhausted(OUT, exc, outcome, message_id="m")
+        runner._note_retry_exhausted(OUT, exc, outcome)
     assert _exhausted_lines(caplog) == []
-    await store.dead_letter_now(claimed.id, "x")
-    await runner._note_retry_exhausted(OUT, exc, retry, None, [at_cap])  # really DEAD
+    runner._note_retry_exhausted(
+        OUT, exc, FailOutcome(dead=1, head_id="r", attempts=2), message_id="m"
+    )
     (line,) = _exhausted_lines(caplog)
-    assert "unconfirmed" not in line.getMessage()
+    assert "outbox row r (message m)" in line.getMessage()
+    assert "after 2 attempt(s)" in line.getMessage()
 
 
-async def test_a_failed_status_read_still_logs_and_never_raises_out_of_the_arm(
+# --- vault BACKLOG #3211: the line follows the outcome the store returns ----------------------------
+# mark_failed and mark_batch_failed return a FailOutcome. Before, they returned float | None, and the
+# runner guessed a dead-letter from the claimed head's attempts, then read the row back. The guess and
+# the read missed real dead-letters and mislabelled others: one case per miss below.
+
+
+class _Crashes:
+    """A connector with a bug: an internal error, not a delivery failure."""
+
+    async def send(self, payload: str) -> None:
+        raise RuntimeError("bug")
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _claim(store: MessageStore) -> OutboxItem:
+    item = await store.claim_next_fifo(OUT, now=1e12)
+    assert item is not None
+    return item
+
+
+async def _status(store: MessageStore, outbox_id: str) -> str:
+    row = await store._row(outbox_id)
+    assert row is not None
+    return str(row["status"])
+
+
+async def test_the_store_contract_on_sqlite(store: MessageStore) -> None:
+    from tests._fail_outcome_contract import assert_fail_outcomes
+
+    await assert_fail_outcomes(store)
+
+
+async def test_the_line_needs_no_status_read_after_the_write(
     store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The read-back is a diagnostic: a store fault there must not escape the failure arm, which
-    # would skip the alert checks and count as an infra fault against the lane.
+    # Item 2: a failed read-back used to mark the line "unconfirmed", and a throttled line lost
+    # that note. The outcome comes from the write itself, so there is no read to fail.
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
     runner = _stepped_runner(store, _Fails(), RetryPolicy(max_attempts=1, **FAST))
     await _enqueue(store, 1)
 
     async def broken(message_id: str) -> object:
-        raise RuntimeError(f"read failed {TOKEN}")
+        raise RuntimeError("read failed")
 
     monkeypatch.setattr(store, "outbox_for", broken)
-    item = await store.claim_next_fifo(OUT, now=1e12)
-    assert item is not None
-    await runner._process_delivery_item(OUT, item)
-
-    assert await store.count_dead(allowed_channels=None) == 1
+    await runner._process_delivery_item(OUT, await _claim(store))
     (line,) = _exhausted_lines(caplog)
-    assert "unconfirmed, the status read failed (RuntimeError)" in line.getMessage()
+    assert "unconfirmed" not in line.getMessage()
     _assert_no_token(caplog.records)
+
+
+async def test_a_batch_whose_first_member_vanished_still_logs(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Item 3: the store decides from the first member still present; the runner read rows[0].
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    await _enqueue(store, 2)
+    claimed = await store.claim_ready(limit=2, now=1e12, destination_name=OUT)
+    (head,) = [i for i in claimed if i.payload == _adt(1)]
+    (second,) = [i for i in claimed if i is not head]
+
+    async def drop_head() -> None:
+        await store._db.execute("DELETE FROM queue WHERE id=?", (head.id,))
+        await store._db.commit()
+
+    runner = _stepped_runner(
+        store, _Fails(before_raise=drop_head), RetryPolicy(max_attempts=1, **FAST)
+    )
+    cfg = BatchConfig(max_count=2, max_wait_ms=1)
+    runner._batch[OUT] = cfg
+    members = [second]  # the batch loop's one further claim hands in the second member
+
+    async def next_member(name: str, **_: object) -> OutboxItem | None:
+        return members.pop() if members else None
+
+    monkeypatch.setattr(store, "claim_next_fifo", next_member)
+    await runner._process_delivery_batch(OUT, head, cfg)
+    assert await _status(store, second.id) == OutboxStatus.DEAD.value
+    (line,) = _exhausted_lines(caplog)
+    assert second.id in line.getMessage() and "a batch of 1" in line.getMessage()
+
+
+async def test_attempts_a_lease_reclaim_moved_still_log(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Item 3: the claim's attempts can be stale. Here a reclaim and a second claim spent an attempt
+    # under the in-flight send, so the store dead-letters a row the claim saw below the cap.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    await _enqueue(store, 1)
+    item = await _claim(store)
+
+    async def reclaimed() -> None:
+        await store._db.execute("UPDATE queue SET attempts=attempts+1 WHERE id=?", (item.id,))
+        await store._db.commit()
+
+    runner = _stepped_runner(
+        store, _Fails(before_raise=reclaimed), RetryPolicy(max_attempts=2, **FAST)
+    )
+    await runner._process_delivery_item(OUT, item)
+    assert await _status(store, item.id) == OutboxStatus.DEAD.value
+    (line,) = _exhausted_lines(caplog)
+    assert "after 2 attempt(s)" in line.getMessage()
+
+
+async def test_a_replay_right_after_the_dead_letter_does_not_hide_the_line(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Item 3: an operator replay between the DEAD write and the read-back made the read see PENDING.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    await _enqueue(store, 1)
+    item = await _claim(store)
+    real = store.mark_failed
+
+    async def then_replay(*args: Any, **kwargs: Any) -> Any:
+        outcome = await real(*args, **kwargs)
+        assert await store.replay_dead(audit=None) == 1
+        return outcome
+
+    monkeypatch.setattr(store, "mark_failed", then_replay)
+    runner = _stepped_runner(store, _Fails(), RetryPolicy(max_attempts=1, **FAST))
+    await runner._process_delivery_item(OUT, item)
+    assert len(_exhausted_lines(caplog)) == 1
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+async def test_an_outbound_that_never_started_logs_its_dead_letter(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, batch: bool
+) -> None:
+    # Item 4: the connector-None arms dead-lettered at the cap with no line.
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    runner = _stepped_runner(store, None, RetryPolicy(max_attempts=1, **FAST))
+    await _enqueue(store, 1)
+    item = await _claim(store)
+    if batch:
+        cfg = BatchConfig(max_count=2, max_wait_ms=1)
+        runner._batch[OUT] = cfg
+        await runner._process_delivery_batch(OUT, item, cfg)
+    else:
+        await runner._process_delivery_item(OUT, item)
+    assert await _status(store, item.id) == OutboxStatus.DEAD.value
+    (line,) = _exhausted_lines(caplog)
+    assert "no running connector" in line.getMessage() and item.id in line.getMessage()
+    assert_no_token(caplog.records)
+
+
+# What every STOP dead-letter line says, and no other line does.
+_STOP_SAID = "so the stop dead-lettered"
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize(
+    ("cap", "status"),
+    [(2, OutboxStatus.PENDING), (1, OutboxStatus.DEAD)],
+    ids=["below-cap", "at-cap"],
+)
+async def test_a_stop_that_dead_letters_at_the_cap_names_what_to_replay(
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    batch: bool,
+    cap: int,
+    status: OutboxStatus,
+) -> None:
+    # Item 5: the STOP arm's mark_failed dead-letters at a finite cap, which bounds a STOP and
+    # re-arm loop. A line says so and names what to replay; docs/USER-GUIDE.md states how. The
+    # batch is drawn from two messages, so the line has to name both.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=cap, **FAST))
+    runner._internal_error[OUT] = InternalErrorPolicy.STOP
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
+        )
+        for n in ((1, 2) if batch else (1,))
+    ]
+    dead_before = await store.count_dead(allowed_channels=None)
+    item = await _claim(store)
+    if batch:
+        cfg = BatchConfig(max_count=2, max_wait_ms=1)
+        runner._batch[OUT] = cfg
+        outcome, _ = await runner._process_delivery_batch(OUT, item, cfg)
+    else:
+        outcome, _ = await runner._process_delivery_item(OUT, item)
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    rows = [r for m in mids for r in await store.outbox_for(m)]
+    assert [r["status"] for r in rows] == [status.value] * len(mids)
+    # Positive control: the capture saw this stop's own STOPPING ERROR, so an empty `said` below
+    # means the dead-letter line was not written, not that nothing was captured.
+    assert len(caplog.records) >= 1
+    assert len([r for r in caplog.records if "STOPPING" in r.getMessage()]) == 1
+    said = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
+    if status is OutboxStatus.PENDING:
+        assert said == []  # below the cap the stop re-pends and says nothing more
+        return
+    (line,) = said
+    text = line.getMessage()
+    if batch:
+        assert f"batch row {item.id}, the first one still present, had made 1 attempt(s)" in text
+        assert "dead-lettered the batch instead of re-pending it, on that row's" in text
+        assert f"the store reports 2 row(s) from 2 message(s), {mids[0]}, {mids[1]};" in text
+        assert "each is an outbound row: replay them from the dead-letter queue" in text
+    else:
+        assert f"row {item.id} (message {mids[0]}) had made 1 attempt(s)" in text
+        assert "at or past its retry cap" in text
+        assert f"replay it from the dead-letter queue, or replay message {mids[0]}" in text
+    # Both recoveries the line names hold for an outbound row: the dead-letter queue lists it,
+    # and replaying each named message re-queues its row.
+    assert await store.count_dead(allowed_channels=None) == dead_before + len(mids)
+    for m in mids:
+        assert await store.replay(m) == 1
+    assert [r["status"] for m in mids for r in await store.outbox_for(m)] == [
+        OutboxStatus.PENDING.value
+    ] * len(mids)
+
+
+async def _ingest_row(store: MessageStore, stage: str, handlers: int) -> tuple[str, OutboxItem]:
+    """A real claimed ingress row, or a real claimed routed row, as each STOP arm meets it. With two
+    handlers the message has a sibling routed row that stays PENDING."""
+    mid = await store.enqueue_ingress(channel_id="c1", raw=_adt(1), now=100.0)
+    row = await store.claim_next_fifo("c1", now=1e12, stage=Stage.INGRESS.value)
+    assert row is not None and row.stage == Stage.INGRESS.value
+    if stage == "transform":
+        assert await store.route_handoff(
+            ingress_id=row.id,
+            message_id=mid,
+            channel_id="c1",
+            handlers=[(f"h{n}", _adt(1)) for n in range(handlers)],
+            disposition=MessageStatus.ROUTED,
+            now=101.0,
+        )
+        row = await store.claim_next_fifo("c1", now=1e12, stage=Stage.ROUTED.value)
+        assert row is not None and row.stage == Stage.ROUTED.value
+    return mid, row
+
+
+@pytest.mark.parametrize(
+    ("stage", "handlers", "cap"),
+    [
+        ("router", 1, 1),
+        ("transform", 1, 1),
+        ("transform", 2, 1),
+        ("router", 1, 2),
+        ("transform", 2, 2),
+    ],
+    ids=[
+        "router",
+        "transform",
+        "transform-two-handlers",
+        "router-below-cap",
+        "transform-below-cap",
+    ],
+)
+async def test_an_ingest_stop_that_dead_letters_at_the_cap_says_how_to_recover(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, stage: str, handlers: int, cap: int
+) -> None:
+    # Item 5, the router and transform STOP arms, which take the cap from the delivery defaults.
+    # Their dead row is an ingress or routed row, which the dead-letter queue never lists; the line
+    # says so and names the message to replay. docs/USER-GUIDE.md states the recovery once.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        egress=EgressSettings(deny_by_default=False),
+        delivery_defaults=RetryPolicy(max_attempts=cap, **FAST),
+        internal_error_default=InternalErrorPolicy.STOP,
+    )
+    mid, item = await _ingest_row(store, stage, handlers)
+    apply = (
+        runner._apply_router_internal_error
+        if stage == "router"
+        else runner._apply_transform_internal_error
+    )
+    outcome, _ = await apply("c1", item, RuntimeError("bug"))
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    # Positive control, as in the delivery test: the capture saw the stop's own STOPPING ERROR.
+    assert len(caplog.records) >= 1
+    assert len([r for r in caplog.records if "STOPPING" in r.getMessage()]) == 1
+    said = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
+    if cap == 2:
+        assert await _status(store, item.id) == OutboxStatus.PENDING.value
+        assert said == []
+        return
+    assert await _status(store, item.id) == OutboxStatus.DEAD.value
+    (line,) = said
+    text = line.getMessage()
+    assert f"{stage} worker 'c1': row {item.id} (message {mid}) had made 1 attempt(s)" in text
+    assert "the dead-letter queue lists outbound rows only, so it is not there" in text
+    assert f"replay message {mid} to re-queue it" in text
+    assert "ERROR" not in text and "replay it from the dead-letter queue" not in text
+    # Both claims hold in every shape, the two-handler one included: the view does not list the
+    # row, and replaying the message re-queues it (with any sibling still PENDING).
+    assert await store.count_dead(allowed_channels=None) == 0
+    assert await store.replay(mid) == handlers
+    assert await _status(store, item.id) == OutboxStatus.PENDING.value
+
+
+async def test_a_store_read_fault_on_a_vanished_row_does_not_claim_a_dead_letter(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Item 5: _note_store_read_fault read any None as "dead-lettered at the cap".
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Fails(), RetryPolicy(max_attempts=1, **FAST))
+    await _enqueue(store, 1)
+    item = await _claim(store)
+
+    async def fault(payload: str) -> str:
+        await store._db.execute("DELETE FROM queue WHERE id=?", (item.id,))
+        await store._db.commit()
+        raise wiring_runner._StoreReadFault("attachment read failed")
+
+    monkeypatch.setattr(runner, "_hydrate_payload", fault)
+    await runner._process_delivery_item(OUT, item)
+    (line,) = [r for r in caplog.records if "before sending" in r.getMessage()]
+    assert "dead-lettered" not in line.getMessage()
+    assert "no retry scheduled" in line.getMessage()
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+async def test_a_store_read_fault_that_reaches_the_cap_writes_the_retry_cap_line(
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    batch: bool,
+) -> None:
+    # The store-read-fault arm's own line goes through a FailureRun, whose backoff drops most passes
+    # of a long run. A dead-letter there also writes the throttled retry-cap line.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Fails(), RetryPolicy(max_attempts=1, **FAST))
+    await _enqueue(store, 1)
+    item = await _claim(store)
+
+    async def fault(payload: str) -> str:
+        raise wiring_runner._StoreReadFault("attachment read failed")
+
+    monkeypatch.setattr(runner, "_hydrate_payload", fault)
+    if batch:
+        cfg = BatchConfig(max_count=2, max_wait_ms=1)
+        runner._batch[OUT] = cfg
+        await runner._process_delivery_batch(OUT, item, cfg)
+    else:
+        await runner._process_delivery_item(OUT, item)
+    assert await _status(store, item.id) == OutboxStatus.DEAD.value
+    (line,) = _exhausted_lines(caplog)
+    assert "hit a store read fault" in line.getMessage() and item.id in line.getMessage()
+
+
+def test_held_reports_the_rows_a_pair_holds() -> None:
+    # Item 7: the tests read the held count through a public method, not the private table.
+    log = _RefusalLog(window=60.0, clock=lambda: 0.0)
+    refusal = NegativeAckError("x", code="AR", permanent=True)
+    log.warning("a", refusal, 1, "refused")
+    log.warning("a", refusal, 3, "refused")
+    log.warning("a", refusal, 2, "ran out", exhausted=True)
+    log.warning("a", refusal, 4, "ran out", exhausted=True)
+    assert log.held("a", "AR") == 3
+    assert log.held("a", "AR", exhausted=True) == 4
+    assert log.held("b", "AR") == 0
+
+
+async def test_a_stop_on_a_batch_dead_letters_members_below_the_cap(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # mark_batch_failed decides from the first member still present. Here that member is past the
+    # cap and the second is below it: both are dead-lettered, and the line says so.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=2, **FAST))
+    runner._internal_error[OUT] = InternalErrorPolicy.STOP
+    cfg = BatchConfig(max_count=2, max_wait_ms=1)
+    runner._batch[OUT] = cfg
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
+        )
+        for n in (1, 2)
+    ]
+    (first,) = await store.outbox_for(mids[0])
+    await store._db.execute("UPDATE queue SET attempts=5 WHERE id=?", (first["id"],))
+    await store._db.commit()
+    head = await _claim(store)
+    assert head.id == first["id"] and head.attempts == 6
+    outcome, _ = await runner._process_delivery_batch(OUT, head, cfg)
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    rows = [r for m in mids for r in await store.outbox_for(m)]
+    assert [(r["status"], r["attempts"]) for r in rows] == [
+        (OutboxStatus.DEAD.value, 6),
+        (OutboxStatus.DEAD.value, 1),  # one attempt, below the cap of 2, and dead all the same
+    ]
+    (line,) = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
+    text = line.getMessage()
+    assert f"batch row {head.id}, the first one still present, had made 6 attempt(s)" in text
+    assert "on that row's attempts alone; the store reports 2 row(s)" in text
+
+
+async def test_a_stop_on_a_batch_neither_counts_nor_names_a_vanished_member(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The line counts and names what the store wrote, not the rows the arm handed it.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    runner = _stepped_runner(store, _Crashes(), RetryPolicy(max_attempts=1, **FAST))
+    runner._internal_error[OUT] = InternalErrorPolicy.STOP
+    cfg = BatchConfig(max_count=3, max_wait_ms=1)
+    runner._batch[OUT] = cfg
+    mids = [
+        await store.enqueue_message(
+            channel_id="c1", raw=_adt(n), deliveries=[(OUT, _adt(n))], now=100.0 + n
+        )
+        for n in (1, 2, 3)
+    ]
+    real = store.mark_batch_failed
+
+    async def vanish_then_fail(ids: list[str], error: str, retry: RetryPolicy) -> FailOutcome:
+        assert len(ids) == 3
+        await store._db.execute("DELETE FROM queue WHERE id=?", (ids[2],))
+        await store._db.commit()
+        return await real(ids, error, retry)
+
+    monkeypatch.setattr(store, "mark_batch_failed", vanish_then_fail)
+    outcome, _ = await runner._process_delivery_batch(OUT, await _claim(store), cfg)
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    (line,) = [r for r in caplog.records if _STOP_SAID in r.getMessage()]
+    text = line.getMessage()
+    assert f"the store reports 2 row(s) from 2 message(s), {mids[0]}, {mids[1]};" in text
+    assert mids[2] not in text
+
+
+def test_a_stop_line_names_the_first_ten_messages_and_counts_them_all(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Item 7: the overflow branch. Twelve messages: the line counts twelve and names ten.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    messages = tuple(f"msg-{n:02d}" for n in range(12))
+    failed = FailOutcome(dead=12, head_id="row-0", attempts=3, dead_messages=messages)
+    wiring_runner._note_stop_dead_letter("delivery worker", OUT, failed, Stage.OUTBOUND.value)
+    (line,) = caplog.records
+    text = line.getMessage()
+    assert "12 row(s) from 12 message(s), the first 10: " + ", ".join(messages[:10]) + ";" in text
+    assert "msg-10" not in text and "msg-11" not in text
+    assert "each is an outbound row: replay them from the dead-letter queue" in text
+
+
+def test_a_stop_line_for_several_rows_takes_its_recovery_from_the_stage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Item 7: the batch branch reads the stage it is handed, not a hardcoded outbound text. A batch
+    # is outbound-only today; this pins that a non-outbound stage never points at the dead-letter
+    # queue.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    failed = FailOutcome(dead=2, head_id="row-0", attempts=1, dead_messages=("m1", "m2"))
+    wiring_runner._note_stop_dead_letter("transform worker", "c1", failed, Stage.ROUTED.value)
+    (line,) = caplog.records
+    text = line.getMessage()
+    assert "the dead-letter queue lists outbound rows only, so they are not there" in text
+    assert "replay each message to re-queue them" in text
+    assert "each is an outbound row" not in text
+
+
+def test_a_stop_line_writes_nothing_when_nothing_was_dead_lettered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    for failed in (FailOutcome(retry_at=5.0, head_id="r", attempts=1), FailOutcome()):
+        wiring_runner._note_stop_dead_letter("delivery worker", OUT, failed, Stage.OUTBOUND.value)
+    assert caplog.records == []

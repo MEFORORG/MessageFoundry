@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from messagefoundry.config.models import RetryPolicy
-from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_POSTGRES"),
@@ -261,7 +261,9 @@ async def test_mark_failed_dead_branch_fenced_retry_branch_lands(store) -> None:
     await _superseded(store)
 
     # Row A: retries exhausted → the DEAD branch → fenced.
-    assert await store.mark_failed(claimed_a.id, "boom", RetryPolicy(max_attempts=1)) is None
+    assert (
+        await store.mark_failed(claimed_a.id, "boom", RetryPolicy(max_attempts=1))
+    ) == FailOutcome()
     assert (await store.outbox_for(mid_a))[0]["status"] == OutboxStatus.PENDING.value
     assert store.fenced_writes == 1
 
@@ -275,7 +277,9 @@ async def test_mark_failed_dead_branch_fenced_retry_branch_lands(store) -> None:
     assert claimed_b is not None
     await _superseded(store, 7)  # superseded again, mid-flight
 
-    next_at = await store.mark_failed(claimed_b.id, "transient", RetryPolicy(max_attempts=None))
+    next_at = (
+        await store.mark_failed(claimed_b.id, "transient", RetryPolicy(max_attempts=None))
+    ).retry_at
     assert isinstance(next_at, float)  # rescheduled, not dead-lettered
     assert (await store.outbox_for(mid_b))[0]["status"] == OutboxStatus.PENDING.value
     assert store.fenced_writes == 1  # UNCHANGED — the retry branch is never fenced
@@ -298,7 +302,7 @@ async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(s
     await store.mark_done(claimed.id)
     store.set_leader_epoch(5, lease_key=_LEASE_KEY)  # back to the stale ex-leader
 
-    next_at = await store.mark_failed(claimed.id, "late", RetryPolicy(max_attempts=None))
+    next_at = (await store.mark_failed(claimed.id, "late", RetryPolicy(max_attempts=None))).retry_at
 
     assert isinstance(next_at, float)
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
@@ -314,7 +318,10 @@ async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(s
     b = await _claim_one(store, "OB3")
     await store.mark_done(a.id)
     assert isinstance(
-        await store.mark_batch_failed([a.id, b.id], "late", RetryPolicy(max_attempts=None)), float
+        (
+            await store.mark_batch_failed([a.id, b.id], "late", RetryPolicy(max_attempts=None))
+        ).retry_at,
+        float,
     )
     statuses = {r["destination_name"]: r["status"] for r in await store.outbox_for(mid2)}
     assert statuses == {"OB2": OutboxStatus.DONE.value, "OB3": OutboxStatus.PENDING.value}
@@ -336,7 +343,7 @@ async def test_a_retry_after_the_lease_sweep_keeps_its_backoff_event_and_error(s
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.PENDING.value  # premise
 
     retry = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=1)
-    next_at = await store.mark_failed(claimed.id, "late", retry, now=swept_at + 1)
+    next_at = (await store.mark_failed(claimed.id, "late", retry, now=swept_at + 1)).retry_at
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value

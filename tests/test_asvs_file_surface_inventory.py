@@ -87,7 +87,11 @@ from messagefoundry.transports.base import _SOURCES, DEFAULT_MAX_ITEMS_PER_POLL
 from messagefoundry.transports.bounded_read import DEFAULT_MAX_RESPONSE_BYTES
 from messagefoundry.transports.database import DEFAULT_DB_LOOKUP_MAX_ROWS
 from messagefoundry.transports.dicom import DEFAULT_MAX_OBJECT_BYTES
-from messagefoundry.transports.file import DEFAULT_MAX_DECOMPRESSED_BYTES, DEFAULT_MAX_FILE_BYTES
+from messagefoundry.transports.file import (
+    DEFAULT_MAX_DECOMPRESSED_BYTES,
+    DEFAULT_MAX_DECOMPRESSED_MEMBERS,
+    DEFAULT_MAX_FILE_BYTES,
+)
 from messagefoundry.transports.http_listener import DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_HEADER_BYTES
 from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES
 from messagefoundry.uploads import _ALLOWED_UPLOAD_EXTENSIONS
@@ -1224,6 +1228,7 @@ def test_receiver_figures_match_their_constants() -> None:
     # The factory signatures quote the same numbers as literals; pin that they still agree.
     assert _sig_default(wiring.File, "max_file_bytes") == DEFAULT_MAX_FILE_BYTES
     assert _sig_default(wiring.File, "max_decompressed_bytes") == DEFAULT_MAX_DECOMPRESSED_BYTES
+    assert _sig_default(wiring.File, "max_decompressed_members") == DEFAULT_MAX_DECOMPRESSED_MEMBERS
     assert _sig_default(wiring.Http, "max_body_bytes") == DEFAULT_MAX_BODY_BYTES
     assert _sig_default(wiring.Http, "max_header_bytes") == DEFAULT_MAX_HEADER_BYTES
     assert _sig_default(wiring.DICOM, "max_object_bytes") == DEFAULT_MAX_OBJECT_BYTES
@@ -1240,6 +1245,7 @@ def test_receiver_figures_match_their_constants() -> None:
         "file": [
             f"DEFAULT_MAX_FILE_BYTES` = {_size(DEFAULT_MAX_FILE_BYTES)}",
             f"DEFAULT_MAX_DECOMPRESSED_BYTES` = {_size(DEFAULT_MAX_DECOMPRESSED_BYTES)}",
+            f"DEFAULT_MAX_DECOMPRESSED_MEMBERS` = {DEFAULT_MAX_DECOMPRESSED_MEMBERS:,}",
             f"`{_sig_default(wiring.File, 'pattern')}`",
         ],
         "remotefile": [
@@ -1317,6 +1323,7 @@ def test_download_figures_match_the_routes(app_routes: dict[tuple[str, str], obj
 QUOTED_CONSTANTS: dict[str, int] = {
     "DEFAULT_MAX_FILE_BYTES": DEFAULT_MAX_FILE_BYTES,
     "DEFAULT_MAX_DECOMPRESSED_BYTES": DEFAULT_MAX_DECOMPRESSED_BYTES,
+    "DEFAULT_MAX_DECOMPRESSED_MEMBERS": DEFAULT_MAX_DECOMPRESSED_MEMBERS,
     "DEFAULT_MAX_OBJECT_BYTES": DEFAULT_MAX_OBJECT_BYTES,
     "DEFAULT_MAX_INFLATED_BYTES": DEFAULT_MAX_INFLATED_BYTES,
     "DEFAULT_MAX_BODY_BYTES": DEFAULT_MAX_BODY_BYTES,
