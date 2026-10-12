@@ -2378,10 +2378,12 @@ def phi_read_hop_disposition(
 # (MLLP-over-TLS, REST/SOAP/FHIR https, the asyncpg store hop): the chain is validated (+ strict RFC
 # 5280 via harden_verify_flags) but a REVOKED-but-unexpired peer cert is still accepted — Python's ssl
 # has no OCSP/CRL fetch and the engine deliberately attempts none (offline-by-default, CLAUDE.md §2).
-# So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction /
-# `messagefoundry check` / dry-run unless revocation is proven in front (a revocation-checking egress
-# terminator) or the operator attests a revocation-checking PKI — per-connection `tls_revocation_attested`
-# or the blanket `MEFOR_TLS_REVOCATION_ATTESTED` env (the same opt-out ADR 0078 gave the listener).
+# So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction
+# (`messagefoundry check`, dry-run, reload, and the live build when `serve` starts) unless the hop's
+# own context checks a CRL or the operator attests a revocation-checking PKI for that connection with
+# `tls_revocation_attested`. A loopback hop is never refused. The blanket
+# `MEFOR_TLS_REVOCATION_ATTESTED` env (ADR 0078's listener opt-out) crosses only a non-enforcing
+# instance (BACKLOG #299).
 #
 # COMPOSES with #200 (ADR 0092): #200 refuses the CLEARTEXT / verify-off hop, so revocation only matters
 # on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse the same hop.
@@ -2412,6 +2414,7 @@ def revocation_hop_disposition(
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
     #. ``proxy_proven`` → :attr:`~HopDisposition.ALLOW` — revocation is *proven in front* by a declared
        revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
+       **Unreachable today:** no call site sets it, so no refusal offers it (BACKLOG #2987).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2471,10 +2474,13 @@ CREDENTIAL_HOP_WAYS_ACROSS = (
 #: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many
 #: hops consume it: that is the hardened-count liability SDS-3.6 names, and this very change moved
 #: four documents off such a count. Find the consumers by symbol.
+#:
+#: It offered a third lever until BACKLOG #2987 (#2977 item 9): terminate at a revocation-checking
+#: egress proxy. No call site sets ``proxy_proven``, so routing egress through such a proxy never
+#: changed the decision, and the refusal named a remedy the operator could not perform (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
-    "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
-    "revocation-checking egress proxy, or set tls_revocation_attested=true with a "
-    "tls_revocation_attested_reason on this connection."
+    "Configure [tls].crl_file so the engine checks a CRL on this hop, or set "
+    "tls_revocation_attested=true with a tls_revocation_attested_reason on this connection."
 )
 
 
@@ -2484,14 +2490,15 @@ class RevocationHopGuard:
 
     The revocation twin of the transports' cleartext :class:`InsecureHopGuard`. Built once at connector
     construction via :meth:`capture`, which snapshots the active hop posture
-    (:func:`current_hop_posture`) and folds the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env into the
-    per-connection attestation. :meth:`enforce_construction` is the ENFORCED gate — it fires inside
-    ``build_check`` (``messagefoundry check`` / dry-run / reload / the serve pre-flight), where the derived
-    posture IS stamped, and refuses a production-PHI verified-but-unrevoked hop off-loopback there. It
-    **no-ops when the posture is unstamped** (``None`` — a live serve build after the pre-flight, or a
-    direct test/embedding): the enforced gate has already validated the config, so re-refusing here would
-    wrongly break every live serve of a legitimately-attested / non-prod lane (identical semantics to the
-    cleartext :class:`InsecureHopGuard`)."""
+    (:func:`current_hop_posture`) and reads the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env into its
+    own field, apart from the per-connection attestation (BACKLOG #299).
+    :meth:`enforce_construction` is the ENFORCED gate. It fires wherever
+    the derived posture is stamped, and refuses a production-PHI verified-but-unrevoked hop
+    off-loopback there: inside ``build_check`` (``messagefoundry check`` / dry-run / reload), and in
+    the runner's live builds when ``serve`` starts the graph, which stamp the same posture. So a first
+    ``serve`` start refuses a hop at its own build (measured for BACKLOG #2193; ``docs/CONNECTIONS.md``
+    says what each refusal stops). It **no-ops when the posture is unstamped** (``None``, such as a
+    direct test build or an embedding that stamps none)."""
 
     host: str
     cell: str
@@ -2507,9 +2514,9 @@ class RevocationHopGuard:
     #: context in :meth:`capture`, never from a global setting.
     crl_checked: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
-    #: (BACKLOG #1498). The default names ``[tls].crl_file``, an egress terminator and a
-    #: connection's ``tls_revocation_attested`` — **all three are inapplicable to the non-connection
-    #: hops that pass this field**. The ones that do (at least the IdP, the syslog forwarder and the
+    #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
+    #: ``tls_revocation_attested`` — **both are inapplicable to the non-connection hops that pass
+    #: this field**. The ones that do (at least the IdP, the syslog forwarder and the
     #: store) each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
     #: never reaches their contexts, and there is no connection to carry the flag; check any new one
     #: before relying on this. Telling such an operator to set one of them is a refusal whose remedy
@@ -2614,7 +2621,8 @@ class RevocationHopGuard:
     def enforce_construction(self) -> None:
         """The ENFORCED construction gate: raise :class:`InsecureHopRefused` on a production-PHI
         verified-but-unrevoked hop off-loopback, loud-log (+audit the attestation) on a warned hop, allow
-        the rest. No-op when the posture is unstamped (``None``) — the build_check gate is the authority."""
+        the rest. No-op when the posture is unstamped (``None``); see the class docstring for where
+        it is stamped."""
         posture = self.posture
         if posture is None:
             return

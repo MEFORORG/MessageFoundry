@@ -1640,6 +1640,8 @@ class FhirLookupExecutor:
                     revocation_attested_reason=rev_reason,
                     opener=self._opener[cname],
                     connection=label,
+                    description="sends read requests over verified https, with no certificate "
+                    "revocation checking,",
                 )
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
