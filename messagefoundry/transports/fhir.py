@@ -697,7 +697,7 @@ class FhirDestination(DestinationConnector):
             self._opener = _insecure_opener(*proxy_handlers)
         # #65: HTTP Digest — fold the challenge-answering handler into a per-connection opener (never the
         # shared one). None (default) → byte-identical. Mutually exclusive with a bearer provider.
-        from messagefoundry.transports.http_auth import HttpAuthError, digest_handler_from_settings
+        from messagefoundry.transports.http_auth import digest_handler_from_settings
 
         digest = digest_handler_from_settings(s, url=self.base_url)
         if digest is not None:
@@ -979,7 +979,8 @@ class FhirDestination(DestinationConnector):
         # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
         # a None guard (secure/loopback base) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send_url(self.base_url)
+            # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
+            self._hop_guard.assert_delivery_url(self.base_url, connector="FHIR")
         data = encode_wire_body(payload, self.encoding, transport="FHIR")
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:

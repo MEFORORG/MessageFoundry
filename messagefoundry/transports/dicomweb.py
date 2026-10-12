@@ -459,7 +459,8 @@ class DicomWebDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send_url(self.base_url)
+            # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
+            self._hop_guard.assert_delivery_url(self.base_url, connector="DICOMweb")
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,

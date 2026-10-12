@@ -474,7 +474,6 @@ class SoapDestination(DestinationConnector):
         # SMART is FHIR/REST-only) injected per-request in _post, OR HTTP Digest folded into the opener.
         # Both None (default) → byte-identical. Mutually exclusive with each other.
         from messagefoundry.transports.http_auth import (
-            HttpAuthError,
             bearer_provider_from_settings,
             digest_handler_from_settings,
         )
@@ -859,7 +858,8 @@ class SoapDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send_url(self.url)
+            # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
+            self._hop_guard.assert_delivery_url(self.url, connector="SOAP")
         # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")

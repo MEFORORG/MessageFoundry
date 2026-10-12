@@ -35,7 +35,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.base import DestinationConnector
+from messagefoundry.transports.base import DestinationConnector, NegativeAckError
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import (
     InsecureHopGuard,
@@ -593,6 +593,9 @@ async def test_rest_send_time_assertion_blocks_before_wire(
     dest._hop_guard = InsecureHopGuard(  # type: ignore[attr-defined]
         posture=_PROD, attested=False, cell="HTTP cleartext egress", cleartext_accepted=False
     )
-    with pytest.raises(InsecureHopRefused):
+    # BACKLOG #2989: classified as a configuration fault, with the refusal on the cause.
+    with pytest.raises(NegativeAckError) as refused:
         await dest.send("payload")  # send-time refusal, before any I/O
+    assert refused.value.code == "insecure-hop-refused"
+    assert isinstance(refused.value.__cause__, InsecureHopRefused)
     assert opener.calls == 1  # the opener was NOT called on the refused send

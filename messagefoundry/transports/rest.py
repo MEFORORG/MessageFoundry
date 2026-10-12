@@ -308,6 +308,9 @@ class HttpAuthError(ValueError):
 #: ``NegativeAckError.code`` of a send refused by :func:`auth_challenge_refused`.
 AUTH_CHALLENGE_REFUSED_CODE = "auth-challenge-refused"
 
+#: ``NegativeAckError.code`` of a send refused by :meth:`InsecureHopGuard.assert_delivery_url`.
+INSECURE_HOP_REFUSED_CODE = "insecure-hop-refused"
+
 #: The FIXED text the destination and ``FhirLookup`` arms report for a wire-time
 #: :class:`HttpAuthError`, after their own hop label. ``HttpAuthError``'s message quotes the peer's
 #: algorithm token and scheme word, so it stays on the cause and never reaches ``queue.last_error``
@@ -739,6 +742,29 @@ class InsecureHopGuard:
             host = ""
         # _redact_url splits the URL again, so it is skipped for a URL that would not split.
         self.assert_send(host, _redact_url(url) if host else "")
+
+    def assert_delivery_url(self, url: str, *, connector: str) -> None:
+        """:meth:`assert_send_url` for a delivery, with the refusal classified (BACKLOG #2989).
+
+        The HTTP-family ``_post`` methods call it first, before a bearer is minted or a byte
+        crosses. They once called :meth:`assert_send_url` outside every ``try``, so the raw
+        :class:`InsecureHopRefused`, a ``ValueError``, left the send unclassified, and the delivery
+        worker filed it as an internal error. :func:`assert_probe_hop` is the probe's twin.
+
+        A permanent configuration fault, as :func:`auth_challenge_refused` is. The guard keys on the
+        connection's own URL and the posture captured when it was built, so every queued row would
+        meet the same refusal until an operator changes the connection and reloads. Under the
+        default ``credential_fault_policy`` the lane stops and the queue stays. The text names the
+        connection, the cell, the host and the redacted URL, and no message content."""
+        try:
+            self.assert_send_url(url)
+        except InsecureHopRefused as exc:
+            raise NegativeAckError(
+                f"{connector} send refused: {exc}",
+                code=INSECURE_HOP_REFUSED_CODE,
+                permanent=True,
+                config_fault=True,
+            ) from exc
 
 
 def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str) -> None:
@@ -1417,7 +1443,8 @@ _APPROVED_DIGEST_ALGORITHM = "SHA-256"
 
 
 class _ApprovedDigestMixin(urllib.request.AbstractDigestAuthHandler):
-    """Refuses a Digest challenge naming any algorithm but SHA-256, instead of answering it.
+    """Refuses a Digest challenge naming any algorithm but SHA-256, instead of answering it. Also
+    refuses one with no realm or nonce, or whose ``qop`` does not offer ``auth`` (BACKLOG #2989).
 
     Shared by the origin handler and the proxy handler so the two cannot drift: before this, the
     proxy path used urllib's bare ``ProxyDigestAuthHandler``, which runs no such check.
@@ -1448,6 +1475,28 @@ class _ApprovedDigestMixin(urllib.request.AbstractDigestAuthHandler):
         # RFC 7616's ABNF literals are case-insensitive but urllib matches the name exactly, so hand it
         # the canonical spelling rather than let a lowercase ``sha-256`` reach its bare ValueError.
         params["algorithm"] = _APPROVED_DIGEST_ALGORITHM
+        # BACKLOG #2989. urllib answers nothing when either is missing: it returns None on the
+        # KeyError, and the challenge then reads as a plain 401 or 407, which looks like bad
+        # credentials. Neither can be answered, so it is the same refusal as a bad algorithm.
+        missing = [name for name in ("realm", "nonce") if name not in params]
+        if missing:
+            raise HttpAuthError(
+                f"the {self._digest_peer}'s HTTP Digest challenge names no {' or '.join(missing)}, "
+                "so it cannot be answered (BACKLOG #2989)."
+            )
+        qop = params.get("qop")
+        if qop is not None:
+            # urllib splits on a bare comma and matches case-sensitively, then raises a URLError for
+            # anything but "auth". So "auth-int, auth" (legal, with a space) and "auth-int" alone
+            # read as an unreachable host and were retried. Offer urllib "auth" alone when the peer
+            # lists it, and refuse otherwise: urllib cannot compute "auth-int".
+            offered = {token.strip().lower() for token in str(qop).split(",")}
+            if "auth" not in offered:
+                raise HttpAuthError(
+                    f"the {self._digest_peer}'s HTTP Digest challenge offers qop {str(qop)[:64]!r}, "
+                    "and the engine answers only qop 'auth' (BACKLOG #2989)."
+                )
+            params["qop"] = "auth"
         return super().get_authorization(req, params)
 
     def http_error_auth_reqed(
@@ -1511,6 +1560,21 @@ class _ApprovedProxyDigestAuthHandler(_ApprovedDigestMixin, urllib.request.Proxy
     """urllib's reactive proxy Digest handler, answering the proxy's 407 with SHA-256 or refusing it."""
 
     _digest_peer = "web proxy"
+
+    def http_error_auth_reqed(
+        self,
+        auth_header: str,
+        host: str,
+        req: urllib.request.Request,
+        headers: http.client.HTTPMessage,
+    ) -> Any:
+        # BACKLOG #2989: the same gate as get_authorization below, placed before the challenge is
+        # screened. A 407 on a request that went direct did not come from the proxy, so whatever
+        # it asks for (NTLM, MD5) is not this handler's to refuse. Returning None lets urllib
+        # raise the 407 as the HTTPError it is.
+        if not req.has_proxy():
+            return None
+        return super().http_error_auth_reqed(auth_header, host, req, headers)
 
     def get_authorization(self, req: urllib.request.Request, chal: Mapping[str, str]) -> str | None:
         # Answer only a 407 on a request that went THROUGH the proxy. ProxyHandler sends a request
@@ -2094,7 +2158,7 @@ class RestDestination(DestinationConnector):
         # #65: HTTP Digest (RFC 7616) — fold the challenge-answering handler into a PER-CONNECTION opener
         # (never mutate the shared _NO_REDIRECT_OPENER). urllib answers the 401 + retries within
         # opener.open(). None (default) → byte-identical. Mutually exclusive with a bearer provider.
-        from messagefoundry.transports.http_auth import HttpAuthError, digest_handler_from_settings
+        from messagefoundry.transports.http_auth import digest_handler_from_settings
 
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
@@ -2273,7 +2337,8 @@ class RestDestination(DestinationConnector):
         # a single byte crosses — defense against a reload / per-message target sneaking PHI past the
         # construction-only gate. A None guard (secure/loopback hop) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send_url(self.url)
+            # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
+            self._hop_guard.assert_delivery_url(self.url, connector="REST")
         data = encode_wire_body(payload, self.encoding, transport="REST")
         headers = self._headers
         if dynamic_headers or self._token_provider is not None or self._signer is not None:
