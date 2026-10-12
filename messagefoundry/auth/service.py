@@ -54,6 +54,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, S
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
+    KerberosTokenRefused,
     LdapAuthenticator,
     LdapError,
     LdapReferralError,
@@ -3953,7 +3954,27 @@ class AuthService:
                 )
                 return LoginOutcome(ok=False, error="SSO authentication failed")
             principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
+        except KerberosTokenRefused as exc:
+            # BACKLOG #3196: a refused token is a failed sign-in, not a directory outage, so it is
+            # audited as `auth.login_failed` beside the other refusals. Only a closed reason and the
+            # exception's type are stored: its message can quote the token, which the caller wrote.
+            await self._audit(
+                "auth.login_failed",
+                actor="<kerberos>",
+                detail=_json(
+                    {
+                        "provider": "ad",
+                        "mech": "kerberos",
+                        "reason": "token_refused",
+                        "error": exc.error_type,
+                    }
+                ),
+                client=client,
+            )
+            return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:
+            # Reached from settings or from the directory, never from the token: the token's own
+            # failures are the arm above, so this text is the engine's or the directory's.
             await self._audit(
                 "auth.login_error",
                 actor="<kerberos>",

@@ -95,6 +95,20 @@ class LdapError(RuntimeError):
     """LDAP/Kerberos configuration or connectivity failure (distinct from rejected credentials)."""
 
 
+class KerberosTokenRefused(Exception):
+    """The SPNEGO acceptor refused the client's token (BACKLOG #3186, #3196).
+
+    Not an :class:`LdapError`: the directory was never asked, and the caller audits it as a refused
+    sign-in, not an outage. ``error_type`` is the refusing exception's class name: a builtin or one
+    pyspnego defines, never chosen by the token. Its message is dropped, because it can quote the
+    token.
+    """
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(f"SPNEGO token refused: {error_type}")
+        self.error_type = error_type
+
+
 class LdapReferralError(LdapError):
     """The directory answered with a referral, which the engine never follows (BACKLOG #2530).
 
@@ -1456,11 +1470,18 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     ``None`` unless :func:`_kerberos_context_complete` says the context finished (BACKLOG #2610
     review point c), so no provider can hand back a principal from a half-done exchange. That is
     defence in depth: no such provider is known.
+
+    Raises :class:`KerberosTokenRefused` when the acceptor refuses the token, and
+    :class:`LdapError` when the acceptor cannot be built from settings.
     """
     import spnego
 
     try:
         server = _kerberos_acceptor(settings)
+    except (spnego.exceptions.SpnegoError, ValueError) as exc:
+        # Building the acceptor reads settings only, never the token: a configuration fault.
+        raise LdapError(str(exc)) from exc
+    try:
         server.step(token)
         principal = server.client_principal if _kerberos_context_complete(server) else None
     except (
@@ -1473,10 +1494,11 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
         # SpnegoError is the SSPI/GSSAPI (Windows/Linux-krb5) rejection; the pure-Python provider
         # instead raises a bare ValueError/struct.error while parsing an untrusted token, and
         # StopIteration or KeyError on a first NegTokenResp, which names a mechanism it never set up
-        # (BACKLOG #3186). Each is a failed SSO attempt — map to LdapError so authenticate_kerberos
-        # audits an `auth.login_error` reject (AUTH-K-AUDIT) rather than escaping to an unaudited
-        # 500. A StopIteration must not reach asyncio.to_thread at all: a Future refuses it.
-        raise LdapError(str(exc)) from exc
+        # (BACKLOG #3186). Each is a refused token, so authenticate_kerberos audits it (AUTH-K-AUDIT)
+        # rather than letting it escape as an unaudited 500. A StopIteration must not reach
+        # asyncio.to_thread at all: a Future refuses it. Only the TYPE crosses: the message can
+        # quote the token, such as an unknown mechanism OID the attacker chose (BACKLOG #3196).
+        raise KerberosTokenRefused(type(exc).__name__) from exc
     if not principal:
         return None
     return str(principal).split("@", 1)[0]

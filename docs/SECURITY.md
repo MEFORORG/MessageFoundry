@@ -3506,9 +3506,11 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   endpoint performs one SPNEGO step and does not return a `WWW-Authenticate` continuation token, so
   there is no mutual authentication and no NTLM-fallback / multi-leg exchange (those fail to
   authenticate). Every reject inside the acceptor (`authenticate_kerberos`) is audited
-  (AUTH-K-AUDIT). The route's own refusals before it are not: a 400 for a missing or malformed
-  `Negotiate` header writes no audit row, and a 429 from the sign-in window is throttle-logged,
-  never audited.
+  (AUTH-K-AUDIT). A token the acceptor refuses is an `auth.login_failed` row with the reason
+  `token_refused` and the error's type, never its message, which can quote the token (BACKLOG
+  #3196). Of the route's own refusals before it, a 400 for a token that is not base64 writes the
+  `malformed_token` row `GET /ui/sso` writes. A 400 for a missing `Negotiate` header writes no
+  row, and a 429 from the sign-in window is throttle-logged, never audited.
   **Browser SSO (L5c, ADR 0068 §9):** `GET /ui/sso` adds the RFC 4559 browser flow over the same
   single-leg acceptor — a 401 + `WWW-Authenticate: Negotiate` challenge (deliberately
   unthrottled; the token-bearing leg is rate-limited **first** — an exhausted limiter is
