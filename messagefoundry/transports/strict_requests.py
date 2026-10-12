@@ -260,16 +260,22 @@ def _narrowed_pool_classes(
             ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
             and terminal conditions, and pins them on each platform CI runs.
 
-            **A CA directory is NOT measured, and it is not refused.** ``ca_cert_dir`` reaches
+            **A CA directory is not refused, because it cannot wait.** ``ca_cert_dir`` reaches
             OpenSSL as ``capath``. OpenSSL reads a directory's files when it verifies a peer, not
-            when the directory is named, and whether an encrypted block in one of them can prompt
-            during a handshake has not been measured on any platform. A directory does reach both
-            loads today. With neither ``MEFOR_STORE_VAULT_CA_FILE`` nor
+            when the directory is named, so no check before the load could cover one. So it was
+            measured with a real handshake (2026-10-12), on CPython 3.14.6 / OpenSSL 3.5.7 on
+            Windows and, off-version, on CPython 3.12.3 / OpenSSL 3.0.13 on Linux. A directory
+            file holding an encrypted ``CERTIFICATE`` or ``X509 CRL`` block, under the name
+            OpenSSL looks up, wrote no prompt and never waited, in every terminal condition
+            tried, a pseudo-terminal among them. The handshake refused the peer at once with a
+            verification error, so the hop fails closed. ``tests/test_encrypted_pem_capath_pin.py``
+            holds that table and its controls, and pins it on each platform CI runs. A directory
+            does reach both loads today. With neither ``MEFOR_STORE_VAULT_CA_FILE`` nor
             ``MEFOR_SECRETS_VAULT_CA_FILE`` set, hvac and requests choose the CA. At least two
             routes can name a directory: hvac's ``VAULT_CAPATH``, used when ``VAULT_CACERT`` is not
             set, and requests' ``REQUESTS_CA_BUNDLE`` or ``CURL_CA_BUNDLE``. requests passes a
-            directory on as ``ca_cert_dir``. So a refusal here would break a hop that works, and
-            the directory is loaded as before."""
+            directory on as ``ca_cert_dir``. A refusal here would break a hop that works and stop
+            nothing that was seen to wait, so the directory is loaded as before."""
             if isinstance(self.ca_cert_data, str) and _has_encryption_header(self.ca_cert_data):
                 # Fixed text: it names no part of the CA text it refuses.
                 raise InsecureHopRefused(

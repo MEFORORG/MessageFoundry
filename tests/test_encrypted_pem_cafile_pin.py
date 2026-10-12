@@ -35,7 +35,8 @@ CPython 3.12.3 / OpenSSL    conditions (pty, and no terminal with       3: still
 On both, an encrypted private-key block beside a plain certificate loaded the certificate through
 a path at once, with no prompt, and a plain certificate loaded both ways. The Linux reading is
 OFF-VERSION: the engine needs CPython 3.14. The on-version POSIX reading is this file's run on the
-hosted ``ubuntu-latest`` leg. ``capath=`` was not measured anywhere.
+hosted ``ubuntu-latest`` leg. A CA directory (``capath=``) is read during a handshake, not at a
+load, so it is measured and pinned apart, in ``tests/test_encrypted_pem_capath_pin.py``.
 
 Every load runs in a child process the probe kills on a deadline, never in the pytest process, so
 a regression fails a test and does not hang the suite. Each test first shows that the harness can
