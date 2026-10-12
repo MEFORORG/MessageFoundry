@@ -364,7 +364,7 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 
 - **The Builder**, the session that writes the change, runs the `code-review` **skill** on its own diff, at the effort level that section names. This document calls that the AI code-review pass. *CORRECTED 2026-10-07: this read `code-review` **subagent**. `code-review` is a skill, not an agent type, and that section now names it so.*
 - **The Lander**, the seat that merges, checks for proof that code review ran on the change being merged. With no proof, it sends the change to code review.
-- The Lander reads what the review found. A finding that names a defect the merge would ship goes back to the **owner** for a ruling.
+- The Lander reads what the review found. A finding that changes behaviour or weakens a control goes to the **owner** for a ruling. *CORRECTED 2026-10-12: this read "A finding that names a defect the merge would ship goes back to the **owner** for a ruling." An owner ruling that day narrowed it, and that section's merge bullet states the rule.*
 - **Required CI contexts and branch protection** gate the merge (§6.5).
 - **The owner** rules on what is routed to them. The Manager, the seat the owner talks to, waits for the owner's go on a plan for anything past a trivial change.
 

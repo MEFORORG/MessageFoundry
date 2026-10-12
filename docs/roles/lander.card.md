@@ -20,8 +20,10 @@ CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
 ## What it must not do
 
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
-  you need not review the diff, but read what it found. None: send it to an `Agent` subagent that
-  runs the `code-review` skill at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
+  you need not review the diff, but read what it found. Once findings are filed as rows, only one
+  that changes behaviour or weakens a control goes to the owner (owner, 2026-10-12). No proof: send
+  it to an `Agent` subagent that runs the `code-review` skill at `xhigh`. Proof must cover the head
+  you merge (CLAUDE.md section 5).
 - **Arm auto-merge outside two cases** (owner ruling 2026-10-07): a `main` that requires the
   queue, or a repo with no queue. **Or arm without the safeguards** (Manager decision, same day):
   green checks, `--match-head-commit` on the re-read head, its SHA posted on the PR, and a

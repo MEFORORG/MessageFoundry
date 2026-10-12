@@ -552,8 +552,15 @@ gates a merge**, and no seat has to clear one.
   Builder's QA line under the `qa` label, or other evidence that code review ran against this
   change. Without it, the Lander sends the change to code review. The proof must cover the change
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
-  reads what the review found, and a finding that names a defect the merge would ship goes back to
-  the owner for a ruling. Korus `roles/LANDER.md` *4a-quinquies* holds the rest; the full text is in
+  reads what the review found. **A finding that names a defect the merge would ship no longer goes
+  to the owner by default (owner ruling 2026-10-12, in session).** The Lander may merge when every
+  open finding is filed as a ledger row and none changes behaviour or weakens a control. A finding
+  that does either still goes to the owner for a ruling. A finding named on the PR as queued for
+  the Lander's next ledger pull request counts as filed; that reading is the Lander's, not the
+  owner's words. The ruling does not let the Lander skip the review proof, decline a finding, or
+  choose between two authors' deliberate changes. **CORRECTED 2026-10-12:** this read *"a finding
+  that names a defect the merge would ship goes back to the owner for a ruling."* Korus
+  `roles/LANDER.md` *4a-quinquies* holds the rest; the full text and the owner's words are in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
