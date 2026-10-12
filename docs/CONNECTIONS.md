@@ -1331,8 +1331,8 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   that the server's listing form looks unsupported. The entry must pass three tests:
   - its parent directory has the same last part as `remote_dir`;
   - it has no `..`, `\`, `:`, leading `//` or control character;
-  - `pattern` matches its file name, the part after the last `/`. An entry ending in `/` has no
-    file name, so it never passes.
+  - `pattern` matches its file name, the part after the last `/`. An entry ending in `/` or `/.`
+    has no file name, so it never passes.
 
   That WARNING names the connection and a count, never a file. It repeats at most every 15 minutes
   while the condition lasts. An entry that passes the first two tests but not the third is refused

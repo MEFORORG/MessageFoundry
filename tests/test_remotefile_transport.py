@@ -2411,16 +2411,21 @@ def test_a_refused_return_to_home_raises_the_original_nlst_reply() -> None:  # #
     assert caught.value.__context__ is None
 
 
-@pytest.mark.parametrize("failing", ["pwd", "cwd"])
+@pytest.mark.parametrize("failing", ["pwd", "cwd", "cwd /home"])
 def test_a_transient_reply_during_the_check_raises_as_itself(failing: str) -> None:  # #1130
     # A 421 is transient, so it must reach _op as error_temp and retry, not as the permanent 550.
+    # "cwd /home" fails only the return trip, after remote_dir was entered.
     ftp = _NlstRefusingFtp("550 No files found")
     transient = ftplib.error_temp("421 Service not available")
+    method, _, only = failing.partition(" ")
+    real = getattr(ftp, method)
 
-    def refuse(*_: object) -> str:
+    def refuse(*args: str) -> str:
+        if only and args != (only,):
+            return str(real(*args))
         raise transient
 
-    setattr(ftp, failing, refuse)
+    setattr(ftp, method, refuse)
     with pytest.raises(ftplib.error_temp) as caught:
         _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
     assert caught.value is transient
@@ -2720,12 +2725,13 @@ async def test_another_listing_form_matches_the_pattern_against_the_file_name(
     assert client.ops == []
 
 
-async def test_another_listing_form_ending_in_a_slash_is_not_counted_even_under_star(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("entry", ["/data/in/", "/data/in/."])
+async def test_another_listing_form_naming_no_file_is_not_counted_even_under_star(
+    monkeypatch: pytest.MonkeyPatch, entry: str
 ) -> None:  # #1130
-    # "/data/in/" has an empty last part, and fnmatch("", "*") is True. It names no file, so it
-    # must not count; the file beside it does, which shows the count is armed.
-    client = _NlstListingClient(["/data/in/", "/data/in/a.hl7"])
+    # The last part is "" or ".", and fnmatch matches both against "*". Neither names a file, so
+    # neither may count; the file beside it does, which shows the count is armed.
+    client = _NlstListingClient([entry, "/data/in/a.hl7"])
     src = _src(monkeypatch, client, pattern="*")
     src._handler = _RecordingHandler()
     with filtered_sink(_REMOTE_LOGGER) as sink:

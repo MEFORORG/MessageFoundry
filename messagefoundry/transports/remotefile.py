@@ -209,6 +209,9 @@ def _is_contained_name(name: object) -> bool:
 #: holds on every poll; one line per poll would bury the rest of the log.
 OTHER_FORM_WARNING_SECONDS = 900.0
 
+#: Last parts of a listing entry that name no file, so ``pattern`` never matches them (BACKLOG #1130).
+_NOT_A_FILE_NAME = frozenset({"", ".", ".."})
+
 
 def _is_other_listing_form(name: str, remote_dir: str) -> bool:
     """True if ``name``, which has a ``/`` and so is refused by :func:`_is_contained_name`, reads as
@@ -441,26 +444,30 @@ def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
     A directory the account may enter but not list still reads as empty, if the server answers
     it with this reply: ``CWD`` cannot tell that case apart.
 
-    The ``NLST`` reply is raised outside every handler, so a refused ``PWD`` or ``CWD`` reply
-    never rides on its ``__context__``: that text is the server's and may name a path."""
+    The check runs after the ``NLST`` handler ends, so neither the ``NLST`` reply nor a ``PWD`` or
+    ``CWD`` reply rides on the other's ``__context__``. A caller that reaches this inside its own
+    handler, as ``publish`` does after a refused ``RNTO``, still chains that handler's error, as
+    any raise there does."""
     try:
         return ftp.nlst(remote_dir)
     except ftplib.error_perm as exc:
         if not _NLST_EMPTY_REPLY.match(str(exc)):
             raise
         refusal = exc
-    if not _ftp_dir_confirmed(ftp, remote_dir):
-        raise refusal
+    try:
+        if not _ftp_dir_confirmed(ftp, remote_dir):
+            raise refusal
+    finally:
+        del refusal  # the frame would hold its own traceback in a cycle
     # The reply text past the match is the server's, and may name a path: not logged.
-    logger.debug("The remote-file poller read NLST reply 550 No files found as an empty directory")
+    logger.debug("The remote-file connector read NLST reply 550 No files found as empty")
     return []
 
 
 def _ftp_dir_confirmed(ftp: ftplib.FTP, remote_dir: str) -> bool:
     """Whether ``CWD`` enters ``remote_dir`` and then puts the session back where ``PWD`` found it.
 
-    A refused or unreadable reply confirms nothing; a transient one raises as itself. Called outside
-    any handler, so neither outcome carries an earlier reply on its chain."""
+    A refused or unreadable reply confirms nothing; a transient one raises as itself."""
     try:
         home = ftp.pwd()
         if not home:  # '' cannot put the session back, so it confirms nothing
@@ -2491,7 +2498,7 @@ class RemoteFileSource(SourceConnector):
         # Counted over the whole listing, not in the loop below, which can stop early. Only an entry
         # the pattern would have read counts. So a narrow pattern such as *.hl7 skips a subdirectory
         # or a stray file, but a broad one such as * counts them, since NLST cannot tell a directory
-        # from a file. An entry ending in "/" names no file and never counts.
+        # from a file. An entry whose last part is empty, "." or ".." names no file and never counts.
         self._log_other_form(sum(1 for e in listing if e.other_form and self._reads(e.name)))
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, entry in enumerate(listing):
@@ -2845,10 +2852,10 @@ class RemoteFileSource(SourceConnector):
         """Whether ``pattern``, a file-name glob, matches ``name``: the one test the poll loop
         and the other-form count share, so the two cannot drift. A name with a ``/`` is judged by
         its last part, since an NLST entry in another listing form (BACKLOG #1130) names the file
-        as a path. A bare name is its own last part. An entry ending in ``/`` has an empty last
-        part, which names no file, so it never matches, even under ``*``."""
+        as a path. A bare name is its own last part. A last part that is empty (an entry ending in
+        ``/``), ``.`` or ``..`` names no file, so it never matches, even under ``*``."""
         leaf = posixpath.basename(name)
-        return bool(leaf) and fnmatch.fnmatch(leaf, self._pattern)
+        return leaf not in _NOT_A_FILE_NAME and fnmatch.fnmatch(leaf, self._pattern)
 
     def _log_other_form(self, count: int) -> None:
         """WARN that ``count`` FTP ``NLST`` entries this poll, each one the pattern would have read,
