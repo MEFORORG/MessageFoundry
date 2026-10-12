@@ -29,13 +29,14 @@ import pytest
 
 from harness import drivers, sinks
 from harness.__main__ import main
-from harness.drivers.file import MAX_DROP_NAME_BYTES
+from harness.drivers.file import _UNSAFE, MAX_DROP_NAME_BYTES
 from harness.drivers.remotefile import RemoteFileDriver
 from harness.endpoints import Endpoints
 from harness.scenarios import SCENARIOS, run_scenario
 from harness.scenarios.remotefile import RemoteFileScenario, verify_written
 from harness.sinks import Record
 from harness.sinks._sftp_server import (
+    _REFUSED_CHARS,
     INBOX,
     OUTBOX,
     PASSWORD_ENV,
@@ -303,8 +304,9 @@ _OVER_LONG = {
 }
 
 #: Names the share must keep accepting: the engine's longest output name (vault BACKLOG #2562, pinned
-#: in the harness as MAX_DROP_NAME_BYTES) inside its 39-byte upload temp, the driver's temp, a name at
-#: the cap, and dot segments.
+#: in the harness as MAX_DROP_NAME_BYTES) inside the upload temp ``RemoteFileDestination`` spells in
+#: ``messagefoundry/transports/remotefile.py``, the driver's temp, a name at the cap, and dot
+#: segments. Not every name the engine can send: its sanitizer keeps DEL and C1, which this refuses.
 _ACCEPTED = {
     "engine-upload-temp": f"/outbox/.{'n' * (MAX_DROP_NAME_BYTES - 4)}.hl7.{'0' * 32}.part",
     "driver-upload-temp": "/inbox/.0123abcd.hl7.part",
@@ -339,12 +341,21 @@ def test_the_share_keeps_every_name_the_engine_and_driver_send(root: Path, remot
     assert Path(_confined(root, remote)).is_relative_to(root)
 
 
+def test_the_share_refuses_every_character_the_drivers_name_class_refuses() -> None:
+    """The share screens a path, the FILE driver one name, so the share's class is the driver's
+    (itself pinned to the engine's) less ``/``. Walks the whole Basic Multilingual Plane."""
+    unsafe = [chr(c) for c in range(0x10000) if _UNSAFE.match(chr(c)) and chr(c) != "/"]
+    assert len(unsafe) > 32
+    assert [c for c in unsafe if not _REFUSED_CHARS.match(c)] == []
+
+
 def test_the_share_answers_a_refused_name_with_a_status_and_keeps_serving(
     tmp_path: Path, password: str
 ) -> None:
     """Over the wire. Unscreened, paramiko's catch-all answers a NUL's ValueError with a bare
-    failure, a missing ``dir.`` with no-such-file, and Windows opens ``x.hl7.`` as ``x.hl7``; so
-    each PermissionError here, and the one file left, is the screen's doing."""
+    failure, a missing ``dir.`` with no-such-file, and Windows opens ``x.hl7.`` as ``x.hl7`` and
+    takes a 128-character name; so each PermissionError here, and the one file left, is the
+    screen's doing."""
     paramiko = _paramiko()
     with RemoteFileSink(0, known_hosts=tmp_path / "known_hosts") as sink:
         share = sink.share
@@ -357,8 +368,9 @@ def test_the_share_answers_a_refused_name_with_a_status_and_keeps_serving(
                     sftp.open(remote, "wb")
             with pytest.raises(PermissionError):
                 sftp.stat("/inbox/a\x00b/x.hl7")
+            # 128 two-byte characters: NTFS alone takes this name, so unscreened it lands on Windows.
             with pytest.raises(OSError):
-                sftp.open(_OVER_LONG["multibyte-name-middle"], "wb")
+                sftp.open("/inbox/" + "é" * 128, "wb")
             with sftp.open("/inbox/ok.hl7", "wb") as fh:
                 fh.write(b"ok")
             sftp.close()
