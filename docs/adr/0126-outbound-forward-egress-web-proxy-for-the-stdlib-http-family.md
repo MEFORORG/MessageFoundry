@@ -239,7 +239,9 @@ for a loopback address. [Corrected 2026-10-12: the operator API client does not;
   INFO. **Not covered:** urllib's own bypass list (`NO_PROXY`, or the system's override list) can
   also send a request direct, and `for_host` does not read that list. A proxy credential header
   can still accompany such a request. That predates this amendment and is a follow-up recorded
-  for the maintainer ledger. [Corrected 2026-10-12: refused at send time; see Amendment E.]
+  for the maintainer ledger. [Corrected 2026-10-12: refused at send time; see Amendment E.
+  Corrected again 2026-10-12: `for_host` now reads that list too, so such a request carries no
+  header and goes direct (vault BACKLOG #3442).]
 - **The ECH sidecar opener passes `ProxyHandler({})`**, so that hop uses no proxy at all. The
   token-endpoint hop is re-addressed to the same sidecar on the token provider's opener, which
   does read the environment, so there the loopback rule is what keeps it direct. For that to hold,

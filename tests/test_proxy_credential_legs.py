@@ -18,6 +18,9 @@ docstring used to list as outside the check:
 * **#3418.** On the one leg that reaches a proxy over TLS, the credential went over a context that
   did not verify the proxy: ``verify_tls=false``, ``tls_allow_expired``, or no host name check.
 
+It also pins #3442: a connection whose target urllib's own bypass list names attaches no header,
+so that send goes direct and is not refused.
+
 Each refusal is read on the wire, at a loopback socket that records what reaches it, as well as in
 the result. Each has a control in the other polarity.
 
@@ -30,7 +33,9 @@ import asyncio
 import base64
 import contextlib
 import http.server
+import socket
 import ssl
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -332,24 +337,91 @@ def test_a_header_on_a_scheme_with_no_proxy_entry_is_refused(recorded: None) -> 
     assert dialled.value.proxy_header == _HEADER
 
 
-def test_a_rest_send_the_bypass_list_sends_direct_is_refused(
-    recorded: None, monkeypatch: pytest.MonkeyPatch
+def _dial_to(monkeypatch: pytest.MonkeyPatch, host: str, address: str) -> None:
+    """Point every connection urllib opens to ``host`` at the loopback ``address`` instead, so a
+    reserved name that no DNS resolves can still be dialled direct, on a real socket."""
+    real = socket.create_connection
+    target_host, _, target_port = address.rpartition(":")
+
+    def create_connection(addr: tuple[str, int], *args: Any, **kwargs: Any) -> socket.socket:
+        if addr[0] == host:
+            addr = (target_host, int(target_port))
+        return real(addr, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+
+
+def _proxied_rest(proxy: _WireProxy, url: str) -> RestDestination:
+    """A ``proxy_user`` connection to a cleartext target, through ``proxy`` on the box, where the
+    guard allows the credential in every posture."""
+    return _rest(
+        url,
+        accepted=True,
+        proxy_url=f"http://{proxy.address}",
+        proxy_user="u5er",
+        proxy_password="pa55w0rd",
+    )
+
+
+def _bypassed_send_goes_direct(monkeypatch: pytest.MonkeyPatch, url: str, host: str) -> None:
+    """The send reaches the destination direct, with no proxy header, and is not refused; the
+    proxy is never dialled (vault BACKLOG #3442)."""
+    with _WireProxy() as proxy, _WireProxy() as destination:
+        _dial_to(monkeypatch, host, destination.address)
+        dest = _proxied_rest(proxy, url)
+        assert "Proxy-Authorization" not in dest._headers
+        asyncio.run(dest.send('{"a": 1}'))
+    assert proxy.connections == 0
+    assert len(destination.cleartext) == 1
+    assert b"proxy-authorization" not in destination.cleartext[0].lower()
+
+
+def test_a_rest_send_the_environment_bypass_list_names_goes_direct_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An engine source for the shape: a connection's ``proxy_user`` header, and ``NO_PROXY``
-    naming its destination. urllib dials that host direct, and the header went with it."""
-    settings: dict[str, Any] = {
-        "proxy_url": "http://127.0.0.1:9",
-        "proxy_user": "u5er",
-        "proxy_password": "pa55w0rd",
-    }
+    """A connection's ``proxy_user`` header, and ``NO_PROXY`` naming its destination. urllib dials
+    that host direct, so the header is not attached and the send is not refused into a retry
+    loop (vault BACKLOG #3442). Before the fix the header went on the request and the #3417 rule
+    refused every send."""
     monkeypatch.setenv("NO_PROXY", "partner.example.test")
-    _send_refused(_rest(_HTTPS_TARGET, **settings), "#3417")
-    # Control: with no bypass list, the send reaches the proxy, header and all.
-    monkeypatch.delenv("NO_PROXY")
-    with pytest.raises(_Dialled) as dialled:
-        asyncio.run(_rest(_HTTPS_TARGET, **settings).send('{"a": 1}'))
-    assert dialled.value.host == "127.0.0.1:9"
-    assert dialled.value.proxy_header == _HEADER
+    _bypassed_send_goes_direct(monkeypatch, _HTTP_TARGET, "partner.example.test")
+
+
+def test_a_bypass_entry_with_a_port_matches_as_urllib_reads_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """urllib asks its bypass list about the host with its port, so an entry naming the port
+    matches there. ``for_host`` reads the URL the same way."""
+    monkeypatch.setenv("NO_PROXY", "partner.example.test:8080")
+    _bypassed_send_goes_direct(
+        monkeypatch, "http://partner.example.test:8080/x", "partner.example.test"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="urllib reads the override list on Windows")
+def test_a_rest_send_the_windows_override_list_names_goes_direct_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registry's ``<local>`` entry bypasses a host with no dot in its name. The registry itself
+    is not touched: its reader is replaced by that one rule, applied to the host without its port."""
+    monkeypatch.setattr(
+        urllib.request, "proxy_bypass_registry", lambda host: "." not in host.partition(":")[0]
+    )
+    _bypassed_send_goes_direct(monkeypatch, "http://partnerhost/x", "partnerhost")
+
+
+def test_control_a_host_on_no_bypass_list_still_reaches_the_proxy_with_its_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_PROXY", "elsewhere.example.test")
+    with _WireProxy() as proxy, _WireProxy() as destination:
+        _dial_to(monkeypatch, "partner.example.test", destination.address)
+        dest = _proxied_rest(proxy, _HTTP_TARGET)
+        asyncio.run(dest.send('{"a": 1}'))
+    assert destination.connections == 0
+    assert len(proxy.cleartext) == 1
+    assert proxy.cleartext[0].startswith(b"POST http://partner.example.test/x ")
+    assert f"Proxy-Authorization: {_HEADER}\r\n".encode() in proxy.cleartext[0]
 
 
 class _Redirector:

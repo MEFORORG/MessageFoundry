@@ -594,7 +594,9 @@ class FhirDestination(DestinationConnector):
             connection=config.name,
         )
         dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
-        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_dest = (
+            self._proxy.for_host(dest_host, url=self.base_url) if self._proxy is not None else None
+        )
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)
@@ -1341,7 +1343,7 @@ class FhirLookupExecutor:
                 connection=label,
             )
             base_host = urllib.parse.urlsplit(url).hostname or ""
-            proxy_dest = proxy.for_host(base_host) if proxy is not None else None
+            proxy_dest = proxy.for_host(base_host, url=url) if proxy is not None else None
             proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
             headers = self._build_headers(s)
             if proxy_dest is not None:

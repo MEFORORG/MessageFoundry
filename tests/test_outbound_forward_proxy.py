@@ -601,6 +601,97 @@ def test_intranet_bypass_ipv6() -> None:
     assert "Proxy-Authorization" in dest2._headers  # type: ignore[attr-defined]
 
 
+#: Named by urllib's own bypass list below, port and all, and by no ``proxy_no_proxy`` entry.
+_URLLIB_BYPASSED = "https://svc.partner.invalid:8443/x"
+_PROXIED = {"http": LOOPBACK_PROXY, "https": LOOPBACK_PROXY}
+
+
+@pytest.fixture
+def no_proxy_names_the_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``NO_PROXY`` names the target with its port, which urllib matches only against the host
+    with its port (vault BACKLOG #3442)."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "svc.partner.invalid:8443,auth.partner.invalid:8443")
+
+
+def _assert_kept_uncredentialed(opener: urllib.request.OpenerDirector) -> None:
+    """The connection's proxy handler stays, so a host the list stops naming still reaches this
+    proxy. It admits no caller-set header, and no Digest handler answers for it."""
+    ph = _proxy_handler(opener)
+    assert ph is not None and ph.proxies == _PROXIED
+    assert getattr(ph, "caller_header_admitted") is False  # noqa: B009
+    assert not any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in opener.handlers)
+
+
+@pytest.mark.parametrize("ctype", list(_FACTORY))
+def test_a_host_on_urllibs_bypass_list_gets_no_proxy_credential(
+    ctype: ConnectorType, no_proxy_names_the_target: None
+) -> None:
+    """Every destination type reads urllib's list through its URL, so the port entry matches and no
+    ``Proxy-Authorization`` goes on a request urllib sends direct (vault BACKLOG #3442)."""
+    dest = _build(
+        ctype, _URLLIB_BYPASSED, proxy=LOOPBACK_PROXY, proxy_user="pu", proxy_password="pw"
+    )
+    assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
+    _assert_kept_uncredentialed(dest._opener)  # type: ignore[attr-defined]
+
+
+def test_the_token_and_lookup_hops_read_urllibs_bypass_list(
+    no_proxy_names_the_target: None,
+) -> None:
+    with active_hop_posture(_WARN_DIAL):
+        cfg = proxy_config_from_settings(
+            {"proxy_url": LOOPBACK_PROXY, "proxy_user": "pu", "proxy_password": "pw"},
+            dest_scheme="https",
+            connection=None,
+        )
+        ex = FhirLookupExecutor(
+            {
+                "epic": {
+                    "url": _URLLIB_BYPASSED,
+                    "proxy_url": LOOPBACK_PROXY,
+                    "proxy_user": "pu",
+                    "proxy_password": "pw",
+                }
+            },
+            egress=permitting({"proxy_url": LOOPBACK_PROXY}),
+        )
+    assert isinstance(cfg, ProxyConfig)
+    for provider in (
+        OAuth2ClientCredentialsProvider(
+            token_url="https://auth.partner.invalid:8443/token",
+            client_id="cid",
+            client_secret="s3cr3t",
+            proxy=cfg,
+        ),
+        SmartBackendTokenProvider(
+            token_url="https://auth.partner.invalid:8443/token",
+            client_id="cid",
+            private_key=_rsa_pem(),
+            proxy=cfg,
+        ),
+    ):
+        assert "Proxy-Authorization" not in provider._proxy_auth
+        _assert_kept_uncredentialed(provider._opener)
+    _assert_kept_uncredentialed(ex._opener["epic"])
+
+
+def test_control_a_port_the_entry_does_not_name_is_proxied_with_its_credential(
+    no_proxy_names_the_target: None,
+) -> None:
+    dest = _build(
+        ConnectorType.REST,
+        "https://svc.partner.invalid:9443/x",
+        proxy=LOOPBACK_PROXY,
+        proxy_user="pu",
+        proxy_password="pw",
+    )
+    assert dest._headers["Proxy-Authorization"].startswith("Basic ")  # type: ignore[attr-defined]
+    assert getattr(_proxy_handler(dest._opener), "caller_header_admitted") is True  # type: ignore[attr-defined]  # noqa: B009
+
+
 def test_proxy_bypasses_unit() -> None:
     """_proxy_bypasses: IPv6 literals match intact; a non-IPv6 name:port / IPv4:port still strips its
     port; bracketed list entries normalize; wildcard/suffix forms still work."""

@@ -334,7 +334,9 @@ class _TokenEndpointProvider(abc.ABC):
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical).
         token_proxy = (
-            proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
+            proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "", url=token_url)
+            if proxy
+            else None
         )
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``

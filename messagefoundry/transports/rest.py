@@ -1568,7 +1568,7 @@ class ProxyConfig:
     # The declaring connection's name, for a log record. A name, never a setting value.
     connection: str | None = None
 
-    def _build_proxy_handler(self) -> urllib.request.ProxyHandler:
+    def _build_proxy_handler(self, *, admitted: bool = True) -> urllib.request.ProxyHandler:
         if self.use_default:
             return LoopbackDirectProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
         # A credential is here only because it passed the posture-keyed guard in
@@ -1576,10 +1576,11 @@ class ProxyConfig:
         # cleartext proxy leg: the one exception bounded_read.ProxyCredentialsRefusedError states
         # (vault BACKLOG #3416). An unverified TLS leg is refused regardless.
         return LoopbackDirectProxyHandler(
-            dict(self.proxies), caller_header_admitted=bool(self.auth_header or self.digest)
+            dict(self.proxies),
+            caller_header_admitted=admitted and bool(self.auth_header or self.digest),
         )
 
-    def for_host(self, host: str) -> _HostProxy | None:
+    def for_host(self, host: str, *, url: str) -> _HostProxy | None:
         """The proxy resolved for ``host``, or ``None`` if the host is bypassed (#128) — a bypassed host
         gets NO proxy handler and NO proxy credential (byte-identical to no proxy).
 
@@ -1587,6 +1588,14 @@ class ProxyConfig:
         would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
         attached either: on a direct request it would go to the destination itself. That makes an
         operator's proxy setting inert for this host, so it is logged.
+
+        A host urllib's own bypass list names (``NO_PROXY``, or the system's override list) gets no
+        credential either (vault BACKLOG #3442). urllib's proxy handler sends that request direct
+        whatever proxy it holds, and the send-time rule would refuse the header. ``url`` is the
+        target URL, read as that handler reads it, so an entry with a port matches as it does
+        there. The handler is kept, without the credential: urllib reads its list again on every
+        request, and a host the list stops naming then still goes to this proxy, not to another.
+        The environment overriding the connection's own proxy is logged at WARNING.
 
         The record states the fact and names the connection, and nothing else. It carries no
         part of the proxy URL and no part of ``host``. Both are read out of the settings mapping
@@ -1600,18 +1609,41 @@ class ProxyConfig:
             return None
         if _proxy_bypasses(host, self.bypass):
             return None
+        if _urllib_bypasses(url):
+            logger.warning(
+                "connection %s; the configured web proxy is not used for this target, because "
+                "urllib's own bypass list (NO_PROXY, or the system proxy override list) names it",
+                audit_connection_name(self.connection),
+            )
+            return _HostProxy(self, credentialed=False)
         return _HostProxy(self)
+
+
+def _urllib_bypasses(url: str) -> bool:
+    """Whether urllib's proxy handler would send a request for ``url`` direct (vault BACKLOG #3442).
+    The handler asks ``urllib.request.proxy_bypass`` about ``req.host``, which keeps the port and
+    an IPv6 literal's brackets, so the URL is read through ``Request`` the same way."""
+    try:
+        target = urllib.request.Request(url).host  # noqa: S310  # nosec B310 — parsed, not opened
+    except ValueError:
+        return False  # urllib cannot build this request either, so nothing is sent direct
+    return bool(target) and bool(urllib.request.proxy_bypass(target))
 
 
 @dataclass(frozen=True, slots=True)
 class _HostProxy:
-    """A :class:`ProxyConfig` resolved for one (non-bypassed) target host."""
+    """A :class:`ProxyConfig` resolved for one (non-bypassed) target host. ``credentialed=False``
+    is a host urllib's own bypass list names: the proxy handler stays, with no admission, no
+    Digest handler and no pre-emptive header (vault BACKLOG #3442)."""
 
     config: ProxyConfig
+    credentialed: bool = True
 
     def opener_handlers(self) -> tuple[urllib.request.BaseHandler, ...]:
         """Fresh handlers to thread into THIS host's opener (a ProxyHandler, + a reactive Digest handler
         when configured). Fresh each call — a urllib handler binds to its opener, so it is never shared."""
+        if not self.credentialed:
+            return (self.config._build_proxy_handler(admitted=False),)
         handlers: list[urllib.request.BaseHandler] = [self.config._build_proxy_handler()]
         if self.config.digest is not None:
             handlers.append(self.config.digest.build())
@@ -1619,7 +1651,7 @@ class _HostProxy:
 
     def auth_headers(self) -> dict[str, str]:
         """The pre-emptive proxy-auth header(s) to add to each request (Basic; empty for Digest/none)."""
-        return dict(self.config.auth_header)
+        return dict(self.config.auth_header) if self.credentialed else {}
 
 
 def proxy_auth_handler_from_settings(
@@ -1743,7 +1775,9 @@ def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
 
     The predicate :meth:`ProxyConfig.for_host` applies, public so the static-credential hop reader
     decides a bypass the way the transport does rather than restating it. So a loopback host goes
-    direct whatever the list says (vault BACKLOG #2579). ``host=None`` is a target
+    direct whatever the list says (vault BACKLOG #2579). It does not read urllib's own bypass list,
+    which ``for_host`` also reads (vault BACKLOG #3442): that list lives in the environment of the
+    process that sends, not in the config this reader sees. ``host=None`` is a target
     whose host cannot be read before the connector is built (an ``env()`` reference): only a
     bypass-everything ``*`` entry is certain to cover it, so nothing else does."""
     bypass = _normalize_no_proxy(no_proxy)
@@ -1996,7 +2030,9 @@ class RestDestination(DestinationConnector):
             )
         )
         dest_host = urllib.parse.urlsplit(self.url).hostname or ""
-        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_dest = (
+            self._proxy.for_host(dest_host, url=self.url) if self._proxy is not None else None
+        )
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
         self._headers = self._build_headers(s)
         if proxy_dest is not None:
