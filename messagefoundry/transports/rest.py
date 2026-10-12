@@ -80,6 +80,8 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.bounded_read import (
     EgressReplyError,
+    LoopbackDirectProxyHandler,
+    NoRedirectHandler,
     build_strict_opener,
     drain_bounded,
     hop_identity,
@@ -338,21 +340,10 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     )
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _NoRedirectHandler(NoRedirectHandler):
     """Refuse to follow HTTP redirects (ASVS 15.3.2): a 3xx could divert a PHI-bearing POST to an
     unintended host. Returning ``None`` makes urllib raise the 3xx as an ``HTTPError`` instead of
     following it, so the delivery is classified (permanent) rather than silently redirected."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
 
 
 #: The operator-recognisable connector label the HTTP-family TLS assertions name in their errors. The
@@ -1571,11 +1562,17 @@ class ProxyConfig:
     digest: _ProxyDigestRecipe | None
     # The declaring connection's name, for a log record. A name, never a setting value.
     connection: str | None = None
+    # True when this connection's proxy credential passed its posture-keyed guard at build. Handed to
+    # the proxy handler, the only thing that lets a caller-set header across a cleartext proxy leg
+    # (vault BACKLOG #3416; bounded_read.ProxyCredentialsRefusedError states the rule).
+    credential_admitted: bool = False
 
     def _build_proxy_handler(self) -> urllib.request.ProxyHandler:
         if self.use_default:
-            return urllib.request.ProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
-        return urllib.request.ProxyHandler(dict(self.proxies))
+            return LoopbackDirectProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
+        return LoopbackDirectProxyHandler(
+            dict(self.proxies), caller_header_admitted=self.credential_admitted
+        )
 
     def for_host(self, host: str) -> _HostProxy | None:
         """The proxy resolved for ``host``, or ``None`` if the host is bypassed (#128) — a bypassed host
@@ -1637,11 +1634,16 @@ def proxy_auth_handler_from_settings(
     ``smart → http_auth`` import cycle; ``http_auth.py`` re-exports the name.)
 
     Basic (the default when a credential is set) → a pre-emptive ``Proxy-Authorization: Basic`` header,
-    which works for BOTH http and https destinations (urllib moves it into the CONNECT tunnel for https).
+    sent for BOTH http and https destinations. For an https destination urllib moves it into the
+    ``CONNECT`` that opens the tunnel, and that ``CONNECT`` crosses to the proxy in cleartext, before
+    any TLS, even to a proxy written ``https://``. A ``proxy_url`` serves both schemes, so an http
+    destination reaches the proxy through such a ``CONNECT`` too.
     Digest → the reactive stdlib handler, **refused for an https destination** (the 407 is inside the
     CONNECT tunnel; digest-over-CONNECT is unsupported). NTLM/Windows → **refused** (deferred, ADR 0126).
-    A cleartext ``http`` proxy hop carrying the credential is refused REGARDLESS of destination scheme via
-    the ONE posture-keyed authority (:func:`refuse_cleartext_credential_hop`)."""
+    So the credential is judged as crossing in cleartext whatever the proxy's scheme, by the ONE
+    posture-keyed authority (:func:`refuse_cleartext_credential_hop`), REGARDLESS of destination
+    scheme (vault BACKLOG #3416). A credential that passes it is admitted onto the cleartext proxy
+    leg at send; ``bounded_read.ProxyCredentialsRefusedError`` states that rule."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -1662,10 +1664,18 @@ def proxy_auth_handler_from_settings(
     # ADR 0153: the proxy hop is a distinct crossing from the destination hop, but it belongs to the
     # SAME connection, so it is governed by that connection's one declaration. Threaded explicitly (like
     # `attested` beside it) rather than read off the settings mapping — one declaration, one source.
+    # Judged as http whatever proxy_scheme says (vault BACKLOG #3416). A proxy_url serves both schemes,
+    # so urllib sends the credential in a CONNECT before any TLS for either destination scheme. The one
+    # exception, urllib's bypass list naming the proxy's own host, is not knowable here, so it is not
+    # relied on. `proxy_scheme` now only words the refusal.
     refuse_cleartext_credential_hop(
-        proxy_scheme,
+        "http",
         proxy_url,
-        credential="web-proxy credential",
+        credential=(
+            "web-proxy credential"
+            if proxy_scheme == "http"
+            else "web-proxy credential (urllib sends it before any TLS, even to an https:// proxy)"
+        ),
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
@@ -1798,6 +1808,8 @@ def proxy_config_from_settings(
         auth_header=auth_header,
         digest=digest,
         connection=connection,
+        # A credential reached here only by passing the posture-keyed guard above.
+        credential_admitted=bool(auth_header or digest),
     )
 
 

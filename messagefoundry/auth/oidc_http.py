@@ -42,7 +42,6 @@ import http.client
 import ssl
 import urllib.request
 from collections.abc import Callable
-from typing import Any
 
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import oidc_anchor_spec, verified_anchor_cadata
@@ -54,6 +53,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
     EgressReplyError,
+    NoRedirectHandler,
     build_strict_opener,
     read_reply_body,
     reply_framing_fault,
@@ -66,21 +66,10 @@ __all__ = ["build_idp_opener", "jwks_fetcher"]
 DEFAULT_IDP_TIMEOUT_SECONDS = 10.0
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _NoRedirectHandler(NoRedirectHandler):
     """Never follow a redirect. Duplicated from ``transports/rest.py`` rather than imported: the house
     pattern (``pipeline/alert_sinks.py`` does the same) is to keep each subsystem's opener policy local
     rather than couple the auth path to a message-transport module."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
 
 
 def build_idp_opener(
