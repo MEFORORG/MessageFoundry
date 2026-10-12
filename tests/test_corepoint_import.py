@@ -174,9 +174,129 @@ def test_multiple_destinations_emit_list_of_sends() -> None:
     )
     src = generate_module(parse_export(export)[0])
     assert 'return [Send("OB_A", msg), Send("OB_B", msg)]' in src
-    # File outbound connector is imported and rendered.
-    assert 'outbound("OB_B", File(directory="./out"))' in src
+    # Both connectors are imported and rendered as the export wrote them, undeployed until an
+    # operator reviews them (BACKLOG #1130).
+    assert 'outbound("OB_B", File(directory="./out"), deployed=False)' in src
+    assert 'outbound("OB_A", MLLP(host="a", port=1), deployed=False)' in src
     assert "from messagefoundry import File, MLLP, Send" in src
+
+
+def _file_export(inbound_dir: str, outbound_dir: str) -> str:
+    """A one-channel JSON export whose inbound and outbound are File endpoints on these directories."""
+    return json.dumps(
+        {
+            "channels": [
+                {
+                    "name": "X",
+                    "inbound": {"name": "IB_X", "connector": "file", "directory": inbound_dir},
+                    "destinations": [
+                        {"name": "OB_X", "connector": "file", "directory": outbound_dir}
+                    ],
+                    "handlers": [{"name": "h", "actions": []}],
+                }
+            ]
+        }
+    )
+
+
+# The directory shapes a hostile export could name: a parent walk, an absolute path outside any base,
+# a drive path, a UNC share, and an alternate-data-stream colon.
+_HOSTILE_DIRS = (
+    "../../../etc",
+    "/etc/cron.d",
+    "C:\\Windows\\System32",
+    "\\\\attacker\\share\\drop",
+    "in:hidden",
+)
+
+
+@pytest.mark.parametrize("directory", _HOSTILE_DIRS)
+def test_a_file_directory_from_the_export_is_emitted_undeployed(
+    directory: str, tmp_path: Path
+) -> None:
+    """The export chooses a File endpoint's directory, and the export is untrusted. A directory is a
+    whole path with no base to contain it in, so the importer keeps it as written and emits both File
+    endpoints ``deployed=False``: the loaded config polls and writes nothing until an operator reviews
+    the path (BACKLOG #1130)."""
+    from messagefoundry.config.wiring import load_config
+
+    src = generate_module(parse_export(_file_export(directory, directory))[0])
+    rendered = json.dumps(directory)
+    assert f'inbound("IB_X", File(directory={rendered}), router="x_router", deployed=False)' in src
+    assert f'outbound("OB_X", File(directory={rendered}), deployed=False)' in src
+    assert "came from the export,\n# which is untrusted. Review each one" in src
+
+    (tmp_path / "IB_X.py").write_text(src, encoding="utf-8")
+    registry = load_config(tmp_path)
+    assert registry.inbound["IB_X"].deployed is False
+    assert registry.outbound["OB_X"].deployed is False
+
+
+def test_a_benign_file_export_still_imports_with_its_directories(tmp_path: Path) -> None:
+    """A benign File export still imports: same names, same directories, a module that compiles and
+    passes ``messagefoundry check``. Only the deploy flag differs, so a reviewed path goes live by
+    dropping ``deployed=False``."""
+    export = tmp_path / "export.json"
+    export.write_text(_file_export("./in", "./out"), encoding="utf-8")
+    out = tmp_path / "config"
+    result = import_corepoint(export, out)
+    assert [c.filename for c in result.channels] == ["IB_X.py"]
+    src = (out / "IB_X.py").read_text(encoding="utf-8")
+    assert 'inbound("IB_X", File(directory="./in"), router="x_router", deployed=False)' in src
+    assert 'outbound("OB_X", File(directory="./out"), deployed=False)' in src
+    assert run_checks(out, run_lint=False).ok
+
+
+def test_a_fully_mapped_import_still_says_its_endpoints_are_undeployed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With nothing unmapped there is no TODO hint, so the summary must still say the endpoints bind
+    nothing; otherwise a clean import reads as ready to run."""
+    from messagefoundry.__main__ import main
+
+    export = tmp_path / "export.json"
+    export.write_text(_file_export("./in", "./out"), encoding="utf-8")
+    assert main(["import", "corepoint", str(export), "--out", str(tmp_path / "out")]) == 0
+    printed = capsys.readouterr().out
+    assert "0 left as TODO stubs" in printed
+    assert (
+        "Every endpoint is emitted deployed=False and binds nothing. Follow the endpoint" in printed
+    )
+
+
+def test_a_mixed_export_binds_nothing_until_reviewed(tmp_path: Path) -> None:
+    """An MLLP inbound beside a File outbound is undeployed too. Holding back only the File leg would
+    leave a live inbound ACKing every message while each Send to that leg is declined, and an
+    export-chosen MLLP port or host is the same untrusted text as a directory."""
+    from messagefoundry.config.wiring import load_config
+
+    export = json.dumps(
+        {
+            "channels": [
+                {
+                    "name": "X",
+                    "inbound": {"name": "IB_X", "connector": "mllp", "port": 2611},
+                    "destinations": [
+                        {
+                            "name": "OB_A",
+                            "connector": "mllp",
+                            "host": "attacker.example",
+                            "port": 1,
+                        },
+                        {"name": "OB_B", "connector": "file", "directory": "../../etc"},
+                    ],
+                    "handlers": [{"name": "h", "actions": []}],
+                }
+            ]
+        }
+    )
+    (tmp_path / "IB_X.py").write_text(generate_module(parse_export(export)[0]), encoding="utf-8")
+    registry = load_config(tmp_path)
+    assert registry.inbound["IB_X"].deployed is False
+    assert {name: c.deployed for name, c in registry.outbound.items()} == {
+        "OB_A": False,
+        "OB_B": False,
+    }
 
 
 # --- count-and-log: unmapped is marked, never dropped and never live (AC-2) --

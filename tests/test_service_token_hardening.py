@@ -98,7 +98,12 @@ def test_only_the_services_own_virtual_account_gets_the_restricted_sid(
 
 # --- 2. set through the SCM, and read back ---------------------------------------------------------
 
-_TOKEN_FNS = ["Get-ServiceSidTypeChoice", "Get-ServiceTokenProblem", "Set-ServiceTokenHardening"]
+_TOKEN_FNS = [
+    "Get-ServiceSidTypeChoice",
+    "Get-ServiceTokenProblem",
+    "Set-ServiceTokenHardening",
+    "Disable-RefusedService",
+]
 
 # Defined AFTER the lifted functions, so they win. `sc.exe` is a function here: PowerShell resolves a
 # function before an application, on every host, so no real sc.exe runs and nothing is registered.
@@ -241,6 +246,7 @@ def test_a_refused_change_stops_the_install_and_disables_the_service(
     assert "sc.exe sidtype MessageFoundry restricted failed (exit 5)" in refused["threw"], refused
     assert "ChangeServiceConfig2 FAILED" in refused["threw"], "sc.exe's own words were dropped"
     assert refused["disabled"] == ["MessageFoundry=Disabled"]
+    assert "'MessageFoundry' was set to Disabled so" in refused["threw"]
     assert len(refused["calls"]) == 1, "the privilege list was still set after the SID type failed"
 
 

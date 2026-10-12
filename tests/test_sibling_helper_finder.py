@@ -21,12 +21,15 @@ import pytest
 
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.wiring import (
+    _CONFIG_SOURCE_LEAD,
     WiringError,
     _assert_safe_config_source,
-    _enforce_windows_config_source,
+    _enforce_windows_paths,
     _HelperImporter,
+    _refuse_unsafe_config_source,
     _WinConfigSourceProbes,
     _WinPathSecurity,
+    config_source_trust_paths,
     load_config,
     validate_config,
 )
@@ -367,7 +370,13 @@ def test_dot_named_modules_are_outside_the_windows_trust_check(tmp_path: Path) -
     probes = _WinConfigSourceProbes(
         self_sid=sid, read_path=_read_path, owner_in_admins=lambda _sid: False
     )
-    _enforce_windows_config_source(tmp_path, probes)
+    _enforce_windows_paths(
+        config_source_trust_paths(tmp_path),
+        probes,
+        lead=_CONFIG_SOURCE_LEAD,
+        refuse=_refuse_unsafe_config_source,
+        first_is_required=True,
+    )
     assert seen == [tmp_path, tmp_path / "_helper.py", tmp_path / "cfg.py"]
 
 

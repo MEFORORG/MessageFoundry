@@ -718,7 +718,9 @@ Other switches on `install-service.ps1` change more than the service:
 
 - `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
-  directory and of everything in it. Without the switch, the script only adds a read grant.
+  directory and of everything in it. It does the same to the value file's folder, and to the
+  settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
+  Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
   keyed by program name. So they affect every process with that name on the machine, not only the
   engine.

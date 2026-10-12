@@ -1221,7 +1221,8 @@ rules are recorded once, in
 [ADR 0105's 2026-09-28 amendment](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md). The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
 which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
 reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
-`text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served
+and the raster image types), matched case-folded and length-bounded. A `text/csv` label is served as
+`text/plain`, for the reason given below. Everything else is served
 as `application/octet-stream` -- every **browser-active** type (`text/html`, `image/svg+xml`,
 `application/hta`), every type nobody listed, and every non-clean or over-long value. The direction
 matters: the earlier control listed the browser-active subtypes to refuse, which asked a reviewer to prove
@@ -1245,6 +1246,22 @@ oversight: a PDF can carry script that runs in a viewer once a saved file is ope
 against the document rather than against the serving origin, and the declared type stops governing the
 moment the file is on disk. The instrument for the local-open threat would be content scanning, which this
 route does not do.
+
+`text/csv` gets the other answer, by a decision recorded beside the same table. A document the sender
+labelled `text/csv` downloads as `text/plain` with a `.txt` name. A sender can start a cell with `=`, and
+a spreadsheet evaluates that cell when it opens the file. The route serves a CSV's stored bytes as they
+are, so the `.txt` name is what keeps a double-click away from a spreadsheet. The comment beside the
+table holds the reasoning and the limits. At least these limits matter to an operator:
+
+- **Do not give a downloaded attachment a `.csv` name to open it.** Renaming it, or importing it into a
+  spreadsheet, still evaluates its cells.
+- The message page's attachment list still shows the sender's `text/csv` label, so the `.txt` name is
+  expected. The page carries no note that says so.
+- Which program opens a `.txt` file is set by your own host. Nobody has tested this route against a
+  browser or a spreadsheet.
+- Only the exact label `text/csv` is covered. Another spelling, such as `application/csv` or
+  `text/csv; charset=utf-8`, downloads as `application/octet-stream` with a `.bin` name, like any
+  unlisted type. The first limit applies to that file too.
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
@@ -1538,6 +1555,13 @@ on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`
 follows the posture, so under `[security].enforcement = warn` it logs a WARNING and the connection
 builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
 connection's `proxy_url` and still follows a proxy from the environment.
+
+A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
+proxy override list) sends direct with no proxy credential, and logs a WARNING (vault BACKLOG
+#3442). A connection that sets `proxy_user` and also writes a `Proxy-Authorization` into `headers`
+fails to build (vault BACKLOG #3443). Its proxy handler admits any caller-set header once the
+`proxy_user` credential passes, so it could not tell the static header from its own. The rule is
+on [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
 
 Which legs reach the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
@@ -2016,7 +2040,7 @@ unrecognized fault is treated as permanent (so a rejected request can't loop the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
 + HTTP status. A 2xx whose body is over the byte bound cannot be inspected, so it is a permanent refusal
-and is not sent again: see *A 2xx reply over the byte bound* under REST.
+and is not sent again: see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, secrets via `env()`). Delivery is **at-least-once**, so a retry **re-sends** —
@@ -2328,6 +2352,8 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
 | `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) |
+| `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load. Refused on any other interaction. Both lists take an `env()` for the whole list: its default is checked at load, and the value it resolves to when the connection is built. A bad item is named by position, never quoted. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
+| `allowed_entry_types` | — (any type) | (vault BACKLOG #2804) `transaction`/`batch` only: the resource types an entry's `request.url` may name, such as `["Patient", "Encounter"]`. Unset means any type. Refused on any other interaction |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
@@ -2342,14 +2368,50 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 
 **Interactions.** The `interaction` plus the `ResourceType`/`id` (read from the outgoing body with the cheap
 `FhirPeek`, no typed parse) derive the method + path off the base `url`. A `transaction`/`batch` POSTs the
-`Bundle` to the base — the FHIR **server** applies it (transaction = all-or-nothing, batch = independent per
-entry); the engine never orchestrates cross-entry atomicity.
+`Bundle` to the base, and the FHIR **server** applies it (transaction = all-or-nothing, batch = independent
+per entry); the engine never orchestrates cross-entry atomicity. The engine does screen every entry first,
+as [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) says.
 
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
 is in the **URL** query), and `if-match` (optimistic lock on a known id via an ETag derived from the
 resource's `meta.versionId`, sent as the entry's `request.ifMatch`).
+
+#### A Bundle connection screens every entry
+
+On `transaction` and `batch`, each Bundle entry names its own method and URL. **If a Handler forwards a
+Bundle it received, the sender chooses them.** It can use every method, URL form and resource type your
+lists allow, with this connection's credentials. Set the lists to what the feed needs and no more. A feed
+that only creates and updates wants `allowed_entry_methods=["POST", "PUT"]`, and it should name its types.
+
+The engine checks the whole Bundle before it sends a byte (vault BACKLOG #2804). It refuses the message
+when any of these hold:
+
+1. The body is not JSON, is not a `Bundle`, or its `Bundle.type` is not the connection's interaction.
+2. A JSON object anywhere in the body repeats a key. The engine and the server might read different
+   values out of one body, so neither reading is trusted.
+3. `entry` is not a list, an entry is not an object, or an entry has no `request` object.
+4. An entry's `request.method` is not one of `allowed_entry_methods`.
+5. An entry's `request.url` does not fit its method. A `POST` takes `Type` only. Every other verb takes
+   `Type/id` or `Type?query`. The type and id follow the FHIR grammars, so neither can carry a
+   `$operation`, percent-encoding, `_search`, `_history`, an absolute URL or an extra path segment. The
+   query must be one or more `name=value` pairs joined by `&`, with no empty name or value. It must hold
+   no whitespace, `#`, backslash, control character or percent-encoded control character such as `%0A`.
+   Other percent-encoding in a query stays allowed, because a search value often needs it.
+6. The URL's type is not in `allowed_entry_types`, when that list is set.
+7. A `POST` or `PUT` entry carries a `resource` whose `resourceType` is not the URL's type.
+
+A refusal is permanent. The message is recorded as `ERROR` and dead-lettered, and no part of the Bundle is
+sent. The error names the entry's index, its method and the rule it broke. It never names the URL or its
+query, which can carry identifiers. The engine sends the Bundle exactly as the Handler built it; the check
+reads a copy. The one-entry Bundle the engine builds itself for an `update` is not screened.
+
+`Type?query` stays open to `PUT`, because per-entry conditional URLs are how a Bundle does what a
+connection-level `conditional` does. The engine checks a query's shape, not what its parameters mean. A
+conditional `DELETE` whose only criterion the server ignores can still match every resource of the type,
+so leave `DELETE` off the list unless the feed needs it. The `smart-scope` advisory that `messagefoundry check` prints does not yet read
+`allowed_entry_methods`.
 
 #### An update keeps the resource id out of the URL
 
@@ -2379,7 +2441,7 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
-  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under REST.
+  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
@@ -2457,7 +2519,7 @@ never an error). On an error status the HTTP code decides, refined by the `Opera
 `incomplete`), or `408`/`429` → retry; any other 4xx / refused 3xx → **dead-letter**. The HTTP status wins
 when in doubt (a 5xx stays transient). `OperationOutcome`/reply bodies are **not** echoed into errors/logs
 (they may carry PHI) — only the HTTP status + a redacted URL. For a 2xx whose body is over the byte bound,
-see *A 2xx reply over the byte bound* under REST.
+see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, cleartext-credential refusal, optional detached-JWS signing, secrets via `env()`).
@@ -2803,7 +2865,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
 a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
 over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
-again: see *A 2xx reply over the byte bound* under REST. **PHI:** the response can
+again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python
@@ -2970,6 +3032,12 @@ anyone can recompute it.
 Every other MAC is refused, unencrypted bags or not, because it runs the passphrase through the
 PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's default
 included. It also holds when the passphrase is empty, as in `cryptography`'s `NoEncryption` output.
+
+A key inside an encrypted part of the bundle is checked too (BACKLOG #1352). `cert import` opens
+each encrypted part with the passphrase and holds every key in it to the same floor before anything
+decrypts the key. To be opened, a part must use PBKDF2 and AES-CBC. OpenSSL 3's default export
+and the re-export command below write that. A part under scrypt, or under any other cipher, is
+refused. Other `-certpbe` choices, such as ARIA, Camellia or 3DES, are among those.
 
 The passphrase comes from `MEFOR_PFX_PASSWORD`. A bundle whose passphrase is empty needs that
 variable set to the empty string; unset means no passphrase. PowerShell and cmd cannot set an empty

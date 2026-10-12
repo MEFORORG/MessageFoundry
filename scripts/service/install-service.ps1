@@ -13,8 +13,8 @@
     Run from an elevated (Administrator) PowerShell prompt.
 
 .EXAMPLE
-    .\install-service.ps1 -Environment prod
-    .\install-service.ps1 -Environment prod -Port 9000 -LogLevel INFO -DataDir D:\MEFOR
+    .\install-service.ps1 -Environment prod -Config D:\hl7\config
+    .\install-service.ps1 -Environment prod -Config D:\hl7\config -Port 9000 -LogLevel INFO -DataDir D:\MEFOR
 #>
 [CmdletBinding()]
 param(
@@ -28,13 +28,28 @@ param(
     # The engine's console-script launcher, e.g. <venv>\Scripts\messagefoundry.exe. It names the
     # INSTALL the service runs from. The service does not run it: it runs the Python interpreter of
     # that install directly, so the interpreter options below reach it (vault BACKLOG #2701).
+    # Defaults to the admin-only install root, "$env:ProgramFiles\MessageFoundry\engine", which the
+    # installer checks and does not build (vault BACKLOG #2626). docs/SERVICE.md "Install the engine
+    # where only administrators can write" builds it from the wheel. A checkout's venv still works
+    # when passed here.
     [string]$AppExe,
     # The interpreter the service runs. Defaults to the python.exe of the install -AppExe is in:
     # beside it for a virtual environment, one folder up for a system-wide install. Pass it when
     # neither is right. It must be able to import messagefoundry in isolated mode, which leaves
     # out the user's own site directory, so a `pip install --user` copy will not do.
     [string]$PythonExe,
+    # The config directory the service loads. Required: it used to default to the checkout's
+    # samples\config, a demo graph in a folder its developers can write (vault BACKLOG #2626).
     [string]$Config,
+    # The service settings file (messagefoundry.toml), registered as an absolute --service-config.
+    # Without it, the installer registers <ProjectRoot or working directory>\messagefoundry.toml
+    # when that file exists, which is the file `serve` would read from its working directory.
+    [string]$ServiceConfig,
+    # The config-repo root the value file environments\<env>.toml resolves under, registered as
+    # --project-root. Without it, a service on the default install root uses the folder above
+    # -Config, the layout docs/INSTALL-GUIDE.md shows, and a service on a passed -AppExe uses its
+    # working directory, as before.
+    [string]$ProjectRoot,
     [string]$DbPath,
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
     [string]$ListenHost = "127.0.0.1",
@@ -70,9 +85,13 @@ param(
     # Opt-in: strip inherited ACEs from the config dir and lock it to SYSTEM + Administrators + the
     # service account (RX). The in-process source-trust guard (SEC-003) refuses to load config from a
     # dir/module a low-privileged principal can write, so this one flag satisfies that requirement.
+    # It locks the value file's folder the same way, and the settings file's folder when that is a
+    # folder of its own, because `serve` refuses a start whose value or settings file another account
+    # can write (vault BACKLOG #2626). It refuses a -Config that is a volume root, a junction, or a
+    # folder holding the data directory, the checkout or the install.
     # Default OFF because the config dir often lives inside a developer's repo, where stripping
     # inheritance is surprising; for production point -Config at a dedicated admin-owned dir and pass
-    # this switch (see docs/SERVICE.md "Restrict the config directory").
+    # this switch (see docs/SERVICE.md "Lock down the config directory (CONFIG-2)").
     [switch]$LockConfigDir,
     # Opt-in: suppress Windows Error Reporting crash dumps for the engine image MACHINE-WIDE (ADR 0152
     # Phase 0). A WER dump of a running engine writes in-flight HL7 bodies, decrypted plaintext and the
@@ -380,6 +399,23 @@ function Set-ServiceAccount {
     }
 }
 # END pinned-hash check
+
+function Disable-RefusedService {
+    <#
+      Set $ServiceName to Disabled after a refusal, and return the sentence that says what happened:
+      that it was set to Disabled, so $Consequence, or that it could not be and must be disabled by
+      hand before the next boot. The refusal message reports this, rather than assuming it.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Consequence)
+    try {
+        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction Stop
+        return "'$ServiceName' was set to Disabled so $Consequence."
+    } catch {
+        return ("WARNING: '$ServiceName' could NOT be set to Disabled ($($_.Exception.Message)), so " +
+            "it may start at the next boot. Disable it by hand: Set-Service -Name '$ServiceName' " +
+            "-StartupType Disabled.")
+    }
+}
 
 function Set-AdminOnlyAcl {
     <#
@@ -1143,9 +1179,7 @@ function Set-ServiceTokenHardening {
     )
     $fail = {
         param([string]$Why)
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-        throw ("$Why '$ServiceName' was set to Disabled so it cannot start with a token this " +
-            "script did not set.")
+        throw "$Why $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start with a token this script did not set')"
     }
     $calls = @(
         @("sidtype", $ServiceName, $SidType),
@@ -1242,9 +1276,172 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Installing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-# Repo root is two levels up from this script (scripts\service\). Computed FIRST: -AppExe and
-# -Config default from it, and the normalization below has to run before anything CONSUMES a path.
+# Repo root is two levels up from this script (scripts\service\). Computed FIRST: it is the working
+# directory of a service run from a checkout (a passed -AppExe), and the normalization below has to
+# run before anything CONSUMES a path.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
+# The default install root (vault BACKLOG #2626). Under Program Files, so a new folder there inherits
+# an access list only administrators can write; the installer checks that below rather than assume
+# it. The installer does not build the root: docs/SERVICE.md "Install the engine where only
+# administrators can write" installs the hash-locked dependencies and the engine wheel into it, never
+# editable. A checkout's own venv stays usable by passing -AppExe, and whether the installer may stop
+# accepting one is an open owner question, so nothing here refuses it.
+$DefaultInstallRoot = Join-Path $env:ProgramFiles "MessageFoundry\engine"
+$UsesDefaultInstall = -not ($AppExe -or $PythonExe)
+
+function Get-DefaultServiceConfig {
+    <#
+      The settings file a service registered without -ServiceConfig is given: messagefoundry.toml
+      under $Anchor when it exists, else "". $Anchor is -ProjectRoot, or the working directory when
+      there is none. For a passed -AppExe with no -ProjectRoot, that is the file `serve` would have
+      read from its working directory. For the default install it sits beside the value folder,
+      above -Config, the layout docs/INSTALL-GUIDE.md shows. `serve` would not find that file on
+      its own, so the installer names it by absolute path (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][string]$Anchor)
+    $candidate = Join-Path $Anchor "messagefoundry.toml"
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    return ""
+}
+
+function Assert-NoNssmExpansion {
+    <#
+      Throw when $Path holds '%'. nssm stores at least the service's arguments, interpreter path,
+      working directory and log paths as expandable strings and expands %NAME% at start, and the
+      SCM expands the image path that names nssm.exe. Either way the service would use a path
+      other than the one this installer checked (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if ($Path.Contains('%')) { throw "A path the service is registered with cannot contain '%': $Path" }
+}
+
+function Format-QuotedPath {
+    <#
+      $Path in double quotes for the service's command line. A drive root such as D:\ ends in a
+      backslash, which the command-line parser would read as escaping the closing quote. Trailing
+      backslashes are doubled, and the parser reads each pair as one (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    # No Windows path holds a double quote. One here would end the quoted path early, and the
+    # parser would read the rest as more arguments, such as a second --host.
+    if ($Path.Contains('"')) { throw "A path on the service's command line cannot contain a double quote: $Path" }
+    Assert-NoNssmExpansion $Path
+    return '"' + ($Path -replace '\\+$', '$0$0') + '"'
+}
+
+function Test-LegacyNativeArgumentPassing {
+    <#
+      Whether this host hands a native program its arguments the old way: Windows PowerShell 5.1,
+      PowerShell 7.0 to 7.2, or a later one set to 'Legacy'. Such a host puts an argument that holds
+      a space inside double quotes and does not escape the double quotes already in it, so the
+      program's parser strips them (vault BACKLOG #2626). PowerShell 7.3 and later escape them for a
+      program such as nssm.exe.
+    #>
+    $mode = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue
+    return (-not $mode) -or ($mode -eq 'Legacy')
+}
+
+function ConvertTo-NativeArgument {
+    <#
+      $Value as one argument that reaches a native program unchanged. With -Legacy (see
+      Test-LegacyNativeArgumentPassing), each double quote is escaped as the program's parser reads
+      it: the backslashes before it are doubled and a backslash goes in front of it. When $Value
+      holds white space, the host adds quotes around it, so its trailing backslashes are doubled
+      as well. Without -Legacy the host escapes, so $Value goes as it is.
+
+      Invoke-Nssm sends every argument through this. Measured 2026-10-11 on Windows PowerShell
+      5.1.26100: without it, nssm received --config "D:\hl7 cfg\config" as two words with no quotes.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value, [switch]$Legacy)
+    if (-not $Legacy) { return $Value }
+    $escaped = $Value -replace '(\\*)"', '$1$1\"'
+    if ($escaped -match '\s') { $escaped = $escaped -replace '(\\+)$', '$1$1' }
+    return $escaped
+}
+
+function Test-ListenHost {
+    <#
+      Whether $Value can go on the service's command line as the --host value: an IP address, or a
+      host name of letters, digits, hyphens and dots. It goes in unquoted, so anything else, such as
+      a space, would add arguments (vault BACKLOG #2626).
+
+      An IPv4 address must be written as four numbers. IPAddress.TryParse also takes shorthand such
+      as '0' or '1.2', and the engine's resolver reads '0' as 0.0.0.0, every interface. For the
+      same reason a host name's last label may not be all digits or start with 0x, so '0x0' is
+      refused too.
+
+      '%' is taken only before a numeric IPv6 zone, such as fe80::1%12. nssm expands %NAME% in the
+      stored arguments at start, and PowerShell 7's IPAddress.TryParse takes a named zone, such as
+      ::1%PATH%, so a named one would reach the service as more arguments.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    # ASCII only: [0-9], not \d, which matches other scripts' digits, and case-sensitive operators,
+    # because a case-insensitive [A-Za-z] also matches the Kelvin sign. Nine zone digits stay inside
+    # a uint32; IPAddress.TryParse silently drops a zone past it.
+    if ($Value -cnotmatch '^(?=.{1,253}\z)[A-Za-z0-9.:-]+(%[0-9]{1,9})?\z') { return $false }
+    $parsed = $null
+    if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) {
+        if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { return $true }
+        # No leading zero: the resolver reads '010' as octal.
+        return $Value -cmatch '^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}\z'
+    }
+    $label = '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    return $Value -cmatch "^($label\.)*(?![0-9]+\z)(?!0[xX])$label\z"
+}
+
+function Get-LockPathProblem {
+    <#
+      Why -LockConfigDir must not lock $Path, or "" when it may. Locking strips inherited access,
+      grants SYSTEM and Administrators full control and the service account read, and makes
+      Administrators the owner of everything below $Path (Set-SecureConfigAcl). So $Path must not be
+      a volume root, a junction or mounted folder, or a folder that holds or is any of $Holds, such
+      as the data directory or this checkout. With -NotWithin, it must also not be inside one of
+      those folders. With -OnlyFolders, every folder directly in $Path must be one of those: a
+      folder that also holds, say, a File connection's drop folders is not MessageFoundry's own,
+      and locking it would take the service's write access to them (vault BACKLOG #2626).
+
+      These compare the paths as written. An 8.3 short name or a substituted drive for one of
+      $Holds is not recognised.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Holds = @(),
+        [string[]]$NotWithin = @(),
+        [AllowNull()][string[]]$OnlyFolders = $null
+    )
+    $trimmed = $Path.TrimEnd('\')
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    if ($root -and $trimmed -eq $root.TrimEnd('\')) { return "it is the root of a volume" }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    # Unread, it cannot be shown not to be a junction, so it is not locked.
+    if (-not $item) { return "it does not exist or could not be read" }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        return "it is a junction, a link or a mounted volume"
+    }
+    $prefix = $trimmed + '\'
+    foreach ($kept in @($Holds | Where-Object { $_ })) {
+        if (($kept.TrimEnd('\') + '\').StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return "it holds '$kept'"
+        }
+    }
+    foreach ($outer in @($NotWithin | Where-Object { $_ })) {
+        if ($prefix.StartsWith($outer.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return "it is inside '$outer'"
+        }
+    }
+    if ($null -ne $OnlyFolders) {
+        $own = @($OnlyFolders | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
+        try {
+            $others = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction Stop |
+                Where-Object { $own -notcontains $_.FullName.TrimEnd('\') } | ForEach-Object { $_.Name })
+        } catch {
+            return "its folders could not be listed ($($_.Exception.Message))"
+        }
+        if ($others) { return "it holds other folders: $($others -join ', ')" }
+    }
+    return ""
+}
 
 # --- absolute paths, before anything consumes one (BACKLOG #1554) -----------------------------------
 # A service resolves a relative path against its own working directory, so every path baked into the
@@ -1266,19 +1463,77 @@ function Resolve-AbsolutePath {
 }
 
 $DataDir = Resolve-AbsolutePath $DataDir
-if (-not $AppExe) { $AppExe = Join-Path $RepoRoot ".venv\Scripts\messagefoundry.exe" }
-else { $AppExe = Resolve-AbsolutePath $AppExe }
+# With -PythonExe alone there is no launcher to name, and nothing below reads one.
+if ($UsesDefaultInstall) { $AppExe = Join-Path $DefaultInstallRoot "Scripts\messagefoundry.exe" }
+elseif ($AppExe) { $AppExe = Resolve-AbsolutePath $AppExe }
 # The interpreter the service runs (vault BACKLOG #2701). Named here, with the other paths, so it
 # is absolute before anything consumes it. Empty when none is found; refused below.
 if ($PythonExe) { $PythonExe = Resolve-AbsolutePath $PythonExe }
 else { $PythonExe = Get-EngineInterpreter -AppExe $AppExe }
-if (-not $Config) { $Config = Join-Path $RepoRoot "samples\config" }
-else { $Config = Resolve-AbsolutePath $Config }
+# No default (vault BACKLOG #2626). It used to be the checkout's samples\config: a demo graph, in a
+# folder its developers can write, run as the service account.
+if (-not $Config) {
+    throw ("Pass -Config with the config directory the service loads. It has no default: the old " +
+        "one was this checkout's samples\config, a demo graph (docs/SERVICE.md 'Install').")
+}
+$Config = Resolve-AbsolutePath $Config
+# The working directory: the install root for the default install, and the checkout for a passed
+# -AppExe, as before. -m resolves nothing against it either way: the service runs isolated (-I).
+$AppDirectory = if ($UsesDefaultInstall) { $DefaultInstallRoot } else { $RepoRoot }
+if ($ProjectRoot) { $ProjectRoot = Resolve-AbsolutePath $ProjectRoot }
+elseif ($UsesDefaultInstall) { $ProjectRoot = Split-Path -Parent $Config }
+# What `serve` resolves the value file and its default settings file under: -ProjectRoot, else
+# its working directory.
+$ValuesAnchor = if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }
+if ($ServiceConfig) { $ServiceConfig = Resolve-AbsolutePath $ServiceConfig }
+else { $ServiceConfig = Get-DefaultServiceConfig -Anchor $ValuesAnchor }
 # Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
 
 $NssmDir = Resolve-AbsolutePath $NssmDir
+
+# --- the service's command line, built before anything acts (vault BACKLOG #2626) --------------------
+# Built here, so a value it refuses stops the install before the NSSM copy below. -ListenHost goes
+# in unquoted, so it is checked; Format-QuotedPath refuses a path holding a double quote or '%'
+# (Assert-NoNssmExpansion says why).
+if (-not (Test-ListenHost $ListenHost)) {
+    throw ("invalid -ListenHost '$ListenHost': pass an IP address, such as 127.0.0.1, or a host " +
+        "name of letters, digits, hyphens and dots.")
+}
+$AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath) --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
+# Absolute, so the file the service reads does not depend on its working directory (vault BACKLOG
+# #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
+if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }
+if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
+# The paths stored outside the arguments: the log paths sit under -DataDir, and the SCM expands the
+# image path, which names nssm.exe in -NssmDir. An empty $PythonExe is refused further down.
+foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir)) { Assert-NoNssmExpansion $stored }
+
+# Before the lock check below, which would report a missing -Config only as a folder it cannot read.
+if (-not (Test-Path -LiteralPath $Config -PathType Container)) { throw "Config directory not found at: $Config" }
+
+# --- what -LockConfigDir may lock (vault BACKLOG #2626) ------------------------------------------------
+# Set-SecureConfigAcl re-owns everything below the folder it locks, so it must never reach these.
+# A -Config that holds one, or is a volume root or a junction, is refused here, before anything
+# acts. The value and settings folders are checked again where they are locked, below.
+if ($LockConfigDir) {
+    $LockKeepOut = @($DataDir, (Split-Path -Parent $DbPath), $NssmDir, $RepoRoot, $AppDirectory,
+        $(if ($PythonExe) { Split-Path -Parent $PythonExe }), $env:SystemRoot, $env:ProgramFiles,
+        ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:ProgramData,
+        # The profiles folder. PUBLIC sits in it whichever account runs this; USERPROFILE does not
+        # when that account is SYSTEM.
+        $(if ($env:PUBLIC) { Split-Path -Parent $env:PUBLIC }),
+        $(if ($env:USERPROFILE) { Split-Path -Parent $env:USERPROFILE }))
+    # Nothing under the Windows folder is a config folder.
+    $LockNotWithin = @($env:SystemRoot)
+    $configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut -NotWithin $LockNotWithin
+    if ($configLockProblem) {
+        throw ("-LockConfigDir will not lock the config directory '$Config': $configLockProblem. " +
+            "Point -Config at a dedicated folder (docs/SERVICE.md 'Lock down the config directory " +
+            "(CONFIG-2)').")
+    }
+}
 
 # AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
 # with that path, so a relative one would be resolved against a different directory later.
@@ -1287,8 +1542,29 @@ $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
 # The launcher only names the install, so it is required only while it is what finds the
 # interpreter. With -PythonExe the service's program is already named.
 if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path $AppExe)) {
-    throw ("Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, " +
-        "or pass -AppExe, or name the interpreter with -PythonExe.")
+    throw ("Engine executable not found at: $AppExe`nBuild the install root from the engine wheel " +
+        "(docs/SERVICE.md 'Install the engine where only administrators can write'), or pass " +
+        "-AppExe, or name the interpreter with -PythonExe.")
+}
+# The default root must be what its name says. A passed -AppExe is not checked here: refusing one a
+# broad principal can write would end most services run from a checkout, and that waits on an owner
+# ruling. `serve` reports such an install at every start.
+#
+# Get-NssmHomeProblem answers that question for any file, not only nssm.exe: who other than
+# administrators could replace it, through the file or any folder above it.
+#
+# The launcher only names the install. The interpreter is what the service runs and the engine
+# package is what it imports, so each is checked as well when it is there.
+if ($UsesDefaultInstall) {
+    $installFiles = @($AppExe, $PythonExe,
+        (Join-Path $DefaultInstallRoot "Lib\site-packages\messagefoundry\__init__.py"))
+    $installProblem = @($installFiles | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+        ForEach-Object { Get-NssmHomeProblem -File $_ } | Where-Object { $_ }) -join "; "
+    if ($installProblem) {
+        throw ("The default install root '$DefaultInstallRoot' is not administrator-only: " +
+            "$installProblem. Set its access list and owner as docs/SERVICE.md 'Install the " +
+            "engine where only administrators can write' shows, or pass -AppExe.")
+    }
 }
 # NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
 # install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in the
@@ -1300,7 +1576,9 @@ if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf))
         "messagefoundry.exe launcher. Pass -PythonExe with the python.exe of the install the " +
         "engine is in (docs/SERVICE.md 'The service launch').")
 }
-if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
+if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Leaf)) {
+    throw "Service settings file not found at: $ServiceConfig"
+}
 
 $LogDir   = Join-Path $DataDir "logs"
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -1313,7 +1591,6 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 
 $StdoutLog = Join-Path $LogDir "service.out.log"
 $StderrLog = Join-Path $LogDir "service.err.log"
-$AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
 
 # --- install -----------------------------------------------------------------
 
@@ -1365,8 +1642,13 @@ function Invoke-Nssm {
     # Built BEFORE the call, from the non-secret arguments only.
     $shown = @($NssmArgs)
     if ($hasSecret) { $shown += '<redacted>' }
+    # Each argument escaped for this host, so a quote or a trailing backslash reaches nssm as it
+    # is on Windows PowerShell 5.1 too (vault BACKLOG #2626).
+    $legacy = Test-LegacyNativeArgumentPassing
+    $sent = @($NssmArgs | ForEach-Object { ConvertTo-NativeArgument "$_" -Legacy:$legacy })
     $global:LASTEXITCODE = $null
-    if ($hasSecret) { & $NssmPath @NssmArgs $Secret } else { & $NssmPath @NssmArgs }
+    if ($hasSecret) { & $NssmPath @sent (ConvertTo-NativeArgument $Secret -Legacy:$legacy) }
+    else { & $NssmPath @sent }
     $exit = $LASTEXITCODE
     if ($null -eq $exit) {
         throw ("nssm $($shown -join ' ') failed (no exit code: '$NssmPath' did not run)")
@@ -1490,15 +1772,29 @@ if ($ServiceExisted) {
 try {
     Set-ServiceImage -ServiceName $ServiceName -Path $NssmPath
 } catch {
-    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-    throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled so it cannot start from an " +
-        "unchecked image. Remove it with .\uninstall-service.ps1 and re-run.")
+    $why = $_.Exception.Message
+    $disabled = Disable-RefusedService -ServiceName $ServiceName -Consequence "it cannot start from an unchecked image"
+    throw "$why $disabled Remove it with .\uninstall-service.ps1 and re-run."
 }
 
 # The interpreter, with the options in $AppParams ahead of `-m messagefoundry` (vault BACKLOG #2701).
 Invoke-Nssm set $ServiceName Application $PythonExe
 Invoke-Nssm set $ServiceName AppParameters $AppParams
-Invoke-Nssm set $ServiceName AppDirectory $RepoRoot
+# Read back what nssm stored, where the service reads it at each start. Invoke-Nssm's escaping
+# depends on how this host passes arguments, and a wrong guess would otherwise show only as a
+# service that fails at its first start (vault BACKLOG #2626). nssm stores it as an expandable
+# string, so it is read unexpanded. On a mismatch the service is set to Disabled first, as above.
+$storedParams = (Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters" `
+    -ErrorAction Stop).GetValue('AppParameters', $null, 'DoNotExpandEnvironmentNames')
+if ($storedParams -cne $AppParams) {
+    $disabled = Disable-RefusedService -ServiceName $ServiceName -Consequence "it cannot start with arguments other than these"
+    # Only a legacy host is a cause that a newer PowerShell fixes.
+    $advice = if (Test-LegacyNativeArgumentPassing) { "Re-run this installer from PowerShell 7.3 or later." }
+              else { "This host already escapes arguments for nssm, so re-running from it will not help; report both strings as an installer defect." }
+    throw ("nssm stored the service's arguments as [$storedParams], not [$AppParams], so this host " +
+        "passed them to nssm differently from what the installer expected. $disabled $advice")
+}
+Invoke-Nssm set $ServiceName AppDirectory $AppDirectory
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"
 Invoke-Nssm set $ServiceName Description "MessageFoundry HL7 v2 integration engine."
 Invoke-Nssm set $ServiceName Start SERVICE_AUTO_START
@@ -1674,8 +1970,42 @@ if ($ServiceAccount) {
 # satisfying the in-process guard that refuses a config dir/module any low-privilege principal can write.
 # Without the switch we stay additive and WARN that the guard will refuse to load if an inherited write
 # ACE survives.
+# The folders `serve` checks at start besides -Config, each with the file in it: the value file's
+# and the settings file's (vault BACKLOG #2626). The value folder is the default name only: a
+# settings file that renames [environments].dir moves the value file, and the installer does not
+# read the settings.
+$ValueFolder = Join-Path $ValuesAnchor "environments"
+$StartFolders = @()
+if (Test-Path -LiteralPath $ValueFolder -PathType Container) {
+    $StartFolders += [pscustomobject]@{ Path = $ValueFolder; NotWithin = @(); OnlyFolders = $null }
+}
+# The settings file's folder is wherever that file sits, and locking it reaches every folder below
+# it. So it is locked only when it is MessageFoundry's own: Get-LockPathProblem's checks, not in
+# the checkout, and holding no folder but -Config and the value folder. The value folder may sit
+# in the checkout, as the config directory may: it is a folder of its own by name, and the
+# windows-service-smoke CI leg locks the checkout's environments\ this way.
+if ($ServiceConfig) {
+    $StartFolders += [pscustomobject]@{
+        Path = (Split-Path -Parent $ServiceConfig); NotWithin = @($RepoRoot); OnlyFolders = @($Config, $ValueFolder)
+    }
+}
+$StartFolders = @($StartFolders | Where-Object { $_.Path.TrimEnd('\') -ne $Config.TrimEnd('\') })
+$UnlockedFolders = @()
 if ($LockConfigDir) {
-    Set-SecureConfigAcl -Path $Config -Account $ServiceAccount
+    $LockPaths = @($Config)
+    foreach ($folder in $StartFolders) {
+        $problem = Get-LockPathProblem -Path $folder.Path -Holds $LockKeepOut `
+            -NotWithin (@($folder.NotWithin) + $LockNotWithin) -OnlyFolders $folder.OnlyFolders
+        if ($problem) { $UnlockedFolders += "'$($folder.Path)' ($problem)" }
+        else { $LockPaths += $folder.Path }
+    }
+    foreach ($LockPath in $LockPaths) {
+        Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount
+    }
+    if ($LockPaths.Count -gt 1) {
+        Write-Host ("  Start  : " + (($LockPaths | Select-Object -Skip 1 | ForEach-Object { "'$_'" }) -join ", ") +
+            " locked the same way (vault BACKLOG #2626).")
+    }
     $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
                    else { "SYSTEM/Administrators (F)" }
     Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."
@@ -1690,7 +2020,16 @@ if ($LockConfigDir) {
         "write/modify on the dir or any *.py in it, AND separately if the dir's owner is neither the " +
         "run-as account nor an administrator it can resolve. Re-run with -LockConfigDir (which sets " +
         "both), or point -Config at a dedicated admin-owned dir; see docs/SERVICE.md " +
-        "'Restrict the config directory'.")
+        "'Lock down the config directory (CONFIG-2)'.")
+    $UnlockedFolders = @($StartFolders | ForEach-Object { "'$($_.Path)'" })
+}
+# The same two criteria as the config dir, for each start folder left as it was.
+if ($UnlockedFolders) {
+    Write-Warning ("This installer did not lock " + ($UnlockedFolders -join ", ") + ". 'serve' " +
+        "checks the settings file and the value file at start, each with its folder, and refuses to " +
+        "start when an account other than SYSTEM, an administrator or the run-as account can write " +
+        "one, AND separately when one's owner is neither the run-as account nor an administrator. " +
+        "Restrict them as docs/SERVICE.md 'Lock down the config directory (CONFIG-2)' shows.")
 }
 if ($ServiceAccount) {
     Write-Host "  ACLs   : granted read on '$Config'; read/write on '$DataDir' (docs/SERVICE.md)."

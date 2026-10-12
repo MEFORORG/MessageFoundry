@@ -286,3 +286,73 @@ def with_pbmac1(pfx: bytes, passphrase: bytes, *, iterations: int, prf: str = "s
     )
     mac_data = seq(seq(seq(oid(PBMAC1), params), octets(signer.finalize())), octets(b"\x00" * 8))
     return seq(head, mac_data)
+
+
+# --- hand-built PKCS#12 parts (BACKLOG #1352, key bags inside an encrypted part) ----------------
+
+PKCS7_DATA = "1.2.840.113549.1.7.1"
+PKCS7_ENCRYPTED_DATA = "1.2.840.113549.1.7.6"
+SHROUDED_KEY_BAG = "1.2.840.113549.1.12.10.1.2"
+CERT_BAG = "1.2.840.113549.1.12.10.1.3"
+X509_CERT = "1.2.840.113549.1.9.22.1"
+
+
+def shrouded_key_bag(epki_der: bytes) -> bytes:
+    """A SafeBag holding an EncryptedPrivateKeyInfo, with no attributes."""
+    return seq(oid(SHROUDED_KEY_BAG), tlv(0xA0, epki_der))
+
+
+def cert_bag(cert: x509.Certificate) -> bytes:
+    """A SafeBag holding one X.509 certificate, with no attributes. OpenSSL pairs it with the key
+    by checking the key against it, so no localKeyID is needed."""
+    der = cert.public_bytes(serialization.Encoding.DER)
+    return seq(oid(CERT_BAG), tlv(0xA0, seq(oid(X509_CERT), tlv(0xA0, octets(der)))))
+
+
+def data_part(*bags: bytes) -> bytes:
+    """A clear ContentInfo of type Data over a SafeContents of ``bags``."""
+    return seq(oid(PKCS7_DATA), tlv(0xA0, octets(seq(*bags))))
+
+
+def encrypted_part(
+    *bags: bytes,
+    passphrase: bytes,
+    iterations: int,
+    prf: str = "sha512",
+    cipher: tuple[str, int] = (AES256_CBC, 32),
+    kdf: bytes | None = None,
+    key_length_field: int | None = None,
+    content_type: str = PKCS7_DATA,
+    content_tag: int = 0x80,
+) -> bytes:
+    """An EncryptedData ContentInfo over a SafeContents of ``bags``: PBES2, PBKDF2 over ``prf``,
+    AES-CBC, keyed by the passphrase's own bytes, as OpenSSL keys PBES2 inside PKCS#12.
+
+    ``kdf`` replaces the KeyDerivationFunc AlgorithmIdentifier, for a derivation this module does
+    not compute; the ciphertext is then still the PBKDF2 one, which nothing decrypts.
+    ``key_length_field`` writes PBKDF2's optional keyLength INTEGER with that value.
+    ``content_type`` and ``content_tag`` bend the EncryptedContentInfo, for the refusal tests."""
+    cipher_oid, key_length = cipher
+    salt, iv = os.urandom(16), os.urandom(16)
+    prf_oid, digest = PRF[prf]
+    derived = PBKDF2HMAC(
+        algorithm=digest, length=key_length, salt=salt, iterations=iterations
+    ).derive(passphrase)
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(seq(*bags)) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(derived), modes.CBC(iv)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    length = b"" if key_length_field is None else integer(key_length_field)
+    kdf_der = kdf or seq(
+        oid(PBKDF2), seq(octets(salt), integer(iterations), length, seq(oid(prf_oid), NULL))
+    )
+    algorithm = seq(oid(PBES2), seq(kdf_der, seq(oid(cipher_oid), octets(iv))))
+    encrypted_content_info = seq(oid(content_type), algorithm, tlv(content_tag, ciphertext))
+    return seq(oid(PKCS7_ENCRYPTED_DATA), tlv(0xA0, seq(integer(0), encrypted_content_info)))
+
+
+def pfx_of(*parts: bytes, passphrase: bytes) -> bytes:
+    """A version-3 PFX over ``parts`` with a PBMAC1 MAC, PBKDF2-HMAC-SHA-512 at its 210,000 floor,
+    keyed by ``passphrase``."""
+    auth_safe = seq(oid(PKCS7_DATA), tlv(0xA0, octets(seq(*parts))))
+    return with_pbmac1(seq(integer(3), auth_safe), passphrase, iterations=210_000, prf="sha512")

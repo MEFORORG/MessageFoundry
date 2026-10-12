@@ -36,6 +36,7 @@ __all__ = [
     "is_drive_relative",
     "load_environment_values",
     "resolve_values_base_dir",
+    "values_file_path",
 ]
 
 #: Env-var prefix for environment values (esp. secrets): MEFOR_VALUE_EPIC_HOST -> key "epic_host".
@@ -89,6 +90,14 @@ def resolve_values_base_dir(base_dir: str, *, cwd: Path) -> Path:
     return cwd / base_dir
 
 
+def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> Path:
+    """The value file :func:`load_environment_values` reads, ``<base_dir>/<dir_name>/<env>.toml``.
+
+    One rule, so the ``serve`` and ``supervise`` start checks vet the file the load reads (vault
+    BACKLOG #2626)."""
+    return Path(base_dir) / dir_name / f"{environment}.toml"
+
+
 def load_environment_values(
     *,
     base_dir: str | Path,
@@ -104,7 +113,7 @@ def load_environment_values(
     """
     values: dict[str, Any] = {}
 
-    path = Path(base_dir) / dir_name / f"{environment}.toml"
+    path = values_file_path(base_dir, dir_name, environment)
     if path.is_file():
         with path.open("rb") as fh:
             data = tomllib.load(fh)

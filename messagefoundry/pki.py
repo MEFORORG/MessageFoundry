@@ -22,13 +22,20 @@ from dataclasses import dataclass
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes, padding, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 
-from messagefoundry.keywrap import refuse_weak_pkcs12
+from messagefoundry.keywrap import (
+    Pkcs12EncryptedPart,
+    pkcs12_encrypted_parts,
+    refuse_weak_pkcs12,
+    refuse_weak_pkcs12_contents,
+)
 
 __all__ = [
     "CertFacts",
@@ -87,15 +94,53 @@ def load_pkcs12(
     Before anything decrypts it, the bundle's MAC and bag encryption are checked (BACKLOG #1352,
     #1171): a weak or unreadable wrap, a MAC that is not PBMAC1 at the floor even over unencrypted
     bags, or a bundle that is encrypted or carries a MAC with no passphrase, raises
-    :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is safe to show."""
+    :class:`~messagefoundry.keywrap.KeyWrapRefused`, whose text is safe to show.
+
+    Then each encrypted part is opened here and the key bags inside it get the same check, before
+    ``cryptography`` decrypts any key (BACKLOG #1352; why the part is opened rather than refused is
+    recorded beside :func:`~messagefoundry.keywrap.pkcs12_encrypted_parts`). A wrong passphrase
+    usually fails that decryption with a ``ValueError``, as it would in ``cryptography``; about
+    once in 256 tries it leaves valid padding, and the refusal then tells the operator to check
+    ``MEFOR_PFX_PASSWORD``."""
+    setting, unlock_setting = "the --pfx bundle", "MEFOR_PFX_PASSWORD"
     refuse_weak_pkcs12(
         pfx_bytes,
-        setting="the --pfx bundle",
-        unlock_setting="MEFOR_PFX_PASSWORD",
+        setting=setting,
+        unlock_setting=unlock_setting,
         passphrase_given=password is not None,
     )
+    # With no passphrase the check above has already refused any bundle with an encrypted part.
+    if password is not None:
+        for part in pkcs12_encrypted_parts(pfx_bytes, setting=setting):
+            refuse_weak_pkcs12_contents(
+                _decrypt_part(part, password), setting=setting, unlock_setting=unlock_setting
+            )
     key, cert, cas = pkcs12.load_key_and_certificates(pfx_bytes, password)
     return key, cert, list(cas)
+
+
+#: The PBKDF2 PRFs a PKCS#12 part may use, by OID. ``keywrap`` hands over only the ones its floor
+#: table approves; a test pins this map to that table's keys.
+_PART_PRF: dict[str, type[hashes.SHA256] | type[hashes.SHA512]] = {
+    "1.2.840.113549.2.9": hashes.SHA256,  # hmacWithSHA256
+    "1.2.840.113549.2.11": hashes.SHA512,  # hmacWithSHA512
+}
+
+
+def _decrypt_part(part: Pkcs12EncryptedPart, password: bytes) -> bytes:
+    """The SafeContents inside one PBES2 AES-CBC part. PBES2 inside PKCS#12 is keyed by the
+    passphrase's own bytes, not the BMPString the PKCS#12 KDF uses. Raises ``ValueError`` when the
+    ciphertext or its padding is wrong, which is what a wrong passphrase usually gives."""
+    derived = PBKDF2HMAC(
+        algorithm=_PART_PRF[part.prf](),
+        length=part.key_length,
+        salt=part.salt,
+        iterations=part.iterations,
+    ).derive(password)
+    decryptor = Cipher(algorithms.AES(derived), modes.CBC(part.iv)).decryptor()
+    padded = decryptor.update(part.ciphertext) + decryptor.finalize()
+    unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
 
 
 def cert_to_pem(cert: x509.Certificate) -> bytes:
