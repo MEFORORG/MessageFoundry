@@ -6,15 +6,17 @@ importing the api package's pure models must not drag the server into a GUI proc
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from functools import cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
@@ -102,9 +104,14 @@ def _imported_modules(path: Path, root: Path, *, with_names: bool = False) -> se
     allowlist below does, because an allowlist must see exactly which submodule a line reaches
     (BACKLOG #1596).
     """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return _modules_imported_by(tree, _package_of(path, root), with_names=with_names)
+
+
+def _modules_imported_by(tree: ast.AST, package: str, *, with_names: bool = False) -> set[str]:
+    """`_imported_modules` over a tree already parsed, for a file in the dotted ``package``."""
     mods: set[str] = set()
-    package = _package_of(path, root)
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             mods.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -1493,37 +1500,61 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
     assert _files_naming_the_toolkit(engine) == (["messagefoundry/planted.py"], 2)
 
 
-# --- No walked source file looks like it imports the anon package (follows PR 2024) -------------
+# --- No walked source file imports the anon package, or looks like it does (follows PR 2024) ----
 #
-# No file in the source trees this test walks imports `messagefoundry.anon` today. Those trees are
-# at least `messagefoundry/`, `harness/` and `scripts/`. The tee carries its own copy of the
-# package, and the harness capture sink is handed a plain str-to-str `anonymizer`. `tests/` and
-# `tee/` are not walked, and tests import the package freely.
+# No file in the source trees this test walks imports `messagefoundry.anon` today, outside the
+# package itself. Those trees are at least `messagefoundry/`, `harness/` and `scripts/`. The tee
+# carries its own copy of the package, and the harness capture sink is handed a plain str-to-str
+# `anonymizer`. `tests/` and `tee/` are not walked, and tests import the package freely.
 #
-# This test holds that state with a search of source TEXT. So a docstring example or a comment
-# that looks like an import counts exactly as a real import does. The `CaptureSink` docstring in
-# `harness/` once opened its example with two such lines, with no import anywhere in those trees.
-# The fix for a line like that is to name the package in a sentence.
+# TWO SEARCHES HOLD THAT STATE, because each sees what the other misses.
 #
-# A REAL import is a different matter. ADR 0030 section 1 allows the harness to import the package
-# directly, and nothing does yet. A real import would end the state this test holds, so the
-# failure message asks for it to be reported and not reworded away.
+# The first searches source TEXT with one pattern, the one the record's verifier uses. So a
+# docstring example or a comment that looks like an import counts exactly as a real import does.
+# The `CaptureSink` docstring in `harness/` once opened its example with two such lines, with no
+# import anywhere in those trees. The fix for a line like that is to name the package in a
+# sentence. Do not change the pattern to make a hit go away. Change the text.
 #
-# This test reuses the source walk in `scripts/asvs/scorecard.py` and keeps no copy of it, so its
-# trees and its view of each cannot drift from that module's. The view is raw text under
-# `harness/` and `messagefoundry/`, for two, and comments and strings blanked under `scripts/`. A
-# `harness/`-only walk would miss the same two lines in a docstring under `messagefoundry/`.
+# The second parses each file and reads its imports. It sees at least the shapes the pattern does
+# not spell: a relative import such as `from ..anon import Keyer`, `import os, messagefoundry.anon`,
+# a `from messagefoundry import (` wrapped over several lines, two spaces after `from`, and an
+# `importlib.import_module` or `__import__` call given the name as a literal. It cannot see a
+# docstring or a comment, which is why the text search stays.
 #
-# WHAT THIS DOES NOT SEE. It is a text search for one pattern. An import the pattern does not
-# spell passes it. That is at least a relative import such as `from .anon import Keyer`,
-# `importlib.import_module("messagefoundry.anon")`, `import os, messagefoundry.anon`, a
-# `from messagefoundry import (` wrapped over several lines, and two spaces after `from`.
+# WHAT NEITHER SEES. At least an import whose name is built at run time, an `exec` of source text,
+# and any file outside the walked trees.
 #
-# Do not change the pattern to make a hit go away. Change the text.
+# A REAL import is a different matter from a line that only looks like one. ADR 0030 section 1
+# allows the harness to import the package directly, and nothing does yet. A real import would end
+# the state this test holds, and which side gives way then is an open owner question. So the
+# failure messages ask for it to be raised and not reworded away.
+#
+# THE PACKAGE'S OWN FILES. The claim is about files outside `messagefoundry/anon/`, and the package
+# imports its own modules, so the parse reports nothing there. It counts those imports instead, as
+# its positive control on the real tree. The text search does report there. The verifier reads the
+# package's files with the same pattern and skips nothing, so a hit there reads the claim FALSE as
+# surely as one anywhere else. It gets its own message.
+#
+# IF THE PACKAGE MOVES. ADR 0201 section 5 moves it to `messagefoundry_toolkit/anon/` (BACKLOG
+# #1192). After that, nothing can import `messagefoundry.anon`, and both searches would pass on
+# nothing. So the real-tree tests fail first when the package directory is gone.
+#
+# Both searches read the files the source walk in `scripts/asvs/scorecard.py` reads, through that
+# module's own per-file view, and keep no copy of its walk. The view is raw text under `harness/`
+# and `messagefoundry/`, and comments and strings blanked under `scripts/`. A `harness/`-only walk
+# would miss the same two lines in a docstring under `messagefoundry/`.
 
 _ANON_IMPORT = re.compile(
     r"(from|import) messagefoundry\.anon\b|from messagefoundry import [^\n]*\banon\b"
 )
+
+#: The dotted package both searches are about, and the directory it lives in.
+_ANON_MODULE = "messagefoundry.anon"
+_ANON_PACKAGE_DIR = PurePosixPath(*_ANON_MODULE.split("."))
+
+#: A file outside the package can import it only by naming ``anon`` as a whole word, whether as
+#: ``messagefoundry.anon``, ``..anon`` or ``import anon``. So a file without it is not parsed.
+_ANON_WORD = re.compile(r"\banon\b")
 
 #: One line per shape the pattern exists to catch. The test searches these first, so a pattern
 #: edited until it matches nothing fails there, before a clean tree can pass it.
@@ -1545,73 +1576,274 @@ _ANON_DOCSTRING_PLANT = (
     '    """\n'
 )
 
-#: The fewest files the real walk must read before a clean verdict means anything. About half the
-#: census of 583 taken when this was written, for the reason `_MIN_FILES_WALKED` gives.
-_MIN_ANON_SEARCH_FILES = 290
+#: The fewest `.py` files the real walk must read under each root before a clean verdict means
+#: anything. About half the census taken at 60647bb242 (messagefoundry 334, harness 147, scripts
+#: 79), for the reason `_MIN_FILES_WALKED` gives. One floor per root, because one total floor still
+#: passes with a whole root gone: losing all of `harness/` left 436 files over a total floor of 290.
+#: `_guarded_anon_search` holds them, so no test reads the search without them.
+_MIN_ANON_SEARCH_FILES: Mapping[str, int] = MappingProxyType(
+    {"messagefoundry": 160, "harness": 70, "scripts": 40}
+)
+
+#: Shared by every failure that may be a real import, and so put first in each.
+_REAL_ANON_IMPORT_ADVICE = (
+    "If a hit is a REAL import, do not reword, move or delete it to get green. ADR 0030 section 1 "
+    "allows the harness to import the package, while the record's absence claim says no file "
+    "outside the package imports it. Which one gives way is an open owner question, BACKLOG #3006 "
+    "part 3. Stop and raise the import with the owner there."
+)
 
 
-def _places_reading_as_an_anon_import(root: Path) -> tuple[list[str], int]:
-    """Each ``path:line`` the pattern matches in the source walk under ``root``, and the number of
-    files that walk read.
+class _AnonSearch(NamedTuple):
+    """What the two anon searches found under one root, and how many `.py` files they read."""
 
-    The texts come from `_absence_corpus`, which blanks comments and strings in the `.py` files
-    under `scripts/`. It returns no paths, so the paths come from a second `_absence_sources` call
-    over the same tree, paired by position. Only the `.py` files count, in the matches and in the
-    number read: the pattern is a Python import, and `_MIN_ANON_SEARCH_FILES` was set from a census
-    of Python files, so the corpus's TypeScript, JavaScript and PowerShell must not pad it.
+    #: ``path:line`` text hits outside the package.
+    outside: tuple[str, ...]
+    #: ``path:line`` text hits in the package's own files.
+    inside: tuple[str, ...]
+    #: ``path: module`` parsed imports of the package, outside it.
+    imports: tuple[str, ...]
+    #: Parsed imports of the package inside it: its own relative imports, which the real tree
+    #: always has. A zero there means the parse resolves nothing.
+    own_imports: int
+    #: `.py` files read, by top-level directory.
+    read: Mapping[str, int]
+
+
+def _anon_pattern_texts(root: Path) -> list[tuple[PurePosixPath, str, str]]:
+    """Each `.py` file the absence corpus reads under ``root``: its path relative to ``root``, its
+    raw text, and the text the pattern reads.
+
+    Each file is paired with its own text through the corpus's per-file view, `_pattern_view`,
+    never by position against a second walk. The texts are then compared with `_absence_corpus`'s
+    as a multiset, so a change to the corpus's view rule fails here rather than drifting. Only the
+    `.py` files are kept: the pattern is a Python import, and the floors were set from a census of
+    Python files, so the corpus's TypeScript, JavaScript and PowerShell must not pad them.
     """
-    sources = scorecard._absence_sources(root)
-    _raw, all_texts, _viewed = scorecard._absence_corpus(root)
-    paired = [(p, t) for p, t in zip(sources, all_texts, strict=True) if p.suffix == ".py"]
-    pattern_texts = [t for _p, t in paired]
-    places: list[str] = []
-    for path, text in paired:
-        rel = path.relative_to(root).as_posix()
-        # The whole text at once. `splitlines` would cut at a form feed, which the pattern's
+    files: list[tuple[PurePosixPath, str, str]] = []
+    for path in scorecard._absence_sources(root):
+        rel = PurePosixPath(path.relative_to(root).as_posix())
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        got = scorecard._pattern_view(rel, raw)
+        # `_absence_corpus`'s rule: a view that stopped early gives way to the raw text.
+        files.append((rel, raw, got[0] if got is not None and got[1] is None else raw))
+    _raw, corpus_texts, _viewed = scorecard._absence_corpus(root)
+    assert Counter(text for _rel, _raw, text in files) == Counter(corpus_texts), (
+        "the per-file view here no longer gives the texts `_absence_corpus` gives, so this test "
+        "would grade something the verifier does not; follow the corpus's view rule here"
+    )
+    return [file for file in files if file[0].suffix == ".py"]
+
+
+def _parsed_anon_imports(rel: PurePosixPath, source: str) -> list[str]:
+    """Each module the file at ``rel``, whose text is ``source``, imports from the anon package.
+
+    The import statements are read as `_imported_modules` reads them, so a relative import is
+    resolved against the file's own package. A call to ``import_module`` or ``__import__`` counts
+    when its name is a literal, resolved against a literal ``package`` if it is relative.
+    """
+    tree = ast.parse(source)
+    named = _modules_imported_by(tree, ".".join(rel.parent.parts))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        match node.func:
+            case ast.Attribute(attr=callee) | ast.Name(id=callee):
+                pass
+            case _:
+                continue
+        first = node.args[0]
+        if callee not in ("import_module", "__import__") or not (
+            isinstance(first, ast.Constant) and isinstance(first.value, str)
+        ):
+            continue
+        name: str = first.value
+        if name.startswith("."):
+            given = node.args[1:2] or [k.value for k in node.keywords if k.arg == "package"]
+            if not (
+                given and isinstance(given[0], ast.Constant) and isinstance(given[0].value, str)
+            ):
+                continue
+            name = importlib.util.resolve_name(name, given[0].value)
+        named.add(name)
+    return sorted(m for m in named if _is_forbidden(m, (_ANON_MODULE,)))
+
+
+def _anon_search(root: Path) -> _AnonSearch:
+    """Run both anon searches over the source walk under ``root``."""
+    outside: list[str] = []
+    inside: list[str] = []
+    imports: list[str] = []
+    own_imports = 0
+    read: Counter[str] = Counter()
+    for rel, raw, text in _anon_pattern_texts(root):
+        read[rel.parts[0]] += 1
+        in_package = rel.is_relative_to(_ANON_PACKAGE_DIR)
+        # Every match of the pattern spells `anon`, and the substring test skips most of the walk.
+        # The whole text at once: `splitlines` would cut at a form feed, which the pattern's
         # `[^\n]*` can cross.
-        places.extend(
-            f"{rel}:{text.count('\n', 0, match.start()) + 1}"
-            for match in _ANON_IMPORT.finditer(text)
+        if "anon" in text:
+            (inside if in_package else outside).extend(
+                f"{rel}:{text.count('\n', 0, match.start()) + 1}"
+                for match in _ANON_IMPORT.finditer(text)
+            )
+        # The package's own files are always parsed: their imports of each other do not spell
+        # `anon`, and they are the parse's positive control on the real tree.
+        if in_package:
+            own_imports += len(_parsed_anon_imports(rel, raw))
+        elif "anon" in raw and _ANON_WORD.search(raw):
+            imports.extend(f"{rel}: {module}" for module in _parsed_anon_imports(rel, raw))
+    return _AnonSearch(
+        tuple(sorted(outside)),
+        tuple(sorted(inside)),
+        tuple(sorted(imports)),
+        own_imports,
+        MappingProxyType(dict(read)),
+    )
+
+
+def _guarded_anon_search(
+    root: Path, floors: Mapping[str, int] = _MIN_ANON_SEARCH_FILES
+) -> _AnonSearch:
+    """Both searches under ``root``, refused unless they reached what they grade.
+
+    The checks sit here and not in a sibling test, so a `-k` that selects only an absence test
+    still runs them; `_engine_scan` says why.
+    """
+    assert floors and min(floors.values()) >= _MIN_FLOOR, (
+        f"every anon search floor must be at least {_MIN_FLOOR}, or it passes a walk that reached "
+        f"nothing: {dict(floors)}"
+    )
+    assert (root / _ANON_PACKAGE_DIR / "__init__.py").is_file(), (
+        f"{_ANON_PACKAGE_DIR}/ is gone, so no file can import {_ANON_MODULE} and the anon "
+        f"searches would pass on nothing. ADR 0201 section 5 moves the package to "
+        f"messagefoundry_toolkit/anon/ (BACKLOG #1192). Re-point or retire these tests together "
+        f"with the record's absence claim on that row; do not just delete this check."
+    )
+    search = _anon_search(root)
+    for top, floor in floors.items():
+        got = search.read.get(top, 0)
+        assert got >= floor, (
+            f"the source walk read only {got} `.py` files under {top}/, under the floor of "
+            f"{floor} -- it is not reaching that tree"
         )
-    return places, len(pattern_texts)
+    assert search.own_imports, (
+        f"the parse resolved none of {_ANON_PACKAGE_DIR}/'s own imports of its modules, so it "
+        f"cannot be trusted to see an import of the package anywhere else"
+    )
+    return search
 
 
-def test_no_walked_source_file_looks_like_it_imports_the_anon_package(tmp_path: Path) -> None:
+@cache
+def _real_anon_search() -> _AnonSearch:
+    return _guarded_anon_search(_REPO)
+
+
+def test_the_anon_guard_refuses_each_tree_it_exists_to_refuse(tmp_path: Path) -> None:
+    floors = {"harness": _MIN_FLOOR, "messagefoundry": _MIN_FLOOR}
+    for top, files in (("harness", _MIN_FLOOR), ("messagefoundry", _MIN_FLOOR - 1)):
+        (tmp_path / top).mkdir()
+        for i in range(files):
+            (tmp_path / top / f"m{i}.py").write_text("import json\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="ADR 0201 section 5"):
+        _guarded_anon_search(tmp_path, floors)
+
+    package = tmp_path / _ANON_PACKAGE_DIR / "__init__.py"
+    package.parent.mkdir()
+    package.write_text("", encoding="utf-8")
+    with pytest.raises(AssertionError, match="resolved none"):
+        _guarded_anon_search(tmp_path, floors)
+
+    package.write_text("from .keying import Keyer\n", encoding="utf-8")
+    assert _guarded_anon_search(tmp_path, floors).read == floors
+    with pytest.raises(AssertionError, match="under the floor"):
+        _guarded_anon_search(tmp_path, {**floors, "scripts": _MIN_FLOOR})
+    with pytest.raises(AssertionError, match="must be at least"):
+        _guarded_anon_search(tmp_path, {"harness": _MIN_FLOOR - 1})
+
+
+def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
     # tests/test_vacuous_absence_assert_lint.py wants a non-empty source before an empty result.
     assert _ANON_IMPORT_SHAPES
     silent = [shape for shape in _ANON_IMPORT_SHAPES if not _ANON_IMPORT.search(shape)]
     assert not silent, f"the pattern no longer matches these import shapes: {silent}"
 
-    # The control, through the same walk that grades the real tree. The docstring is seen under
+    # The controls go through the same walk that grades the real tree. The docstring is seen under
     # `harness/` and `messagefoundry/`, which the walk reads raw. Under `scripts/` the walk blanks
-    # strings, so the same docstring there is not a hit, and it must not become one here.
-    for planted in ("harness/reconcile/capture.py", "messagefoundry/x.py", "scripts/tool.py"):
+    # strings, so the docstring there is not a hit, while a real import there still is. Each
+    # parse-only plant is a shape the pattern does not spell, so the text search must stay silent
+    # on it. The package's own files are text-searched and not parsed for a violation.
+    plants = {
+        "harness/reconcile/capture.py": _ANON_DOCSTRING_PLANT,
+        "messagefoundry/x.py": _ANON_DOCSTRING_PLANT,
+        "scripts/tool.py": _ANON_DOCSTRING_PLANT,
+        "scripts/live.py": "from messagefoundry.anon import Keyer\n",
+        "harness/clean.py": "import json\n",
+        "harness/joined.py": "import os, messagefoundry.anon\n",
+        "harness/spaced.py": "from  messagefoundry.anon import Keyer\n",
+        "harness/call_rel.py": 'import_module(".anon", package="messagefoundry")\n',
+        "messagefoundry/sub/rel.py": "from ..anon import Keyer\n",
+        "messagefoundry/call.py": 'importlib.import_module("messagefoundry.anon.leak")\n',
+        "scripts/wrapped.py": "from messagefoundry import (\n    parsing,\n    anon,\n)\n",
+        "messagefoundry/anon/__init__.py": (
+            '"""Use it as::\n\n    from messagefoundry.anon import Keyer\n"""\n'
+            "from .keying import Keyer\n"
+        ),
+    }
+    for planted, text in plants.items():
         target = tmp_path / planted
-        target.parent.mkdir(parents=True)
-        target.write_text(_ANON_DOCSTRING_PLANT, encoding="utf-8")
-    (tmp_path / "harness" / "clean.py").write_text("import json\n", encoding="utf-8")
-    seen, planted_read = _places_reading_as_an_anon_import(tmp_path)
-    assert (sorted(seen), planted_read) == (
-        [
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    assert _anon_search(tmp_path) == (
+        (
             "harness/reconcile/capture.py:4",
             "harness/reconcile/capture.py:5",
             "messagefoundry/x.py:4",
             "messagefoundry/x.py:5",
-        ],
-        4,
+            "scripts/live.py:1",
+        ),
+        ("messagefoundry/anon/__init__.py:3",),
+        (
+            "harness/call_rel.py: messagefoundry.anon",
+            "harness/joined.py: messagefoundry.anon",
+            "harness/spaced.py: messagefoundry.anon",
+            "messagefoundry/call.py: messagefoundry.anon.leak",
+            "messagefoundry/sub/rel.py: messagefoundry.anon",
+            "scripts/live.py: messagefoundry.anon",
+            "scripts/wrapped.py: messagefoundry.anon",
+        ),
+        1,
+        {"harness": 5, "messagefoundry": 4, "scripts": 3},
     )
 
-    places, read = _places_reading_as_an_anon_import(_REPO)
-    assert read >= _MIN_ANON_SEARCH_FILES, (
-        f"the source walk read only {read} files, under the floor of {_MIN_ANON_SEARCH_FILES} -- "
-        f"it is not reaching the tree"
+
+def test_the_anon_searches_reach_every_root_they_grade() -> None:
+    # A named reporter for the guard: every real-tree test below runs it too.
+    _real_anon_search()
+
+
+def test_no_walked_source_file_looks_like_it_imports_the_anon_package() -> None:
+    search = _real_anon_search()
+    assert not search.outside, (
+        f"{len(search.outside)} place(s) in the walked source trees look like an import of "
+        f"{_ANON_MODULE}: {list(search.outside)}. {_REAL_ANON_IMPORT_ADVICE} If a hit is docstring "
+        f"or comment text, name the package in a sentence instead (`Keyer` is in the "
+        f"`messagefoundry.anon` package), and start the example at its first call. This search "
+        f"reads source text, so text shaped like an import counts as one."
     )
-    assert not places, (
-        f"{len(places)} place(s) in the walked source trees look like an import of "
-        f"messagefoundry.anon: {places}. No file in those trees imports that package today, and "
-        f"this test holds that with a search of source text. So a docstring example or a comment "
-        f"counts as an import. Name the package in a sentence instead (`Keyer` is in the "
-        f"`messagefoundry.anon` package), and start the example at its first call. If the line is "
-        f"a REAL import, do not reword it and do not remove it quietly: report it, because it "
-        f"ends the state this test holds."
+    assert not search.inside, (
+        f"{len(search.inside)} place(s) in {_ANON_PACKAGE_DIR}/ read as an import of the package "
+        f"itself: {list(search.inside)}. The record's verifier reads the package's own files with "
+        f"this same pattern and skips nothing, so these read its absence claim FALSE. Import a "
+        f"sibling module relatively (`from .keying import Keyer`), and keep import-shaped lines "
+        f"out of the package's docstrings and comments."
+    )
+
+
+def test_no_walked_source_file_imports_the_anon_package() -> None:
+    search = _real_anon_search()
+    assert not search.imports, (
+        f"{len(search.imports)} import(s) of {_ANON_MODULE} outside {_ANON_PACKAGE_DIR}/: "
+        f"{list(search.imports)}. {_REAL_ANON_IMPORT_ADVICE}"
     )
