@@ -1173,9 +1173,9 @@ def apply_connection_tls_ciphers(
         raise EngineTlsListRefused(f"{connector}: {exc}") from exc
     except (ValueError, ssl.SSLError) as exc:
         if ciphers is None:
-            # No operator string is set, so nothing may read as "tls_ciphers rejected" (BACKLOG
-            # #3096). Latent: the narrow raises only EngineTlsListRefused today.
-            raise
+            # No operator string is set, so the connector is named without "tls_ciphers rejected"
+            # (BACKLOG #3096). Latent: the narrow raises only EngineTlsListRefused today.
+            raise ValueError(f"{connector}: {exc}") from exc
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
 
@@ -2809,13 +2809,17 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
         # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
         # test returns this text to the caller and audits it. The setting tells the operator where.
         #
-        # A [tls].crl_file refusal on the same hop still names its file. The two shapes are kept on
-        # purpose (BACKLOG #3096 item 11). This text is built per connection, and a connection test
-        # returns it and audits it. The CRL file is the instance's one [tls] setting, and settings
-        # load refuses a missing one, path and all, before any hop is built.
+        # A [tls].crl_file refusal on the same hop still names its file, and the two shapes are
+        # kept by Manager decision (BACKLOG #3096 item 11). This CA setting is per connection. The
+        # CRL file is the instance's one [tls] setting: settings load refuses a missing one, path
+        # and all, and harden_crl_check's refusals at hop build name it too. So the CRL path can
+        # still reach a connection test's text. One rule for both is not decided here.
         setting = anchor.cafile_setting or "the CA file setting"
         if isinstance(exc, ssl.SSLError):
-            problem = f"holds no usable CA certificate: {exc.reason or type(exc).__name__}"
+            # OpenSSL's text names no path. reason is None for some errors, such as a bad PEM body,
+            # and absent on an SSLError built in Python.
+            reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
+            problem = f"holds no usable CA certificate: {reason}"
         else:
             problem = f"cannot be read: {exc.strerror or type(exc).__name__}"
         raise CaFileUnreadable(f"{setting} names a CA file that {problem}") from exc

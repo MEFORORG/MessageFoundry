@@ -422,19 +422,30 @@ def test_a_missing_dicom_or_mllp_ca_file_names_the_connection(
     assert "gone.pem" not in message
 
 
-@pytest.mark.parametrize(
-    ("name", "label"),
-    [("OB_PACS", "DICOM destination 'OB_PACS'"), ("", "DICOM destination")],
-    ids=["named", "unnamed-control"],
-)
-def test_a_dicom_suite_refusal_names_the_connection(name: str, label: str) -> None:
-    """BACKLOG #3096 item 3. The runner passes the name, so a refused ``tls_ciphers`` says which
-    DICOM destination to fix. The control is a direct build with no name, which keeps the bare
-    label the refusal always had."""
-    settings = {"tls": True, "host": "pacs.internal.example.org", "tls_ciphers": "NULL-SHA256"}
+def test_a_dicom_suite_refusal_names_the_connection() -> None:
+    """BACKLOG #3096 item 3. Built the way the runner builds it, a refused ``tls_ciphers`` says
+    which DICOM destination to fix. The control is a direct build with no name, which keeps the
+    bare label the refusal always had."""
+    spec = DICOM(
+        ae_title="MEFOR",
+        host="pacs.internal.example.org",
+        port=11112,
+        tls=True,
+        tls_ciphers="NULL-SHA256",
+    )
+    config = _dest_config(
+        build_outbound_connection("OB_PACS", spec),
+        {},
+        trust_anchor_policy=TrustAnchorPolicy(),
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(ValueError) as caught:
-        dicom._client_ssl_context(settings, trust_anchor_policy=TrustAnchorPolicy(), name=name)
-    assert str(caught.value).startswith(f"{label}: tls_ciphers rejected"), str(caught.value)
+        build_destination(config, egress=EgressSettings(deny_by_default=False))
+    message = str(caught.value)
+    assert message.startswith("DICOM destination 'OB_PACS': tls_ciphers rejected"), message
+    with pytest.raises(ValueError) as unnamed:
+        dicom._client_ssl_context(dict(spec.settings), trust_anchor_policy=TrustAnchorPolicy())
+    assert str(unnamed.value).startswith("DICOM destination: tls_ciphers rejected")
 
 
 def test_the_token_hop_reads_the_factory_ca_even_with_verify_tls_off(tmp_path: Path) -> None:

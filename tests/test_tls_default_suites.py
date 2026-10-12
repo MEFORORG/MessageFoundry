@@ -882,23 +882,30 @@ def test_a_refused_engine_tls12_list_is_a_config_refusal_too(settings: dict[str,
         assert all(name in message for name in APPROVED_TLS12_SUITES), message
 
 
+@pytest.mark.parametrize("fault_type", [ValueError, ssl.SSLError])
 def test_an_unset_ciphers_narrow_never_blames_the_operator_string(
-    monkeypatch: pytest.MonkeyPatch,
+    fault_type: type[Exception], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #3096 item 1. With ``tls_ciphers`` unset there is no operator string, so a fault in
-    the engine's own narrow must not read as "tls_ciphers rejected". It is latent: the narrow
-    raises only EngineTlsListRefused today. The stub raises a plain ValueError to prove the arm."""
+    the engine's own narrow must not read as "tls_ciphers rejected". It still names the connector,
+    and an SSLError still arrives as the ValueError a seam reports. It is latent: the narrow raises
+    only EngineTlsListRefused today. The stub raises a plain error to prove the arm."""
+
+    fault = fault_type("a fault in the narrow")
 
     def broken(ctx: ssl.SSLContext) -> None:
-        raise ValueError("a fault inside the engine's narrow")
+        raise fault
 
     monkeypatch.setattr(tls_policy, "narrow_to_approved_suites", broken)
     with pytest.raises(ValueError) as caught:
         tls_policy.apply_connection_tls_ciphers(
             ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), {}, connector="MLLP destination"
         )
-    assert str(caught.value) == "a fault inside the engine's narrow"
-    assert "tls_ciphers rejected" not in str(caught.value)
+    message = str(caught.value)
+    assert message.startswith("MLLP destination: "), message
+    assert "a fault in the narrow" in message
+    assert "tls_ciphers rejected" not in message
+    assert caught.value.__cause__ is fault
 
 
 def test_the_library_seam_still_names_its_connector_on_a_refused_engine_list() -> None:
