@@ -2004,20 +2004,21 @@ dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 00
 digest of the target directory, taken at request time. An approver sees it in the queue. The
 release takes the digest again twice. The first check runs before any config module runs. The
 second runs right after the load, and before the checks that refuse an invalid graph. A load that
-fails is checked too. So an edit that also breaks the graph is recorded as an edit. The second
-digest is the one the `config_reload` row records. If either differs from the approved one,
-nothing loads past that point and nothing swaps. The running graph keeps the environment values
-it had. A reload applies the values it re-read only with the swap, and a rolled-back swap puts
-the old ones back. A dry run checks the values and never applies them. The approve answers **422**, the request
-moves to `failed`, and a `config_reload_failed` row records reason `digest_mismatch` with
-`approved_fingerprint` and `current_fingerprint`. A hold that took no digest is refused the same
-way, with reason `no_approved_digest`. A release that cannot take the digest now is refused with
-reason `digest_unavailable`, and the engine logs the cause at WARNING. The requester asks again,
-and a second approver reviews the new bytes. A request whose directory is outside the reload roots
-or missing is refused with the status and refusal row an inline reload gets, and no hold is filed.
-It writes no `config_reload_attempted` row, because nothing was attempted. A repeat request joins an open
-hold only while the digest is unchanged. An ungated reload takes no request-time digest. At least
-these limits remain:
+fails as an invalid config is checked too. So an edit that also breaks the graph is recorded as
+an edit. The second digest is the one the `config_reload` row records. If either differs from the
+approved one, nothing loads past that point and nothing swaps. The running graph keeps the
+environment values it had. A reload applies the values it re-read only with the swap, and a
+rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
+approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
+reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold that took
+no digest is refused the same way, with reason `no_approved_digest`. A release that cannot take
+the digest now is refused with reason `digest_unavailable`, and the engine logs the cause at
+WARNING. The requester asks again, and a second approver reviews the new bytes.
+
+A request for a directory outside the reload roots, or a missing one, files no hold. It gets the
+status and refusal row an inline reload gets. It writes no `config_reload_attempted` row, because
+nothing was attempted. A repeat request joins an open hold only while the digest is unchanged. An
+ungated reload takes no request-time digest. At least these limits remain:
 
 - the digest is not sealed. A writer to the `pending_approvals` table can replace it along with the
   rest of the params. Sealing that row is vault BACKLOG #2592;
@@ -2027,9 +2028,10 @@ these limits remain:
 - each check samples the files. An edit that lands after the first check runs its module code
   before the second check refuses it. An edit reverted while the release loads is not seen at all.
   Hashing, compiling and running the same bytes is that same step 1;
-- the request-time digest is taken before the route checks its step-up proof. A directory that
-  cannot be read, or whose path fails to resolve for a reason other than being missing, still
-  files a hold with no digest. Its release is certain to be refused;
+- the request-time digest is taken before the route checks its step-up proof. Some requests still
+  file a hold with no digest: a file in the directory cannot be read, or resolving the path raises
+  an OS error. Their release is certain to be refused;
+- a directory moved away during a release is recorded as `not_found`, not as an edit;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held

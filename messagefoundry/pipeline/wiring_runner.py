@@ -1972,9 +1972,16 @@ class RegistryRunner:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
 
+    @property
+    def env_values(self) -> dict[str, Any]:
+        """The values ``env()`` refs resolve against when connectors are (re)built. The engine
+        reads them back after :meth:`reload`, which owns the swap (vault BACKLOG #2596)."""
+        return self._env_values
+
     def set_env_values(self, values: Mapping[str, Any]) -> None:
-        """Replace the environment values used to resolve ``env()`` refs when (re)building connectors.
-        The engine calls this on reload so a promote picks up edited values without a restart (M-23)."""
+        """Replace the environment values used to resolve ``env()`` refs when (re)building connectors,
+        outside a reload. A reload passes its values to :meth:`reload` instead, which swaps them with
+        the graph under its lock and restores them on a rollback (vault BACKLOG #2596, M-23)."""
         self._env_values = dict(values)
 
     # --- connection-event capture (Corepoint-style transport/lifecycle log, #46) ----------------
