@@ -2616,6 +2616,59 @@ def _doc(name: str) -> str:
     return (_ROOT / name).read_text(encoding="utf-8")
 
 
+# One table states which security controls are built, which are on by default and which are not
+# built (vault BACKLOG #2970, SDS-3.5). README.md, sections 1 and 6 of the early-adopter guide and
+# docs/PHI.md section 1 each restated those facts, and engine PR 2015 guarded each copy. The copies
+# are links now, so the guards that read a deleted sentence read the table's rows instead. Each
+# still reds on the retired claim, in the table or as a sentence that comes back.
+
+_GUIDE = "docs/EARLY-ADOPTER-GUIDE.md"
+_H_SECURITY_TABLE = "### Security controls: built, on by default, and not built"
+
+#: The two words the Status column may hold. A third word is a status the guards cannot read.
+_STATUSES = frozenset({"Built", "Not built"})
+
+
+def _github_anchor(heading: str) -> str:
+    """The fragment GitHub gives ``heading``: lower case, punctuation dropped, spaces to hyphens."""
+    words = re.sub(r"[^\w\- ]", "", heading.lstrip("#").strip().lower())
+    return "#" + words.replace(" ", "-")
+
+
+_SECURITY_TABLE_ANCHOR = _github_anchor(_H_SECURITY_TABLE)
+
+
+def _security_table() -> dict[str, list[str]]:
+    """The guide's security controls table, as label -> the row's four cells, emphasis removed.
+
+    Read through ``_doc``, as every prose check here is. The floor is 8 rows against 12 on
+    2026-10-12: enough to tell the table from a stub."""
+    guide = _doc(_GUIDE)
+    assert guide.count(_H_SECURITY_TABLE) == 1, (
+        f"{_GUIDE} must hold the heading {_H_SECURITY_TABLE!r} once. README.md, docs/PHI.md and "
+        "the guide's own sections 1 and 6 link to it; rename it and those links together."
+    )
+    start = guide.index(_H_SECURITY_TABLE)
+    block = guide[start : guide.index("\n### ", start + 1)]
+    tables = [t for t in _tables(block) if t[0][:2] == ["Control", "Status"]]
+    assert len(tables) == 1, f"{_GUIDE}'s security controls section must hold one table"
+    rows = {
+        _flat(row[0]).replace("*", ""): [_flat(cell).replace("*", "") for cell in row]
+        for row in tables[0][1:]
+    }
+    assert len(rows) >= 8, f"the security controls table has {len(rows)} row(s), floor 8"
+    odd = {label: row[1] for label, row in rows.items() if row[1] not in _STATUSES}
+    assert not odd, f"the security controls table's Status column holds {odd}; use {_STATUSES}"
+    return rows
+
+
+def _security_row(label: str) -> list[str]:
+    """The one row whose label matches ``label``. No row, or two, fails here."""
+    hits = [row for name, row in _security_table().items() if re.search(label, name, re.I)]
+    assert len(hits) == 1, f"the security controls table has {len(hits)} row(s) for {label!r}"
+    return hits[0]
+
+
 def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2845,15 +2898,32 @@ def test_the_twelfth_sweep_no_doc_says_a_built_control_is_missing(name: str, sub
 
     Two units are read. A clause may not pair the control, under any of its names, with absence.
     A table row may not name the control in its label cell and absence in a later cell, which a
-    clause cut at the cell bars cannot see. The subject must occur, or the scan examined nothing."""
+    clause cut at the cell bars cannot see.
+
+    The guide holds the one table that states these facts, so the subject must occur there. Its row
+    marked "Not built" reds through the row unit. README.md links to that table and names neither
+    control now (vault BACKLOG #2970). So for README.md the scan has a clause floor and the link
+    must be present, and a sentence that brings the claim back still reds."""
     pattern = {
         "second factor": _SECOND_FACTOR,
         "off-box logs or de-identification": _BUILT_ELSEWHERE,
     }[subject]
     text = _doc(name)
-    clauses = [c for c in _clauses(text) if pattern.search(c)]
-    assert clauses, f"{name} no longer names the {subject} at all, so this check reads nothing"
-    stale = [c for c in clauses if _ABSENT.search(c)]
+    clauses = _clauses(text)
+    floor = {"README.md": 100, _GUIDE: 300}[name]
+    assert len(clauses) >= floor, (
+        f"{name} cut into {len(clauses)} clause(s), floor {floor}: the scan reads too little to "
+        "clear it."
+    )
+    if name == _GUIDE:
+        assert any(pattern.search(c) for c in clauses), (
+            f"{name} no longer names the {subject} at all, and it holds the table that states it"
+        )
+    else:
+        assert _SECURITY_TABLE_ANCHOR in text, (
+            f"{name} must link to the security controls table, which states the {subject} for it"
+        )
+    stale = [c for c in clauses if pattern.search(c) and _ABSENT.search(c)]
     for line in text.splitlines():
         cells = [c.strip().replace("*", "") for c in line.strip().strip("|").split("|")]
         if line.lstrip().startswith("|") and len(cells) > 1 and pattern.search(cells[0]):
@@ -3299,10 +3369,20 @@ def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_def
         f"docs/EARLY-ADOPTER-GUIDE.md cut into {len(clauses)} clause(s), floor 300: the opt-in and "
         "auth-disabled scans read too little to clear it."
     )
+    # The sentence that named the gap is a link to the security controls table now (vault BACKLOG
+    # #2970), so the table's row carries the fact: raw TCP and X12 are the transport rows marked
+    # "Not built", and no other transport row is. A sentence that comes back must still name them.
     gap = [c for c in clauses if re.search(r"\bremaining transport gaps?\b", c, re.IGNORECASE)]
-    assert gap and all("raw TCP and X12" in c for c in gap), (
+    assert all("raw TCP and X12" in c for c in gap), (
         f"the guide's remaining-transport-gap sentence must name raw TCP and X12: {gap}"
     )
+    transport = {
+        label: row[1] for label, row in _security_table().items() if re.search(r"\bm?TLS\b", label)
+    }
+    assert len(transport) >= 4, f"the table has {len(transport)} TLS row(s), floor 4: {transport}"
+    assert [label for label, status in transport.items() if status == "Not built"] == [
+        "Transport TLS for raw TCP and X12"
+    ], f"the table must mark raw TCP and X12, and only them, as the transport gap: {transport}"
     opt_in = [
         c
         for c in clauses
@@ -3344,15 +3424,16 @@ def test_the_guide_points_at_section_2_for_the_deidentification_framework_only_i
     "built too (§2)". Section 2 names the framework only inside a not-built row,
     "De-identification on the AI-assist path", so the pointer sent a reader to a not-built row for
     a built feature (vault BACKLOG #2993, item 4). A pointer to section 2 is right only while that
-    section's built table lists the framework."""
+    section lists the framework as built.
+
+    Section 2's security controls table lists it now (vault BACKLOG #2970), so this reads that
+    table: a row whose label names the framework and whose status is "Built". The row for the
+    AI-assist path is "Not built" and does not count."""
     guide = _doc("docs/EARLY-ADOPTER-GUIDE.md")
-    built_start = guide.index("### Built and production-ready")
-    built = guide[built_start : guide.index("\n### ", built_start + 1)]
-    # An empty table reads as "not listed", which is the strict side, so it needs no floor.
     listed = any(
-        re.search(r"de-identification|anonymi[sz]", row[0], re.IGNORECASE)
-        for table in _tables(built)
-        for row in table
+        re.search(r"de-identification framework|anonymi[sz]", label, re.IGNORECASE)
+        and row[1] == "Built"
+        for label, row in _security_table().items()
     )
     about = [
         c for c in _clauses(guide) if re.search(r"de-identification framework", c, re.IGNORECASE)
@@ -3363,8 +3444,136 @@ def test_the_guide_points_at_section_2_for_the_deidentification_framework_only_i
     # "§2" alone, or at a sentence end: not "§20" and not a subsection such as "§2.1".
     pointed = [c for c in about if re.search(r"§2(?!\.?\d)", c)]
     assert listed or not pointed, (
-        f"the guide points at §2 for the de-identification framework: {pointed}. Section 2's built "
-        "table does not list it; docs/PHI.md section 9 documents it."
+        f"the guide points at §2 for the de-identification framework: {pointed}. Section 2's "
+        "security controls table does not list it as built; docs/PHI.md section 9 documents it."
+    )
+
+
+def test_the_security_controls_table_states_what_the_code_does() -> None:
+    """The one table of built and not-built security facts (vault BACKLOG #2970) is read against
+    the code, row by row: the status, and the first word of the shipped default. The pages that
+    used to restate these facts link here, so a row that drifts has no second copy to hide behind.
+
+    At least these rows are tied to a setting or a callable. The API TLS and log redaction rows
+    are checked for status only; `tests/test_api_tls.py` and the thirteenth sweep's second-round
+    probe hold their behaviour."""
+    from messagefoundry import anon
+    from messagefoundry.config import ai_policy
+    from messagefoundry.config import settings as settings_module
+    from messagefoundry.config.wiring import MLLP, X12, Tcp
+
+    def row(label: str, status: str, default: str = "") -> str:
+        cells = _security_row(label)
+        assert cells[1] == status, (
+            f"the table marks {cells[0]!r} {cells[1]!r}; the code says {status}"
+        )
+        assert cells[2].startswith(default), (
+            f"the table's default for {cells[0]!r} must start {default!r}: {cells[2][:80]!r}"
+        )
+        return cells[2]
+
+    # Sign-in has no off switch: both keys that once turned it off are refused at load.
+    for key in (("auth", "enabled"), ("security", "require_sign_in")):
+        assert key in settings_module._REMOVED_KEYS
+    row(r"^Sign-in", "Built", "Always on.")
+    # A keyless start is refused unless the audited opt-out is taken.
+    assert (
+        settings_module.keyless_opt_out_refusal(
+            settings_module.StoreSettings(), settings_module.SecuritySettings()
+        )
+        == settings_module.KEYLESS_REFUSED_BY_NO_OPT_OUT
+    )
+    assert "opt-out" in row(r"^At-rest body encryption", "Built", "Required.")
+    row(r"^API TLS", "Built", "Always served")
+    assert inspect.signature(MLLP).parameters["tls"].default is False
+    row(r"^MLLP-over-TLS", "Built", "Off.")
+    assert ApiSettings.model_fields["tls_client_ca_file"].default is None
+    assert "`[api].tls_client_ca_file`" in row(r"^mTLS\b", "Built", "Off.")
+    assert callable(check_inbound_revocation)
+    row(r"revocation", "Built")
+    # Raw TCP and X12 take no TLS setting. The second-round probe floors each signature at 10.
+    assert not any(
+        "tls" in name.lower() for f in (Tcp, X12) for name in inspect.signature(f).parameters
+    )
+    row(r"raw TCP and X12", "Not built")
+    on = AuthSettings.model_fields["require_mfa"].default is True
+    row(r"second factor", "Built", "On." if on else "Off.")
+    # No collector by default, and serve's forwarding gate refuses that default.
+    assert settings_module.LoggingSettings.model_fields["forward_host"].default is None
+    assert settings_module.forwarding_gate_refusal(settings_module.LoggingSettings()) is not None
+    forwarding = row(r"^Off-box log", "Built", "No collector is named")
+    assert "refuse to start" in forwarding and "`[logging].forward_host`" in forwarding
+    row(r"^PHI redaction", "Built", "Always on")
+    assert callable(getattr(anon, "anonymize_checked", None))
+    row(r"de-identification framework", "Built")
+    deid = ai_policy.resolve_effective_policy(
+        mode=ai_policy.AiMode.MANAGED_CLAUDE_BAA,
+        data_scope=ai_policy.AiDataScope.DEIDENTIFIED,
+        production=True,
+    )
+    assert deid.data_scope is ai_policy.AiDataScope.CODE_ONLY
+    assert "`code_only`" in row(r"AI-assist", "Not built")
+
+
+#: A control the table states, under the names the pages gave it.
+_TABLE_CONTROL = re.compile(
+    r"\bMFA\b|\bTOTP\b|\bpasskeys?\b|second factor|off-box log|log (?:shipping|forwarding)"
+    r"|de-identification framework|at-rest (?:body )?encryption|encryption[- ]at[- ]rest"
+    r"|\bmTLS\b|MLLP-over-TLS|(?:native|transport) TLS|\bRBAC\b",
+    re.IGNORECASE,
+)
+
+#: A status or a default, in the words the retired copies used.
+_TABLE_STATUS = re.compile(rf"\bbuilt\b|\bby default\b|{_ABSENT.pattern}", re.IGNORECASE)
+
+
+def _guide_section(heading: str, until: str = "\n## ") -> str:
+    guide = _doc(_GUIDE)
+    start = guide.index("\n" + heading)
+    return guide[start : guide.index(until, start + 1)]
+
+
+#: Each place that restated the table's facts, with how to cut it out of its page, the link it
+#: must carry, and a clause floor below its count on 2026-10-12.
+_LINKING_SCOPES: dict[str, tuple[Callable[[], str], str, int]] = {
+    "README.md": (lambda: _doc("README.md"), "docs/EARLY-ADOPTER-GUIDE.md", 100),
+    "guide section 1": (lambda: _guide_section("## 1. What MessageFoundry is"), "](", 10),
+    "guide section 6 opening": (
+        lambda: _guide_section("## 6. Security & PHI hardening", until="\n- [ ]"),
+        "](",
+        3,
+    ),
+    "docs/PHI.md off-loopback paragraph": (
+        lambda: "\n\n".join(
+            p
+            for p in re.split(r"\n\s*\n", _doc("docs/PHI.md"))
+            if "only become material off-loopback" in _flat(p)
+        ),
+        "(EARLY-ADOPTER-GUIDE.md",
+        3,
+    ),
+}
+
+
+@pytest.mark.parametrize("scope", sorted(_LINKING_SCOPES))
+def test_the_pages_that_restated_the_security_facts_link_to_the_table(scope: str) -> None:
+    """README.md, sections 1 and 6 of the early-adopter guide and docs/PHI.md section 1 each said
+    which security controls are built. Four copies drifted, and engine PR 2015 had to correct and
+    guard each one (vault BACKLOG #2970, SDS-3.5). Each now links to the one table. A clause there
+    that names a control beside a status or a default is a copy coming back.
+
+    It reads these four places only. Other pages still state some of the same facts."""
+    cut, link_prefix, floor = _LINKING_SCOPES[scope]
+    text = cut()
+    clauses = _clauses(text)
+    assert len(clauses) >= floor, f"{scope} cut into {len(clauses)} clause(s), floor {floor}"
+    assert f"{link_prefix}{_SECURITY_TABLE_ANCHOR})" in text, (
+        f"{scope} must link to the security controls table in {_GUIDE}"
+    )
+    restated = [c for c in clauses if _TABLE_CONTROL.search(c) and _TABLE_STATUS.search(c)]
+    assert not restated, (
+        f"{scope} states a security control's status or default again: {restated}. The security "
+        f"controls table in {_GUIDE} states it once; link to it."
     )
 
 
@@ -3725,18 +3934,30 @@ def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
 def test_the_thirteenth_sweep_phi_qualifies_the_second_factor_for_oidc() -> None:
     """docs/PHI.md said the engine enforces its own second factor "on any bind". With
     `oidc_require_mfa_claim` on, the default, an OIDC session meets it on the identity provider's
-    claim (the probe above). A paragraph that says the factor applies everywhere must say so."""
+    claim (the probe above). A paragraph that says the factor applies everywhere must say so.
+
+    docs/PHI.md section 1 links to the security controls table for the factor now (vault BACKLOG
+    #2970), so the table's second-factor row is where the reach is stated. That row must name the
+    claim. It is read beside PHI.md's paragraphs, so the old sentence reds in either place."""
+    factor_row = " | ".join(_security_row(r"second factor"))
+    for token in ("`[security].require_mfa`", "`[auth].oidc_require_mfa_claim`"):
+        assert token in factor_row, (
+            f"the security controls table's second-factor row must name {token}: an OIDC session "
+            "meets the factor on the identity provider's claim."
+        )
     paragraphs = [p for p in re.split(r"\n\s*\n", _doc("docs/PHI.md")) if "require_mfa`" in p]
     assert paragraphs, "docs/PHI.md names require_mfa nowhere, so this check reads nothing"
-    universal = [
-        p
-        for p in paragraphs
+    units = [*paragraphs, factor_row]
+    assert len(units) >= 2, "the scan needs PHI.md's paragraphs and the table's row"
+    bare = [
+        _flat(p)[:120]
+        for p in units
         if re.search(r"\bany bind\b|\bevery (?:sign-in|session|bind)\b", _flat(p), re.I)
+        and "oidc_require_mfa_claim" not in p
     ]
-    assert universal, "docs/PHI.md no longer says where require_mfa applies; re-derive this check"
-    bare = [_flat(p)[:120] for p in universal if "oidc_require_mfa_claim" not in p]
     assert not bare, (
-        f"docs/PHI.md says the engine's factor applies on any bind without the OIDC claim: {bare}"
+        f"docs/PHI.md, or the table, says the engine's factor applies on any bind without the "
+        f"OIDC claim: {bare}"
     )
 
 
@@ -4036,21 +4257,50 @@ def test_the_thirteenth_sweep_no_doc_calls_the_forwarded_copy_phi_free(
 def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
     """docs/PHI.md said mTLS, revocation and off-box logs are "built into the engine" with nothing
     on what turns them on, and sent the reader to section 11 for `forward_*`, which section 7
-    documents."""
+    documents.
+
+    That paragraph links to the security controls table now (vault BACKLOG #2970), so the table's
+    rows carry what turns each control on. A PHI.md paragraph that calls the controls built again
+    must carry the same three settings, as it had to before."""
+    turned_on_by = (
+        "`[api].tls_client_ca_file`",
+        "`[logging].forward_host`",
+        "`[logging].forward_tls_crl_file`",
+    )
+    rows = " | ".join(
+        cell
+        for label in (r"^mTLS\b", r"revocation", r"Off-box log")
+        for cell in _security_row(label)
+    )
+    for token in turned_on_by:
+        assert token in rows, (
+            f"the security controls table's mTLS, revocation and forwarding rows must name {token}: "
+            "built is not the same as on."
+        )
     doc = _doc("docs/PHI.md")
-    paragraphs = [
+    off_loopback = [
         _flat(p)
         for p in re.split(r"\n\s*\n", doc)
-        if "built into the engine" in _flat(p) and "mTLS" in p and "off-box" in p
+        if "only become material off-loopback" in _flat(p)
     ]
-    assert paragraphs, "docs/PHI.md no longer says the off-loopback controls are built"
+    assert off_loopback, "docs/PHI.md no longer has its off-loopback controls paragraph"
+    paragraphs = [
+        *off_loopback,
+        *(
+            _flat(p)
+            for p in re.split(r"\n\s*\n", doc)
+            if "built into the engine" in _flat(p) and "mTLS" in p and "off-box" in p
+        ),
+    ]
     for p in paragraphs:
-        for token in (
-            "`[api].tls_client_ca_file`",
-            "`[logging].forward_host`",
-            "`[logging].forward_tls_crl_file`",
+        # Either the paragraph links to the table, or it states the controls and names what turns
+        # each one on. The retired paragraph did neither.
+        if (
+            f"EARLY-ADOPTER-GUIDE.md{_SECURITY_TABLE_ANCHOR}" not in p
+            or "built into the engine" in p
         ):
-            assert token in p, f"docs/PHI.md's built-controls paragraph must name {token}"
+            for token in turned_on_by:
+                assert token in p, f"docs/PHI.md's built-controls paragraph must name {token}"
         # The paragraph's own "documented per deployment" pointer names no `forward_*`, so the
         # clause scan below does not read it (vault BACKLOG #2993, item 3).
         # "§11" alone, or at a sentence end. A citation such as "ASVS §11.7" is not the pointer.

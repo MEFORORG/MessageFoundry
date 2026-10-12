@@ -12,8 +12,9 @@ MessageFoundry is an **open-source healthcare integration engine** — a modern,
 interface engine. It connects clinical and business systems by routing, transforming, and validating
 messages across many formats (HL7 v2, JSON, XML/SOAP, X12, database records) and connection types
 (MLLP, MLLP-over-TLS, TCP, HTTP/REST, SOAP, FHIR, DICOM, database, files, SFTP/FTP). Configure it with
-guided tooling or extend it in Python; it runs on SQLite, PostgreSQL, or SQL Server with
-authentication, RBAC, audit logging, and encryption-at-rest built in.
+guided tooling or extend it in Python; it runs on SQLite, PostgreSQL, or SQL Server. One table lists
+its security controls, built and not built:
+[security controls](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built).
 
 > Python import package: `messagefoundry`. Built with its own tolerant HL7 parser + **hl7apy** (HL7 parsing/
 > validation), **FastAPI** (engine API + the same-origin `/ui` web console), and **PySide6** (the
@@ -48,11 +49,10 @@ renders on GitHub and in the VS Code preview). The prose source of truth is
 - **Configure visually or in code.** Author connections and routes with guided wizards, or in
   Python (`inbound`/`outbound`/`@router`/`@handler`) for full control — always version-controlled.
   The database holds runtime state and messages only, never configuration.
-- **PHI is first-class.** Authentication, RBAC, a user-attributed audit log of message
-  views/replays, **encryption-at-rest** for message bodies (AES-256-GCM), **global PHI log redaction**,
-  **transport TLS** (HTTPS/WSS for the API plus MLLP-over-TLS), a **native second factor** (TOTP
-  and passkeys, required by default through `[security].require_mfa`) and **off-box log
-  forwarding** to a syslog/SIEM collector (`[logging].forward_*`) are **built**. See [docs/PHI.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/PHI.md) for the full data-protection map.
+- **PHI is first-class.** Access control, audit, encryption and transport security are part of
+  the engine. Which controls are built, which are on by default and which are missing is stated
+  once, in the [security controls table](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built).
+  This page does not repeat it. See [docs/PHI.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/PHI.md) for the full data-protection map.
 
 ## Features
 
@@ -60,9 +60,10 @@ MessageFoundry ships a reliable, PHI-aware engine today: the Connection/Router/H
 over a durable staged pipeline (at-least-once delivery, retries, dead-letter, replay), backed by
 SQLite, PostgreSQL, or SQL Server. It speaks MLLP (plain and over TLS), file/SFTP, REST, SOAP,
 FHIR, database, and DICOM (C-STORE SCP), parses HL7 v2 tolerantly (with opt-in strict validation)
-and carries other formats payload-agnostically (JSON, XML/SOAP, X12, binary). Security is
-first-class — authentication, RBAC, a user-attributed audit log, at-rest body encryption, and
-transport TLS — and it runs single-node or in active-passive high availability.
+and carries other formats payload-agnostically (JSON, XML/SOAP, X12, binary). The
+[security controls table](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
+says which security controls are built. The engine runs single-node or in active-passive high
+availability.
 
 **See the full, up-to-date feature breakdown — built vs. planned — at
 [messagefoundry.org/features-table.html](https://messagefoundry.org/features-table.html).**
