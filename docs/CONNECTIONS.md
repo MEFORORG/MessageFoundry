@@ -1496,9 +1496,9 @@ system bypass list names. A connection's own `proxy_no_proxy` is not that list. 
 skips the connection's `proxy_url` and still follows a proxy from the environment.
 **Writing the proxy `https://` does not get a credential past this rule:** for an `https` target,
 `urllib` sends `CONNECT`, with the credential header, before any TLS. A connection's `proxy_url`
-serves both schemes, so a credentialed `proxy_url` is refused for every destination. Which legs
-pass, and what the check does not cover, is listed once, on `ProxyCredentialsRefusedError` in
-`messagefoundry/transports/bounded_read.py`. Take the credentials out of the proxy URL.
+serves both schemes, so a credentialed `proxy_url` is refused for every request sent through it.
+Which legs pass, and what the check does not cover, is listed once, on
+`ProxyCredentialsRefusedError` in `messagefoundry/transports/bounded_read.py`. Take the credentials out of the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a

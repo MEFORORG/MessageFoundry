@@ -799,10 +799,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     proxy follows. That is the one leg on which urllib was measured to open TLS first. For an
     ``https`` target it sends ``CONNECT`` with the header before any TLS, whatever the proxy's
     scheme. A connection's ``proxy_url`` serves both schemes, so a credentialed ``proxy_url`` is
-    refused for every destination, written ``https://`` or not. The handler
-    checks at every proxy it hands a request to, and reads the header already on the request as
-    well as the current proxy's URL, because urllib keeps that header when it hands the request on
-    to a second proxy (vault BACKLOG #3410). A value with no scheme counts as not ``https://``. So
+    refused for every request sent through it, written ``https://`` or not. The handler checks at
+    every proxy it hands a request to, and reads the header already on the request as well as the
+    current proxy's URL, because urllib keeps that header when it hands the request on to a second
+    proxy (vault BACKLOG #3410). A value with no scheme counts as not ``https://``. So
     does a value urllib cannot parse, when it holds an ``@``: urllib would refuse that one itself,
     with text that quotes it.
 
