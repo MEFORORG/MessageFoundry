@@ -437,6 +437,13 @@ def test_cleartext_refusals(monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
     assert d.use_tls is False
 
 
+def test_an_explicit_none_tls_setting_takes_its_default(pki: dict[str, Any]) -> None:
+    """Vault BACKLOG #3230: ``None`` used to read as off, which would have dropped STARTTLS, the
+    certificate check and the name check. It now takes each default, as absence does."""
+    d = DirectDestination(_dest(pki, use_tls=None, tls_verify=None, tls_check_hostname=None))
+    assert (d.use_tls, d.tls_verify, d.tls_check_hostname) == (True, True, True)
+
+
 # --- the SMTP envelope on the wire (vault BACKLOG #2870) ---------------------------------------------
 #
 # Each test reads the MAIL and RCPT lines a loopback listener received, so it checks what a relay

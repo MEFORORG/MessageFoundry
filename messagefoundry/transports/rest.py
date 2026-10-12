@@ -1052,10 +1052,11 @@ def refuse_credential_over_unverified_tls(
 
     sent = http_hop_credentials(ctype, settings, lookup=lookup)
     if not sent and any(name.lower() == "authorization" for name in headers):
-        sent = ["an Authorization header"]
+        sent = ["Authorization header"]
     if sent:
         raise ValueError(
-            f"{hop_name_prefix(connection)}{connector} would send {' + '.join(sent)} to a peer "
+            f"{hop_name_prefix(connection)}{connector} would send its credentials "
+            f"({', '.join(sent)}) to a peer "
             "whose certificate it does not verify (verify_tls=false); refused, with no escape. "
             "Leave verify_tls on (the default). For a server whose certificate comes from a private "
             "or self-signed CA, pin that CA with tls_ca_file."

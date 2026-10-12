@@ -1434,6 +1434,53 @@ def test_sftp_unknown_host_key_accepted_with_escape(
     assert client._accept_unknown is True  # AutoAddPolicy will be selected (logged loudly)
 
 
+class _PolicyCallingSSHClient(_FakeSSHClient):
+    """Calls the chosen policy's ``missing_host_key`` for an unknown key, as paramiko's ``connect``
+    does before authentication. Records whether authentication was reached."""
+
+    authenticated = False
+
+    def connect(self, **kw: Any) -> None:
+        if isinstance(self.policy, _RejectPolicy):
+            raise _SSHException("Server host key not found in known_hosts")
+        if not isinstance(self.policy, _AutoAddPolicy):
+            self.policy.missing_host_key(self, kw["hostname"], object())
+        type(self).authenticated = True
+
+
+class _PolicyCallingParamiko(_FakeParamiko):
+    SSHClient = _PolicyCallingSSHClient
+
+
+def test_sftp_password_login_never_takes_the_escape(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3230: the escape would auto-accept an unknown host key, and the password would
+    then go to whichever server answered. A password login refuses the unknown key instead, before
+    it authenticates, with text naming the connection and the fix."""
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _PolicyCallingParamiko)
+    _PolicyCallingSSHClient.authenticated = False
+    client = _SftpClient(
+        {"host": "h", "port": 22, "remote_dir": "/in", "username": "svc", "password": "synthetic"},
+        name="OB_SFTP",
+    )
+    assert client._accept_unknown is False
+    with pytest.raises(_RemoteError) as ei:
+        client.list_dir("/in")
+    assert ei.value.permanent is True
+    message = str(ei.value)
+    assert "connection 'OB_SFTP'" in message and "known_hosts" in message
+    assert "with no escape" in message and "MEFOR_ALLOW_INSECURE_TLS" not in message
+    assert "synthetic" not in message
+    assert _PolicyCallingSSHClient.authenticated is False  # refused before any password crossed
+
+
+def test_sftp_key_only_login_keeps_the_escape(escape_at_warn: None) -> None:
+    """The control arm: a login with no password is outside this row and still takes the escape."""
+    client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in", "username": "svc"})
+    assert client._accept_unknown is True
+
+
 def _sftp_connect_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Drive ``_SftpClient._connect`` against the fake paramiko and return what it passed to connect.
 

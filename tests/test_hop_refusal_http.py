@@ -22,6 +22,7 @@ Nothing hits the network: refusals fire at construction, and the one send test u
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -254,6 +255,203 @@ def test_verify_off_attested_allowed_on_prod(cell: str, monkeypatch: pytest.Monk
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
         assert _build(_HTTPS[cell], verify_tls=False, attested=True) is not None
+
+
+# --- a credential over verify_tls=false is refused outright (vault BACKLOG #3230) ---------------
+#
+# The escape, the posture, an attestation and a loopback host each still let a credential-less
+# verify-off hop through. None of them lets a credential through: the engine would hand it to
+# whichever peer answered.
+
+_SECRET = "ZZCREDENTIAL3230"
+_CREDENTIAL_REFUSAL = re.escape("(verify_tls=false); refused, with no escape")
+
+# Every cell takes these three. Digest, OAuth2, WS-Security and body secrets are cell-specific below.
+_COMMON_CREDENTIALS: dict[str, dict[str, Any]] = {
+    "bearer": {"bearer_token": _SECRET},
+    "basic": {"basic_user": "svc", "basic_password": _SECRET},
+    "static-authorization-header": {"headers": {"authorization": f"Bearer {_SECRET}"}},
+}
+
+
+def _build_raw(
+    cell: str,
+    extra: dict[str, Any],
+    *,
+    url: str | None = None,
+    attested: bool = False,
+) -> DestinationConnector:
+    """Build ``cell`` from its factory's settings plus raw ``extra`` keys, so a credential the factory
+    does not take (a static header, a digest pair) reaches the connector as a hand-built spec would."""
+    ctype, factory, https_url = _HTTPS[cell]
+    settings = {**factory(url=url or https_url).settings, **extra}
+    return build_destination(
+        Destination(
+            name="OB",
+            type=ctype,
+            settings=settings,
+            tls_hop_attested=attested,
+            tls_hop_attested_reason="proxy-terminated trusted segment" if attested else None,
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+def _assert_credential_refusal(exc: pytest.ExceptionInfo[ValueError]) -> None:
+    message = str(exc.value)
+    assert "connection 'OB'" in message  # names the connection
+    assert "verify_tls on" in message and "tls_ca_file" in message  # the levers that can cross
+    assert "MEFOR_ALLOW_INSECURE_TLS" not in message  # never offers the escape it ignores
+    assert _SECRET not in message  # never echoes the credential
+
+
+@pytest.mark.parametrize("credential", list(_COMMON_CREDENTIALS))
+@pytest.mark.parametrize("cell", _CELLS)
+def test_a_credential_over_verify_off_is_refused_with_the_escape_open(
+    cell: str, credential: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, **_COMMON_CREDENTIALS[credential]}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, extra)
+    _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_the_same_hop_with_no_credential_still_crosses_on_the_escape(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control arm: the escape still releases a credential-less verify-off hop, as before."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with active_hop_posture(_STAGING):
+        assert _build_raw(cell, {"verify_tls": False}) is not None
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_an_attested_or_loopback_credentialed_hop_is_refused_too(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both levers that ALLOW a credential-less verify-off hop on production leave this one refused."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    extra = {"verify_tls": False, "bearer_token": _SECRET}
+    with active_hop_posture(_PROD):
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL):
+            _build_raw(cell, extra, attested=True)
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL):
+            _build_raw(cell, extra, url="https://127.0.0.1:8443/x")
+
+
+@pytest.mark.parametrize("cell", ["REST", "SOAP", "FHIR"])
+def test_a_digest_credential_over_verify_off_is_refused(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {
+        "verify_tls": False,
+        "http_auth": "digest",
+        "http_auth_user": "svc",
+        "http_auth_password": _SECRET,
+    }
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, extra)
+    _assert_credential_refusal(exc)
+
+
+def test_a_minted_oauth2_bearer_over_verify_off_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The token hop verifies, but the bearer it mints would cross the unverified delivery hop."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {
+        "verify_tls": False,
+        "oauth2_token_url": "https://auth.example.com/token",
+        "oauth2_client_id": "engine",
+        "oauth2_client_secret": _SECRET,
+    }
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw("REST", extra)
+    assert "minted bearer token" in str(exc.value)
+    _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"soap_version": "1.2", "ws_security": True, "ws_username": "svc", "ws_password": _SECRET},
+        {"body_secret_tokens": ["{{PIN}}"], "body_secret_value_0": _SECRET},
+    ],
+    ids=["ws-security-username-token", "body-secret"],
+)
+def test_a_soap_body_credential_over_verify_off_is_refused(
+    extra: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw("SOAP", {"verify_tls": False, **extra})
+    _assert_credential_refusal(exc)
+
+
+def test_a_fhir_lookup_credential_over_verify_off_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    lookup = {"url": "https://fhir.example.org/fhir", "verify_tls": False}
+    with active_hop_posture(_STAGING):
+        with pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+            FhirLookupExecutor(
+                {"L": {**lookup, "bearer_token": _SECRET}},
+                egress=EgressSettings(deny_by_default=False),
+            )
+        assert "FhirLookup 'L'" in str(exc.value) and _SECRET not in str(exc.value)
+        # The control arm: with no credential the escape still releases it.
+        ex = FhirLookupExecutor({"L": lookup}, egress=EgressSettings(deny_by_default=False))
+    assert ex.connections == frozenset({"L"})
+
+
+def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> None:
+    """A Proxy-Authorization goes to the proxy inside the CONNECT, never across this hop, and an
+    http url has no TLS to verify (refuse_cleartext_credentials governs it). Neither raises here."""
+    from messagefoundry.transports.rest import refuse_credential_over_unverified_tls
+
+    refuse_credential_over_unverified_tls(
+        ConnectorType.REST,
+        {},
+        {"Proxy-Authorization": "Basic x"},
+        scheme="https",
+        connector="REST destination",
+        connection="OB",
+    )
+    refuse_credential_over_unverified_tls(
+        ConnectorType.REST,
+        {"bearer_token": _SECRET},
+        {"Authorization": "Bearer x"},
+        scheme="http",
+        connector="REST destination",
+        connection="OB",
+    )
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_an_explicit_none_verify_tls_verifies(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vault BACKLOG #3230: ``verify_tls = None`` takes the default (on). It used to read as off, so
+    on production this build would have been refused as a verify-off hop."""
+    from messagefoundry.config.tls_policy import verifies_peer_fully
+    from messagefoundry.transports.rest import opener_tls_context
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    ctype, factory, url = _HTTPS[cell]
+    settings = {**factory(url=url).settings, "verify_tls": None}
+    with active_hop_posture(_PROD):
+        conn = build_destination(
+            Destination(
+                name="OB",
+                type=ctype,
+                settings=settings,
+                tls_revocation_attested=True,
+                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
+            ),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    opener = conn._opener  # type: ignore[attr-defined]
+    assert verifies_peer_fully(opener_tls_context(opener, connector=cell))
 
 
 # --- SOAP WS-Security UsernameToken over cleartext http (the credentialed-cleartext variant) ----------
