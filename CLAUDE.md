@@ -552,15 +552,15 @@ gates a merge**, and no seat has to clear one.
   Builder's QA line under the `qa` label, or other evidence that code review ran against this
   change. Without it, the Lander sends the change to code review. The proof must cover the change
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
-  reads what the review found. **The Lander may merge when every open finding is filed as a ledger
-  row and none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A
-  finding that does either still goes to the owner for a ruling. Until that day, every finding
-  that named a defect the merge would ship went to the owner. The ruling does not let the Lander
-  skip the review proof, or choose between two authors' deliberate changes. Nor does it let the
-  Lander decline a finding that names a defect the merge would ship. **CORRECTED 2026-10-12:**
-  this read *"a finding that names a defect the merge would ship goes back to the owner for a
-  ruling."* Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the
-  earlier rule, this ruling is the newer one. The full text and the owner's words are in
+  reads what the review found. **The Lander may merge when the open findings are filed as rows and
+  none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A finding
+  that does either still goes to the owner for a ruling. **CORRECTED 2026-10-12:** this read *"a
+  finding that names a defect the merge would ship goes back to the owner for a ruling."* Until
+  that day, every finding that named a defect the merge would ship went to the owner. The ruling
+  does not let the Lander skip the review proof, or choose between two authors' deliberate
+  changes. Nor does it let the Lander decline a finding that names a defect the merge would ship.
+  Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
+  rule, this ruling is the newer one. The full text and the owner's words are in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
