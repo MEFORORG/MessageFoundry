@@ -247,7 +247,7 @@ def test_show_reports_a_default_operation_left_out_of_dual_control(
     data = _show(toml, capsys)
     assert data["loosenings_partial"] is False
     risks = {e["switch"]: e["risk"] for e in data["loosenings"]}
-    assert "does not hold connection_purge, " in risks["approvals.operations"]
+    assert "the default operation connection_purge. " in risks["approvals.operations"]
     toml.write_text("[approvals]\nenabled = true\n", encoding="utf-8")
     data = _show(toml, capsys)
     assert "approvals.operations" not in [e["switch"] for e in data["loosenings"]]

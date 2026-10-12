@@ -1138,7 +1138,7 @@ def test_each_default_operation_left_out_of_dual_control_is_named(dropped: str) 
     assert kept, "a one-item default would make this the empty-list case"
     risks = _approval_risks(_held(kept))
     assert list(risks) == [_OPS]
-    assert f"does not hold {dropped}," in risks[_OPS]
+    assert f"leaves out the default operation {dropped}. " in risks[_OPS]
     assert not any(op in risks[_OPS] for op in kept)
     # Opting config_reload in does not make up for it.
     assert _names(approvals=_held([*kept, "config_reload"])) == [_OPS]
@@ -1147,12 +1147,14 @@ def test_each_default_operation_left_out_of_dual_control_is_named(dropped: str) 
 def test_a_dropped_purge_or_replay_is_named_by_its_own_name() -> None:
     """The two cases the row names, written out by hand so they do not lean on the default list."""
     purge = _approval_risks(_held(["dead_letter_replay"]))[_OPS]
-    assert "does not hold connection_purge, " in purge and "dead_letter_replay" not in purge
+    assert "the default operation connection_purge. " in purge and "dead_letter_replay" not in purge
     replay = _approval_risks(_held(["connection_purge"]))[_OPS]
-    assert "does not hold dead_letter_replay, " in replay and "connection_purge" not in replay
+    assert "the default operation dead_letter_replay. " in replay
+    assert "connection_purge" not in replay
     # Both dropped with one opt-in operation still held: each is named, and config_reload is not.
+    # The names end the sentence, so no later phrase reads as a third operation.
     both = _approval_risks(_held(["config_reload"]))[_OPS]
-    assert "does not hold connection_purge, dead_letter_replay, " in both
+    assert "the default operations connection_purge, dead_letter_replay. " in both
     assert "config_reload" not in both
     for risk in (purge, replay, both):
         assert "no second approver" in risk
@@ -1184,7 +1186,7 @@ def test_an_empty_list_with_dual_control_on_is_named_as_holding_nothing() -> Non
     That is the narrowing in its largest form, and it has its own wording."""
     risk = _approval_risks(_held([]))[_OPS]
     assert "holds no operation" in risk
-    assert "does not hold" not in risk
+    assert "leaves out" not in risk
     # The wording belongs to the empty list alone.
     assert "holds no operation" not in _approval_risks(_held(["config_reload"]))[_OPS]
 
@@ -1243,7 +1245,7 @@ def test_serve_names_a_narrowed_operations_list(
     rc, _ = _run_secure_serve(tmp_path, monkeypatch, narrowed)
     assert rc == 0
     out = capsys.readouterr().out
-    assert f"{_OPS} (" in out and "does not hold connection_purge, " in out
+    assert f"{_OPS} (" in out and "the default operation connection_purge. " in out
 
 
 # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4) --------------------

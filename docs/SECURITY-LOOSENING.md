@@ -1016,11 +1016,14 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   a replay its on-call operator must be able to run alone. There is no good case for an
   empty list with dual control on: turn dual control off instead, so the setting says what the
   engine does.
-- **Compensating controls:** an operation left out still needs its own permission and step-up; the
-  route table in [SECURITY.md](SECURITY.md) lists both. Review the audit rows for the action itself,
-  since a call that is not held writes no `approval.requested` row.
-- **Where it is reported:** `security_loosenings()` names it, so the serve-time warning,
-  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it. The
+- **Compensating controls:** nothing here supplies the second person. An operation left out still
+  needs its own permission and step-up, and the route table in [SECURITY.md](SECURITY.md) lists
+  both. Those limit who may run it and guard a stolen session; one person can still pass both.
+  Review the audit rows for the action itself, since a call that is not held writes no
+  `approval.requested` row.
+- **Where it is reported:** `security_loosenings()` names it, so at least the serve-time warning,
+  `messagefoundry security show`, `GET /security/posture` and the start's `config_loaded` audit row
+  list it. Nothing refuses it. The
   serve-time advisory about exposed dual control reads `enabled` only, so it stays quiet for a
   narrowed or an empty list.
 - **Reversible:** yes, immediately — restore the default (or delete the `operations` line) and

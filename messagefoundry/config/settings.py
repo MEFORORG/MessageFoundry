@@ -8328,9 +8328,7 @@ def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]
     **A request already held.** ``ApprovalGate.approve`` refuses a request whose operation is no
     longer held (409, ``approval.no_longer_gated``), whether dual control was turned off or the
     operation left the list. So narrowing the list releases nothing already held; it changes what
-    the NEXT call does. Each request keeps the deadline stamped when it was made. This paragraph
-    said until vault BACKLOG #3123 that ``approve`` checked neither setting, which the gate no
-    longer bears out."""
+    the NEXT call does. Each request keeps the deadline stamped when it was made."""
     out: list[tuple[str, str]] = []
     if not approvals.enabled:
         return out
@@ -8347,11 +8345,14 @@ def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]
     # The default is read off the field, so a default that moves is followed and never restated.
     left_out = sorted(set(fields["operations"].get_default(call_default_factory=True)) - held)
     if left_out:
+        # The names end the sentence, so nothing after them reads as one more operation.
+        one = len(left_out) == 1
         out.append(
             (
                 "approvals.operations",
-                f"dual control is on and does not hold {', '.join(left_out)}, held by default. "
-                f"One caller's authority completes {'it' if len(left_out) == 1 else 'each'} with "
+                "dual control is on and its list leaves out the default "
+                f"{'operation' if one else 'operations'} {', '.join(left_out)}. "
+                f"One caller's authority completes {'it' if one else 'each'} with "
                 "no second approver",
             )
         )
