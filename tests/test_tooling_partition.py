@@ -76,6 +76,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
         # doc-drift guard, but the doc half is not the reason it stays.
         "test_adaptive_attributes_doc_drift.py",
+        # Reads messagefoundry/config/ai_policy.py, messagefoundry/anon/__init__.py and
+        # harness/load/corpus.py off disk (BACKLOG #2996). It fails when the ai_policy or corpus
+        # docstring calls the anonymizer's output PHI-free again. Its anon/__init__.py arm is about
+        # the "byte-identical tee/anon/" claim only, and is a strict xfail until that docstring is
+        # corrected. Either change arrives as an ENGINE or harness diff, which does not trip the
+        # tooling path gate. Its other arms read docs/*.md, and they are not the reason it stays.
+        "test_anon_doc_claims.py",
         # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of
         # docs/architecture-diagram.md (`pipeline/`, `store/`, ...) to a folder that exists. What
         # breaks that arm is an engine package being renamed or removed, which arrives as an ENGINE
