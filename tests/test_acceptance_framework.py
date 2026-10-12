@@ -114,8 +114,13 @@ def test_reports_render(tmp_path: Path) -> None:
 
 
 def _md_data_rows(md: str) -> list[str]:
-    # Every table line but the header ("| ID |...") and the rule ("|---|...").
-    return [line for line in md.splitlines() if line.startswith("| ") and "| ID |" not in line]
+    # Every line starting with a pipe, whatever follows it, but the header and the rule. A forged
+    # row spelled "|A9|..." still counts, so a regression cannot hide by dropping a space.
+    return [
+        line
+        for line in md.splitlines()
+        if line.startswith("|") and not line.startswith(("| ID |", "|---|"))
+    ]
 
 
 def test_render_markdown_keeps_a_hostile_detail_in_one_row() -> None:
