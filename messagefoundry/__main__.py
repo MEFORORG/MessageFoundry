@@ -2332,6 +2332,34 @@ def _start_logging(
     return None
 
 
+def _exposure_description(settings: ServiceSettings) -> str:
+    """What made this instance exposed, as the start of a ``serve`` exposure message. Empty when it
+    is not exposed.
+
+    Whether the instance is exposed is read from ``host_is_browser_origin``, the predicate
+    ``instance_exposed`` reads in ``_serve``. It is not worked out again here, so this text cannot
+    call an instance exposed that the arms do not, or the reverse (vault BACKLOG #3102). The
+    branches below only choose which field to name. They name the one the operator set, so a
+    loopback bind that only trusts a proxy (re-encrypting to an operator certificate) is told
+    ``[api].trusted_proxies``, not a terminator it never declared (vault BACKLOG #2251).
+
+    The last line covers a term added to the predicate and not named here yet. Its text is true of
+    any exposed instance, so a new term gets a vague message rather than a wrong one."""
+    api = settings.api
+    if api.host_is_browser_origin:
+        return ""
+    if not api.is_loopback:
+        return f"API bound to non-loopback host {api.host!r}"
+    if api.tls_terminated_upstream:
+        return (
+            "admin interface reached through a declared reverse proxy "
+            "([api].tls_terminated_upstream)"
+        )
+    if api.trusted_proxies:
+        return "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
+    return "admin interface reachable from beyond this host"
+
+
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
     # because a script injected before the hook is in place runs. It is NOT first in the process:
@@ -3369,9 +3397,10 @@ def _serve(args: argparse.Namespace) -> int:
             "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
-    # Only the two advisories below read this: instance_exposed plus the serve_ui term. The refusing
-    # arms read instance_exposed alone, since serve_ui is rewritten in place above (BACKLOG #326,
-    # #2218, vault BACKLOG #2251).
+    # Only the two advisories below read this: instance_exposed plus the serve_ui term. At least the
+    # MFA-at-exposure, dual-control and ADR 0152 arms read instance_exposed alone, since serve_ui is
+    # rewritten in place above (BACKLOG #326, #2218, vault BACKLOG #2251). Of those, dual-control
+    # only warns.
     ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
@@ -3504,20 +3533,10 @@ def _serve(args: argparse.Namespace) -> int:
     # it points back at the sentence that names it rather than printing it twice.
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     directory_exception = ", with the OIDC exception above" if oidc_exception else ""
-    # What made this instance exposed, named once for the MFA and dual-control arms below. It names
-    # the field the operator set, so a loopback bind that only trusts a proxy (re-encrypting to an
-    # operator certificate) is told [api].trusted_proxies, not a terminator it never declared
-    # (vault BACKLOG #2251). Empty when not exposed, and read only when admin_exposed.
-    exposure_desc = (
-        f"API bound to non-loopback host {settings.api.host!r}"
-        if not settings.api.is_loopback
-        else "admin interface reached through a declared reverse proxy "
-        "([api].tls_terminated_upstream)"
-        if settings.api.tls_terminated_upstream
-        else "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
-        if settings.api.trusted_proxies
-        else ""
-    )
+    # What made this instance exposed, named once for the MFA and dual-control arms below. The
+    # helper reads the predicate instance_exposed reads, so the two agree by construction (vault
+    # BACKLOG #3102). Empty when not exposed, and read only when admin_exposed.
+    exposure_desc = _exposure_description(settings)
     if admin_exposed and not settings.auth.require_mfa:
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
@@ -3570,13 +3589,15 @@ def _serve(args: argparse.Namespace) -> int:
     if not instance_exposed and settings.api.public_origin and not settings.auth.require_mfa:
         print(
             "warning: [security].web_console_public_address is set with no declared TLS terminator "
-            "on a PHI instance "
+            "and no [api].trusted_proxies on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
             "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
             f"over the network{oidc_exception}, and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
-            "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
-            "trusted_proxies, or set [security].require_mfa=true.",
+            "exposure signal the engine can verify). Declare it by naming the proxy in "
+            "[api].trusted_proxies, with [api].tls_terminated_upstream=true if it terminates TLS or "
+            "an operator [api].tls_cert_file if it re-encrypts to the engine; or set "
+            "[security].require_mfa=true.",
             file=sys.stderr,
         )
 
@@ -3683,6 +3704,20 @@ def _serve(args: argparse.Namespace) -> int:
     # call needs. Before #1026 this comment named three conditions while the gate had four, and the
     # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
     # instance sits behind a declared terminator under `enforce`, and it did not.
+    #
+    # NOT EVERY EXPOSED POSTURE IS PROBED (vault BACKLOG #3102). `instance_exposed` also counts a
+    # set `trusted_proxies` with no declared terminator (vault BACKLOG #2251): a proxy that
+    # re-encrypts to an operator certificate. This gate and the refusal above it read
+    # `tls_terminated_upstream`, not `instance_exposed`, so that shape is never probed and may leave
+    # `public_origin` unset. Two facts, and neither says the gap is safe:
+    #  1. On the hop the engine serves there, its own listener enforces the floor: api/tls.py sets
+    #     `minimum_version` from `[api].tls_min_version`, which the loader holds to 1.2 or 1.3.
+    #  2. The browser's hop still ends at the proxy, as it does behind a terminator. Nothing at
+    #     start measures that proxy's floor, and that shape owes no attestation of it either:
+    #     the only gate that asks for `proxy_tls_min_version` is the terminator gate.
+    # Widening this gate would add a start refusal and a network dependency to configs that start
+    # today. The terminator case took an owner ruling (BACKLOG #1026), and no ruling covers this
+    # shape, so it is left as it was before #2251 rather than widened in passing.
     if settings.api.tls_terminated_upstream and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 
