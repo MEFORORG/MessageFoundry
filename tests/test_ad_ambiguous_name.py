@@ -248,9 +248,18 @@ def test_both_id_keys_at_once_are_refused() -> None:
 
 
 def test_two_entries_carrying_the_stored_object_id_are_refused() -> None:
-    """An id is meant to name one object. Two entries reading it back prove neither is the account.
-    Both hold the name here, as same-named accounts in two domains under one search base would."""
-    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_Entry("victor", "CN=V,DC=y"), _GUID_X)])
+    """An id is meant to name one object. Two entries reading it back prove neither is the account,
+    even when only one of them holds the name."""
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_X)])
+    found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_X))
+    assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_two_entries_holding_the_name_are_refused_whatever_the_stored_id() -> None:
+    """Same-named accounts in two domains under one search base. The ticket's realm is dropped
+    before the lookup, so it cannot say which one signed in, and the row's id must not choose."""
+    other_domain = _carrying(_Entry("victor", "CN=victor,DC=y"), _GUID_V)
+    conn = _Conn([_carrying(_X, _GUID_X), other_domain])
     found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_X))
     assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
 

@@ -1009,9 +1009,10 @@ class LdapAuthenticator:
         and ``answer`` says which (ADR 0195 rule item 2).
 
         ``tie_break_object_id``, a canonical id, picks among several matches of a name-keyed search
-        (vault BACKLOG #3228): the one entry whose ``sAMAccountName`` is ``fallback_username`` and
-        which reads the id back is used, and none or several are still ``AMBIGUOUS``. It never
-        changes a search that matched one entry. See :meth:`_lookup_by_name`.
+        (vault BACKLOG #3228). It is used only when exactly one match holds ``fallback_username`` as
+        its own ``sAMAccountName`` and that entry is the only match reading the id back. Anything
+        else is still ``AMBIGUOUS``. It never changes a search that matched one entry. See
+        :meth:`_lookup_by_name`.
 
         ``expected_object_id``, the canonical id an id-keyed search asked for, makes an entry that
         does not read it back a no-match, before its account state is read (BACKLOG #2027). See
@@ -1062,24 +1063,30 @@ class LdapAuthenticator:
             # Refusing it too let anyone able to write a colliding entry lock the account out. No
             # match, or more than one, still proves nothing, so it is refused as before.
             #
-            # THE CHOSEN ENTRY MUST ALSO HOLD THE NAME AS ITS OWN sAMAccountName. A Kerberos ticket
-            # proves the holder's sAMAccountName, so an entry that matched only through its UPN is
-            # not the ticket holder. Without this, a renamed account that kept its old UPN would
-            # sign in whoever the directory reissued the old name to, as the renamed account.
-            # The name is compared first, so an unrelated colliding entry with no objectGUID does
-            # not raise the site-wide "objectGUID is unusable" warning. The `is not None` test is
-            # load-bearing: an entry with no readable id reads back None, which must never match a
-            # caller that holds no id.
+            # THE CHOSEN ENTRY MUST BE THE ONLY MATCH HOLDING THE NAME AS ITS sAMAccountName. The
+            # Kerberos caller passes the ticket's name with its realm already dropped, so the ticket
+            # proves only that its holder has this sAMAccountName in SOME realm the acceptor trusts.
+            # - An entry that matched only through its UPN is not that holder. Choosing it would let
+            #   a renamed account that kept its old UPN be signed in by whoever was later given the
+            #   old name.
+            # - Two entries holding the name, as same-named accounts in two domains under one
+            #   search base would, cannot be told apart by the ticket, so the id does not choose.
+            # The id must also be on that entry alone: an id on two entries names neither.
+            # Compared with lower(), not casefold(), so "straße" does not equal "strasse".
+            # The `is not None` test is load-bearing: an entry with no readable id reads back
+            # None, which must never match a caller that holds no id.
             label = safe_name(fallback_username)
-            name = fallback_username.casefold()
-            matching = [
-                x
-                for x in conn.entries
-                if tie_break_object_id is not None
-                and (_attr(x, "sAMAccountName") or "").casefold() == name
-                and _object_guid(x) == tie_break_object_id
+            name = fallback_username.lower()
+            holders = [
+                x for x in conn.entries if (_attr(x, "sAMAccountName") or "").lower() == name
             ]
-            chosen = len(matching) == 1
+            chosen = (
+                tie_break_object_id is not None
+                and len(holders) == 1
+                # Identity, not ==: the one entry carrying the id must be the holder itself.
+                and [id(x) for x in conn.entries if _object_guid(x) == tie_break_object_id]
+                == [id(holders[0])]
+            )
             # Reported either way: the collision is in the directory, and an operator should clear it.
             _warn_once(
                 f"ambiguous-chosen:{label}" if chosen else f"ambiguous:{label}",
@@ -1092,7 +1099,7 @@ class LdapAuthenticator:
             )
             if not chosen:
                 return _Lookup(DirectoryAnswer.AMBIGUOUS)
-            e, own = matching[0], tie_break_object_id
+            e, own = holders[0], tie_break_object_id
         if expected_object_id is not None:
             own = _object_guid(e)
             if own != expected_object_id:
@@ -1137,9 +1144,9 @@ class LdapAuthenticator:
 
         Vault BACKLOG #3228. The name stays the key: a Kerberos ticket proves a name, so searching
         by the stored id instead would sign the ticket holder in as whoever holds that id now, even
-        after the name passed to someone else. For the same reason the tie-break only accepts an
-        entry whose own ``sAMAccountName`` is the name (:meth:`_search_user`). The id is normalised
-        here, the one place it enters this lookup; one that cannot be read breaks no tie.
+        after the name passed to someone else. For the same reason the tie-break only accepts the
+        one entry whose own ``sAMAccountName`` is the name (:meth:`_search_user`). The id is
+        normalised here, the one place it enters this lookup; one that cannot be read breaks no tie.
         """
         upn = f"{username}@{self._s.ad_domain}" if self._s.ad_domain else username
         return self._search_user(
