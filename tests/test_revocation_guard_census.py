@@ -358,8 +358,9 @@ def test_every_census_entry_is_still_a_site() -> None:
 def test_every_guarded_site_calls_a_guard() -> None:
     scan = _scan()
     guarded = {site: entry for site, entry in _CENSUS.items() if isinstance(entry, Guarded)}
-    # 15 sites are Guarded today. A floor of 10 leaves room to retire a hop or two, and still
-    # fails a census emptied or turned all Exempt, over which the check below would pass on nothing.
+    # 15 sites were Guarded when this floor was set, so 10 lets up to five retire with no edit here.
+    # It is a floor against a census emptied or turned all Exempt, over which the check below would
+    # pass on nothing. It does not catch a single hop moved from Guarded to Exempt; review does.
     assert len(guarded) >= 10, f"only {len(guarded)} Guarded census entries, floor 10"
     unguarded = [
         f"{site} (guard expected in {entry.by or 'the site itself'}; {entry.note or 'no note'})"
@@ -393,8 +394,10 @@ def test_every_builder_name_is_still_defined() -> None:
     """A renamed builder would drop all its callers from the census without a red."""
     scan = _scan()
     engine_builders = _BUILDERS - _STDLIB_BUILDERS
-    # 17 engine builder names today. A floor of 12 still fails a list emptied or cut to a few names,
-    # over which the check below would pass on nothing.
+    # 17 engine builder names when this floor was set, so 12 lets up to five go with no edit here.
+    # It fails a list emptied or cut to a few names, over which the check below would pass on
+    # nothing. Most such cuts also turn census entries stale in the test above; this floor makes
+    # this test stand on its own.
     assert len(engine_builders) >= 12, f"only {len(engine_builders)} engine builder names, floor 12"
     missing = sorted(name for name in engine_builders if name not in scan.defs)
     assert not missing, f"builder name(s) no longer defined in messagefoundry/: {missing}"
