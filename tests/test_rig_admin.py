@@ -601,6 +601,7 @@ class _FakeClient:
         self.step_up: Any = None
         self.reauths: list[str] = []
         self.refuse_reauth = False
+        self.session_ended = False
 
     def set_token(self, token: str) -> None:
         if token not in self.accepts:
@@ -615,6 +616,9 @@ class _FakeClient:
         self.reauths.append(password)
         if self.refuse_reauth:
             raise ApiError("re-verification failed", status=403)
+        if self.session_ended:
+            self.session_ended = False
+            raise ApiError("session ended; sign in again", status=401)
         self.token = f"{self.token}-rekeyed"
 
 
@@ -664,6 +668,46 @@ def test_the_step_up_handler_re_proves_on_a_session_of_its_own(
     assert client.token == "private-rekeyed"
     client.refuse_reauth = True
     assert client.step_up() is False
+
+
+def test_a_second_step_up_re_proves_on_the_same_private_session(
+    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3241: each sign-in is one more session against the per-user cap, which
+    revokes the OLDEST, the held session every other client uses. So a second step-up re-proves
+    on the private session the first one left, and signs in again only when that session has
+    ended (401)."""
+    monkeypatch.setattr(rigadmin, "session_token", lambda url, cacert=None: "fresh")
+    signed_in: list[str] = []
+
+    def sign_in(url: str, admin: object = None, *, cacert: str | None = None) -> str:
+        signed_in.append(url)
+        return f"private{len(signed_in)}"
+
+    monkeypatch.setattr(rigadmin, "sign_in", sign_in)
+    monkeypatch.setattr(rigadmin, "rig_admin", lambda: rigadmin.RigAdmin("rigadmin", "held-pw"))
+    monkeypatch.setattr(enginepoll, "_STEP_UP_RETRY_GAP_SECONDS", 0.0)
+    client = _FakeClient(accepts={"fresh", "private1", "private2"})
+    enginepoll.adopt_rig_session(client, "https://b", None)  # type: ignore[arg-type]
+    assert client.step_up() is True and client.token == "private1-rekeyed"
+    assert client.step_up() is True and client.token == "private1-rekeyed-rekeyed"
+    assert len(signed_in) == 1, f"the second step-up signed in again: {signed_in}"
+    # The private session has ended: one more sign-in, then the re-proof.
+    client.session_ended = True
+    assert client.step_up() is True and client.token == "private2-rekeyed"
+    assert len(signed_in) == 2
+    # CONTROL: once another session replaced the private one, the handler does not re-key it.
+    client.token = "fresh"
+    signed_in.clear()
+    assert client.step_up() is True and signed_in == ["https://b"]
+
+
+def test_a_token_poller_gets_no_reload_client() -> None:
+    """A ``--token`` poller drives an engine the rig did not start, so it holds no password to
+    re-prove with (vault BACKLOG #3241 declines that limb). It is told so, with no request made."""
+    poller = EnginePoller("https://127.0.0.1:1", "a-token", origin=0.0)
+    poller._clients = [object()]  # type: ignore[list-item]
+    assert asyncio.run(poller.reload_client()) is None
 
 
 def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(
@@ -844,24 +888,33 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
         await poller.open()
         try:
             assert await poller.sample_once() is not None
-            # A caller about to TIME a reload proves for it first (vault BACKLOG #2625): a
-            # session of the client's own, holding a proof bound to config_reload. The held
-            # session every other client uses is left alone.
+            # A caller about to TIME a reload proves for it first (vault BACKLOG #2625), on a
+            # client of its own holding a proof bound to config_reload (vault BACKLOG #3241).
+            # Neither the held session nor the sampler's client is re-keyed.
             before = rigadmin._held.token
             primary = poller.client
             assert primary is not None
-            await poller.prove_sign_in()
-            assert rigadmin._held.token == before
-            assert primary.token not in (None, before)
+            sampler_token = primary.token
+            proved = await poller.reload_client()
+            assert proved is not None and proved is not primary
+            assert rigadmin._held.token == before and primary.token == sampler_token
+            assert proved.token not in (None, before)
             assert await poller.sample_once() is not None
             # The proof opens the reload with no step-up retry, and only once.
-            primary.set_step_up_handler(None)
-            result = await asyncio.to_thread(primary.reload_config)
+            result = await asyncio.to_thread(proved.reload_config)
             assert getattr(result, "inbound", None) is not None, result
             await asyncio.sleep(0.3)  # past the engine's admin-write gap
             with pytest.raises(ApiError) as refused:
-                await asyncio.to_thread(primary.reload_config)
+                await asyncio.to_thread(proved.reload_config)
             assert refused.value.status == 403
+            # Ending it signs its session out, so a run of reloads holds one session at a time.
+            ended = proved.token
+            await poller.end_reload_client(proved)
+            async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as check:
+                me = await check.get(
+                    f"{node.url}/auth/me", headers={"Authorization": f"Bearer {ended}"}
+                )
+            assert me.status_code == 401, me.status_code
         finally:
             await poller.close()
         # CONTROL: the same poller with no session reads nothing.
