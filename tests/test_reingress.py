@@ -29,7 +29,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
-from messagefoundry.store.crypto import cell_aad
+from messagefoundry.store.queue_tag import queue_payload_aad, queue_row_aad
 from messagefoundry.transports.loopback import LoopbackSource
 
 
@@ -59,7 +59,16 @@ async def _insert_response_row(
 ) -> str:
     """Insert one Stage.RESPONSE work-row directly (Step 1 has no producer yet — that is Step 3). The
     payload is the encrypted artifact reference, exactly as complete_with_response will write it."""
-    ref = store._enc(f"{message_id}\x1fOB_X\x1f{seq}", aad=cell_aad("queue", "payload", row_id))
+    aad = queue_payload_aad(
+        row_id=row_id,
+        message_id=message_id,
+        stage=Stage.RESPONSE.value,
+        channel_id=loopback,
+        destination_name=None,
+        handler_name=None,
+        body_ref=None,
+    )
+    ref = store._enc(f"{message_id}\x1fOB_X\x1f{seq}", aad=aad)
     await store._db.execute(
         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
         " payload, status, attempts, next_attempt_at, created_at, updated_at)"
@@ -642,9 +651,11 @@ async def test_ingress_handoff_corrupt_ref_dead_letters_not_loops(store: Message
     # A corrupt/unparseable work-row reference must dead-letter the token + ERROR the origin + CONSUME it
     # (return True) — never infinite-loop on a row that can't be parsed (review finding).
     origin, work = await _seed_reingress(store)
+    cur = await store._db.execute("SELECT * FROM queue WHERE id=?", (work.id,))
+    work_row = await cur.fetchone()
     await store._db.execute(
         "UPDATE queue SET payload=? WHERE id=?",
-        (store._enc("not-a-valid-ref", aad=cell_aad("queue", "payload", work.id)), work.id),
+        (store._enc("not-a-valid-ref", aad=queue_row_aad(work_row)), work.id),
     )
     await store._db.commit()
     ok = await store.ingress_handoff(

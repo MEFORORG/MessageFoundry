@@ -38,6 +38,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
+from messagefoundry.store.queue_tag import queue_row_aad
 from messagefoundry.store.store import load_audit_chain
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
@@ -4211,13 +4212,11 @@ async def test_resend_funnels_behind_uncommitted_producer_pg(store) -> None:
         # ORDER: the resend lands at the lane TAIL, never ahead of the older producer.
         async with store._pool.acquire() as c2:
             lane = await c2.fetch(
-                "SELECT id, payload FROM queue WHERE stage=$1 AND destination_name=$2 ORDER BY seq",
+                "SELECT * FROM queue WHERE stage=$1 AND destination_name=$2 ORDER BY seq",
                 Stage.OUTBOUND.value,
                 "OB2",
             )
-        assert [
-            store._dec(r["payload"], aad=cell_aad("queue", "payload", r["id"])) for r in lane
-        ] == ["PRODUCER", "SRC"]
+        assert [store._dec(r["payload"], aad=queue_row_aad(r)) for r in lane] == ["PRODUCER", "SRC"]
     finally:
         await store._pool.release(conn)
         await other.close()
@@ -5114,6 +5113,34 @@ async def test_session_seal_contract(store) -> None:
             )
         await assert_session_seal_contract(keyed, raw)
         assert_session_columns({str(r["column_name"]) for r in rows})
+    finally:
+        await keyed.close()
+
+
+async def test_queue_tag_contract(store) -> None:
+    """BACKLOG #2593: the queue payload's routing tag, the same contract the SQLite suite runs, on a
+    keyed handle under the cell-bound writer. ``raw`` and ``fetch`` run on pooled connections,
+    outside the store's helpers. The ``store`` fixture truncates the queue tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._queue_tag_contract import assert_queue_tag_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store,
+        cipher=make_cipher(generate_key(), write_v2=True),
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async def fetch(sql: str, params: tuple[object, ...]) -> list[dict[str, object]]:
+            async with keyed._pool.acquire() as conn:
+                return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
+
+        await assert_queue_tag_contract(keyed, raw, fetch, store_once=False)
     finally:
         await keyed.close()
 
