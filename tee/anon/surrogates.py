@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import _pools
 from .keying import Keyer
-from .rules import AnonError, FieldRule, SurrogateKind
+from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind
 
 #: A never-matching pattern — the site-code detector when no prefix is configured (a token-less
 #: public build). ``re`` has no built-in "match nothing", so encode one explicitly.
@@ -496,11 +496,12 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
     The OBX-5 case reads OBX-2 from the text it is given. A rule that rewrites OBX-2 hides the date
     type, and that OBX-5 is then scrubbed as before the exemption existed.
 
-    An MSH line is never skipped. Both adapters apply an ``MSH-N`` rule (BACKLOG #2265), but this
-    test does not number MSH fields the MSH way, so a ``DATE`` rule there earns no exemption: its
-    output is checked and scrubbed like any other MSH field. What this lets through: a site
-    code that reads as a year and a month, sitting in a date field, leaves as its first four digits
-    and ``01``.
+    A header line (``MSH``, ``BHS``, ``FHS``) is never skipped. Both adapters apply a rule there
+    (BACKLOG #2265, #2998), but this test does not number a header's fields the header way, so a
+    ``DATE`` rule there earns no exemption: its output is checked and scrubbed like any other
+    header field. Before, a ``BHS-7`` date rule exempted the field one to the right of the one
+    the rule wrote. What this lets through: a site code that reads as a year and a month,
+    sitting in a date field, leaves as its first four digits and ``01``.
     """
     if not _SITE_PREFIXES:
         return lambda fields, index: False  # no site code can match, so there is nothing to skip
@@ -513,7 +514,7 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
 
     def is_date_output(fields: list[str], index: int) -> bool:
         seg_id = fields[0]
-        if index == 0 or seg_id.upper() == "MSH":
+        if index == 0 or seg_id.upper() in HEADER_SEGMENTS:
             return False
         if f"{seg_id}-{index}" not in date_paths and not (
             obx5_dates

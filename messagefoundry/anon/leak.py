@@ -44,7 +44,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 
-from .rules import FieldRule, SurrogateKind
+from .rules import HEADER_SEGMENTS, FieldRule, SurrogateKind
 from .surrogates import Seps, message_has_site_code, read_message_seps
 
 
@@ -220,8 +220,11 @@ def known_segments(version: str) -> frozenset[str]:
     return chosen if chosen is not None else _ANY_VERSION_SEGMENTS
 
 
-#: Header segments. Each carries its own separators, so none is ever a legal bare line.
-_HEADER_SEGMENTS: frozenset[str] = frozenset({"MSH", "FHS", "BHS"})
+#: The fewest split fields a header line (``HEADER_SEGMENTS``) can have: the id, the encoding
+#: characters, and one field after them. The separator that ends the encoding characters is what
+#: the engine's parser looks for. Without it the parser cuts the encoding characters short and
+#: re-encodes the line with its own text repeated (BACKLOG #2998).
+_HEADER_MIN_FIELDS = 3
 
 
 def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) -> bool:
@@ -232,12 +235,19 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
     alone. A bare ``LEE`` or ``ZOE`` is three letters of untrusted text that no rule can address,
     so it is malformed. ``defined`` is the ids the message's HL7 version defines plus the ids a
     rule names, so a bare ``ZPD`` is an empty segment only when a rule names ``ZPD``. A Z-prefix
-    alone does not count (BACKLOG #2247). A header id (``MSH``, ``FHS``, ``BHS``) never stands
-    bare: it carries the separators, and the engine's parser refuses one that the tee would emit."""
+    alone does not count (BACKLOG #2247).
+
+    A header line (``MSH``, ``FHS``, ``BHS``) is malformed with fewer than
+    :data:`_HEADER_MIN_FIELDS` split fields. A bare one carries no separators, and the engine's
+    parser refuses it where the tee would emit it. One with no separator after its encoding
+    characters (``BHS|TEXT``) is re-encoded out of shape by the engine, with ``TEXT`` written
+    twice, where the tee would emit it as it came (BACKLOG #2998)."""
     seg_id = fields[0]
     if not _SEGMENT_ID.fullmatch(seg_id):
         return True
-    return len(fields) == 1 and (seg_id not in defined or seg_id in _HEADER_SEGMENTS)
+    if seg_id in HEADER_SEGMENTS:
+        return len(fields) < _HEADER_MIN_FIELDS
+    return len(fields) == 1 and seg_id not in defined
 
 
 def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, str]]:
@@ -246,9 +256,11 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
 
     The MSH control header -- the FIRST MSH line only -- is skipped whole: it carries routing/site
     data the field-anchored site-code pass already covers, not patient PHI. A later MSH line is
-    checked, and numbered the MSH way (MSH-N sits at split-index N-1). ``mapped_paths`` is occurrence-agnostic (a rule applies to every
-    occurrence of its segment), so the address is the bare ``SEG-i``. Returns ``[]`` when the message
-    has no parseable MSH (there is no field separator to split on).
+    checked. It, and every ``BHS`` and ``FHS`` line, is numbered the header way: field N sits at
+    split index N-1, because field 1 is the separator itself. Both adapters apply a rule to that
+    same field (BACKLOG #2265, #2998). ``mapped_paths`` is occurrence-agnostic (a rule applies to
+    every occurrence of its segment), so the address is the bare ``SEG-i``. Returns ``[]`` when
+    the message has no parseable MSH (there is no field separator to split on).
 
     A line whose first field is not a well-formed segment id, or that has no field separator and
     is not an id the message's HL7 version defines or a rule names (a wrapped ``LEE`` looks like a
@@ -283,7 +295,7 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
             out.extend((f"{MALFORMED_SEGMENT}-{i}", v) for i, v in enumerate(fields) if i and v)
             continue
         named = seg_id if seg_id in nameable or seg_id.startswith("Z") else UNKNOWN_SEGMENT
-        shift = 1 if seg_id == "MSH" else 0  # a later MSH: MSH-1 is the separator itself
+        shift = 1 if seg_id in HEADER_SEGMENTS else 0  # field 1 is the separator itself
         for i in range(1, len(fields)):
             value = fields[i]
             if not value or f"{seg_id}-{i + shift}" in mapped_paths:
