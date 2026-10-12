@@ -498,6 +498,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # under a per-process AES-256-GCM key built through store.crypto._install_key (lock + wipe of the
     # key buffer). Memory hygiene for decoded cache values, not at-rest protection.
     "messagefoundry/store/sealed_cache.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #2592: row integrity seals. hmac = HMAC-SHA256 over a typed row encoding under a key
+    # derived (HKDF, through the store.crypto seam) from the store key's authorization root; hashlib =
+    # the SHA-256 the HMAC runs over; compare_digest for the constant-time verify.
+    "messagefoundry/store/row_seal.py": frozenset(
+        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+    ),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -1314,6 +1320,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
+    # BACKLOG #2592: HMAC-SHA256 row seals and their constant-time verify, under a key the
+    # store.crypto seam derives (HKDF) and names by a SHA-256 digest.
+    "messagefoundry/store/row_seal.py": frozenset(
+        {
+            "compare:hmac.compare_digest",
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:hmac.new[sha256]",
+        }
+    ),
     # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
     # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
     # sha256) by store.crypto._install_key.

@@ -200,6 +200,12 @@ class TransitCipher(_UnmarkedPolicy):
         """No in-heap audit keys. Transit versions its own audit key, so the engine sees one range."""
         return {}
 
+    def authz_root(self) -> None:
+        """No in-heap DEK, so no in-process authorization root (BACKLOG #2592). Row seals under this
+        provider are Transit's own HMAC, a separate piece of work; until it lands this cipher writes
+        and checks no row seals."""
+        return None
+
     def audit_hmac(self, data: bytes, *, key_version: int | None = None) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
 
