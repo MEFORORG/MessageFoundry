@@ -111,6 +111,19 @@ def reference_connection_name(name: str) -> str:
     return f"reference:{name}"
 
 
+def reference_acquire_timeout(settings: Mapping[str, Any]) -> float:
+    """Read a DATABASE reference source's ``acquire_timeout`` by the rule in
+    :func:`~messagefoundry.transports.base.float_setting`, or refuse it (BACKLOG #3432).
+
+    One reader for the sync and for ``build_check_registry``, so an ``env()`` value the sync would
+    refuse fails ``messagefoundry check`` too. ``DatabaseRef`` reads a literal the same way."""
+    return float_setting(
+        settings.get("acquire_timeout", DEFAULT_STORE_ACQUIRE_TIMEOUT),
+        knob="acquire_timeout",
+        transport="DATABASE reference source",
+    )
+
+
 def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None = None) -> str:
     """Build a DATABASE reference source's DSN, refusing weakened TLS under the AMBIENT hop posture.
 
@@ -171,11 +184,7 @@ async def _load_database_source(
     # the runner's existing per-set source-failure handler catches it, keeps the last-good snapshot
     # and alerts, exactly as it does for any other source error.
     # Read before the pool is made, so a refused value leaves no pool unclosed (BACKLOG #3432).
-    acquire_timeout = float_setting(
-        settings.get("acquire_timeout", DEFAULT_STORE_ACQUIRE_TIMEOUT),
-        knob="acquire_timeout",
-        transport="DATABASE reference source",
-    )
+    acquire_timeout = reference_acquire_timeout(settings)
     pool = await _make_pool(
         dsn,
         count_setting(

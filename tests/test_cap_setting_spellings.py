@@ -35,6 +35,7 @@ from messagefoundry.config.wiring import (
     ConnectionSpec,
     Database,
     DatabasePoll,
+    DatabaseRef,
     Ftp,
     Http,
     Sftp,
@@ -46,6 +47,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.transports import build_destination, build_source, database, mllp
 from messagefoundry.transports.base import (
     cap_setting,
+    count_setting,
     float_setting,
     poll_interval,
     positive_cap,
@@ -933,3 +935,97 @@ def test_the_http_factory_refuses_what_the_connector_refuses(key: str, bad: obje
     message = str(caught.value)
     assert f"Http {key} must be a finite positive number of seconds (value withheld)" in message
     assert "-7.25" not in message
+
+
+def test_the_http_factory_refuses_an_int_too_large_for_a_float_by_name() -> None:
+    """``math.isfinite(10**400)`` raises ``OverflowError``, so the factory raised that raw error, naming
+    no key. A long ``connections.toml`` integer reaches the same check through the desugar.
+
+    Red mutation: drop the factory's ``float(value)`` overflow guard. ``OverflowError`` escapes."""
+    for key in ("reply_timeout", "reply_write_timeout"):
+        overrides: dict[str, Any] = {key: 10**400}
+        with pytest.raises(WiringError, match=rf"^Http {key} .*too large for a float") as caught:
+            Http(port=0, reply_from="OB_REPLY", **overrides)
+        assert "0" * 20 not in str(caught.value)
+
+
+#: Exact zeros that ``_ZERO_TEXT`` does not match. ``int()`` reads the whole-number ones as ``0``, so
+#: an ``int`` cap already took them as off; a float setting called them "rounded to zero".
+_ODD_ZERO_TEXT = ["0_0", "０", "-0_0.0_0", "０.０"]
+
+
+def test_a_float_setting_reads_every_exact_zero_spelling_as_zero() -> None:
+    """Text whose digits are all zeros, with no exponent, is exactly zero, so it reads as zero and a
+    float cap reads it as off, as an ``int`` cap does.
+
+    Red mutation: test text against ``_ZERO_TEXT`` alone in ``_spells_zero``. Each case is refused."""
+    for zero in _ODD_ZERO_TEXT:
+        assert float_setting(zero, knob="k", transport="t") == 0.0, repr(zero)
+        assert cap_setting(zero, float, knob="k", transport="t") is None, repr(zero)
+    for zero in ("0_0", "０"):
+        assert count_setting(zero, knob="k", transport="t") == 0, repr(zero)
+        assert cap_setting(zero, int, knob="k", transport="t") is None, repr(zero)
+
+
+def test_a_float_setting_refusal_of_a_zero_reading_states_a_true_reason() -> None:
+    """What ``float()`` reads as zero but is refused is either exponent text or not zero at all, such
+    as a plain decimal too small for a float. The reason says so, and claims no rounding of an exact
+    zero.
+
+    Red mutation: restore "float() rounds it to zero, but it is not zero". The match fails."""
+    tiny_decimal = "0." + "0" * 400 + "1"
+    for bad in ("0e0", "1e-400", tiny_decimal, Decimal("1e-400")):
+        with pytest.raises(ValueError, match="it is not an exact zero in plain digits$"):
+            float_setting(bad, knob="k", transport="t")
+
+
+@pytest.mark.parametrize("bad", [True, False, math.nan, "inf", "1e-400", [2.5]])
+def test_database_ref_refuses_a_bad_acquire_timeout_when_declared(bad: object) -> None:
+    """A reference set is first synced after start, so a bool or a NaN refused only at sync passed
+    ``messagefoundry check``. ``DatabaseRef`` checks it when declared, as it checks ``connect_timeout``.
+
+    Red mutation: drop the declaration check. ``DatabaseRef`` returns a spec."""
+    overrides: dict[str, Any] = {"acquire_timeout": bad}
+    with pytest.raises(WiringError, match=_refusal("reference source acquire_timeout")):
+        DatabaseRef(server="s", database="d", statement="SELECT a", key_column="a", **overrides)
+
+
+def test_database_ref_accepts_a_number_or_an_env_ref_for_acquire_timeout() -> None:
+    """The control: a number and its text are declared, and an ``env()`` ref is left for the sync."""
+    for good in (12.5, "12.5", 0, env("MEFOR_TEST_3432_ACQUIRE")):
+        overrides: dict[str, Any] = {"acquire_timeout": good}
+        spec = DatabaseRef(
+            server="s", database="d", statement="SELECT a", key_column="a", **overrides
+        )
+        assert spec.settings["acquire_timeout"] is good
+
+
+def test_the_build_check_refuses_an_env_acquire_timeout_the_sync_would_refuse() -> None:
+    """``DatabaseRef`` cannot read an ``env()`` ref, so ``build_check_registry`` reads it once
+    resolved, by the sync's own reader. Before, ``messagefoundry check`` passed it.
+
+    Red mutation: drop the ``reference_acquire_timeout`` call from ``build_check_registry``."""
+    from messagefoundry.config.wiring import ReferenceSpec, Registry
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    registry = Registry()
+    source = DatabaseRef(
+        server="db.example.org",
+        database="d",
+        statement="SELECT a",
+        key_column="a",
+        acquire_timeout=env("MEFOR_TEST_3432_ACQUIRE"),  # type: ignore[arg-type]
+    )
+    registry.references["codes"] = ReferenceSpec(name="codes", source=source)
+
+    def check(value: str) -> None:
+        build_check_registry(
+            registry,
+            inbound_bind_host="127.0.0.1",
+            env_values={"mefor_test_3432_acquire": value},
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+    with pytest.raises(ValueError, match=_refusal("reference source acquire_timeout")):
+        check("nan")
+    check("12.5")  # the control: a number passes

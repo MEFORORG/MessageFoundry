@@ -876,6 +876,23 @@ def DatabaseRef(
             check_db_connect_timeout(connect_timeout, "DatabaseRef")
         except ValueError as exc:
             raise WiringError(str(exc)) from None
+    # The same holds for acquire_timeout: a bool or a NaN would otherwise be refused only at the first
+    # sync, after start, so `messagefoundry check` passed it (BACKLOG #3432). The sync reads it again,
+    # by the same rule, because an env() ref is resolved only then.
+    if not isinstance(acquire_timeout, EnvRef):
+        # Imported here: messagefoundry.transports imports this module at its top level.
+        from messagefoundry.transports.base import float_setting
+
+        # The refusal is raised outside the handler, so it carries no exception chain.
+        refusal: str | None = None
+        try:
+            float_setting(
+                acquire_timeout, knob="acquire_timeout", transport="DATABASE reference source"
+            )
+        except ValueError as exc:
+            refusal = str(exc)
+        if refusal is not None:
+            raise WiringError(refusal)
     return ReferenceSourceSpec(
         "database",
         {
@@ -2497,6 +2514,18 @@ def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
         value = settings[name]
         # A bool is an int, and NaN and inf pass `<= 0`, so each is refused by name (BACKLOG #3432).
         # The connector reads the same keys by the rule in transports/base.py float_setting.
+        # math.isfinite() raises OverflowError on an int too large for a float, such as 10**400 or a
+        # long TOML integer, so that int is refused by name here instead, outside the handler.
+        too_large = False
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                float(value)
+            except OverflowError:
+                too_large = True
+        if too_large:
+            raise WiringError(
+                f"Http {name} is not a valid float value (value withheld): it is too large for a float"
+            )
         if (
             isinstance(value, bool)
             or not isinstance(value, int | float)

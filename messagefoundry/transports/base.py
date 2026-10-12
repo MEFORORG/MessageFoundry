@@ -112,10 +112,11 @@ __all__ = [
 DEFAULT_MAX_ITEMS_PER_POLL = 500
 
 
-#: Text that spells zero in plain digits: ``"0"``, ``"00"``, ``"0.0"``, ``"-0.0"``, ``".0"``. A cap
-#: reads this as "off" without ``float()``, so text that ``float()`` merely rounds to zero, such as
+#: ASCII text that spells zero: ``"0"``, ``"00"``, ``"0.0"``, ``"-0.0"``, ``".0"``. A cap reads this
+#: as "off" without ``float()``, so text that ``float()`` merely rounds to zero, such as
 #: ``"1e-400"``, reaches :func:`count_setting` or :func:`float_setting` and is refused there
-#: (BACKLOG #3431, #3432).
+#: (BACKLOG #3431, #3432). It is a shortcut, not the whole rule: ``int()`` and :func:`_spells_zero`
+#: each read a few more exact zeros, such as ``"0_0"``.
 _ZERO_TEXT = re.compile(r"[+-]?(?:0+(?:\.0*)?|\.0+)")
 
 
@@ -189,8 +190,9 @@ def float_setting(value: Any, *, knob: str, transport: str) -> float:
     - a bool is refused, ``False`` as well as ``True``: a bool is not a number of seconds;
     - a NaN or an infinity is refused, and so is a number too large for a float, such as ``1e400``;
     - a value that ``float()`` only rounds to zero is refused, such as the text ``"1e-400"`` or
-      ``Decimal("1e-400")``. Text is zero only when it spells zero in plain digits, such as ``"0"``,
-      ``"0.0"`` or ``"-0"``, so ``"0e0"`` is refused too;
+      ``Decimal("1e-400")``. Text is zero only when every digit in it is a zero and it has no
+      exponent. So ``"0"``, ``"0.0"``, ``"-0"``, ``"0_0"`` and the full-width ``"０"`` are zero,
+      as :func:`count_setting`'s ``int()`` reads the whole-number ones, and ``"0e0"`` is refused;
     - other text is read by ``float()``, so ``" 2.5 "`` and ``"+2.5"`` pass;
     - anything else is refused, whatever ``float()`` would have made of it.
 
@@ -221,7 +223,7 @@ def float_setting(value: Any, *, knob: str, transport: str) -> float:
             if not math.isfinite(seconds):
                 reason = "it is not a finite number"
             elif seconds == 0 and not _spells_zero(value):
-                reason = "float() rounds it to zero, but it is not zero"
+                reason = "float() reads it as zero, but it is not an exact zero in plain digits"
             else:
                 return seconds
     else:
@@ -243,9 +245,15 @@ def positive_seconds(value: Any, *, knob: str, transport: str) -> float:
 
 
 def _spells_zero(value: Any) -> bool:
-    """Whether ``value`` is an exact zero: text in plain digits, or a number equal to zero."""
+    """Whether ``value``, which ``float()`` read as zero, is an exact zero: a number equal to zero, or
+    text whose digits are all zeros and which has no exponent.
+
+    ``float()`` has already parsed the text, so without an exponent its value is its digits; when
+    every digit is a zero, the value is exactly zero. That takes ``"0_0"`` and the full-width
+    ``"０"``, which ``int()`` reads as ``0`` on an ``int`` cap too. An exponent is refused even on
+    zero digits, as ``"0e0"`` is on an ``int`` cap."""
     if isinstance(value, str):
-        return _ZERO_TEXT.fullmatch(value.strip()) is not None
+        return not any(c in "eE" or (c.isdecimal() and int(c) != 0) for c in value)
     return bool(value == 0)
 
 
@@ -277,10 +285,12 @@ def cap_setting[NumT: (int, float)](
     :func:`count_setting`, which refuses it, as it refuses ``"0e0"``. A number that equals zero, such
     as ``0.0`` or ``-0.0``, is off too.
 
-    **A ``float`` cap is read by :func:`float_setting`, and the same exact zeros are its only "off"
-    (BACKLOG #3432).** So ``"1e-400"`` and ``"0e0"`` are refused there rather than read as off, and a
-    bool, a NaN and an infinity are refused too. That function's docstring holds the rule, including
-    why a ``connections.toml`` literal ``1e-400`` still reads as zero.
+    **A ``float`` cap is read by :func:`float_setting`, and only an exact zero is its "off" (BACKLOG
+    #3432).** Its exact zeros are a little wider than an ``int`` cap's: text whose digits are all
+    zeros with no exponent, so ``"0_0.0"`` is off on a ``float`` cap and refused on an ``int`` cap,
+    whose ``int()`` cannot read it. ``"1e-400"`` and ``"0e0"`` are refused on both, and a bool, a NaN
+    and an infinity are refused too. That function's docstring holds the rule, including why a
+    ``connections.toml`` literal ``1e-400`` still reads as zero.
 
     A negative value is returned as-is, for the callers that refuse one at build with a message naming
     their own key; :func:`positive_cap` is that caller for most sites. It is a different mistake with a
