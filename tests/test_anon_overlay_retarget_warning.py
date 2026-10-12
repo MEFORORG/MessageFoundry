@@ -197,6 +197,11 @@ def test_the_default_rules_and_a_rule_set_built_in_code(anon: ModuleType) -> Non
     assert [(d.kind.value, now.kind.value) for d, now in rules.retargeted_defaults(built)] == [
         ("name", "ssn")
     ]
+    # Every rule on a path runs. Appended to the defaults, the name rule still scrubs PID-5, so
+    # nothing was replaced; the same rule alone is a retarget.
+    appended = (*rules.DEFAULT_RULES, rules.FieldRule("PID-5", "id"))
+    assert rules.retargeted_defaults(appended) == ()
+    assert "ZZTEST" not in anon.anonymize(_MESSAGE, salt=_SALT, rules=appended)
 
 
 @_BOTH

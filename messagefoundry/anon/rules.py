@@ -480,7 +480,7 @@ def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
 
 def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, FieldRule], ...]:
     """The :data:`DEFAULT_RULES` entries that ``rules`` scrubs with a DIFFERENT kind, each as
-    ``(default rule, rule now in force)``, in :data:`DEFAULT_RULES` order.
+    ``(default rule, last rule on that path)``, in :data:`DEFAULT_RULES` order.
 
     The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
     value behind while the leak-check still counts the field as scrubbed. ``id``, ``mrn`` and
@@ -493,14 +493,19 @@ def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, 
     not listed. :func:`load_rules` logs each entry, and a caller with a console of its own can
     repeat them there.
     """
-    in_force = {r.path: r for r in rules}
-    quiet = (SurrogateKind.KEEP, SurrogateKind.DROP)
-    pairs = ((default, in_force.get(default.path)) for default in DEFAULT_RULES)
-    return tuple(
-        (default, now)
-        for default, now in pairs
-        if now is not None and now.kind != default.kind and now.kind not in quiet
-    )
+    # Every rule on a path runs, in order, so a set built in code may hold several. The default
+    # scrub is replaced only when none of them is the default's kind and none is a drop.
+    on_path: dict[str, list[FieldRule]] = {}
+    for rule in rules:
+        if rule.kind != SurrogateKind.KEEP:
+            on_path.setdefault(rule.path, []).append(rule)
+    listed: list[tuple[FieldRule, FieldRule]] = []
+    for default in DEFAULT_RULES:
+        rewrites = on_path.get(default.path, [])
+        kinds = [rule.kind for rule in rewrites]  # a list: kinds compare by value, see FieldRule
+        if rewrites and default.kind not in kinds and SurrogateKind.DROP not in kinds:
+            listed.append((default, rewrites[-1]))
+    return tuple(listed)
 
 
 def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:
