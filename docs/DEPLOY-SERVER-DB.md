@@ -66,7 +66,7 @@ Test-ADServiceAccount   -Identity mefor-svc      # must return True (the install
 trailing `$` and **no password**:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod `
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config `
   -ServiceAccount "CORP\mefor-svc$"          # gMSA — passwordless; preflight + SeServiceLogonRight auto
 ```
 

@@ -64,7 +64,7 @@ from messagefoundry.pipeline.alerts import (
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
-from messagefoundry.transports.bounded_read import build_strict_opener
+from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
 from messagefoundry.transports.email import checked_envelope
 
 __all__ = [
@@ -300,22 +300,11 @@ def _render_subject(template: str, values: Mapping[str, str]) -> str:
     return rendered.replace("\r", " ").replace("\n", " ")
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _NoRedirectHandler(NoRedirectHandler):
     """Refuse to follow HTTP redirects on the outbound webhook POST (ASVS 15.3.2): a 3xx could
     divert the alert to an unintended host or be chained to probe an internal endpoint. Returning
     ``None`` makes urllib raise on the redirect instead of following it, so the send fails (logged)
     — the safe default for a fire-and-forget webhook."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
 
 
 def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
@@ -446,10 +435,8 @@ class WebhookTransport:
         )
         # Bounded so the drain cannot be turned into a memory exhaustion by a webhook host that
         # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily for the
-        # same reason as the length gate above. An over-cap reply raises ResponseTooLargeError, which
-        # the notifier's fan-out treats like any other failed sink send: the alert is not delivered
-        # here, and the engine's own message flow is untouched.
-        from messagefoundry.transports.bounded_read import drain_bounded
+        # same reason as the length gate above.
+        from messagefoundry.transports.bounded_read import drain_2xx_reply
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
         with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
@@ -458,7 +445,12 @@ class WebhookTransport:
             # failing the drain on a short reply would report an alert as undelivered when the host
             # took it. The byte bound still applies -- an unbounded drain is a memory exhaustion
             # whether or not anyone reads the bytes.
-            drain_bounded(resp, connector=f"alert webhook {host}")
+            #
+            # An over-cap body after a 2xx counts as delivered, with a WARNING: owner ruling
+            # 2026-10-12 (#3040 item 1), which extends the owner ruling of 2026-10-05, "decide by
+            # who reads the body", to this sink. Nothing reads this body. The label is fixed, so
+            # the WARNING does not carry the configured host.
+            drain_2xx_reply(resp, connector="alert webhook")
 
 
 #: The name the alerts SMTP hop logs under. The security notifier registers its verification-off

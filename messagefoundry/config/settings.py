@@ -145,6 +145,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "settings_file_path",
     "settings_error_detail",
     "keyless_opt_out_refusal",
     "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
@@ -2136,7 +2137,11 @@ class SandboxSettings(_Section):
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
     wall_seconds: float = Field(default=5.0, gt=0)
-    # POSIX-only RLIMIT_AS address-space cap (MiB) inside the child (no-op on Windows). None disables it.
+    # POSIX-only memory cap (MiB) inside the child (no-op on Windows). None disables it. On Linux it is
+    # HEADROOM above the loaded graph: RLIMIT_DATA at the worker's VmData after load_config, plus this,
+    # with MALLOC_ARENA_MAX=2 so thread arenas cannot keep spending it.
+    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it dead-letters and its
+    # worker is recycled (ADR 0087, amendment of 2026-10-11).
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
@@ -9381,6 +9386,13 @@ def settings_error_detail(exc: Exception) -> str:
     return str(exc)
 
 
+def settings_file_path(config_path: str | Path | None) -> Path:
+    """The settings file :func:`load_settings` reads for ``config_path``: that path, else
+    ``./messagefoundry.toml``, which it reads only when it exists. One rule, so the ``serve`` start
+    check vets the file the load read (vault BACKLOG #2626)."""
+    return Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
+
+
 def load_settings(
     *,
     config_path: str | Path | None = None,
@@ -9403,7 +9415,7 @@ def load_settings(
     data: dict[str, dict[str, Any]] = {}
     file_data: Mapping[str, Any] = {}
 
-    path = Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
+    path = settings_file_path(config_path)
     if config_path is not None and not path.exists():
         raise FileNotFoundError(f"service config not found: {path}")
     if (config_path is not None or default_file) and path.exists():

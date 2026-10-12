@@ -59,6 +59,16 @@ LIST_SETTINGS: dict[tuple[str, str], Callable[[Any], Any]] = {
     ("FHIR", "proxy_no_proxy"): lambda v: messagefoundry.FHIR(
         url="https://example.invalid/fhir", proxy_no_proxy=v
     ),
+    # vault BACKLOG #2804: both lists apply only to a transaction or batch connection.
+    ("FHIR", "allowed_entry_methods"): lambda v: messagefoundry.FHIR(
+        url="https://example.invalid/fhir", interaction="transaction", allowed_entry_methods=v
+    ),
+    ("FHIR", "allowed_entry_types"): lambda v: messagefoundry.FHIR(
+        url="https://example.invalid/fhir",
+        interaction="transaction",
+        allowed_entry_methods=["POST"],
+        allowed_entry_types=v,
+    ),
     ("Email", "recipients"): lambda v: messagefoundry.Email(
         host="smtp.example.invalid", sender="mf@example.invalid", recipients=v
     ),
@@ -100,8 +110,13 @@ TOML_MARKER = f'{{ env = "partner_value", default = "{SENTINEL}" }}'
 
 
 def _static(setting: str) -> str:
-    """A static item the setting accepts; ``intake_client_subjects`` needs a qualified prefix."""
-    return "CN:partner.example" if setting == "intake_client_subjects" else "static.example.invalid"
+    """A static item the setting accepts; ``intake_client_subjects`` needs a qualified prefix, and
+    the FHIR Bundle entry lists take a verb and a resource type (vault BACKLOG #2804)."""
+    return {
+        "intake_client_subjects": "CN:partner.example",
+        "allowed_entry_methods": "POST",
+        "allowed_entry_types": "Patient",
+    }.get(setting, "static.example.invalid")
 
 
 def _write(tmp_path: pathlib.Path, body: str) -> pathlib.Path:

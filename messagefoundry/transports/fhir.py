@@ -15,9 +15,14 @@ REST/SOAP arm — see transports.egress ``_allowlist_for``/``check_egress_allowe
   is deferred — ADR 0022 Options #5).
 - Interaction → method + path off the FHIR service **base** ``url`` (e.g. ``https://host/fhir``): a
   ``create`` is ``POST {base}/{ResourceType}``, and a ``transaction``/``batch`` is ``POST {base}`` with a
-  ``Bundle`` body (the server applies it). An ``update`` is a ``PUT {ResourceType}/{id}`` carried as the
-  one entry of a ``transaction`` ``Bundle`` POSTed to ``{base}``, so the message-derived id is in the
-  body and never in the request URL (vault BACKLOG #1965, ASVS 14.2.1, owner ruling R3). A connection
+  ``Bundle`` body. Amended 2026-10-10 (vault BACKLOG #2804): the server still applies that Bundle, but
+  the engine first screens every entry. The connection must list ``allowed_entry_methods`` (no
+  default) and may list ``allowed_entry_types``; an entry whose method, URL form or type falls
+  outside them, or a Bundle that is malformed, repeats a JSON key or names another ``type``, is
+  refused whole and dead-lettered. The engine's own one-entry update wrap is not screened.
+  An ``update`` is a ``PUT {ResourceType}/{id}`` carried as the one entry of a ``transaction``
+  ``Bundle`` POSTed to ``{base}``, so the message-derived id is in the body and never in the request
+  URL (vault BACKLOG #1965, ASVS 14.2.1, owner ruling R3). A connection
   may opt back into the plain ``PUT {base}/{ResourceType}/{id}`` with ``update_url_form="path"``, for
   a server with no ``transaction`` interaction; that is a listed loosening (vault BACKLOG #2550). The
   ResourceType/id are read from the outgoing body with the cheap :class:`FhirPeek` (no typed parse).
@@ -51,7 +56,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 
 from messagefoundry.config.models import (
@@ -65,6 +70,7 @@ from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -123,6 +129,9 @@ logger = logging.getLogger(__name__)
 
 _INTERACTIONS = ("create", "update", "transaction", "batch")
 _CONDITIONALS = ("if-none-exist", "conditional-update", "if-match")
+#: The interactions whose body is the Handler's own Bundle, screened entry by entry before the post
+#: (vault BACKLOG #2804).
+_BUNDLE_INTERACTIONS = ("transaction", "batch")
 #: How an update reaches the server. ``transaction`` (the default) keeps the resource id out of the
 #: request URL (vault BACKLOG #1965); ``path`` is the plain RESTful PUT, a listed loosening (#2550).
 _UPDATE_URL_FORMS = ("transaction", "path")
@@ -151,6 +160,8 @@ def scope_letters_for_shape(interaction: str, conditional: str | None) -> frozen
 
     ``None`` for ``transaction``/``batch`` — the Bundle carries arbitrary methods over arbitrary
     types, so no letter set is determinate — and for any interaction word this table does not know.
+    Since vault BACKLOG #2804 such a connection lists the entry methods it may send, and the screen
+    refuses the rest; this table does not read that list yet.
     Quiet is the safe failure for the advisory that reads this: whoever adds an interaction to
     :data:`_INTERACTIONS` or a knob to :data:`_CONDITIONALS` must extend these tables, or a new shape
     silently stops being graded.
@@ -163,7 +174,7 @@ def scope_letters_for_shape(interaction: str, conditional: str | None) -> frozen
     from the OUTGOING MESSAGE BODY, so it varies per message and is not derivable at config time.
 
     Pure — two declared values in, a letter set out."""
-    if interaction in ("transaction", "batch"):
+    if interaction in _BUNDLE_INTERACTIONS:
         return None
     if conditional:
         return _CONDITIONAL_SCOPE_LETTERS.get(conditional)
@@ -201,6 +212,217 @@ _FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
 # read id (`_resolve_read_url`). `_FHIR_ID_RE` stays the plain grammar for an id-typed value that is
 # not a path segment, such as meta.versionId inside an ETag.
 _FHIR_PATH_ID_RE = re.compile(r"^(?!\.+\Z)[A-Za-z0-9.\-]{1,64}\Z")
+
+#: The verbs a Bundle entry may carry, spelled exactly as FHIR spells them
+#: (https://hl7.org/fhir/R4B/valueset-http-verb.html).
+_ENTRY_METHODS = ("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH")
+
+
+class _EntryScreen(NamedTuple):
+    """The allow-lists a ``transaction``/``batch`` connection screens each Bundle entry against.
+    ``types`` is None when the connection does not narrow the resource types."""
+
+    methods: frozenset[str]
+    types: frozenset[str] | None
+
+
+#: Stands for an entry list whose items are not known when the ``FHIR()`` factory runs: an ``env()``
+#: with no default, which resolves only when the connection is built. It counts as set, and its items
+#: are checked by :class:`FhirDestination`, which sees the resolved list.
+DEFERRED_ENTRY_LIST: Any = object()
+
+
+def _allow_list(
+    value: object, setting: str, valid: Callable[[str], bool], want: str
+) -> frozenset[str]:
+    """One operator-written allow-list, checked at construction: a non-empty list of valid strings.
+    A bad item is named by its index, never quoted: the list can come from an ``env()``, and an
+    environment value is withheld from errors (BACKLOG #1183)."""
+    if value is DEFERRED_ENTRY_LIST:
+        return frozenset()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"FHIR destination {setting} must be a list, got {type(value).__name__}")
+    if not value:
+        raise ValueError(f"FHIR destination {setting} must not be empty")
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not valid(item):
+            raise ValueError(
+                f"FHIR destination {setting} items must each be {want}; item {index} is not "
+                "(value withheld)"
+            )
+    return frozenset(value)
+
+
+def entry_screen_settings(interaction: str, methods: object, types: object) -> _EntryScreen | None:
+    """Check the Bundle entry allow-lists a connection declares, and return its screen, or ``None``
+    for an interaction that sends no Bundle of the Handler's (vault BACKLOG #2804).
+
+    On ``transaction`` and ``batch``, ``allowed_entry_methods`` is REQUIRED, with no default: the
+    Handler hands over the whole Bundle, often one forwarded from an inbound sender, and each entry
+    names its own method and URL. Deny-by-default, like the ``[egress]`` lists. ``allowed_entry_types``
+    is optional, and unset means any type. On any other interaction both are refused rather than
+    ignored, as ``update_url_form`` is. Raises ``ValueError``, as the other construction checks do.
+
+    Pure. The ``FHIR()`` factory calls it too, so the loaded graph never holds a connection that
+    would not build. The factory passes :data:`DEFERRED_ENTRY_LIST` for an ``env()`` it cannot read
+    yet, and ignores what this returns."""
+    if interaction not in _BUNDLE_INTERACTIONS:
+        for setting, value in (("allowed_entry_methods", methods), ("allowed_entry_types", types)):
+            if value is not None:
+                raise ValueError(
+                    f"FHIR destination {setting} applies only to interaction='transaction' or "
+                    "'batch'"
+                )
+        return None
+    if methods is None:
+        raise ValueError(
+            f"FHIR destination interaction={interaction!r} requires an 'allowed_entry_methods' "
+            f"setting: the Bundle entry methods it may send, from {_ENTRY_METHODS} (no default; "
+            "vault BACKLOG #2804)"
+        )
+    return _EntryScreen(
+        _allow_list(
+            methods,
+            "allowed_entry_methods",
+            _ENTRY_METHODS.__contains__,
+            f"one of {_ENTRY_METHODS}",
+        ),
+        None
+        if types is None
+        else _allow_list(
+            types,
+            "allowed_entry_types",
+            lambda t: _FHIR_TYPE_RE.match(t) is not None,
+            "a FHIR resource type of ASCII letters",
+        ),
+    )
+
+
+class _RepeatedKey(ValueError):
+    """A JSON object in the body repeats a key. Carries neither the key nor any value."""
+
+
+def _refuse_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # json.loads keeps the LAST of two equal keys; a server may keep the first. Refused, so the
+    # screen and the server can never read two different entries out of one body.
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise _RepeatedKey
+    return obj
+
+
+#: A percent-encoded control character (%00-%1F, %7F). A server decodes it back into one.
+_ENCODED_CONTROL_RE = re.compile(r"%(?:[01][0-9A-Fa-f]|7[Ff])")
+
+
+def _entry_query_ok(query: str) -> bool:
+    """Whether a Bundle entry's query has the shape of a search: one or more ``name=value`` pairs
+    joined by ``&``, each name and value non-empty. That refuses ``Type?``, ``Type?&`` and a bare
+    ``Type?name``, which a lenient server can read as no criteria at all, so a conditional DELETE
+    would match every resource of the type. A query with criteria the server ignores can still
+    pass: the shape is checked, not the meaning. Also refused: whitespace, ``#``, a backslash, a
+    control character, and a percent-encoded control character. Other percent-encoding stays,
+    since a search value such as a system URL needs it."""
+    if (
+        has_control_char(query)
+        or _ENCODED_CONTROL_RE.search(query)
+        or any(c in query for c in "#\\")
+        or any(c.isspace() for c in query)
+    ):
+        return False
+    pairs = [part.partition("=") for part in query.split("&")]
+    return all(name and eq and value for name, eq, value in pairs)
+
+
+def _entry_url_type(method: str, url: str) -> str | None:
+    """The resource type an entry's ``request.url`` names, when it fits the form ``method`` allows,
+    else None. A POST takes ``Type``; every other verb takes ``Type/id`` or ``Type?query``. The
+    type and id use the same grammars as the other write paths, so neither can carry a
+    ``$operation``, percent-encoding, ``_search``, ``_history``, an absolute URL or an extra
+    segment. The query is checked for shape only (see :func:`_entry_query_ok`); what its
+    parameters mean is the server's to read."""
+    if method == "POST":
+        return url if _FHIR_TYPE_RE.match(url) else None
+    head, has_query, query = url.partition("?")
+    if has_query:
+        if not _entry_query_ok(query):
+            return None
+        return head if _FHIR_TYPE_RE.match(head) else None
+    head, has_id, rid = url.partition("/")
+    if has_id and _FHIR_TYPE_RE.match(head) and _FHIR_PATH_ID_RE.match(rid):
+        return head
+    return None
+
+
+def _entry_refusal(entry: object, screen: _EntryScreen) -> str | None:
+    """Why one Bundle entry is refused, or None when it passes. A positive grammar: an entry must
+    show it is allowed, and a malformed one is refused, never skipped. PHI-safe: the text names a
+    method only when it is one of :data:`_ENTRY_METHODS`, and never the URL, its query or a type."""
+    if not isinstance(entry, dict):
+        return "is not a JSON object"
+    request = entry.get("request")
+    if not isinstance(request, dict):
+        return "has no request object"
+    method, url = request.get("method"), request.get("url")
+    if not isinstance(method, str) or not isinstance(url, str):
+        return "has a request.method or request.url that is not a string"
+    if method not in _ENTRY_METHODS:
+        return "has a request.method that is not a FHIR verb in upper case"
+    if method not in screen.methods:
+        return f"({method}) uses a method allowed_entry_methods does not list"
+    url_type = _entry_url_type(method, url)
+    if url_type is None:
+        form = "'Type'" if method == "POST" else "'Type/id' or 'Type?query'"
+        return f"({method}) has a request.url that is not of the form {form}"
+    if screen.types is not None and url_type not in screen.types:
+        return f"({method}) names a resource type allowed_entry_types does not list"
+    if method in ("POST", "PUT") and "resource" in entry:
+        resource = entry["resource"]
+        if not isinstance(resource, dict) or resource.get("resourceType") != url_type:
+            return f"({method}) carries a resource whose resourceType is not the request.url type"
+    return None
+
+
+def _screen_bundle(payload: str, interaction: str, screen: _EntryScreen) -> None:
+    """Refuse a ``transaction``/``batch`` body the connection's allow-lists do not cover (vault
+    BACKLOG #2804). Raises a permanent ``NegativeAckError``, so the message is dead-lettered and
+    nothing is sent: a retry would re-send the same Bundle.
+
+    The body is parsed here for the check only. The bytes sent are the payload as given, never a
+    re-serialization, which would rewrite a FHIR decimal's precision (see :func:`_as_transaction`).
+
+    PHI-safe: a refusal names the entry index, the method and the rule, never a URL or a query,
+    which can carry identifiers. The parse error is not chained either, since it holds the body."""
+    reason = _bundle_refusal(payload, interaction, screen)
+    if reason is not None:
+        raise NegativeAckError(
+            f"outgoing FHIR {interaction} Bundle refused: {reason}",
+            code="bundle-entry-refused",
+            permanent=True,
+        )
+
+
+def _bundle_refusal(payload: str, interaction: str, screen: _EntryScreen) -> str | None:
+    """Why :func:`_screen_bundle` refuses ``payload``, or None when every entry passes."""
+    parsed, hint = json_loads_or_refusal(
+        payload.lstrip(_BOM), object_pairs_hook=_refuse_repeated_keys
+    )
+    if hint == _RepeatedKey.__name__:
+        return "a JSON object in it repeats a key"
+    if hint is not None:
+        return f"it is not parseable JSON ({hint})"
+    if not isinstance(parsed, dict) or parsed.get("resourceType") != "Bundle":
+        return "its resourceType is not Bundle"
+    if parsed.get("type") != interaction:
+        return f"its Bundle.type is not {interaction!r}, the connection's interaction"
+    entries = parsed.get("entry")
+    if not isinstance(entries, list):
+        return "its Bundle.entry is missing or not a list"
+    for index, entry in enumerate(entries):
+        rule = _entry_refusal(entry, screen)
+        if rule is not None:
+            return f"entry {index} {rule}"
+    return None
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:
@@ -525,7 +747,7 @@ class FhirDestination(DestinationConnector):
                 f"FHIR destination conditional={self.conditional!r} requires a 'conditional_query' "
                 "setting (the search parameters)"
             )
-        if self.conditional is not None and self.interaction in ("transaction", "batch"):
+        if self.conditional is not None and self.interaction in _BUNDLE_INTERACTIONS:
             # A connection-level conditional applies to a single create/update, not a Bundle — it would
             # be silently ignored for transaction/batch (per-entry conditionals go in Bundle.entry.request
             # in the Handler). Refuse the incoherent combo at wiring time rather than no-op it.
@@ -533,6 +755,12 @@ class FhirDestination(DestinationConnector):
                 f"FHIR destination conditional={self.conditional!r} is incompatible with "
                 f"interaction={self.interaction!r}; set per-entry Bundle.entry.request fields instead"
             )
+        # vault BACKLOG #2804: a transaction/batch body is the Handler's own Bundle, so each entry's
+        # method and URL are screened against these lists before the post (in _exchange, off the
+        # event loop). None on every other interaction, the engine's own update wrap included.
+        self._entry_screen = entry_screen_settings(
+            self.interaction, s.get("allowed_entry_methods"), s.get("allowed_entry_types")
+        )
         # Whether this connection's writes are updates by id. Conditional first, as _resolve_request
         # dispatches: if-match is an update whatever the interaction says.
         self._is_update = self.conditional == "if-match" or (
@@ -593,8 +821,7 @@ class FhirDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
-        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_dest = self._proxy.for_host(self.base_url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)
@@ -775,8 +1002,8 @@ class FhirDestination(DestinationConnector):
         operator's listed loosening (vault BACKLOG #2550), which resolves to the plain
         ``PUT {base}/{type}/{id}`` with any ETag in the ``If-Match`` header."""
         base = self.base_url.rstrip("/")
-        if self.interaction in ("transaction", "batch"):
-            # The body is itself a Bundle; the server applies it.
+        if self.interaction in _BUNDLE_INTERACTIONS:
+            # The body is itself a Bundle; _exchange screens its entries (vault BACKLOG #2804).
             return _FhirRequest("POST", base, {})
 
         peek = self._peek(payload)
@@ -876,7 +1103,11 @@ class FhirDestination(DestinationConnector):
     ) -> tuple[str, int, dict[str, str], str | None]:
         """Send one resolved request; the last element is the capture outcome of a wrapped update's
         reply, or ``None``. An update goes out as a one-entry ``transaction`` (vault BACKLOG #1965)
-        and its reply is unwrapped; everything else goes to ``_post`` as resolved."""
+        and its reply is unwrapped; everything else goes to ``_post`` as resolved. A ``transaction``
+        or ``batch`` connection's Bundle is screened first (vault BACKLOG #2804); the screen parses
+        the whole body, so it runs here, on the worker thread."""
+        if self._entry_screen is not None:
+            _screen_bundle(payload, self.interaction, self._entry_screen)
         if not request.transaction:
             return (*self._post(payload, request.method, request.url, extra_headers), None)
         base = self.base_url.rstrip("/")
@@ -1340,8 +1571,7 @@ class FhirLookupExecutor:
                 cleartext_reason=lk_reason,
                 connection=label,
             )
-            base_host = urllib.parse.urlsplit(url).hostname or ""
-            proxy_dest = proxy.for_host(base_host) if proxy is not None else None
+            proxy_dest = proxy.for_host(url) if proxy is not None else None
             proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
             headers = self._build_headers(s)
             if proxy_dest is not None:

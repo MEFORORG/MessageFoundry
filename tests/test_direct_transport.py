@@ -26,11 +26,13 @@ reads the envelope's AES-256-CBC OID out of the DER structure.
 from __future__ import annotations
 
 import datetime
+import functools
 import inspect
 import smtplib
 import ssl
 import traceback
-from collections.abc import Iterator
+import types
+from collections.abc import Callable, Iterator
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -39,7 +41,16 @@ import pytest
 from cryptography import x509
 from cryptography.exceptions import InternalError, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import (
+    dsa,
+    ec,
+    ed448,
+    ed25519,
+    padding,
+    rsa,
+    x448,
+    x25519,
+)
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
@@ -1127,16 +1138,253 @@ def test_an_unapproved_ec_curve_is_refused(pki: dict[str, Any], tmp_path: Path) 
         DirectDestination(_dest(pki, signing_cert=str(cert_p), signing_key=str(key_p)))
 
 
+# --- key-type allow-list on all three S/MIME surfaces (ASVS 11.2.3, BACKLOG #3384) ----------------
+#
+# The floor used to pass any key type it could not classify, DSA included. Measured before the
+# allow-list: an RSA recipient cert issued by a 2048-bit DSA CA constructed cleanly. Each surface
+# below takes a DSA key and an unlisted type (X25519, a key-agreement type that can sit in a cert).
+# On the signer and recipient surfaces a stricter type gate refuses them before the floor does,
+# by design; the trust anchor is where the floor's own type list refuses.
+# The RSA controls are `test_the_default_2048_pki_still_constructs`; the EC controls are
+# `test_an_ec_p256_signer_clears_the_floor` and `test_an_ec_trust_anchor_issuing_an_rsa_recipient_
+# still_constructs`. The recipient surface has no EC control, because it is RSA-only (#1918).
+
+
+@functools.cache
+def _dsa_key() -> dsa.DSAPrivateKey:
+    # 2048-bit, so a refusal is about the TYPE and cannot be read as a size floor. Cached because
+    # DSA parameter generation is the slow part and every DSA test only needs some DSA key.
+    return dsa.generate_private_key(key_size=2048)
+
+
+def _cert_for(
+    public_key: Any,
+    cn: str,
+    issuer_key: Any,
+    issuer_name: x509.Name | None = None,
+    *,
+    ca: bool = False,
+) -> x509.Certificate:
+    """A cert carrying ``public_key``, signed by ``issuer_key``. Self-signed when ``issuer_name`` is
+    None. EdDSA issuers sign with no separate hash, so the hash is None for them."""
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(issuer_name or name)
+        .public_key(public_key)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+    )
+    if ca:
+        builder = builder.add_extension(
+            x509.BasicConstraints(ca=True, path_length=None), critical=True
+        )
+    eddsa = isinstance(issuer_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey))
+    return builder.sign(issuer_key, None if eddsa else hashes.SHA256())
+
+
+def _signer_files(pki: dict[str, Any], tmp_path: Path, key: Any, tag: str) -> dict[str, str]:
+    """Overrides for a signer of any key type, its cert issued by the RSA test CA."""
+    cert = _cert_for(key.public_key(), f"{tag} Sender", pki["ca_key"], pki["ca_cert"].subject)
+    cert_p = tmp_path / f"{tag}_signer.crt"
+    key_p = tmp_path / f"{tag}_signer.key"
+    _write_pem(cert_p, cert)
+    key_p.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return {"signing_cert": str(cert_p), "signing_key": str(key_p)}
+
+
+def _recipient_file(pki: dict[str, Any], tmp_path: Path, public_key: Any, tag: str) -> str:
+    cert = _cert_for(public_key, f"{tag}@hisp.example", pki["ca_key"], pki["ca_cert"].subject)
+    path = tmp_path / f"{tag}_recip.crt"
+    _write_pem(path, cert)
+    return str(path)
+
+
+def _anchor_issuing_an_rsa_recipient(tmp_path: Path, ca_key: Any, tag: str) -> dict[str, str]:
+    """A self-signed CA on ``ca_key`` and an RSA-2048 recipient it issues, as overrides."""
+    ca_cert = _cert_for(ca_key.public_key(), f"{tag} Direct CA", ca_key, ca=True)
+    recip_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    recip_cert = _cert_for(recip_key.public_key(), f"rsa-recip-of-{tag}", ca_key, ca_cert.subject)
+    anchor_p = tmp_path / f"{tag}_ca.crt"
+    recip_p = tmp_path / f"rsa_recip_of_{tag}_ca.crt"
+    _write_pem(anchor_p, ca_cert)
+    _write_pem(recip_p, recip_cert)
+    return {"recipient_cert": str(recip_p), "trust_anchor": str(anchor_p)}
+
+
+def test_a_dsa_signing_key_is_refused_and_named(pki: dict[str, Any], tmp_path: Path) -> None:
+    # Refused by the RSA-or-EC signer gate, which runs before the floor on this surface.
+    files = _signer_files(pki, tmp_path, _dsa_key(), "dsa")
+    with pytest.raises(ValueError, match="'signing_key' key type is DSA; S/MIME signing"):
+        DirectDestination(_dest(pki, **files))
+
+
+def test_an_unlisted_signing_key_type_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    files = _signer_files(pki, tmp_path, x25519.X25519PrivateKey.generate(), "x25519")
+    with pytest.raises(ValueError, match="'signing_key' key type is X25519; S/MIME signing"):
+        DirectDestination(_dest(pki, **files))
+
+
+@pytest.mark.parametrize(
+    "make",
+    [ed25519.Ed25519PrivateKey.generate, ed448.Ed448PrivateKey.generate],
+    ids=["ed25519", "ed448"],
+)
+def test_an_eddsa_signer_is_refused_by_the_signer_gate(
+    pki: dict[str, Any], tmp_path: Path, make: Callable[[], Any]
+) -> None:
+    """EdDSA is on the floor's list, but ``add_signer`` takes only RSA and EC, so the signer's own
+    type gate refuses it and names the type. The tripwire below watches the library limit."""
+    files = _signer_files(pki, tmp_path, make(), "eddsa")
+    with pytest.raises(ValueError, match="'signing_key' key type is Ed(25519|448); S/MIME signing"):
+        DirectDestination(_dest(pki, **files))
+
+
+def test_pkcs7_add_signer_still_refuses_an_eddsa_key() -> None:
+    """Library-drift tripwire for the signer gate. If a later ``cryptography`` signs with EdDSA,
+    this fails, and the gate is refusing a key the library could now use -- re-read BACKLOG #3384
+    before widening it."""
+    key = ed25519.Ed25519PrivateKey.generate()
+    cert = _cert_for(key.public_key(), "ed25519 signer", key)
+    # Typed Any on purpose: the stubs already say add_signer takes only RSA and EC, and this test
+    # asks whether the RUNTIME still agrees.
+    signer: Any = key
+    with pytest.raises(TypeError, match="Only RSA & EC"):
+        pkcs7.PKCS7SignatureBuilder().set_data(b"synthetic").add_signer(
+            cert, signer, hashes.SHA256()
+        )
+
+
+def test_a_dsa_recipient_cert_is_refused_and_named(pki: dict[str, Any], tmp_path: Path) -> None:
+    # Refused by the RSA-only gate, which runs before the floor on this surface and names the type.
+    path = _recipient_file(pki, tmp_path, _dsa_key().public_key(), "dsa")
+    with pytest.raises(ValueError, match="'recipient_cert' key type is DSA; S/MIME encryption"):
+        DirectDestination(_dest(pki, recipient_cert=path))
+
+
+def test_an_unlisted_recipient_key_type_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    public = x25519.X25519PrivateKey.generate().public_key()
+    path = _recipient_file(pki, tmp_path, public, "x25519")
+    with pytest.raises(ValueError, match="'recipient_cert' key type is X25519; S/MIME encryption"):
+        DirectDestination(_dest(pki, recipient_cert=path))
+
+
+def _unreadable_key_cert_pem(pki: dict[str, Any]) -> bytes:
+    """A cert whose key algorithm OID ``cryptography`` does not know. Built by changing the last
+    arc of rsaEncryption (1.2.840.113549.1.1.1) to 99, so ``public_key()`` raises
+    ``UnsupportedAlgorithm``. The signature no longer verifies, which does not matter: the floor
+    reads the key before any issuance check."""
+    der = pki["ca_cert"].public_bytes(serialization.Encoding.DER)
+    rsa_oid = bytes.fromhex("06092a864886f70d010101")
+    assert der.count(rsa_oid) == 1
+    odd = x509.load_der_x509_certificate(der.replace(rsa_oid, rsa_oid[:-1] + b"\x63"))
+    with pytest.raises(UnsupportedAlgorithm):
+        odd.public_key()  # the premise: unmapped, this is not a ValueError
+    return odd.public_bytes(serialization.Encoding.PEM)
+
+
+@pytest.mark.parametrize("setting", ["signing_cert", "recipient_cert", "trust_anchor"])
+def test_a_key_type_nobody_can_read_is_refused_as_a_value_error(
+    pki: dict[str, Any], tmp_path: Path, setting: str
+) -> None:
+    odd = _unreadable_key_cert_pem(pki)
+    path = tmp_path / f"unreadable_{setting}.pem"
+    if setting == "trust_anchor":
+        # Bundled beside the real anchor, so the refusal cannot be an issuance failure.
+        path.write_bytes(Path(pki["trust_anchor"]).read_bytes() + odd)
+    else:
+        path.write_bytes(odd)
+    with pytest.raises(ValueError, match=f"'{setting}' holds a key of a type this connector"):
+        DirectDestination(_dest(pki, **{setting: str(path)}))
+
+
+def test_a_dsa_trust_anchor_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    """The case that was live before the allow-list: ``verify_directly_issued_by`` checks a DSA
+    CA's signature, so a DSA anchor issuing a valid RSA recipient constructed cleanly."""
+    files = _anchor_issuing_an_rsa_recipient(tmp_path, _dsa_key(), "dsa")
+    with pytest.raises(ValueError, match="'trust_anchor' key type is DSA, which is not on"):
+        DirectDestination(_dest(pki, **files))
+
+
+def test_an_unlisted_trust_anchor_type_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    # Bundled beside the real anchor, which issues the recipient. The floor checks every anchor in
+    # the bundle before the issuance loop, so the unlisted one is refused though it issues nothing.
+    public = x25519.X25519PrivateKey.generate().public_key()
+    odd = _cert_for(public, "x25519 anchor", pki["ca_key"], pki["ca_cert"].subject)
+    bundle = tmp_path / "bundle_x25519.pem"
+    bundle.write_bytes(
+        Path(pki["trust_anchor"]).read_bytes() + odd.public_bytes(serialization.Encoding.PEM)
+    )
+    with pytest.raises(ValueError, match="'trust_anchor' key type is X25519, which is not on"):
+        DirectDestination(_dest(pki, trust_anchor=str(bundle)))
+
+
+@pytest.mark.parametrize(
+    "make",
+    [ed25519.Ed25519PrivateKey.generate, ed448.Ed448PrivateKey.generate],
+    ids=["ed25519", "ed448"],
+)
+def test_an_eddsa_trust_anchor_issuing_an_rsa_recipient_constructs(
+    pki: dict[str, Any], tmp_path: Path, make: Callable[[], Any]
+) -> None:
+    # POSITIVE CONTROL for EdDSA being on the list: the trust anchor is the one surface Direct can
+    # carry it on today, because verify_directly_issued_by checks an EdDSA CA's signature.
+    DirectDestination(_dest(pki, **_anchor_issuing_an_rsa_recipient(tmp_path, make(), "eddsa")))
+
+
 def test_the_partner_key_floor_matches_its_twin_in_xml_signature() -> None:
     """``parsing/`` may not import ``transports/``, so the XML-DSig key floor copies this curve set
     and RSA number rather than sharing them (BACKLOG #1166). This pins the copies, so the two cannot
     drift apart. It lives here, not beside the XML tests, because those skip without the ``[xml]``
-    extra."""
+    extra.
+
+    It also pins the allowed key TYPES (BACKLOG #3384) by behaviour, not by a constant: each probe
+    key goes to both floors, and both must give the same verdict. The probes cover every type either
+    floor lists, a weak key of each sized type, and two types neither lists."""
     from messagefoundry.parsing.xml import signature
     from messagefoundry.transports import direct
 
     assert signature._APPROVED_EC_CURVES == direct._APPROVED_EC_CURVES
     assert signature._MIN_RSA_BITS == direct._MIN_RSA_BITS
+
+    probes: dict[str, Any] = {
+        "rsa-2048": rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        # A negative control, minted only to be refused; see _weak_pki for the CodeQL note.
+        "rsa-1024": rsa.generate_private_key(public_exponent=65537, key_size=1024),
+        "p-256": ec.generate_private_key(ec.SECP256R1()),
+        "p-192": ec.generate_private_key(ec.SECP192R1()),
+        "ed25519": ed25519.Ed25519PrivateKey.generate(),
+        "ed448": ed448.Ed448PrivateKey.generate(),
+        "dsa-2048": _dsa_key(),
+        "x25519": x25519.X25519PrivateKey.generate(),
+        "x448": x448.X448PrivateKey.generate(),
+    }
+    allowed = {"rsa-2048", "p-256", "ed25519", "ed448"}
+    for label, key in probes.items():
+        public = key.public_key()
+        # A stand-in for signxml's VerifyResult: the XML floor reads only ``signature_key``.
+        reported = types.SimpleNamespace(
+            signature_key=public.public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
+        xml_passes = signature._signing_key_refusal(reported) is None
+        try:
+            direct._require_key_strength(public, "probe")
+            direct_passes = True
+        except ValueError:
+            direct_passes = False
+        assert xml_passes == direct_passes, f"the two floors disagree on {label}"
+        assert direct_passes == (label in allowed), f"both floors give the wrong verdict on {label}"
 
 
 # --- recipient key type: RSA only, refused at construction (BACKLOG #1918) ---------------------------
@@ -1179,7 +1427,7 @@ def test_a_non_ec_non_rsa_recipient_cert_is_refused_too(
     )
     path = tmp_path / "ed25519_recip.crt"
     _write_pem(path, cert)
-    with pytest.raises(ValueError, match="recipient_cert' key type is not RSA"):
+    with pytest.raises(ValueError, match="recipient_cert' key type is Ed25519; S/MIME encryption"):
         DirectDestination(_dest(pki, recipient_cert=str(path)))
 
 

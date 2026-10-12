@@ -67,7 +67,10 @@ non-whitespace controls deleted), so a crafted ``@Data``/``@Comment``, action cl
 target field cannot escape the ``#`` into a statement, and a NUL cannot make the module uncompilable.
 XML is parsed through **defusedxml** with ``forbid_dtd``/``forbid_entities``/``forbid_external`` all
 on, so a billion-laughs or external-entity payload raises instead of expanding.
-Paths ride across as data to :meth:`Message.set` at run time.
+Paths ride across as data to :meth:`Message.set` at run time. The JSON model's endpoint config (a
+File ``directory``, an MLLP port or host) is the export's own text, so :func:`generate_module` keeps
+it as written and emits every endpoint ``deployed=False`` for an operator to review, as the XML layer
+does (BACKLOG #1130).
 
 **Message handles become Python locals, in a FULLY UNDERSTOOD list only (BACKLOG #313 step 2, ADR
 0086).** An action-list works on several message trees at once; a Handler receives one ``msg``. Before
@@ -288,9 +291,9 @@ class Channel:
     destinations: tuple[Destination, ...]
     handlers: tuple[Handler, ...]
     # Which input layer produced this channel: "xml" (the validated ``<Package>`` export) or "json"
-    # (the superseded synthetic model). Drives the generated module's provenance header and whether
-    # the endpoints are emitted as inert ``deployed=False`` placeholders — the XML export carries no
-    # modelled connection subtree, so its wiring is a hand-finish stub that binds nothing.
+    # (the superseded synthetic model). Drives the generated module's provenance header and review
+    # note. Both emit their endpoints ``deployed=False``: the XML export carries no modelled connection
+    # subtree, and the JSON one's endpoint config is untrusted export text (see :func:`generate_module`).
     source_format: str = "json"
 
 
@@ -2407,7 +2410,9 @@ def generate_module(channel: Channel) -> str:
         else [
             "This module was mechanically translated from a SYNTHETIC-schema Corepoint export (the",
             "superseded JSON model, ADR 0086 §2(a)); the validated input is the XML `<Package>` shape.",
-            "Verify field paths, routing, and any `# TODO: Corepoint ...` markers before deploying.",
+            "The export is untrusted, so the endpoints below are `deployed=False`: review each port,",
+            "host and directory, then verify field paths, routing, and any `# TODO: Corepoint ...`",
+            "markers before deploying.",
         ]
     )
     lines: list[str] = [
@@ -2429,10 +2434,14 @@ def generate_module(channel: Channel) -> str:
         lines.append(f"from messagefoundry.actions import {', '.join(sorted(used_vocab))}")
     lines.append("")
 
-    # Endpoints: inbound (naming its router) + one outbound per destination. An XML-sourced channel
-    # emits them ``deployed=False`` (#233, ADR 0111) — present in the config, binding nothing — because
-    # the transports are placeholders, so an unfinished import can never open a socket or poll a path.
-    placeholder = ", deployed=False" if xml else ""
+    # Endpoints: inbound (naming its router) + one outbound per destination, all emitted
+    # ``deployed=False`` (#233, ADR 0111) — present in the config, binding nothing — so an unfinished
+    # import can never open a socket or poll a path. An XML channel's transports are placeholders. A
+    # JSON channel's are the export's own text (BACKLOG #1130), and the export is untrusted: a File
+    # directory is a whole path with no base to contain it in, so no fold or containment check can make
+    # it safe, and a rewrite would silently move the feed. Every endpoint of the channel waits for
+    # review together, because undeploying only some would leave a live inbound ACKing messages whose
+    # every Send is declined.
     if xml:
         lines.append(
             "# TODO: Corepoint — the export's connection config is not modelled; these endpoints are"
@@ -2440,12 +2449,17 @@ def generate_module(channel: Channel) -> str:
         lines.append(
             "# placeholders. Replace them with the real transports, then drop deployed=False."
         )
+    else:
+        lines.append(
+            "# TODO: Corepoint — these endpoints' ports, hosts and directories came from the export,"
+        )
+        lines.append("# which is untrusted. Review each one, then drop deployed=False.")
     lines.append(
         f"inbound({_lit(channel.module_name)}, {channel.inbound_call}, "
-        f"router={_lit(channel.router_name)}{placeholder})"
+        f"router={_lit(channel.router_name)}, deployed=False)"
     )
     for d in channel.destinations:
-        lines.append(f"outbound({_lit(d.name)}, {d.call}{placeholder})")
+        lines.append(f"outbound({_lit(d.name)}, {d.call}, deployed=False)")
     lines.append("")
     lines.append("")
 
