@@ -297,9 +297,10 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 >   patient data ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
 >
 > The refuse/warn severity of the PHI serve-gate ladder is the `[security].enforcement` dial (default
-> `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind you hit only the
-> keyless-PHI refusal above — the off-loopback exposure rungs (TLS, MFA-at-exposure, …) need a non-loopback
-> bind, and MFA-at-exposure also fires on a loopback bind behind a declared or trusted proxy. Set `[security].enforcement = warn` to downgrade the PHI refusals to loud, audited warnings during
+> `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind with no proxy
+> declared or trusted you hit only the keyless-PHI refusal above. The exposure rungs need more than that:
+> the TLS rung needs a non-loopback bind, and at least the MFA-at-exposure rung also fires on a loopback
+> bind behind a declared or trusted proxy (`[api].tls_terminated_upstream` or `[api].trusted_proxies`). Set `[security].enforcement = warn` to downgrade the PHI refusals to loud, audited warnings during
 > local bring-up.
 
 ### 4.4 Run it as a Windows service (the supported production run-mode)
