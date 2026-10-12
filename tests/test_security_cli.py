@@ -235,6 +235,24 @@ def test_show_reports_a_shortened_approval_dwell(
     assert "min_dwell_seconds" not in [e["switch"] for e in data["loosenings"]]
 
 
+def test_show_reports_a_default_operation_left_out_of_dual_control(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3123: a list that omits a default operation is listed, and the entry names
+    the one left out. The same section with no list is the control."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text(
+        '[approvals]\nenabled = true\noperations = ["dead_letter_replay"]\n', encoding="utf-8"
+    )
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    risks = {e["switch"]: e["risk"] for e in data["loosenings"]}
+    assert "does not hold connection_purge, " in risks["approvals.operations"]
+    toml.write_text("[approvals]\nenabled = true\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert "approvals.operations" not in [e["switch"] for e in data["loosenings"]]
+
+
 def test_show_reports_the_credential_reminders_turned_off(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

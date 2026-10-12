@@ -8299,13 +8299,14 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
 
 def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]:
-    """The ``[approvals]`` dual-control limits set LOOSER THAN THEIR SHIPPED DEFAULT, as
-    ``(switch, risk)`` entries for :func:`security_loosenings` (BACKLOG #2489; ASVS 2.3.5, 2.4.2).
+    """The ``[approvals]`` dual-control limits and held list set LOOSER THAN THEIR SHIPPED DEFAULT,
+    as ``(switch, risk)`` entries for :func:`security_loosenings` (BACKLOG #2489; ASVS 2.3.5, 2.4.2).
 
     It reads them as :func:`_auth_limit_loosenings` reads the ``[auth]`` limits: the shipped default
     is the cutoff, a stricter value is never named, and a part of a control is named only while the
-    control is built. Dual control ships OFF, so nothing here is named until ``enabled`` is on with
-    at least one operation held. Switching it off again is the shipped posture, not a loosening.
+    control is built. Dual control ships OFF, so nothing here is named until ``enabled`` is on, and
+    its two limits only with at least one operation held. Switching it off again is the shipped
+    posture, not a loosening.
 
     The direction is read from ``ApprovalGate``. Its dwell check skips a ``min_dwell_seconds`` of 0
     and refuses an approve younger than the floor, so a floor below the default is looser. Its
@@ -8315,13 +8316,43 @@ def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]
     Values are quoted at 15 significant digits, so a value just past the default never prints as
     the default itself.
 
+    **The held list is read the same way (vault BACKLOG #3123).** While ``enabled`` is on, an
+    ``operations`` list that leaves out an operation the field's own default holds is named as
+    ``approvals.operations``, with the operations left out. ``ApprovalGate`` holds an action only
+    while its operation is in the list, so each one left out completes on one caller's authority.
+    An EMPTY list loads and holds nothing, which is that narrowing at its largest: it gets its own
+    wording, and the dwell and expiry are then not named, because they bind no request. Adding an
+    operation the default leaves out (``config_reload``) holds more and is not named, and it does
+    not make up for a default one left out.
+
     **Not covered:** ``approve`` checks neither ``enabled`` nor ``operations``, and each request
     keeps the deadline stamped when it was made. A request left pending when dual control is turned
     off can still be released under the current dwell, and nothing here names that."""
     out: list[tuple[str, str]] = []
-    if not (approvals.enabled and approvals.operations):
+    if not approvals.enabled:
         return out
     fields = ApprovalsSettings.model_fields
+    held = set(approvals.operations)
+    if not held:
+        out.append(
+            (
+                "approvals.operations",
+                "dual control is on and holds no operation. One caller's authority completes "
+                "every action with no second approver, as it does with dual control off",
+            )
+        )
+        return out
+    # The default is read off the field, so a default that moves is followed and never restated.
+    left_out = sorted(set(fields["operations"].get_default(call_default_factory=True)) - held)
+    if left_out:
+        out.append(
+            (
+                "approvals.operations",
+                f"dual control is on and does not hold {', '.join(left_out)}, held by default. "
+                f"One caller's authority completes {'it' if len(left_out) == 1 else 'each'} with "
+                "no second approver",
+            )
+        )
     dwell, dwell_default = approvals.min_dwell_seconds, fields["min_dwell_seconds"].default
     if dwell <= 0:
         out.append(
@@ -8539,7 +8570,8 @@ def security_loosenings(
     AD timeout, step-up window, TOTP skew and temporary-password life
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
-    (#2489), any ``[api].trusted_proxies`` entry covering more than one address, with its own
+    (#2489), an ``[approvals].operations`` list that leaves out a default operation (vault BACKLOG
+    #3123), any ``[api].trusted_proxies`` entry covering more than one address, with its own
     wording where the entries together cover every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
@@ -8996,7 +9028,8 @@ def security_loosenings(
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
     out.extend(_auth_limit_loosenings(auth))
-    # BACKLOG #2489: the dual-control dwell floor and expiry ceiling, read the same way.
+    # BACKLOG #2489: the dual-control dwell floor and expiry ceiling, read the same way. Vault
+    # BACKLOG #3123: and a held list that leaves out a default operation.
     out.extend(_approvals_loosenings(approvals))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
