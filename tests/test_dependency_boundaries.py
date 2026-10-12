@@ -1542,9 +1542,9 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 # against an evasion.
 #
 # A REAL import is a different matter from a line that only looks like one. ADR 0030 section 1
-# allows the harness to import the package directly, and nothing does yet. A real import would end
-# the state this test holds, and which side gives way then is an open owner question. So the
-# failure messages ask for it to be raised and not reworded away.
+# allows the harness to import the package directly, and nothing does yet. An owner ruling says
+# which side gives way then, and `_REAL_ANON_IMPORT_ADVICE` cites it in every failure message
+# that may be a real import.
 #
 # THE PACKAGE'S OWN FILES. The claim is about files outside `messagefoundry/anon/`, and the package
 # imports its own modules, so the parse reports nothing there. It counts those imports instead, as
@@ -1619,10 +1619,11 @@ _UNFLOORED_ANON_ROOTS: Mapping[str, str] = MappingProxyType(
 
 #: Shared by every failure that may be a real import, and so put first in each.
 _REAL_ANON_IMPORT_ADVICE = (
-    "If a hit is a REAL import, do not reword, move or delete it to get green. ADR 0030 section 1 "
-    "allows the harness to import the package, while the record's absence claim says no file "
-    "outside the package imports it. Which one gives way is an open owner question, BACKLOG #3006 "
-    "part 3. Stop and raise the import with the owner there."
+    "If a hit is a REAL import, the import must go. ADR 0030 section 1 allows the harness to "
+    "import the package, but the owner ruled that the import gives way to the record's absence "
+    "claim, which says no file outside the package imports it (owner ruling 2026-10-12, #3006 "
+    "part 3). An author who needs the package waits for its move, BACKLOG #1192. Do not hide the "
+    "import from these searches by rewording it or building its name at run time."
 )
 
 
