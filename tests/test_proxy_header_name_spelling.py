@@ -371,10 +371,59 @@ def test_a_plain_header_refusal_comes_before_any_error_from_the_value(value: Any
 
 @pytest.mark.parametrize("value", list(_TYPE_ERROR_VALUES.values()), ids=list(_TYPE_ERROR_VALUES))
 def test_control_with_no_credential_refusal_the_type_error_stands(value: Any) -> None:
-    """With nothing for the rule to refuse, the request fails as it did before the fix: with
-    ``http.client``'s own ``TypeError``, and with nothing sent."""
-    with _WireProxy() as proxy, pytest.raises(TypeError):
+    """With nothing for the rule to refuse, the request fails as it did before the fix: with a
+    ``TypeError``, the class ``http.client`` raises for the value, and with nothing sent. The
+    text is the opener's fixed one."""
+    with _WireProxy() as proxy, pytest.raises(TypeError, match="can never be sent") as raised:
         _opener(proxy).open(_odd_request(value), timeout=5)
+    assert type(raised.value) is TypeError
+    assert "made" not in str(raised.value)
+    assert proxy.connections == 0
+
+
+def _two_unsendable(first: str) -> urllib.request.Request:
+    """Two spellings that can never be sent, one by its name and one by its value, stored in
+    the order asked for."""
+    by_name, by_value = (" " + _NAME, _VALUE), (_NAME + " ", None)
+    request = urllib.request.Request(_HTTP_TARGET)
+    for name, value in (by_name, by_value) if first == "name" else (by_value, by_name):
+        request.headers[name] = value  # type: ignore[assignment]
+    return request
+
+
+@pytest.mark.parametrize(("first", "raised_class"), [("name", ValueError), ("value", TypeError)])
+def test_the_first_unsendable_header_decides_the_class(
+    first: str, raised_class: type[Exception]
+) -> None:
+    """``http.client`` stops at the first header it will not send, so the class of the error
+    follows the order the headers are sent in. The opener raises the same class as urllib's own
+    opener does for the same request."""
+    with _WireProxy() as destination:
+        url = f"http://{destination.address}/x"
+        stock = _two_unsendable(first)
+        stock.full_url = url
+        with pytest.raises(raised_class):
+            _stock_opener().open(stock, timeout=5)
+    assert destination.connections == 0
+    with _WireProxy() as proxy, pytest.raises(raised_class, match="can never be sent") as raised:
+        _opener(proxy).open(_two_unsendable(first), timeout=5)
+    assert type(raised.value) is raised_class
+    assert proxy.connections == 0
+
+
+class _FaultyValue:
+    """A header value whose ``encode`` fails in a way that says nothing about the header."""
+
+    def encode(self, encoding: str) -> bytes:
+        raise RuntimeError("a fault of the value's own")
+
+
+def test_an_error_that_is_no_verdict_on_the_header_stops_the_request() -> None:
+    """Only a ``ValueError`` or a ``TypeError`` is read as ``http.client`` refusing a header.
+    Anything else stops the request where it is raised. Reading it as a refusal would leave the
+    header out of the rule, and a fault that then passed would let the header go."""
+    with _WireProxy() as proxy, pytest.raises(RuntimeError, match="of the value's own"):
+        _opener(proxy).open(_odd_request(_FaultyValue()), timeout=5)
     assert proxy.connections == 0
 
 
@@ -399,13 +448,17 @@ seen.clear()
 
 plain = "Proxy-Authorization"
 value = "made up"
+def ask(name, value):
+    refusal = bounded_read._refusal_by_http_client(name, value)
+    return refusal and refusal.__name__
+
 answers = {
-    "leading space": bounded_read._can_never_be_sent(chr(32) + plain, value),
-    "line feed": bounded_read._can_never_be_sent(plain + chr(10), value),
-    "not ascii": bounded_read._can_never_be_sent(plain + chr(160), value),
-    "value is None": bounded_read._can_never_be_sent(plain + chr(32), None),
-    "trailing space": bounded_read._can_never_be_sent(plain + chr(32), value),
-    "bytes name": bounded_read._can_never_be_sent(plain.encode() + bytes([32]), value),
+    "leading space": ask(chr(32) + plain, value),
+    "line feed": ask(plain + chr(10), value),
+    "not ascii": ask(plain + chr(160), value),
+    "value is None": ask(plain + chr(32), None),
+    "trailing space": ask(plain + chr(32), value),
+    "bytes name": ask(plain.encode() + bytes([32]), value),
 }
 print(json.dumps({"control": control, "seen": seen, "answers": answers}))
 """
@@ -427,12 +480,12 @@ def test_asking_http_client_about_a_header_opens_no_socket_and_resolves_no_name(
     assert "socket.getaddrinfo" in report["control"]
     assert "socket.__new__" in report["control"]
     assert report["answers"] == {
-        "leading space": True,
-        "line feed": True,
-        "not ascii": True,
-        "value is None": True,
-        "trailing space": False,
-        "bytes name": False,
+        "leading space": "ValueError",
+        "line feed": "ValueError",
+        "not ascii": "ValueError",
+        "value is None": "TypeError",
+        "trailing space": None,
+        "bytes name": None,
     }
     assert report["seen"] == []
 
