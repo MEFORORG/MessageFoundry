@@ -1654,7 +1654,11 @@ def _attribute_swaps(source: str) -> tuple[str, ...]:
 
     It sees at least those two forms. It cannot see a swap made through a second name for the
     module, through ``unittest.mock``, or on a module fetched by ``importlib``. A subscript write
-    such as ``os.environ["X"] = v`` is not an attribute assignment and does not count."""
+    such as ``os.environ["X"] = v`` is not an attribute assignment and does not count.
+
+    Names are resolved for the whole module, with no scope. So a parameter or local that shares an
+    imported name is reported too. That errs toward a report a person must then read: rename the
+    local rather than register a swap that is not one."""
     tree = _parse(source)
     aliases = _aliases(tree)
     swaps: list[str] = []
@@ -1690,7 +1694,11 @@ def _harness_swaps(sources: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
 
 
 def _modules_calling(sources: Mapping[str, str], names: frozenset[str]) -> set[str]:
-    """Modules that call a function with one of ``names``, bare or as an attribute."""
+    """Modules that call a function with one of ``names``, bare or as an attribute.
+
+    The match is on the called name alone. A call through another name, such as
+    ``from importlib import import_module as load``, passes unseen, and so does any other way to
+    run code by name, at least ``runpy`` and ``exec``. The page states this limit."""
     return {
         rel
         for rel, source in sources.items()
@@ -1869,7 +1877,9 @@ def test_harness_drift_is_reported() -> None:
 
     # The page, one break at a time: a dropped row or bullet, a wrong count, a wrong form, a name
     # the swap paragraph loses, and a module dropped from or added to the parser table.
+    # The counts come from the code, so a correct count change on the page keeps these breaks live.
     n_starts = len(_start_sites(sources))
+    n_imports = len(_modules_calling(sources, _DYNAMIC_IMPORTS))
     for broken in (
         _drop_line(text, "| `load/connscale/probe.py` |"),
         _drop_line(text, "- `acceptance/probes.py` imports"),
@@ -1877,7 +1887,9 @@ def test_harness_drift_is_reported() -> None:
         _replace_once(
             text, f"{n_starts} harness modules start", f"{n_starts + 1} harness modules start"
         ),
-        _replace_once(text, "2 harness modules import", "3 harness modules import"),
+        _replace_once(
+            text, f"{n_imports} harness modules import", f"{n_imports + 1} harness modules import"
+        ),
         _replace_once(
             text,
             "| Stamping a load report with the commit it ran at | argument list |",
