@@ -8818,10 +8818,19 @@ def _rotate_key(args: argparse.Namespace) -> int:
         #
         # ValueError (vault BACKLOG #3247): under key_provider=vault the Vault client build can
         # refuse with a bare one, which reached the dispatch floor and exited 1, an aborted
-        # rotation's code. Taken and printed whole, as `build_store_cipher` treats the same refusal
-        # when the open below meets it: it comes from the settings or the key provider, and only
-        # the key is resolved here, so nothing a store holds can reach this arm.
-        print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
+        # rotation's code. Taken whole, subclasses too, as `build_store_cipher` takes the same
+        # refusal when the open below meets it: it comes from the settings or the key provider, and
+        # only the key is resolved here, so nothing a store holds can reach this arm.
+        #
+        # Printed through `codec_safe_str`, not as `{exc}`. One ValueError here is a
+        # UnicodeDecodeError from a DPAPI key file that unprotects to bytes that are not ASCII, and
+        # its own text quotes a byte of the key. Every other text is printed whole.
+        from messagefoundry.redaction import codec_safe_str
+
+        print(
+            f"error: cannot load the active key for rotation: {codec_safe_str(exc)}",
+            file=sys.stderr,
+        )
         return 2
     if not active_key:
         print(

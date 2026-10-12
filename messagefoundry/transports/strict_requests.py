@@ -138,8 +138,9 @@ class VaultHopRefused(InsecureHopRefused):
     under ``messagefoundry/`` calls this name. This module calls neither ``InsecureHopRefused``
     nor ``enforce_insecure_hop``, which raises it. And each text built here is a literal, the
     connector label, a module constant, or one helper the test names. The scans match a call by
-    name, so they do not see an alias or a subclass, and they cannot judge the helper's own text.
-    A reviewer still has to.
+    name, so they do not see an alias, and they cannot judge the helper's own text. A reviewer
+    still has to. A subclass is not seen either, so :func:`vault_failure_text` keeps the text of
+    exactly this type.
     """
 
 
@@ -532,7 +533,9 @@ def vault_failure_text(exc: BaseException) -> str:
     least the handlers in ``store/crypto_transit.py``, ``store/keyprovider_vault.py`` and
     ``config/secretprovider_vault.py``.
     """
-    if isinstance(exc, (VaultHopRefused, EgressReplyError)):
+    # Exactly the marked type: a subclass built elsewhere is outside what the source scans see.
+    # The reply half takes subclasses, because the reply reader's refusals ARE subclasses.
+    if type(exc) is VaultHopRefused or isinstance(exc, EgressReplyError):
         return str(exc)
     return type(exc).__name__
 

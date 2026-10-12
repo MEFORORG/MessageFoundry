@@ -93,6 +93,27 @@ def test_rotate_key_exits_2_when_the_vault_client_build_refuses(
     assert "OK:" not in captured.out, captured.out
 
 
+def test_a_unicode_error_at_the_key_check_does_not_print_the_byte_it_failed_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``UnicodeDecodeError`` is a ``ValueError``, and its own text quotes the byte it failed on.
+    At this check that byte can be one of the store key's: a DPAPI key file that unprotects to
+    bytes that are not ASCII raises one. So the arm exits 2 and prints the error without the byte.
+    Raised here from the Vault client build, which reaches the same arm. Synthetic bytes."""
+    db = _select_the_vault_provider(monkeypatch, tmp_path)
+
+    def refuse(addr: str | None, token: str | None) -> object:
+        return bytes([0x41, 0x42, 0x9C]).decode("ascii")
+
+    monkeypatch.setattr(keyprovider_vault, "_build_client", refuse)
+
+    assert main(["rotate-key", "--db", db]) == 2
+    captured = capsys.readouterr()
+    assert _KEY_CHECK_LINE in captured.err, captured.err
+    assert "UnicodeDecodeError" in captured.err, captured.err
+    assert "0x9c" not in captured.err.lower(), captured.err
+
+
 def test_rotate_key_exits_2_on_a_real_client_build_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -80,10 +80,23 @@ def test_the_strict_reader_module_builds_no_unmarked_hop_refusal(unmarked: str) 
 _TEXT_HELPERS = frozenset({"_unverifiable_proxy_leg"})
 
 
-def _is_label_or_constant(node: ast.expr) -> bool:
-    """``connector``, ``self._connector``, or a module constant spelled in upper case."""
+def _string_constants(tree: ast.Module) -> frozenset[str]:
+    """The names a module binds at its top level to a string literal, and nothing else."""
+    return frozenset(
+        target.id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    )
+
+
+def _is_label_or_constant(node: ast.expr, constants: frozenset[str]) -> bool:
+    """``connector``, ``self._connector``, or one of the module's own string constants."""
     if isinstance(node, ast.Name):
-        return node.id == "connector" or node.id.isupper()
+        return node.id == "connector" or node.id in constants
     return (
         isinstance(node, ast.Attribute)
         and node.attr == "_connector"
@@ -92,19 +105,28 @@ def _is_label_or_constant(node: ast.expr) -> bool:
     )
 
 
-def _is_fixed_text(call: ast.Call) -> bool:
-    """Whether a refusal is built from one argument that can carry only fixed text: a literal, a
-    listed helper's result, or an f-string whose holes are the connector label or a constant."""
+def _is_fixed_text(call: ast.Call, constants: frozenset[str]) -> bool:
+    """Whether a refusal is built from one argument that can carry only fixed text.
+
+    That is a literal, a listed helper called on the connector label alone, or an f-string whose
+    holes are the connector label or a module string constant. A hole with a conversion or a
+    format spec is refused, because a format spec can hold a second value."""
     if len(call.args) != 1 or call.keywords:
         return False
     text = call.args[0]
     if isinstance(text, ast.Constant):
         return isinstance(text.value, str)
     if isinstance(text, ast.Call):
-        return callee_name(text, bare_only=True) in _TEXT_HELPERS
+        return (
+            callee_name(text, bare_only=True) in _TEXT_HELPERS
+            and not text.keywords
+            and all(_is_label_or_constant(arg, frozenset()) for arg in text.args)
+        )
     if isinstance(text, ast.JoinedStr):
         return all(
-            _is_label_or_constant(part.value)
+            part.conversion == -1
+            and part.format_spec is None
+            and _is_label_or_constant(part.value, constants)
             for part in text.values
             if isinstance(part, ast.FormattedValue)
         )
@@ -114,10 +136,14 @@ def _is_fixed_text(call: ast.Call) -> bool:
 def test_every_marked_refusal_is_built_from_fixed_text() -> None:
     """The marker means the text names no address, proxy URL, token or reply. This holds each
     site to a shape that cannot interpolate one. It does not read a listed helper's own text."""
-    sites = call_sites(parse_source(_HOME.read_text(encoding="utf-8")), _MARKER)
-    loose = [site.lineno for site in sites if not _is_fixed_text(site)]
+    tree = parse_source(_HOME.read_text(encoding="utf-8"))
+    constants = _string_constants(tree)
+    sites = call_sites(tree, _MARKER)
+    loose = [site.lineno for site in sites if not _is_fixed_text(site, constants)]
     assert loose == [], f"a marked refusal interpolates something at lines {loose}"
     assert sites, "the scan saw no marked refusal at all"
+    # The constants the sites use today are found, so the lookup is not passing on an empty set.
+    assert {"_CLEARTEXT_VAULT_HOP", "_CLEARTEXT_PROXY_CREDENTIALS"} <= constants
 
 
 @pytest.mark.parametrize(
@@ -128,12 +154,30 @@ def test_every_marked_refusal_is_built_from_fixed_text() -> None:
         "VaultHopRefused(str(exc))",
         'VaultHopRefused("refused: " + url)',
         "VaultHopRefused(_other_helper(connector))",
+        # Round 2 of the review: three shapes the first scan passed.
+        "VaultHopRefused(_unverifiable_proxy_leg(request.url))",
+        'VaultHopRefused(f"{connector:{url}}")',
+        'VaultHopRefused(f"{connector!r}: {PROXY}")',
+        'PROXY = os.environ["HTTPS_PROXY"]\nVaultHopRefused(f"{connector}: {PROXY}")',
     ],
 )
 def test_the_fixed_text_scan_can_fail(source: str) -> None:
     """The control for the scan above: each of these would put a caller's value in the text."""
-    (site,) = call_sites(parse_source(source), _MARKER)
-    assert not _is_fixed_text(site)
+    tree = parse_source(source)
+    (site,) = call_sites(tree, _MARKER)
+    assert not _is_fixed_text(site, _string_constants(tree))
+
+
+def test_the_fixed_text_scan_passes_the_shapes_the_module_uses() -> None:
+    """The other control: the scan is not refusing everything."""
+    tree = parse_source(
+        'FIXED = "a fixed reason"\n'
+        'VaultHopRefused(f"{connector}: {FIXED}")\n'
+        'VaultHopRefused(f"{self._connector} would do a fixed thing")\n'
+        "VaultHopRefused(_unverifiable_proxy_leg(self._connector))\n"
+    )
+    constants = _string_constants(tree)
+    assert [_is_fixed_text(site, constants) for site in call_sites(tree, _MARKER)] == [True] * 3
 
 
 @_needs_the_vault_extra
@@ -145,6 +189,12 @@ def test_an_unmarked_hop_refusal_gives_only_its_type_name() -> None:
     marked = VaultHopRefused("Vault test hop: fixed text")
     assert vault_failure_text(marked) == "Vault test hop: fixed text"
     assert isinstance(marked, InsecureHopRefused)
+
+    # Exactly the marked type. The source scans do not see a subclass, so one keeps no text.
+    class _Elsewhere(VaultHopRefused):
+        pass
+
+    assert vault_failure_text(_Elsewhere(_HOST_ECHOING)) == "_Elsewhere"
 
 
 @_needs_the_vault_extra
