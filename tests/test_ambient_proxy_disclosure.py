@@ -3,9 +3,10 @@
 """An environment web proxy is disclosed at start, never silent (BACKLOG #1125, ASVS 4.2.1).
 
 Owner ruling 2026-10-11: an ambient proxy must not attach silently, or must be disclosed. The
-engine's urllib openers follow ``HTTP_PROXY``, ``HTTPS_PROXY`` and the system proxy, and its Vault
-clients follow those and ``ALL_PROXY`` too. So ``serve`` and ``supervise`` name that proxy, and
-the hops that follow it, in one WARNING per process.
+engine's urllib openers follow ``HTTP_PROXY``, ``HTTPS_PROXY`` and the system proxy. Its Vault
+clients reach an ``https://`` Vault through ``HTTPS_PROXY`` or ``ALL_PROXY``, and refuse an
+``http://`` Vault that ``HTTP_PROXY`` or ``ALL_PROXY`` would carry. So ``serve`` and ``supervise``
+name that proxy, and the hops it affects, in one WARNING per process.
 Both polarities are tested: with a proxy in the environment the warning names its host and no
 credential; with none, nothing is logged.
 """
@@ -26,6 +27,7 @@ from messagefoundry.transports.ambient_proxy import ambient_proxy_warning, envir
 
 _SECRET = "s3cretpw"
 _PROXY = f"http://alice:{_SECRET}@proxy.example:3128"
+_VAULT_TLS = "The Vault and OpenBao clients do open TLS to an https:// proxy."
 
 
 @pytest.fixture
@@ -132,28 +134,41 @@ def test_the_warning_does_not_claim_a_tls_proxy_leg_for_the_urllib_hops() -> Non
     text = ambient_proxy_warning(proxies={"https": "https://u:pw@proxy.example:443"})
     assert text is not None and "https targets via https://proxy.example:443" in text
     assert "An https:// one is not refused, and is not safe either." in text
-    assert "the urllib hops reach any proxy over plain TCP" in text
+    assert "the urllib hops reach every proxy over plain TCP, even one written https://" in text
     assert "and any credential from the proxy URL, in cleartext" in text
-    assert "The Vault and OpenBao clients do open TLS to an https:// proxy" in text
-    for claim in ("is TLS", "encrypted", "is safe"):
-        assert claim not in text, claim
-    # With only an http entry, no Vault hop follows the proxy, so no TLS leg is claimed at all.
-    http_only = ambient_proxy_warning(proxies={"http": "https://proxy.example:443"})
-    assert http_only is not None and "open TLS" not in http_only
-    # With only an all entry, no urllib hop follows it, so their sentences are left out.
-    all_only = ambient_proxy_warning(proxies={"all": "https://proxy.example:443"})
-    assert all_only is not None and "urllib" not in all_only and "open TLS" in all_only
+    # TLS is named only in the Vault clients' sentence: nothing else may claim a TLS leg.
+    assert _VAULT_TLS in text
+    rest = text.replace(_VAULT_TLS, "").lower()
+    for claim in ("tls", "encrypt", "secure", "is safe", "protected"):
+        assert claim not in rest, claim
 
 
-def test_an_http_only_proxy_does_not_list_the_vault_clients() -> None:
-    """requests picks no ``http`` entry for an ``https://`` Vault, and ``strict_requests`` refuses an
-    ``http://`` Vault behind any proxy. So an ``http``-only proxy carries no Vault hop."""
+def test_with_no_https_proxy_only_an_https_written_http_proxy_gets_tls() -> None:
+    """The one shape the measurement found a TLS leg in: an ``http`` target, no ``https`` proxy."""
+    text = ambient_proxy_warning(proxies={"http": "https://proxy.example:443"})
+    assert text is not None
+    assert "With no https proxy set, an https target goes direct" in text
+    assert "only an http proxy written https:// gets a TLS leg" in text
+    assert "not safe either" not in text and "plain TCP" not in text and _VAULT_TLS not in text
+
+
+def test_an_http_only_proxy_does_not_list_the_vault_clients_but_says_it_refuses_them() -> None:
+    """requests picks no ``http`` entry for an ``https://`` Vault, so that entry carries no Vault
+    hop. It does pick it for an ``http://`` Vault, which ``strict_requests`` then refuses even on
+    loopback, so the warning says that instead of listing the Vault among the hops that follow."""
     assert select_proxy("https://vault.example:8200", {"http": "http://p.example:1"}) is None
+    assert select_proxy("http://127.0.0.1:8200", {"http": "http://p.example:1"}) == (
+        "http://p.example:1"
+    )
     text = ambient_proxy_warning(proxies={"http": _PROXY})
     assert text is not None and "http targets via http://proxy.example:3128" in text
-    assert "Vault" not in text
+    assert "Vault and OpenBao clients, loopback addresses included" not in text
+    assert "refuse an http:// Vault address that an http or all proxy would carry" in text
     for hop in ("HTTP-family", "alert webhook", "OIDC", "AI broker"):
         assert hop in text, hop
+    # An https-only proxy is never picked for an http:// Vault, so it makes no refusal claim.
+    https_only = ambient_proxy_warning(proxies={"https": _PROXY})
+    assert https_only is not None and "refuse an http:// Vault" not in https_only
 
 
 def test_the_remedy_says_proxy_url_does_not_stop_the_warning() -> None:
@@ -162,6 +177,10 @@ def test_the_remedy_says_proxy_url_does_not_stop_the_warning() -> None:
     assert text is not None
     assert "[egress].proxy_url to an address names a proxy for the HTTP family only" in text
     assert "The other hops keep this proxy, and this warning still logs" in text
+    # No HTTP-family hop follows an all-only proxy, so proxy_url is no remedy to offer there.
+    all_only = ambient_proxy_warning(proxies={"all": _PROXY})
+    assert all_only is not None and "proxy_url" not in all_only and "urllib" not in all_only
+    assert "To stop it, clear http_proxy" in all_only
 
 
 def test_the_warning_does_not_promise_the_vault_a_loopback_bypass(

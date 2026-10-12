@@ -40,25 +40,45 @@ _HTTP_FAMILY_HOPS = (
 #: The urllib hops with no proxy setting of their own.
 _OTHER_URLLIB_HOPS = ("the alert webhook", "the OIDC sign-in requests", "the AI broker")
 #: The keys requests selects for an ``https://`` Vault. It honours ``all`` too, which urllib's
-#: handler does not read. An ``http``-only entry never carries an ``https://`` Vault, and
-#: ``strict_requests`` refuses an ``http://`` Vault behind any proxy, so that entry reaches no Vault.
+#: handler does not read.
 _VAULT_SCHEMES = frozenset({"https", "all"})
+#: The keys requests selects for an ``http://`` Vault. ``strict_requests`` refuses that hop behind
+#: any proxy, loopback included, so such an entry carries no Vault hop but can break one.
+_VAULT_REFUSING_SCHEMES = frozenset({"http", "all"})
 #: requests has no loopback-direct rule, so an ``https://`` Vault on a loopback address is proxied.
 _VAULT_HOPS = "the Vault and OpenBao clients, loopback addresses included"
 
-#: What the proxy URL's scheme does not buy the urllib hops. ``bounded_read`` records the
-#: measurement in ``ProxyCredentialsRefusedError``: only an ``http`` target with no ``https`` proxy
-#: set gets a TLS leg to an ``https://`` proxy. So the scheme the warning names must not read as an
-#: encrypted leg.
-_URLLIB_PROXY_LEG = (
+_URLLIB_DIRECT = (
     "The urllib hops dial a loopback host direct, and a host on NO_PROXY or the system bypass "
     "list goes direct. A proxy URL that carries credentials and is not https:// is refused on "
-    "each request. An https:// one is not refused, and is not safe either. For an https target, "
-    "the urllib hops reach any proxy over plain TCP. They send CONNECT, and any credential from "
-    "the proxy URL, in cleartext. "
+    "each request. "
+)
+#: The proxy's scheme is not a TLS leg for the urllib hops, so the warning must not let it read
+#: as one (SDS-3.7). ``bounded_read.ProxyCredentialsRefusedError`` holds the measurement: only an
+#: ``http`` target, with no ``https`` proxy set, gets TLS to a proxy written ``https://``.
+_URLLIB_NO_TLS_LEG = (
+    "An https:// one is not refused, and is not safe either. With an https proxy set, the "
+    "urllib hops reach every proxy over plain TCP, even one written https://. For an https "
+    "target they send CONNECT, and any credential from the proxy URL, in cleartext. "
+)
+_URLLIB_HTTP_ONLY_LEG = (
+    "With no https proxy set, an https target goes direct, and only an http proxy written "
+    "https:// gets a TLS leg. "
 )
 #: What the Vault clients get that the urllib hops do not (``strict_requests``, BACKLOG #300).
-_VAULT_PROXY_LEG = "The Vault and OpenBao clients do open TLS to an https:// proxy. "
+_VAULT_TLS_LEG = "The Vault and OpenBao clients do open TLS to an https:// proxy. "
+_VAULT_REFUSED = (
+    "The Vault and OpenBao clients refuse an http:// Vault address that an http or all proxy "
+    "would carry, loopback included. "
+)
+_REMEDY = (
+    "To stop it, clear http_proxy, https_proxy and all_proxy in either case, and the system "
+    "proxy, for the account the engine runs as. "
+)
+_PROXY_URL_REMEDY = (
+    "Setting [egress].proxy_url to an address names a proxy for the HTTP family only. The other "
+    "hops keep this proxy, and this warning still logs, because it reads only the environment. "
+)
 
 
 def _address_of(value: str) -> str:
@@ -67,11 +87,8 @@ def _address_of(value: str) -> str:
     Read by the peer-label parser the posture read-out uses for a proxy URL, so the two agree, and
     so its refusals apply here too: whitespace, a control character, or a ``%`` that could hide an
     encoded userinfo in the host all give the placeholder rather than an echo. A value with no
-    scheme is read as ``http`` by both libraries, so it is named that way.
-
-    The scheme does not say the leg to the proxy is TLS. For an ``https`` target, the urllib hops
-    send ``CONNECT`` to an ``https://`` proxy in cleartext. The Vault clients open TLS to it on
-    every hop they allow."""
+    scheme is read as ``http`` by both libraries, so it is named that way. The scheme is not always
+    a TLS leg to the proxy; :data:`_URLLIB_NO_TLS_LEG` says when it is not."""
     parts = _split_address(value)
     if parts is None:
         return "an unreadable value"
@@ -103,23 +120,28 @@ def ambient_proxy_warning(proxies: Mapping[str, str] | None = None) -> str | Non
     hosts = environment_proxy_hosts(found)
     if not hosts:
         return None
-    urllib_hops = bool(_URLLIB_SCHEMES & hosts.keys())
-    vault_hops = bool(_VAULT_SCHEMES & hosts.keys())
+    keys = hosts.keys()
+    urllib_hops = bool(_URLLIB_SCHEMES & keys)
+    vault_hops = bool(_VAULT_SCHEMES & keys)
     hops = [_HTTP_FAMILY_HOPS, *_OTHER_URLLIB_HOPS] if urllib_hops else []
     if vault_hops:
         hops.append(_VAULT_HOPS)
-    named = "; ".join(f"{scheme} targets via {address}" for scheme, address in hosts.items())
-    return (
-        f"a web proxy from the environment or the system proxy settings is in force ({named}). "
-        "At least these engine hops follow it for targets of a matching scheme, with no engine "
-        f"setting naming it: {'; '.join(hops)}. "
-        + (_URLLIB_PROXY_LEG if urllib_hops else "")
-        + (_VAULT_PROXY_LEG if vault_hops else "")
-        + "To stop it, clear http_proxy, https_proxy and all_proxy in either case, and the system "
-        "proxy, for the account the engine runs as. Setting [egress].proxy_url to an address "
-        "names a proxy for the HTTP family only. The other hops keep this proxy, and this "
-        "warning still logs, because it reads only the environment (BACKLOG #1125)"
-    )
+    parts = [
+        "a web proxy from the environment or the system proxy settings is in force ("
+        + "; ".join(f"{scheme} targets via {address}" for scheme, address in hosts.items())
+        + "). At least these engine hops follow it for targets of a matching scheme, with no "
+        f"engine setting naming it: {'; '.join(hops)}. "
+    ]
+    if urllib_hops:
+        parts += [_URLLIB_DIRECT, _URLLIB_NO_TLS_LEG if "https" in keys else _URLLIB_HTTP_ONLY_LEG]
+    if vault_hops:
+        parts.append(_VAULT_TLS_LEG)
+    if _VAULT_REFUSING_SCHEMES & keys:
+        parts.append(_VAULT_REFUSED)
+    parts.append(_REMEDY)
+    if urllib_hops:
+        parts.append(_PROXY_URL_REMEDY)
+    return "".join(parts) + "(BACKLOG #1125)"
 
 
 def warn_ambient_proxy(logger: logging.Logger) -> None:
