@@ -44,7 +44,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 
-from .rules import HEADER_SEGMENTS, FieldRule, SurrogateKind
+from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind
 from .surrogates import Seps, message_has_site_code, read_message_seps
 
 
@@ -191,12 +191,24 @@ _SEGMENT_TABLE_CHANGES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+#: The longest run of digits :func:`_version_key` turns into a number. No HL7 version comes near
+#: it. The interpreter refuses to convert a run past its own limit (4300 digits unless that
+#: setting is changed or turned off) with a plain ``ValueError``, so the length is capped here,
+#: well under that limit, and the refusal does not depend on the setting (BACKLOG #3004).
+_VERSION_PART_MAX_DIGITS = 32
+
+
 def _version_key(version: str) -> tuple[int, ...] | None:
     parts = version.strip().split(".")
     # ASCII digits only: a superscript two passes str.isdigit() and then int() raises on it,
     # and MSH-12 is untrusted text that must not reach an error message (BACKLOG #2246).
     if not all(part.isascii() and part.isdigit() for part in parts):
         return None
+    if any(len(part) > _VERSION_PART_MAX_DIGITS for part in parts):
+        raise AnonError(
+            "message has an HL7 version in MSH-12 with a run of digits too long to read — "
+            "refusing to emit; repair the header, then retry"
+        )
     return tuple(int(part) for part in parts)
 
 
@@ -216,7 +228,8 @@ _ANY_VERSION_SEGMENTS: frozenset[str] = frozenset().union(*(ids for _, ids in _S
 def known_segments(version: str) -> frozenset[str]:
     """The segment ids HL7 ``version`` (MSH-12) defines: the newest table at or below it. An empty or
     unparseable version, or one older than every table, gets the ids that ANY version defines, which
-    names more than the message's own version would."""
+    names more than the message's own version would. A version with a run of more than
+    :data:`_VERSION_PART_MAX_DIGITS` digits raises a body-free :class:`AnonError`."""
     key = _version_key(version)
     chosen: frozenset[str] | None = None
     if key is not None:
