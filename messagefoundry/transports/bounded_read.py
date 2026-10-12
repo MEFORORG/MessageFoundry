@@ -865,6 +865,8 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
 
     * A proxy credential carried in any header but ``Proxy-Authorization``. Which names count as
       that header is :func:`is_proxy_credential_header_name`'s to say.
+    * A spelling of that name which ``http.client`` can never send. The request fails with that
+      library's own error and not this one, as :func:`_proxy_credential_headers` explains.
     * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
       trusts, so a context on the system store accepts any publicly trusted certificate for the
       proxy's host.
@@ -967,41 +969,66 @@ def _is_from_a_proxy_url(
 _PLAIN_NAME = "proxy-authorization"
 
 
-def is_proxy_credential_header_name(name: str) -> bool:
+def is_proxy_credential_header_name(name: str | bytes) -> bool:
     """Whether ``name`` is the ``Proxy-Authorization`` header, however it is spelled.
 
-    The one reading of that name, so the rules that ask the question cannot drift apart. The
+    Every rule that asks which names are that header asks here, so they cannot drift apart. The
     letter case is ignored. So is every character at either end that cannot be part of a header
     name: whitespace, a control character, a NUL. ``http.client`` sends at least a name that ends
     in a space, a tab, a NUL or a DEL as it is written, and a proxy may read each as the plain
     name. A name that differs in any other way is another header, which the rule on
     :class:`ProxyCredentialsRefusedError` leaves out.
+
+    A ``bytes`` name is read as the wire would carry it. ``http.client`` sends one byte for byte,
+    so it is decoded as latin-1, one character for each byte.
+
+    :func:`_is_spelled_plainly` asks a narrower question about a name this function accepts:
+    whether urllib itself would take it for the header.
     """
-    return _PROXY_CREDENTIAL_NAME.fullmatch(name) is not None
+    text = name.decode("latin-1") if isinstance(name, bytes) else name
+    return _PROXY_CREDENTIAL_NAME.fullmatch(text) is not None
 
 
-def _is_spelled_plainly(name: str) -> bool:
+def _is_spelled_plainly(name: str | bytes) -> bool:
     """Whether ``name`` is ``Proxy-Authorization`` with nothing around it, in any letter case.
-    ``do_open`` title-cases each name, so this is the set of spellings it moves into a ``CONNECT``."""
-    return name.lower() == _PLAIN_NAME
+    ``do_open`` title-cases each name, so this is the set of spellings it moves into a ``CONNECT``.
+    It looks the name up as a ``str``, so a ``bytes`` name is never one of them."""
+    return isinstance(name, str) and name.lower() == _PLAIN_NAME
 
 
-def _proxy_credential_headers(req: urllib.request.Request) -> dict[str, str]:
+def _proxy_credential_headers(req: urllib.request.Request) -> dict[str | bytes, str]:
     """Each ``Proxy-Authorization`` header on ``req``, by the name it is stored under. The name
-    is read by :func:`is_proxy_credential_header_name`.
+    is read by :func:`is_proxy_credential_header_name`. urllib annotates a name as ``str``, but
+    nothing stops a caller storing ``bytes``, and ``http.client`` sends either.
 
     urllib stores a header under ``str.capitalize()`` of its name, but ``do_open`` sends every
     header it holds, so a key stored in another case would still reach the wire. So would one
     stored with whitespace after it, beside a plainly spelled one. Every match is returned for
     that reason: one value must not hide another. The unredirected headers are read last because
     ``do_open`` lets them win over a header of the same name.
+
+    **A name ``http.client`` can never send raises here what ``http.client`` raises for it.** At
+    least a name that starts with a space, one that holds a line feed, and one that will not
+    encode as ASCII are such names. No request could carry one, so it is a fault in what the
+    caller wrote and not a credential on its way out. Each hop already maps that error to its own
+    permanent refusal, and a retry would only spend the retry policy on it.
     """
-    return {
+    found: dict[str | bytes, str] = {
         name: str(value)
         for headers in (req.headers, req.unredirected_hdrs)
         for name, value in headers.items()
         if is_proxy_credential_header_name(name)
     }
+    odd = [name for name in found if not _is_spelled_plainly(name)]
+    if odd:
+        # Asked of http.client itself, so this follows its rule in every Python version. Nothing
+        # is connected: putrequest and putheader only fill a buffer. The value is left out, so
+        # the error can quote the name and nothing else.
+        probe = http.client.HTTPConnection("localhost")
+        probe.putrequest("GET", "/")
+        for name in odd:
+            probe.putheader(name, "")
+    return found
 
 
 def _proxy_url_credentials(proxies: Mapping[str, str]) -> set[str]:

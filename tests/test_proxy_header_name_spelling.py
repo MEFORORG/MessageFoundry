@@ -18,11 +18,16 @@ no caller-set header:
 * a request that goes direct: the header reached the destination.
 
 **Which spellings can be sent.** ``http.client`` refuses a name that starts with a space, a tab,
-a vertical tab or a form feed, and one that holds a carriage return or a line feed anywhere. It
-sends at least the others listed in ``_SENDABLE``: a name that ends in whitespace or in another
-control character, and one that starts with a control character its pattern does not count as
-whitespace. ``_SENDABLE`` and ``_UNSENDABLE`` are that measurement, and ``test_measured_*`` pin
-it on the wire with urllib's own opener.
+a vertical tab or a form feed, and one that holds a colon, a carriage return or a line feed
+anywhere. It sends at least the others listed in ``_SENDABLE``: a name that ends in whitespace,
+in another control character or in a punctuation mark, and one that starts with a control
+character its pattern does not count as whitespace. ``_SENDABLE`` and ``_UNSENDABLE`` are that
+measurement, and ``test_measured_*`` pin it on the wire with urllib's own opener.
+
+**A spelling that can never be sent is a fault in the configuration, not a leak.** The rule
+lets ``http.client`` refuse it with its own error, as it did before the fix, so a connector
+maps it to a permanent refusal and does not retry it. A sendable spelling is refused by the
+rule, and that refusal is retried like the plain name's.
 
 Each refusal is read at a loopback socket that records what reaches it, as well as in the result.
 
@@ -43,7 +48,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Rest
 from messagefoundry.transports import build_destination, rest
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
     LoopbackDirectProxyHandler,
     ProxyCredentialsRefusedError,
@@ -80,6 +85,10 @@ _SENDABLE = {
     "leading-unit-separator": "\x1f" + _NAME,
     "leading-nul": "\x00" + _NAME,
     "leading-delete": "\x7f" + _NAME,
+    "leading-backspace": "\x08" + _NAME,
+    "semicolon": _NAME + ";",
+    "leading-parenthesis": "(" + _NAME,
+    "quotation-mark": _NAME + '"',
 }
 
 #: Spellings ``http.client`` refuses before it opens a connection, each with what it raises.
@@ -91,6 +100,7 @@ _UNSENDABLE: dict[str, tuple[str, type[Exception]]] = {
     "both-ends": (" " + _NAME + " ", ValueError),
     "carriage-return": (_NAME + "\r", ValueError),
     "line-feed": (_NAME + "\n", ValueError),
+    "colon": (_NAME + ":", ValueError),
     "no-break-space": (_NAME + "\xa0", UnicodeEncodeError),
 }
 
@@ -172,11 +182,15 @@ def test_measured_http_client_refuses_the_spelling_before_it_connects(spelling: 
 @pytest.mark.parametrize("admitted", [False, True])
 @pytest.mark.parametrize("spelling", list(_UNSENDABLE))
 def test_an_unsendable_spelling_never_reaches_a_proxy(spelling: str, admitted: bool) -> None:
-    """The rule reads these as the proxy header too, so the engine opener refuses them itself,
-    before ``http.client`` would."""
-    name, _ = _UNSENDABLE[spelling]
-    with _WireProxy() as proxy:
-        _refused(_opener(proxy, admitted=admitted), _request(name, _HTTP_TARGET), "#3416")
+    """The rule reads these as the proxy header too, and then lets ``http.client`` speak for
+    itself: the engine opener raises exactly what the stock one does, and not the retryable
+    refusal it keeps for a name that could be sent. The error holds no part of the value."""
+    name, raised_by_http_client = _UNSENDABLE[spelling]
+    with _WireProxy() as proxy, pytest.raises(raised_by_http_client) as raised:
+        _opener(proxy, admitted=admitted).open(_request(name, _HTTP_TARGET), timeout=5)
+    assert type(raised.value) is raised_by_http_client
+    for part in ("u5er", "pa55w0rd", _VALUE):
+        assert part not in f"{raised.value!s} {raised.value!r}", part
     assert proxy.connections == 0
 
 
@@ -368,6 +382,47 @@ def test_control_another_static_header_beside_proxy_user_builds() -> None:
     assert dest._headers["X-Proxy-Authorization"] == _VALUE
 
 
+#: One spelling of each kind ``http.client`` can never send: its own name pattern refuses the
+#: first two, and the third will not encode as ASCII.
+_NEVER_SENT = {
+    "leading-space": " " + _NAME,
+    "trailing-line-feed": _NAME + "\n",
+    "trailing-no-break-space": _NAME + "\xa0",
+}
+
+
+@pytest.mark.parametrize("name", list(_NEVER_SENT.values()), ids=list(_NEVER_SENT))
+def test_a_rest_send_with_a_name_that_can_never_be_sent_fails_permanently(name: str) -> None:
+    """A fault in what the operator wrote, which no retry can mend. Before the fix this was a
+    permanent refusal, raised from ``http.client``'s own error. The rule must not turn it into
+    a retryable one, which would spend the retry policy before the message dead-letters."""
+    with _WireProxy() as proxy:
+        dest = _rest_with_static_header(name, proxy)
+        with pytest.raises(NegativeAckError) as raised:
+            asyncio.run(dest.send('{"a": 1}'))
+    assert raised.value.permanent is True
+    assert raised.value.code == "bad-request-value"
+    assert isinstance(raised.value.__cause__, ValueError)
+    for part in ("u5er", "pa55w0rd", _VALUE):
+        assert part not in str(raised.value), part
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("name", [_NAME, _NAME + " "], ids=["plain", "space"])
+def test_control_a_rest_send_with_a_sendable_proxy_header_is_refused_and_retried(
+    name: str,
+) -> None:
+    """The other polarity. A name that could reach the wire is a credential on its way out: the
+    rule refuses it, and the refusal is the retryable kind, as the plain name's already was."""
+    with _WireProxy() as proxy:
+        dest = _rest_with_static_header(name, proxy)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send('{"a": 1}'))
+    assert not isinstance(raised.value, NegativeAckError)
+    assert isinstance(raised.value.__cause__, ProxyCredentialsRefusedError)
+    assert proxy.connections == 0
+
+
 def test_control_a_rest_send_with_another_static_header_reaches_the_proxy() -> None:
     """The same connection with a header the rule does not read. The fake proxy may hang up
     before the body is sent, so the result is not read: what reached the socket is."""
@@ -377,6 +432,77 @@ def test_control_a_rest_send_with_another_static_header_reaches_the_proxy() -> N
             asyncio.run(dest.send('{"a": 1}'))
     assert len(proxy.cleartext) == 1
     assert f"X-Trace: {_VALUE}\r\n".encode() in proxy.cleartext[0]
+
+
+# --- a bytes name ----------------------------------------------------------------------------------
+
+
+def _bytes_request(name: bytes, url: str) -> urllib.request.Request:
+    """A request that holds one header under a ``bytes`` name. urllib annotates a name as
+    ``str``, but stores and sends whatever it is given."""
+    request = urllib.request.Request(url)
+    request.headers[name] = _VALUE  # type: ignore[index]
+    return request
+
+
+_BYTES_SPELLINGS = [_NAME.encode(), _NAME.lower().encode(), _NAME.encode() + b" "]
+
+
+def test_measured_http_client_sends_a_bytes_name_as_written() -> None:
+    """The control for the tests below: urllib's own opener puts a ``bytes`` name on the wire
+    byte for byte."""
+    with _WireProxy() as destination:
+        request = _bytes_request(_NAME.encode(), f"http://{destination.address}/x")
+        _open_and_discard(_stock_opener(), request)
+    assert len(destination.cleartext) == 1
+    assert f"\r\n{_NAME}: {_VALUE}\r\n".encode() in destination.cleartext[0]
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("target", [_HTTP_TARGET, _HTTPS_TARGET])
+@pytest.mark.parametrize("name", _BYTES_SPELLINGS)
+def test_a_bytes_spelling_of_the_proxy_header_is_refused_before_a_proxy_leg(
+    name: bytes, target: str, admitted: bool
+) -> None:
+    """Before the fix a ``bytes`` name was not read at all, so it reached the proxy. It is read
+    as latin-1 now. An admission never covers it: urllib looks the name up as a ``str`` when it
+    fills a ``CONNECT``, so a ``bytes`` one would stay on the request sent inside the tunnel."""
+    with _WireProxy() as proxy:
+        _refused(_opener(proxy, admitted=admitted), _bytes_request(name, target), "#3416")
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("name", _BYTES_SPELLINGS)
+def test_a_bytes_spelling_of_the_proxy_header_on_a_direct_request_is_refused(name: bytes) -> None:
+    with _WireProxy() as destination:
+        opener = build_strict_opener(urllib.request.ProxyHandler({}))
+        _refused(opener, _bytes_request(name, f"http://{destination.address}/x"), "#3417")
+    assert destination.connections == 0
+
+
+@pytest.mark.parametrize("through_a_proxy", [False, True])
+def test_control_another_bytes_header_is_sent(through_a_proxy: bool) -> None:
+    """A ``bytes`` name the rule does not read still crosses, direct or through a proxy."""
+    with _WireProxy() as peer:
+        if through_a_proxy:
+            opener, url = _opener(peer), _HTTP_TARGET
+        else:
+            opener = build_strict_opener(urllib.request.ProxyHandler({}))
+            url = f"http://{peer.address}/x"
+        with opener.open(_bytes_request(b"X-Trace", url), timeout=5) as resp:
+            assert resp.read() == b"ok"
+    assert len(peer.cleartext) == 1
+    assert f"\r\nX-Trace: {_VALUE}\r\n".encode() in peer.cleartext[0]
+
+
+@pytest.mark.parametrize("name", [*_BYTES_SPELLINGS, b"\x00" + _NAME.encode() + b"\xa0"])
+def test_a_bytes_name_is_read_as_the_wire_would_carry_it(name: bytes) -> None:
+    assert is_proxy_credential_header_name(name)
+
+
+@pytest.mark.parametrize("name", [b"X-Trace", b"Authorization", b"", b"X-" + _NAME.encode()])
+def test_control_another_bytes_name_is_not_the_proxy_credential_header(name: bytes) -> None:
+    assert not is_proxy_credential_header_name(name)
 
 
 # --- the one reading of the name -----------------------------------------------------------------
