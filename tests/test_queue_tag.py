@@ -10,12 +10,14 @@ legs run the same contract from ``tests/test_postgres_store.py`` and ``tests/tes
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import sqlite3
 from typing import Any
 
 import pytest
 
+import messagefoundry
 from messagefoundry.pipeline.alerts import QUEUE_TAG_SUBJECT, alert_cell_tag_failure
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import (
@@ -146,6 +148,38 @@ def test_the_tag_failure_hook_and_alert() -> None:
     sink = _Sink()
     alert_cell_tag_failure(sink, "queue", "r")  # type: ignore[arg-type]
     assert sink.calls == [(QUEUE_TAG_SUBJECT, "r")]
+
+
+_STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
+
+
+def _queue_payload_literals(path: pathlib.Path) -> int:
+    count = 0
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None)) == "cell_aad"
+            and len(node.args) >= 2
+            and all(isinstance(a, ast.Constant) for a in node.args[:2])
+            and [a.value for a in node.args[:2] if isinstance(a, ast.Constant)]
+            == ["queue", "payload"]
+        ):
+            count += 1
+    return count
+
+
+def test_one_helper_builds_every_queue_payload_tag() -> None:
+    """No store module builds the queue payload's associated data except through the helper."""
+    counts = {
+        p.name: _queue_payload_literals(p)
+        for p in sorted(_STORE_DIR.rglob("*.py"))
+        if _queue_payload_literals(p)
+    }
+    # The helper's own frame is the one call; every backend reaches it through queue_payload_aad.
+    assert counts == {"queue_tag.py": 1}, counts
+    for backend in ("store.py", "postgres.py", "sqlserver.py"):
+        source = (_STORE_DIR / backend).read_text(encoding="utf-8")
+        assert "queue_payload_aad(" in source and "queue_row_aad" in source, backend
 
 
 def test_queue_tag_columns_are_queue_columns() -> None:

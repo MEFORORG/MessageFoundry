@@ -144,6 +144,16 @@ from messagefoundry.store.privilege import (
     classify_audit_writes,
     postgres_excess,
 )
+from messagefoundry.store.queue_tag import (
+    QUEUE_TAG_COLUMNS,
+    QUEUE_TAG_SELECT,
+    QueueTagError,
+    alert_queue_tag_failure,
+    open_queue_cell,
+    queue_payload_aad,
+    queue_row_aad,
+    report_queue_tag_failure,
+)
 from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
@@ -1346,7 +1356,8 @@ class PostgresStore:
     # passes — see _encrypt_existing_rows / reencrypt_to_active (mirrors MessageStore._CIPHER_COLUMNS).
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
-        ("queue", "payload"),
+        # NB: `queue.payload` binds the row's routing fields, not its id alone (BACKLOG #2593), so it
+        # has its own pass in _encrypt_existing_rows / reencrypt_to_active.
         ("messages", "error"),
         ("queue", "last_error"),
         ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
@@ -2622,6 +2633,15 @@ class PostgresStore:
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             total += await self._seal_surface(table, column, like, aad_cols=("id",))
+        # The `queue.payload` cell binds the row's routing fields (BACKLOG #2593).
+        total += await self._seal_surface(
+            "queue",
+            "payload",
+            like,
+            aad_cols=QUEUE_TAG_COLUMNS,
+            key_cols=("id",),
+            aad_of=queue_row_aad,
+        )
         total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
         total += await self._seal_surface(
             "reference", "value", like, aad_cols=("name", "version", "key")
@@ -2680,6 +2700,7 @@ class PostgresStore:
         *,
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
+        aad_of: Callable[[Any], bytes] | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -2687,7 +2708,8 @@ class PostgresStore:
         The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
         surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
         11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. Identifiers are code
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD
+        from the row instead (the queue payload's routing tag, BACKLOG #2593). Identifiers are code
         constants; only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
@@ -2736,7 +2758,12 @@ class PostgresStore:
                     await conn.execute(
                         f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
                         self._cipher.encrypt(
-                            r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                            r["v"],
+                            aad=(
+                                aad_of(r)
+                                if aad_of is not None
+                                else cell_aad(table, column, *(r[c] for c in aad_cols))
+                            ),
                         ),
                         *(r[c] for c in keys),
                     )
@@ -2746,6 +2773,33 @@ class PostgresStore:
         return sealed
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
+
+    async def _reencrypt_queue_payload_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
+        (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
+        selected so the decrypt and the encrypt share one tag. A cell whose tag no longer matches
+        its row raises before any UPDATE, so the rotation stops rather than re-seal it."""
+        total = 0
+        while True:
+            rows = await self._fetchall(
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                " WHERE payload NOT LIKE $1 AND payload <> '' LIMIT $2",
+                active_like,
+                batch,
+            )
+            if not rows:
+                return total
+            updates = [
+                (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
+                for r in rows
+            ]
+            async with self._timed_acquire() as conn, conn.transaction():
+                for new_value, rid in updates:
+                    await conn.execute("UPDATE queue SET payload=$1 WHERE id=$2", new_value, rid)
+            await self._charge_bound_batch()
+            total += len(rows)
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation
@@ -2808,6 +2862,8 @@ class PostgresStore:
                         )
                 await self._charge_bound_batch()
                 total += len(rows)
+        # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
+        total += await self._reencrypt_queue_payload_to_active(cipher, active_like, batch)
         total += await self._reencrypt_composite(
             cipher, "state", ("namespace", "key"), active_like, batch
         )
@@ -3125,7 +3181,18 @@ class PostgresStore:
             Stage.OUTBOUND.value,
             channel_id,
             dest_name,
-            self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+            self._cipher.encrypt(
+                payload,
+                aad=queue_payload_aad(
+                    row_id=row_id,
+                    message_id=mid,
+                    stage=Stage.OUTBOUND.value,
+                    channel_id=channel_id,
+                    destination_name=dest_name,
+                    handler_name=None,
+                    body_ref=None,
+                ),
+            ),
             OutboxStatus.PENDING.value,
             now,
             created_at,
@@ -3151,7 +3218,18 @@ class PostgresStore:
             Stage.ROUTED.value,
             channel_id,
             handler_name,
-            self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+            self._cipher.encrypt(
+                payload,
+                aad=queue_payload_aad(
+                    row_id=row_id,
+                    message_id=mid,
+                    stage=Stage.ROUTED.value,
+                    channel_id=channel_id,
+                    destination_name=None,
+                    handler_name=handler_name,
+                    body_ref=None,
+                ),
+            ),
             OutboxStatus.PENDING.value,
             now,
             created_at,
@@ -3249,7 +3327,18 @@ class PostgresStore:
                 new_mid,
                 Stage.INGRESS.value,
                 pt_channel,
-                self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
+                self._cipher.encrypt(
+                    body,
+                    aad=queue_payload_aad(
+                        row_id=pt_ingress_id,
+                        message_id=new_mid,
+                        stage=Stage.INGRESS.value,
+                        channel_id=pt_channel,
+                        destination_name=None,
+                        handler_name=None,
+                        body_ref=None,
+                    ),
+                ),
                 OutboxStatus.PENDING.value,
                 now,
                 ingress_created,
@@ -3299,7 +3388,18 @@ class PostgresStore:
             pt_name,
             pt_name,
             PASSTHROUGH_MARKER_HANDLER,  # the stamp replay keys on (BACKLOG #1580)
-            self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
+            self._cipher.encrypt(
+                "",
+                aad=queue_payload_aad(
+                    row_id=marker_id,
+                    message_id=parent_id,
+                    stage=Stage.OUTBOUND.value,
+                    channel_id=pt_name,
+                    destination_name=pt_name,
+                    handler_name=PASSTHROUGH_MARKER_HANDLER,
+                    body_ref=None,
+                ),
+            ),
             status,
             now,
             created_at,
@@ -3465,7 +3565,18 @@ class PostgresStore:
                 mid,
                 Stage.INGRESS.value,
                 channel_id,
-                self._cipher.encrypt(raw, aad=cell_aad("queue", "payload", ingress_row_id)),
+                self._cipher.encrypt(
+                    raw,
+                    aad=queue_payload_aad(
+                        row_id=ingress_row_id,
+                        message_id=mid,
+                        stage=Stage.INGRESS.value,
+                        channel_id=channel_id,
+                        destination_name=None,
+                        handler_name=None,
+                        body_ref=None,
+                    ),
+                ),
                 OutboxStatus.PENDING.value,
                 now,
                 ingress_created_at,
@@ -3842,8 +3953,7 @@ class PostgresStore:
             try:
                 items.append(self._outbox_item(row))
             except CipherError as exc:
-                log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-                await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+                await self._dead_letter_unopenable(row, exc)
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -4387,9 +4497,37 @@ class PostgresStore:
         except CipherError as exc:
             # An undecryptable head must not stall the lane — dead-letter it and let the next poll
             # advance, rather than raising into the worker (mirrors SQLite).
-            log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+            await self._dead_letter_unopenable(row, exc)
             return None
+
+    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> None:
+        """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
+        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way."""
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        if isinstance(exc, QueueTagError):
+            await report_queue_tag_failure(self, self._cipher, row)
+
+    async def _open_queue_body(self, conn: Any, row: Any) -> str:
+        """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
+        twin is :meth:`MessageStore._open_queue_body`. This backend writes no store-once rows, but a
+        row whose sealed body kind is ``ref`` is still dereferenced, so the sealed kind and never the
+        plaintext ``body_ref`` column decides which body is read. A tag failure raises the alert
+        and propagates, refusing the read. ``conn`` is the caller's connection, or ``None`` for
+        the pool."""
+        try:
+            opened = open_queue_cell(self._cipher, row)
+        except QueueTagError:
+            alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+            raise
+        if row["body_ref"] is None:
+            return opened
+        sql = "SELECT body FROM shared_body WHERE hash=$1"
+        source = conn if conn is not None else self._pool
+        br = await source.fetchrow(sql, opened)
+        if br is None:
+            raise CipherError(f"shared body {opened} missing")
+        return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
     def _outbox_item(self, row: Any) -> OutboxItem:
         """Build an :class:`OutboxItem` from a claimed ``queue`` record, decrypting the payload (may
@@ -4399,16 +4537,22 @@ class PostgresStore:
             message_id=row["message_id"],
             channel_id=row["channel_id"],
             destination_name=row["destination_name"],
-            # Inline body bound to its own queue cell (ASVS 11.3.3); Postgres keeps bodies inline
-            # (body_ref always NULL this increment), so there is no shared_body deref here.
-            payload=self._cipher.decrypt(
-                row["payload"], aad=cell_aad("queue", "payload", row["id"])
-            ),
+            # Opened under the row's own routing tag (BACKLOG #2593). This backend writes no
+            # store-once rows, so a claimed row that names a shared body is refused.
+            payload=self._open_inline_payload(row),
             attempts=row["attempts"],
             stage=row["stage"],
             handler_name=row["handler_name"],
             created_at=row["created_at"],  # claim RETURNING q.* includes it (ingest-time, ADR 0009)
         )
+
+    def _open_inline_payload(self, row: Any) -> str:
+        """An inline claimed row's body, opened under its tag; a row whose sealed kind is ``ref``
+        raises :class:`QueueTagError`, since no claim on this backend dereferences one (#2593)."""
+        opened = open_queue_cell(self._cipher, row)
+        if row["body_ref"] is not None:
+            raise QueueTagError("integrity: a store-once row is not delivered on this backend")
+        return opened
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
         """Force one row terminal (``DEAD``) immediately — fail-fast, no retry consumed. Serializes
@@ -4638,7 +4782,18 @@ class PostgresStore:
                             message_id,
                             Stage.RESPONSE.value,
                             reingress_to,
-                            self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
+                            self._enc(
+                                artifact_ref,
+                                aad=queue_payload_aad(
+                                    row_id=work_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.RESPONSE.value,
+                                    channel_id=reingress_to,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            ),
                             OutboxStatus.PENDING.value,
                             now,
                             work_created,
@@ -4696,7 +4851,8 @@ class PostgresStore:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
                     wr = await conn.fetchrow(
-                        "SELECT message_id, payload FROM queue WHERE id=$1 AND stage=$2 AND status=$3",
+                        f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                        " WHERE id=$1 AND stage=$2 AND status=$3",
                         response_row_id,
                         Stage.RESPONSE.value,
                         OutboxStatus.INFLIGHT.value,
@@ -4705,13 +4861,7 @@ class PostgresStore:
                         raise _Noop()  # already consumed by a committed prior run
                     origin_id = wr["message_id"]
                     try:
-                        ref = (
-                            self._dec(
-                                wr["payload"],
-                                aad=cell_aad("queue", "payload", response_row_id),
-                            )
-                            or ""
-                        )
+                        ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
                         origin_msg_id, dest, seq_s = ref.split("\x1f")
                         seq = int(seq_s)
                     except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
@@ -4851,7 +5001,16 @@ class PostgresStore:
                                 Stage.INGRESS.value,
                                 loopback_channel_id,
                                 self._cipher.encrypt(
-                                    body, aad=cell_aad("queue", "payload", reingress_row_id)
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=reingress_row_id,
+                                        message_id=new_mid,
+                                        stage=Stage.INGRESS.value,
+                                        channel_id=loopback_channel_id,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
                                 ),
                                 OutboxStatus.PENDING.value,
                                 now,
@@ -4897,13 +5056,13 @@ class PostgresStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013) — the Postgres
         twin of :meth:`MessageStore.response_body_for_work_row`."""
         row = await self._pool.fetchrow(
-            "SELECT payload FROM queue WHERE id=$1 AND stage=$2",
+            f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=$1 AND stage=$2",
             response_row_id,
             Stage.RESPONSE.value,
         )
         if row is None:
             return None
-        ref = self._dec(row["payload"], aad=cell_aad("queue", "payload", response_row_id)) or ""
+        ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
         except ValueError:
@@ -6573,10 +6732,8 @@ class PostgresStore:
                         src_where += " AND destination_name=$3"
                         src_args.append(from_)
                     src_rows = await conn.fetch(
-                        "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
-                        " COALESCE(sb.body, q.payload) AS _body_ciphertext"
-                        " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
-                        f" WHERE {src_where} ORDER BY q.destination_name",
+                        f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                        f" WHERE {src_where} ORDER BY destination_name",
                         *src_args,
                     )
                     if not src_rows:
@@ -6593,13 +6750,10 @@ class PostgresStore:
                     src = src_rows[0]
                     src_channel = str(src["channel_id"])
                     src_dest = str(src["destination_name"])
-                    # The body's cell depends on its source (store-once shared body vs inline payload).
-                    body_aad = (
-                        cell_aad("shared_body", "body", src["body_ref"])
-                        if src["body_ref"] is not None
-                        else cell_aad("queue", "payload", src["id"])
-                    )
-                    decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
+                    # A '' payload is what retention leaves. Otherwise the body is opened under the
+                    # source row's own tag (BACKLOG #2593); its sealed body kind decides whether a
+                    # shared body is read, never the plaintext body_ref column alone.
+                    decoded = "" if src["payload"] == "" else await self._open_queue_body(conn, src)
                     if not decoded:
                         raise ResendSourceEmpty(
                             f"message {message_id} source body was purged by retention -- cannot resend"
@@ -6748,7 +6902,16 @@ class PostgresStore:
                         Stage.INGRESS.value,
                         channel_id,
                         self._cipher.encrypt(
-                            raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                            raw,
+                            aad=queue_payload_aad(
+                                row_id=resubmit_row_id,
+                                message_id=new_mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=channel_id,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
                         ),
                         OutboxStatus.PENDING.value,
                         now,
@@ -7186,9 +7349,14 @@ class PostgresStore:
             message_id,
             Stage.OUTBOUND.value,
         )
-        # Postgres keeps bodies inline (body_ref always NULL this increment), so payload is decoded as
-        # queue.payload directly — no shared_body deref (mirrors _outbox_item). Both cols key on queue.id.
-        return [self._decode_record(r, "queue", (r["id"],), "last_error", "payload") for r in rows]
+        # Each body is opened under its row's own tag (BACKLOG #2593), as SQLite does; a purged
+        # row ('') reads as an empty body.
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = self._decode_record(r, "queue", (r["id"],), "last_error")
+            d["payload"] = "" if r["payload"] == "" else await self._open_queue_body(None, r)
+            out.append(d)
+        return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
         rows = await self._fetchall(
