@@ -1533,7 +1533,19 @@ def test_a_delta_crl_drops_a_revocation_without_the_refusal(
     # depends on OpenSSL's delta rule; pki.judge_every_crl's docstring states both rules.
     # Python 3.14.7 for Windows bundles OpenSSL 3.5.7, and 3.14.8 bundles 3.5.9. This test used to
     # assert the old rule alone, so it went red on every runner that drew 3.14.8.
+    from cryptography import x509
+
     bundle = _crl_material["ca_base_then_delta"]
+    # The old rule reads the delta as complete only when it is NEWER than its base. Below the fixed
+    # versions nothing else pins that, so a fixture edit making the delta no newer would pass there
+    # unnoticed. Not a version-gated assert of the old rule: a distribution may backport the fix.
+    marker = b"-----BEGIN X509 CRL-----"
+    base, delta = (
+        x509.load_pem_x509_crl(marker + part)
+        for part in Path(bundle).read_bytes().split(marker)[1:]
+    )
+    assert delta.extensions.get_extension_for_class(x509.DeltaCRLIndicator)
+    assert delta.last_update_utc > base.last_update_utc
     # Both CRLs must load. A delta OpenSSL skipped at load would show the new rule's outcome on
     # any OpenSSL, and the count tells that apart from a delta that loaded and was set aside.
     loaded = _verifying_ctx()
