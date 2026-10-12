@@ -80,11 +80,13 @@ async def _outbound(store: Any, fetch: RawFetch, lane: str, body: str) -> tuple[
 
 
 async def assert_queue_tag_contract(
-    store: Any, raw: RawSql, fetch: RawFetch, *, store_once: bool
+    store: Any, raw: RawSql, fetch: RawFetch, *, store_once: bool, claim_reads_body_ref: bool = True
 ) -> None:
     """Drive the queue tag through its whole contract on ``store``'s backend.
 
-    ``store_once`` is True on a backend that writes shared-body fan-out rows (SQLite today)."""
+    ``store_once`` is True on a backend that writes shared-body fan-out rows (SQLite today).
+    ``claim_reads_body_ref`` is False on a backend whose claim output carries no ``body_ref`` (SQL
+    Server): its claims build the inline tag and deliver only the row's own body."""
     cipher = store.cipher()
     assert cipher.encrypts, "the contract needs a store opened with a store key"
     hook = _Hook()
@@ -101,10 +103,25 @@ async def assert_queue_tag_contract(
     await raw("UPDATE queue SET destination_name=? WHERE id=?", ("OB_QT_D", rid))
     assert await store.claim_next_fifo("OB_QT_D") is None
     await _assert_refused(store, fetch, hook, message_id=mid, row_id=rid, label="destination")
+    # The body view leaves the refused, dead row out rather than failing the whole read.
+    assert all(v["id"] != rid for v in await store.outbox_payloads_for(mid))
     # The lane keeps moving: the next row on it delivers.
     _, nxt = await _outbound(store, fetch, "OB_QT_D", "SYNTH-BODY-D")
     item = await store.claim_next_fifo("OB_QT_D")
     assert item is not None and item.id == nxt and item.payload == "SYNTH-BODY-D"
+
+    # --- the body view refuses a live row whose tag fails, and alerts --------------------------
+    mid, rid = await _outbound(store, fetch, "OB_QT_V", "SYNTH-BODY-V")
+    views = await store.outbox_payloads_for(mid)
+    assert [v["payload"] for v in views] == ["SYNTH-BODY-V"]  # control
+    await raw("UPDATE queue SET destination_name=? WHERE id=?", ("OB_QT_W", rid))
+    try:
+        await store.outbox_payloads_for(mid)
+    except Exception as exc:  # noqa: BLE001 -- the refusal type is the cipher's, asserted below
+        assert "integrity" in str(exc), exc
+    else:
+        raise AssertionError("a body view of a row whose tag fails was not refused")
+    assert any(rid[:12] in reason for reason in hook.reasons)
 
     # --- a message_id moved onto another message is refused ------------------------------------
     other, _ = await _outbound(store, fetch, "OB_QT_E0", "SYNTH-BODY-E0")
@@ -188,11 +205,17 @@ async def assert_queue_tag_contract(
         status, _ = await _status(fetch, new_id)
         assert status == OutboxStatus.DEAD.value, new_id
 
-    # --- a body_ref set on an inline row is refused, at a claim and at a resend source ---------
+    # --- a body_ref set on an inline row never reaches another body ---------------------------
     mid, rid = await _outbound(store, fetch, "OB_QT_M", "SYNTH-BODY-M")
     await raw("UPDATE queue SET body_ref=? WHERE id=?", ("1" * 64, rid))
-    assert await store.claim_next_fifo("OB_QT_M") is None
-    await _assert_refused(store, fetch, hook, message_id=mid, row_id=rid, label="body_ref")
+    if claim_reads_body_ref:
+        assert await store.claim_next_fifo("OB_QT_M") is None
+        await _assert_refused(store, fetch, hook, message_id=mid, row_id=rid, label="body_ref")
+    else:
+        # This backend's claims never read body_ref, so the row delivers its own sealed body to
+        # its own destination, and nothing else. The resend source below still refuses it.
+        item = await store.claim_next_fifo("OB_QT_M")
+        assert item is not None and item.id == rid and item.payload == "SYNTH-BODY-M"
 
     mid, rid = await _outbound(store, fetch, "OB_QT_N", "SYNTH-BODY-N")
     item = await store.claim_next_fifo("OB_QT_N")

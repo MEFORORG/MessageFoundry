@@ -5086,7 +5086,7 @@ class SqlServerStore:
                     ),
                 )
                 for dest_name, payload in deliveries:
-                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    # Hoist the row id so the payload binds to its own row tag.
                     row_id = uuid4().hex
                     await cur.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -5130,7 +5130,7 @@ class SqlServerStore:
         self, cur: Any, message_id: str, channel_id: str, dest_name: str, payload: str, now: float
     ) -> None:
         """Insert one ``stage='outbound'`` queue row (lane = destination_name)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         await cur.execute(
             _SQL_INSERT_QUEUE_OUTBOUND,
             _insert_outbound_params(
@@ -5161,7 +5161,7 @@ class SqlServerStore:
         self, cur: Any, message_id: str, channel_id: str, dest_name: str, payload: str, now: float
     ) -> None:
         """Synchronous twin of :meth:`_insert_outbound` (ADR 0071 B5)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         cur.execute(
             _SQL_INSERT_QUEUE_OUTBOUND,
             _insert_outbound_params(
@@ -5196,7 +5196,7 @@ class SqlServerStore:
         now: float,
     ) -> None:
         """Insert one ``stage='routed'`` queue row (lane = channel_id)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         await cur.execute(
             _SQL_INSERT_QUEUE_ROUTED,
             _insert_routed_params(
@@ -5231,7 +5231,7 @@ class SqlServerStore:
         now: float,
     ) -> None:
         """Synchronous twin of :meth:`_insert_routed` (ADR 0071 B5)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         cur.execute(
             _SQL_INSERT_QUEUE_ROUTED,
             _insert_routed_params(
@@ -5312,7 +5312,7 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
-            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
+            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             await cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
                 _insert_queue_ingress_params(
@@ -5398,7 +5398,7 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
-            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
+            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
                 _insert_queue_ingress_params(
@@ -5440,7 +5440,7 @@ class SqlServerStore:
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
         payload is the empty-body sentinel; ``next_attempt_at`` is ``now`` (terminal, never due)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
-        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own queue cell
+        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own row tag
         await cur.execute(
             _SQL_INSERT_QUEUE_PT_MARKER,
             _insert_marker_params(
@@ -5473,7 +5473,7 @@ class SqlServerStore:
     ) -> None:
         """Synchronous twin of :meth:`_insert_passthrough_marker_mssql` (ADR 0071 B5)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
-        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own queue cell
+        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own row tag
         cur.execute(
             _SQL_INSERT_QUEUE_PT_MARKER,
             _insert_marker_params(
@@ -5562,7 +5562,7 @@ class SqlServerStore:
                     )
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
                     created_at = now
-                    # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+                    # Hoist the row id so the ingress payload binds to its own row tag.
                     ingress_row_id = uuid4().hex
                     await cur.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -5767,9 +5767,7 @@ class SqlServerStore:
                     await conn.rollback()
                     return False  # already handed off (crash-restart) — idempotent no-op
                 for handler_name, payload in handlers:
-                    routed_row_id = (
-                        uuid4().hex
-                    )  # hoisted so the payload binds to its own queue cell
+                    routed_row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
                     acc.add(
                         _SQL_INSERT_QUEUE_ROUTED,
                         _insert_routed_params(
@@ -6054,9 +6052,7 @@ class SqlServerStore:
                     )
                     applied.append(((namespace, key), value))
                 for dest_name, payload in deliveries:
-                    outbound_row_id = (
-                        uuid4().hex
-                    )  # hoisted so the payload binds to its own queue cell
+                    outbound_row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
                     acc.add(
                         _SQL_INSERT_QUEUE_OUTBOUND,
                         _insert_outbound_params(
@@ -6319,7 +6315,7 @@ class SqlServerStore:
                     artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
                     work_created = now
-                    # Hoist the row id so the artifact-ref payload binds to its own queue cell.
+                    # Hoist the row id so the artifact-ref payload binds to its own row tag.
                     work_row_id = uuid4().hex
                     await cur.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -7191,7 +7187,7 @@ class SqlServerStore:
                     if not peek_failed:
                         # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
                         ingress_created = now
-                        # Hoist the row id so the payload binds to its own queue cell.
+                        # Hoist the row id so the payload binds to its own row tag.
                         reingress_row_id = uuid4().hex
                         await cur.execute(
                             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -7841,30 +7837,48 @@ class SqlServerStore:
     async def _reencrypt_queue_payload_to_active(self, active_like: str, batch: int) -> int:
         """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
         (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
-        selected so the decrypt and the encrypt share one tag. A cell whose tag no longer matches
-        its row raises before any write, so the rotation stops rather than re-seal it."""
-        total = 0
+        selected so the decrypt and the encrypt share one tag. A cell whose tag no longer matches its row raises, so the rotation stops rather than re-seal
+        it. The one exception is a DEAD row: the claim already refused and reported it, it is
+        never delivered, and retention blanks it, so it is left as it is and counted in a WARNING
+        instead of blocking every rotation until then. Pages by ``id``, since a skipped row still
+        matches the marker filter."""
+        total = skipped = 0
+        after = ""
         while True:
             rows = await self._fetchall(
-                f"SELECT TOP (?) {QUEUE_TAG_SELECT}, payload FROM queue"
-                " WHERE payload NOT LIKE ? AND payload <> ''",
-                (batch, active_like),
+                f"SELECT TOP (?) {QUEUE_TAG_SELECT}, status, payload FROM queue"
+                " WHERE payload NOT LIKE ? AND payload <> '' AND id > ? ORDER BY id",
+                (batch, active_like, after),
             )
             if not rows:
-                return total
-            updates = [
-                (self._reencrypt_value(r["payload"], queue_row_aad(r)), r["id"]) for r in rows
-            ]
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+                break
+            after = rows[-1]["id"]
+            updates: list[tuple[str, str]] = []
+            for r in rows:
                 try:
-                    for enc, rid in updates:
-                        await cur.execute("UPDATE queue SET payload=? WHERE id=?", (enc, rid))
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            total += len(rows)
+                    updates.append((self._reencrypt_value(r["payload"], queue_row_aad(r)), r["id"]))
+                except CipherError:
+                    if r["status"] != OutboxStatus.DEAD.value:
+                        raise
+                    skipped += 1
+            if updates:
+                async with self._acquire() as conn, self._cursor(conn) as cur:
+                    try:
+                        for enc, rid in updates:
+                            await cur.execute("UPDATE queue SET payload=? WHERE id=?", (enc, rid))
+                        await self._commit(conn)
+                    except Exception:
+                        await conn.rollback()
+                        raise
+                await self._charge_bound_batch()
+                total += len(updates)
+        if skipped:
+            log.warning(
+                "rotation left %d dead queue row(s) whose payload does not open under its own"
+                " tag; they are never delivered and retention blanks them (BACKLOG #2593)",
+                skipped,
+            )
+        return total
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any key) then re-encrypt under the active key, rebinding the SAME cell AAD
@@ -8421,8 +8435,12 @@ class SqlServerStore:
         """A claimed row's body, opened under its routing tag (BACKLOG #2593).
 
         A claim's OUTPUT carries no ``stage`` and no ``body_ref``. Each claim's WHERE fixes the
-        stage, so the tag takes it from the claim. No claim on this backend dereferences a shared
-        body, so the tag is the inline kind and a row sealed any other way fails it."""
+        stage, so the tag takes it from the claim. No claim on this backend reads ``body_ref`` or
+        dereferences a shared body, so the tag is the inline kind: a row sealed any other way fails
+        it, and a ``body_ref`` set outside the store reaches no other body here. The resend source
+        and the body view do read ``body_ref``, and they refuse such a row. Adding the two columns
+        to the OUTPUT would change the versioned claim procedures (ADR 0114), so it is not done
+        here."""
         return open_queue_cell(self._cipher, {**d, "stage": stage, "body_ref": None})
 
     async def _dead_letter_unopenable(
@@ -8435,16 +8453,18 @@ class SqlServerStore:
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, {**d, "stage": stage})
 
-    async def _open_queue_body(self, cur: Any, row: dict[str, Any]) -> str:
+    async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
         twin is :meth:`MessageStore._open_queue_body`. This backend writes no store-once rows, but a
-        row whose sealed body kind is ``ref`` is still dereferenced, so the sealed kind and never the
-        plaintext ``body_ref`` column decides which body is read. A tag failure raises the alert
-        and propagates, refusing the read. ``cur`` is the caller's cursor."""
+        row whose ``body_ref`` is set is still dereferenced. The column picks the body kind and the
+        tag binds that kind, so a column changed outside the store fails the tag rather than
+        choosing another body. A tag failure raises the alert when ``alert`` is set, and
+        propagates, refusing the read. ``cur`` is the caller's cursor."""
         try:
             opened = open_queue_cell(self._cipher, row)
         except QueueTagError:
-            alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+            if alert:
+                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
             raise
         if row["body_ref"] is None:
             return opened
@@ -10512,8 +10532,8 @@ class SqlServerStore:
                         src = rows[0]
                         src_dest, src_channel = src["destination_name"], src["channel_id"]
                         # A '' payload is what retention leaves. Otherwise the body is opened under
-                        # the source row's own tag (BACKLOG #2593); its sealed body kind decides
-                        # whether a shared body is read, never the plaintext body_ref column alone.
+                        # the source row's own tag (BACKLOG #2593); the body_ref column picks the kind
+                        # and the tag binds it, so a changed column fails the tag.
                         decoded = (
                             "" if src["payload"] == "" else await self._open_queue_body(cur, src)
                         )
@@ -10684,7 +10704,7 @@ class SqlServerStore:
                                 actor,
                             ),
                         )
-                        # Hoist the row id so the payload binds to its own queue cell.
+                        # Hoist the row id so the payload binds to its own row tag.
                         resubmit_row_id = uuid4().hex
                         await cur.execute(
                             _SQL_INSERT_QUEUE_INGRESS,
@@ -11109,20 +11129,25 @@ class SqlServerStore:
             "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
             (message_id, Stage.OUTBOUND.value),
         )
-        for r in rows:
-            # Opened under the row's own tag (BACKLOG #2593), as SQLite does; a purged row ('')
-            # reads as an empty body. A ref-kind row's shared body is read on a fresh cursor.
-            if r["payload"] == "":
-                r["payload"] = ""
-            elif r["body_ref"] is None:
-                r["payload"] = await self._open_queue_body(None, r)
-            else:
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    r["payload"] = await self._open_queue_body(cur, r)
-            r["last_error"] = self._dec(
-                r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
-            )  # H4: null/legacy-plaintext-safe decrypt
-        return rows
+        # Each body is opened under its row's own tag (BACKLOG #2593), as SQLite does: a purged
+        # row ('') reads as an empty body, a live row whose tag fails refuses the read and alerts,
+        # and a dead row whose tag fails is left out, since its claim already reported it.
+        out: list[dict[str, Any]] = []
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            for r in rows:
+                dead = r["status"] == OutboxStatus.DEAD.value
+                try:
+                    if r["payload"] != "":
+                        r["payload"] = await self._open_queue_body(cur, r, alert=not dead)
+                except QueueTagError:
+                    if not dead:
+                        raise
+                    continue
+                r["last_error"] = self._dec(
+                    r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
+                )  # H4: null/legacy-plaintext-safe decrypt
+                out.append(r)
+        return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
         rows = await self._fetchall(

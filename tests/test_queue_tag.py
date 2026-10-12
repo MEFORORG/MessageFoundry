@@ -211,3 +211,48 @@ async def test_queue_tag_contract_sqlite(tmp_path: pathlib.Path) -> None:
     finally:
         side.close()
         await store.close()
+
+
+async def test_rotation_reseals_the_tag_and_steps_over_a_refused_dead_row(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``rotate-key``'s queue pass re-seals each payload under its own tag. A DEAD row that the
+    claim refused for its tag is left as it is and counted, so it cannot block every rotation. A
+    live row whose tag fails still stops the rotation (control)."""
+    db = tmp_path / "rotate.db"
+    old_key, new_key = generate_key(), generate_key()
+    store = await MessageStore.open(db, cipher=make_cipher(old_key, write_v2=True))
+    side = sqlite3.connect(db, timeout=30)
+    try:
+        await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[("OB_KEEP", "B1")])
+        await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[("OB_BENT", "B2")])
+        side.execute("UPDATE queue SET destination_name='OB_ELSE' WHERE destination_name='OB_BENT'")
+        side.commit()
+        assert await store.claim_next_fifo("OB_ELSE") is None  # refused and dead-lettered
+    finally:
+        await store.close()
+
+    rotated = await MessageStore.open(
+        db, cipher=make_cipher(new_key, retired_b64=[old_key], write_v2=True)
+    )
+    try:
+        with caplog.at_level("WARNING"):
+            assert await rotated.reencrypt_to_active() >= 1
+        assert "rotation left 1 dead queue row" in caplog.text
+        item = await rotated.claim_next_fifo("OB_KEEP")
+        assert item is not None and item.payload == "B1"  # re-sealed under the new key and tag
+        await rotated.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[("OB_LIVE", "B3")])
+        side.execute("UPDATE queue SET destination_name='OB_X' WHERE destination_name='OB_LIVE'")
+        side.commit()
+    finally:
+        await rotated.close()
+
+    again = await MessageStore.open(
+        db, cipher=make_cipher(generate_key(), retired_b64=[new_key, old_key], write_v2=True)
+    )
+    try:
+        with pytest.raises(CipherError):  # a live row whose tag fails stops the rotation
+            await again.reencrypt_to_active()
+    finally:
+        side.close()
+        await again.close()

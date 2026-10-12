@@ -2779,27 +2779,49 @@ class PostgresStore:
     ) -> int:
         """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
         (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
-        selected so the decrypt and the encrypt share one tag. A cell whose tag no longer matches
-        its row raises before any UPDATE, so the rotation stops rather than re-seal it."""
-        total = 0
+        selected so the decrypt and the encrypt share one tag. A cell whose tag no longer matches its row raises, so the rotation stops rather than re-seal
+        it. The one exception is a DEAD row: the claim already refused and reported it, it is
+        never delivered, and retention blanks it, so it is left as it is and counted in a WARNING
+        instead of blocking every rotation until then. Pages by ``id``, since a skipped row still
+        matches the marker filter."""
+        total = skipped = 0
+        after = ""
         while True:
             rows = await self._fetchall(
-                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
-                " WHERE payload NOT LIKE $1 AND payload <> '' LIMIT $2",
+                f"SELECT {QUEUE_TAG_SELECT}, status, payload FROM queue"
+                " WHERE payload NOT LIKE $1 AND payload <> '' AND id > $2 ORDER BY id LIMIT $3",
                 active_like,
+                after,
                 batch,
             )
             if not rows:
-                return total
-            updates = [
-                (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
-                for r in rows
-            ]
-            async with self._timed_acquire() as conn, conn.transaction():
-                for new_value, rid in updates:
-                    await conn.execute("UPDATE queue SET payload=$1 WHERE id=$2", new_value, rid)
-            await self._charge_bound_batch()
-            total += len(rows)
+                break
+            after = rows[-1]["id"]
+            updates: list[tuple[str, str]] = []
+            for r in rows:
+                try:
+                    updates.append(
+                        (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
+                    )
+                except CipherError:
+                    if r["status"] != OutboxStatus.DEAD.value:
+                        raise
+                    skipped += 1
+            if updates:
+                async with self._timed_acquire() as conn, conn.transaction():
+                    for new_value, rid in updates:
+                        await conn.execute(
+                            "UPDATE queue SET payload=$1 WHERE id=$2", new_value, rid
+                        )
+                await self._charge_bound_batch()
+                total += len(updates)
+        if skipped:
+            log.warning(
+                "rotation left %d dead queue row(s) whose payload does not open under its own"
+                " tag; they are never delivered and retention blanks them (BACKLOG #2593)",
+                skipped,
+            )
+        return total
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation
@@ -3206,7 +3228,7 @@ class PostgresStore:
         """Insert one ``stage='routed'`` queue row (one handler assignment awaiting transform)."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
         created_at = now
-        # Hoist the row id so the payload binds to its own (queue, payload, id) cell (ASVS 11.3.3).
+        # Hoist the row id so the payload binds to its own row tag (ASVS 11.3.3).
         row_id = uuid4().hex
         await conn.execute(
             "INSERT INTO queue"
@@ -3317,7 +3339,7 @@ class PostgresStore:
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
-            # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+            # Hoist the row id so the payload binds to its own row tag.
             pt_ingress_id = uuid4().hex
             await conn.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -3376,7 +3398,7 @@ class PostgresStore:
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
         created_at = now
-        # Hoist the row id so the (empty) marker payload binds to its own (queue, payload, id) cell.
+        # Hoist the row id so the (empty) marker payload binds to its own row tag.
         marker_id = uuid4().hex
         await conn.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
@@ -3554,7 +3576,7 @@ class PostgresStore:
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created_at = now
-            # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+            # Hoist the row id so the ingress payload binds to its own row tag.
             ingress_row_id = uuid4().hex
             await conn.execute(
                 "INSERT INTO queue"
@@ -4508,17 +4530,19 @@ class PostgresStore:
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
 
-    async def _open_queue_body(self, conn: Any, row: Any) -> str:
+    async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
         twin is :meth:`MessageStore._open_queue_body`. This backend writes no store-once rows, but a
-        row whose sealed body kind is ``ref`` is still dereferenced, so the sealed kind and never the
-        plaintext ``body_ref`` column decides which body is read. A tag failure raises the alert
-        and propagates, refusing the read. ``conn`` is the caller's connection, or ``None`` for
-        the pool."""
+        row whose ``body_ref`` is set is still dereferenced. The column picks the body kind and the
+        tag binds that kind, so a column changed outside the store fails the tag rather than
+        choosing another body. A tag failure raises the alert when ``alert`` is set, and
+        propagates, refusing the read. ``conn`` is the caller's connection, or ``None`` for the
+        pool."""
         try:
             opened = open_queue_cell(self._cipher, row)
         except QueueTagError:
-            alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+            if alert:
+                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
             raise
         if row["body_ref"] is None:
             return opened
@@ -4771,7 +4795,7 @@ class PostgresStore:
                         artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
                         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
                         work_created = now
-                        # Hoist the row id so the artifact-ref payload binds to its own (queue, payload, id) cell.
+                        # Hoist the row id so the artifact-ref payload binds to its own row tag.
                         work_row_id = uuid4().hex
                         await conn.execute(
                             "INSERT INTO queue"
@@ -4989,7 +5013,7 @@ class PostgresStore:
                         if not peek_failed:
                             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
                             ingress_created = now
-                            # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                            # Hoist the row id so the payload binds to its own row tag.
                             reingress_row_id = uuid4().hex
                             await conn.execute(
                                 "INSERT INTO queue (id, message_id, stage, channel_id,"
@@ -6751,8 +6775,8 @@ class PostgresStore:
                     src_channel = str(src["channel_id"])
                     src_dest = str(src["destination_name"])
                     # A '' payload is what retention leaves. Otherwise the body is opened under the
-                    # source row's own tag (BACKLOG #2593); its sealed body kind decides whether a
-                    # shared body is read, never the plaintext body_ref column alone.
+                    # source row's own tag (BACKLOG #2593); the body_ref column picks the kind
+                    # and the tag binds it, so a changed column fails the tag.
                     decoded = "" if src["payload"] == "" else await self._open_queue_body(conn, src)
                     if not decoded:
                         raise ResendSourceEmpty(
@@ -6890,7 +6914,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
-                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    # Hoist the row id so the payload binds to its own row tag.
                     resubmit_row_id = uuid4().hex
                     await conn.execute(
                         "INSERT INTO queue"
@@ -7349,12 +7373,23 @@ class PostgresStore:
             message_id,
             Stage.OUTBOUND.value,
         )
-        # Each body is opened under its row's own tag (BACKLOG #2593), as SQLite does; a purged
-        # row ('') reads as an empty body.
+        # Each body is opened under its row's own tag (BACKLOG #2593), as SQLite does: a purged
+        # row ('') reads as an empty body, a live row whose tag fails refuses the read and alerts,
+        # and a dead row whose tag fails is left out, since its claim already reported it.
         out: list[dict[str, Any]] = []
         for r in rows:
             d = self._decode_record(r, "queue", (r["id"],), "last_error")
-            d["payload"] = "" if r["payload"] == "" else await self._open_queue_body(None, r)
+            dead = r["status"] == OutboxStatus.DEAD.value
+            try:
+                d["payload"] = (
+                    ""
+                    if r["payload"] == ""
+                    else await self._open_queue_body(None, r, alert=not dead)
+                )
+            except QueueTagError:
+                if not dead:
+                    raise
+                continue
             out.append(d)
         return out
 

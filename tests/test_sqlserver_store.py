@@ -5478,7 +5478,9 @@ async def test_queue_tag_contract(store) -> None:
                 await conn.commit()
                 return rows
 
-        await assert_queue_tag_contract(keyed, raw, fetch, store_once=False)
+        await assert_queue_tag_contract(
+            keyed, raw, fetch, store_once=False, claim_reads_body_ref=False
+        )
     finally:
         await keyed.close()
 
