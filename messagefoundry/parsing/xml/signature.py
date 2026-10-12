@@ -101,7 +101,9 @@ _MIN_RSA_BITS = 2048
 #: above 128-bit security. Named positively, so a curve nobody considered is refused by construction.
 #: Twin of ``_APPROVED_EC_CURVES`` in ``transports/direct.py``; keep the two sets equal. It is copied,
 #: not imported, because ``parsing/`` is a pure leaf library and must not import ``transports/``.
-#: Only the curve sets are twins: Direct does not refuse DSA or an unlisted key type, and this does.
+#: The allowed key TYPES are twins too: both floors admit RSA, EC, Ed25519 and Ed448, and refuse
+#: DSA and every other type (BACKLOG #3384). A test in ``tests/test_direct_transport.py`` pins all
+#: three.
 _APPROVED_EC_CURVES = frozenset({"secp256r1", "secp384r1", "secp521r1"})
 
 #: Fixed, PHI-safe ``reason`` values. Each names a category, never key or document content.
