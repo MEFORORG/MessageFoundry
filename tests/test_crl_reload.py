@@ -37,7 +37,7 @@ from pathlib import Path
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.config import loaded_crls
@@ -177,9 +177,9 @@ class _Pki:
 
 def _ca_cert(
     name: x509.Name,
-    key: ec.EllipticCurvePrivateKey,
+    key: ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey,
     issuer: x509.Name,
-    signer: ec.EllipticCurvePrivateKey,
+    signer: ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey,
 ) -> x509.Certificate:
     return (
         x509.CertificateBuilder()

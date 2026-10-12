@@ -194,12 +194,10 @@ def first_unconfirmed_signature(
     with _LOCK:
         seen = _UNCONFIRMED.get(key)
         if seen is None or seen[0] != fingerprint:
-            _UNCONFIRMED[key] = (fingerprint, {finding})
-            return True
-        if finding in seen[1]:
-            return False
+            seen = _UNCONFIRMED[key] = (fingerprint, set())
+        first = finding not in seen[1]
         seen[1].add(finding)
-        return True
+        return first
 
 
 def record_crl_load(

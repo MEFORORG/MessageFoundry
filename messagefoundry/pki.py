@@ -16,7 +16,6 @@ Pure and side-effect-free (no engine state, I/O, or DB): it takes/returns bytes 
 from __future__ import annotations
 
 import datetime
-import functools
 import ipaddress
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -391,7 +390,7 @@ class CrlSignature:
 
     ``where`` names the block and its issuer, for a message. ``state`` is one of five. A CA "fits"
     when its subject equals the CRL's issuer name exactly and it fits the CRL's Authority Key
-    Identifier (:func:`_fits_akid`).
+    Identifier (:func:`_akid_fit`).
 
     * ``verified``: a CA that fits verifies the CRL.
     * ``bad``: **proven** badly signed. The CRL's key identifier equals a fitting CA's Subject Key
@@ -420,7 +419,14 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     (:func:`crl_signature_refusal`). A CA that does not parse, or whose names do not, is ignored:
     it cannot be shown to be an issuer, and a system trust store may hold one. ``pem`` must be
     bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
-    cas = [listed for der in ca_ders if (listed := _listed_ca(der)) is not None]
+    cas: list[tuple[x509.Name, x509.Certificate]] = []
+    for der in ca_ders:
+        try:
+            ca = x509.load_der_x509_certificate(der)
+            _ = ca.issuer  # read here: a bad name must not raise from the middle of a judgment
+            cas.append((ca.subject, ca))
+        except ValueError:
+            continue
     blocks = list(_crl_blocks(pem))
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
@@ -428,37 +434,28 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
         yield CrlSignature(where, _signature_state(crl, cas))
 
 
-@functools.lru_cache(maxsize=1024)
-def _listed_ca(der: bytes) -> tuple[x509.Name, x509.Certificate] | None:
-    """The CA certificate ``der`` with its subject, or ``None`` when it or its names do not parse.
-
-    Cached, because a start runs this over the hop's whole CA list, and a hop that builds a
-    context per connection (the Postgres store) runs it per connection. Measured 2026-10-12 on
-    Windows, CPython 3.14.6: 89 system roots took 2.2 ms per judgment uncached, nearly all of it
-    parsing certificates and names that never change. The names are read here so a certificate
-    whose names do not parse is dropped once, not raised from the middle of a judgment."""
-    try:
-        ca = x509.load_der_x509_certificate(der)
-        _ = ca.issuer
-        return ca.subject, ca
-    except ValueError:
-        return None
-
-
 def _signature_state(
     crl: x509.CertificateRevocationList, cas: list[tuple[x509.Name, x509.Certificate]]
 ) -> CrlSignatureState:
     """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
     issuer = crl.issuer
-    fits = [ca for subject, ca in cas if subject == issuer and _fits_akid(crl, ca)]
-    if not fits:
+    fitting = False
+    named = False  # the CRL names some fitting CA's key
+    unchecked = False
+    for subject, ca in cas:
+        if subject != issuer or (names_key := _akid_fit(crl, ca)) is None:
+            continue
+        fitting = True
+        named = named or names_key
+        answer = _verifies(crl, ca)
+        if answer:
+            return "verified"
+        unchecked = unchecked or answer is None
+    if not fitting:
         return "unlisted"
-    answers = [_verifies(crl, ca) for ca in fits]
-    if any(answer is True for answer in answers):
-        return "verified"
-    if any(answer is None for answer in answers):
+    if unchecked:
         return "uncheckable"
-    return "bad" if any(_names_key_of(crl, ca) for ca in fits) else "unproven"
+    return "bad" if named else "unproven"
 
 
 def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
@@ -482,62 +479,55 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
     unlisted: str | None = None
     for signature in judge_crl_signatures(pem, ca_ders):
-        if signature.state == "verified":
-            continue
         if signature.state == "unlisted":
             # Go on: a block that is known to be badly signed is the stronger finding.
             unlisted = unlisted or (
                 f"{signature.where} names no CA certificate this hop lists as its issuer"
             )
-            continue
-        return (
-            f"{signature.where} does not verify against the key of the CA certificate this hop "
-            "trusts for that issuer. Loaded, it would make every handshake it judges fail with "
-            "'CRL signature failure'",
-            True,
-        )
+        elif signature.state != "verified":
+            return (
+                f"{signature.where} does not verify against the key of the CA certificate this "
+                "hop trusts for that issuer. Loaded, it would make every handshake it judges fail "
+                "with 'CRL signature failure'",
+                True,
+            )
     return None if unlisted is None else (unlisted, False)
 
 
-def _fits_akid(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
-    """Whether ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's
-    ``X509_check_akid`` matches one: each part the AKID carries must match the CA."""
+def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
+    """How ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's ``X509_check_akid``
+    matches one: each part the AKID carries must match the CA. ``None`` when it does not fit.
+
+    When it fits, the answer is whether the CRL **names the CA's key**: the AKID carries a key
+    identifier, the CA carries a Subject Key Identifier, and the two are equal. A CRL with no key
+    identifier fits, and so does a CA with no Subject Key Identifier, but neither names the key."""
     try:
         akid = crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
     except x509.ExtensionNotFound:
-        return True
-    except x509.DuplicateExtension:
         return False
+    except x509.DuplicateExtension:
+        return None
+    names_key = False
     if akid.key_identifier is not None:
         try:
             ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
         except x509.ExtensionNotFound:
             ski = None
         except (x509.DuplicateExtension, ValueError):
-            return False
-        if ski is not None and ski != akid.key_identifier:
-            return False
+            return None
+        if ski is not None:
+            if ski != akid.key_identifier:
+                return None
+            names_key = True
     serial = akid.authority_cert_serial_number
     if serial is not None and serial != ca.serial_number:
-        return False
+        return None
     names = [
         name.value
         for name in akid.authority_cert_issuer or ()
         if isinstance(name, x509.DirectoryName)
     ]
-    return not names or ca.issuer in names
-
-
-def _names_key_of(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
-    """Whether ``crl`` names ``ca``'s key: its AKID carries a key identifier, and that equals the
-    CA's Subject Key Identifier. :func:`_fits_akid` is looser: it also passes a CRL with no key
-    identifier, and a CA with no Subject Key Identifier."""
-    try:
-        named = crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
-        ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
-    except (x509.ExtensionNotFound, x509.DuplicateExtension, ValueError):
-        return False
-    return named.key_identifier is not None and named.key_identifier == ski
+    return names_key if not names or ca.issuer in names else None
 
 
 def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:

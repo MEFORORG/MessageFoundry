@@ -36,15 +36,14 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
-from messagefoundry.config import loaded_crls
+from messagefoundry.config import loaded_crls, tls_policy
 from messagefoundry.config.tls_policy import (
     TrustAnchor,
     build_verifying_client_context,
     harden_crl_check,
 )
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
-from tests.test_crl_bundle_anchors import _ku
-from tests.test_crl_reload import _key_pem, _leaf
+from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
 
 _NOW = datetime.datetime.now(datetime.UTC)
@@ -52,27 +51,21 @@ _DAY = datetime.timedelta(days=1)
 _PEM = serialization.Encoding.PEM
 _NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-twin-ca")])
 _SETTING = "[tls].crl_file"
+#: An issuer no hop in this file lists.
+_OTHER_NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
 
 _CaKey = ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey
 
 
 def _ca(key: _CaKey, signer: _CaKey, *, name: x509.Name = _NAME) -> x509.Certificate:
     """A CA certificate for ``key`` named ``name``, issued under that same name by ``signer``."""
-    return (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(_NOW - _DAY)
-        .not_valid_after(_NOW + 365 * _DAY)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
-        .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
-        )
-        .add_extension(_ku(ca=True), critical=True)
-        .sign(signer, hashes.SHA256())
+    return _ca_cert(name, key, name, signer)
+
+
+def _hop(ca_file: Path, crl: Path) -> ssl.SSLContext:
+    """An outbound hop whose CA file is ``ca_file``, with ``crl`` loaded as every hop loads it."""
+    return build_verifying_client_context(
+        TrustAnchor(cafile=str(ca_file), load_system_roots=False, crl_file=str(crl))
     )
 
 
@@ -144,11 +137,7 @@ class _Twins:
 
     def hop(self, listed: str) -> ssl.SSLContext:
         """An outbound hop whose CA file is ``listed``, with the CRL loaded as every hop does."""
-        return build_verifying_client_context(
-            TrustAnchor(
-                cafile=str(self.ca_file(listed)), load_system_roots=False, crl_file=str(self.crl)
-            )
-        )
+        return _hop(self.ca_file(listed), self.crl)
 
     def server(self, *, sends_renewed: bool) -> ssl.SSLContext:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -162,6 +151,7 @@ def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     before it. Restored after the test."""
     monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary())
     monkeypatch.setattr(loaded_crls, "_UNCONFIRMED", {})
+    tls_policy._judged_crl_signatures.cache_clear()
 
 
 @pytest.fixture
@@ -209,6 +199,13 @@ def _raw_hop(ca_file: Path, crl: Path) -> ssl.SSLContext:
     return ctx
 
 
+_WARNING = "could not confirm at start"
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if _WARNING in r.getMessage()]
+
+
 # --- the refuse arm ------------------------------------------------------------------------------
 
 
@@ -243,14 +240,17 @@ def test_the_refusal_needs_no_named_ca_file(twins: _Twins) -> None:
     assert not ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-def test_a_badly_signed_block_refuses_wherever_it_sits_in_the_file(twins: _Twins) -> None:
-    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
-    unlisted = _crl(twins.stranger, names=twins.stranger, name=other)
-    forged = _crl(twins.stranger, names=twins.new_key)
-    twins.crl.write_bytes(unlisted + forged)
-
-    with pytest.raises(ValueError, match="CRL block 2 of 2"):
+def test_a_badly_signed_block_refuses_wherever_it_sits_and_logs_no_warning(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Block 1 is from an issuer the hop does not list, which alone would only warn.
+    twins.crl.write_bytes(
+        _crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME)
+        + _crl(twins.stranger, names=twins.new_key)
+    )
+    with caplog.at_level("WARNING"), pytest.raises(ValueError, match="CRL block 2 of 2"):
         twins.hop("new")
+    assert _warnings(caplog) == []
 
 
 def test_a_planted_certificate_is_still_reported_as_that(twins: _Twins) -> None:
@@ -354,19 +354,16 @@ def test_a_key_of_another_kind_than_the_signature_is_cannot_check_not_bad(tmp_pa
 
     (tmp_path / "ca.pem").write_bytes(ca.public_bytes(_PEM))
     (tmp_path / "crl.pem").write_bytes(pem)
-    hop = build_verifying_client_context(
-        TrustAnchor(
-            cafile=str(tmp_path / "ca.pem"),
-            load_system_roots=False,
-            crl_file=str(tmp_path / "crl.pem"),
-        )
-    )
+    hop = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
 @pytest.mark.parametrize("error", [ValueError, TypeError])
-def test_an_error_from_the_verification_is_cannot_check(
-    twins: _Twins, monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+def test_an_error_from_the_verification_is_cannot_check_and_warns(
+    twins: _Twins,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: type[Exception],
 ) -> None:
     # Manager decision for this row: ``ValueError`` is the warn arm too, with ``TypeError`` and
     # ``UnsupportedAlgorithm``.
@@ -378,7 +375,11 @@ def test_an_error_from_the_verification_is_cannot_check(
 
     judged = list(judge_crl_signatures(pem, _ders(twins.new_ca)))
     assert [signature.state for signature in judged] == ["uncheckable"]
-    assert twins.hop("new").verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    with caplog.at_level("WARNING"):
+        hops = [twins.hop("new"), twins.hop("new")]
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+    assert len(logged := _warnings(caplog)) == 1
+    assert "cannot check its signature" in logged[0]
 
 
 def test_a_ca_that_does_not_parse_is_ignored(twins: _Twins) -> None:
@@ -388,12 +389,6 @@ def test_a_ca_that_does_not_parse_is_ignored(twins: _Twins) -> None:
 
 
 # --- the warn arm: one line for the file, however many contexts load it -------------------------
-
-_WARNING = "could not confirm at start"
-
-
-def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [r.getMessage() for r in caplog.records if _WARNING in r.getMessage()]
 
 
 def _postgres_shaped(twins: _Twins, listed: str) -> ssl.SSLContext:
@@ -427,22 +422,6 @@ def test_a_signature_short_of_proof_warns_once_however_many_contexts_load_the_fi
     assert all(ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for ctx in (first, *kept))
 
 
-def test_a_signature_the_engine_cannot_check_warns_and_does_not_refuse(
-    twins: _Twins, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def refuse(key: object, crl: x509.CertificateRevocationList) -> None:
-        raise ValueError("not a pair this can check")
-
-    monkeypatch.setattr(pki_module, "_verify_with", refuse)
-    twins.write_crl("stranger", "new")
-    with caplog.at_level("WARNING"):
-        twins.hop("new")
-        twins.hop("new")
-
-    assert len(logged := _warnings(caplog)) == 1
-    assert "cannot check its signature" in logged[0]
-
-
 def test_a_file_whose_every_crl_verifies_logs_nothing(
     twins: _Twins, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -450,19 +429,6 @@ def test_a_file_whose_every_crl_verifies_logs_nothing(
     twins.write_crl("new", "new")
     with caplog.at_level("WARNING"):
         twins.hop("both")
-        twins.hop("new")
-    assert _warnings(caplog) == []
-
-
-def test_a_file_that_refuses_logs_no_warning(
-    twins: _Twins, caplog: pytest.LogCaptureFixture
-) -> None:
-    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
-    twins.crl.write_bytes(
-        _crl(twins.stranger, names=twins.stranger, name=other)
-        + _crl(twins.stranger, names=twins.new_key)
-    )
-    with caplog.at_level("WARNING"), pytest.raises(ValueError, match="CRL block 2 of 2"):
         twins.hop("new")
     assert _warnings(caplog) == []
 
@@ -484,9 +450,9 @@ def test_a_new_version_of_the_file_is_logged_again(
 def test_a_hop_whose_ca_list_reaches_another_finding_logs_its_own_line(
     twins: _Twins, caplog: pytest.LogCaptureFixture
 ) -> None:
-    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
     twins.crl.write_bytes(
-        _crl(twins.new_key, names=None) + _crl(twins.stranger, names=twins.stranger, name=other)
+        _crl(twins.new_key, names=None)
+        + _crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME)
     )
     with caplog.at_level("WARNING"):
         twins.hop("old")  # block 1 unproven, block 2 unlisted

@@ -76,7 +76,7 @@ MIRRORED_CONNECTION_SETTING = "connection_name"
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from messagefoundry.pki import CrlBlock, CrlFacts
+    from messagefoundry.pki import CrlBlock, CrlFacts, CrlSignature
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
@@ -585,18 +585,14 @@ def _check_crl_signatures(
     There is no setting that turns this off and none that widens it, as for the expired-CRL
     refusal in :func:`judge_crl_bytes`."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
-    from messagefoundry.pki import judge_crl_signatures
 
-    judged = []
-    for signature in judge_crl_signatures(pem, anchors):
-        if signature.state == "bad":
-            raise ValueError(
-                f"{label}: {signature.where} names the key of a CA certificate this hop trusts, "
-                "and that key does not verify the CRL's signature. Loaded, it would make every "
-                "handshake it judges fail with 'CRL signature failure'. Give this setting the CRL "
-                "that CA signed"
-            )
-        judged.append(signature)
+    judged = _judged_crl_signatures(pem, tuple(anchors))
+    if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
+        raise ValueError(
+            f"{label}: {bad.where} names the key of a CA certificate this hop trusts, and that "
+            "key does not verify the CRL's signature. Loaded, it would make every handshake it "
+            "judges fail with 'CRL signature failure'. Give this setting the CRL that CA signed"
+        )
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, crl_fingerprint(pem), finding):
@@ -618,6 +614,20 @@ def _check_crl_signatures(
         len(judged),
         shown,
     )
+
+
+@functools.lru_cache(maxsize=16)
+def _judged_crl_signatures(pem: bytes, anchors: tuple[bytes, ...]) -> tuple[CrlSignature, ...]:
+    """:func:`~messagefoundry.pki.judge_crl_signatures` for one file against one CA list, kept.
+
+    The verdict depends on those bytes alone, and :func:`harden_crl_check` runs once per TLS
+    context. The Postgres store builds a context per connection, so without this each connection
+    would parse the hop's whole CA list and verify every CRL again. Measured 2026-10-12 on
+    Windows, CPython 3.14.6: 2.2 ms for 89 system roots and one small CRL. A hit costs the hash
+    and comparison of the bytes. It keeps at most 16 files with their CA lists."""
+    from messagefoundry.pki import judge_crl_signatures
+
+    return tuple(judge_crl_signatures(pem, anchors))
 
 
 class _CrlStagingFailed(OSError, ValueError):
