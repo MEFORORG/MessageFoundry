@@ -267,16 +267,12 @@ def raw_body_without_summary(perms: Iterable[Permission]) -> bool:
     every body route (``/raw``, attachments, the console body page, export) rather than one route at
     a time; the routes keep their own gates as a second line. No built-in role has this shape.
 
-    **Judged per role, and it stays that way (decided 2026-10-12, vault BACKLOG #2727).** Both
-    callers pass one role's set: the validator a proposed role, the decoder one stored row. Neither
-    passes a user's merged set. So a ``view_raw`` role meant to pair with another role's
-    ``view_summary`` is refused, even for a user who would hold both roles.
-
-    That cost is accepted. A role is the unit an administrator grants, so such a role could later
-    be assigned alone. ``Identity.build`` only ever unions whole roles, so while no role has this
-    shape, no merged identity has it either. A rule on the merged identity would instead need a
-    check wherever a role reaches a user, at least each role assignment and each directory group
-    mapping. ``tests/test_custom_roles.py`` pins the per-role answer at both callers.
+    **Judged per role, and it stays that way (decided 2026-10-12, vault BACKLOG #2727).** Each
+    caller passes one role's set, never a user's merged set. So a ``view_raw`` role meant to pair
+    with another role's ``view_summary`` is refused, even for a user who would hold both roles.
+    ``Identity.build`` only ever unions whole roles, so while no role has this shape, no merged
+    identity has it either. docs/SECURITY.md, "Custom roles", gives the reasons, and
+    ``tests/test_custom_roles.py`` pins the answer.
     """
     held = set(perms)  # one pass, so an iterator argument answers correctly
     return Permission.MESSAGES_VIEW_RAW in held and Permission.MESSAGES_VIEW_SUMMARY not in held

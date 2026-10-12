@@ -64,6 +64,12 @@ def _anchored(tmp_path: Path) -> list[str]:
     return ["--project-root", str(tmp_path), "--env", "dev"]
 
 
+@pytest.fixture(params=[False, True], ids=["plain", "anchored"])
+def anchor(request: pytest.FixtureRequest, tmp_path: Path) -> list[str]:
+    """No extra flags, then the anchoring flags: one load of the config, then two."""
+    return _anchored(tmp_path) if request.param else []
+
+
 def _stdout_json(capsys: pytest.CaptureFixture[str]) -> object:
     """Stdout parsed as one JSON document, after checking the print ran and went to stderr."""
     captured = capsys.readouterr()
@@ -73,37 +79,31 @@ def _stdout_json(capsys: pytest.CaptureFixture[str]) -> object:
     return json.loads(captured.out)
 
 
-@pytest.mark.parametrize("anchored", [False, True])
 def test_validate_sends_a_config_modules_print_to_stderr(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], anchored: bool
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], anchor: list[str]
 ) -> None:
     cfg = _config(tmp_path, PRINTING_CONFIG)
-    extra = _anchored(tmp_path) if anchored else []
-    assert main(["validate", "--config", cfg, "--json", *extra]) == 0
+    assert main(["validate", "--config", cfg, "--json", *anchor]) == 0
     assert _stdout_json(capsys) == []
 
 
-@pytest.mark.parametrize("anchored", [False, True])
 def test_validate_reports_a_failing_module_as_json_despite_its_print(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], anchored: bool
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], anchor: list[str]
 ) -> None:
     cfg = _config(tmp_path, RAISING_CONFIG)
-    extra = _anchored(tmp_path) if anchored else []
-    assert main(["validate", "--config", cfg, "--json", *extra]) == 1
+    assert main(["validate", "--config", cfg, "--json", *anchor]) == 1
     diags = _stdout_json(capsys)
     assert isinstance(diags, list) and diags, diags
     assert any(str(d["file"]).endswith("IB_TEST.py") for d in diags), diags
 
 
-@pytest.mark.parametrize("anchored", [False, True])
 @pytest.mark.parametrize("compact", [["--json"], []])
 def test_graph_sends_a_config_modules_print_to_stderr(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], anchored: bool, compact: list[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], anchor: list[str], compact: list[str]
 ) -> None:
     """``graph`` prints JSON with and without ``--json``; the flag only makes it compact."""
     cfg = _config(tmp_path, PRINTING_CONFIG)
-    extra = _anchored(tmp_path) if anchored else []
-    assert main(["graph", "--config", cfg, *compact, *extra]) == 0
+    assert main(["graph", "--config", cfg, *compact, *anchor]) == 0
     graph = _stdout_json(capsys)
     assert isinstance(graph, dict)
     assert [c["name"] for c in graph["inbound"]] == ["IB_TEST"]

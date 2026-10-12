@@ -5107,10 +5107,9 @@ def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
     the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
     ``_print_json`` still write to the real stdout (vault BACKLOG #1187).
 
-    ``validate`` and ``graph`` import config modules too, and wrap that load the same way. So does
-    the anchor helper's own load in ``_check_env_file_present``, which runs before any of the
-    three commands reaches its own (vault BACKLOG #2727). At least these loads are wrapped; other
-    commands that load a config are not."""
+    ``validate``, ``graph`` and the anchor helper's own load wrap their config load the same way
+    (vault BACKLOG #2727). Nothing enforces the wrap: a command that loads a config without it
+    still lets a print reach stdout."""
     return contextlib.redirect_stdout(sys.stderr)
 
 

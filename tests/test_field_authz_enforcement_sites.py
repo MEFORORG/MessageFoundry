@@ -103,30 +103,34 @@ _MODEL_SIGNATURES: dict[frozenset[str], str] = {
 
 #: The one top-level ``MessageDetail`` property the PROCESSED seed row cannot carry: it has no error
 #: text. The route-tier test expects every other property ``PHI_FIELDS`` gates on that model to be
-#: set on both rows it opens, so a property added to the map is checked there with no edit here.
+#: set on both rows it opens. So a property added to the map is checked there: the seed must set
+#: it on both rows, or it must be named here.
 _UNSET_ON_THE_PROCESSED_ROW = frozenset({"error"})
+
+
+def _attributed(node: object) -> list[tuple[str, dict[str, object]]]:
+    """``(model name, object)`` for every JSON object in ``node`` whose field names match a mapped
+    model's signature. The one place a response object is attributed to its model."""
+    return [
+        (model, obj)
+        for obj in _objects(node)
+        if (model := _MODEL_SIGNATURES.get(frozenset(obj))) is not None
+    ]
 
 
 def _attributed_pairs(node: object) -> set[tuple[str, str]]:
     """``{(model, property)}`` for every gated property that came back NON-null in ``node``."""
-    found: set[tuple[str, str]] = set()
-    for obj in _objects(node):
-        model = _MODEL_SIGNATURES.get(frozenset(obj))
-        if model is None:
-            continue
-        for _cls_name, prop in _GATED_PAIRS:
-            if _cls_name == model and obj.get(prop) is not None:
-                found.add((model, prop))
-    return found
+    return {
+        (model, prop)
+        for model, obj in _attributed(node)
+        for cls_name, prop in _GATED_PAIRS
+        if cls_name == model and obj.get(prop) is not None
+    }
 
 
 def _models_present(node: object) -> set[str]:
-    """The mapped models with at least one object anywhere in ``node``, by field signature."""
-    return {
-        model
-        for obj in _objects(node)
-        if (model := _MODEL_SIGNATURES.get(frozenset(obj))) is not None
-    }
+    """The mapped models with at least one object anywhere in ``node``."""
+    return {model for model, _obj in _attributed(node)}
 
 
 @dataclass(frozen=True)
@@ -348,9 +352,10 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
             assert response.status_code == 200, (
                 f"{path} as {who}: {response.status_code} {response.text}"
             )
+            body = response.json()
             leaked = [
                 (prop, obj[prop])
-                for obj in _objects(response.json())
+                for obj in _objects(body)
                 for prop in _GATED_PROPERTIES
                 if obj.get(prop) is not None
             ]
@@ -365,7 +370,7 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
             assert exposed_on, (
                 f"{path} shows the administrator no gated value, so nothing on it tests withholding"
             )
-            missing = exposed_on - _models_present(response.json())
+            missing = exposed_on - _models_present(body)
             assert not missing, (
                 f"{path} as {who} returned no {sorted(missing)} object, so the assertion above "
                 "had nothing to withhold from and passed without checking that model."
@@ -376,7 +381,7 @@ def test_every_mapped_model_has_a_distinct_field_signature() -> None:
     """The attribution below is sound only while the model signatures are unique — assert it."""
     assert len(_MODEL_SIGNATURES) == len(PHI_FIELDS), (
         "two PHI_FIELDS models now share a field-name signature, so a JSON object cannot be "
-        "attributed to its model. Re-key _attributed_pairs before trusting it."
+        "attributed to its model. Re-key _attributed before trusting it."
     )
 
 
