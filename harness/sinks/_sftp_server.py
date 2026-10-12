@@ -29,7 +29,7 @@ Every path a client names is confined to the served directory: it is normalized 
 (so ``..`` cannot climb out), and a path that resolves outside through a symlink is refused. Before
 that, :func:`_screen` refuses a path holding a control or Windows-reserved character, a name past its
 length bound, and at least two kinds of name Windows would open as another: a trailing dot or space,
-and a device name. It does not catch an 8.3 short name or a name differing only in case. A write
+and a device name. It does not catch at least an 8.3 short name or a name differing only in case. A write
 past the engine's per-message cap is refused. The server never logs what it is sent, and keeps it only
 in its own temporary directory, which :meth:`SftpShare.stop` deletes.
 """

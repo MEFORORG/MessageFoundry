@@ -269,7 +269,7 @@ def test_the_share_confines_every_path_and_refuses_to_replace_on_rename(
             ssh.close()
 
 
-# --- the share's name screen (vault BACKLOG #2932, ASVS 1.3.3 ground S) --------------------------
+# --- the share's name screen (vault BACKLOG #2932) ------------------------------------------------
 
 #: One refused name per path. Most sit in a MIDDLE component, so a screen of the last name alone
 #: misses them. Each is refused as a PermissionError (EACCES).
