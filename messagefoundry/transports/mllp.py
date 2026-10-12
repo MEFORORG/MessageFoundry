@@ -1772,10 +1772,11 @@ class MLLPSource(SourceConnector):
         # Every cap on THIS listener: key absent -> secure default; None/0 -> disabled, in whichever
         # spelling arrives. `_cap_setting` is what makes that last clause true -- see it for why
         # deciding "off" before the conversion read a string `"0"` as a live cap of zero. It lives in
-        # transports/base.py (BACKLOG #1872). Three caps go through `positive_cap` on top of it, which
-        # refuses a negative or a NaN, as the raw-TCP, X12 and HTTP listeners do. The other two keep
-        # guards of their own below, each with its own message. An int cap is held to the count rule
-        # in `count_setting` on either path (BACKLOG #3431).
+        # transports/base.py (BACKLOG #1872). Most caps go through `positive_cap` on top of it, which
+        # refuses a negative or a NaN, as the raw-TCP, X12 and HTTP listeners do.
+        # `max_connections_per_host` and `max_frame_seconds` keep guards of their own below, each
+        # with its own message. An int cap is held to the count rule in `count_setting` on either
+        # path (BACKLOG #3431).
         self.max_connections: int | None = positive_cap(
             s.get("max_connections", DEFAULT_MAX_CONNECTIONS),
             int,

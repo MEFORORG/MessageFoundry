@@ -284,7 +284,8 @@ def test_a_negative_or_nan_receive_timeout_is_refused_at_build(build: Build, bad
     each one as an idle timeout. NaN is refused with it: every comparison with NaN is false, so it
     could not be recognised as off and would fire a bare ``wait_for`` at once.
 
-    Red mutation: drop the MLLP listener's receive_timeout guard. Its ``-1`` case builds cleanly."""
+    Red mutation: read the MLLP listener's receive_timeout with ``_cap_setting`` instead of
+    ``positive_cap``. Its ``-1`` case builds cleanly."""
     with pytest.raises(ValueError, match="receive_timeout"):
         build({"receive_timeout": bad})
 
@@ -301,8 +302,8 @@ def test_a_positive_receive_timeout_still_builds(build: Build) -> None:
     [("max_connections", "max_connections"), ("max_frame_bytes", "max_frame_bytes")],
 )
 def test_the_mllp_listener_refuses_its_other_negative_caps(key: str, attr: str) -> None:
-    """The MLLP listener's call sites are unchanged; its guard block now refuses a negative on the two
-    caps that had none, so it matches the other three listeners."""
+    """The MLLP listener reads these two caps through ``positive_cap``, so a negative is refused as
+    it is on the other three listeners."""
     with pytest.raises(ValueError, match=key):
         _MLLP_IN({key: -1})
     assert getattr(_MLLP_IN({key: "0"}), attr) is None
@@ -321,8 +322,8 @@ def test_positive_cap_refuses_what_is_left_after_zero_reads_as_off() -> None:
     assert positive_cap("0", int, knob="k", transport="t") is None
     assert positive_cap(" 0 ", float, knob="k", transport="t") is None
     assert positive_cap("3", int, knob="k", transport="t") == 3
-    # 0.5 truncates to an int cap of zero, which refuses everything; NaN, "1e3" and text fail inside
-    # int() itself, and must still name the setting.
+    # 0.5 is not a whole count (BACKLOG #3431), and NaN, inf, "1e3", text and a list are not counts
+    # at all. Each refusal must still name the setting.
     for bad in (-1, "-1", 0.5, math.nan, "1e3", "lots", [1], math.inf):
         with pytest.raises(ValueError, match="t k="):
             positive_cap(bad, int, knob="k", transport="t")
@@ -539,3 +540,23 @@ def test_the_bool_refusal_says_why() -> None:
         positive_cap(Decimal("1.9"), int, knob="k", transport="t")
     # A float cap is not a count, so a fraction is the whole point of it.
     assert positive_cap(1.9, float, knob="k", transport="t") == 1.9
+
+
+_FLOAT_CAPS = [
+    pytest.param(_MLLP_IN, "receive_timeout", id="mllp-in-receive_timeout"),
+    pytest.param(_MLLP_IN, "max_frame_seconds", id="mllp-in-max_frame_seconds"),
+    pytest.param(_MLLP_IN, "max_messages_per_second", id="mllp-rate"),
+    pytest.param(_TCP_OUT, "idle_timeout_seconds", id="tcp-out-idle"),
+    pytest.param(_SCP, "max_associations_per_second", id="scp-association-rate"),
+]
+
+
+@pytest.mark.parametrize(("build", "key"), _FLOAT_CAPS)
+@pytest.mark.parametrize("bad", [True, False])
+def test_a_float_cap_refuses_a_bool(build: Build, key: str, bad: bool) -> None:
+    """``float(True)`` is 1.0, so a bool built a one-second timeout or a rate of one per second, and
+    ``False`` read as "off". Neither is what a bool means here, so both are refused, naming the key.
+
+    Red mutation: drop the bool refusal from ``cap_setting``'s float path. Every case builds."""
+    with pytest.raises(ValueError, match=f"{key}={bad!r} is not a valid float value"):
+        build({key: bad})

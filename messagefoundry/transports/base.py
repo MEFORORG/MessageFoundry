@@ -110,14 +110,16 @@ DEFAULT_MAX_ITEMS_PER_POLL = 500
 
 
 def count_setting(value: Any, *, knob: str, transport: str) -> int:
-    """Read one integer setting as a whole count, or refuse it at build naming the key (BACKLOG #3431).
+    """Read one integer setting as a whole count, or refuse it naming the key (BACKLOG #3431).
 
-    **This is the one rule for an integer setting; every other reader points here.** ``int()`` turns
-    ``True`` into 1 and ``1.9`` into 1, so either one used to build a live cap of one byte or one
-    connection, from a value nobody meant as that number. So:
+    **This docstring holds the rule; the readers that use it point here.** They are at least every
+    ``int`` cap read through :func:`cap_setting`, plus the setting reads that call this directly. Not
+    every integer read in the engine uses it yet; a ``port``, for one, is still a bare ``int()``.
+    ``int()`` turns ``True`` into 1 and ``1.9`` into 1, so either one used to build a live cap of one
+    byte or one connection, from a value nobody meant as that number. So:
 
     - an ``int`` passes, and so does any other whole number: ``2048.0``, ``Decimal("2048")``,
-      ``Fraction(4, 2)``, or a NumPy integer;
+      ``Fraction(4, 2)``, or another ``numbers.Integral`` type;
     - a bool is refused, ``False`` as well as ``True``: a bool is not a count, so ``False`` is not a
       spelling of "off" either;
     - a number that is not whole is refused, of any numeric type, so ``0.5``, ``1.9``,
@@ -179,7 +181,8 @@ def cap_setting[NumT: (int, float)](
     **An ``int`` cap is read by :func:`count_setting`, and only its exact zero is "off".** That
     refuses a bool and every fraction, so nothing truncates to zero: a ``max_connections_per_host`` of
     ``-0.5`` cannot silently disable a security cap the caller's guard is supposed to refuse. Text
-    that spells zero, such as ``"0.0"``, is off on either kind of cap, and so is a float ``-0.0``.
+    that spells zero, such as ``"0.0"``, is off on either kind of cap, and so is a float ``-0.0``. A
+    ``float`` cap refuses a bool too, ``False`` included.
 
     A negative value is returned as-is, for the callers that refuse one at build with a message naming
     their own key; :func:`positive_cap` is that caller for most sites. It is a different mistake with a
@@ -195,6 +198,9 @@ def cap_setting[NumT: (int, float)](
     if kind is int:
         count = count_setting(value, knob=knob, transport=transport)
         return None if count == 0 else count
+    if isinstance(value, bool):
+        # float(True) is 1.0, so a bool would build a one-second timeout or a rate of one per second.
+        raise ValueError(f"{transport} {knob}={value!r} is not a valid float value: it is a bool")
     try:
         cap = kind(value)
     except (TypeError, ValueError, OverflowError) as exc:
