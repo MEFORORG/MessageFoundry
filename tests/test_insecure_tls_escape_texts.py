@@ -37,7 +37,8 @@ define the rule, so a scan of every docstring flags text that misleads nobody.
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
 as ``f"{INSECURE_TLS_ESCAPE_ENV}=1:refused"``; a call lent through ``+``, as in
-``(_("set %s") + "...") % NAME``; a docstring or comment outside the pinned files; and prose that
+``(_("set %s") + "...") % NAME``; the variable handed through a nested call, as in
+``"set %s" % str(NAME)``; a docstring or comment outside the pinned files; and prose that
 says "the dev escape" without the variable. A green run is a statement about the shapes above, not
 about every text in the packages.
 
@@ -67,7 +68,7 @@ _POSTURE = "[security].enforcement = warn"
 _HOLE = "{}"
 #: A signature comment that says this names the escape without spelling the variable.
 _UNNAMED_ESCAPE = "the escape"
-_BOM = "﻿"
+_BOM = "\ufeff"
 
 #: Files that must each hold at least one checked text. Pinned so a scanner that matches nothing
 #: fails here instead of passing vacuously.
@@ -99,8 +100,8 @@ _DOCSTRING_FILES = (
 #: comments reach an operator as help text.
 _COMMENT_FILES = ("messagefoundry/config/wiring.py",)
 
-_DOCUMENTED = ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
 _DEF = ast.FunctionDef | ast.AsyncFunctionDef
+_DOCUMENTED = ast.Module | ast.ClassDef | _DEF
 _PARAGRAPH_BREAK = re.compile(r"(\n\s*\n)")
 
 
@@ -141,15 +142,14 @@ def _read(node: ast.AST, texts: list[str], *, lent: bool = False) -> bool:
     named = False
     if isinstance(node, ast.Call):
         func = node.func
-        formats = isinstance(func, ast.Attribute) and func.attr == "format"
-        if not (formats or lent):
-            return False
-        if isinstance(func, ast.Attribute) and formats:
+        if isinstance(func, ast.Attribute) and func.attr == "format":
             named = _read(func.value, texts, lent=True)
+        elif not lent:
+            return False
         parts: list[ast.AST] = [*node.args, *(kw.value for kw in node.keywords)]
     elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
         named = _read(node.left, texts, lent=True)
-        return _read(node.right, texts) or named
+        parts = [node.right]
     elif _is_text(node):
         parts = []
         text = _spell(node, parts)
@@ -215,7 +215,7 @@ def _comments(source: str) -> Iterator[tuple[int, str]]:
     """Each comment as its first line and its text. Own-line comments on consecutive lines are one
     comment; a comment after code stands alone."""
     parts: list[str] = []
-    start = end = 0
+    start = 0
     takes_more = False
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type != tokenize.COMMENT:
@@ -223,13 +223,12 @@ def _comments(source: str) -> Iterator[tuple[int, str]]:
         line = token.start[0]
         own_line = not token.line[: token.start[1]].strip()
         text = token.string.lstrip("#").strip()
-        if parts and takes_more and own_line and line == end + 1:
+        if takes_more and own_line and line == start + len(parts):
             parts.append(text)
-            end = line
             continue
         if parts:
             yield start, " ".join(parts)
-        parts, start, end, takes_more = [text], line, line, own_line
+        parts, start, takes_more = [text], line, own_line
     if parts:
         yield start, " ".join(parts)
 
