@@ -49,6 +49,7 @@ __all__ = [
     "CAFILE_MODES",
     "CONDITIONS",
     "ENCRYPTED_SHAPES",
+    "ENCRYPTION_HEADERS",
     "PLAIN_SHAPE",
     "Trial",
     "run_trial",
@@ -56,7 +57,9 @@ __all__ = [
 ]
 
 #: The RFC 1421 headers of an encrypted PEM block, as ``tests/test_trust_anchors.py`` writes them.
-_ENCRYPTED = "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"
+ENCRYPTION_HEADERS = (
+    "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"
+)
 
 #: File name of each shape :func:`write_shapes` writes that carries an encryption header.
 ENCRYPTED_SHAPES = ("certificate.pem", "crl.pem", "certificate-and-key.pem")
@@ -164,6 +167,16 @@ if pid:
     waited = True
     os.kill(pid, signal.SIGKILL)
     os.waitpid(pid, 0)
+# The child can write its result and end between the last read and the look that found it gone.
+# Whatever it left in the pty is read here, or that result would be lost.
+while select.select([fd], [], [], 0.2)[0]:
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    seen += chunk
 sys.stdout.write(json.dumps({"waited": waited, "seen": seen.decode("ascii", "replace")}))
 """
 
@@ -328,10 +341,10 @@ def write_shapes(directory: str | os.PathLike[str]) -> None:
 
     def with_headers(pem: bytes) -> str:
         begin, rest = pem.decode("ascii").split("\n", 1)
-        return f"{begin}\n{_ENCRYPTED}{rest}"
+        return f"{begin}\n{ENCRYPTION_HEADERS}{rest}"
 
     label = "RSA PRIVATE" + " KEY"  # split, so a secret scanner does not read a real key
-    key_block = f"-----BEGIN {label}-----\n{_ENCRYPTED}AAAA\n-----END {label}-----\n"
+    key_block = f"-----BEGIN {label}-----\n{ENCRYPTION_HEADERS}AAAA\n-----END {label}-----\n"
     out = Path(directory)
     shapes = {
         PLAIN_SHAPE: cert.decode("ascii"),

@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A path load of an encrypted PEM block refuses at once and never prompts (BACKLOG #3090).
 
-The engine loads CA and CRL files from a path at 14 sites that ``anchor_cadata`` does not cover,
-and the Vault hop makes a fifteenth such load. BACKLOG #2270 found that a ``cadata=`` load of a
-block with a ``Proc-Type: 4,ENCRYPTED`` header waits for a password. The row asked whether a
-``cafile=`` load can wait too. It was measured, and it cannot, so those sites got no check. This
+The engine loads CA and CRL files from a path in at least 14 functions that ``anchor_cadata``
+does not cover, and the Vault hop loads one more. ``git grep -n "cafile=" -- messagefoundry``
+finds them. BACKLOG #2270 found that a ``cadata=`` load of a block with a ``Proc-Type:
+4,ENCRYPTED`` header waits for a password, and ``anchor_cadata``'s docstring holds that row's own
+Windows reading. The row asked whether a ``cafile=`` load can wait too. It was measured, and it cannot, so those sites got no check. This
 file pins that reading on every platform CI runs, because the engine's safety at those sites now
 rests on it.
 

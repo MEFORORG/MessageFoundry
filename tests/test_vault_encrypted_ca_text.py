@@ -16,13 +16,17 @@ from typing import Any
 
 import pytest
 import requests
-import urllib3.exceptions
 from urllib3._base_connection import ProxyConfig
 from urllib3.util import parse_url
 
-from messagefoundry.transports.strict_requests import StrictReplyAdapter, _narrowed_pool_classes
+from messagefoundry.config.tls_policy import InsecureHopRefused
+from messagefoundry.transports.strict_requests import (
+    StrictReplyAdapter,
+    _narrowed_pool_classes,
+    vault_failure_text,
+)
+from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
 
-_HEADERS = "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"
 _BEGIN = "-----BEGIN CERTIFICATE-----\n"
 #: A body that is not a certificate. Nothing here hands it to OpenSSL.
 _PLAIN = _BEGIN + "SYNTHETICBODYMARKER\n-----END CERTIFICATE-----\n"
@@ -105,10 +109,10 @@ def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
 def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: str) -> None:
     """Red under: the ``_refuse_encrypted_ca_text`` call removed from ``connect``. Through a proxy
     the stand-in context then raises its ``AssertionError``, and direct the stand-in socket raises
-    ``_Stopped``. The refusal is the type a failed CA load raises, with fixed text."""
+    ``_Stopped``. The refusal is the hop's own type, with fixed text."""
     made, factory = _contexts(_NoTlsLoad)
     conn = _connection(factory, proxied=proxied, ca_cert_data=text)
-    with pytest.raises(urllib3.exceptions.SSLError, match="encryption header") as refusal:
+    with pytest.raises(InsecureHopRefused, match="encryption header") as refusal:
         conn.connect()
     assert made == [], "a TLS context was built for CA text the hop refuses"
     assert "Vault test hop" in str(refusal.value)
@@ -159,3 +163,31 @@ def test_a_ca_directory_reaches_the_proxy_leg_and_is_not_refused(tmp_path: Path)
     with pytest.raises(_Stopped):
         conn.connect()
     assert made[0].loads == [(None, str(tmp_path), None)]
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [None, "http://127.0.0.1:9", "https://127.0.0.1:9"],
+    ids=["direct", "http proxy", "https proxy"],
+)
+def test_the_refusal_reaches_the_caller_with_its_text(proxy: str | None) -> None:
+    """Through requests, as the Vault clients call it, and no socket opens. urllib3 relabels an
+    ``SSLError`` raised before a proxy has connected as a ``ProxyError``, and the providers would
+    then report a type name only. Red under: the refusal raised as ``urllib3.exceptions.SSLError``,
+    which comes out as ``requests.exceptions.SSLError`` direct and ``ProxyError`` through a proxy."""
+    made, factory = _contexts(_NoTlsLoad)
+    adapter = StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
+    text = _PLAIN.replace(_BEGIN, _BEGIN + _HEADERS)
+    # requests never sets ca_cert_data, so a later caller is stood in for at the pool manager.
+    adapter.poolmanager.connection_pool_kw["ca_cert_data"] = text
+    proxies: dict[str, str] = {}
+    if proxy is not None:
+        adapter.proxy_manager_for(proxy).connection_pool_kw["ca_cert_data"] = text
+        proxies = {"https": proxy}
+    session = requests.Session()
+    session.trust_env = False
+    session.mount("https://", adapter)
+    with pytest.raises(InsecureHopRefused, match="encryption header") as refusal:
+        session.get("https://127.0.0.1:9/v1/sys/health", proxies=proxies, timeout=5)
+    assert vault_failure_text(refusal.value) == str(refusal.value)
+    assert made == [], "a TLS context was built for CA text the hop refuses"
