@@ -178,6 +178,9 @@ _DANGEROUS_ROW_KEYS: dict[str, str] = {
     # checkout, so these tests skip here and in CI) and its 15.1.5 row must be rewritten to match.
     "**Sandbox IPC deserialization**": "_sandbox_codec",
     "**Other subprocess invocations**": "shell=False",
+    # This row had no anchor and no key, so deleting it failed no test (BACKLOG #3048). A key pins it
+    # by its own label, which a bare `os.startfile` anchor would not once another row names that call.
+    "**Tray opens through the Windows file-type association**": "os.startfile",
 }
 
 #: Resource-demanding surfaces (ASVS 15.1.3). Each entry must appear in a 15.1.3 TABLE ROW.
