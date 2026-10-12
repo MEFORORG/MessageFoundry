@@ -1423,11 +1423,9 @@ class ApiSettings(_Section):
         """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
         engine off-box or through a proxy. ``serve`` reads it for the console exposure checks
         (BACKLOG #2218) and as ``instance_exposed``, the single exposure test at least three of its
-        arms read (vault BACKLOG #2251). They do not all refuse. MFA-at-exposure refuses under
-        ``enforce`` unless its audited opt-out is set, and warns otherwise. Dual-control only warns.
-        The ADR 0152 declaration warns, and refuses only under ``enforce`` with its opt-in set. A
-        change to :func:`request_host_is_browser_origin` therefore moves those refusals and warnings
-        too."""
+        arms read: MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251).
+        They do not all refuse, and each arm in ``serve`` says what it does. A change to
+        :func:`request_host_is_browser_origin` therefore moves those refusals and warnings too."""
         return request_host_is_browser_origin(
             loopback=self.is_loopback,
             trusted_proxies=self.trusted_proxies,

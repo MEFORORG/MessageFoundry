@@ -3399,8 +3399,7 @@ def _serve(args: argparse.Namespace) -> int:
         )
     # Only the two advisories below read this: instance_exposed plus the serve_ui term. At least the
     # MFA-at-exposure, dual-control and ADR 0152 arms read instance_exposed alone, since serve_ui is
-    # rewritten in place above (BACKLOG #326, #2218, vault BACKLOG #2251). Of those, dual-control
-    # only warns.
+    # rewritten in place above (BACKLOG #326, #2218, vault BACKLOG #2251).
     ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
@@ -3533,9 +3532,7 @@ def _serve(args: argparse.Namespace) -> int:
     # it points back at the sentence that names it rather than printing it twice.
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     directory_exception = ", with the OIDC exception above" if oidc_exception else ""
-    # What made this instance exposed, named once for the MFA and dual-control arms below. The
-    # helper reads the predicate instance_exposed reads, so the two agree by construction (vault
-    # BACKLOG #3102). Empty when not exposed, and read only when admin_exposed.
+    # Named once for the MFA and dual-control arms below, and read only when admin_exposed.
     exposure_desc = _exposure_description(settings)
     if admin_exposed and not settings.auth.require_mfa:
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
