@@ -206,7 +206,6 @@ class CaptureSink:
     def _write(self, received_id: str | None, raw: str) -> None:
         # ``received_id`` is MSH-10 as delivered. It is written only when there is no anonymizer;
         # with one, the id is read again from the anonymized body below.
-        control_id = received_id
         assert self._file is not None, "CaptureSink.start() must be called before messages arrive"
         if self._anonymizer is not None:
             try:
@@ -221,9 +220,10 @@ class CaptureSink:
                 # refused, so neither str(exc) nor a traceback may reach the log (BACKLOG #2994).
                 log.warning("anonymizer refused a message; dropped it (%s)", type(exc).__name__)
                 return
-            # Read the id from the body being written, not the one received, so a rule that rewrites
-            # MSH-10 never leaves the real id beside the surrogate body (BACKLOG #2994).
-            control_id = _control_id_of(raw)
+        # With an anonymizer, read the id from the body being written, not the one received, so a
+        # rule that rewrites MSH-10 never leaves the real id beside the surrogate body
+        # (BACKLOG #2994).
+        control_id = received_id if self._anonymizer is None else _control_id_of(raw)
         json.dump(
             {"control_id": control_id, "raw": raw, "received_at": time.time()},
             self._file,
@@ -243,8 +243,9 @@ def _control_id_of(body: str) -> str | None:
 
     It never raises: it runs after the anonymizer's fail-closed catch, where an exception would
     lose a body that is safe to write. ``HL7PeekError`` and ``UnicodeEncodeError`` are both
-    ``ValueError``s, so the read-fault family covers the refusal and the encode. The tee's ``_anonymize_captures`` reads its id from the
-    anonymized body as well, with the tee relay's own reader.
+    ``ValueError``s, so the read-fault family covers the refusal and the encode. The tee's
+    ``_anonymize_captures`` reads its id from the anonymized body as well, with the tee relay's
+    own reader.
     """
     try:
         return Peek.parse(body.encode("latin-1")).control_id

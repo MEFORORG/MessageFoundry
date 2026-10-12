@@ -85,6 +85,7 @@ _MSH_RULES = (
 )
 # MSH-7 with a month, day and time, so the date rule visibly changes it.
 _RAW_TIMED = _RAW.replace("|20260101||", "|20260315142233||")
+assert _RAW_TIMED != _RAW  # the replace hit, or the MSH-7 controls below would check nothing
 
 
 def test_capture_sink_control_id_follows_an_msh10_rule(tmp_path) -> None:
@@ -181,7 +182,9 @@ def test_capture_sink_logs_one_warning_per_anonymizer_drop_with_no_body_text(
     ]
     assert all(any(TOKEN in text for text in record_texts(r)) for r in leaky)
     # The real lines carry the class name and nothing from the body.
-    assert_no_token(records)
+    # Every captured record, not only the sink's: a body that escaped as an unretrieved task
+    # exception would surface on the asyncio logger instead.
+    assert_no_token(caplog.records)
 
 
 def test_capture_sink_fails_closed_on_real_engine_refusal(tmp_path) -> None:
