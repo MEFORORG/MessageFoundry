@@ -3867,8 +3867,10 @@ found" for *deleted*, *moved out of the search base* and *the search base was ne
   account is left, and the engine then restarts, the restarted engine knows only that one. It
   treats it as a lone undetermined account. So when a pass also reads the attribute on another
   account, the engine strikes the formerly held account. It revokes that account once its strikes
-  reach `ad_session_recheck_strikes` (2 at the default). Held accounts are left out of
-  the population the breaker below judges, and a pass it aborts still writes the held row. The rule is fixed, with no setting
+  reach `ad_session_recheck_strikes` (2 at the default). Held accounts count in
+  the population the breaker below judges. That weakens the breaker while a hold stands; ADR 0195's
+  amendment of 2026-10-11 states by how much. A pass the breaker aborts still writes the held row.
+  The hold rule is fixed, with no setting
   and no floor. **The cost:**
   two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
   the absolute cap.
