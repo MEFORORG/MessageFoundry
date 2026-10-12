@@ -2960,6 +2960,10 @@ def FHIR(
     update_url_form: Literal[
         "transaction", "path"
     ] = "transaction",  # how an update/if-match is sent; "path" puts the id in the URL (a listed loosening)
+    allowed_entry_methods: list[str]
+    | None = None,  # transaction/batch only, and no default there: the entry verbs a Bundle may carry (#2804)
+    allowed_entry_types: list[str]
+    | None = None,  # transaction/batch only: the entry resource types it may name; unset = any (#2804)
     headers: dict[str, str]
     | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (SMART/OAuth; use env())
@@ -2997,7 +3001,9 @@ def FHIR(
     ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``POST {base}`` with a one-entry
     ``transaction`` Bundle whose entry is ``PUT {ResourceType}/{id}`` (so the message-derived id never
     appears in the request URL; vault BACKLOG #1965), ``transaction``/``batch`` → ``POST {base}`` with the
-    Bundle. ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
+    Bundle, whose every entry must fit ``allowed_entry_methods`` (required there, no default) and the
+    optional ``allowed_entry_types``, or the message is dead-lettered unsent (vault BACKLOG #2804).
+    ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
     idempotency/concurrency levers: ``if-none-exist`` (conditional create, ``If-None-Exist`` header),
     ``conditional-update`` (search-based ``PUT`` with ``conditional_query`` in the URL), ``if-match``
     (version-aware update, sent like ``update``, whose ETag is derived from the resource's
@@ -3030,6 +3036,24 @@ def FHIR(
         "FHIR",
         capture_response_headers=capture_response_headers,
         proxy_no_proxy=proxy_no_proxy,
+        allowed_entry_methods=allowed_entry_methods,
+        allowed_entry_types=allowed_entry_types,
+    )
+    # vault BACKLOG #2804: checked here as well as in FhirDestination, so the loaded graph cannot
+    # hold a transaction/batch connection with no entry allow-list. Lazy, as the smart-scope
+    # advisory's import of the same module is.
+    from messagefoundry.transports.fhir import DEFERRED_ENTRY_LIST, entry_screen_settings
+
+    def load_time(value: object) -> object:
+        # An env() standing for the whole list: its default is what an unset key resolves to, so
+        # that is checked now. With no default its items are known only at build, where
+        # FhirDestination checks them; it still counts as set.
+        if isinstance(value, EnvRef):
+            return DEFERRED_ENTRY_LIST if value.default is _UNSET else value.default
+        return value
+
+    entry_screen_settings(
+        interaction, load_time(allowed_entry_methods), load_time(allowed_entry_types)
     )
     return ConnectionSpec(
         ConnectorType.FHIR,
@@ -3041,6 +3065,8 @@ def FHIR(
             "conditional": conditional,
             "conditional_query": conditional_query,
             "update_url_form": update_url_form,
+            "allowed_entry_methods": allowed_entry_methods,
+            "allowed_entry_types": allowed_entry_types,
             "headers": headers or {},
             "bearer_token": bearer_token,
             "basic_user": basic_user,

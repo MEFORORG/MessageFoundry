@@ -231,6 +231,16 @@ str) -> DeliveryResponse | None`, optional `aclose`/`test_connection` overrides,
    - **Bundle transaction/batch** — `POST {base}` with a `Bundle` body (`Bundle.type =
      transaction`/`batch`). The engine *builds/posts* the Bundle; the FHIR **server** applies it (transaction =
      all-or-nothing, batch = independent per entry) — this is a server-side semantic the engine never executes.
+     **Amended 2026-10-10 (vault BACKLOG #2804):** the server still applies the Bundle, but the engine
+     screens every entry before the post. A Handler that forwards an inbound Bundle would otherwise let
+     the sender pick every entry's method and URL. The connection must declare `allowed_entry_methods`,
+     with no default, and may declare `allowed_entry_types`. Each entry must fit a positive grammar: a
+     `POST` names `Type`, every other verb names `Type/id` or `Type?query`, built from the same type and
+     id grammars as the other write paths. A Bundle that is malformed, repeats a JSON key or names
+     another `Bundle.type` is refused too. A refusal is a permanent dead-letter that names the entry
+     index, method and rule, never the URL. The body sent is still the Handler's bytes, unchanged. The
+     engine's own one-entry update wrap is not screened. See [CONNECTIONS.md](../CONNECTIONS.md), "A
+     Bundle connection screens every entry".
    The `ResourceType`/`id` are read from the outgoing body via `FhirPeek` (cheap, no typed parse) when the
    interaction needs them, so the destination derives its method+path without a full model build.
 3. **Conditional interactions — three distinct, spec-correct knobs (CHOSEN: supported, header/URL-driven,

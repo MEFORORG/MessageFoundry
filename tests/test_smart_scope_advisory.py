@@ -87,7 +87,11 @@ with_smart_backend(
 outbound(
     "OB_TXN",
     _smart(
-        FHIR(url="https://fhir.example.invalid/fhir", interaction="transaction"),
+        FHIR(
+            url="https://fhir.example.invalid/fhir",
+            interaction="transaction",
+            allowed_entry_methods=["POST", "PUT"],
+        ),
         "system/*.cruds",
     ),
 )
