@@ -647,6 +647,30 @@ def test_ftp_publish_reads_an_nlst_empty_reply_as_no_names(
     assert ftp.calls == ["MLSD /in", "PWD", "CWD /in", "CWD /", "RNTO /in/msg.hl7"]
 
 
+class _UnquotedPwdFtp(_ScriptedFtp):
+    """A server whose ``PWD`` reply quotes no path, which ``ftplib`` reads as no home at all."""
+
+    def pwd(self) -> str:
+        self.calls.append("PWD")
+        return ftplib.parse257("257 /home is cwd")
+
+
+def test_ftp_publish_never_confirms_an_empty_dir_from_an_unquoted_pwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    """With no home to return to, ``CWD in`` would leave the session inside ``in``, and the
+    relative ``RNFR`` that follows would name ``in/in/.t.part``. So the ``NLST`` reply stands, the
+    listing fails transient as any refused publish listing does, and no ``CWD`` or ``RNTO`` runs."""
+    ftp = _UnquotedPwdFtp({"in/.t.part": b"new"})
+    ftp.list_reply = "550 No files found"
+    with pytest.raises(_RemoteError) as caught:
+        _ftp_client(ftp, monkeypatch).publish("in/.t.part", ["in/msg.hl7"])
+    assert caught.value.permanent is False
+    assert "No files found" in str(caught.value)
+    assert ftp.calls == ["MLSD in", "PWD"]
+    assert ftp.files == {"in/.t.part": b"new"}
+
+
 # === an SFTP rename whose outcome is unknown is never a collision ==============
 
 

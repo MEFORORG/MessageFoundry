@@ -58,6 +58,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+import fnmatch
 import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are refused (see _validate_common); FTPS/SFTP are the encrypted defaults
 import hashlib
 import io
@@ -433,7 +434,9 @@ def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
     not poll as empty for good. So the directory is confirmed with ``CWD`` first, then the session
     is returned to where ``PWD`` found it, since later commands may use relative paths. A refused
     or unreadable reply to any of the three raises the original ``NLST`` reply, as before this
-    check; a transient one raises as itself. The round trips are paid only on this reply.
+    check; a transient one raises as itself. So does a ``PWD`` reply with no quoted path: ``pwd()``
+    returns ``''`` for it, and ``cwd('')`` sends ``CWD .``, which would leave the session inside
+    ``remote_dir``. The round trips are paid only on this reply.
 
     A directory the account may enter but not list still reads as empty, if the server answers
     it with this reply: ``CWD`` cannot tell that case apart."""
@@ -444,9 +447,12 @@ def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
             raise
         try:
             home = ftp.pwd()
-            ftp.cwd(remote_dir)
-            ftp.cwd(home)
+            if home:  # '' cannot put the session back, so it confirms nothing
+                ftp.cwd(remote_dir)
+                ftp.cwd(home)
         except (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto):
+            raise exc from None
+        if not home:
             raise exc from None
         # The reply text past the match is the server's, and may name a path: not logged.
         logger.debug("REMOTEFILE NLST answered 550 No files found; read as an empty directory")
@@ -2461,8 +2467,6 @@ class RemoteFileSource(SourceConnector):
         return False
 
     async def _poll_once(self) -> None:
-        import fnmatch
-
         assert self._handler is not None
         await asyncio.to_thread(self._client.ensure_dir, self._processed_dir)
         await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
@@ -2473,9 +2477,7 @@ class RemoteFileSource(SourceConnector):
         self._prune_settle(listing)
         # Counted over the whole listing, not in the loop below, which can stop early. Only an entry
         # the pattern would have read counts, so a subdirectory or a stray file never raises it.
-        self._log_other_form(
-            sum(1 for e in listing if e.other_form and fnmatch.fnmatch(e.name, self._pattern))
-        )
+        self._log_other_form(sum(1 for e in listing if e.other_form and self._reads(e.name)))
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, entry in enumerate(listing):
             name, size, mtime = entry.name, entry.size, entry.mtime
@@ -2490,10 +2492,11 @@ class RemoteFileSource(SourceConnector):
                 # leave-mode dedup key), and a per-consumer check would keep missing one: the
                 # consumer set grew at every measurement pass and never shrank.
                 # NOT quarantined: moving it would join the hostile name onto a directory, which is
-                # the very operation being refused. Left in place and logged, so an operator sees it
-                # every poll rather than once. No name is logged: this arm has refused the name as an
-                # unsafe path component, so it is the one place that must not hand it to `safe_name`
-                # either — the host:dir and the fact of a refusal are the signal.
+                # the very operation being refused. Left in place, and logged on every poll rather
+                # than once, except for the other-form entry described below. No name is logged:
+                # this arm has refused the name as an unsafe path component, so it is the one place
+                # that must not hand it to `safe_name` either — the host:dir and the fact of a
+                # refusal are the signal.
                 #
                 # This comment used to justify that by asserting "names are not logged at INFO+
                 # elsewhere in this source". Nine WARNING sites below falsified it (BACKLOG #1748),
@@ -2501,9 +2504,11 @@ class RemoteFileSource(SourceConnector):
                 # sites now route through `safe_name`, so the claim would be true today — it is gone
                 # anyway, because this arm's reason never depended on what the others do.
                 #
-                # An FTP NLST entry in another listing form, with no traversal shape, was counted
-                # and logged once above instead (BACKLOG #1130), so an operator can tell a server's
-                # listing format from an attack. It is refused here all the same.
+                # An FTP NLST entry in another listing form, with no traversal shape, gets no line
+                # here (BACKLOG #1130). It was counted above instead, and logged at most every
+                # OTHER_FORM_WARNING_SECONDS, so an operator can tell a server's listing format from
+                # an attack. One the pattern would not read is refused with no line at all: like a
+                # bare name the pattern skips, it is not a file this poller would ever read.
                 if not entry.other_form:
                     logger.warning(
                         "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
@@ -2511,7 +2516,7 @@ class RemoteFileSource(SourceConnector):
                         _where(self._host, self._remote_dir),
                     )
                 continue
-            if not fnmatch.fnmatch(name, self._pattern):
+            if not self._reads(name):
                 continue
             path = posixpath.join(self._remote_dir, name)
             # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
@@ -2820,6 +2825,13 @@ class RemoteFileSource(SourceConnector):
         full = posixpath.join(self._remote_dir, name)
         identity = f"{full}\x00{size}" if mtime is None else f"{full}\x00{size}\x00{mtime}"
         return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _reads(self, name: str) -> bool:
+        """Whether ``pattern``, a file-name glob, matches ``name``: the one test the poll loop
+        and the other-form count share, so the two cannot drift. A name with a ``/`` is judged by
+        its last part, since an NLST entry in another listing form (BACKLOG #1130) names the file
+        as a path. A bare name is its own last part."""
+        return fnmatch.fnmatch(name.rpartition("/")[2], self._pattern)
 
     def _log_other_form(self, count: int) -> None:
         """WARN that ``count`` FTP ``NLST`` entries this poll, each one the pattern would have read,

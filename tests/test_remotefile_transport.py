@@ -2317,23 +2317,33 @@ class _NlstRefusingFtp(_NlstOnlyFtp):
     """An NLST-only server that answers ``NLST`` with one permanent reply (BACKLOG #1130)."""
 
     def __init__(
-        self, reply: str, *, dir_exists: bool = True, pwd_reply: str | None = None
+        self,
+        reply: str,
+        *,
+        dir_exists: bool = True,
+        pwd_error: ftplib.Error | None = None,
+        pwd_reply: str = '257 "/home" is the current directory',
+        home_refused: bool = False,
     ) -> None:
         super().__init__([])
         self._reply = reply
         self._dir_exists = dir_exists
+        self._pwd_error = pwd_error
         self._pwd_reply = pwd_reply
+        self._home_refused = home_refused
         self.cwds: list[str] = []
 
     def nlst(self, path: str) -> list[str]:
         raise ftplib.error_perm(self._reply)
 
     def pwd(self) -> str:
-        if self._pwd_reply is not None:
-            raise ftplib.error_perm(self._pwd_reply)
-        return "/home"
+        if self._pwd_error is not None:
+            raise self._pwd_error
+        return ftplib.parse257(self._pwd_reply)  # what ftplib.FTP.pwd returns for this reply
 
     def cwd(self, path: str) -> str:
+        if path == "/home" and self._home_refused:
+            raise ftplib.error_perm("550 /home: Permission denied")
         if path != "/home" and not self._dir_exists:
             raise ftplib.error_perm("550 No such file or directory")
         self.cwds.append(path)
@@ -2363,12 +2373,38 @@ def test_an_nlst_empty_reply_for_a_missing_directory_still_fails() -> None:  # #
         _FtpClient._names(ftp, "/inbx")  # type: ignore[arg-type]
 
 
-def test_a_refused_pwd_raises_the_original_nlst_reply() -> None:  # #1130
+@pytest.mark.parametrize(
+    "pwd_error",
+    [
+        ftplib.error_perm("502 Command not implemented"),
+        ftplib.error_reply("200 Not a PWD reply"),  # what parse257 raises for a non-257 reply
+        ftplib.error_proto("garbage"),
+    ],
+    ids=["refused", "unreadable", "protocol"],
+)
+def test_a_pwd_that_fails_raises_the_original_nlst_reply(pwd_error: ftplib.Error) -> None:  # #1130
     # The check confirms nothing, so the NLST reply raises as it did before the check existed.
-    ftp = _NlstRefusingFtp("550 No files found", pwd_reply="502 Command not implemented")
+    ftp = _NlstRefusingFtp("550 No files found", pwd_error=pwd_error)
     with pytest.raises(ftplib.error_perm, match="No files found"):
         _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
     assert ftp.cwds == []
+
+
+def test_a_pwd_with_no_quoted_path_raises_the_original_nlst_reply() -> None:  # #1130
+    # ftplib reads no home from an unquoted 257, and cwd("") sends CWD ., which succeeds and would
+    # leave the session inside remote_dir. So the check stops before any CWD.
+    ftp = _NlstRefusingFtp("550 No files found", pwd_reply="257 /home is cwd")
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._list(ftp, "in")  # type: ignore[arg-type]
+    assert ftp.cwds == []
+
+
+def test_a_refused_return_to_home_raises_the_original_nlst_reply() -> None:  # #1130
+    # remote_dir was entered, but the session could not be put back, so nothing is confirmed.
+    ftp = _NlstRefusingFtp("550 No files found", home_refused=True)
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._names(ftp, "/in")  # type: ignore[arg-type]
+    assert ftp.cwds == ["/in"]
 
 
 @pytest.mark.parametrize(
@@ -2645,6 +2681,22 @@ async def test_another_listing_form_counts_only_entries_the_pattern_would_read(
         await src._poll_once()
     assert _OTHER_FORM_LINE not in sink.text
     assert _TRAVERSAL_LINE not in sink.text
+
+
+async def test_another_listing_form_matches_the_pattern_against_the_file_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # pattern is a file-name glob. An entry named as a path is judged by its last part, so a
+    # pattern that does not start with "*" still counts it, and the operator gets the WARNING.
+    client = _NlstListingClient(["/data/in/ADT_1.hl7", "/data/in/ORU_1.hl7"])
+    src = _src(monkeypatch, client, pattern="ADT_*.hl7")
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert "1 NLST listing entry named a path" in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+    assert src._other_form_warned_at is not None
+    assert client.ops == []
 
 
 async def test_a_path_from_any_other_listing_still_logs_as_traversal(
