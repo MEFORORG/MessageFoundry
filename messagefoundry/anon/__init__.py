@@ -5,7 +5,9 @@
 Turns a real, messy HL7 v2 message into a **structurally-faithful, de-identified** copy to commit,
 share, and replay as a fixture — the first built slice of the de-identification capability CLAUDE.md
 §9 / PHI.md §9 call planned-not-built. Consumed by the standalone **tee** relay and the PySide6
-**test harness**; a byte-identical ``tee/anon/`` vendors the shared logic for the dependency-free tee.
+**test harness**; ``tee/anon/`` vendors the logic for the dependency-free tee. Only some of its
+files are byte-identical copies: ``tests/test_anon_parity.py`` names which, and checks that the two
+anonymizers give the same output on a generated corpus and a set of hand-written inputs.
 
 Two-layer rule model (ADR 0030 §2): field **selection** is data (:func:`load_rules` over an optional
 ``anon.toml``); surrogate **production** is code (:mod:`.surrogates`). Surrogates are deterministic

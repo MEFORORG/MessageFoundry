@@ -89,19 +89,14 @@ _SITES = (
         2,
         id="parity-test-comments",
     ),
-    # The module docstring of messagefoundry/anon/__init__.py still makes the blanket claim, and
-    # another change in the same pull request corrects it. The mark is strict on purpose: the
-    # correction turns this case red until the mark is removed, so the site cannot stay unguarded.
-    # The floor here is wording the docstring holds before and after, so the retired phrase is the
-    # only reason this case fails today.
+    # The module docstring of messagefoundry/anon/__init__.py made the blanket claim. Only some
+    # files under tee/anon/ are byte-identical copies, and the docstring now points at the parity
+    # test, which names them.
     pytest.param(
         "messagefoundry/anon/__init__.py",
         ("a byte-identical tee/anon/",),
-        "tee/anon/",
+        "tests/test_anon_parity.py names which",
         1,
-        marks=pytest.mark.xfail(
-            strict=True, reason="the anon/__init__.py docstring is corrected in a later commit"
-        ),
         id="anon-package-docstring",
     ),
 )

@@ -665,6 +665,42 @@ def test_a_clean_return_can_still_carry_a_name_a_date_and_an_undashed_ssn(
     assert report.hits == []  # type: ignore[attr-defined]
 
 
+def _zzz_message(field_sep: str, value: str) -> str:
+    """A synthetic message whose header declares ``field_sep``, with ``value`` in an unmapped ZZZ."""
+    header = field_sep.join(
+        ("MSH", "^~\\&", "A", "B", "C", "D", "20260101", "", "ADT^A01", "M1", "P", "2.5.1")
+    )
+    return _msg(header, field_sep.join(("ZZZ", "1", value)))
+
+
+@_NO_SCANNER
+@_CHECKED
+@pytest.mark.parametrize(
+    ("value", "shape"),
+    [("123-45-6789", "SSN-shaped"), ("555-555-0100", "phone-shaped")],
+    ids=("ssn", "phone"),
+)
+def test_a_shape_split_by_the_field_separator_passes(
+    checked: Callable[..., str], value: str, shape: str
+) -> None:
+    """A KNOWN GAP, pinned as docs/PHI.md section 9 states it (BACKLOG #2996). The detectors read
+    one field at a time, so a dashed value under a field separator of ``-`` is three fields and
+    none of them has the shape.
+
+    A fix should turn the first half of this test around: the ``-`` message must then be refused.
+    Update docs/PHI.md section 9 in the same change.
+    """
+    reports: list[object] = []
+    out = checked(_zzz_message("-", value), salt=_SALT, on_report=reports.append)
+    assert out.split("\r")[1] == f"ZZZ-1-{value}"  # the value leaves whole, in the output
+    (report,) = reports
+    assert report.hits == []  # type: ignore[attr-defined]
+    assert report.structural_hits == []  # type: ignore[attr-defined]
+    # The control: the same value under the usual separator is one field, and it is refused.
+    with pytest.raises(RuntimeError, match=f"{shape} value in ZZZ-2"):
+        checked(_zzz_message("|", value), salt=_SALT)
+
+
 def test_alphanumeric_identifier_preserves_width_and_shape() -> None:
     msg = _msg(
         r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",

@@ -79,8 +79,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # Reads messagefoundry/config/ai_policy.py, messagefoundry/anon/__init__.py and
         # harness/load/corpus.py off disk (BACKLOG #2996). It fails when the ai_policy or corpus
         # docstring calls the anonymizer's output PHI-free again. Its anon/__init__.py arm is about
-        # the "byte-identical tee/anon/" claim only, and is a strict xfail until that docstring is
-        # corrected. Either change arrives as an ENGINE or harness diff, which does not trip the
+        # the "byte-identical tee/anon/" claim only: it fails when that docstring makes the claim
+        # again. Either change arrives as an ENGINE or harness diff, which does not trip the
         # tooling path gate. Its other arms read docs/*.md, and they are not the reason it stays.
         "test_anon_doc_claims.py",
         # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of

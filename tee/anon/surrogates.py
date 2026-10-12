@@ -638,9 +638,9 @@ _TIME_OF_DAY = r"""
       )?)?
     (?:[+-](?:(?:0[0-9]|1[0-3])[0-5][0-9]|1400))?  # offset, no wider than 1400 either way
 """
-#: Every character the three grammars are written in. A message that declares one of them as a
-#: separator is not preserved at all: under a repetition separator of ``-``, ``000-12-3456`` splits
-#: into three valid numbers.
+#: Every character the three grammars are written in. No numeric value is kept when one of them is
+#: the component, repetition or subcomponent separator: under a repetition separator of ``-``,
+#: ``000-12-3456`` splits into three valid numbers. The field separator is not read.
 _NUMERIC_GRAMMAR_CHARS = frozenset("0123456789+-.:/<>=")
 #: What each COMPONENT of a preserved numeric value must match, by position. A value with more
 #: components than its type has is refused. ``NM`` takes a leading comparator because ``<5`` under
@@ -674,8 +674,8 @@ def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
 def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps: Seps) -> bool:
     """True if every repetition of ``value`` fits ``grammar``, component by component. An empty
     component is legal, because an ``SN`` leaves out the parts it does not use. No numeric type has
-    subcomponents, and the patterns refuse that separator like any other stray character. Nothing
-    is kept under a separator the grammars themselves use, because the split would hide it."""
+    subcomponents, and the patterns refuse that separator. Nothing is kept when a grammar uses the
+    component, repetition or subcomponent separator. The field separator is not read."""
     if not _NUMERIC_GRAMMAR_CHARS.isdisjoint((seps.component, seps.repetition, seps.subcomponent)):
         return False
     for rep in value.split(seps.repetition):
