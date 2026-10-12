@@ -245,7 +245,7 @@ def test_a_redirect_off_the_box_is_refused_not_followed(monkeypatch: pytest.Monk
     ):
         _set_env_proxy(monkeypatch, proxy_port)
         get = make_getter(f"http://127.0.0.1:{engine_port}", _TOKEN, timeout=5.0)
-        with pytest.raises(MeforApiError, match="HTTP 302"):
+        with pytest.raises(MeforApiError, match="HTTP 302 .*redirects are not followed"):
             get(_PATH)
     assert proxy_seen == []
     assert len(engine_seen) == 1

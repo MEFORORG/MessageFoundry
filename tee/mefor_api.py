@@ -8,7 +8,9 @@ message's per-destination transformed payloads. Uses :mod:`urllib.request` delib
 standalone (stdlib + ``aiosqlite``), the same dependency-minimal principle as the vendored MLLP/HL7
 codecs: a few authenticated GETs to a default-localhost engine need only a timeout, a bearer-token
 header and an optional TLS context. (mTLS / rich retry against a remote TLS engine would be the trigger
-to revisit a richer HTTP client — deferred, not built.)
+to revisit a richer HTTP client — deferred, not built.) The opener also dials a loopback engine past
+any proxy and follows no redirect (BACKLOG #2708); a replacement client must keep both, or the token
+can reach a proxy again.
 
 The ``/messages/{id}/outbound`` body is PHI; callers handle it under the test-data-only guardrail.
 """
@@ -39,7 +41,7 @@ def _is_loopback_host(host: str | None) -> bool:
 
     A copy of ``is_never_proxied_host`` in ``messagefoundry/transports/bounded_read.py``, which says
     which hosts that is. The tee imports no ``messagefoundry``, so it carries its own;
-    ``tests/test_tee_mefor_api.py`` holds the two equal."""
+    ``tests/test_tee_mefor_api.py`` compares the two on a sample of hosts."""
     if not host:
         return False
     host = host.lower()
@@ -109,7 +111,12 @@ def make_getter(
             with opener.open(req, timeout=timeout) as resp:  # nosec B310
                 payload = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            raise MeforApiError(f"GET {path} -> HTTP {exc.code} {exc.reason}") from exc
+            # The Location is left out: it names a host, and an operator may paste this error.
+            redirected = 300 <= exc.code < 400
+            hint = (
+                " (redirects are not followed; give the engine's own address)" if redirected else ""
+            )
+            raise MeforApiError(f"GET {path} -> HTTP {exc.code} {exc.reason}{hint}") from exc
         except urllib.error.URLError as exc:
             raise MeforApiError(f"GET {path} failed: {exc.reason}") from exc
         try:

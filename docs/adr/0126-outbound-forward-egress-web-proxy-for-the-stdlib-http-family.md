@@ -300,7 +300,8 @@ contradicts. The sentences stay in place, each marked with a pointer here.
   `make_getter` in `tee/mefor_api.py` dials a loopback engine direct by its own copy of Amendment
   B's host rule, and an off-box engine still reaches the proxy (BACKLOG #2708). It also follows no
   redirect. The tee imports no engine code, so it cannot share the handler. It copies the host rule
-  only: it has no refusal of a web-proxy credential, because it sets none of its own.
+  only, not the refusal of a web-proxy credential. A `user:password@` written into `HTTP_PROXY` or
+  `HTTPS_PROXY` still goes to the proxy for an off-box engine, as stock urllib sends it.
   `tests/test_tee_mefor_api.py` pins both cases.
 
 ### Amendment E (2026-10-12) — a proxy written `https://` gets no pass
