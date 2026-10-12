@@ -19,8 +19,12 @@ arm stays unexpressible, which is why the "not present" arm is the one taken.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
+import textwrap
+from collections.abc import Callable
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +34,7 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.store.base import Store
-from messagefoundry.store.store import MessageStore, new_user_record
+from messagefoundry.store.store import MessageStore, UserRow, new_user_record
 from tests._admin_account import provision_totp
 
 # The three store classes, reused rather than re-derived — that module's docstring establishes the
@@ -107,12 +111,13 @@ def test_no_store_backend_can_be_asked_to_create_a_disabled_account() -> None:
     INSERT that binds every column, ``disabled`` included, from :func:`new_user_record`. So the
     second altitude moved there: that builder takes no ``disabled`` parameter either, it sets the
     column to a literal False rather than deciding it from its inputs, and each backend's
-    ``create_user`` builds its row with it. Both altitudes are asserted because the signature alone
-    would not catch a row builder that started deciding the column for itself. Reaching the
-    disabled arm of 6.3.2 is therefore a protocol change across three backends and the shared
-    builder, not a keyword at the one call site — a cost the redesign has to price rather than
-    discover. :func:`test_every_backend_binds_disabled_false_in_its_user_insert` checks the value
-    each backend's INSERT really binds.
+    ``create_user`` calls it once. Both altitudes are asserted because the signature alone would
+    not catch a row builder that started deciding the column for itself. Reaching the disabled arm
+    of 6.3.2 is therefore a protocol change across three backends and the shared builder, not a
+    keyword at the one call site — a cost the redesign has to price rather than discover. The call
+    is read off each ``create_user``'s syntax tree, which does not show where its row goes;
+    :func:`test_every_backend_binds_disabled_false_in_its_user_insert` checks the value each
+    backend's INSERT really binds.
     """
     signatures = {"protocol": Store.create_user, "new_user_record": new_user_record} | {
         name: cls.create_user for name, cls in _BACKENDS.items()
@@ -124,23 +129,45 @@ def test_no_store_backend_can_be_asked_to_create_a_disabled_account() -> None:
         # parameter mapping would satisfy the assertion above for the wrong reason.
         assert "username" in params, f"{name} signature did not read as expected"
 
-    # The builder hardcodes the column. Read off its source, whitespace-normalised, so a computed
-    # value (`disabled=password_hash is None`) cannot pass. The count is the positive control: one
-    # assignment, so the read found the row literal rather than a stray mention.
-    builder = " ".join(inspect.getsource(new_user_record).split())
-    assignments = re.findall(r"\bdisabled=([^,)]+)", builder)
-    assert len(assignments) == 1, f"expected one 'disabled=' in new_user_record, saw {assignments}"
-    assert assignments[0].strip() == "False", f"new_user_record sets disabled={assignments[0]!r}"
+    # The builder hardcodes the column. Read off its syntax tree, so a docstring or comment cannot
+    # count, and a computed value (`disabled=password_hash is None`) is not a constant.
+    keywords = [
+        kw
+        for node in ast.walk(_function_tree(new_user_record))
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+    ]
+    # Positive control: the walk reached the row's own keyword arguments, one per column.
+    assert len(keywords) >= len(fields(UserRow)), f"read {len(keywords)} keyword arguments"
+    disabled = [kw.value for kw in keywords if kw.arg == "disabled"]
+    assert len(disabled) == 1, [ast.unparse(v) for v in disabled]
+    assert isinstance(disabled[0], ast.Constant) and disabled[0].value is False, (
+        f"new_user_record sets disabled={ast.unparse(disabled[0])}"
+    )
+    # A `**mapping` argument could set the column without naming it.
+    assert all(kw.arg is not None for kw in keywords), "new_user_record passes a ** mapping"
 
     for name, cls in _BACKENDS.items():
-        assert "new_user_record(" in inspect.getsource(cls.create_user), (
-            f"{name}.create_user no longer builds its row with new_user_record"
-        )
+        builds = [
+            node
+            for node in ast.walk(_function_tree(cls.create_user))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "new_user_record"
+        ]
+        assert len(builds) == 1, f"{name}.create_user calls new_user_record {len(builds)} times"
 
 
-#: Two account shapes that differ in every input ``create_user`` takes, so a backend whose INSERT
-#: derived ``disabled`` from one of them would bind True for at least one shape.
-_ACCOUNT_SHAPES: list[dict[str, object]] = [
+def _function_tree(func: Callable[..., object]) -> ast.AST:
+    """``func``'s own syntax tree, dedented so a method parses on its own."""
+    return ast.parse(textwrap.dedent(inspect.getsource(func)))
+
+
+#: Two account shapes, a local one with a credential and a directory one without, differing in the
+#: provider, credential, profile and time inputs. Not every input: ``notify_email`` and ``audits``
+#: stay at their defaults in both. The static test above is what rules out a derived value; these
+#: check what the INSERT binds.
+_ACCOUNT_SHAPES: list[dict[str, Any]] = [
     {
         "user_id": "u-local",
         "username": "local-op",
@@ -150,6 +177,7 @@ _ACCOUNT_SHAPES: list[dict[str, object]] = [
         "password_hash": "not-a-real-hash",
         "must_change_password": True,
         "password_generated": True,
+        "now": 1_700_000_000.0,
     },
     {
         "user_id": "u-dir",
@@ -158,6 +186,7 @@ _ACCOUNT_SHAPES: list[dict[str, object]] = [
         "directory_object_id": "a79c897c-1793-5458-bd1b-b3ae0642c0e3",
         "password_generated": False,
         "adopt_notify_email": False,
+        "now": 1_700_000_100.0,
     },
 ]
 
@@ -167,22 +196,26 @@ async def test_every_backend_binds_disabled_false_in_its_user_insert() -> None:
 
     SQLite runs for real and the row is read back. The two server backends need a live database, so
     their one write call, ``_execute_with_audits``, is captured instead, and the bound ``disabled``
-    value is read positionally off the captured statement's own column list. The username slot is
-    the positive control: it proves the positional read lines up with the bound parameters.
+    value is read off the captured statement's own column list. That list must equal the
+    :class:`UserRow` field order the parameters are built in, so every slot lines up, and slots on
+    both sides of ``disabled`` are checked against the inputs as the positive control.
     """
     sqlite = await MessageStore.open(":memory:")
     try:
         for shape in _ACCOUNT_SHAPES:
-            await sqlite.create_user(**shape)  # type: ignore[arg-type]
+            await sqlite.create_user(**shape)
             user = await sqlite.get_user(str(shape["user_id"]))
             assert user is not None and user.username == shape["username"]
             assert user.disabled is False, f"SQLite created {shape['username']} disabled"
     finally:
         await sqlite.close()
 
+    row_columns = [f.name for f in fields(UserRow)]
+    exercised: list[str] = []
     for name, cls in _BACKENDS.items():
         if cls is MessageStore:
             continue
+        exercised.append(name)
         store: Any = object.__new__(cls)  # the offline idiom: no pool, no I/O
         store._row_sealer = None  # what the constructor sets on a keyless store
         captured: list[tuple[str, tuple[object, ...]]] = []
@@ -205,13 +238,18 @@ async def test_every_backend_binds_disabled_false_in_its_user_insert() -> None:
             match = re.search(r"INSERT INTO users \((.*?)\) VALUES", " ".join(sql.split()))
             assert match is not None, f"{name}.create_user did not write an INSERT INTO users"
             columns = [c.strip() for c in match.group(1).split(",")]
+            assert columns == row_columns, f"{name}'s INSERT columns are not in UserRow order"
             assert len(columns) == len(params), (
                 f"{name}: {len(columns)} columns, {len(params)} params"
             )
-            assert params[columns.index("username")] == shape["username"], f"{name} slots misread"
-            assert params[columns.index("disabled")] is False, (
-                f"{name} bound disabled={params[columns.index('disabled')]!r} for {shape['username']}"
+            bound = dict(zip(columns, params, strict=True))
+            assert bound["username"] == shape["username"], f"{name} slots misread"
+            assert bound["created_at"] == shape["now"], f"{name} slots misread"
+            assert bound["password_generated"] is shape["password_generated"], name
+            assert bound["disabled"] is False, (
+                f"{name} bound disabled={bound['disabled']!r} for {shape['username']}"
             )
+    assert exercised == ["Postgres", "SQL Server"], exercised
 
 
 async def test_a_directory_sign_in_creates_a_roleless_row() -> None:
