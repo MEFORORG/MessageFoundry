@@ -35,6 +35,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
+    CaFileUnreadable,
     HopPosture,
     InsecureHopRefused,
     TrustAnchorPolicy,
@@ -432,14 +433,15 @@ def _config_error(
 def test_a_bad_ca_file_is_reported_before_the_revocation_refusal(
     cell: str, shape: str, tmp_path: Path
 ) -> None:
-    """A ``tls_ca_file`` the opener build cannot load raises ``OSError``, which is what ``ssl``
-    raises: ``FileNotFoundError`` for a missing file and ``ssl.SSLError`` for one with no
-    certificate. Neither is a ``ValueError``, so neither can be the posture refusal."""
+    """A ``tls_ca_file`` the opener build cannot load raises ``CaFileUnreadable``, missing or not
+    PEM (vault BACKLOG #2370, #2977 item 10). It is an ``OSError``, and the posture refusal is
+    not, so it cannot be the posture refusal."""
     ca = tmp_path / "ca.pem"
     if shape == "not-pem":
         ca.write_text("not a certificate\n", encoding="ascii")
-    with active_hop_posture(PROD_PHI), pytest.raises(OSError):
+    with active_hop_posture(PROD_PHI), pytest.raises(OSError) as caught:
         _build(cell, extra={"tls_ca_file": str(ca)})
+    assert isinstance(caught.value, CaFileUnreadable)
 
 
 @pytest.mark.parametrize("cell", list(_CELLS))

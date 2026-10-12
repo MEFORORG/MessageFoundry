@@ -1181,16 +1181,19 @@ def apply_connection_tls_ciphers(
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
     try:
         if ciphers is None:
-            # Raises only EngineTlsListRefused, so the unset hop is never "tls_ciphers rejected".
             narrow_to_approved_suites(ctx)
-            return
-        text = str(ciphers)
-        validate_tls_ciphers(text)
-        apply_operator_tls_ciphers(ctx, text)
+        else:
+            text = str(ciphers)
+            validate_tls_ciphers(text)
+            apply_operator_tls_ciphers(ctx, text)
     except EngineTlsListRefused as exc:
         # The build refused the engine's list, so name the connector without blaming its string.
         raise EngineTlsListRefused(f"{connector}: {exc}") from exc
     except (ValueError, ssl.SSLError) as exc:
+        if ciphers is None:
+            # No operator string is set, so the connector is named without "tls_ciphers rejected"
+            # (BACKLOG #3096). Latent: the narrow raises only EngineTlsListRefused today.
+            raise ValueError(f"{connector}: {exc}") from exc
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
 
@@ -1726,9 +1729,10 @@ def urllib_handler_context(
 
 
 def _narrow_library_context(ctx: ssl.SSLContext, *, connector: str, hop: str) -> None:
-    """:func:`narrow_to_approved_suites` for a library-built hop, a refusal re-raised as ValueError.
+    """:func:`narrow_to_approved_suites` for a library-built hop, a refusal re-raised naming the hop.
 
-    The ldap3 and hvac factories share it. Each still calls :func:`harden_cipher_suites` itself
+    The refusal stays an :class:`EngineTlsListRefused`, with the connector and hop in front of its
+    text. The ldap3 and hvac factories share it. Each still calls :func:`harden_cipher_suites` itself
     after it, so the call-site guards see the assertion at each seam by name."""
     try:
         narrow_to_approved_suites(ctx)  # TLS 1.2, TLS 1.3 and sigalgs (BACKLOG #300, #2494)
@@ -2681,9 +2685,10 @@ class TrustAnchorPolicy:
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
     #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
-    #: reaches (BACKLOG #299), and to the inbound FTPS poller, which dials out (BACKLOG #2370). Independent of ``mode``: revocation is orthogonal to which roots anchor
-    #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
-    #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
+    #: reaches (BACKLOG #299), and to the inbound FTPS poller, which dials out (BACKLOG #2370).
+    #: Independent of ``mode``: revocation is orthogonal to which roots anchor the hop, so a
+    #: ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching the
+    #: exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
     crl_file: str | None = None
 
 
@@ -2803,27 +2808,39 @@ class CaFileUnreadable(OSError, ValueError):
 
     Both bases on purpose. It was a bare ``FileNotFoundError`` before, so a caller catching
     ``OSError`` still catches it. The load seams surface a ``ValueError`` as a configuration
-    refusal, so it now reads as one too, with the setting and connection in the text."""
+    refusal, so it now reads as one too, with the setting and connection in the text.
+
+    It also covers a file that reads but holds no usable PEM, which ``ssl`` raises as an
+    :class:`ssl.SSLError` (vault BACKLOG #2977 item 10)."""
 
 
 @contextmanager
 def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
-    """Turn an unreadable ``anchor.cafile`` into :class:`CaFileUnreadable` naming its setting.
+    """Turn an unloadable ``anchor.cafile`` into :class:`CaFileUnreadable` naming its setting.
 
-    An :class:`ssl.SSLError` (a file that reads but holds no usable PEM) passes through unchanged:
-    it is an :class:`OSError` too, but not the missing-file case this names."""
+    Two shapes get the one worded error: a file that cannot be read, and one that reads but holds
+    no usable PEM. The second is an :class:`ssl.SSLError`, and it used to pass through raw, naming
+    neither the setting nor the connection (vault BACKLOG #2977 item 10)."""
     try:
         yield
-    except ssl.SSLError:
-        raise
     except OSError as exc:
         # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
         # test returns this text to the caller and audits it. The setting tells the operator where.
-        # It does not make the hop path-free; a [tls].crl_file refusal still names its file.
+        #
+        # A [tls].crl_file refusal on the same hop still names its file, and the two shapes are
+        # kept by Manager decision (BACKLOG #3096 item 11). This CA setting is per connection. The
+        # CRL file is the instance's one [tls] setting: settings load refuses a missing one, path
+        # and all, and harden_crl_check's refusals at hop build name it too. So the CRL path can
+        # still reach a connection test's text. One rule for both is not decided here.
         setting = anchor.cafile_setting or "the CA file setting"
-        raise CaFileUnreadable(
-            f"{setting} names a CA file that cannot be read: {exc.strerror or type(exc).__name__}"
-        ) from exc
+        if isinstance(exc, ssl.SSLError):
+            # OpenSSL's text names no path. reason is None for some errors, such as a bad PEM body,
+            # and absent on an SSLError built in Python.
+            reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
+            problem = f"OpenSSL could not load as PEM certificates: {reason}"
+        else:
+            problem = f"cannot be read: {exc.strerror or type(exc).__name__}"
+        raise CaFileUnreadable(f"{setting} names a CA file that {problem}") from exc
 
 
 def build_verifying_client_context(
