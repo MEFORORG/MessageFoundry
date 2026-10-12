@@ -152,8 +152,9 @@ it stands.
 R2 into this section and routed four questions it did not decide. The batch 309 Manager seat
 answered the first three under the owner's driver rule, which tells that seat to decide calls like
 these itself. They are not owner rulings, and the owner may overturn any of them. The record is
-`docs/security/ASVS-MANAGER-RULINGS-2026-10-11-BATCH309.md`, pending in the `MessageFoundry-vault`
-repository on vault branch `b309-rulings-and-cells`. §1.1d answers the fourth.
+MD-19, MD-20 and MD-21 of `docs/security/ASVS-MANAGER-RULINGS-2026-10-11-BATCH309.md`, pending in
+the `MessageFoundry-vault` repository on vault branch `b309-rulings-and-cells`. §1.1d answers the
+fourth.
 
 1. A reverse proxy that the assessed posture (§2.2) names cannot meet a host-substrate limb. The
    proxy is not one of the five software artifacts that §2 assesses, so a cell grades what those
@@ -265,12 +266,13 @@ Four limits come with the two-branch rule.
    owner rulings file below names that cell.
 
 **One consequence is flagged, and nobody has decided it.** Limit 1 may change the rule under which
-at least one cell is graded today. That cell is a candidate for a re-read. The Manager rulings file
-named in §1.1b names it.
+at least one cell is graded today. That cell is a candidate for a re-read. The owner rulings file
+named below names it.
 
 **Which parts are the owner's.** On 2026-10-11 the owner was asked about the two-branch rule above.
-The question said adversarial review had upheld it with amendments. The owner chose the option whose
-description begins *"Adopt the split"*. The four limits are those amendments. Their wording is the
+The question said adversarial review had upheld it with amendments. Two of the three options
+adopted the split. The owner chose the one that also raises a cell, not the one that holds the cell
+at `needs-review`. The four limits are those amendments. Their wording is the
 batch 309 Manager seat's, after adversarial review, and the owner was not asked about them one by
 one. Some text here is neither the ruling nor its amendments. It is this section's reading, added
 in code review. At least these passages are that reading:
@@ -280,7 +282,7 @@ in code review. At least these passages are that reading:
 - in limit 3, the two sentences on what the instrument must answer;
 - the cause-4 sentence in limit 4, and the flagged consequence.
 
-The ruling was given in session. Its record is
+The ruling was given in session. Its record is B309-R3 of
 `docs/security/OWNER-RULINGS-2026-10-11-BATCH309.md`, pending in the `MessageFoundry-vault`
 repository on vault branch `b309-rulings-and-cells`.
 
