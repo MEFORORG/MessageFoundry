@@ -3591,10 +3591,12 @@ def _serve(args: argparse.Namespace) -> int:
             "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
             f"over the network{oidc_exception}, and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
-            "exposure signal the engine can verify). Declare it by naming the proxy in "
-            "[api].trusted_proxies, with [api].tls_terminated_upstream=true if it terminates TLS or "
-            "an operator [api].tls_cert_file if it re-encrypts to the engine; or set "
-            "[security].require_mfa=true.",
+            "exposure signal the engine can verify). Set [security].require_mfa=true. If a proxy "
+            "does serve that origin, also declare it by naming the proxy in [api].trusted_proxies, "
+            "with [api].tls_terminated_upstream=true if it terminates TLS or an operator "
+            "[api].tls_cert_file if it re-encrypts to the engine. A declared proxy counts as "
+            "exposed, so with require_mfa still off the MFA-at-exposure gate then applies, and a "
+            "declared terminator has start requirements of its own (docs/CONFIGURATION.md).",
             file=sys.stderr,
         )
 

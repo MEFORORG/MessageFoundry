@@ -2417,6 +2417,8 @@ def test_undeclared_proxy_warns_about_single_factor_admin(
     assert "naming the proxy in [api].trusted_proxies" in err
     assert "[api].tls_terminated_upstream=true if it terminates TLS" in err
     assert "[api].tls_cert_file if it re-encrypts" in err
+    # Declaring the proxy is not a way round MFA: it is what makes the refusal apply.
+    assert "the MFA-at-exposure gate then applies" in err
     assert "proxy posture is undeclared" not in err, (
         "the ADR 0068 §8 heuristic fired after all — re-check whether this arm is still needed, and "
         "correct the docs either way"

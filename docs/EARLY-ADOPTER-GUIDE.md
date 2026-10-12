@@ -298,7 +298,7 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 >
 > The refuse/warn severity of the PHI serve-gate ladder is the `[security].enforcement` dial (default
 > `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind with no proxy
-> declared or trusted you hit only the keyless-PHI refusal above. The exposure rungs need an exposed
+> declared or trusted you hit at least the keyless-PHI refusal above, and none of the exposure rungs. Those need an exposed
 > instance: a non-loopback bind, or a loopback bind behind a declared or trusted proxy
 > (`[api].tls_terminated_upstream` or `[api].trusted_proxies`). At least the MFA-at-exposure rung fires on
 > each of those. Which other rungs fire depends on which of them you have. Set `[security].enforcement = warn` to downgrade the PHI refusals to loud, audited warnings during

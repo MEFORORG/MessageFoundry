@@ -317,12 +317,14 @@ The one row that *does* vary:
 > ASVS 12.1.1 startup probe dials that origin to measure the terminator's TLS floor, so leaving it
 > unset *silently disabled the check* rather than failing it — and a control that degrades to a
 > no-op reports success forever afterwards. So on a PHI instance, read this as a property of the
-> **deployment posture**, not of whether you serve the console. The probe runs only behind a declared
-> terminator. A proxy named in `trusted_proxies` alone, re-encrypting to an operator `tls_cert_file`,
-> is not probed, so nothing at start measures that proxy's TLS floor (vault BACKLOG #3102). It is only in the **in-process-TLS off-loopback** case that the
+> **deployment posture**, not of whether you serve the console. It is only in the **in-process-TLS off-loopback** case that the
 > engine warns and starts — and *there* the ceremonies do fail closed (no passkeys) until you set it.
 > Either way, **changing its host later invalidates every enrolled passkey** (they pin their
 > mint-time RP; the account page marks them "unusable (origin changed)").
+>
+> **The ASVS 12.1.1 probe runs only behind a declared terminator.** A proxy named in
+> `trusted_proxies` alone, re-encrypting to an operator `tls_cert_file`, is not probed, so nothing
+> at start measures that proxy's TLS floor (vault BACKLOG #3102).
 
 > **Off-loopback browser-console walkthrough (L5b, ADR 0068 §8).**
 >
