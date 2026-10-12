@@ -15,20 +15,24 @@ arguments spells the variable in a string, or refers to ``INSECURE_TLS_ESCAPE_EN
 an attribute; that covers f-strings, ``%`` and ``+`` formatting, ``.format``, and a ``%s`` logging
 argument. A nested call keeps its strings to itself, so it cannot lend the posture to the call
 around it. Two nested calls are this call's own text instead: ``"...".format(...)``, and a call
-whose result ``%`` or ``.format`` fills, such as ``_("set %s") % NAME``. A literal, an f-string and a ``+`` chain
+whose result ``%`` or ``.format`` fills, such as ``_("set %s") % NAME``. That second rule has a
+cost: any call on the left of ``%`` lends its strings, whatever it is for. A literal, an f-string
+and a ``+`` chain
 of them are read as the one string Python builds, in source order, with ``{}`` where a value goes.
 The text is every such string that holds a space or spells the variable, so a bare key such as the
 ``""`` default of ``os.environ.get`` is not a message. That text must name the posture, and a
 phrase that wraps or is split across ``+`` still counts.
 
 **What the prose scans see** (vault BACKLOG #3099). Docstrings in ``_DOCSTRING_FILES``, one
-paragraph at a time: a paragraph that spells the variable must name the posture, so a second
-mention cannot ride on the first. Comments in ``_COMMENT_FILES``: own-line comments on consecutive
+paragraph at a time: a paragraph that spells the variable must name the posture, so a mention
+cannot ride on the posture in another paragraph. Two mentions inside one paragraph are judged
+together. Comments in ``_COMMENT_FILES``: own-line comments on consecutive
 lines are one comment, and a comment after code is read alone. A comment names the escape when it
 spells the variable. A comment in a ``def`` signature also names it when it says "the escape",
 because a factory's parameter comments are the help text the connection editor shows
 (:mod:`messagefoundry.config.connection_schema`). A signature comment about another escape must
-name that one some other way.
+name that one some other way. The editor joins a parameter's comments by its own rules, and this
+scan does not copy them: it reads each trailing comment alone, which is stricter.
 
 **The docstring files are a pinned list, not the tree.** At least ``_reject_unknown_env_keys`` and
 ``weakened_tls_escape_permitted`` in ``config/settings.py`` name the variable to list it or to
@@ -37,10 +41,12 @@ define the rule, so a scan of every docstring flags text that misleads nobody.
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
 as ``f"{INSECURE_TLS_ESCAPE_ENV}=1:refused"``; a call lent through ``+``, as in
-``(_("set %s") + "...") % NAME``; the variable handed through a nested call, as in
+``(_("set %s") + "...") % NAME``; a method called on the template, as in
+``"set %s".strip() % NAME``; the variable handed through a nested call, as in
 ``"set %s" % str(NAME)``; a docstring or comment outside the pinned files; and prose that
-says "the dev escape" without the variable. A green run is a statement about the shapes above, not
-about every text in the packages.
+says "the dev escape" without the variable. A lent call that spells the variable itself is counted
+twice, once on its own and once in the call around it. A green run is a statement about the shapes
+above, not about every text in the packages.
 
 **The positive controls are planted and pinned.** Each scanner is proved on planted sources, some
 that must be flagged and some that must pass. The tree walks are proved by pinning the files they
@@ -93,7 +99,9 @@ _MUST_FIND = frozenset(
 _DOCSTRING_FILES = (
     "messagefoundry/config/wiring.py",
     "messagefoundry/store/postgres.py",
+    "messagefoundry/transports/database.py",
     "messagefoundry/transports/direct.py",
+    "messagefoundry/transports/email.py",
     "messagefoundry/transports/remotefile.py",
 )
 #: Files whose comments are held to it. The authoring factories live here, and their parameter
@@ -114,14 +122,21 @@ def _spell(node: ast.AST, holes: list[ast.AST]) -> str:
     """The text a string expression builds: a literal, an f-string, or a ``+`` chain of them,
     joined with nothing between the parts, as Python joins them. Any other part is written as
     ``{}`` and put on ``holes``, to be read on its own."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.JoinedStr):
-        return "".join(_spell(part, holes) for part in node.values)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _spell(node.left, holes) + _spell(node.right, holes)
-    holes.append(node)
-    return _HOLE
+    spelled: list[str] = []
+    # A stack, not recursion: a long ``+`` chain nests one level per term.
+    todo = [node]
+    while todo:
+        part = todo.pop()
+        if isinstance(part, ast.Constant) and isinstance(part.value, str):
+            spelled.append(part.value)
+        elif isinstance(part, ast.JoinedStr):
+            todo.extend(reversed(part.values))
+        elif isinstance(part, ast.BinOp) and isinstance(part.op, ast.Add):
+            todo.extend((part.right, part.left))
+        else:
+            holes.append(part)
+            spelled.append(_HOLE)
+    return "".join(spelled)
 
 
 def _is_text(node: ast.AST) -> bool:
@@ -429,5 +444,6 @@ def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
     assert not failures, (
         f"these docstrings and comments name {INSECURE_TLS_ESCAPE_ENV}, or say "
         f"{_UNNAMED_ESCAPE!r} in a signature comment, without saying it works only at "
-        f"{_POSTURE!r}: {failures}"
+        f"{_POSTURE!r}. A signature comment that means some other escape must name that one "
+        f"another way: {failures}"
     )
