@@ -296,10 +296,42 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
     return len(fields) == 1 and seg_id not in defined
 
 
-def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, str]]:
+def _header_version(header: list[str], seps: Seps) -> str:
+    """The version id in MSH-12 of a header line already split into fields."""
+    return header[11].split(seps.component)[0] if len(header) > 11 else ""
+
+
+def message_version(text: str) -> str | None:
+    """The HL7 version in MSH-12 of the header of ``text``: the first line ``read_message_seps``
+    accepts, the same line :func:`unmapped_field_values` takes as the header. ``None`` when the
+    message has no parseable MSH. MLLP framing bytes are dropped first, as ``normalized_message``
+    drops them, so a captured message reads the same as its normalized form.
+
+    ``anonymize_checked`` reads this from its INPUT and hands it to :func:`leak_report`, so the
+    leak-check judges a bare line by the version the message came with (BACKLOG #3004)."""
+    text = text.replace("\x0b", "").replace("\x1c", "")
+    parsed = read_message_seps(text)
+    if parsed is None:
+        return None
+    seps, field_sep = parsed
+    lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
+    # read_message_seps accepted one of these lines, so the search cannot come back empty.
+    header = next(seg for seg in lines if read_message_seps(seg) is not None)
+    return _header_version(header.split(field_sep), seps)
+
+
+def unmapped_field_values(
+    text: str, mapped_paths: set[str], *, version: str | None = None
+) -> list[tuple[str, str]]:
     """Every ``(address, value)`` in ``text`` whose whole-field ``SEG-i`` address is **not** in
     ``mapped_paths`` and whose value is non-empty — the fields the rule map never touched. One
     kind of record has an empty value: the one a bare line gets, described below.
+
+    ``version`` is the HL7 version to judge a bare line by. Left out, it is read from the header
+    of ``text``. A caller that checks OUTPUT passes the version of the INPUT
+    (:func:`message_version`): a rule on MSH-12 writes a surrogate there, and a surrogate version
+    can leave out an id the real version defines, so a line that passed on the way in would be
+    refused on the way out (BACKLOG #3004).
 
     The MSH control header is skipped whole: it carries routing/site data the field-anchored
     site-code pass already covers, not patient PHI. The header is the ONE line
@@ -336,8 +368,8 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
     lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
     # read_message_seps accepted one of these lines, so the search cannot come back empty.
     header_at = next(n for n, seg in enumerate(lines) if read_message_seps(seg) is not None)
-    header = lines[header_at].split(field_sep)
-    version = header[11].split(seps.component)[0] if len(header) > 11 else ""
+    if version is None:
+        version = _header_version(lines[header_at].split(field_sep), seps)
     nameable = known_segments(version) | {path.split("-", 1)[0] for path in mapped_paths}
     for n, seg in enumerate(lines):
         if all(c.isspace() or not c.isprintable() for c in seg):
@@ -395,10 +427,13 @@ def _structural_reasons(value: str, seps: Seps) -> list[str]:
     return reasons
 
 
-def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
+def structural_phi_hits(
+    text: str, mapped_paths: set[str], *, version: str | None = None
+) -> list[str]:
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
     ADDRESS only (e.g. ``"unmapped SSN-shaped value in ZPD-4"``), never the offending value, so the
-    result is safe to raise/log. Empty when the message has no parseable MSH.
+    result is safe to raise/log. Empty when the message has no parseable MSH. ``version`` is
+    handed to :func:`unmapped_field_values`.
 
     A line with a malformed segment id is a hit by itself, whatever it holds: no rule can reach it,
     so the anonymizer passed it through untouched, and a wrapped name or note is exactly what such a
@@ -408,7 +443,7 @@ def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
         return []
     seps, _field_sep = parsed
     hits: list[str] = []
-    for address, value in unmapped_field_values(text, mapped_paths):
+    for address, value in unmapped_field_values(text, mapped_paths, version=version):
         if address == _MALFORMED_LINE:
             hits.append(MALFORMED_LINE_HIT)
         hits.extend(f"{reason} in {address}" for reason in _structural_reasons(value, seps))
@@ -485,7 +520,9 @@ class LeakReport:
     blanked_fields: tuple[str, ...] = ()
 
 
-def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> LeakReport:
+def leak_report(
+    text: str, *, rules: tuple[FieldRule, ...] | None = None, version: str | None = None
+) -> LeakReport:
     """The full :class:`LeakReport` for ``text`` using the tee's vendored token authority.
 
     Behaviourally parallel to the engine's :func:`messagefoundry.anon.leak.leak_report`: the token
@@ -493,6 +530,10 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
     than the engine's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
     when ``rules`` is supplied**; a bare-string call is the legacy token-only behaviour.
+
+    ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
+    ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may
+    have rewritten MSH-12. Left out, the version is read from ``text`` (BACKLOG #3004).
     """
     token_hits = scan_text(text, include_estate=True)
     # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
@@ -507,8 +548,9 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
         # counts as DECIDED for the coverage switch (BACKLOG #1710).
         # ``!=``, not ``is not``: StrEnum compares by value, so an engine or plain "keep" counts too.
         mapped_paths = {r.path for r in rules if r.kind != SurrogateKind.KEEP}
-        unmapped = tuple(sorted({addr for addr, _ in unmapped_field_values(text, mapped_paths)}))
-        structural = structural_phi_hits(text, mapped_paths)
+        walked = unmapped_field_values(text, mapped_paths, version=version)
+        unmapped = tuple(sorted({addr for addr, _ in walked}))
+        structural = structural_phi_hits(text, mapped_paths, version=version)
         decided = {r.path for r in rules}
         # A bare line has no field a rule could name, so a rule or a keep on ANY field of its
         # segment decides it (BACKLOG #3001).
@@ -519,7 +561,7 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
             sorted(
                 {
                     address
-                    for address, value in unmapped_field_values(text, decided)
+                    for address, value in unmapped_field_values(text, decided, version=version)
                     if address not in decided_bare and not _decided_by_shape(address, value, seps)
                 }
             )

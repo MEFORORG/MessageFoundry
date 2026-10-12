@@ -42,6 +42,7 @@ from .leak import (
     coverage_clause,
     leak_check,
     leak_report,
+    message_version,
     refusal_advice,
 )
 from .rules import (
@@ -157,8 +158,11 @@ def anonymize_checked(
     effective = rules if rules is not None else load_rules(overlay)
     blanked: list[str] = []
     output = anonymize(raw, salt=salt, rules=effective, blanked=blanked)
+    # The version of the INPUT: a rule on MSH-12 has put a surrogate in the output, and a
+    # surrogate version can leave out a bare id the real version defines (BACKLOG #3004).
     report = replace(
-        leak_report(output, rules=effective), blanked_fields=tuple(sorted(set(blanked)))
+        leak_report(output, rules=effective, version=message_version(raw)),
+        blanked_fields=tuple(sorted(set(blanked))),
     )
     if on_report is not None:
         on_report(report)
