@@ -1153,6 +1153,15 @@ replacement:
   at once (`/raw`, attachments, `/ui/messages/{id}/body`, a one-id `/messages/export`), and the
   route gates on `/outbound` and the `/responses` body stay as a second line. No deployment exists,
   so no stored role is broken by the change.
+  *Decided 2026-10-12, vault BACKLOG #2727:* the rule is judged **per role**, and it stays that
+  way. A `view_raw` role meant to pair with another role's `view_summary` is refused, even for a
+  user who would hold both roles. That cost is accepted. A role is the unit an administrator
+  grants, so such a role could later be assigned alone. An identity is a union of whole roles, so
+  while no role has the shape, no merged identity has it either. A rule on the merged identity
+  would need a check wherever a role reaches a user, at least each role assignment and each
+  directory group mapping. `raw_body_without_summary` in
+  [`auth/permissions.py`](../messagefoundry/auth/permissions.py) is the one predicate, and
+  `tests/test_custom_roles.py` pins the per-role answer.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
   a forbidden value that somehow reached storage is dropped.

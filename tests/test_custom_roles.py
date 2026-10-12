@@ -212,6 +212,59 @@ async def test_service_refuses_to_mint_or_edit_into_view_raw_without_view_summar
         await store.close()
 
 
+async def test_the_pairing_rule_is_judged_per_role_not_on_the_merged_identity() -> None:
+    """vault BACKLOG #2727 records the decision: the rule is per role. A ``view_raw`` role meant to
+    pair with another role's ``view_summary`` is refused at minting. A stored row of that shape
+    loses ``view_raw`` even for a user who also holds a ``view_summary`` role. The control user
+    holds one role with both permissions and keeps both."""
+    store = await _store()
+    try:
+        service = await _service(store)
+        summary_half = await service.create_custom_role(
+            display_name="Summary half",
+            description=None,
+            permissions=["messages:read", "messages:view_summary"],
+            actor="admin",
+        )
+        # Minting: refused although the partner role exists.
+        with pytest.raises(CustomRoleError, match="messages:view_raw needs messages:view_summary"):
+            await service.create_custom_role(
+                display_name="Raw half",
+                description=None,
+                permissions=["messages:view_raw", "messages:replay"],
+                actor="admin",
+            )
+        # Decoding: the same shape written straight to the store, held beside the partner role.
+        raw_half = CUSTOM_ROLE_ID_PREFIX + "rawhalf"
+        await store.upsert_role(
+            role_id=raw_half,
+            display_name="Raw half",
+            builtin=False,
+            permissions=json.dumps(["messages:view_raw", "messages:replay"]),
+        )
+        split = await _identity_for(
+            service, store, await _make_user(service, "split", summary_half.id, raw_half)
+        )
+        # The stored row still resolves, and the partner role still grants the summary.
+        assert split.has(Permission.MESSAGES_REPLAY) and split.has(Permission.MESSAGES_VIEW_SUMMARY)
+        assert not split.has(Permission.MESSAGES_VIEW_RAW)
+        # Control: one role holding both keeps both, so the drop above is the per-role rule.
+        whole_role = await service.create_custom_role(
+            display_name="Whole",
+            description=None,
+            permissions=["messages:view_raw", "messages:view_summary"],
+            actor="admin",
+        )
+        whole = await _identity_for(
+            service, store, await _make_user(service, "whole", whole_role.id)
+        )
+        assert whole.has(Permission.MESSAGES_VIEW_RAW) and whole.has(
+            Permission.MESSAGES_VIEW_SUMMARY
+        )
+    finally:
+        await store.close()
+
+
 # --- service: create + resolve (AC-1) ----------------------------------------
 
 
