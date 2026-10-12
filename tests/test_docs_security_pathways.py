@@ -2669,6 +2669,9 @@ def _security_table() -> dict[str, list[str]]:
     tables = [t for t in _tables(block) if t[0][:2] == ["Control", "Status"]]
     assert len(tables) == 1, f"{_GUIDE}'s security controls section must hold one table"
     body = [[_flat(cell).replace("*", "") for cell in row] for row in tables[0][1:]]
+    # A pipe inside a cell would shift every cell after it.
+    uneven = [row[0] for row in body if len(row) != 4]
+    assert not uneven, f"these security controls rows do not have four cells: {uneven}"
     rows = {row[0]: row for row in body}
     # A dict keeps the last of two rows with one label, so a second row would go unread.
     assert len(rows) == len(body), f"the security controls table repeats a label: {sorted(rows)}"
@@ -3467,9 +3470,10 @@ def test_the_security_controls_table_states_what_the_code_does() -> None:
     the code, row by row: the status, and the first word of the shipped default. The pages that
     used to restate these facts link here, so a row that drifts has no second copy to hide behind.
 
-    At least these rows are tied to a setting or a callable. The API TLS and log redaction rows
-    are checked for status only; `tests/test_api_tls.py` and the thirteenth sweep's second-round
-    probe hold their behaviour."""
+    Most rows are tied to a setting or a callable. The API TLS and log redaction rows are checked
+    for status and opening words only; `tests/test_api_tls.py` and the thirteenth sweep's
+    second-round probe hold their behaviour. The revocation row is tied to one CRL setting, not to
+    which hops are covered. Some probes repeat ones the sweeps above hold."""
     from messagefoundry import anon
     from messagefoundry.config import ai_policy
     from messagefoundry.config import settings as settings_module
@@ -3505,7 +3509,10 @@ def test_the_security_controls_table_states_what_the_code_does() -> None:
     row(r"^MLLP-over-TLS", "Built", "Off.")
     assert ApiSettings.model_fields["tls_client_ca_file"].default is None
     assert "`[api].tls_client_ca_file`" in row(r"^mTLS\b", "Built", "Off.")
-    row(r"revocation", "Built")
+    # Revocation is not an estate-wide control (docs/DEPLOYMENT.md, "Revocation-guard behavior"),
+    # so the row must open by saying so. The CRL setting it names as its example must exist.
+    assert settings_module.LoggingSettings.model_fields["forward_tls_crl_file"].default is None
+    assert "`[logging].forward_tls_crl_file`" in row(r"revocation", "Built", "Not on every hop.")
     # Raw TCP and X12 take no TLS setting. The second-round probe floors each signature at 10.
     assert not any(
         "tls" in name.lower() for f in (Tcp, X12) for name in inspect.signature(f).parameters
@@ -3592,10 +3599,15 @@ def test_the_pages_that_restated_the_security_facts_link_to_the_table(scope: str
     assert f"{link_prefix}{_SECURITY_TABLE_ANCHOR})" in text, (
         f"{scope} must link to the security controls table in {_GUIDE}"
     )
-    restated = [c for c in clauses if _TABLE_CONTROL.search(c) and _TABLE_STATUS.search(c)]
+    # A link target is not prose: the table's own anchor holds the word "built".
+    restated = [
+        c
+        for c in clauses
+        if _TABLE_CONTROL.search(c) and _TABLE_STATUS.search(re.sub(r"\]\([^)]*\)", "]", c))
+    ]
     assert not restated, (
         f"{scope} states a security control's status or default again: {restated}. The security "
-        f"controls table in {_GUIDE} states it once; link to it."
+        f"controls table in {_GUIDE} states it; link to it."
     )
 
 

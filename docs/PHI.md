@@ -51,11 +51,12 @@ The security controls that only become material off-loopback (mTLS, certificate 
 off-box logs) each lean on the org's environment.
 Its PKI issues the certificates and the CRL files the engine checks, its SIEM receives the forwarded
 logs, and its network controls stay its own. Whether each control is in the engine, and what turns
-it on, is stated once, in the
+it on, is in the
 [security controls table](EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
 of the early-adopter guide. Each is documented per deployment — see
 [DEPLOYMENT.md](DEPLOYMENT.md), and [§7](#7-logging--phi-redaction) for log forwarding.
-The same table covers the engine's second factor. Which accounts that factor covers is stated in
+The engine's second factor is not among them, because it does not depend on the bind. The same
+table covers it. Which accounts that factor covers is stated in
 [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14).
 
 | Actor / vector | In scope? | Mitigation |
@@ -2360,10 +2361,10 @@ strict-parse time budget · de-identification covers HL7 v2 only (the anonymizer
 with X12/FHIR seams still to come. Each is tracked in
 [§11](#11-hardening-roadmap).
 
-This list no longer says which security controls work. The
+For at least the main security controls, the
 [security controls table](EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
-of the early-adopter guide says that for at least the main controls, and which are on by default. §4
-documents transport TLS and the egress allowlist, and §7 documents logging and redaction.
+of the early-adopter guide says which are in the engine and which are on by default. §4 documents
+transport TLS, and §7 documents logging and redaction.
 
 **The test harness's at-rest data falls short of its protection levels.** The harness is in the
 ASVS assessed scope (owner ruling 2026-10-02); its stores, and how far each falls short, are in the

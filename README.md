@@ -49,9 +49,8 @@ renders on GitHub and in the VS Code preview). The prose source of truth is
 - **Configure visually or in code.** Author connections and routes with guided wizards, or in
   Python (`inbound`/`outbound`/`@router`/`@handler`) for full control — always version-controlled.
   The database holds runtime state and messages only, never configuration.
-- **PHI is first-class.** Access control, audit, encryption and transport security are part of
-  the engine. For at least the main controls, which are built, which are on by default and which
-  are missing is stated once, in the [security controls table](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built).
+- **PHI is first-class.** For at least the main security controls, one table says which are
+  built, which are on by default and which are missing: the [security controls table](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built).
   See [docs/PHI.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/PHI.md) for the full data-protection map.
 
 ## Features

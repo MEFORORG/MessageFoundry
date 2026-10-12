@@ -108,7 +108,7 @@ column before you plan around a row.
 | **API TLS** (HTTPS/WSS, TLS 1.2 or later) | Built | Always served, with one exception. With no operator certificate the engine serves a self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). The exception is a declared TLS-terminating proxy with no operator certificate: the engine then speaks plain HTTP to that proxy. At the shipped `[security].enforcement = enforce`, a non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused, and the placeholder does not count. §6 says what `warn` changes. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **MLLP-over-TLS** (TLS 1.2 or later) | Built | Off. MLLP is plaintext until you set `tls = true` on the connection. At the shipped `[security].enforcement = enforce`, a non-loopback plaintext MLLP listener is refused. [PHI.md §4](PHI.md#4-data-in-transit) states the exceptions. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **mTLS** (API clients and MLLP partners) | Built | Off. API mTLS acts only once `[api].tls_client_ca_file` names a CA. An inbound MLLP connection asks for a client certificate only once its `tls_ca_file` names a CA. An outbound one presents a client certificate only once you give it `tls_cert_file`. | [DEPLOYMENT.md](DEPLOYMENT.md) |
-| **Certificate revocation checking** | Built | It reads a CRL file your PKI publishes. You name one per hop, for example `[logging].forward_tls_crl_file`. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **Certificate revocation checking** | Built | Not on every hop. Where it is built, it reads a CRL file your PKI publishes. You name one per hop, for example `[logging].forward_tls_crl_file`. | [DEPLOYMENT.md](DEPLOYMENT.md#revocation-guard-behavior) says which hops are covered and which are not |
 | **Transport TLS for raw TCP and X12** | Not built | Those two connectors are plaintext only. Keep them on loopback, or put a TLS-terminating proxy in front. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **Native second factor** (TOTP and passkeys, local and directory accounts) | Built | On. `[security].require_mfa` enforces a second factor as an access gate on every authorized route. An OIDC session can meet it on the identity provider's MFA claim, which the engine checks while `[auth].oidc_require_mfa_claim` is on, the default. | [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states which sessions owe an engine factor |
 | **Off-box log and audit forwarding** | Built | No collector is named, so nothing is forwarded until `[logging].forward_host` names one. `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction, to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). The transport **default** is UDP. Under the default `[security].enforcement = enforce`, though, `serve` and `supervise` refuse to start without verified TLS forwarding to a collector on another host. That needs `forward_tls_ca_file` and, for the revocation check, `forward_tls_crl_file`. A loopback collector address does not count. Under `warn` the refusal is only a warning. The collector is an egress destination too: [`[egress].allowed_syslog`](CONFIGURATION.md#egress) says when an unlisted one is refused, under either enforcement value. | [PHI.md §7](PHI.md#7-logging--phi-redaction) |
@@ -124,8 +124,8 @@ column before you plan around a row.
 | **In-place SQLite → server-DB migration** | ❌ Not built. Server-DB deployments are **greenfield only** — there is no automatic carry-over of SQLite history. Drain and cut over deliberately (§13). |
 | **A throughput guarantee for your hardware** | **CAUTION:** By design. A baseline + tuning method is **published** ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), Gate #3) as a two-tier gate — host-independent **conformance** invariants (hard) + **performance** numbers *"as measured on the reference config"*. Because the durable-write path is hardware-dependent, those msg/s are not a promise for your box. **Measure on your own hardware** (§9). |
 
-**The early-adopter bargain, stated plainly:** you get a durable engine, the security controls the
-table above marks built, opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
+**The early-adopter bargain, stated plainly:** you get a durable engine, the controls the
+[security controls table](#security-controls-built-on-by-default-and-not-built) marks built, opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
 your own hardware and working around the pieces §2 lists as not built yet. If that trade is acceptable, the rest of this guide is your playbook.
 
 ---
@@ -439,7 +439,7 @@ Guidance for a clean first flow:
 
 Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DEPLOYMENT.md](DEPLOYMENT.md)**
 (network exposure). For at least the main controls, what is built, what is on by default and what
-is missing is stated once, in the
+is missing is in the
 [security controls table](#security-controls-built-on-by-default-and-not-built) in §2. The steps
 below are what you do about it. Complete this checklist **before any real PHI flows**:
 
