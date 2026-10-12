@@ -1106,7 +1106,7 @@ def FhirLookup(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -1152,8 +1152,8 @@ def FhirLookup(
     the engine only at allowed hosts. Put secrets (``bearer_token`` / ``basic_*`` / SMART keys) in
     :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
     ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
-    ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that is
-    ``cleartext_accepted``, below). The pure
+    ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1852,7 +1852,7 @@ def MLLP(
     | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
-    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn)
+    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
     # too unless tls_check_hostname=False.
@@ -2874,7 +2874,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -2977,7 +2977,7 @@ def FHIR(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3104,8 +3104,8 @@ def Email(
     subject: str | EnvRef = "",  # static Subject (a per-message subject is a Phase-2 follow-up)
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
-    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless tls_hop_attested or cleartext_accepted is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3181,8 +3181,8 @@ def Direct(
     subject: str | EnvRef = "",  # static Subject
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
-    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3391,7 +3391,7 @@ def DICOMweb(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -3557,7 +3557,7 @@ def Database(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3648,7 +3648,7 @@ def DatabasePoll(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3795,7 +3795,7 @@ def Soap(
     basic_user: str | EnvRef | None = None,
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is allowed by MEFOR_ALLOW_INSECURE_TLS only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)

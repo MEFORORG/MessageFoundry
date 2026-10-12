@@ -36,7 +36,10 @@ scan does not copy them: it reads each trailing comment alone, which is stricter
 
 **The docstring files are a pinned list, not the tree.** At least ``_reject_unknown_env_keys`` and
 ``weakened_tls_escape_permitted`` in ``config/settings.py`` name the variable to list it or to
-define the rule, so a scan of every docstring flags text that misleads nobody.
+define the rule, so a scan of every docstring flags some text that misleads nobody. The list is
+the files brought into line so far, and it is not every file that needs it: at least the module
+docstring of ``transports/rest.py`` and ``insecure_tls_allowed`` in ``config/settings.py`` still
+name the variable without the posture, and no scan here reads them.
 
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
@@ -45,7 +48,9 @@ as ``f"{INSECURE_TLS_ESCAPE_ENV}=1:refused"``; a call lent through ``+``, as in
 ``"set %s".strip() % NAME``; the variable handed through a nested call, as in
 ``"set %s" % str(NAME)``; a docstring or comment outside the pinned files; and prose that
 says "the dev escape" without the variable. A lent call that spells the variable itself is counted
-twice, once on its own and once in the call around it. A green run is a statement about the shapes
+twice, once on its own and once in the call around it. A ``.format`` call is also judged on its
+own, by its arguments and without its template, so a spaced argument beside the variable is
+flagged even where the template names the posture. A green run is a statement about the shapes
 above, not about every text in the packages.
 
 **The positive controls are planted and pinned.** Each scanner is proved on planted sources, some
@@ -255,7 +260,11 @@ def comments_without_posture(source: str) -> tuple[list[int], int]:
     signature: set[int] = set()
     for node in ast.walk(parse_source(source)):
         if isinstance(node, _DEF):
-            signature.update(range(node.lineno, node.body[0].lineno))
+            # To the last line of the parameters or the return type, not to the body: a comment
+            # between the colon and the first statement is about the body.
+            parts = [*ast.walk(node.args), *([node.returns] if node.returns else [])]
+            last = max((getattr(part, "end_lineno", None) or 0 for part in parts), default=0)
+            signature.update(range(node.lineno, last + 1))
     unposted: list[int] = []
     seen = 0
     for line, text in _comments(source):
@@ -385,6 +394,7 @@ def factory(
     tls_verify: bool = True,  # False needs the escape at [security].enforcement = warn
     quote: str = "",  # an escape character, which this rule does not read
 ) -> None:
+    # the escape meant here is some other one: this comment is past the signature
     """Refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
     ``[security].enforcement = warn``."""
     # MEFOR_ALLOW_INSECURE_TLS lets this through only at [security].enforcement =

@@ -36,7 +36,8 @@ exchange runs off the event loop via ``asyncio.to_thread``.
 rest and in flight, but the SMTP session still carries envelope metadata (and any AUTH credentials), so
 TLS stays on by default; disabling it is refused unless the project-wide ``MEFOR_ALLOW_INSECURE_TLS``
 escape is set on an instance at ``[security].enforcement = warn``, and SMTP AUTH over cleartext is
-refused outright (the ``refuse_cleartext_credentials`` rule). The ``[egress].allowed_direct`` allowlist is the authoritative fail-closed host gate (enforced
+refused outright (the ``refuse_cleartext_credentials`` rule). One part is not inherited: EMAIL also
+lets ``tls_hop_attested`` or ``cleartext_accepted`` cross this gate, and Direct reads neither. The ``[egress].allowed_direct`` allowlist is the authoritative fail-closed host gate (enforced
 by the runner at load/reload/start).
 
 **Idempotency.** Delivery is at-least-once, so a retry re-sends the S/MIME message; a Direct mailbox
