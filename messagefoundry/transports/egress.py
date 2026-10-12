@@ -19,7 +19,7 @@ import logging
 import urllib.parse
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, EgressSettings
@@ -528,16 +528,41 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             )
     if dest.type is ConnectorType.EMAIL:
         # The host arm above gates only the relay hop, which forwards to any address. This arm bounds
-        # where the mail ends up (vault BACKLOG #2616), and it is deny-by-default on its own terms.
-        _check_email_recipient_domains(dest, egress.allowed_recipient_domains)
+        # where the mail ends up (vault BACKLOG #2616) and where its bounces go (vault BACKLOG #2912),
+        # and it is deny-by-default on its own terms.
+        permitted = frozenset(egress.allowed_recipient_domains)
+        _check_email_recipient_domains(dest, permitted)
+        _check_email_sender_domain(dest, permitted)
 
 
-def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> None:
+def _check_email_sender_domain(dest: Destination, permitted: frozenset[str]) -> None:
+    """Refuse an EMAIL destination whose sender's domain is outside
+    ``[egress].allowed_recipient_domains`` (vault BACKLOG #2912, ADR 0029).
+
+    The sender is ``MAIL FROM``, so bounces and replies go to its mailbox, and either can carry the
+    message body. The connection's author chooses that mailbox and can cause a bounce on purpose,
+    so an ungated sender would route the body around the recipient check. Allowing a domain as a
+    sender is as strong as allowing it as a recipient, so the one list gates both, through the same
+    rule. The sender is a connection setting, so this runs at load; a per-message sender would need
+    the check at send time."""
+    sender = dest.settings.get("sender")
+    if not isinstance(sender, str) or not sender:
+        # Fail closed: a gate that checked nothing has not passed.
+        log.warning("egress denied: outbound %r EMAIL names no sender address", dest.name)
+        raise WiringError(f"outbound {dest.name!r}: EMAIL destination names no sender address")
+    _require_listed_domain(
+        dest.name,
+        "sender",
+        sender,
+        permitted,
+        ", which gates the sender because bounces and replies go to it and can carry the message body",
+    )
+
+
+def _check_email_recipient_domains(dest: Destination, permitted: frozenset[str]) -> None:
     """Refuse an EMAIL destination with any recipient outside ``[egress].allowed_recipient_domains``.
-    An empty list refuses every EMAIL destination. Matching is exact and case-insensitive on the
-    domain after the last ``@``; a subdomain needs its own entry. The log line and the error name
-    the destination and the domain, never the full address. ``EgressSettings`` has already
-    normalised the entries."""
+    An empty list refuses every EMAIL destination. The rule is :func:`_require_listed_domain`'s.
+    ``EgressSettings`` has already normalised the entries."""
     try:
         addresses = envelope_recipients(dest.settings.get("recipients"))
     except ValueError as exc:
@@ -550,31 +575,38 @@ def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> Non
         # Fail closed without leaning on the parser: a gate that checked nothing has not passed.
         log.warning("egress denied: outbound %r EMAIL names no recipient address", dest.name)
         raise WiringError(f"outbound {dest.name!r}: EMAIL destination names no recipient address")
-    permitted = set(allowed)
     for address in addresses:
-        problem = envelope_address_problem(address)
-        if problem is not None:
-            _refuse_email_recipient(dest.name, problem)
-        domain = address.rpartition("@")[2].lower()
-        if domain not in permitted:
-            log.warning(
-                "egress denied: outbound %r EMAIL recipient domain %r not in "
-                "[egress].allowed_recipient_domains",
-                dest.name,
-                domain,
-            )
-            raise WiringError(
-                f"outbound {dest.name!r}: EMAIL recipient domain {domain!r} is not in the "
-                "[egress].allowed_recipient_domains allowlist (an empty list permits no recipient)"
-            )
+        _require_listed_domain(dest.name, "recipient", address, permitted)
 
 
-def _refuse_email_recipient(name: str, why: str) -> NoReturn:
-    log.warning("egress denied: outbound %r EMAIL recipient %s", name, why)
-    raise WiringError(
-        f"outbound {name!r}: an EMAIL recipient {why}, so the "
-        "[egress].allowed_recipient_domains check cannot pass it"
-    )
+def _require_listed_domain(
+    name: str, role: str, address: str, permitted: frozenset[str], why_gated: str = ""
+) -> None:
+    """Refuse ``address``, the EMAIL ``role`` (recipient or sender), unless it passes the address
+    rule and its domain is in ``permitted``. Matching is exact and case-insensitive on the domain
+    after the last ``@``; a subdomain needs its own entry, and an empty set permits nothing. The log
+    line and the error name the destination and the domain, never the full address."""
+    problem = envelope_address_problem(address)
+    if problem is not None:
+        log.warning("egress denied: outbound %r EMAIL %s %s", name, role, problem)
+        raise WiringError(
+            f"outbound {name!r}: an EMAIL {role} {problem}, so the "
+            "[egress].allowed_recipient_domains check cannot pass it"
+        )
+    domain = address.rpartition("@")[2].lower()
+    if domain not in permitted:
+        log.warning(
+            "egress denied: outbound %r EMAIL %s domain %r not in "
+            "[egress].allowed_recipient_domains",
+            name,
+            role,
+            domain,
+        )
+        raise WiringError(
+            f"outbound {name!r}: EMAIL {role} domain {domain!r} is not in the "
+            f"[egress].allowed_recipient_domains allowlist{why_gated} "
+            f"(an empty list permits no {role})"
+        )
 
 
 def syslog_forward_refusal(host: str, port: int, egress: EgressSettings) -> str | None:
