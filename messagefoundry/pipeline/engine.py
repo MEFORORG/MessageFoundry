@@ -120,6 +120,7 @@ from messagefoundry.transports.base import IntakeGate
 __all__ = [
     "ApprovedConfig",
     "ConfigDigestMismatch",
+    "ConfigDigestUnavailable",
     "ConfigReloadDenied",
     "Engine",
     "ReloadOutcome",
@@ -163,6 +164,16 @@ class ConfigDigestMismatch(Exception):
         self.current = current
 
 
+class ConfigDigestUnavailable(Exception):
+    """A released reload could not take the digest of its config, so nothing can be checked
+    against its approval (vault BACKLOG #2596). The cause is logged at WARNING where the digest
+    failed; ``approved`` is the digest the hold captured. Raised before anything is swapped."""
+
+    def __init__(self, approved: str) -> None:
+        super().__init__("the config's digest could not be taken to check it against its approval")
+        self.approved = approved
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovedConfig:
     """The config a dual-control approval released, which :meth:`Engine.reload_detail` binds a
@@ -174,11 +185,16 @@ class ApprovedConfig:
 
 
 def _require_approved(current: str | None, approval: ApprovedConfig) -> None:
-    """Raise :class:`ConfigDigestMismatch` unless ``current`` is the digest ``approval`` names. A
-    digest that could not be taken (``None``) never matches."""
+    """Raise unless ``current`` is the digest ``approval`` names: :class:`ConfigDigestMismatch`
+    when the approval named none or the digests differ, :class:`ConfigDigestUnavailable` when no
+    digest could be taken now (``current`` is ``None``)."""
     from messagefoundry.config.fingerprint import fingerprint_matches
 
-    if approval.fingerprint is None or not fingerprint_matches(current, approval.fingerprint):
+    if approval.fingerprint is None:
+        raise ConfigDigestMismatch(None, current)
+    if current is None:
+        raise ConfigDigestUnavailable(approval.fingerprint)
+    if not fingerprint_matches(current, approval.fingerprint):
         raise ConfigDigestMismatch(approval.fingerprint, current)
 
 
@@ -2453,13 +2469,10 @@ class Engine:
         A held reload's approval carries it, and the release passes it back to
         :meth:`reload_detail` in an :class:`ApprovedConfig` (vault BACKLOG #2596). The target is
         found by :meth:`_existing_reload_target`, as a reload finds it, so a path outside the reload
-        roots is never read. ``None`` means no digest could be taken: the target is refused, missing
-        or unreadable. A release of such a hold still meets the refusal the reload itself raises
-        first, and otherwise is refused as a digest mismatch."""
-        try:
-            path = await self._existing_reload_target(config_dir)
-        except (ConfigReloadDenied, WiringError, OSError):
-            return None
+        roots is never read, and its refusal propagates: a hold that release can only refuse is
+        never filed. ``None`` means the directory resolved but its digest could not be taken; the
+        reason is logged at WARNING."""
+        path = await self._existing_reload_target(config_dir)
         return await self._content_digest(path)
 
     async def _content_digest(self, path: Path) -> str | None:
@@ -2520,13 +2533,26 @@ class Engine:
         if self._registry_guard is not None:
             self._registry_guard(registry)
 
-    async def preflight_registry(self, registry: Registry) -> None:
+    async def preflight_registry(
+        self, registry: Registry, env_values: Mapping[str, Any] | None = None
+    ) -> None:
         """Run the engine's registry preflight over ``registry``; raises ``WiringError`` to refuse it.
 
-        A no-op when none was configured. Public for the same reason as :meth:`guard_registry`: the
-        managed app's first load reaches ``add_registry`` directly."""
+        ``env_values`` defaults to the engine's own; :meth:`reload_detail` passes the values it has
+        read but not yet applied. A no-op when none was configured. Public for the same reason as
+        :meth:`guard_registry`: the managed app's first load reaches ``add_registry`` directly."""
         if self._registry_preflight is not None:
-            await self._registry_preflight(registry, self._env_values)
+            values = self._env_values if env_values is None else env_values
+            await self._registry_preflight(registry, values)
+
+    def _apply_env_values(self, values: dict[str, Any]) -> None:
+        """Make ``values`` the ones the engine and its live runner resolve ``env()`` against. With
+        no provider a reload re-reads nothing, so there is nothing to apply."""
+        if values is self._env_values:
+            return
+        self._env_values = values
+        if self._registry_runner is not None:
+            self._registry_runner.set_env_values(values)
 
     async def preflight_settings(self) -> None:
         """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none
@@ -2599,18 +2625,21 @@ class Engine:
 
         ``approval`` binds the reload to the digest a dual-control approval named (vault BACKLOG
         #2596, step 3; :meth:`reload_target_digest` took it at request time). The bundle's digest is
-        checked against it twice: before ``load_config`` runs any config module, and again with the
-        digest taken just before the swap, the one the audit row records. Either miss raises
-        :class:`ConfigDigestMismatch` with nothing swapped. ``None`` binds nothing: an ungated
-        reload, a convergence reload and a dry run pass none. The digest covers what
-        :mod:`messagefoundry.config.fingerprint` hashes and no more.
+        checked against it twice: before ``load_config`` runs any config module, and again right
+        after the load with the digest the audit row records, before any check that can refuse the
+        graph as invalid. A load that fails is checked too, so an edit that breaks the graph is
+        refused as an edit. A miss raises :class:`ConfigDigestMismatch`, or
+        :class:`ConfigDigestUnavailable` when no digest can be taken now, with nothing swapped.
+        ``None`` binds nothing: an ungated reload, a convergence reload and a dry run pass none. The
+        digest covers what :mod:`messagefoundry.config.fingerprint` hashes and no more.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``FileNotFoundError``
-        (missing dir), ``ConfigDigestMismatch`` (not the approved bytes) or ``WiringError`` (invalid /
-        empty config / unresolved env value / an environment value file this reload could not read)
-        — the caller maps these to HTTP errors.
+        (missing dir), ``ConfigDigestMismatch`` (not the approved bytes), ``ConfigDigestUnavailable``
+        (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / an
+        environment value file this reload could not read) — the caller maps these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
-        live graph is the one that was already running.
+        live graph is the one that was already running. A real reload applies the environment
+        values it re-read only at the swap, so a raise also leaves the running values as they were.
         """
         failures: list[ReloadStepFailure] = []
         if not dry_run:
@@ -2622,8 +2651,11 @@ class Engine:
             # Before load_config, which runs every config module's top-level code, so bytes
             # changed since the request are refused before they run (vault BACKLOG #2596). This
             # samples the files: an edit landing between here and the load still runs its module
-            # code, and the check before the swap then refuses it.
+            # code, and the check after the load then refuses it.
             _require_approved(await self._content_digest(path), approval)
+        # The values this reload resolves env() against. A real reload applies them only at the
+        # swap, so a refusal leaves the running graph's values as they were (vault BACKLOG #2596).
+        env_values = self._env_values
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
         # (or MEFOR_VALUE_* changes) without a restart — otherwise the WiringError telling the operator
         # to add a missing value would never clear (review M-23).
@@ -2640,7 +2672,7 @@ class Engine:
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             try:
-                self._env_values = dict(self._env_values_provider())
+                env_values = dict(self._env_values_provider())
             except WiringError:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
@@ -2668,11 +2700,42 @@ class Engine:
                     "could not re-read this environment's values for the reload, so the live graph "
                     f"is unchanged: {refusal}"
                 )
-            if self._registry_runner is not None:
-                self._registry_runner.set_env_values(self._env_values)
-        # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy
-        # imports), which would otherwise stall every listener mid-reload (review low-3).
-        registry = await asyncio.to_thread(load_config, path)  # raises WiringError on a bad config
+        if dry_run:
+            # A dry run's checker reuses the live runner, so it needs the values now. It swaps
+            # nothing and carries no approval.
+            self._apply_env_values(env_values)
+        try:
+            # Off the event loop: load_config executes user config modules (arbitrary, potentially
+            # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
+            registry = await asyncio.to_thread(load_config, path)  # WiringError on a bad config
+        except WiringError:
+            if approval is not None:
+                # An edit after the first check can also break the load. Name the edit, so a
+                # tamper is audited as one and not as a bad config (vault BACKLOG #2596).
+                _require_approved(await self._content_digest(path), approval)
+            raise
+        fingerprint: dict[str, object] | None = None
+        if not dry_run:
+            # ADR 0041 D1 (config provenance, item C): fingerprint the bundle right after the load
+            # and BEFORE the swap. The digest is a pure, offline fold over the directory's file
+            # BYTES (config/fingerprint.py) and never reads the live graph, so taking it here is
+            # meaning-preserving and keeps the window to the bytes load_config read small. A
+            # failure the OSError guard never covered (an ImportError on the local import, say)
+            # aborts the reload while the OLD graph is still live. The value is ASSIGNED only after
+            # the swap. Still best-effort: an unreadable bundle leaves provenance unknown rather
+            # than refusing an otherwise-applicable config, and is recorded as a step failure so the
+            # caller is not told the reload was clean when GET /config/provenance reports nothing.
+            fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
+            if fingerprint_failure is not None:
+                failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
+        if approval is not None:
+            # Again, on the digest the audit row records, so a released reload's row names the
+            # approved digest. Before every check that can refuse the graph as invalid, so a tamper
+            # is audited as one and those checks read only approved bytes. An edit that lands and
+            # is reverted inside the load is not seen.
+            taken = fingerprint.get("fingerprint") if fingerprint is not None else None
+            current = taken if isinstance(taken, str) else await self._content_digest(path)
+            _require_approved(current, approval)
         # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
         # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
         self.guard_registry(registry)
@@ -2715,7 +2778,7 @@ class Engine:
         if not dry_run:
             # The graph this process will run, so after the shard filter. Before anything is swapped,
             # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3).
-            await self.preflight_registry(registry)
+            await self.preflight_registry(registry, env_values)
         if dry_run:
             # Validate against THIS environment without swapping: build-check every connector (which
             # resolves env() refs against this instance's values and raises on a missing key or bad
@@ -2753,25 +2816,10 @@ class Engine:
             )
             checker.build_check(registry)
             return ReloadOutcome(registry=registry, applied=False, directory=path)
-        # ADR 0041 D1 (config provenance, item C): fingerprint the bundle BEFORE the swap. The digest
-        # is a pure, offline fold over the directory's file BYTES (config/fingerprint.py). It never
-        # reads the live graph, so computing it here is meaning-preserving, and it narrows the window
-        # between the bytes load_config just read and the bytes attributed to this reload. Doing it
-        # here also means a failure the OSError guard never covered (an ImportError on the local
-        # import, say) aborts the reload while the OLD graph is still live, instead of surfacing as a
-        # failed reload with the NEW graph already serving. The value is ASSIGNED only after the swap.
-        # Still best-effort: an unreadable bundle leaves provenance unknown rather than refusing an
-        # otherwise-applicable config. Recorded as a step failure so the caller is not told the
-        # reload was clean when GET /config/provenance will report nothing.
-        fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
-        if fingerprint_failure is not None:
-            failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
-        if approval is not None:
-            # Again, on the digest the audit row records, so a released reload's row names the
-            # approved digest. An edit that lands and is reverted inside the load is not seen.
-            taken = fingerprint.get("fingerprint") if fingerprint is not None else None
-            current = taken if isinstance(taken, str) else await self._content_digest(path)
-            _require_approved(current, approval)
+        # Every check has passed, so the values go live with the graph. The swap still builds and can
+        # refuse; wherever a refusal keeps the old graph, it puts the old values back too.
+        previous_env_values = self._env_values
+        self._apply_env_values(env_values)
         if runner is None:
             runner = self.add_registry(registry)
             try:
@@ -2784,9 +2832,16 @@ class Engine:
                 # cancellation, so clearing the reference then would orphan a running runner that
                 # engine.stop() could no longer reach.
                 self._registry_runner = None
+                self._apply_env_values(previous_env_values)
                 raise
         else:
-            await runner.reload(registry)
+            try:
+                await runner.reload(registry)
+            except BaseException:
+                # RegistryRunner.reload restores the previous graph on a failure or a cancellation
+                # (vault BACKLOG #2753) before it propagates, so the previous values go with it.
+                self._apply_env_values(previous_env_values)
+                raise
         # ---- THE NEW GRAPH IS LIVE FROM HERE (BACKLOG #1111, ASVS 2.3.3) --------------------------
         # Nothing below can put the old graph back: the runner owns the new registry and the old one
         # is gone, and the swap is not a store transaction that could roll back. So a failure below is
