@@ -272,15 +272,17 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine
     # cannot tell a comment from a CRL the operator meant to load: skipped, a CRL typed after a
     # space would be reported as applied while the hop still checks the old one. And
-    # :func:`_crl_blocks` is a model with a measured miss, which its docstring records. Skipping
-    # what it does not count would fail open, by letting in a CRL nothing here judged.
+    # :func:`_crl_blocks` is a model with a measured miss, which its docstring records, so an
+    # uncounted marker may be a CRL OpenSSL loads unjudged. A load counts what OpenSSL took, and
+    # that count is the backstop; this check does not lean on it.
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(
-            "it has a '-----BEGIN X509 CRL-----' marker that does not start a line, so OpenSSL "
-            "does not load that CRL. The marker must be the first thing on its line, after a line "
-            "feed: no space, tab or other text before it, and no line that ends in a carriage "
-            "return alone. The marker text inside a comment refuses the file too, because the "
-            "engine cannot tell it from a CRL the file is meant to hold: take it out of the comment"
+            "it has a '-----BEGIN X509 CRL-----' marker that does not start a line. If that is a "
+            "CRL, OpenSSL does not load it as written. If it is text in a comment, the engine "
+            "cannot tell it from a CRL the file is meant to hold. Either one refuses the file. "
+            "Put each CRL's marker first on its line, after a line feed: no space, tab or other "
+            "text before it, and no line that ends in a carriage return alone. Take the marker "
+            "text out of any comment"
         )
     if not blocks:
         raise ValueError(_NO_CRL)

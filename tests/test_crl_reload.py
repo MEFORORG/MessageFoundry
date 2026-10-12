@@ -1344,7 +1344,7 @@ def test_a_begin_marker_inside_a_comment_line_refuses_the_file_and_says_why(
     assert "cannot tell it from a CRL" in str(refused.value)  # the reason, in the refusal itself
 
     pki.crl.write_bytes(commented)
-    with pytest.raises(ValueError, match="inside a comment"):
+    with pytest.raises(ValueError, match="text in a comment"):
         pki.outbound_hop()
 
 

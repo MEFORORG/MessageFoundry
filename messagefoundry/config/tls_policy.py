@@ -340,6 +340,12 @@ def harden_crl_check(
     (:func:`_refuse_crl_count`), or the hop would be recorded as checking a CRL it never loaded.
     It runs last, after the #1890 check, so a planted certificate is reported as that.
 
+    A fifth, since vault BACKLOG #2866: on a context that already held a CRL, that count needs a
+    private copy of the file, and the copy could not be staged. This one is an ``OSError`` as well
+    as a ``ValueError`` (:class:`_CrlStagingFailed` says why). A caller that carries on past an
+    ``OSError`` must still discard the context, which by then holds the CRL and may not have the
+    check flag set.
+
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
     a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
@@ -427,8 +433,8 @@ def harden_crl_check(
                 f"{label} could not be checked: the engine could not make or read its private "
                 f"copy of the file in its temporary directory "
                 f"({exc.strerror or type(exc).__name__}). That is not a verdict on the file. "
-                "Give the engine's account a temporary directory it can write to, with room for "
-                "the file"
+                "Check that the engine's account can write to its temporary directory, and that "
+                "there is room for the file"
             ) from exc
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
@@ -542,7 +548,10 @@ class _CrlStagingFailed(OSError, ValueError):
     caller catching ``OSError`` still catches it. At least the log forwarder's start does: it
     carries on without the forwarder, where a plain ``ValueError`` would turn a full temp disk into
     a refused start. The store counts ``OSError`` as a connect error too. A seam that surfaces a
-    ``ValueError`` as a configuration refusal now gets one that names the file."""
+    ``ValueError`` as a configuration refusal now gets one that names the file.
+
+    Only the type carries over. ``errno``, ``strerror`` and the ``OSError`` subclass of the cause
+    are not copied, so read those from ``__cause__``."""
 
 
 @contextmanager
