@@ -217,11 +217,17 @@ def _skip_unmeasured(reason: str) -> NoReturn:
 
     The hosted test legs run ``pytest -q``, which prints no skip reasons, so a skip alone leaves
     no line in the log. pytest does print its warnings summary under ``-q``, with the test's
-    name and this text. Both ways the injection test can skip come through here. So when that
-    test ran and the summary has no such warning, it did not skip. A test that was deselected or
-    never collected leaves no warning either, and this cannot show that."""
+    name and this text. The injection test skips through here and nowhere else, as it stands. A
+    skip added to it some other way would be silent again, and nothing pins that. A test that
+    was deselected or never collected leaves no warning either."""
     warnings.warn(f"{_NOT_MEASURED}: {reason}", InjectionNotMeasured, stacklevel=2)
     pytest.skip(reason)
+
+
+def _not_measured(caught: pytest.WarningsRecorder) -> list[warnings.WarningMessage]:
+    """The ``InjectionNotMeasured`` warnings in ``caught``. ``pytest.warns`` records every
+    category, so an unrelated warning raised inside the block must not be counted."""
+    return [w for w in caught if issubclass(w.category, InjectionNotMeasured)]
 
 
 def _inject(target: _Target) -> None:
@@ -287,7 +293,7 @@ def test_a_refused_attach_skips_with_a_warning(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(sys, "remote_exec", refused)
     with pytest.warns(InjectionNotMeasured) as caught, pytest.raises(pytest.skip.Exception):
         _inject(target)
-    (warning,) = caught
+    (warning,) = _not_measured(caught)
     assert str(warning.message).startswith(f"{_NOT_MEASURED}: ")
     assert "the platform said no" in str(warning.message)
 
@@ -314,7 +320,7 @@ def test_a_test_process_that_cannot_inject_skips_with_a_warning(
 
     with pytest.warns(InjectionNotMeasured) as caught, pytest.raises(pytest.skip.Exception):
         test_an_injected_script_runs_without_the_hook_and_not_with_it(start)
-    (warning,) = caught
+    (warning,) = _not_measured(caught)
     assert str(warning.message).startswith(f"{_NOT_MEASURED}: ")
 
 

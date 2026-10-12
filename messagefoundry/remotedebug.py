@@ -59,14 +59,14 @@ be removed, so each reading came from a child process of its own.
 
 - *Count.* One child ran a ``RegistryRunner`` on a SQLite store with one feed: MLLP inbound,
   router, handler, MLLP outbound, cleartext, with logging at INFO. It added an audit hook that
-  only counts events by name. Another process sent synthetic ADT messages on one connection and
-  ACKed each delivery. After 200 warm-up messages, 5 idle seconds raised no event. Then 500
+  only counts events by name. Another process sent synthetic ADT messages, on one connection
+  for each batch, and ACKed each delivery. After 200 warm-up messages, 5 idle seconds raised no event. Then 500
   messages raised 502 events: 501 ``socket.__new__`` and one thread start. 2,000 more raised
   2,001, all ``socket.__new__``. That is about one audited operation for each message. It fits
   the MLLP outbound's default of a new connection for each message, though no event was traced
   to that code. Each batch arrived on a new sender connection, which may be its one extra socket.
-- *Time.* Two more children timed ``sys.audit`` for an event this hook does not match, in 18
-  rounds of 2,000,000 calls each. With no audit hook the median was 36 ns a call (30 to 52).
+- *Time.* Four more children, two for each arm, timed ``sys.audit`` for an event this hook does
+  not match. Each ran 9 rounds of 2,000,000 calls, so each arm has 18. With no audit hook the median was 36 ns a call (30 to 52).
   With this hook, installed as the command line installs it, it was 110 ns (91 to 133). The
   medians differ by 74 ns. An earlier reading, taken when the hook was written, was 60 to 90 ns.
 
