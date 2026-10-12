@@ -2385,9 +2385,10 @@ def test_an_nlst_empty_reply_for_a_missing_directory_still_fails() -> None:  # #
 def test_a_pwd_that_fails_raises_the_original_nlst_reply(pwd_error: ftplib.Error) -> None:  # #1130
     # The check confirms nothing, so the NLST reply raises as it did before the check existed.
     ftp = _NlstRefusingFtp("550 No files found", pwd_error=pwd_error)
-    with pytest.raises(ftplib.error_perm, match="No files found"):
+    with pytest.raises(ftplib.error_perm, match="No files found") as caught:
         _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
     assert ftp.cwds == []
+    assert caught.value.__context__ is None  # the PWD reply is the server's text
 
 
 def test_a_pwd_with_no_quoted_path_raises_the_original_nlst_reply() -> None:  # #1130
@@ -2402,9 +2403,28 @@ def test_a_pwd_with_no_quoted_path_raises_the_original_nlst_reply() -> None:  # 
 def test_a_refused_return_to_home_raises_the_original_nlst_reply() -> None:  # #1130
     # remote_dir was entered, but the session could not be put back, so nothing is confirmed.
     ftp = _NlstRefusingFtp("550 No files found", home_refused=True)
-    with pytest.raises(ftplib.error_perm, match="No files found"):
+    with pytest.raises(ftplib.error_perm, match="No files found") as caught:
         _FtpClient._names(ftp, "/in")  # type: ignore[arg-type]
     assert ftp.cwds == ["/in"]
+    # The refused CWD reply names a path, so it must not ride on the raised reply's chain.
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("failing", ["pwd", "cwd"])
+def test_a_transient_reply_during_the_check_raises_as_itself(failing: str) -> None:  # #1130
+    # A 421 is transient, so it must reach _op as error_temp and retry, not as the permanent 550.
+    ftp = _NlstRefusingFtp("550 No files found")
+    transient = ftplib.error_temp("421 Service not available")
+
+    def refuse(*_: object) -> str:
+        raise transient
+
+    setattr(ftp, failing, refuse)
+    with pytest.raises(ftplib.error_temp) as caught:
+        _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert caught.value is transient
+    assert caught.value.__context__ is None  # nor does the NLST reply ride on it
 
 
 @pytest.mark.parametrize(
@@ -2673,7 +2693,8 @@ async def test_another_listing_form_logs_its_own_warning_without_a_name(
 async def test_another_listing_form_counts_only_entries_the_pattern_would_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # #1130
-    # A subdirectory or a stray file in the other form loses nothing, so it raises neither line.
+    # Under the default *.hl7, a subdirectory or a stray file in the other form loses nothing, so it
+    # raises neither line.
     client = _NlstListingClient(["/data/in/archive", "/data/in/README.txt"])
     src = _src(monkeypatch, client)
     src._handler = _RecordingHandler()
@@ -2696,6 +2717,21 @@ async def test_another_listing_form_matches_the_pattern_against_the_file_name(
     assert "1 NLST listing entry named a path" in sink.text
     assert _TRAVERSAL_LINE not in sink.text
     assert src._other_form_warned_at is not None
+    assert client.ops == []
+
+
+async def test_another_listing_form_ending_in_a_slash_is_not_counted_even_under_star(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # "/data/in/" has an empty last part, and fnmatch("", "*") is True. It names no file, so it
+    # must not count; the file beside it does, which shows the count is armed.
+    client = _NlstListingClient(["/data/in/", "/data/in/a.hl7"])
+    src = _src(monkeypatch, client, pattern="*")
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert "1 NLST listing entry named a path" in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
     assert client.ops == []
 
 

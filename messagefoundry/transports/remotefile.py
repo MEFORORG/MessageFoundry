@@ -439,27 +439,37 @@ def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
     ``remote_dir``. The round trips are paid only on this reply.
 
     A directory the account may enter but not list still reads as empty, if the server answers
-    it with this reply: ``CWD`` cannot tell that case apart."""
+    it with this reply: ``CWD`` cannot tell that case apart.
+
+    The ``NLST`` reply is raised outside every handler, so a refused ``PWD`` or ``CWD`` reply
+    never rides on its ``__context__``: that text is the server's and may name a path."""
     try:
         return ftp.nlst(remote_dir)
     except ftplib.error_perm as exc:
         if not _NLST_EMPTY_REPLY.match(str(exc)):
             raise
-        unconfirmed = (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto)
-        try:
-            home = ftp.pwd()
-        except unconfirmed:
-            raise exc from None
+        refusal = exc
+    if not _ftp_dir_confirmed(ftp, remote_dir):
+        raise refusal
+    # The reply text past the match is the server's, and may name a path: not logged.
+    logger.debug("The remote-file poller read NLST reply 550 No files found as an empty directory")
+    return []
+
+
+def _ftp_dir_confirmed(ftp: ftplib.FTP, remote_dir: str) -> bool:
+    """Whether ``CWD`` enters ``remote_dir`` and then puts the session back where ``PWD`` found it.
+
+    A refused or unreadable reply confirms nothing; a transient one raises as itself. Called outside
+    any handler, so neither outcome carries an earlier reply on its chain."""
+    try:
+        home = ftp.pwd()
         if not home:  # '' cannot put the session back, so it confirms nothing
-            raise exc from None
-        try:
-            ftp.cwd(remote_dir)
-            ftp.cwd(home)
-        except unconfirmed:
-            raise exc from None
-        # The reply text past the match is the server's, and may name a path: not logged.
-        logger.debug("REMOTEFILE NLST answered 550 No files found; read as an empty directory")
-        return []
+            return False
+        ftp.cwd(remote_dir)
+        ftp.cwd(home)
+    except (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto):
+        return False
+    return True
 
 
 class _BoundedSink:
@@ -2479,7 +2489,9 @@ class RemoteFileSource(SourceConnector):
         listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
         self._prune_settle(listing)
         # Counted over the whole listing, not in the loop below, which can stop early. Only an entry
-        # the pattern would have read counts, so a subdirectory or a stray file never raises it.
+        # the pattern would have read counts. So a narrow pattern such as *.hl7 skips a subdirectory
+        # or a stray file, but a broad one such as * counts them, since NLST cannot tell a directory
+        # from a file. An entry ending in "/" names no file and never counts.
         self._log_other_form(sum(1 for e in listing if e.other_form and self._reads(e.name)))
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, entry in enumerate(listing):
@@ -2833,8 +2845,10 @@ class RemoteFileSource(SourceConnector):
         """Whether ``pattern``, a file-name glob, matches ``name``: the one test the poll loop
         and the other-form count share, so the two cannot drift. A name with a ``/`` is judged by
         its last part, since an NLST entry in another listing form (BACKLOG #1130) names the file
-        as a path. A bare name is its own last part."""
-        return fnmatch.fnmatch(name.rpartition("/")[2], self._pattern)
+        as a path. A bare name is its own last part. An entry ending in ``/`` has an empty last
+        part, which names no file, so it never matches, even under ``*``."""
+        leaf = posixpath.basename(name)
+        return bool(leaf) and fnmatch.fnmatch(leaf, self._pattern)
 
     def _log_other_form(self, count: int) -> None:
         """WARN that ``count`` FTP ``NLST`` entries this poll, each one the pattern would have read,
