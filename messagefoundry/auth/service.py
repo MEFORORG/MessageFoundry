@@ -3955,26 +3955,15 @@ class AuthService:
                 return LoginOutcome(ok=False, error="SSO authentication failed")
             principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
         except KerberosTokenRefused as exc:
-            # BACKLOG #3196: a refused token is a failed sign-in, not a directory outage, so it is
-            # audited as `auth.login_failed` beside the other refusals. Only a closed reason and the
-            # exception's type are stored: its message can quote the token, which the caller wrote.
-            await self._audit(
-                "auth.login_failed",
-                actor="<kerberos>",
-                detail=_json(
-                    {
-                        "provider": "ad",
-                        "mech": "kerberos",
-                        "reason": "token_refused",
-                        "error": exc.error_type,
-                    }
-                ),
-                client=client,
+            # BACKLOG #3196: audited as a failed sign-in, not a directory outage. Where pyspnego's
+            # wrapper is the acceptor, a bad keytab also lands here; kerberos_principal logs its text.
+            await self._directory_reject_audit(
+                "<kerberos>", "kerberos", "token_refused", client=client, error=exc.error_type
             )
             return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:
-            # Reached from settings or from the directory, never from the token: the token's own
-            # failures are the arm above, so this text is the engine's or the directory's.
+            # Reached from settings or from the directory, never from the token: every failure of
+            # the acceptor's step is the arm above, so this text is the engine's or the directory's.
             await self._audit(
                 "auth.login_error",
                 actor="<kerberos>",
@@ -4991,20 +4980,19 @@ class AuthService:
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
     async def _directory_reject_audit(
-        self, actor: str, mech: str, reason: str, *, client: str | None
+        self, actor: str, mech: str, reason: str, *, client: str | None, error: str | None = None
     ) -> None:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
         "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored.
+        ``error``, when given, is an exception's TYPE name, never its message (BACKLOG #3196).
 
         ``client`` is keyword-only with no default, so every caller must name it (BACKLOG #2132).
         The type still accepts ``None``, so this forces a decision and does not enforce an address.
         A run of refusals is how a spray shows, and the operator needs to see its source."""
-        await self._audit(
-            "auth.login_failed",
-            actor=actor,
-            detail=_json({"provider": "ad", "mech": mech, "reason": reason}),
-            client=client,
-        )
+        detail: dict[str, object] = {"provider": "ad", "mech": mech, "reason": reason}
+        if error is not None:
+            detail["error"] = error
+        await self._audit("auth.login_failed", actor=actor, detail=_json(detail), client=client)
 
     async def _complete_ad_login(
         self,

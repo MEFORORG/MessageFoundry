@@ -43,7 +43,8 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.redaction import safe_name
+from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.redaction import safe_exc, safe_name
 
 if TYPE_CHECKING:
     from messagefoundry.auth.ldap_tls import NarrowedTls
@@ -1481,6 +1482,8 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     except (spnego.exceptions.SpnegoError, ValueError) as exc:
         # Building the acceptor reads settings only, never the token: a configuration fault.
         raise LdapError(str(exc)) from exc
+    refused: str | None = None
+    principal = None
     try:
         server.step(token)
         principal = server.client_principal if _kerberos_context_complete(server) else None
@@ -1498,7 +1501,16 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
         # rather than letting it escape as an unaudited 500. A StopIteration must not reach
         # asyncio.to_thread at all: a Future refuses it. Only the TYPE crosses: the message can
         # quote the token, such as an unknown mechanism OID the attacker chose (BACKLOG #3196).
-        raise KerberosTokenRefused(type(exc).__name__) from exc
+        refused = type(exc).__name__
+        # The operator's diagnostic stays in the log. Where pyspnego's wrapper is the acceptor, a
+        # missing keytab entry also fails here, as BadMechanismError or a GSSAPI error, so a run of
+        # these rows can be configuration. The text is redacted, bounded and scrubbed.
+        logger.warning(
+            "Kerberos sign-in refused the SPNEGO token: %s", scrub_log_argument(safe_exc(exc))
+        )
+    if refused is not None:
+        # Raised outside the except block, so neither __cause__ nor __context__ keeps the original.
+        raise KerberosTokenRefused(refused)
     if not principal:
         return None
     return str(principal).split("@", 1)[0]

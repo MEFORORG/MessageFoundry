@@ -90,8 +90,24 @@ def test_kerberos_principal_refuses_a_crafted_token_by_type_only(
     with pytest.raises(KerberosTokenRefused) as caught:
         kerberos_principal(token, AuthSettings())
     assert caught.value.error_type == error
-    assert type(caught.value.__cause__).__name__ == error
     assert _LEAK not in str(caught.value)
+    # Not merely suppressed: a structured logger or crash reporter reads both attributes directly.
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+def test_the_refusal_keeps_its_diagnostic_in_the_log(
+    real_wrapper: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The audit row names only the type, so the log is where an operator reads a bad keytab,
+    which on a host without SSPI fails the same way a crafted token does."""
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.auth.ldap"),
+        pytest.raises(KerberosTokenRefused),
+    ):
+        kerberos_principal(_VALUE_ERROR, AuthSettings())
+    [record] = [r for r in caplog.records if r.name == "messagefoundry.auth.ldap"]
+    assert record.levelname == "WARNING"
+    assert record.getMessage().startswith("Kerberos sign-in refused the SPNEGO token: ValueError")
 
 
 # --- where an operator meets it: the service and both routes -----------------------------------

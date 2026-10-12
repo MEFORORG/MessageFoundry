@@ -6706,7 +6706,8 @@ async def _kerberos_audits(engine: Engine) -> list[str]:
         str(a["detail"])
         for a in audit  # login_failed = mocked rejects, and a token the REAL pyspnego path refused
         # (BACKLOG #3196; the JSON /auth/negotiate unchanged-endpoint pin runs it live, and SSPI
-        # rejects the fake token); login_error = a directory or acceptor-configuration fault.
+        # rejects the fake token); login_error = a directory fault, or an acceptor that could not
+        # be built from settings.
         if a["action"] in ("auth.login_failed", "auth.login_error") and a["detail"]
     ]
 
