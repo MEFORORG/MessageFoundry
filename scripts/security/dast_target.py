@@ -324,7 +324,13 @@ async def dast_target(
                     json={"password": password, "purpose": action},
                     headers={"Authorization": f"Bearer {token}"},
                 )
-            rekeyed = response.json().get("token") if response.status_code == 200 else None
+            rekeyed: object = None
+            if response.status_code == 200:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                rekeyed = payload.get("token") if isinstance(payload, dict) else None
             if not isinstance(rekeyed, str) or not rekeyed:
                 raise DastTargetUnusable(
                     f"POST /me/reauth answered {response.status_code} to an action-bound re-proof, "

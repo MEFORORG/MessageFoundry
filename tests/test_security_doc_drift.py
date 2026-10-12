@@ -1327,8 +1327,47 @@ def _gates_by_operation() -> dict[tuple[str, str], _GateInfo]:
     }
 
 
+#: The gate factories that ask for a step-up, on both planes, and those that do not. A closed set,
+#: never a name pattern (route_gates.py recognises a gate by its mark, BACKLOG #2604):
+#: ``test_every_gate_is_classed_as_step_up_or_not`` reds when a new factory appears in neither.
+_STEP_UP_GATES = frozenset(
+    {
+        "require_step_up",
+        "require_step_up_action",
+        "require_reauth_only",
+        "require_reauth_only_action",
+        "require_ui_step_up",
+        "require_ui_step_up_action",
+        "require_ui_reauth_only",
+        "require_ui_reauth_only_action",
+    }
+)
+_NOT_STEP_UP_GATES = frozenset(
+    {
+        "require",
+        "require_paced",
+        "require_phi_read",
+        "require_ui",
+        "require_service_cert",
+        # The /ws/stats socket's gates, read off the endpoint body by the shared walk.
+        "authorize_ui_ws",
+        "authorize_ws",
+    }
+)
+
+
 def _is_step_up(gate: str) -> bool:
-    return "step_up" in gate or "reauth" in gate
+    return gate in _STEP_UP_GATES
+
+
+def test_every_gate_is_classed_as_step_up_or_not() -> None:
+    """The parity tests below sort gates by these two sets, so a gate in neither is unreviewed."""
+    pytest.importorskip("messagefoundry_webconsole")
+    seen = {gate for gate, _perms, _action in _gates_by_operation().values()}
+    assert seen <= _STEP_UP_GATES | _NOT_STEP_UP_GATES, (
+        f"gate factories classed as neither step-up nor not: {sorted(seen - _STEP_UP_GATES - _NOT_STEP_UP_GATES)}"
+    )
+    assert not _STEP_UP_GATES & _NOT_STEP_UP_GATES
 
 
 def _parity_breaks(
@@ -1338,7 +1377,11 @@ def _parity_breaks(
 
     A /ui route must: take a step-up when the JSON route does; take a proof bound to the SAME action
     when the JSON route binds one; keep the MFA gate when the JSON route keeps it (a ``reauth_only``
-    gate drops it); and require every permission the JSON route requires."""
+    gate drops it); and require every permission the JSON route requires.
+
+    It reads the gate, not the route body, so it cannot see ``spend=False``: a /ui gate that only
+    holds the proof leaves the spend to the route. ``test_ui_bound_step_up.py`` pins that each such
+    lane spends its proof once."""
     breaks: list[str] = []
     for ui, json_op in sorted(pairs.items()):
         if ui not in gates or json_op not in gates:

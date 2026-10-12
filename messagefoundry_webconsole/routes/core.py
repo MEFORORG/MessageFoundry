@@ -1222,10 +1222,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # Before #2625 the outcome rendered in place on the POST, and a refresh re-POSTed, which was
     # safe only as ADR 0090 §4's no-op. Answering with a GET keeps a refresh from sending anything.
     #
-    # Same permission as the POST and nothing more, and it reads no message: the page echoes the
-    # outcome the POST put in the query, through the escaping builders and the connection-name
-    # rule. A crafted link can therefore show a "queued" page for a resend that never ran. It queues
-    # nothing, the audit row is the record, and the detail page is where the delivery shows.
+    # Same permission as the POST, plus the caller's channel scope on the target. It reads the
+    # store's record of the resend's key (vault BACKLOG #3241), so a link that names no resend this
+    # engine ran answers 404 "No such resend", and the target and source shown are the record's.
+    # The `duplicate` flag still rides the query and only picks the wording: "queued" and "already
+    # resent" are both true of a key whose resend ran. Before #3241 the page echoed the query alone,
+    # so a crafted link showed "queued" for a resend that never ran.
     @app.get("/ui/messages/{message_id}/resend-done", response_class=HTMLResponse)
     async def ui_message_resend_done(
         message_id: str,
@@ -1238,7 +1240,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # (vault BACKLOG #3241). The key is the unguessable value the confirm page minted.
         key: Annotated[IdempotencyKey, Query(min_length=1, max_length=128)],
         duplicate: bool = Query(False),
-        _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
+        identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
     ) -> HTMLResponse:
         prior = await core.prior_resend(
             engine=await deps.get_engine(request),
@@ -1246,7 +1248,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             message_id=message_id,
             to=to,
         )
-        if prior is None:
+        # Out of scope reads as no record, so the page is no oracle for another channel's resends.
+        if prior is None or not identity.can_access_channel(prior.to_destination):
             return HTMLResponse(pages.message_resend_unknown(message_id), status_code=404)
         # `from_destination` may be empty: a key first used over the JSON API without a source.
         return HTMLResponse(

@@ -518,7 +518,8 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             "write_session_rebuilds": len(rebuilt),
             # Method + path template only, the same body-free shape as a finding.
             "write_session_rebuild_rows": list(rebuilt),
-            # Rows reached only after an action-bound re-proof (vault BACKLOG #3241). Method + path
+            # Rows re-proved for an action-bound step-up and probed again (vault BACKLOG #3241);
+            # whether the retry was reached is scored like any other probe. Method + path
             # template only; the action the gate named is a header value and stays out.
             "step_up_reproofs": len(reproved),
             "step_up_reproof_rows": list(reproved),

@@ -794,6 +794,14 @@ async def test_a_crafted_outcome_link_reports_no_resend(engine: Engine, tmp_path
         ):
             other = await c.get(path, params=params)
             assert other.status_code == 404, (path, params, other.status_code)
+    # A caller without scope on the target is told no more than about an unknown key.
+    await _add(service, "narrow", Role.OPERATOR.value, channels=["IB_ELSEWHERE"])
+    async with _client(engine, service) as c:
+        await _login(c, "narrow")
+        hidden = await c.get(
+            f"/ui/messages/{mid}/resend-done", params={"to": "OB2", "key": "k-real"}
+        )
+        assert hidden.status_code == 404 and "No such resend" in hidden.text
 
 
 async def test_a_malformed_name_costs_no_proof(engine: Engine) -> None:

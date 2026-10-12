@@ -768,6 +768,9 @@ class EnginePoller:
         except SIGN_IN_ERRORS:
             self._end_reload_client_sync(client)
             return None
+        except BaseException:
+            self._end_reload_client_sync(client)
+            raise
         return client
 
     async def end_reload_client(self, client: EngineClient) -> None:
