@@ -1478,10 +1478,10 @@ these hops, such as `check-privileges` and `verify`, do not log this warning.
 direct. The urllib hops also dial a loopback host direct. The Vault clients have no loopback rule,
 so an `https://` Vault on a loopback address is proxied.
 
-**A credential in a proxy URL is refused where it would reach a proxy in cleartext.** The urllib
-hops refuse it on each request, on any leg with no TLS to a proxy. Writing the proxy `https://`
-does not by itself exempt the credential. The rule, an example of a leg it lets through, and what
-it does not check are stated once, on
+**A credential in a proxy URL is refused at least where it would reach a proxy in cleartext.** The
+urllib hops refuse it on each request, on any leg with no TLS to a proxy. Writing the proxy
+`https://` does not by itself exempt the credential. Every leg the rule refuses, an example of a
+leg it lets through, and what it does not check are stated once, on
 [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). The Vault clients
 refuse a credentialed proxy not written `https://`, when they are built and again on each send.
 

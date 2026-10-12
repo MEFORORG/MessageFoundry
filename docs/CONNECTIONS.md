@@ -1524,7 +1524,8 @@ and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
 broker. The error names no part of the proxy URL. Which legs are refused, and the one exception
-for a `proxy_user` credential its connection admitted when it was built, are stated once, on
+for a `proxy_user` credential its connection admitted when it was built, which covers cleartext
+legs only, are stated once, on
 [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
 a leg it lets through and what it does not check.
 
