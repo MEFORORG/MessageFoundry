@@ -2,11 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Capture sink for the parallel-run **shadow** phase (TEST-ENVIRONMENT-PLAN.md §5).
 
-A headless MLLP receiver that ACKs (``AA``) every message and appends it to a per-connection capture
-file, so MEFOR Test's shadow output can be diffed **offline** against Corepoint's export. In shadow mode
-each MEFOR Test outbound's ``env()`` host/port points at one of these sinks (one sink ⇒ one connection's
-output), so the captured stream *is* that connection's output — without delivering duplicates to the real
-ancillaries/Epic.
+A headless MLLP receiver that ACKs (``AA``) every message it can parse and appends each one to a
+per-connection capture file, so MEFOR Test's shadow output can be diffed **offline** against
+Corepoint's export. In shadow mode each MEFOR Test outbound's ``env()`` host/port points at one of
+these sinks (one sink ⇒ one connection's output), so the captured stream *is* that connection's
+output — without delivering duplicates to the real ancillaries/Epic.
 
 Reuses the engine's own MLLP framing/ACK primitives (``MLLPDecoder`` / ``build_ack`` /
 ``frame_neutralised``) so the sink ACKs as the engine's own listeners do, an echoed MLLP frame byte
@@ -37,7 +37,7 @@ from messagefoundry.mllpcodec import (
     frame_neutralised,
 )
 from messagefoundry.parsing import Peek
-from messagefoundry.parsing.peek import HL7PeekError
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError
 
 _READ_BYTES = 65536  # the sink only absorbs + ACKs, never routes
 
@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 
 
 class CaptureSink:
-    """Bind one or more MLLP ports, ACK every received message, and append each to a JSONL capture.
+    """Bind one or more MLLP ports, ACK each message that parses, and append each to a JSONL capture.
 
     ``anonymizer`` is an optional de-identifier (ADR 0030 §6). When set, each captured body passes
     through it at the single ``_write`` choke point, so the JSONL carries de-identified bodies.
@@ -61,21 +61,26 @@ class CaptureSink:
       that carries PHI, discard the capture, add a rule for that field, and capture again.
     * A tally covers one run, and the sink appends. A file that already held lines has bodies
       that no summary covers.
-    * Each record's ``control_id`` is the MSH-10 the sink read before the anonymizer ran. It is
-      written as received.
-    * Any anonymizer error drops the message, and the sender still gets its ``AA``. A weak salt
-      is one such error, so check the salt before you start. Only ``anon_failed`` counts the
-      drops, so check that too.
+    * Each record's ``control_id`` is the MSH-10 of the body the sink writes. With an anonymizer,
+      that is the anonymized body, so the id follows the rules: a rule that rewrites MSH-10
+      rewrites the id too. It is ``None`` when that body does not parse.
+    * ``received_at`` is the real time of capture. No rule shifts it, an MSH-7 rule included.
+    * Any anonymizer error drops the message. The sink logs one WARNING per drop that names the
+      exception class, never its text or the body, and counts it in ``anon_failed``. A weak salt
+      or a bad overlay is one such error, so check both before you start.
+    * A message that parses gets its ``AA`` even when the anonymizer drops it. A payload that
+      does not parse gets no ACK at all, with or without an anonymizer.
 
-    The example below uses three names. ``Keyer`` and ``anonymize_checked`` are in the
-    ``messagefoundry.anon`` package. ``CoverageTally`` is in that package's ``leak`` module.
+    The example below uses four names. ``Keyer``, ``load_rules`` and ``anonymize_checked`` are in
+    the ``messagefoundry.anon`` package. ``CoverageTally`` is in that package's ``leak`` module.
 
     For example::
 
         Keyer(salt)  # raises here on a weak salt, before any message is dropped
+        rules = load_rules(overlay)  # raises here on a bad overlay; None gives the defaults
         tally = CoverageTally()
         sink = CaptureSink(out, anonymizer=lambda raw: anonymize_checked(
-            raw, salt=salt, on_report=tally.add))
+            raw, salt=salt, rules=rules, on_report=tally.add))
         ...  # run the capture, then after ``await sink.stop()``:
         print(tally.summary(), file=sys.stderr)
         print(f"dropped by the anonymizer: {sink.anon_failed}", file=sys.stderr)
@@ -200,13 +205,20 @@ class CaptureSink:
         if self._anonymizer is not None:
             try:
                 raw = self._anonymizer(raw)
-            except Exception:
+            except Exception as exc:
                 # Fail closed on ANY anonymizer error at this PHI choke point: an anonymization
                 # failure must NEVER write the un-anonymized body (PHI). Drop it and count it — a
                 # finding to reconcile, not a silent leak (CLAUDE.md §9). Broad on purpose: the engine
                 # path can raise a parser exception that is not a ValueError/RuntimeError.
                 self.anon_failed += 1
+                # The class name only, and no exc_info: an anonymizer's message can quote the body it
+                # refused, so neither str(exc) nor a traceback may reach the log (BACKLOG #2994).
+                log.warning("anonymizer refused a message; dropped it (%s)", type(exc).__name__)
                 return
+            # Read the id from the body being written, not the one received, so a rule that rewrites
+            # MSH-10 never leaves the real id beside the surrogate body (BACKLOG #2994). The id the
+            # caller passed is used only when there is no anonymizer, which saves a second parse.
+            control_id = _control_id_of(raw)
         json.dump(
             {"control_id": control_id, "raw": raw, "received_at": time.time()},
             self._file,
@@ -215,3 +227,18 @@ class CaptureSink:
         self._file.write("\n")
         self._file.flush()  # flush per message so a kill mid-shadow keeps everything captured so far
         self.captured += 1
+
+
+def _control_id_of(body: str) -> str | None:
+    """MSH-10 of ``body``, or ``None`` when ``body`` does not parse.
+
+    It never raises: it runs after the anonymizer's fail-closed catch, where an exception would
+    lose a body that is safe to write. ``HL7PeekError`` is a ``ValueError``, so the read-fault
+    family covers the parse refusal too. Not ``harness.scenarios._core.control_id_of``: that one
+    decodes bytes as UTF-8, and importing it would pull the scenario drivers into this sink. The
+    tee's ``_anonymize_captures`` applies the same rule with its own reader.
+    """
+    try:
+        return Peek.parse(body).control_id or None  # a blank MSH-10 is written as null, not ""
+    except PEEK_READ_FAULTS:
+        return None

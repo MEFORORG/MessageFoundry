@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,10 +19,12 @@ from harness.load.corpus import corpus_from_file
 from harness.load.ids import ControlIds
 from harness.load.profile import LoadProfileError, TypeMix
 from harness.reconcile.capture import CaptureSink
-from messagefoundry.anon import anonymize
+from messagefoundry.anon import DEFAULT_RULES, FieldRule, SurrogateKind, anonymize
+from messagefoundry.parsing import Peek
 from messagefoundry.transports.mllp import frame
 from tee.__main__ import main as tee_main
 from tee.store import RelayStore
+from tests._refusal_log_capture import TOKEN, assert_no_token, record_texts
 
 _SALT = "integ-salt-0123456789abcdef"
 _RAW = (
@@ -66,8 +69,84 @@ def test_capture_sink_anonymizes_on_capture(tmp_path) -> None:
     sink = asyncio.run(run())
     assert sink.captured == 1 and sink.anon_failed == 0
     record = json.loads(out.read_text().splitlines()[0])
-    assert record["control_id"] == "C1"  # MSH-10 kept => still correlatable
+    # The id is read from the anonymized body. The default rules keep MSH-10, so it is still the
+    # sender's own and the record stays correlatable (BACKLOG #2994).
+    assert record["control_id"] == "C1"
     assert "DOE" not in record["raw"] and "999" not in record["raw"]  # PHI scrubbed on capture
+
+
+# A rule set that rewrites MSH-10, the case BACKLOG #2994 is about. The default rules keep it.
+_MSH10_RULES = (*DEFAULT_RULES, FieldRule("MSH-10", SurrogateKind.ID))
+
+
+def test_capture_sink_control_id_follows_an_msh10_rule(tmp_path) -> None:
+    out = tmp_path / "cap.jsonl"
+
+    async def run() -> CaptureSink:
+        sink = CaptureSink(
+            out, ports=(0,), anonymizer=lambda r: anonymize(r, salt=_SALT, rules=_MSH10_RULES)
+        )
+        await sink.start()
+        try:
+            ack = await _send_and_ack(sink.bound_ports[0], _RAW.encode("latin-1"))
+        finally:
+            await sink.stop()
+        # The ACK still answers the sender's own id: only the record follows the rules.
+        assert b"MSA|AA|C1" in ack
+        return sink
+
+    sink = asyncio.run(run())
+    assert sink.captured == 1
+    _assert_id_follows_the_rules(json.loads(out.read_text().splitlines()[0]))
+
+
+def _assert_id_follows_the_rules(record: dict[str, object]) -> None:
+    """The record's id is the surrogate MSH-10 in its own body, never the real ``C1``."""
+    assert isinstance(record["raw"], str)
+    written_id = Peek.parse(record["raw"]).control_id
+    assert written_id and written_id != "C1"  # control: the rule did rewrite MSH-10
+    assert record["control_id"] == written_id
+
+
+def test_capture_sink_logs_one_warning_per_anonymizer_drop_with_no_body_text(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out = tmp_path / "cap.jsonl"
+    raised: list[ValueError] = []
+
+    def quoting(raw: str) -> str:
+        # An anonymizer whose error quotes the body it refused, which is what the log must not echo.
+        exc = ValueError(f"cannot scrub {raw}")
+        raised.append(exc)
+        raise exc
+
+    async def run() -> CaptureSink:
+        sink = CaptureSink(out, ports=(0,), anonymizer=quoting)
+        await sink.start()
+        try:
+            for _ in range(2):
+                await _send_and_ack(sink.bound_ports[0], _RAW.replace("DOE", TOKEN).encode())
+        finally:
+            await sink.stop()
+        return sink
+
+    caplog.set_level(logging.WARNING, logger="harness.reconcile.capture")
+    sink = asyncio.run(run())
+    assert sink.anon_failed == 2 and sink.captured == 0
+
+    records = [r for r in caplog.records if r.name == "harness.reconcile.capture"]
+    assert len(records) == 2  # one line per drop
+    assert all(r.levelno == logging.WARNING and "ValueError" in r.getMessage() for r in records)
+
+    # Positive controls: the scan fires on a line that carried str(exc), or the traceback.
+    assert len(raised) == 2
+    leaky = [
+        logging.makeLogRecord({"msg": "dropped (%s)", "args": (raised[0],)}),
+        logging.makeLogRecord({"msg": "dropped", "exc_info": (ValueError, raised[0], None)}),
+    ]
+    assert all(any(TOKEN in text for text in record_texts(r)) for r in leaky)
+    # The real lines carry the class name and nothing from the body.
+    assert_no_token(records)
 
 
 def test_capture_sink_fails_closed_on_real_engine_refusal(tmp_path) -> None:
@@ -152,6 +231,23 @@ def test_tee_anonymize_captures_end_to_end(tmp_path, monkeypatch) -> None:
     assert outgoing.code == "ADT"
     assert "DOE" not in outgoing.payload
     assert outgoing.control_id.startswith("T")  # MSH-10 restamped for replay
+
+
+def test_tee_anonymize_captures_control_id_follows_an_msh10_rule(tmp_path, monkeypatch) -> None:
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, _RAW.encode("latin-1"))  # the stored row's own id is the real "C1"
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    overlay = tmp_path / "anon.toml"
+    overlay.write_text('[hl7.fields]\n"MSH-10" = "id"\n', encoding="utf-8")
+    out = tmp_path / "ds.jsonl"
+
+    rc = tee_main(["anonymize-captures", "--db", db, "--out", str(out), "--overlay", str(overlay)])
+    assert rc == 0
+    (line,) = out.read_text().splitlines()
+    record = json.loads(line)
+    _assert_id_follows_the_rules(record)
+    # received_at is the relay's real receive time, kept on purpose (docs/PHI.md section 9).
+    assert isinstance(record["received_at"], float)
 
 
 def test_tee_anonymize_captures_refuses_no_msh_body(tmp_path, monkeypatch) -> None:
