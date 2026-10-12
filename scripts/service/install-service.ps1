@@ -1308,11 +1308,12 @@ function Get-DefaultServiceConfig {
 function Assert-NoNssmExpansion {
     <#
       Throw when $Path holds '%'. nssm stores at least the service's arguments, interpreter path,
-      working directory and log paths as expandable strings and expands %NAME% at start, so the
-      service would use a path other than the one this installer checked (vault BACKLOG #2626).
+      working directory and log paths as expandable strings and expands %NAME% at start, and the
+      SCM expands the image path that names nssm.exe. Either way the service would use a path
+      other than the one this installer checked (vault BACKLOG #2626).
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
-    if ($Path.Contains('%')) { throw "A path nssm stores for the service cannot contain '%': $Path" }
+    if ($Path.Contains('%')) { throw "A path the service is registered with cannot contain '%': $Path" }
 }
 
 function Format-QuotedPath {
@@ -1375,16 +1376,18 @@ function Test-ListenHost {
       ::1%PATH%, so a named one would reach the service as more arguments.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
-    # [0-9], not \d: .NET's \d also matches other scripts' digits.
-    if ($Value -notmatch '^(?=.{1,253}\z)[A-Za-z0-9.:-]+(%[0-9]{1,10})?\z') { return $false }
+    # ASCII only: [0-9], not \d, which matches other scripts' digits, and case-sensitive operators,
+    # because a case-insensitive [A-Za-z] also matches the Kelvin sign. Nine zone digits stay inside
+    # a uint32; IPAddress.TryParse silently drops a zone past it.
+    if ($Value -cnotmatch '^(?=.{1,253}\z)[A-Za-z0-9.:-]+(%[0-9]{1,9})?\z') { return $false }
     $parsed = $null
     if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) {
         if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { return $true }
         # No leading zero: the resolver reads '010' as octal.
-        return $Value -match '^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}\z'
+        return $Value -cmatch '^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}\z'
     }
     $label = '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
-    return $Value -match "^($label\.)*(?![0-9]+\z)(?!0[xX])$label\z"
+    return $Value -cmatch "^($label\.)*(?![0-9]+\z)(?!0[xX])$label\z"
 }
 
 function Get-LockPathProblem {
@@ -1508,7 +1511,7 @@ if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectR
 foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir)) { Assert-NoNssmExpansion $stored }
 
 # Before the lock check below, which would report a missing -Config only as a folder it cannot read.
-if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
+if (-not (Test-Path -LiteralPath $Config -PathType Container)) { throw "Config directory not found at: $Config" }
 
 # --- what -LockConfigDir may lock (vault BACKLOG #2626) ------------------------------------------------
 # Set-SecureConfigAcl re-owns everything below the folder it locks, so it must never reach these.

@@ -68,6 +68,13 @@ def test_config_has_no_default_and_its_absence_is_refused() -> None:
     assert "throw" in text[refusal : refusal + 300]
     # Before the first thing that acts: the NSSM copy.
     assert refusal < text.index("$NssmPath = Resolve-Nssm")
+    # A missing folder is named as missing, before the lock check could call it unreadable.
+    missing = text.index(
+        'if (-not (Test-Path -LiteralPath $Config -PathType Container)) { throw "Config directory '
+        'not found at: $Config" }'
+    )
+    assert missing < text.index("$configLockProblem = Get-LockPathProblem -Path $Config")
+    assert missing < text.index("$NssmPath = Resolve-Nssm")
 
 
 def test_only_the_default_install_root_is_checked_for_broad_write() -> None:
@@ -274,7 +281,7 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
         " ForEach-Object { Test-ListenHost $_ })\n"
         "    bad = @('127.0.0.1 --host 0.0.0.0', '\"127.0.0.1\"', '', '-x', 'a..b', 'a_b', '0', "
         "'1.2', '0x0', '127.0.0.010', 'a.1', '::1%PATH%', 'fe80::1%TEMP%', 'host%1', "
-        "'fe80::1%١٢' |"
+        "'fe80::1%١٢', 'fe80::1%9999999999', 'Key' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
         # Empty is the interpreter not found, which a later, clearer refusal names.
         "    empty = try { Assert-NoNssmExpansion ''; 'passed' } catch { $_.Exception.Message }\n"
@@ -292,13 +299,15 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
     )
     assert got == {
         "quote": "refused",
-        "percent": "A path nssm stores for the service cannot contain '%': D:\\%TEMP%\\cfg",
+        "percent": "A path the service is registered with cannot contain '%': D:\\%TEMP%\\cfg",
         # '10.0.0.1x' and '1e5' are host names: no resolver reads them as a number, so they do
         # not widen the bind, and a name that does not resolve fails at start.
         "good": [True] * 10,
         # nssm expands %NAME% at start, and PowerShell 7's IPAddress.TryParse takes a named zone.
-        # A zone of non-ASCII digits is refused too: .NET's \d would match it.
-        "bad": [False] * 15,
+        # Non-ASCII digits in a zone and the Kelvin sign in a name are refused: \d and a
+        # case-insensitive [A-Za-z] would match them. So is a zone past a uint32, which
+        # IPAddress.TryParse drops without a word.
+        "bad": [False] * 17,
         "empty": "passed",
     }
 
