@@ -134,7 +134,14 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
-from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import (
+    PASSKEYS_LABEL,
+    SESSION_KIND,
+    USER_KIND,
+    RowSealer,
+    RowSealError,
+    seal_bytes,
+)
 from messagefoundry.store.schema_verify import (
     SchemaMismatchError,
     is_schema_step_error,
@@ -1252,10 +1259,6 @@ _SESSION_RESEAL: Final = (
     " seal=? WHERE token_hash=? AND seal=?"
 )
 
-#: Raises an account's session epoch, which ends every session minted under the old one (BACKLOG
-#: #2592). Run beside every whole-account revoke.
-_BUMP_SESSION_EPOCH_SQL: Final = "UPDATE users SET session_epoch=session_epoch+1 WHERE id=?"
-
 
 def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
     """The parameters :data:`_SESSION_RESEAL` binds, in order: ``new``'s sealed columns and seal,
@@ -1692,24 +1695,6 @@ _SQL_ADMIN_GUARD_COUNTS = (
     " WHERE r.role_id = ? AND u.disabled = 0"
 )
 
-#: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
-#: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
-#: the manual marker.
-WITHDRAW_AD_SCOPE_SQL: Final = (
-    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
-    " WHERE id=? AND channel_scope = ?"
-    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
-)
-
-#: ``set_user_federated_subject``'s two statements on SQLite: unconditional, and conditional on the
-#: row holding no pair (``expect_unbound``, BACKLOG #1143). Both literal, so no SQL is assembled.
-_SET_FEDERATED_SQL: Final = (
-    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
-)
-_SET_FEDERATED_IF_UNBOUND_SQL: Final = (
-    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
-    " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
-)
 #: The session sweep a bind and an unbind each run inside their own transaction. A revoke blanks
 #: the seal (BACKLOG #2592): that needs no key, and a revoked row then fails its seal even with
 #: ``revoked_at`` put back to NULL. Each caller also raises the account's session epoch.
@@ -1835,11 +1820,13 @@ class UserRecord:
     # mutable credential state. The login-time rehash (``set_password_hash``) never writes it.
     password_generated: bool = False
     # THE ACCOUNT'S SESSION EPOCH (BACKLOG #2592). Every whole-account session revoke raises it by
-    # one, and a session resolves only while its own ``user_epoch`` equals it. The session's copy is
-    # sealed; this column is not yet, because the account row has no seal of its own. Until it does,
-    # the epoch orders the store's own writes (a sign-in racing an "end every session") and is not
-    # an integrity control on its own.
+    # one, and a session resolves only while its own ``user_epoch`` equals it. Both copies are
+    # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
+    #: Every column of the row as it was read, for the integrity seal (BACKLOG #2592). Carries the
+    #: TOTP ciphertext and the recovery-code hashes, so it is never printed or compared, and nothing
+    #: but the seal check and the store's write helper reads it. ``None`` on a record built by hand.
+    row: UserRow | None = field(default=None, compare=False, repr=False)
 
     def sign_in_locked(self, now: float) -> bool:
         """Whether the SIGN-IN lock is live at ``now``."""
@@ -1903,6 +1890,7 @@ class UserRecord:
             # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
             # session minted before a revoke also carries, so it is the OPEN direction.
             session_epoch=int(d["session_epoch"]),
+            row=UserRow.from_mapping(d),
         )
 
 
@@ -2071,6 +2059,713 @@ class WebAuthnCredential:
             created_at=float(d["created_at"]),
             last_used_at=_opt_float(d.get("last_used_at")),
         )
+
+
+# --- the sealed user record (BACKLOG #2592) ----------------------------------------------------
+#
+# One seal per account covers its whole authorization record: every column of its ``users`` row,
+# its ``user_roles`` rows, and a digest of its passkeys (``users.cred_digest``). The store writes it,
+# through one helper per backend; ``AuthService._load_user`` checks it. The canonical form is built
+# from :class:`UserRow`'s own fields, so a column added later is sealed by default and only an entry
+# in :data:`USER_SEAL_EXCLUDED` leaves one out.
+
+#: The ``users`` columns a user seal leaves out, each with its reason (BACKLOG #2592).
+#: ``tests/test_user_seal.py`` pins this list.
+USER_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "authz_seal": "the seal itself",
+        "totp_secret": (  # nosec B105 -- a column name and the reason it is left out, no secret
+            "re-encrypted in place by the key-rotation and legacy-encryption passes, which hold no"
+            " user seal; its own AES-GCM tag binds it to this row's id under a key the database does"
+            " not hold, and the seal covers whether it is set (totp_secret_set)"
+        ),
+    }
+)
+
+#: The ``webauthn_credentials`` columns the passkey digest leaves out, each with its reason.
+PASSKEY_DIGEST_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "sign_count": "written on every assertion, by a compare-and-set",
+        "last_used_at": "written on every assertion, with the sign count",
+    }
+)
+
+
+def _opt_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+@dataclass(frozen=True)
+class UserRow:
+    """Every column of one ``users`` row, each in the one type every backend reads it back as
+    (BACKLOG #2592). ``tests/test_user_seal.py`` holds the fields equal to the table's columns on
+    each backend, so a column cannot sit outside the seal unnoticed."""
+
+    id: str
+    username: str
+    auth_provider: str
+    display_name: str | None
+    email: str | None
+    notify_email: str | None
+    disabled: bool
+    created_at: float
+    updated_at: float
+    last_login_at: float | None
+    password_hash: str | None
+    password_changed_at: float | None
+    must_change_password: bool
+    failed_attempts: int
+    locked_until: float | None
+    channel_scope: str | None
+    totp_secret: str | None
+    totp_enabled: bool
+    totp_enrolled_at: float | None
+    totp_recovery_codes: str | None
+    last_totp_step: int | None
+    oidc_issuer: str | None
+    oidc_subject: str | None
+    directory_object_id: str | None
+    password_claimed_at: float | None
+    channel_scope_source: str | None
+    lock_cycles: int
+    second_step_failed_attempts: int
+    second_step_locked_until: float | None
+    second_step_lock_cycles: int
+    password_generated: bool
+    session_epoch: int
+    #: A digest of the account's passkeys (:func:`passkey_digest`), ``""`` with none.
+    cred_digest: str
+    #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
+    authz_seal: str
+
+    @classmethod
+    def from_mapping(cls, d: Mapping[str, Any]) -> UserRow:
+        """Hard subscripts throughout: every reader is a ``SELECT *``, and a row missing a column
+        must fail loudly rather than decode a default the seal was never made over."""
+        last_step = d["last_totp_step"]
+        return cls(
+            id=str(d["id"]),
+            username=str(d["username"]),
+            auth_provider=str(d["auth_provider"]),
+            display_name=_opt_str(d["display_name"]),
+            email=_opt_str(d["email"]),
+            notify_email=_opt_str(d["notify_email"]),
+            disabled=bool(d["disabled"]),
+            created_at=float(d["created_at"]),
+            updated_at=float(d["updated_at"]),
+            last_login_at=_opt_float(d["last_login_at"]),
+            password_hash=_opt_str(d["password_hash"]),
+            password_changed_at=_opt_float(d["password_changed_at"]),
+            must_change_password=bool(d["must_change_password"]),
+            failed_attempts=int(d["failed_attempts"]),
+            locked_until=_opt_float(d["locked_until"]),
+            channel_scope=_opt_str(d["channel_scope"]),
+            totp_secret=_opt_str(d["totp_secret"]),
+            totp_enabled=bool(d["totp_enabled"]),
+            totp_enrolled_at=_opt_float(d["totp_enrolled_at"]),
+            totp_recovery_codes=_opt_str(d["totp_recovery_codes"]),
+            last_totp_step=None if last_step is None else int(last_step),
+            oidc_issuer=_opt_str(d["oidc_issuer"]),
+            oidc_subject=_opt_str(d["oidc_subject"]),
+            directory_object_id=_opt_str(d["directory_object_id"]),
+            password_claimed_at=_opt_float(d["password_claimed_at"]),
+            channel_scope_source=_opt_str(d["channel_scope_source"]),
+            lock_cycles=int(d["lock_cycles"]),
+            second_step_failed_attempts=int(d["second_step_failed_attempts"]),
+            second_step_locked_until=_opt_float(d["second_step_locked_until"]),
+            second_step_lock_cycles=int(d["second_step_lock_cycles"]),
+            password_generated=bool(d["password_generated"]),
+            session_epoch=int(d["session_epoch"]),
+            cred_digest=str(d["cred_digest"] or ""),
+            authz_seal=str(d["authz_seal"] or ""),
+        )
+
+    def recovery_code_hashes(self) -> list[str]:
+        """The remaining single-use recovery-code hashes this row holds, or ``[]``."""
+        if self.totp_recovery_codes is None:
+            return []
+        return [str(h) for h in json.loads(self.totp_recovery_codes)]
+
+    def write_params(self) -> tuple[object, ...]:
+        """Every column but ``id``, in :class:`UserRow` field order, as the write statements bind
+        them. Booleans go in as ``bool``; each backend's driver stores them in its own type."""
+        return tuple(getattr(self, f.name) for f in _dc_fields(self) if f.name != "id")
+
+
+@dataclass(frozen=True)
+class RoleGrant:
+    """One ``user_roles`` row of an account, as the user seal covers it (BACKLOG #2592)."""
+
+    role_id: str
+    assigned_at: float
+    assigned_by: str | None
+
+    @classmethod
+    def from_mapping(cls, d: Mapping[str, Any]) -> RoleGrant:
+        return cls(
+            role_id=str(d["role_id"]),
+            assigned_at=float(d["assigned_at"]),
+            assigned_by=_opt_str(d["assigned_by"]),
+        )
+
+
+@dataclass(frozen=True)
+class UserAuthzRecord:
+    """One account's whole authorization record: its ``users`` row and its role rows, sorted by
+    role id (BACKLOG #2592). The one value a user seal is computed over."""
+
+    row: UserRow
+    roles: tuple[RoleGrant, ...] = ()
+
+    @classmethod
+    def of(cls, row: UserRow, roles: Iterable[RoleGrant]) -> UserAuthzRecord:
+        return cls(row=row, roles=tuple(sorted(roles, key=lambda g: g.role_id)))
+
+    @property
+    def role_ids(self) -> tuple[str, ...]:
+        return tuple(g.role_id for g in self.roles)
+
+    def changed(self, **columns: Any) -> UserAuthzRecord:
+        """This record with the named ``users`` columns replaced."""
+        return replace(self, row=replace(self.row, **columns))
+
+    def with_roles(
+        self, role_ids: Iterable[str], *, assigned_by: str | None, now: float
+    ) -> UserAuthzRecord:
+        """This record holding exactly ``role_ids``, each assigned at ``now`` by ``assigned_by``,
+        as :meth:`MessageStore.set_user_roles` has always written them."""
+        grants = {r: RoleGrant(r, float(now), assigned_by) for r in role_ids}
+        return UserAuthzRecord.of(self.row, grants.values())
+
+    def bump_epoch(self) -> UserAuthzRecord:
+        """This record with its session epoch raised by one, which ends every session minted under
+        the old one."""
+        return self.changed(session_epoch=self.row.session_epoch + 1)
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        """The ``(name, value)`` pairs a user seal covers: every :class:`UserRow` field not in
+        :data:`USER_SEAL_EXCLUDED`, whether a TOTP secret is set, then the role rows, counted."""
+        out: list[tuple[str, object]] = [
+            (f.name, getattr(self.row, f.name))
+            for f in _dc_fields(self.row)
+            if f.name not in USER_SEAL_EXCLUDED
+        ]
+        out.append(("totp_secret_set", self.row.totp_secret is not None))
+        out.append(("roles", len(self.roles)))
+        for grant in self.roles:
+            out.extend(
+                (
+                    ("role_id", grant.role_id),
+                    ("assigned_at", grant.assigned_at),
+                    ("assigned_by", grant.assigned_by),
+                )
+            )
+        return tuple(out)
+
+
+def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
+    """The digest of an account's passkeys that its user seal covers (``users.cred_digest``):
+    SHA-256 over every credential's fields but those :data:`PASSKEY_DIGEST_EXCLUDED` names, sorted by
+    the credential's id hash. ``""`` for no passkeys, which is what a new account carries."""
+    ordered = sorted(creds, key=lambda c: c.credential_id_hash)
+    if not ordered:
+        return ""
+    parts: list[tuple[str, object]] = [("count", len(ordered))]
+    for cred in ordered:
+        for f in _dc_fields(cred):
+            if f.name in PASSKEY_DIGEST_EXCLUDED:
+                continue
+            value = getattr(cred, f.name)
+            parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
+    return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
+
+
+def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
+    """``record`` with its seal set: the sealer's seal over it under the active key, or empty on a
+    store with no sealer (BACKLOG #2592)."""
+    seal = "" if sealer is None else sealer.seal(USER_KIND, record.seal_fields())
+    return record.changed(authz_seal=seal)
+
+
+def user_seal_ok(sealer: RowSealer | None, record: UserAuthzRecord) -> bool:
+    """Whether ``record`` carries a valid seal under a key this process holds. Always True with no
+    sealer: a store that holds no key writes and checks no seals. With one, a missing or empty seal
+    fails like a wrong one, and so does a value the encoder cannot read."""
+    if sealer is None:
+        return True
+    try:
+        return sealer.verify_held(USER_KIND, record.seal_fields(), record.row.authz_seal)
+    except TypeError:
+        return False
+
+
+@dataclass(frozen=True)
+class VerifiedUser(UserRecord):
+    """A :class:`UserRecord` whose whole authorization record passed its integrity seal (BACKLOG
+    #2592). Built by ``AuthService._load_user`` and nothing else, which
+    ``tests/test_user_seal.py`` holds. The identity build and the credential checks take this type,
+    so a record nobody checked does not type-check there.
+
+    ``role_ids`` are the role rows the seal covered: the identity build reads them from here, not
+    from a second store read that nobody checked."""
+
+    role_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def of(cls, user: UserRecord, role_ids: Iterable[str]) -> VerifiedUser:
+        values = {f.name: getattr(user, f.name) for f in _dc_fields(UserRecord)}
+        return cls(**values, role_ids=tuple(role_ids))
+
+    @property
+    def cred_digest(self) -> str:
+        return "" if self.row is None else self.row.cred_digest
+
+    @property
+    def has_passkeys(self) -> bool:
+        """Whether the sealed record names at least one passkey."""
+        return self.cred_digest != ""
+
+    def recovery_code_hashes(self) -> list[str]:
+        """The recovery-code hashes the seal covered, or ``[]``."""
+        return [] if self.row is None else self.row.recovery_code_hashes()
+
+
+# The statements that write a sealed user record (BACKLOG #2592), with `?` placeholders: SQLite and
+# SQL Server run them as written, Postgres carries `$n` twins. Each names every column, in
+# `UserRow` field order, so the write and the seal cover the same row. They are used only by each
+# backend's `create_user` and `_write_user`; `tests/test_user_seal.py` keeps it so.
+_USER_INSERT: Final = (
+    "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email, disabled,"
+    " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+    " must_change_password, failed_attempts, locked_until, channel_scope, totp_secret,"
+    " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
+    " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
+    " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
+    " password_generated, session_epoch, cred_digest, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+_USER_RESEAL: Final = (
+    "UPDATE users SET username=?, auth_provider=?, display_name=?, email=?, notify_email=?,"
+    " disabled=?, created_at=?, updated_at=?, last_login_at=?, password_hash=?,"
+    " password_changed_at=?, must_change_password=?, failed_attempts=?, locked_until=?,"
+    " channel_scope=?, totp_secret=?, totp_enabled=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+    " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
+    " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
+    " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
+    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " WHERE id=? AND authz_seal=?"
+)
+_USER_ROLES_CLEAR: Final = "DELETE FROM user_roles WHERE user_id=?"
+_USER_ROLE_INSERT: Final = (
+    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by) VALUES (?,?,?,?)"
+)
+_WEBAUTHN_INSERT: Final = (
+    "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
+    " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
+    " aaguid, created_at, last_used_at)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_WEBAUTHN_DELETE_ONE: Final = (
+    "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
+)
+_WEBAUTHN_DELETE_ALL: Final = "DELETE FROM webauthn_credentials WHERE user_id=?"
+
+
+def user_insert_params(record: UserAuthzRecord) -> tuple[object, ...]:
+    """The parameters :data:`_USER_INSERT` binds, in order."""
+    return (record.row.id, *record.row.write_params())
+
+
+def user_reseal_params(new: UserAuthzRecord, old: UserAuthzRecord) -> tuple[object, ...]:
+    """The parameters :data:`_USER_RESEAL` binds: ``new``'s columns and seal, then the id and the
+    seal of the row as it was read."""
+    return (*new.row.write_params(), old.row.id, old.row.authz_seal)
+
+
+def webauthn_insert_params(cred: WebAuthnCredential) -> tuple[object, ...]:
+    """The parameters :data:`_WEBAUTHN_INSERT` binds, in order."""
+    return (
+        cred.credential_id_hash,
+        cred.credential_id,
+        cred.user_id,
+        cred.rp_id,
+        cred.public_key,
+        cred.sign_count,
+        json.dumps(cred.transports) if cred.transports is not None else None,
+        cred.device_type,
+        bool(cred.backed_up),
+        cred.label,
+        cred.aaguid,
+        cred.created_at,
+        cred.last_used_at,
+    )
+
+
+def new_user_record(
+    *,
+    user_id: str,
+    username: str,
+    auth_provider: str,
+    display_name: str | None,
+    email: str | None,
+    notify_email: str | None,
+    password_hash: str | None,
+    must_change_password: bool,
+    password_generated: bool,
+    directory_object_id: str | None,
+    now: float,
+) -> UserAuthzRecord:
+    """The whole row ``create_user`` writes, every float as the backend reads it back, so the seal
+    made over it verifies after the round trip (BACKLOG #2592). No roles, no passkeys."""
+    now = float(now)
+    row = UserRow(
+        id=user_id,
+        username=username,
+        auth_provider=auth_provider,
+        display_name=display_name,
+        email=email,
+        notify_email=notify_email,
+        disabled=False,
+        created_at=now,
+        updated_at=now,
+        last_login_at=None,
+        password_hash=password_hash,
+        password_changed_at=now if password_hash is not None else None,
+        must_change_password=bool(must_change_password),
+        failed_attempts=0,
+        locked_until=None,
+        channel_scope=None,
+        totp_secret=None,
+        totp_enabled=False,
+        totp_enrolled_at=None,
+        totp_recovery_codes=None,
+        last_totp_step=None,
+        oidc_issuer=None,
+        oidc_subject=None,
+        directory_object_id=directory_object_id,
+        password_claimed_at=None,
+        channel_scope_source=None,
+        lock_cycles=0,
+        second_step_failed_attempts=0,
+        second_step_locked_until=None,
+        second_step_lock_cycles=0,
+        password_generated=bool(password_generated),
+        session_epoch=0,
+        cred_digest="",
+        authz_seal="",
+    )
+    return UserAuthzRecord(row=row)
+
+
+#: A change to one user record, for a backend's ``_write_user``: the new record, or ``None`` to
+#: write nothing (a condition the old statement carried in its WHERE did not hold).
+UserChange = Callable[[UserAuthzRecord], UserAuthzRecord | None]
+
+
+def full_authentication_clear(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
+    """What a FULL AUTHENTICATION writes (ADR 0197 AC-8): the sign-in stamp and all six lockout
+    columns back to "no history". Zeroing the sign-in cycle count is the ADR's recommendation,
+    matching "consecutive failures": an owner who signs in restarts the escalation."""
+    return r.changed(
+        last_login_at=float(now),
+        failed_attempts=0,
+        locked_until=None,
+        lock_cycles=0,
+        second_step_failed_attempts=0,
+        second_step_locked_until=None,
+        second_step_lock_cycles=0,
+        updated_at=float(now),
+    )
+
+
+def lockout_clear(r: UserAuthzRecord, *, reset_cycles: bool, now: float) -> UserAuthzRecord:
+    """What ``clear_lockout`` writes (ADR 0197 AC-9, the ``admin-unlock`` write): both locks and
+    both failure counts. Both cycle counts are KEPT unless ``reset_cycles``, so an attacker who
+    re-locks after an unlock resumes at the escalated length (the ADR's recommendation); the operator
+    passes ``--reset-cycles`` when they know the campaign is over."""
+    out = r.changed(
+        failed_attempts=0,
+        locked_until=None,
+        second_step_failed_attempts=0,
+        second_step_locked_until=None,
+        updated_at=float(now),
+    )
+    return out.changed(lock_cycles=0, second_step_lock_cycles=0) if reset_cycles else out
+
+
+def password_change(
+    *,
+    password_hash: str,
+    password_generated: bool,
+    must_change_password: bool,
+    require_totp: bool,
+    now: float,
+) -> UserChange:
+    """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
+
+    Both locks, both failure counts and the SECOND-STEP cycle count are cleared, because the
+    password those failures proved is gone; the sign-in cycle count stays: a caller who knows only
+    the username is not answered by a new password.
+
+    ``password_claimed_at`` is single-writer and WRITE-ONCE (BACKLOG #1245). A caller passing
+    ``must_change_password`` False is issuing a credential the holder chose, so the claim is
+    recorded, and a stamp already there is kept; that monotonicity is the point, since the flag it
+    replaces as a claimed-ness test is not monotonic. A caller passing True (an admin-created
+    account, an admin reset) can neither stamp nor clear it. Self-service rotation is the intended
+    caller passing False and need not be the only one; the invariant to preserve is that every
+    caller passing False has just authenticated the holder. Do not add a second writer of the
+    column, and never set it back to NULL after creation.
+
+    With ``require_totp`` (ADR 0197 Amendment A) the write happens only while TOTP is on with a
+    secret, so an ``admin_reset_mfa`` landing first makes it write nothing. TOTP with no secret is
+    no way past the lock, hence the second test."""
+    when = float(now)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if require_totp and not (r.row.totp_enabled and r.row.totp_secret is not None):
+            return None
+        claimed = r.row.password_claimed_at
+        if not must_change_password and claimed is None:
+            claimed = when
+        return r.changed(
+            password_hash=password_hash,
+            password_changed_at=when,
+            must_change_password=bool(must_change_password),
+            password_claimed_at=claimed,
+            failed_attempts=0,
+            locked_until=None,
+            second_step_failed_attempts=0,
+            second_step_locked_until=None,
+            second_step_lock_cycles=0,
+            password_generated=bool(password_generated),
+            updated_at=when,
+        )
+
+    return apply
+
+
+def lockout_increment(
+    counter: LockoutCounter,
+    *,
+    threshold: int,
+    lockout_seconds: float,
+    max_lockout_seconds: float,
+    now: float,
+    out: list[LockoutIncrement],
+) -> UserChange:
+    """One failed credential attempt on ``counter``, with the lockout policy applied
+    (:func:`next_lockout_state`). The answer is appended to ``out``."""
+    attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord:
+        state = next_lockout_state(
+            failed_attempts=int(getattr(r.row, attempts_col)),
+            locked_until=getattr(r.row, until_col),
+            lock_cycles=int(getattr(r.row, cycles_col)),
+            now=now,
+            threshold=threshold,
+            lockout_seconds=lockout_seconds,
+            max_lockout_seconds=max_lockout_seconds,
+            escalate=lockout_escalates(
+                counter, auth_provider=r.row.auth_provider, totp_enabled=r.row.totp_enabled
+            ),
+            lockable=lockout_arms(counter, password_generated=r.row.password_generated),
+        )
+        out.append(LockoutIncrement(state.attempts, state.just_locked, state.cycles))
+        return r.changed(
+            **{
+                attempts_col: state.attempts,
+                until_col: _opt_float(state.locked_until),
+                cycles_col: state.cycles,
+            },
+            updated_at=float(now),
+        )
+
+    return apply
+
+
+def totp_enable(recovery_code_hashes: Sequence[str], now: float) -> UserChange:
+    """What ``enable_totp`` writes, only where a secret is staged and TOTP is still off (BACKLOG
+    #2224). The enrolment confirm rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an
+    ``admin_reset_mfa`` can clear the staged secret inside that window, and a second confirm can
+    enable first; either way this writes nothing and the caller refuses."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.totp_secret is None or r.row.totp_enabled:
+            return None
+        return r.changed(
+            totp_enabled=True,
+            totp_enrolled_at=float(now),
+            totp_recovery_codes=json.dumps(list(recovery_code_hashes)),
+            updated_at=float(now),
+        )
+
+    return apply
+
+
+def totp_disable(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
+    """What ``disable_totp`` writes. ``last_totp_step`` goes too (ADR 0197 Amendment A): the
+    high-water mark belonged to the secret being removed, and a new secret has no history."""
+    return r.changed(
+        totp_secret=None,
+        totp_enabled=False,
+        totp_enrolled_at=None,
+        totp_recovery_codes=None,
+        last_totp_step=None,
+        updated_at=float(now),
+    )
+
+
+def totp_replace(
+    *,
+    sealed_secret: str | None,
+    recovery_code_hashes: Sequence[str],
+    step: int,
+    expected_enrolled_at: float | None,
+    now: float,
+) -> UserChange:
+    """``replace_totp_enrolment``'s swap (ADR 0171 Amendment B): only where TOTP is on, with a
+    seed, still enrolled at ``expected_enrolled_at``. The session epoch is raised in the same
+    write, since the caller ends every session with it."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not r.row.totp_enabled or r.row.totp_secret is None:
+            return None
+        if r.row.totp_enrolled_at != _opt_float(expected_enrolled_at):
+            return None
+        return r.bump_epoch().changed(
+            totp_secret=sealed_secret,
+            totp_enrolled_at=float(now),
+            totp_recovery_codes=json.dumps(list(recovery_code_hashes)),
+            last_totp_step=int(step),
+            updated_at=float(now),
+        )
+
+    return apply
+
+
+def recovery_code_spend(code_hash: str, now: float) -> UserChange:
+    """Remove one recovery-code hash; nothing is written when it is already gone, which is how two
+    concurrent verifications cannot both spend it (WP-14)."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        hashes = r.row.recovery_code_hashes()
+        if code_hash not in hashes:
+            return None
+        hashes.remove(code_hash)
+        return r.changed(totp_recovery_codes=json.dumps(hashes), updated_at=float(now))
+
+    return apply
+
+
+def totp_step_spend(step: int) -> UserChange:
+    """Record ``step`` as the highest consumed TOTP time-step, only when it is strictly greater than
+    the one stored, which makes each code single-use (ASVS 6.5.1)."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        last = r.row.last_totp_step
+        if last is not None and last >= step:
+            return None
+        return r.changed(last_totp_step=int(step))
+
+    return apply
+
+
+def scope_if_source(
+    scope_json: str | None,
+    source: ChannelScopeSource,
+    expected_source: ChannelScopeSource | None,
+    now: float,
+) -> UserChange:
+    """``set_user_channel_scope_if_source``'s compare-and-set (BACKLOG #2098): the scope and its
+    source, only while the row's source is still ``expected_source`` (``None`` matching NULL)."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope_source != expected_source:
+            return None
+        return r.changed(
+            channel_scope=scope_json, channel_scope_source=source, updated_at=float(now)
+        )
+
+    return apply
+
+
+def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
+    """``withdraw_ad_channel_scope``'s compare-and-set (BACKLOG #1927): withdraw to NULL, marked
+    ``ad``, only while the row holds ``expected_scope`` exactly and no administrator set it. The
+    compare is Python's, so it is byte-exact on every backend, as SQL Server's pinned collation
+    made it there."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope != expected_scope:
+            return None
+        if r.row.channel_scope_source == SCOPE_SOURCE_MANUAL:
+            return None
+        return r.changed(
+            channel_scope=None, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
+        )
+
+    return apply
+
+
+def federated_bind(issuer: str, subject: str, *, expect_unbound: bool, now: float) -> UserChange:
+    """``set_user_federated_subject``'s write, with the session epoch raised in the same write
+    because the caller ends the account's sessions with it. With ``expect_unbound`` (BACKLOG
+    #1143) only a row holding no pair is written."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if expect_unbound and (r.row.oidc_issuer is not None or r.row.oidc_subject is not None):
+            return None
+        return r.bump_epoch().changed(
+            oidc_issuer=issuer, oidc_subject=subject, updated_at=float(now)
+        )
+
+    return apply
+
+
+def federated_unbind(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
+    """``clear_user_federated_subject``'s write, epoch raised for the same reason as the bind."""
+    return r.bump_epoch().changed(oidc_issuer=None, oidc_subject=None, updated_at=float(now))
+
+
+def report_unsealed_users(count: int) -> None:
+    """Name, at a keyed open, the accounts that carry no integrity seal (BACKLOG #2592).
+
+    A keyed store refuses such an account on every read, the same as one whose seal is wrong: a
+    blank seal is exactly what a row inserted outside the store carries, so nothing seals one
+    automatically. They are accounts written before this store held a key, or before the seal
+    existed. The remedy is an account the store itself writes, such as ``provision-admin`` under a
+    new username, and not a sweep that would seal whatever the table holds."""
+    if count:
+        log.warning(
+            "%d user account(s) carry no integrity seal and are refused on every sign-in and"
+            " request (BACKLOG #2592); provision a new administrator with 'messagefoundry"
+            " provision-admin' under a new username, then recreate or remove these accounts",
+            count,
+        )
+
+
+def report_user_reseal(resealed: int, refused: int) -> None:
+    """Log what ``rotate-key``'s user re-seal pass did (BACKLOG #2592)."""
+    if resealed:
+        log.info("re-sealed %d user record(s) under the active key (rotation)", resealed)
+    if refused:
+        log.warning(
+            "%d user record(s) failed their integrity seal and were left as they are; each is"
+            " refused on every read (BACKLOG #2592)",
+            refused,
+        )
+
+
+def without_role(role_id: str) -> UserChange:
+    """The account's record with ``role_id`` removed; nothing written when it does not hold it."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if role_id not in r.role_ids:
+            return None
+        return replace(r, roles=tuple(g for g in r.roles if g.role_id != role_id))
+
+    return apply
 
 
 # PHI-at-rest encryption is the store's `_cipher` (messagefoundry.store.crypto): identity when no
@@ -4798,38 +5493,6 @@ def require_notify_email(email: str) -> str:
     return cleaned
 
 
-def password_claim_set(must_change_password: bool, placeholder: str) -> str:
-    """The ``users.password_claimed_at`` term of a ``set_password`` UPDATE — shared by all three
-    backends so the single-writer rule is stated once (BACKLOG #1245).
-
-    A caller passing ``must_change_password`` False is issuing a credential the holder chose, so that
-    call records the claim. A caller passing True is issuing a provisional credential (an
-    admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
-    from the SET list and the statement can neither stamp nor clear it.
-
-    **AT LEAST TWO callers pass False, not one** -- stated as a floor rather than an enumeration
-    because a closed list here is a liability (SDS-3.6), and an earlier draft of this docstring said
-    "and only that call" and was wrong. Self-service rotation is the intended one. The argon2
-    rehash-on-login path passes the record's EXISTING flag straight through, which is False for any
-    already-rotated account, so it reaches this branch too. That is safe for a reason worth writing
-    down rather than rediscovering: reaching it requires a verified password, and on any row where
-    the flag is False with a password set the stamp is already present (a fresh database because
-    only rotation clears the flag, and it stamps; a migrated one because the upgrade backfill covers
-    exactly ``must_change_password = 0 AND password_hash IS NOT NULL``), so the COALESCE no-ops.
-    **The invariant to preserve is therefore not "one caller" but "every caller passing False has
-    just authenticated the holder".**
-
-    ``COALESCE`` makes the claim WRITE-ONCE: a later rotation re-runs this term against a non-NULL
-    column and changes nothing, so the stamp is monotonic once set. That monotonicity is the whole
-    point — the flag it replaces as a claimed-ness test is non-monotonic (rotation clears it, an
-    admin reset re-sets it), which is why no reader could tell "never claimed" from "claimed, then
-    reset". Do not add a second writer of this column, and never assign it NULL after creation.
-    """
-    if must_change_password:
-        return ""
-    return f" password_claimed_at=COALESCE(password_claimed_at, {placeholder}),"
-
-
 def check_password_generated(*, password_generated: bool, password_hash: str | None) -> None:
     """Refuse a row that claims an engine-generated credential and carries none (ADR 0197
     Amendment A). Shared by the three backends' ``create_user`` so the rule is stated once: a
@@ -4837,29 +5500,6 @@ def check_password_generated(*, password_generated: bool, password_hash: str | N
     not exist, and the census would then never name it."""
     if password_generated and password_hash is None:
         raise ValueError("password_generated needs a password_hash: there is no credential to flag")
-
-
-#: The WHERE term a conditional rotation adds (ADR 0197 Amendment A, N-B2 part 4). The rotation's
-#: own UPDATE carries the factor check, so an ``admin_reset_mfa`` that clears TOTP between the
-#: service's read and this write makes the write match no row, and the caller refuses. Backend
-#: truth literals differ, so each backend passes its own.
-def rotation_factor_term(true_literal: str) -> str:
-    # ``totp_secret IS NOT NULL`` too, because TOTP with no secret is no way past the lock. Since
-    # BACKLOG #2224 ``enable_totp`` no longer writes that state (see ``totp_enable_term``), but at
-    # least ``set_totp_secret(secret=None)`` still can, so the second guard stays.
-    return f" AND totp_enabled={true_literal} AND totp_secret IS NOT NULL"
-
-
-#: The WHERE term that makes ``enable_totp`` conditional (BACKLOG #2224). The enrolment confirm
-#: rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an ``admin_reset_mfa`` can clear
-#: the staged secret inside that window, and a second confirm can enable first. Unconditional, the
-#: enable would then set ``totp_enabled`` over a NULL secret, or replace the first confirm's
-#: recovery codes. With this term the write matches no row in either case, and the caller refuses.
-#: It checks that SOME secret is staged, not that it is the one the caller verified: a second
-#: ``set_totp_secret`` landing in the window is not caught here. Backend false literals differ, so
-#: each backend passes its own.
-def totp_enable_term(false_literal: str) -> str:
-    return f" AND totp_secret IS NOT NULL AND totp_enabled={false_literal}"
 
 
 #: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
@@ -4880,37 +5520,6 @@ LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyTyp
         ),
     }
 )
-
-#: The SET terms a FULL AUTHENTICATION writes (ADR 0197 AC-8): all six lockout columns back to "no
-#: history", in the one ``record_login_success`` UPDATE on every backend. Zeroing the sign-in cycle
-#: count here is the ADR's recommendation, matching "consecutive failures": an owner who signs in
-#: restarts the escalation.
-FULL_AUTHENTICATION_LOCKOUT_CLEAR: Final = (
-    "failed_attempts=0, locked_until=NULL, lock_cycles=0, second_step_failed_attempts=0,"
-    " second_step_locked_until=NULL, second_step_lock_cycles=0"
-)
-
-#: The SET terms a PASSWORD CHANGE writes (``set_password``, ADR 0197 Decision item 8): both locks and
-#: both failure counts, and the SECOND-STEP cycle count, because the password those failures proved
-#: is gone. The sign-in cycle count stays: a caller who knows only the username is not answered by a
-#: new password.
-PASSWORD_CHANGE_LOCKOUT_CLEAR: Final = (
-    "failed_attempts=0, locked_until=NULL, second_step_failed_attempts=0,"
-    " second_step_locked_until=NULL, second_step_lock_cycles=0"
-)
-
-
-def lockout_clear_set(*, reset_cycles: bool) -> str:
-    """The SET terms ``clear_lockout`` writes (ADR 0197 AC-9, the ``admin-unlock`` write): both locks
-    and both failure counts. Both cycle counts are KEPT unless ``reset_cycles``, so an attacker who
-    re-locks after an unlock resumes at the escalated length (the ADR's recommendation); the operator
-    passes ``--reset-cycles`` when they know the campaign is over."""
-    terms = (
-        "failed_attempts=0, locked_until=NULL, second_step_failed_attempts=0,"
-        " second_step_locked_until=NULL"
-    )
-    return terms + (", lock_cycles=0, second_step_lock_cycles=0" if reset_cycles else "")
-
 
 #: The largest exponent the escalation ever computes. 2**64 lock lengths are far past any ceiling an
 #: operator can configure, so capping here changes no answer and keeps a huge stored count finite.
@@ -5602,7 +6211,9 @@ CREATE TABLE IF NOT EXISTS users (
     second_step_locked_until REAL,             -- ADR 0197: the second-step lock expiry; NULL = not locked
     second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: how many times the second-step lock was set
     password_generated   INTEGER NOT NULL DEFAULT 0,  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
-    session_epoch        INTEGER NOT NULL DEFAULT 0  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
+    session_epoch        INTEGER NOT NULL DEFAULT 0,  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
+    cred_digest          TEXT NOT NULL DEFAULT '',  -- BACKLOG #2592: digest of the account's passkeys; the user seal covers it. NO COMMA in this comment
+    authz_seal           TEXT NOT NULL DEFAULT ''  -- BACKLOG #2592: integrity seal over the account's row and role rows. NO COMMA in this comment
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -6156,6 +6767,8 @@ class MessageStore:
                 await store.checkpoint_cipher_invocations()
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
+            if store._row_sealer is not None:
+                report_unsealed_users(await store.count_unsealed_users())
             if read_only:
                 await store._load_read_only()
             else:
@@ -6850,6 +7463,7 @@ class MessageStore:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
+        report_user_reseal(*await self.reseal_user_records())
         return total
 
     @staticmethod
@@ -7214,6 +7828,12 @@ class MessageStore:
             # BACKLOG #2592: the account's session epoch. 0 on an existing row, which every
             # existing session (user_epoch 0 below) matches, so nothing is signed out by the add.
             ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
+            # BACKLOG #2592: the passkey digest and the account's integrity seal. An existing row
+            # gets an empty seal, which a keyed store refuses like a wrong one: a blank seal is
+            # exactly what a row inserted outside the store has, so nothing here seals it.
+            # `_report_unsealed_users` names the count at open.
+            ("cred_digest", "TEXT NOT NULL DEFAULT ''"),
+            ("authz_seal", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -12653,28 +13273,23 @@ class MessageStore:
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
+        record = new_user_record(
+            user_id=user_id,
+            username=username,
+            auth_provider=auth_provider,
+            display_name=display_name,
+            email=email,
+            notify_email=birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
+            password_hash=password_hash,
+            must_change_password=must_change_password,
+            password_generated=password_generated,
+            directory_object_id=directory_object_id,
+            now=now,
+        )
         async with _writer_guard(self._db, self._lock):
+            # BACKLOG #2592: the whole row, sealed, in one INSERT.
             await self._db.execute(
-                "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
-                " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-                " must_change_password, failed_attempts, locked_until, directory_object_id,"
-                " password_generated)"
-                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?,?)",
-                (
-                    user_id,
-                    username,
-                    auth_provider,
-                    display_name,
-                    email,
-                    birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
-                    now,
-                    now,
-                    password_hash,
-                    now if password_hash is not None else None,
-                    1 if must_change_password else 0,
-                    directory_object_id,
-                    1 if password_generated else 0,
-                ),
+                _USER_INSERT, user_insert_params(seal_user(self._row_sealer, record))
             )
             # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
             appended = await self._append_audits(audits, now=now)
@@ -12686,6 +13301,135 @@ class MessageStore:
             cur = await db.execute("SELECT * FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
+
+    async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
+        """The account's role rows, whole, as its user seal covers them (BACKLOG #2592)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?",
+                (user_id,),
+            )
+            return [RoleGrant.from_mapping(dict(r)) for r in await cur.fetchall()]
+
+    async def _read_user_record(self, user_id: str) -> UserAuthzRecord | None:
+        """The account's whole authorization record, read on the writer connection inside the
+        caller's transaction (BACKLOG #2592)."""
+        cur = await self._db.execute("SELECT * FROM users WHERE id=?", (user_id,))
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        cur = await self._db.execute(
+            "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?", (user_id,)
+        )
+        grants = [RoleGrant.from_mapping(dict(r)) for r in await cur.fetchall()]
+        return UserAuthzRecord.of(UserRow.from_mapping(dict(row)), grants)
+
+    async def _write_user(self, user_id: str, change: UserChange) -> UserAuthzRecord | None:
+        """The one writer of a user's sealed record (BACKLOG #2592). Call it inside a writer
+        transaction on ``self._db``.
+
+        Reads the row and its role rows, verifies the seal, applies ``change``, seals the result and
+        writes every column with a compare on the seal it read, then rewrites the role rows when they
+        changed. Returns the new record, or ``None`` when there is no row, ``change`` declined, or
+        the compare lost to a concurrent write; nothing is written then. Raises
+        :class:`RowSealError`, and writes nothing, when the record it read does not verify:
+        re-sealing it would turn a change made outside this helper into a sealed record."""
+        current = await self._read_user_record(user_id)
+        if current is None:
+            return None
+        if not user_seal_ok(self._row_sealer, current):
+            raise RowSealError(USER_KIND)
+        changed = change(current)
+        if changed is None:
+            return None
+        updated = seal_user(self._row_sealer, changed)
+        cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
+        if cur.rowcount != 1:
+            return None
+        if updated.roles != current.roles:
+            await self._db.execute(_USER_ROLES_CLEAR, (current.row.id,))
+            for grant in updated.roles:
+                await self._db.execute(
+                    _USER_ROLE_INSERT,
+                    (current.row.id, grant.role_id, grant.assigned_at, grant.assigned_by),
+                )
+        return updated
+
+    async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
+        rows = await self._db.execute(
+            "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
+        )
+        return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
+
+    async def _write_passkeys(
+        self,
+        user_id: str,
+        statement: str,
+        params: tuple[object, ...],
+        *,
+        removes_all: bool = False,
+    ) -> int:
+        """Run one passkey write and re-seal the account over its new passkey digest, in the
+        caller's writer transaction (BACKLOG #2592). Returns the statement's row count.
+
+        The account's record and its passkeys are checked first: a passkey is never added to or
+        removed from an account whose record fails its seal, or whose passkeys no longer match the
+        digest it covers, since the new digest would then seal a row the store never wrote.
+        ``removes_all`` skips the passkey check: once every passkey is gone nothing unchecked is
+        left to seal, so ``admin_reset_mfa`` can still clear a set that fails."""
+        current = await self._read_user_record(user_id)
+        if current is not None:
+            if not user_seal_ok(self._row_sealer, current):
+                raise RowSealError(USER_KIND)
+            if (
+                self._row_sealer is not None
+                and not removes_all
+                and passkey_digest(await self._account_passkeys(user_id)) != current.row.cred_digest
+            ):
+                raise RowSealError(USER_KIND)
+        # With no account the statement runs as it always did: an INSERT meets the foreign key and
+        # a DELETE matches nothing, and there is no record to seal. ``statement`` is one of the
+        # module's ``_WEBAUTHN_*`` constants, never caller text.
+        cur = await self._db.execute(statement, params)
+        count = int(cur.rowcount or 0)
+        if current is not None:
+            digest = passkey_digest(await self._account_passkeys(user_id))
+            await self._write_user(user_id, lambda r: r.changed(cred_digest=digest))
+        return count
+
+    async def reseal_user_records(self) -> tuple[int, int]:
+        """Re-seal every user record under the active key (BACKLOG #2592), for ``rotate-key``.
+
+        A record sealed under a retired key verifies until that key is dropped; this moves it to the
+        active key first, so dropping the retired key locks nobody out. A record that fails its seal
+        is left exactly as it is and counted. Returns ``(re-sealed, refused)``."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        async with self._read() as db:
+            cur = await db.execute("SELECT id FROM users WHERE authz_seal <> '' ORDER BY id")
+            ids = [str(r["id"]) for r in await cur.fetchall()]
+        resealed = refused = 0
+        for user_id in ids:
+            try:
+                async with _writer_guard(self._db, self._lock):
+                    written = await self._write_user(
+                        user_id, lambda r: None if sealer.is_active(r.row.authz_seal) else r
+                    )
+                    await self._commit()
+            except RowSealError:
+                refused += 1
+                continue
+            resealed += written is not None
+        return resealed, refused
+
+    async def count_unsealed_users(self) -> int:
+        """How many accounts carry no integrity seal (BACKLOG #2592). See
+        :func:`report_unsealed_users`."""
+        async with self._read() as db:
+            cur = await db.execute("SELECT COUNT(*) FROM users WHERE authz_seal = ''")
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns are compared, never `subject` alone: a subject is unique only
@@ -12743,15 +13487,28 @@ class MessageStore:
         #
         # The residual is still absorbed at the call site (`_refresh_cached_username`) for every
         # backend alike -- this store must not be the reason that handler looks unnecessary.
+        #
+        # BACKLOG #2592: the compare and the NOT EXISTS are now a read inside the same writer
+        # transaction, then the sealed write; the lock and SQLite's file-level writer lock still
+        # order it against every other writer as the comment above describes.
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                "UPDATE users SET username=?, updated_at=? WHERE id=? AND username=? AND NOT EXISTS "
-                "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
-                (username, now, user_id, expected_username, username, user_id),
+                "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
             )
+            taken = await cur.fetchone() is not None
+            written = None
+            if not taken:
+                written = await self._write_user(
+                    user_id,
+                    lambda r: (
+                        r.changed(username=username, updated_at=float(now))
+                        if r.row.username == expected_username
+                        else None
+                    ),
+                )
             await self._commit()
-            return int(cur.rowcount) > 0
+            return written is not None
 
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
@@ -12773,28 +13530,17 @@ class MessageStore:
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        claim_set = password_claim_set(must_change_password, "?")
-        claim_args: tuple[float, ...] = () if must_change_password else (now,)
-        condition = rotation_factor_term("1") if require_totp else ""
+        change = password_change(
+            password_hash=password_hash,
+            password_generated=password_generated,
+            must_change_password=must_change_password,
+            require_totp=require_totp,
+            now=now,
+        )
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
-                f"{claim_set}"
-                f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=?, updated_at=?"
-                f" WHERE id=?{condition}",
-                (
-                    password_hash,
-                    now,
-                    1 if must_change_password else 0,
-                    *claim_args,
-                    1 if password_generated else 0,
-                    now,
-                    user_id,
-                ),
-            )
-            written = cur.rowcount > 0
+            written = await self._write_user(user_id, change)
             await self._commit()
-        return written
+        return written is not None
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -12803,9 +13549,8 @@ class MessageStore:
         See the protocol's note on why it must not reuse ``set_password``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
-                (password_hash, now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(password_hash=password_hash, updated_at=float(now))
             )
             await self._commit()
 
@@ -12814,9 +13559,8 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET disabled=?, updated_at=? WHERE id=?",
-                (1 if disabled else 0, now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
             )
             await self._commit()
 
@@ -12836,9 +13580,9 @@ class MessageStore:
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
-                (display_name, email, now, user_id),
+            await self._write_user(
+                user_id,
+                lambda r: r.changed(display_name=display_name, email=email, updated_at=float(now)),
             )
             appended = await self._append_audits(audits, now=now)
             await self._commit()
@@ -12856,9 +13600,8 @@ class MessageStore:
         cleaned = require_notify_email(email)
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET notify_email=?, updated_at=? WHERE id=?",
-                (cleaned, now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(notify_email=cleaned, updated_at=float(now))
             )
             await self._commit()
 
@@ -12871,10 +13614,10 @@ class MessageStore:
         enable MFA — enrollment is confirmed by :meth:`enable_totp` after the user proves a live code.
         ``secret=None`` clears the staged secret."""
         now = time.time() if now is None else now
+        sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET totp_secret=?, updated_at=? WHERE id=?",
-                (self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)), now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(totp_secret=sealed, updated_at=float(now))
             )
             await self._commit()
 
@@ -12894,17 +13637,12 @@ class MessageStore:
     ) -> bool:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
         recovery codes. Writes only where a secret is staged and TOTP is still off, and returns
-        whether it wrote (BACKLOG #2224, see :func:`totp_enable_term`)."""
+        whether it wrote (BACKLOG #2224, see :func:`totp_enable`)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-                f" updated_at=? WHERE id=?{totp_enable_term('0')}",
-                (now, json.dumps(recovery_code_hashes), now, user_id),
-            )
-            written = cur.rowcount > 0
+            written = await self._write_user(user_id, totp_enable(recovery_code_hashes, now))
             await self._commit()
-        return written
+        return written is not None
 
     async def replace_totp_enrolment(
         self,
@@ -12929,28 +13667,19 @@ class MessageStore:
         never be turned on for an account that did not have it. The audit row and the session sweep
         commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
         now = time.time() if now is None else now
+        change = totp_replace(
+            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            recovery_code_hashes=recovery_code_hashes,
+            step=step,
+            expected_enrolled_at=expected_enrolled_at,
+            now=now,
+        )
         async with _writer_txn(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
-                " last_totp_step=?, updated_at=?"
-                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
-                " AND totp_enrolled_at IS ?",
-                (
-                    self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
-                    now,
-                    json.dumps(recovery_code_hashes),
-                    step,
-                    now,
-                    user_id,
-                    expected_enrolled_at,
-                ),
-            )
-            if int(cur.rowcount) <= 0:
+            if await self._write_user(user_id, change) is None:
                 # Nothing written, so nothing is revoked or audited. The commit ends the empty
                 # transaction, as set_user_federated_subject does.
                 await self._commit()
                 return None
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             appended = await self._append_audits((audit,), now=now)
             await self._commit()
@@ -12961,15 +13690,10 @@ class MessageStore:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            # ``last_totp_step`` too (ADR 0197 Amendment A): the high-water mark belonged to the secret
-            # being removed, and a new secret has no history. Kept, it would refuse the first code of
+            # ``last_totp_step`` too (:func:`totp_disable`): kept, it would refuse the first code of
             # the next secret inside the same 30 seconds -- which the earlier holder of a row being
             # repaired by ``provision-admin`` could use to block the repair.
-            await self._db.execute(
-                "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-                " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
-                (now, user_id),
-            )
+            await self._write_user(user_id, lambda r: totp_disable(r, now))
             await self._commit()
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
@@ -12989,22 +13713,10 @@ class MessageStore:
         concurrent verifications can't double-spend a single-use recovery code (WP-14)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,)
-            )
-            row = await cur.fetchone()
-            if not row or row["totp_recovery_codes"] is None:
-                return False
-            hashes = [str(h) for h in json.loads(row["totp_recovery_codes"])]
-            if code_hash not in hashes:
-                return False  # already consumed by a concurrent caller
-            hashes.remove(code_hash)
-            await self._db.execute(
-                "UPDATE users SET totp_recovery_codes=?, updated_at=? WHERE id=?",
-                (json.dumps(hashes), now, user_id),
-            )
+            # Nothing written when the hash is gone: a concurrent caller already spent it.
+            written = await self._write_user(user_id, recovery_code_spend(code_hash, now))
             await self._commit()
-            return True
+        return written is not None
 
     async def consume_totp_step(self, user_id: str, step: int) -> bool:
         """Atomically record ``step`` as the user's highest consumed TOTP time-step; return ``True``
@@ -13014,16 +13726,10 @@ class MessageStore:
         (ASVS 6.5.1). The re-read + compare + write run under one ``self._lock``, so two concurrent
         verifications of the same code can't both win."""
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("SELECT last_totp_step FROM users WHERE id=?", (user_id,))
-            row = await cur.fetchone()
-            if row is None:
-                return False
-            last = row["last_totp_step"]
-            if last is not None and last >= step:
-                return False  # already consumed (or an older step) — replay within the window
-            await self._db.execute("UPDATE users SET last_totp_step=? WHERE id=?", (step, user_id))
+            # Nothing written for an older or equal step: a replay within the window.
+            written = await self._write_user(user_id, totp_step_spend(step))
             await self._commit()
-            return True
+        return written is not None
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
@@ -13031,29 +13737,10 @@ class MessageStore:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
         ``_CIPHER_COLUMNS`` note). A duplicate ``(user_id, label)`` raises the backend's
         IntegrityError — the caller renders it as the same "label already in use" error as its
-        pre-check (the concurrent-enroll race, ADR 0068 §4)."""
+        pre-check (the concurrent-enroll race, ADR 0068 §4). The account is re-sealed over its new
+        passkey digest in the same transaction (BACKLOG #2592)."""
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
-                " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
-                " aaguid, created_at, last_used_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    cred.credential_id_hash,
-                    cred.credential_id,
-                    cred.user_id,
-                    cred.rp_id,
-                    cred.public_key,
-                    cred.sign_count,
-                    json.dumps(cred.transports) if cred.transports is not None else None,
-                    cred.device_type,
-                    int(cred.backed_up),
-                    cred.label,
-                    cred.aaguid,
-                    cred.created_at,
-                    cred.last_used_at,
-                ),
-            )
+            await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
@@ -13094,23 +13781,24 @@ class MessageStore:
 
     async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
-        predicate keeps the action self-scoped even if a foreign id-hash is submitted)."""
+        predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
+        account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?",
-                (user_id, credential_id_hash),
+            count = await self._write_passkeys(
+                user_id, _WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash)
             )
             await self._commit()
-            return cur.rowcount > 0
+        return count > 0
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int:
-        """Remove every credential for a user (``admin_reset_mfa``); returns the count removed."""
+        """Remove every credential for a user (``admin_reset_mfa``); returns the count removed.
+        The account is re-sealed over its empty passkey digest in the same transaction."""
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
+            count = await self._write_passkeys(
+                user_id, _WEBAUTHN_DELETE_ALL, (user_id,), removes_all=True
             )
             await self._commit()
-            return int(cur.rowcount or 0)
+        return count
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
@@ -13188,13 +13876,15 @@ class MessageStore:
                     await self._db.rollback()
                     return False
             if change is AdminRemoval.DISABLE:
-                await self._db.execute(
-                    "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                await self._write_user(
+                    user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
                 )
             elif change is AdminRemoval.DELETE:
                 await self._delete_user_rows(user_id)
             elif change is AdminRemoval.SET_ROLES:
-                await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
+                await self._write_user(
+                    user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
+                )
             else:
                 assert_never(change)
             await self._commit()
@@ -13202,10 +13892,11 @@ class MessageStore:
 
     async def _delete_user_rows(self, user_id: str) -> None:
         """Delete the account and every row keyed to it. Commits nothing: the caller holds the
-        writer transaction."""
-        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        writer transaction. Destroying a sealed record needs no key, so nothing here re-seals
+        (BACKLOG #2592)."""
+        await self._db.execute(_USER_ROLES_CLEAR, (user_id,))
         await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-        await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        await self._db.execute(_WEBAUTHN_DELETE_ALL, (user_id,))
         # vault BACKLOG #2145: the account's known sign-in addresses go with it.
         await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
         # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
@@ -13219,11 +13910,7 @@ class MessageStore:
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                f"UPDATE users SET last_login_at=?, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
-                " updated_at=? WHERE id=?",
-                (now, now, user_id),
-            )
+            await self._write_user(user_id, lambda r: full_authentication_clear(r, now))
             await self._commit()
 
     async def clear_lockout(
@@ -13231,10 +13918,8 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=?"
-                " WHERE id=?",
-                (now, user_id),
+            await self._write_user(
+                user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
             )
             await self._commit()
 
@@ -13248,9 +13933,13 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
-                (failed_attempts, locked_until, now, user_id),
+            await self._write_user(
+                user_id,
+                lambda r: r.changed(
+                    failed_attempts=int(failed_attempts),
+                    locked_until=_opt_float(locked_until),
+                    updated_at=float(now),
+                ),
             )
             await self._commit()
 
@@ -13276,36 +13965,19 @@ class MessageStore:
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
-        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
+        out: list[LockoutIncrement] = []
+        change = lockout_increment(
+            counter,
+            threshold=threshold,
+            lockout_seconds=lockout_seconds,
+            max_lockout_seconds=max_lockout_seconds,
+            now=now,
+            out=out,
+        )
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
-                " password_generated FROM users WHERE id=?",
-                (user_id,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                return LockoutIncrement(0, False, 0)
-            state = next_lockout_state(
-                failed_attempts=int(row[0]),
-                locked_until=_opt_float(row[1]),
-                lock_cycles=int(row[2]),
-                now=now,
-                threshold=threshold,
-                lockout_seconds=lockout_seconds,
-                max_lockout_seconds=max_lockout_seconds,
-                escalate=lockout_escalates(
-                    counter, auth_provider=str(row[3]), totp_enabled=bool(row[4])
-                ),
-                lockable=lockout_arms(counter, password_generated=bool(row[5])),
-            )
-            await self._db.execute(
-                f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?, updated_at=?"
-                " WHERE id=?",
-                (state.attempts, state.locked_until, state.cycles, now, user_id),
-            )
+            written = await self._write_user(user_id, change)
             await self._commit()
-            return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
+        return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
     async def upsert_role(
         self,
@@ -13347,6 +14019,15 @@ class MessageStore:
             if row is None or int(row["builtin"]) != 0:
                 await self._db.rollback()
                 return False
+            # BACKLOG #2592: each holder's record is re-sealed without the role. A holder whose
+            # record fails its seal is refused on every read already; its row of this role is
+            # simply deleted below, which needs no key and re-seals nothing.
+            cur = await self._db.execute(
+                "SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)
+            )
+            for holder in [str(r["user_id"]) for r in await cur.fetchall()]:
+                with suppress(RowSealError):
+                    await self._write_user(holder, without_role(role_id))
             await self._db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))
@@ -13471,21 +14152,10 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
-            await self._commit()
-
-    async def _replace_user_roles(
-        self, user_id: str, role_ids: Sequence[str], *, assigned_by: str | None, now: float
-    ) -> None:
-        """Replace the account's role rows. Commits nothing: the caller holds the writer
-        transaction."""
-        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-        for role_id in role_ids:
-            await self._db.execute(
-                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                " VALUES (?,?,?,?)",
-                (user_id, role_id, now, assigned_by),
+            await self._write_user(
+                user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
+            await self._commit()
 
     async def set_user_channel_scope(
         self,
@@ -13500,9 +14170,11 @@ class MessageStore:
         ``source`` records who wrote it, in the same statement (BACKLOG #1927)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
-                (scope_json, source, now, user_id),
+            await self._write_user(
+                user_id,
+                lambda r: r.changed(
+                    channel_scope=scope_json, channel_scope_source=source, updated_at=float(now)
+                ),
             )
             await self._commit()
 
@@ -13519,13 +14191,11 @@ class MessageStore:
         ``=`` so a ``None`` expectation matches a NULL source."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
-                " WHERE id=? AND channel_scope_source IS ?",
-                (scope_json, source, now, user_id, expected_source),
+            written = await self._write_user(
+                user_id, scope_if_source(scope_json, source, expected_source, now)
             )
             await self._commit()
-            return int(cur.rowcount) > 0
+        return written is not None
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
@@ -13533,12 +14203,9 @@ class MessageStore:
         """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                WITHDRAW_AD_SCOPE_SQL,
-                (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
-            )
+            written = await self._write_user(user_id, scope_withdrawal(expected_scope, now))
             await self._commit()
-            return int(cur.rowcount) > 0
+        return written is not None
 
     async def set_user_federated_subject(
         self,
@@ -13557,17 +14224,11 @@ class MessageStore:
         # ux_users_federated_subject refusing this UPDATE is EXPECTED (the #1256 race loser), and the
         # unwind rolls it back (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
-            if expect_unbound:
-                cur = await self._db.execute(
-                    _SET_FEDERATED_IF_UNBOUND_SQL, (issuer, subject, now, user_id)
-                )
-            else:
-                cur = await self._db.execute(_SET_FEDERATED_SQL, (issuer, subject, now, user_id))
-            if int(cur.rowcount) <= 0:
+            change = federated_bind(issuer, subject, expect_unbound=expect_unbound, now=now)
+            if await self._write_user(user_id, change) is None:
                 # Nothing written, so nothing is revoked. The commit ends the empty transaction.
                 await self._commit()
                 return None
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return int(revoked.rowcount)
@@ -13613,11 +14274,7 @@ class MessageStore:
                 return FederatedUnbind(
                     username=row["username"], issuer=None, subject=None, sessions_revoked=0
                 )
-            await self._db.execute(
-                "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
-                (now, user_id),
-            )
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+            await self._write_user(user_id, lambda r: federated_unbind(r, now))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return FederatedUnbind(
@@ -13878,7 +14535,7 @@ class MessageStore:
         :class:`RowSealError` and the whole transaction, revokes included, rolls back."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+            await self._bump_session_epoch(user_id)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             else:
@@ -13902,6 +14559,16 @@ class MessageStore:
         cur = await self._db.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
         row = await cur.fetchone()
         return 0 if row is None else int(row["session_epoch"])
+
+    async def _bump_session_epoch(self, user_id: str) -> None:
+        """Raise the account's session epoch through the write helper, inside the caller's writer
+        transaction (BACKLOG #2592). An account whose record fails its seal is refused on every
+        read already, so the revoke that called this goes ahead without the raise: ending sessions
+        needs no key, and refusing it would keep them live."""
+        try:
+            await self._write_user(user_id, UserAuthzRecord.bump_epoch)
+        except RowSealError:
+            log.warning("an account's record failed its integrity seal; its sessions end anyway")
 
     async def enforce_session_cap(
         self,
