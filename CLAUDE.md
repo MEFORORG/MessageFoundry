@@ -555,9 +555,8 @@ gates a merge**, and no seat has to clear one.
   reads what the review found. **The Lander may merge when the open findings are filed as rows and
   none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A finding
   that does either still goes to the owner for a ruling. **CORRECTED 2026-10-12:** this read *"a
-  finding that names a defect the merge would ship goes back to the owner for a ruling."* Until
-  that day, every finding that named a defect the merge would ship went to the owner. The ruling
-  does not let the Lander skip the review proof, or choose between two authors' deliberate
+  finding that names a defect the merge would ship goes back to the owner for a ruling."* The
+  ruling does not let the Lander skip the review proof, or choose between two authors' deliberate
   changes. Nor does it let the Lander decline a finding that names a defect the merge would ship.
   Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
   rule, this ruling is the newer one. The full text and the owner's words are in
