@@ -19,18 +19,24 @@
   0184 amendment 2026-10-06).
 - **Amendment 2026-10-11 (BACKLOG #2138). A seat decision under owner delegation 2026-10-08, not
   an owner ruling.** Rule item 7's last sentence no longer holds and is kept as the record: held
-  probes now stay in the mass-revoke breaker's probed count. Left out, a large hold beside more than
-  `ad_session_revoke_max` genuine revocations tripped the breaker on every pass while the wave was
-  held. So genuine disables and deletions went unrevoked, and the breaker alerted, for as long as
-  the hold stood. Counted in, the breaker judges revocations against every principal the pass
-  probed, as it already does for referred and unreachable ones (BACKLOG #2538). The cost is that a
-  hold dilutes the fraction a wave of false absences must exceed. A genuine wave still trips it:
-  30 absences beside 40 held accounts exceed 0.34 of 70. **Not measured:** a hold that comes with
-  false absences from one directory fault. Such a wave would be judged against a count the hold
-  has inflated, and nothing here says how often the two arrive together. The
-  `auth.ad_reconcile_aborted` row drops its `judged` key, which would now always equal `probed`.
-  `ReconcilePlan.judged` carries the rule, and
-  `tests/test_ad_session_reconcile.py::test_held_probes_stay_in_the_breakers_count` pins it.
+  probes now stay in the mass-revoke breaker's probed count. Left out, more than
+  `ad_session_revoke_max` genuine revocations beside a hold tripped the breaker whenever they also
+  exceeded `ad_session_revoke_max_fraction` of the probes that were not held. Where most of the
+  probed accounts were held, that was every pass while the hold stood, so genuine disables and
+  deletions went unrevoked and the breaker alerted the whole time. Counted in, the breaker judges
+  revocations against every principal the pass probed, as it already does for referred and
+  unreachable ones (BACKLOG #2538).
+  **The cost: a hold weakens the breaker in proportion to its size.** A wave of false absences now
+  trips it only while the absences exceed 0.34 (the default fraction) of every probe, held ones
+  included. 30 absences beside 40 held accounts and nothing else still trip it (30 is more than
+  0.34 of 70). 30 absences beside 60 held and 10 present do not (30 is not more than 0.34 of 100),
+  and the old rule aborted that pass (30 is more than 0.34 of 40). **Not measured:** how often one
+  directory fault makes both, for example one access change that loses read on
+  `userAccountControl` for some accounts and on the entries themselves for others. Such a fault
+  would now revoke the false absences on their second pass. The `auth.ad_reconcile_aborted` row
+  drops its `judged` key, which would now always equal `probed`. `ReconcilePlan.judged` carries the
+  rule. `tests/test_ad_session_reconcile.py::test_held_probes_stay_in_the_breakers_count` pins it,
+  and `::test_a_hold_now_lets_a_false_absence_wave_under_the_breaker` pins the cost.
 - **Related:** [ADR 0079](0079-kerberos-idp-session-coordination.md) (mechanism 2, the directory
   session reconciler, and its mass-revoke breaker) · [CLAUDE.md](../../CLAUDE.md) section 0 (not
   deployed) and section 11 (SDS-3.6, SDS-3.7) · BACKLOG #1639 (the fail-closed read this follows) ·

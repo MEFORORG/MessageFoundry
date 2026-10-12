@@ -6908,7 +6908,7 @@ class AuthService:
         self._reconcile_alert = (
             f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
             f"revoked more than {ceiling} of the {plan.judged} signed-in directory principals it "
-            f"judged ({len(plan.held)} of them held). No "
+            f"judged{f' ({len(plan.held)} of them held)' if plan.held else ''}. No "
             f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
             f"ad_bind_dn service account's read rights."
         )

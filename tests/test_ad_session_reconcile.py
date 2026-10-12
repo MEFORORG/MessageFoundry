@@ -465,6 +465,19 @@ def test_a_mass_revocation_wave_beside_a_held_one_still_trips_the_breaker() -> N
     assert plan.outcomes and plan.undetermined == 40
 
 
+def test_a_hold_now_lets_a_false_absence_wave_under_the_breaker() -> None:
+    """The cost the ADR 0195 amendment of 2026-10-11 accepts, pinned so it cannot widen unseen. 30
+    absences beside 60 held and 10 present are not more than 0.34 of 100, so they revoke. With held
+    probes left out they were more than 0.34 of 40, and the pass aborted. RED when: the
+    denominator grows or shrinks again without a test and an amendment saying so."""
+    held = [reconcile.Probe(f"h{i}", f"h{i}", U) for i in range(60)]
+    gone = [reconcile.Probe(f"g{i}", f"g{i}", reconcile.ProbeOutcome.ABSENT) for i in range(30)]
+    present = [reconcile.Probe(f"p{i}", f"p{i}", P) for i in range(10)]
+    plan = _plan(held + gone + present, prior_strikes={p.user_id: 1 for p in gone})
+    assert plan.aborted is None and plan.hold and len(plan.revocations) == 30
+    assert plan.judged == 100
+
+
 def test_an_outage_carries_the_hold_state_and_judges_nothing() -> None:
     down = [reconcile.Probe("u1", "a", reconcile.ProbeOutcome.UNAVAILABLE)]
     for latched in (True, False):
@@ -742,6 +755,7 @@ async def test_mass_revoke_breaker_aborts_the_pass_and_alerts() -> None:
             assert token is not None and await service.identity_for_token(token) is not None
         assert service.directory_reconcile_alert is not None
         assert "circuit breaker TRIPPED" in service.directory_reconcile_alert
+        assert "held" not in service.directory_reconcile_alert  # no hold, so no held clause
         assert any(a["action"] == "auth.ad_reconcile_aborted" for a in await store.list_audit())
     finally:
         await store.close()
