@@ -156,6 +156,12 @@ def test_a_clean_install_reports_nothing(fake_windows_readers: FakeReaders) -> N
 
 # --- serve ---------------------------------------------------------------------------------------
 
+#: What a real refusal at start says. Each platform's arm names the defect in its own words: the
+#: Windows arm reads an access list, and the POSIX arm reads a mode, which it prints.
+_START_REFUSAL = "refusing to start from " + (
+    "writable-by-others path" if sys.platform == "win32" else "group/world-writable path"
+)
+
 
 def _grant_others_write(path: Path) -> None:
     """Give a broad principal write on ``path`` for real, by the platform's own means."""
@@ -203,7 +209,7 @@ def test_serve_refuses_a_value_file_others_can_write(
     _grant_others_write(values)
     assert _serve(tmp_path, monkeypatch) == 2
     err = capsys.readouterr().err
-    assert "refusing to start from writable-by-others path" in err
+    assert _START_REFUSAL in err
     assert str(values) in err
     # Before any side effect: nothing was minted or opened in the working directory.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["environments"]
@@ -220,7 +226,7 @@ def test_serve_refuses_a_settings_file_others_can_write(
     _grant_others_write(settings)
     assert _serve(tmp_path, monkeypatch, "--service-config", str(settings)) == 2
     err = capsys.readouterr().err
-    assert "refusing to start from writable-by-others path" in err
+    assert _START_REFUSAL in err
     assert str(settings) in err
 
 
@@ -245,7 +251,7 @@ def test_serve_vets_the_default_settings_file(
     _grant_others_write(settings)
     assert _serve(tmp_path, monkeypatch) == 2
     err = capsys.readouterr().err
-    assert "refusing to start from writable-by-others path" in err
+    assert _START_REFUSAL in err
     assert str(settings) in err
 
 
@@ -260,7 +266,7 @@ def test_supervise_refuses_a_value_file_others_can_write(
     _grant_others_write(values)
     assert _start(tmp_path, monkeypatch, "supervise") == 2
     err = capsys.readouterr().err
-    assert "refusing to start from writable-by-others path" in err
+    assert _START_REFUSAL in err
     assert str(values) in err
     assert "refusing to start the fleet" in err
 
