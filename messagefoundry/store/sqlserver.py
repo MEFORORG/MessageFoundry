@@ -7519,6 +7519,8 @@ class SqlServerStore:
         # cell-bound writer, `mfenc:v4:<alg>:<kid>:<salt>:` (ADR 0196). Built off the cipher (not a baked-in
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
+        # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        report_user_reseal(*await self.reseal_user_records())
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
@@ -7528,7 +7530,7 @@ class SqlServerStore:
         for table, column in (
             ("messages", "raw"),
             ("queue", "payload"),
-            # users.totp_secret is re-encrypted with its seal by reseal_user_records (BACKLOG #2592).
+            ("users", "totp_secret"),
             ("messages", "summary"),
             ("messages", "metadata"),
             ("messages", "error"),
@@ -7734,7 +7736,6 @@ class SqlServerStore:
         ended = len(await self._execute_output("DELETE FROM sessions OUTPUT deleted.token_hash"))
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
-        report_user_reseal(*await self.reseal_user_records())
         return total
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
@@ -12086,6 +12087,10 @@ class SqlServerStore:
                 refused += 1
                 continue
             resealed += written is not None
+        if resealed:
+            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
+            # 11.3.4); charged here, as each generic rotation batch charges its own.
+            await self._charge_bound_batch()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -12616,18 +12621,13 @@ class SqlServerStore:
         (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # XLOCK (BACKLOG #2592): a concurrent grant of this role reads the row under a shared
-                # lock for its foreign key, so it waits here and then fails the key; no grant can land
-                # between the holder read below and the bulk delete, which would desync its seal.
-                await cur.execute(
-                    "SELECT builtin FROM roles WITH (XLOCK, ROWLOCK) WHERE id=?", (role_id,)
-                )
+                await cur.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
                 row = await cur.fetchone()
                 if row is None or int(row[0]) != 0:
                     await conn.rollback()
                     return False
-                # BACKLOG #2592: each holder re-sealed without the role; store.py says why a holder
-                # whose record fails is simply left to the delete below.
+                # BACKLOG #2592: each holder re-sealed without the role, and only a refused holder's
+                # own row deleted; store.py says why there is no bulk delete.
                 await cur.execute("SELECT user_id FROM user_roles WHERE role_id=?", (role_id,))
                 holders = [str(h[0]) for h in await cur.fetchall()]
                 for holder in holders:
@@ -12635,7 +12635,10 @@ class SqlServerStore:
                         await self._write_user(cur, holder, without_role(role_id))
                     except RowSealError:
                         report_refused_role_holder()
-                await cur.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+                        await cur.execute(
+                            "DELETE FROM user_roles WHERE role_id=? AND user_id=?",
+                            (role_id, holder),
+                        )
                 await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
                 await cur.execute("DELETE FROM roles WHERE id=?", (role_id,))
                 await self._commit(conn)

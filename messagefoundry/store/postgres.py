@@ -2848,12 +2848,10 @@ class PostgresStore:
         # cell-bound writer, `mfenc:v4:<alg>:<kid>:<salt>:` (ADR 0196). Built off the cipher (not a baked-in
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
+        # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        report_user_reseal(*await self.reseal_user_records())
         total = 0
         for table, column in self._CIPHER_COLUMNS:
-            if table == "users":
-                # BACKLOG #2592: re-encrypted with its seal by reseal_user_records; store.py's
-                # rotation_reseal says why.
-                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT id, {column} AS v FROM {table}"
@@ -2942,7 +2940,6 @@ class PostgresStore:
         ended = await self._execute("DELETE FROM sessions")
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
-        report_user_reseal(*await self.reseal_user_records())
         return total
 
     async def _reencrypt_composite(
@@ -8199,6 +8196,10 @@ class PostgresStore:
                 refused += 1
                 continue
             resealed += written is not None
+        if resealed:
+            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
+            # 11.3.4); charged here, as each generic rotation batch charges its own.
+            await self._charge_bound_batch()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -8741,21 +8742,21 @@ class PostgresStore:
         """Delete a custom (``builtin=FALSE``) role and its user/AD-group assignments in one
         transaction (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
         async with self._timed_acquire() as conn, conn.transaction():
-            # FOR UPDATE (BACKLOG #2592): a concurrent grant of this role takes FOR KEY SHARE on the
-            # row for its foreign key, so it waits here and then fails the key; no grant can land
-            # between the holder read below and the bulk delete, which would desync its seal.
-            row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1 FOR UPDATE", role_id)
+            row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1", role_id)
             if row is None or bool(row["builtin"]):
                 return False
-            # BACKLOG #2592: each holder re-sealed without the role; store.py says why a holder
-            # whose record fails is simply left to the delete below.
+            # BACKLOG #2592: each holder re-sealed without the role, and only a refused holder's own
+            # row deleted; store.py says why there is no bulk delete. A grant committed after the
+            # holder read keeps its row, so the role delete below then fails the foreign key.
             holders = await conn.fetch("SELECT user_id FROM user_roles WHERE role_id=$1", role_id)
             for holder in [str(h["user_id"]) for h in holders]:
                 try:
                     await self._write_user(conn, holder, without_role(role_id))
                 except RowSealError:
                     report_refused_role_holder()
-            await conn.execute("DELETE FROM user_roles WHERE role_id=$1", role_id)
+                    await conn.execute(
+                        "DELETE FROM user_roles WHERE role_id=$1 AND user_id=$2", role_id, holder
+                    )
             await conn.execute("DELETE FROM ad_group_role_map WHERE role_id=$1", role_id)
             await conn.execute("DELETE FROM roles WHERE id=$1", role_id)
             return True

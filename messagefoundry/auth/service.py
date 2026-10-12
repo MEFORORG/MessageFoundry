@@ -2267,6 +2267,18 @@ _UNSEALED_NAME_REFUSAL: Final = (
 )
 
 
+def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
+    """Every value a loader may find an account by (BACKLOG #2592), so a re-read in
+    ``AuthService._verified`` can tell it still names the account the caller looked up."""
+    return (
+        user.id,
+        user.username,
+        user.oidc_issuer,
+        user.oidc_subject,
+        user.directory_object_id,
+    )
+
+
 @dataclass(frozen=True)
 class _UserLookup:
     """What one user read found (BACKLOG #2592): the account with its seal checked, or ``None``,
@@ -7749,6 +7761,10 @@ class AuthService:
                 reread = await self._store.get_user(user.id)
                 if reread is None:
                     return None  # deleted meanwhile: nothing to report
+                if _lookup_keys(reread) != _lookup_keys(user):
+                    # The account was renamed, rebound or re-keyed meanwhile, so it may no longer be
+                    # the one the caller looked up. Not reported, and the next request reads afresh.
+                    return None
                 user = reread
         await self._user_seal_failed(user.id)
         return None

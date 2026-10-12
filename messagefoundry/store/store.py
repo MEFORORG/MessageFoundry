@@ -7452,13 +7452,14 @@ class MessageStore:
         # prefix, so a value re-encrypted to the active key/format matches next round and the loop ends.
         # Built off the cipher (not a baked-in v1 prefix+keyid) so a v4-active rotation matches its own rows.
         active_like = f"{cipher.active_marker_prefix}%"
+        # BACKLOG #2592: first, each sealed account's TOTP secret re-encrypted and the account
+        # re-sealed under the active key in one write (rotation_reseal), so the loop below finds those
+        # secrets already under the active key. The loop then rotates the rest, which are accounts
+        # whose record has no seal or fails it and is refused anyway.
+        report_user_reseal(*await self.reseal_user_records())
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
-                if table == "users":
-                    # BACKLOG #2592: the user seal covers the secret's bytes, so it is re-encrypted
-                    # with its seal by reseal_user_records, after this pass.
-                    continue
                 while True:
                     # Anything not already under the active key (plaintext or a retired-key blob),
                     # excluding NULL/blank. Rewritten rows match active_like next round, so this ends.
@@ -7516,7 +7517,6 @@ class MessageStore:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
-        report_user_reseal(*await self.reseal_user_records())
         return total
 
     @staticmethod
@@ -13487,6 +13487,10 @@ class MessageStore:
                 refused += 1
                 continue
             resealed += written is not None
+        if resealed:
+            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
+            # 11.3.4); charged here, as each generic rotation batch charges its own.
+            await self._charge_bound_batch()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -14087,8 +14091,10 @@ class MessageStore:
                 await self._db.rollback()
                 return False
             # BACKLOG #2592: each holder's record is re-sealed without the role. A holder whose
-            # record fails its seal is refused on every read already; its row of this role is
-            # simply deleted below, which needs no key and re-seals nothing.
+            # record fails its seal is refused on every read already; only its own row of this role
+            # is deleted, which needs no key and re-seals nothing. No bulk delete: a holder that
+            # appeared after the read keeps its row, sealed and granting nothing once the role is
+            # gone (the server backends' foreign key, where there is one, refuses that order).
             cur = await self._db.execute(
                 "SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)
             )
@@ -14097,7 +14103,9 @@ class MessageStore:
                     await self._write_user(holder, without_role(role_id))
                 except RowSealError:
                     report_refused_role_holder()
-            await self._db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+                    await self._db.execute(
+                        "DELETE FROM user_roles WHERE role_id=? AND user_id=?", (role_id, holder)
+                    )
             await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))
             await self._commit()
