@@ -1317,6 +1317,30 @@ def test_an_openssl_error_on_the_private_copy_is_not_reworded_as_a_staging_failu
         harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
 
 
+# --- vault BACKLOG #2866 item 2: a BEGIN marker inside a comment still refuses the file -----------
+
+
+def test_a_begin_marker_inside_a_comment_line_refuses_the_file_and_says_why(
+    pki: _Pki, tmp_path: Path
+) -> None:
+    # Kept on purpose: OpenSSL loads this file's one CRL, and the engine refuses the file anyway.
+    # ``judge_every_crl`` records why, where it counts the markers.
+    crl = pki.crl.read_bytes()
+    commented = b"# the -----BEGIN X509 CRL----- block below is the root CRL\n" + crl
+    assert _openssl_count(tmp_path, commented) == 1
+    # Control: a comment line without the marker is judged, so the marker is what refuses.
+    assert len(judge_every_crl(b"# the block below is the root CRL\n" + crl, now=time.time())) == 1
+
+    with pytest.raises(ValueError, match="does not start a line") as refused:
+        judge_every_crl(commented, now=time.time())
+    assert "inside a comment" in str(refused.value)
+    assert "cannot tell it from a CRL" in str(refused.value)
+
+    pki.crl.write_bytes(commented)
+    with pytest.raises(ValueError, match="inside a comment"):
+        pki.outbound_hop()
+
+
 # --- vault BACKLOG #2866 items 3 and 4: a refusal that holds still across passes -------------------
 
 
