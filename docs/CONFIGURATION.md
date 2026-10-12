@@ -1837,7 +1837,11 @@ connection's own `tls_ca_file`, whole, CRL blocks included. So does the syslog f
 `[logging].forward_tls_ca_file`. Once a CRL setting turns revocation checking on for that hop, those
 CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer. The scan watches
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
-file, so a refreshed CRL inside one needs a restart, and the alert's `detail` says so. Put a CRL in
+file, so a refreshed CRL inside one needs a restart, and the alert's `detail` says so. A start does
+not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's
+start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
+its issuer. If the new CRL is expired, not yet in effect, a delta CRL, unreadable, or badly signed,
+`detail` says to fix it in the CA file before restarting. Put a CRL in
 the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
 only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
 The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.

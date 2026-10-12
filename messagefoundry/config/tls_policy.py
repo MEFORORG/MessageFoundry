@@ -469,18 +469,22 @@ def record_ca_bundle_crls(ctx: ssl.SSLContext, ca_file: str | None, *, setting: 
         )
         return
     try:
-        # Only the blocks OpenSSL loads: one whose BEGIN does not start a line is skipped by both.
-        if not crl_pem_blocks(pem):
-            return  # the usual CA file: certificates only
-        facts = read_soonest_crl_facts(pem, now=time.time())
+        try:
+            # Only the blocks OpenSSL loads: one whose BEGIN does not start a line is skipped by both.
+            if not crl_pem_blocks(pem):
+                return  # the usual CA file: certificates only
+            facts = read_soonest_crl_facts(pem, now=time.time())
+        except ValueError as exc:
+            logger.warning(
+                "the CA file %s carries a CRL block the expiry monitor cannot judge (%s), so no "
+                "alert will cover it. Move the CRL to the hop's CRL setting, which judges it at "
+                "start",
+                where,
+                exc,
+            )
+            return
+        # Outside that clause, so a ValueError from the record is a defect, not a bad CRL (#3176).
         record_crl_load(ctx, ca_file, pem, facts, setting=setting, ca_bundle=True)
-    except ValueError as exc:
-        logger.warning(
-            "the CA file %s carries a CRL block the expiry monitor cannot judge (%s), so no "
-            "alert will cover it. Move the CRL to the hop's CRL setting, which judges it at start",
-            where,
-            exc,
-        )
     except Exception:
         # Not a verdict on the file: a defect here. This only records for the monitor, and a hop
         # that built before this existed must not stop building because of it.

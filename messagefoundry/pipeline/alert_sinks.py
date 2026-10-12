@@ -977,8 +977,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         Vault BACKLOG #2319: a date that is a running hop's held copy says so. The event gains
         ``held_copy``, ``shared_with`` and a ``detail`` only when there is something to say, so a
-        plain CRL alert's payload is what it was. ``detail`` also becomes the alert instance's
-        reason, which the store cuts to about 200 characters, so it leads with the remedy."""
+        plain CRL alert's payload is what it was. The event's ``detail`` is
+        :func:`~messagefoundry.pipeline.alerts.crl_expiry_detail`: the held-copy marker, then the
+        scan's ``detail``, then the other rows. It also becomes the alert instance's reason, which
+        the store cuts to about 200 characters, so the marker and the scan's remedy lead."""
         event: dict[str, Any] = {
             "type": "cert_expiry",
             "connection": f"{name} (CRL)",
