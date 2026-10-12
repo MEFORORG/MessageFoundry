@@ -105,6 +105,7 @@ import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import NamedTuple
 
 from messagefoundry.config.loaded_crls import (
     HeldCrl,
@@ -679,6 +680,8 @@ def _reload_path(
         )
         # Judged again each pass, so the warning goes once its time has passed.
         refusals.reopen()
+        # The reopen above is also what lets the flag live on the outcome and not on the recorded
+        # refusal: such a refusal is never final, so ``_pending`` never replays it without the flag.
         refusals.start_refuses = True
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
 
@@ -896,6 +899,16 @@ def reload_replaced_crls(
     return outcomes
 
 
+class _Alerted(NamedTuple):
+    """A refusal :class:`CrlReloadRunner` has raised ``crl_reload_refused`` for and not resolved."""
+
+    #: The file as the pass read it, for the clear's log line and payload.
+    path: str
+    #: The refused bytes and the reason: together, the file version the alert was raised for.
+    fingerprint: tuple[int, int]
+    reason: str
+
+
 class CrlReloadRunner:
     """Runs :func:`reload_replaced_crls` every ``interval_seconds``, off the event loop.
 
@@ -939,11 +952,10 @@ class CrlReloadRunner:
         self._task: asyncio.Task[None] | None = None
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._node = node
-        # Per path key, the refusal already alerted: the file's path, the fingerprint of the
-        # refused bytes and the reason. A pass returns a refused outcome every minute, so this is
-        # what keeps the alert to one per file version. It is also the set of alerts this runner
-        # has open. Touched only on the event loop.
-        self._alerted: dict[str, tuple[str, tuple[int, int], str]] = {}
+        # Per path key, the refusal already alerted. A pass returns a refused outcome every
+        # minute, so this is what keeps the alert to one per file version. It is also the set of
+        # alerts this runner has open. Touched only on the event loop.
+        self._alerted: dict[str, _Alerted] = {}
         # True while the sink is refusing calls: one WARNING per failing streak, not one a pass.
         self._sink_failing = False
 
@@ -1037,7 +1049,7 @@ class CrlReloadRunner:
     def _resolve(self, keys: Sequence[str], why: str) -> None:
         """Raise ``crl_reload_applied`` for each alert in ``keys``, and forget the ones raised."""
         for key in keys:
-            path = self._alerted[key][0]
+            path = self._alerted[key].path
             try:
                 self._alert_sink.crl_reload_applied(
                     reload_alert_subject(key, self._node), path=path
@@ -1064,17 +1076,19 @@ class CrlReloadRunner:
 
     def _raise_refused(self, outcome: ReloadOutcome, refusal: ReloadRefusal) -> None:
         key = crl_path_key(outcome.path)
+        version = (refusal.fingerprint, refusal.reason)
         known = self._alerted.get(key)
-        if known is not None and known[1:] == (refusal.fingerprint, refusal.reason):
+        if known is not None and (known.fingerprint, known.reason) == version:
             return  # this version of the file is alerted already
+        token = _REMEDY_CLASS.get(refusal.remedy)
         try:
             self._alert_sink.crl_reload_refused(
                 reload_alert_subject(key, self._node),
                 path=outcome.path,
-                remedy_class=outcome.remedy_class or _OTHER_REMEDY_CLASS,
+                remedy_class=token or _OTHER_REMEDY_CLASS,
                 stale_contexts=outcome.stale,
                 # Only a sentence the class map vouches for. Never ``refusal.reason``.
-                remedy=refusal.remedy if refusal.remedy in _REMEDY_CLASS else "",
+                remedy=refusal.remedy if token else "",
                 start_refuses=outcome.start_refuses,
             )
         except Exception:
@@ -1083,4 +1097,4 @@ class CrlReloadRunner:
             self._sink_failed("raised")
             return
         self._sink_failing = False
-        self._alerted[key] = (outcome.path, refusal.fingerprint, refusal.reason)
+        self._alerted[key] = _Alerted(outcome.path, *version)

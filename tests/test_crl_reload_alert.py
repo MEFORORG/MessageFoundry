@@ -59,11 +59,12 @@ from messagefoundry.pipeline.crl_reload import (
 from messagefoundry.pipeline.intake_bound import INTAKE_SUBJECT_MAX_LENGTH
 from messagefoundry.pki import read_soonest_crl_facts
 from tests import test_crl_reload as _base
+from tests._refusal_log_capture import until
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
 from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
-from tests.test_crl_reload import _DAY, _fresher, _Pki
+from tests.test_crl_reload import _DAY, _fresher, _Pki, _refusals_logged
 
 # The reload suite's fixtures, bound here by name so pytest finds them in this module too: an
 # empty registry and pass state per test, and one CA with a leaf and a CRL file.
@@ -76,34 +77,25 @@ _ISSUER = "CN=mefor-299-reload-ca"
 
 
 class _Sink(LoggingAlertSink):
-    """Records the reload alert. Every other event logs, so an engine can run on it."""
+    """Records the reload alert and its inverse. Every other event logs, so an engine can run on
+    it. While ``down`` is set both calls raise, as a broken sink would."""
 
     def __init__(self) -> None:
         self.events: list[tuple[str, str, dict[str, Any]]] = []
         self.threads: list[str] = []
+        self.down = False
 
-    def crl_reload_refused(
-        self,
-        name: str,
-        *,
-        path: str,
-        remedy_class: str,
-        stale_contexts: int,
-        remedy: str,
-        start_refuses: bool = False,
-    ) -> None:
+    def _record(self, kind: str, name: str, payload: dict[str, Any]) -> None:
+        if self.down:
+            raise RuntimeError("sink down")
+        self.events.append((kind, name, payload))
+
+    def crl_reload_refused(self, name: str, **payload: Any) -> None:
         self.threads.append(threading.current_thread().name)
-        payload = {
-            "path": path,
-            "remedy_class": remedy_class,
-            "stale_contexts": stale_contexts,
-            "remedy": remedy,
-            "start_refuses": start_refuses,
-        }
-        self.events.append(("refused", name, payload))
+        self._record("refused", name, payload)
 
-    def crl_reload_applied(self, name: str, *, path: str) -> None:
-        self.events.append(("applied", name, {"path": path}))
+    def crl_reload_applied(self, name: str, **payload: Any) -> None:
+        self._record("applied", name, payload)
 
     def kinds(self) -> list[str]:
         return [kind for kind, _name, _payload in self.events]
@@ -130,6 +122,15 @@ def _expired(pki: _Pki) -> bytes:
 def _not_newer(pki: _Pki) -> bytes:
     """Issued no later than the held copy, so OpenSSL would go on choosing the held one."""
     return pki.crl_pem(issued=3 * _DAY, lasts=60 * _DAY, revoke=True)
+
+
+def _unproven_hop(pki: _Pki) -> ssl.SSLContext:
+    """A context that holds the file's CRL but recorded no blocks, so the reload must refuse it
+    rather than guess. The caller keeps it alive: the registry holds contexts weakly."""
+    hop = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    pem = pki.crl.read_bytes()
+    record_crl_load(hop, str(pki.crl), pem, read_soonest_crl_facts(pem, now=time.time()))
+    return hop
 
 
 # --- the alert: the file, the remedy class, the count, and no CRL contents ----------------------
@@ -186,7 +187,7 @@ async def test_one_alert_per_file_version_for_a_verdict_the_reload_treats_as_fin
 
     assert len(sink.events) == 2, "a second refused version raises one more"
     # Matching the log: one ERROR line per version, by the same rule.
-    assert sum("refused to apply" in r.getMessage() for r in caplog.records) == 2
+    assert _refusals_logged(caplog) == 2
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -210,9 +211,7 @@ async def test_the_count_is_the_contexts_still_on_the_old_copy(pki: _Pki) -> Non
     # Two hops hold the starting copy. One recorded no blocks, so the reload refuses it and
     # brings the other current: one context reloaded, one still on the old copy.
     current = pki.outbound_hop()
-    unproven = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    pem = pki.crl.read_bytes()
-    record_crl_load(unproven, str(pki.crl), pem, read_soonest_crl_facts(pem, now=time.time()))
+    unproven = _unproven_hop(pki)
     sink = _Sink()
     runner = _runner(sink)
     pki.crl.write_bytes(_fresher(pki, revoke=False))
@@ -222,6 +221,7 @@ async def test_the_count_is_the_contexts_still_on_the_old_copy(pki: _Pki) -> Non
     assert (outcome.reloaded, outcome.stale) == (1, 1)
     assert sink.refused()[0]["stale_contexts"] == 1
     assert current.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert unproven.verify_mode == ssl.CERT_REQUIRED  # keeps both contexts alive to here
 
 
 async def test_a_refusal_replayed_without_a_new_judgment_still_carries_the_count(
@@ -313,11 +313,7 @@ class _CountedPasses:
         """Wait until ``passes`` further passes have run AND been reported. A pass is counted
         when it returns, before its report, so one more pass must finish to cover the last."""
         target = self.done + passes + 1
-        for _ in range(2000):
-            if self.done >= target:
-                return
-            await asyncio.sleep(0.005)
-        raise AssertionError(f"the runner made {self.done} passes, short of {target}")
+        await until(lambda: self.done >= target, f"reload pass {target}")
 
 
 async def test_the_runner_raises_on_the_event_loop_and_the_alert_store_gets_its_row(
@@ -391,10 +387,7 @@ async def test_the_runner_raises_from_the_loop_thread_not_the_pass_thread(pki: _
     pki.crl.write_bytes(_expired(pki))
     runner.start()
     try:
-        for _ in range(2000):
-            if sink.events:
-                break
-            await asyncio.sleep(0.005)
+        await until(lambda: bool(sink.events), "the refused-reload alert")
     finally:
         await runner.stop()
 
@@ -414,16 +407,9 @@ async def test_a_pass_that_returns_no_outcomes_raises_nothing(returned: object) 
 async def test_a_sink_that_raises_does_not_stop_the_runner_and_is_retried(
     pki: _Pki, caplog: pytest.LogCaptureFixture
 ) -> None:
-    class _Broken(_Sink):
-        down = True
-
-        def crl_reload_refused(self, name: str, **kw: Any) -> None:
-            if self.down:
-                raise RuntimeError("sink down")
-            super().crl_reload_refused(name, **kw)
-
     hop = pki.outbound_hop()
-    sink = _Broken()
+    sink = _Sink()
+    sink.down = True
     runner = _runner(sink)
     pki.crl.write_bytes(_expired(pki))
 
@@ -508,9 +494,7 @@ async def test_putting_the_old_bytes_back_resolves_the_alert(pki: _Pki) -> None:
 
 async def test_the_alert_stays_while_any_context_is_on_the_old_copy(pki: _Pki) -> None:
     current = pki.outbound_hop()
-    unproven = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    pem = pki.crl.read_bytes()
-    record_crl_load(unproven, str(pki.crl), pem, read_soonest_crl_facts(pem, now=time.time()))
+    unproven = _unproven_hop(pki)
     sink = _Sink()
     runner = _runner(sink)
     pki.crl.write_bytes(_fresher(pki, revoke=False))
@@ -558,10 +542,7 @@ async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(pki: _P
     runner.start()
     try:
         # Before the stop, which resolves too.
-        for _ in range(2000):
-            if "applied" in sink.kinds():
-                break
-            await asyncio.sleep(0.005)
+        await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
         assert sink.kinds() == ["refused", "applied"]
         assert passes == [], "no pass ran: the idle branch resolved it"
         assert reload_refusals() == {}
@@ -666,20 +647,13 @@ async def test_a_runner_started_again_raises_a_refusal_that_still_stands(pki: _P
 async def test_a_clear_the_sink_refuses_is_retried(
     pki: _Pki, caplog: pytest.LogCaptureFixture
 ) -> None:
-    class _Broken(_Sink):
-        down = True
-
-        def crl_reload_applied(self, name: str, *, path: str) -> None:
-            if self.down:
-                raise RuntimeError("sink down")
-            super().crl_reload_applied(name, path=path)
-
     hop = pki.outbound_hop()
-    sink = _Broken()
+    sink = _Sink()
     runner = _runner(sink)
     pki.crl.write_bytes(_expired(pki))
     _pass(runner)
     pki.crl.write_bytes(_fresher(pki, revoke=False))
+    sink.down = True  # after the raise landed, so only the clear is refused
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
         for _ in range(3):

@@ -1886,15 +1886,17 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 
 | Event field | What it holds |
 |---|---|
-| `connection` | `crl_reload:` and the CRL file's absolute path, case-folded on Windows. `@node:<node_id>` or `@shard:<id>` follows when several engine processes share the store, because each process holds its own TLS contexts. A path over 120 characters is cut to `~`, an 8-digit checksum, `~` and its last 110 characters. |
+| `connection` | `crl_reload:` and the CRL file's absolute path, case-folded on Windows. `@node:<node_id>` or `@shard:<id>` follows when several engine processes share the store, because each process holds its own TLS contexts. A long path is shortened to a checksum and its tail; `path` holds it whole. |
 | `path` | the file as configured |
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy when the alert was raised |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
 | `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
 
-The event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
-it stays in the engine log, in the `crl_reload` ERROR line. Read that line before you act.
+This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
+it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that
+line before you act. That holds for this event only: the CRL expiry alert's `detail` does carry the
+reason, once the held copy nears its `nextUpdate`.
 
 | `remedy_class` | What to do |
 |---|---|
