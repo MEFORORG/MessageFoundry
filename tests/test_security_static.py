@@ -567,7 +567,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         r"""'^(?P<pre>\\s*' + re.escape(key) + '\\s*=\\s*)(?P<lit>(?P<q>[\\"\'])' + re.escape(old) + '(?P=q))'""",
     ),
     "messagefoundry/logging_setup.py": (
-        r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=[^&\\s\\"\']+'""",
+        r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=' + _QUERY_VALUE""",
     ),
     # BACKLOG #1572 -- the separator-aware redaction pass. Unresolvable BY CONSTRUCTION and that is the
     # point: the character class is the delimiter set the MESSAGE declares in MSH-1/MSH-2, read at

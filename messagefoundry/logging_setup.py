@@ -306,8 +306,77 @@ class RedactionFilter(logging.Filter):
 #: **Cite the ruling, not this sentence.**
 _CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
 
+#: The label words ``secretscrub`` redacts a value under: its credential, token and key-material
+#: words. A COPY, because those tuples are private to that module. ``tests/test_logging.py`` holds
+#: this copy, the ``MEFOR_`` prefix and the label prefix below to their sources there, so a change
+#: made there and not here goes red.
+_QUERY_STOP_WORDS = (
+    "password",
+    "passwd",
+    "passphrase",
+    "pass",
+    "pwd",
+    "secret",
+    "credential",
+    "authorization",
+    "bearer",
+    "token",
+    "session",
+    "api_key",
+    "api-key",
+    "apikey",
+    "encryption_keys_retired",
+    "encryption_key",
+    "private_key",
+    "intake_api_key_next",
+)
+
+#: A credential label whose value starts where a query value ends (BACKLOG #3002). The label is a
+#: word above, or a ``MEFOR_`` name, with an optional dotted, hyphenated or underscored prefix of
+#: at most six segments, ``secretscrub``'s bound. Unlike there, the walk starts at the separator
+#: and cannot restart later, so a label with a deeper dotted or hyphenated prefix is not stopped
+#: for. Then an optional quote, its ":" or "=", and a QUOTE that opens its value, with optional
+#: spaces around the ":" or "=". So the label's value lies outside the query value, and the label
+#: is all the stop leaves behind.
+#:
+#: THE QUOTE IS REQUIRED, as it is for ``secretscrub``'s own stop. Without it the stop fired on a
+#: label with an empty value, and a credential such as a base64 code whose tail reads ``/Pwd=``
+#: printed that tail, which the query value used to hide. Measured in review, 2026-10-12.
+_LABEL_WITH_ITS_VALUE_OUTSIDE = (
+    r"\b(?:(?-i:MEFOR_[A-Z0-9_]+)|(?:[A-Za-z0-9]+[._-]){0,6}(?:"
+    + "|".join(re.escape(word) for word in sorted(_QUERY_STOP_WORDS, key=len, reverse=True))
+    + r"))\b['\"]?\s*[:=]\s*['\"]"
+)
+
+#: A query value: every character up to "&", whitespace or a quote, as before, except that it stops
+#: BEFORE A SEPARATOR FOLLOWED BY SUCH A LABEL (BACKLOG #3002). Until then the value ran on through
+#: ``;password=`` and ended at the quote that opened the password's value. The label went with it,
+#: so ``CredentialScrubFilter`` after this filter found no label, and ``token=a;password="v w"``
+#: printed "v w" on every configured sink.
+#:
+#: A separator is any value character a label cannot hold, so at least ";", ",", ":", "=", "|", "/"
+#: and "+". Where the label's value is not quoted, as in ``token=a;password=b`` or
+#: ``token=a;password=``, the value runs on and is hidden whole, as before. A single value holding
+#: a bare ";" or "," is hidden whole too. The ".", "-" and "_" are label characters, so a label glued on by one of them still goes
+#: with the value: ``token=a.password="v w"`` still prints "v w". That residual is #2966's and
+#: #3122's, not this filter's.
+#:
+#: Other shapes still print the later value, at least these, and each printed the same before:
+#: a braced value (``;PWD={p w}``, also #2966's); an unquoted value after a space
+#: (``;password= v``); a label deeper than the prefix bound above; a ``MEFOR_`` name with any
+#: prefix; a bare ``Bearer`` scheme word; a token-word label quoted before its ":" or "=", which
+#: ``secretscrub`` does not read either; and a separator that is a Unicode letter or a
+#: percent-encoded one, where the label has no ``\b``.
+#:
+#: LINEAR. The two branches take disjoint characters and are possessive. The lookahead runs only at a
+#: separator. It walks at most six label segments and the label's word, so it ends at the next
+#: separator. Past a quote or a space it walks one run of spaces, and then the value has ended.
+_QUERY_VALUE = (
+    r"(?:[A-Za-z0-9._\-]++|[^A-Za-z0-9._\-&\s\"'](?!" + _LABEL_WITH_ITS_VALUE_OUTSIDE + r"))++"
+)
+
 _CREDENTIAL_QUERY_RE = re.compile(
-    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=[^&\s\"']+",
+    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _QUERY_VALUE,
 )
 
 
