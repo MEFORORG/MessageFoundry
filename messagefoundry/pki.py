@@ -329,11 +329,11 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
             crl, nxt = _parse_first_crl(block)
             if _is_delta_crl(crl):
                 raise ValueError(
-                    "it is a delta CRL, so OpenSSL drops a revocation whichever delta rule it has. "
-                    "Before openssl/openssl PR 31044 it reads a newer delta as a complete CRL and "
-                    "drops every revocation listed only in the base CRL. From that fix on it rejects "
-                    "a delta as a complete CRL and drops every revocation listed only in the delta; "
-                    "give base CRLs only"
+                    "it is a delta CRL, which OpenSSL mishandles whichever delta rule it has. "
+                    "Before openssl/openssl PR 31044 it reads a newer delta as a complete CRL, so "
+                    "every revocation listed only in the base CRL is lost. From that fix on it "
+                    "rejects a delta as a complete CRL, so every revocation listed only in the "
+                    "delta is lost; give base CRLs only"
                 )
             judged.append(
                 (

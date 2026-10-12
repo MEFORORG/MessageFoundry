@@ -1544,7 +1544,11 @@ def test_a_delta_crl_drops_a_revocation_without_the_refusal(
         x509.load_pem_x509_crl(marker + part)
         for part in Path(bundle).read_bytes().split(marker)[1:]
     )
-    assert delta.extensions.get_extension_for_class(x509.DeltaCRLIndicator)
+    is_delta = [
+        any(isinstance(ext.value, x509.DeltaCRLIndicator) for ext in crl.extensions)
+        for crl in (base, delta)
+    ]
+    assert is_delta == [False, True]
     assert delta.last_update_utc > base.last_update_utc
     # Both CRLs must load. A delta OpenSSL skipped at load would show the new rule's outcome on
     # any OpenSSL, and the count tells that apart from a delta that loaded and was set aside.
