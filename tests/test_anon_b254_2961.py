@@ -69,6 +69,7 @@ _REFUSED: dict[str, tuple[str, str]] = {
     "NM comparator after the number": ("NM", "5<"),
     "SN ssn shape in the comparator place": ("SN", _SSN_SHAPE),
     "SN phone shape in the comparator place": ("SN", _PHONE_SHAPE),
+    "SN bare number in the comparator place": ("SN", "100"),
     "SN ssn shape in the number place": ("SN", f"^{_SSN_SHAPE}"),
     "SN dotted phone shape in the number place": ("SN", f"^{_PHONE_DOTTED}"),
     "SN phone shape in the second number place": ("SN", f"^1^-^{_PHONE_SHAPE}"),
@@ -173,6 +174,7 @@ _STILL_KEPT_BY_DESIGN: dict[str, tuple[str, str]] = {
     "NM undashed ten digits": ("NM", "5555550100"),
     "NM signed eleven digits": ("NM", "+15555550100"),
     "SN undashed nine digits": ("SN", "^900000001"),
+    "NM identifier split across repetitions": ("NM", "000~12~3456"),
 }
 
 
