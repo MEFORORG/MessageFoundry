@@ -2620,7 +2620,8 @@ def _doc(name: str) -> str:
 # built (vault BACKLOG #2970, SDS-3.5). README.md, sections 1 and 6 of the early-adopter guide and
 # docs/PHI.md section 1 each restated those facts, and engine PR 2015 guarded each copy. The copies
 # are links now, so the guards that read a deleted sentence read the table's rows instead. Each
-# still reds on the retired claim, in the table or as a sentence that comes back.
+# still reds on the retired claim, in the table or in the words it was retired in. The linking
+# test further down refuses at least the wordings its two patterns know, and no more than those.
 
 _GUIDE = "docs/EARLY-ADOPTER-GUIDE.md"
 _H_SECURITY_TABLE = "### Security controls: built, on by default, and not built"
@@ -2667,10 +2668,10 @@ def _security_table() -> dict[str, list[str]]:
     block = _doc_section(_GUIDE, _H_SECURITY_TABLE, until="\n### ")
     tables = [t for t in _tables(block) if t[0][:2] == ["Control", "Status"]]
     assert len(tables) == 1, f"{_GUIDE}'s security controls section must hold one table"
-    rows = {
-        _flat(row[0]).replace("*", ""): [_flat(cell).replace("*", "") for cell in row]
-        for row in tables[0][1:]
-    }
+    body = [[_flat(cell).replace("*", "") for cell in row] for row in tables[0][1:]]
+    rows = {row[0]: row for row in body}
+    # A dict keeps the last of two rows with one label, so a second row would go unread.
+    assert len(rows) == len(body), f"the security controls table repeats a label: {sorted(rows)}"
     assert len(rows) >= 8, f"the security controls table has {len(rows)} row(s), floor 8"
     odd = {label: row[1] for label, row in rows.items() if row[1] not in _STATUSES}
     assert not odd, f"the security controls table's Status column holds {odd}; use {_STATUSES}"
@@ -3157,7 +3158,8 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
     )
     tls = [f"{factory}({name})" for factory, name in parameters if "tls" in name.lower()]
     assert not tls, (
-        f"{tls} are TLS settings now; the guide names raw TCP and X12 as the remaining transport gap."
+        f"{tls} are TLS settings now; the guide's security controls table marks raw TCP and X12 "
+        "transport TLS not built."
     )
     # 5. `[auth].enabled`, and the `[security].require_sign_in` it had moved to, are removed keys,
     #    refused at load: no config turns sign-in off.
@@ -3473,8 +3475,11 @@ def test_the_security_controls_table_states_what_the_code_does() -> None:
     from messagefoundry.config import settings as settings_module
     from messagefoundry.config.wiring import MLLP, X12, Tcp
 
+    read: set[str] = set()
+
     def row(label: str, status: str, default: str = "") -> str:
         cells = _security_row(label)
+        read.add(cells[0])
         assert cells[1] == status, (
             f"the table marks {cells[0]!r} {cells[1]!r}; the code says {status}"
         )
@@ -3523,18 +3528,29 @@ def test_the_security_controls_table_states_what_the_code_does() -> None:
     )
     assert deid.data_scope is ai_policy.AiDataScope.CODE_ONLY
     assert "`code_only`" in row(r"AI-assist", "Not built")
+    # A row nobody reads here is a fact with no guard. Add its probe with the row.
+    assert read == set(_security_table()), (
+        f"the security controls table has row(s) this test does not read: "
+        f"{sorted(set(_security_table()) - read)}"
+    )
 
 
 #: A control the table states, under the names the pages gave it.
 _TABLE_CONTROL = re.compile(
     rf"{_SECOND_FACTOR.pattern}|{_BUILT_ELSEWHERE.pattern}"
     r"|at-rest (?:body )?encryption|encryption[- ]at[- ]rest"
-    r"|\bmTLS\b|MLLP-over-TLS|(?:native|transport) TLS|\bRBAC\b",
+    r"|\bmTLS\b|MLLP-over-TLS|(?:native|transport) TLS|\bRBAC\b"
+    r"|\bauth(?:entication)?\b|\baudit\b|\bredaction\b|\brevocation\b|\blog forward\w*",
     re.IGNORECASE,
 )
 
-#: A status or a default, in the words the retired copies used.
-_TABLE_STATUS = re.compile(rf"\bbuilt\b|\bby default\b|{_ABSENT.pattern}", re.IGNORECASE)
+#: A status or a default, in at least the words the retired copies used. A copy that comes back
+#: in other words passes, so this is a floor and not a proof that no copy exists.
+_TABLE_STATUS = re.compile(
+    rf"\bbuilt\b|\bby default\b|\bships?\b|\bshipped\b|\bfirst-class\b"
+    rf"|\b(?:acts|starts) (?:only )?once\b|\brefus\w+ to start\b|{_ABSENT.pattern}",
+    re.IGNORECASE,
+)
 
 
 #: Each place that restated the table's facts, with how to cut it out of its page, the link it

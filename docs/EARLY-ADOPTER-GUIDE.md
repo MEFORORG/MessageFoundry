@@ -58,8 +58,9 @@ operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 and who are comfortable validating a pre-1.0 tool against their own traffic before trusting it. A single
 engine node on a trusted network is the simplest pilot; an opt-in
 **active-passive failover** cluster on a shared server-DB store (PostgreSQL or SQL Server) is built when you need it (see
-§2/§14). One table in §2 says which security controls are built, which are on by default and
-which are missing: the [security controls table](#security-controls-built-on-by-default-and-not-built).
+§2/§14). One table in §2 says, for at least the main security controls, which are built, which
+are on by default and which are missing: the
+[security controls table](#security-controls-built-on-by-default-and-not-built).
 This section does not repeat it.
 What is genuinely *not* there yet is listed in §2 — track those items
 and pilot the parts that are ready. (Horizontal *active-active*
@@ -90,9 +91,10 @@ when planning. Security controls have a table of their own, the second one below
 
 ### Security controls: built, on by default, and not built
 
-**This table is where these facts are stated.** `README.md`, §1 and §6 of this guide, and the
-off-loopback paragraph of [PHI.md](PHI.md) §1 link here and do not repeat them. A test reads each
-row against the code. If another page disagrees with a row, report it (§15).
+**This table is where these facts are stated.** `README.md`, §1 and the opening of §6 of this
+guide, and two paragraphs of [PHI.md](PHI.md) (in §1 and §12) link here in place of their own
+lists. A test reads every row, most of them against the setting behind the row. If another page
+disagrees with a row, report it (§15).
 
 It holds at least the controls those pages used to list as built or as missing. It is not a full
 security inventory. [SECURITY.md](SECURITY.md) and [PHI.md](PHI.md) go further, and the last column
@@ -103,9 +105,9 @@ column before you plan around a row.
 |---|---|---|---|
 | **Sign-in, RBAC and the hash-chained audit log** | Built | Always on. `serve` always requires sign-in, and no setting turns it off. | [SECURITY.md](SECURITY.md) |
 | **At-rest body encryption** (AES-256-GCM) and key rotation | Built | Required. The engine refuses to start without a store key unless you take the audited opt-out. | [PHI.md §3](PHI.md#3-encryption-at-rest) |
-| **API TLS** (HTTPS/WSS, TLS 1.2 or later) | Built | Always served, with one exception. With no operator certificate the engine serves a self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). The exception is a declared TLS-terminating proxy with no operator certificate: the engine then speaks plain HTTP to that proxy. A non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused, and the placeholder does not count. | [DEPLOYMENT.md](DEPLOYMENT.md) |
-| **MLLP-over-TLS** (TLS 1.2 or later) | Built | Off. MLLP is plaintext until you set `tls = true` on the connection. A non-loopback plaintext MLLP bind is refused. | [DEPLOYMENT.md](DEPLOYMENT.md) |
-| **mTLS** (API clients and MLLP partners) | Built | Off. API mTLS acts only once `[api].tls_client_ca_file` names a CA. MLLP mTLS acts only once the connection's `tls_ca_file` does. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **API TLS** (HTTPS/WSS, TLS 1.2 or later) | Built | Always served, with one exception. With no operator certificate the engine serves a self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). The exception is a declared TLS-terminating proxy with no operator certificate: the engine then speaks plain HTTP to that proxy. At the shipped `[security].enforcement = enforce`, a non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused, and the placeholder does not count. §6 says what `warn` changes. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **MLLP-over-TLS** (TLS 1.2 or later) | Built | Off. MLLP is plaintext until you set `tls = true` on the connection. At the shipped `[security].enforcement = enforce`, a non-loopback plaintext MLLP listener is refused. [PHI.md §4](PHI.md#4-data-in-transit) states the exceptions. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **mTLS** (API clients and MLLP partners) | Built | Off. API mTLS acts only once `[api].tls_client_ca_file` names a CA. An inbound MLLP connection asks for a client certificate only once its `tls_ca_file` names a CA. An outbound one presents a client certificate only once you give it `tls_cert_file`. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **Certificate revocation checking** | Built | It reads a CRL file your PKI publishes. You name one per hop, for example `[logging].forward_tls_crl_file`. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **Transport TLS for raw TCP and X12** | Not built | Those two connectors are plaintext only. Keep them on loopback, or put a TLS-terminating proxy in front. | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | **Native second factor** (TOTP and passkeys, local and directory accounts) | Built | On. `[security].require_mfa` enforces a second factor as an access gate on every authorized route. An OIDC session can meet it on the identity provider's MFA claim, which the engine checks while `[auth].oidc_require_mfa_claim` is on, the default. | [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states which sessions owe an engine factor |
@@ -436,7 +438,8 @@ Guidance for a clean first flow:
 ## 6. Security & PHI hardening before real data
 
 Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DEPLOYMENT.md](DEPLOYMENT.md)**
-(network exposure). What is built, what is on by default and what is missing is stated once, in the
+(network exposure). For at least the main controls, what is built, what is on by default and what
+is missing is stated once, in the
 [security controls table](#security-controls-built-on-by-default-and-not-built) in §2. The steps
 below are what you do about it. Complete this checklist **before any real PHI flows**:
 
@@ -477,8 +480,9 @@ below are what you do about it. Complete this checklist **before any real PHI fl
       (`[security].require_mfa`, WP-14) on. It covers directory accounts too:
       a Kerberos session owes an engine factor even when your directory enforces its own MFA
       ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)).
-- [ ] **Populate the fail-closed `[egress]` allowlist** (it defaults to unrestricted) for REST/Database
-      destinations.
+- [ ] **Populate the fail-closed `[egress]` allowlist** for REST/Database
+      destinations. [CONFIGURATION.md](CONFIGURATION.md#egress) says what `serve` does with an
+      empty list.
 - [ ] **Keep logging at `INFO` or above** and `expose_docs` off in production. Full payloads are never
       logged at INFO+ by design, and log redaction is best-effort
       ([PHI.md §7](PHI.md#7-logging--phi-redaction)) — **do not raise the service to DEBUG with real PHI**.

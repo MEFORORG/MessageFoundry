@@ -53,7 +53,7 @@ Its PKI issues the certificates and the CRL files the engine checks, its SIEM re
 logs, and its network controls stay its own. Whether each control is in the engine, and what turns
 it on, is stated once, in the
 [security controls table](EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
-of the early-adopter guide. This document does not repeat it. Each is documented per deployment — see
+of the early-adopter guide. Each is documented per deployment — see
 [DEPLOYMENT.md](DEPLOYMENT.md), and [§7](#7-logging--phi-redaction) for log forwarding.
 The same table covers the engine's second factor. Which accounts that factor covers is stated in
 [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14).
@@ -2360,9 +2360,9 @@ strict-parse time budget · de-identification covers HL7 v2 only (the anonymizer
 with X12/FHIR seams still to come. Each is tracked in
 [§11](#11-hardening-roadmap).
 
-This list holds limitations only, and no control that works. The
+This list no longer says which security controls work. The
 [security controls table](EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
-of the early-adopter guide says which controls are in the engine and which are on by default. §4
+of the early-adopter guide says that for at least the main controls, and which are on by default. §4
 documents transport TLS and the egress allowlist, and §7 documents logging and redaction.
 
 **The test harness's at-rest data falls short of its protection levels.** The harness is in the
