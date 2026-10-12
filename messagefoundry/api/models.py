@@ -914,7 +914,7 @@ class EngineInfo(BaseModel):
     ``fhir_lookups_failed`` names each ``FhirLookup`` that failed to start and is isolated (vault
     BACKLOG #3008): every Handler call to it fails closed until a reload or a restart builds it.
     Names only, never the reason, for the reason ``channels_failed_names`` gives. A lookup belongs
-    to no channel, so the list is not channel-scoped.
+    to no channel, so only an estate-wide caller gets the names; a channel-scoped one gets ``[]``.
 
     All four are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
 

@@ -432,7 +432,7 @@ async def test_an_engine_start_isolates_the_lookup_on_a_single_node_and_on_a_clu
 
 async def test_status_names_the_failed_lookup(tmp_path: Path, dials: list[str]) -> None:
     """Where an operator sees it besides the log and the alert: ``/status`` names the isolated
-    lookup, without its reason."""
+    lookup, without its reason, to an estate-wide caller only."""
     import httpx
 
     from messagefoundry.api import create_app
@@ -456,30 +456,41 @@ async def test_status_names_the_failed_lookup(tmp_path: Path, dials: list[str]) 
     try:
         service = AuthService(eng.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        uid = await create_local_user_chosen(
-            service,
-            username="vw",
-            password=pw,
-            display_name=None,
-            email=None,
-            roles=[Role.VIEWER.value],
-            actor="test",
-        )
-        await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
-        u = await service.store.get_user(uid)
-        assert u is not None and u.password_hash is not None
-        await service.store.set_password(
-            uid, password_hash=u.password_hash, must_change_password=False, password_generated=False
-        )
+        # 'vw' sees the whole estate; 'narrow' is scoped to one channel, and a lookup belongs to none.
+        for username, channels in (("vw", [ALL_CHANNELS]), ("narrow", ["IB_X"])):
+            uid = await create_local_user_chosen(
+                service,
+                username=username,
+                password=pw,
+                display_name=None,
+                email=None,
+                roles=[Role.VIEWER.value],
+                actor="test",
+            )
+            await service.set_channel_scope(uid, channels, actor="test")
+            u = await service.store.get_user(uid)
+            assert u is not None and u.password_hash is not None
+            await service.store.set_password(
+                uid,
+                password_hash=u.password_hash,
+                must_change_password=False,
+                password_generated=False,
+            )
         await eng.start()
         transport = httpx.ASGITransport(app=create_app(eng, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            r = await c.post(
-                "/auth/login", json={"username": "vw", "password": pw, "provider": "local"}
-            )
-            headers = {"Authorization": f"Bearer {r.json()['token']}"}
-            info = (await c.get("/status", headers=headers)).json()["engine"]
-        assert info["fhir_lookups_failed"] == ["epic"]
+
+            async def failed_lookups(username: str) -> object:
+                r = await c.post(
+                    "/auth/login", json={"username": username, "password": pw, "provider": "local"}
+                )
+                headers = {"Authorization": f"Bearer {r.json()['token']}"}
+                return (await c.get("/status", headers=headers)).json()["engine"][
+                    "fhir_lookups_failed"
+                ]
+
+            assert await failed_lookups("vw") == ["epic"]
+            assert await failed_lookups("narrow") == []
     finally:
         await eng.stop()
     assert dials == []

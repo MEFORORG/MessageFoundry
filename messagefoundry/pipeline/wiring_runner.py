@@ -2341,20 +2341,26 @@ class RegistryRunner:
         # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its warning
         # and attestation lines, so on this path each surviving lookup logs them again per build.
         # That cost falls only on a start that already failed, and keeps the healthy start to one build.
-        failed: dict[str, str] = {}
+        errors: dict[str, Exception] = {}
         for name in specs:
             try:
                 build([name])
             except Exception as exc:
-                failed[name] = self._record_fhir_lookup_failed(name, exc)
-        return build([name for name in specs if name not in failed], failed)
+                errors[name] = exc
+        failed = {name: safe_exc(err) for name, err in errors.items()}
+        executor = build([name for name in specs if name not in errors], failed)
+        # Logged and alerted only once the survivors have built, so no alert says the engine went on
+        # when this last build raised and unwound the start instead.
+        for name, err in errors.items():
+            self._record_fhir_lookup_failed(name, err)
+        return executor
 
-    def _record_fhir_lookup_failed(self, name: str, exc: BaseException) -> str:
-        """Isolate a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed` isolates
-        a connection (ADR 0031, vault BACKLOG #3008), and return the reason for the executor to
-        keep. The alert names the lookup by its record name, so it cannot be read as an outbound
-        of the same name."""
-        return self._log_and_alert_start_failure(
+    def _record_fhir_lookup_failed(self, name: str, exc: BaseException) -> None:
+        """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
+        does for a connection (ADR 0031, vault BACKLOG #3008). The executor keeps the record. The
+        alert names the lookup by its record name, so it is not taken for a connection of the same
+        name."""
+        self._log_and_alert_start_failure(
             f"fhir lookup {name!r}",
             fhir_lookup_record_name(name),
             "reload or restart; every Handler call to it fails closed meanwhile",
@@ -5083,7 +5089,7 @@ class RegistryRunner:
                 if self._log_write_stopped:
                     await self._unbind_for_log_failure()
             except Exception:
-                # A truly fatal startup error (store / lookup executor — NOT a single connection, which
+                # A truly fatal startup error (store / DB-lookup executor — NOT a single connection, which
                 # is isolated above) must not leave half the graph wired with _running still False:
                 # unwind everything we started so the listeners are released and a retry can rebind (M-8).
                 log.exception("wiring start failed; unwinding the partial start")
