@@ -158,8 +158,10 @@ class _Twins:
 
 @pytest.fixture(autouse=True)
 def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No held copy from another test, so nothing here depends on what ran before it."""
+    """No held copy and no logged finding from another test, so nothing here depends on what ran
+    before it. Restored after the test."""
     monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary())
+    monkeypatch.setattr(loaded_crls, "_UNCONFIRMED", {})
 
 
 @pytest.fixture
@@ -383,3 +385,132 @@ def test_a_ca_that_does_not_parse_is_ignored(twins: _Twins) -> None:
     pem = twins.write_crl("new", "new")
     judged = list(judge_crl_signatures(pem, [b"not a certificate", *_ders(twins.new_ca)]))
     assert [signature.state for signature in judged] == ["verified"]
+
+
+# --- the warn arm: one line for the file, however many contexts load it -------------------------
+
+_WARNING = "could not confirm at start"
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if _WARNING in r.getMessage()]
+
+
+def _postgres_shaped(twins: _Twins, listed: str) -> ssl.SSLContext:
+    """A context built the way the Postgres store builds one per connection: nothing recorded."""
+    ctx = ssl.create_default_context(cafile=str(twins.ca_file(listed)))
+    harden_crl_check(ctx, str(twins.crl), setting="[store].ssl_crl_file", record_held_copy=False)
+    return ctx
+
+
+@pytest.mark.parametrize(
+    ("signer", "names", "words"),
+    [
+        pytest.param("new", "new", "no CA certificate this hop lists", id="unlisted"),
+        pytest.param("new", None, "a renewed CA key could explain it", id="unproven"),
+    ],
+)
+def test_a_signature_short_of_proof_warns_once_however_many_contexts_load_the_file(
+    twins: _Twins, caplog: pytest.LogCaptureFixture, signer: str, names: str | None, words: str
+) -> None:
+    twins.write_crl(signer, names)
+    with caplog.at_level("WARNING"):
+        first = twins.hop("old")
+        logged = _warnings(caplog)
+        # A context per connection, as the Postgres store builds them, and two more hops.
+        kept = [_postgres_shaped(twins, "old") for _ in range(5)] + [twins.hop("old")] * 2
+
+    assert len(logged) == 1 and _warnings(caplog) == logged
+    assert logged[0].startswith(f"{_SETTING} ({str(twins.crl)!r})")
+    assert "1 of the 1 CRL(s)" in logged[0] and words in logged[0]
+    assert "CRL block 1 of 1" in logged[0] and "mefor-2905-twin-ca" in logged[0]
+    assert all(ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for ctx in (first, *kept))
+
+
+def test_a_signature_the_engine_cannot_check_warns_and_does_not_refuse(
+    twins: _Twins, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(key: object, crl: x509.CertificateRevocationList) -> None:
+        raise ValueError("not a pair this can check")
+
+    monkeypatch.setattr(pki_module, "_verify_with", refuse)
+    twins.write_crl("stranger", "new")
+    with caplog.at_level("WARNING"):
+        twins.hop("new")
+        twins.hop("new")
+
+    assert len(logged := _warnings(caplog)) == 1
+    assert "cannot check its signature" in logged[0]
+
+
+def test_a_file_whose_every_crl_verifies_logs_nothing(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The zero here has its control in the tests above, where the same instrument counts one.
+    twins.write_crl("new", "new")
+    with caplog.at_level("WARNING"):
+        twins.hop("both")
+        twins.hop("new")
+    assert _warnings(caplog) == []
+
+
+def test_a_file_that_refuses_logs_no_warning(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
+    twins.crl.write_bytes(
+        _crl(twins.stranger, names=twins.stranger, name=other)
+        + _crl(twins.stranger, names=twins.new_key)
+    )
+    with caplog.at_level("WARNING"), pytest.raises(ValueError, match="CRL block 2 of 2"):
+        twins.hop("new")
+    assert _warnings(caplog) == []
+
+
+def test_a_new_version_of_the_file_is_logged_again(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        first = twins.write_crl("new", None)
+        twins.hop("old")
+        twins.write_crl("new", None, revoke=True)  # other bytes, the same finding
+        twins.hop("old")
+        twins.hop("old")
+        twins.crl.write_bytes(first)  # put back: a version this process has not just judged
+        twins.hop("old")
+    assert len(_warnings(caplog)) == 3
+
+
+def test_a_hop_whose_ca_list_reaches_another_finding_logs_its_own_line(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
+    twins.crl.write_bytes(
+        _crl(twins.new_key, names=None) + _crl(twins.stranger, names=twins.stranger, name=other)
+    )
+    with caplog.at_level("WARNING"):
+        twins.hop("old")  # block 1 unproven, block 2 unlisted
+        twins.hop("old")
+        twins.hop("both")  # block 1 verified, block 2 unlisted
+        twins.hop("both")
+        twins.hop("new")  # the same finding as "both"
+
+    logged = _warnings(caplog)
+    assert len(logged) == 2
+    assert "2 of the 2 CRL(s)" in logged[0] and "1 of the 2 CRL(s)" in logged[1]
+
+
+def test_the_warning_describes_three_crls_and_counts_the_rest(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    blocks = b""
+    for index in range(5):
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"mefor-2905-unlisted-{index}")])
+        blocks += _crl(twins.stranger, names=twins.stranger, name=name)
+    twins.crl.write_bytes(blocks)
+    with caplog.at_level("WARNING"):
+        twins.hop("new")
+
+    (line,) = _warnings(caplog)
+    assert "5 of the 5 CRL(s)" in line and "and 2 more" in line
+    assert "mefor-2905-unlisted-2" in line and "mefor-2905-unlisted-3" not in line

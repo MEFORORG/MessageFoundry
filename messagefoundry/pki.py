@@ -16,6 +16,7 @@ Pure and side-effect-free (no engine state, I/O, or DB): it takes/returns bytes 
 from __future__ import annotations
 
 import datetime
+import functools
 import ipaddress
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -419,14 +420,7 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     (:func:`crl_signature_refusal`). A CA that does not parse, or whose names do not, is ignored:
     it cannot be shown to be an issuer, and a system trust store may hold one. ``pem`` must be
     bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
-    cas: list[x509.Certificate] = []
-    for der in ca_ders:
-        try:
-            ca = x509.load_der_x509_certificate(der)
-            _ = ca.subject, ca.issuer  # read lazily: raise here, not in the middle of a judgment
-        except ValueError:
-            continue
-        cas.append(ca)
+    cas = [listed for der in ca_ders if (listed := _listed_ca(der)) is not None]
     blocks = list(_crl_blocks(pem))
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
@@ -434,11 +428,29 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
         yield CrlSignature(where, _signature_state(crl, cas))
 
 
+@functools.lru_cache(maxsize=1024)
+def _listed_ca(der: bytes) -> tuple[x509.Name, x509.Certificate] | None:
+    """The CA certificate ``der`` with its subject, or ``None`` when it or its names do not parse.
+
+    Cached, because a start runs this over the hop's whole CA list, and a hop that builds a
+    context per connection (the Postgres store) runs it per connection. Measured 2026-10-12 on
+    Windows, CPython 3.14.6: 89 system roots took 2.2 ms per judgment uncached, nearly all of it
+    parsing certificates and names that never change. The names are read here so a certificate
+    whose names do not parse is dropped once, not raised from the middle of a judgment."""
+    try:
+        ca = x509.load_der_x509_certificate(der)
+        _ = ca.issuer
+        return ca.subject, ca
+    except ValueError:
+        return None
+
+
 def _signature_state(
-    crl: x509.CertificateRevocationList, cas: list[x509.Certificate]
+    crl: x509.CertificateRevocationList, cas: list[tuple[x509.Name, x509.Certificate]]
 ) -> CrlSignatureState:
     """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
-    fits = [ca for ca in cas if ca.subject == crl.issuer and _fits_akid(crl, ca)]
+    issuer = crl.issuer
+    fits = [ca for subject, ca in cas if subject == issuer and _fits_akid(crl, ca)]
     if not fits:
         return "unlisted"
     answers = [_verifies(crl, ca) for ca in fits]

@@ -74,6 +74,7 @@ __all__ = [
     "clear_reload_refusal",
     "crl_fingerprint",
     "crl_path_key",
+    "first_unconfirmed_signature",
     "has_held_copies",
     "held_contexts",
     "held_crl_copies",
@@ -141,6 +142,10 @@ class ReloadRefusal:
 _HELD: weakref.WeakKeyDictionary[ssl.SSLContext, tuple[HeldCrl, ...]] = weakref.WeakKeyDictionary()
 # The latest refusal per path key. Keys are configured CRL paths, so this stays small.
 _REFUSED: dict[str, ReloadRefusal] = {}
+# What a start could not confirm about a CRL file's signatures and has already logged (vault
+# BACKLOG #2905). Per path key: the fingerprint of the bytes judged, and each finding logged for
+# them. One entry per path, replaced when the file changes, so this stays small too.
+_UNCONFIRMED: dict[str, tuple[tuple[int, int], set[tuple[str, ...]]]] = {}
 _LOCK = threading.Lock()
 
 
@@ -168,6 +173,31 @@ def ca_bundle_fingerprint(pem: bytes) -> tuple[int, int]:
     from messagefoundry.pki import crl_pem_blocks
 
     return crl_fingerprint(b"".join(crl_pem_blocks(pem)))
+
+
+def first_unconfirmed_signature(
+    path: str | os.PathLike[str], fingerprint: tuple[int, int], finding: tuple[str, ...]
+) -> bool:
+    """Whether this process now meets ``finding`` for the first time, for the file at ``path``
+    whose bytes have ``fingerprint`` (vault BACKLOG #2905). Records it either way.
+
+    ``finding`` is what a start could not confirm about the signatures of the CRLs in the file:
+    one state per CRL. ``harden_crl_check`` logs its warning only when this is True. It runs once
+    per TLS context, and the Postgres store builds a context per connection, so a warning per call
+    would repeat for as long as the engine runs. This keeps it to one line per process for each
+    version of the file and each finding. Hops with different CA lists can reach different
+    findings for one file, and each of those is logged once. The state is in memory, so every
+    start logs again, and each engine shard logs its own line."""
+    key = _path_key(path)
+    with _LOCK:
+        seen = _UNCONFIRMED.get(key)
+        if seen is None or seen[0] != fingerprint:
+            _UNCONFIRMED[key] = (fingerprint, {finding})
+            return True
+        if finding in seen[1]:
+            return False
+        seen[1].add(finding)
+        return True
 
 
 def record_crl_load(

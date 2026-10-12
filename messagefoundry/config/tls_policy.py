@@ -347,8 +347,9 @@ def harden_crl_check(
     check flag set.
 
     A sixth, since vault BACKLOG #2905 (owner ruling 2026-10-05): a CRL that is proven badly
-    signed. :func:`_refuse_bad_crl_signature` says what counts as proof. It runs last of all, once
-    OpenSSL is known to hold exactly the CRLs judged, so it hides none of the refusals above.
+    signed. :func:`_check_crl_signatures` says what counts as proof. It runs last of all, once
+    OpenSSL is known to hold exactly the CRLs judged, so it hides none of the refusals above. A
+    signature it cannot confirm, short of proof, loads with one warning for the file.
 
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
@@ -444,7 +445,7 @@ def harden_crl_check(
                 "there is room for the file"
             ) from exc
     # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged.
-    _refuse_bad_crl_signature(pem, anchors, label=label)
+    _check_crl_signatures(pem, anchors, label=label, crl_file=crl_file)
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
@@ -549,9 +550,25 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
         )
 
 
-def _refuse_bad_crl_signature(pem: bytes, anchors: Sequence[bytes], *, label: str) -> None:
-    """Refuse the judged CRL bytes ``pem`` when a CRL in them is proven badly signed against
-    ``anchors``, the hop's own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
+#: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
+#: state, in the words of the one warning :func:`_check_crl_signatures` logs.
+_UNCONFIRMED_SIGNATURE = {
+    "unlisted": "no CA certificate this hop lists has that name and the key the CRL names",
+    "unproven": (
+        "a listed CA has that name and its key does not verify the CRL, but the CRL does not "
+        "name that CA's key, so a renewed CA key could explain it"
+    ),
+    "uncheckable": "the engine cannot check its signature with the listed CA's key",
+}
+#: How many CRLs that warning describes before it only counts the rest.
+_UNCONFIRMED_SHOWN = 3
+
+
+def _check_crl_signatures(
+    pem: bytes, anchors: Sequence[bytes], *, label: str, crl_file: str
+) -> None:
+    """Check the signature of each CRL in the judged bytes ``pem`` against ``anchors``, the hop's
+    own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
 
     **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
     ``bad``: the CRL names a listed CA's key by key identifier, and that key does not verify it.
@@ -559,11 +576,18 @@ def _refuse_bad_crl_signature(pem: bytes, anchors: Sequence[bytes], *, label: st
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
 
-    Everything short of proof loads: a CRL that names no key, a key the engine cannot check with,
-    and an issuer the hop does not list. There is no setting that turns this off and none that
-    widens it, as for the expired-CRL refusal in :func:`judge_crl_bytes`."""
+    **Everything short of proof loads, with one warning.** That covers a CRL that names no key, a
+    key the engine cannot check with, and an issuer the hop does not list. The last is the usual
+    case in a two-tier PKI, where the peer sends the intermediate that issued the CRL, so it must
+    not log per hop. The warning is one line for the file, logged once per process for each
+    version of the file (:func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature`).
+
+    There is no setting that turns this off and none that widens it, as for the expired-CRL
+    refusal in :func:`judge_crl_bytes`."""
+    from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
     from messagefoundry.pki import judge_crl_signatures
 
+    judged = []
     for signature in judge_crl_signatures(pem, anchors):
         if signature.state == "bad":
             raise ValueError(
@@ -572,6 +596,28 @@ def _refuse_bad_crl_signature(pem: bytes, anchors: Sequence[bytes], *, label: st
                 "handshake it judges fail with 'CRL signature failure'. Give this setting the CRL "
                 "that CA signed"
             )
+        judged.append(signature)
+    unconfirmed = [signature for signature in judged if signature.state != "verified"]
+    finding = tuple(signature.state for signature in judged)
+    if not unconfirmed or not first_unconfirmed_signature(crl_file, crl_fingerprint(pem), finding):
+        return
+    shown = "; ".join(
+        f"{signature.where}: {_UNCONFIRMED_SIGNATURE[signature.state]}"
+        for signature in unconfirmed[:_UNCONFIRMED_SHOWN]
+    )
+    if (more := len(unconfirmed) - _UNCONFIRMED_SHOWN) > 0:
+        shown = f"{shown}; and {more} more"
+    logger.warning(
+        "%s: the engine could not confirm at start that a CA this hop lists signed %d of the %d "
+        "CRL(s) in this file. %s. The file is loaded and revocation checking is on. OpenSSL "
+        "checks each signature at the handshake. If peers are then refused with 'CRL signature "
+        "failure' or 'unable to get certificate CRL', check this file first. Logged once for "
+        "this version of the file",
+        label,
+        len(unconfirmed),
+        len(judged),
+        shown,
+    )
 
 
 class _CrlStagingFailed(OSError, ValueError):
@@ -634,7 +680,7 @@ def judge_crl_bytes(
     to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``.
 
     No signature is checked here, because this has no CA list. A start checks it in
-    :func:`_refuse_bad_crl_signature`, and the reload in
+    :func:`_check_crl_signatures`, and the reload in
     :func:`~messagefoundry.pki.crl_signature_refusal`. The two do not refuse the same files."""
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
