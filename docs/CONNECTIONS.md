@@ -1477,9 +1477,10 @@ error. The error names no part of the proxy URL, and `[security].enforcement` do
 request that goes direct is not refused: one to a loopback host, or to a host that `NO_PROXY` or the
 system bypass list names. A connection's own `proxy_no_proxy` is not that list. A host it names
 skips the connection's `proxy_url` and still follows a proxy from the environment.
-**Writing the proxy `https://` is not refused, and it does not protect the credentials either:**
-`urllib` sends `CONNECT`, with the credential header, before any TLS. Take the credentials out of
-the proxy URL.
+**Writing the proxy `https://` is not refused, and it does not keep the credentials off the wire
+either.** When the leg to the proxy has no TLS is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
+out of the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
