@@ -2719,6 +2719,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     for _env_line in unread_env_warnings(settings):
         logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
+    # BACKLOG #1125 (owner ruling 2026-10-11): an environment proxy must not attach silently. Named
+    # as soon as logging reaches its handlers, before the first hop that could use it.
+    from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
+
+    warn_ambient_proxy(logging.getLogger(__name__))
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
@@ -4875,6 +4880,10 @@ def _supervise(args: argparse.Namespace) -> int:
     if logging_refused is not None:
         return logging_refused
     _log_static_credential_outcome(sc_outcome)
+    # BACKLOG #1125: the supervisor's own store open and pair renewal can go through it too.
+    from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
+
+    warn_ambient_proxy(logging.getLogger(__name__))
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
