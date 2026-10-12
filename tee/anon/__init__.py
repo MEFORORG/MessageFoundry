@@ -29,7 +29,15 @@ from pathlib import Path
 from .hl7 import anonymize_message
 from .keying import Keyer
 from .leak import LeakReport, coverage_clause, leak_check, leak_report, refusal_advice
-from .rules import DEFAULT_RULES, AnonError, FieldRule, RuleError, SurrogateKind, load_rules
+from .rules import (
+    DEFAULT_RULES,
+    AnonError,
+    FieldRule,
+    RuleError,
+    SurrogateKind,
+    kept_defaults,
+    load_rules,
+)
 
 __all__ = [
     "DEFAULT_RULES",
@@ -42,6 +50,7 @@ __all__ = [
     "SurrogateKind",
     "anonymize",
     "anonymize_checked",
+    "kept_defaults",
     "leak_check",
     "leak_report",
     "load_rules",

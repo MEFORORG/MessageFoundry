@@ -580,20 +580,6 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    store = await RelayStore.open(args.db)
-    try:
-        rows = await store.captures(
-            direction=args.direction, since=args.since, before=args.before, limit=args.limit
-        )
-    finally:
-        await store.close()
-    if not rows:
-        print(
-            f"error: no captured bodies for direction={args.direction!r} in {args.db} — run the "
-            "relay with --capture-bodies or --capture-corepoint-copy",
-            file=sys.stderr,
-        )
-        return 1
 
     overlay = Path(args.overlay) if args.overlay else None
 
@@ -617,6 +603,25 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     except RuleError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    # The store is read AFTER both checks above. Read before them, a run with no captured bodies
+    # returned here and never read the overlay, so a bad one stayed hidden until a run that had
+    # bodies (BACKLOG #3003).
+    store = await RelayStore.open(args.db)
+    try:
+        rows = await store.captures(
+            direction=args.direction, since=args.since, before=args.before, limit=args.limit
+        )
+    finally:
+        await store.close()
+    if not rows:
+        print(
+            f"error: no captured bodies for direction={args.direction!r} in {args.db} — run the "
+            "relay with --capture-bodies or --capture-corepoint-copy",
+            file=sys.stderr,
+        )
+        return 1
+
     # Printed, not only logged by load_rules: --log-level ERROR hides that WARNING, and a keep
     # that turns off a default scrub must not be hidden. Addresses and kinds only (BACKLOG #2268).
     kept = kept_defaults(rules)

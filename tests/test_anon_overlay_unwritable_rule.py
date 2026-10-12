@@ -73,24 +73,25 @@ def test_an_overlay_rule_on_a_delimiter_field_is_refused_at_load(
 
 @_BOTH
 @pytest.mark.parametrize(
-    "body",
+    ("body", "path", "kind"),
     [
-        '[hl7]\nkeep = ["MSH-2"]\n',
-        '[hl7]\nkeep = ["MSH-1", "MSH-2"]\n',
-        '[hl7.fields]\n"MSH-2" = "keep"\n',
+        ('[hl7]\nkeep = ["MSH-2"]\n', "MSH-2", "keep"),
+        ('[hl7]\nkeep = ["MSH-1", "MSH-2"]\n', "MSH-1", "keep"),
+        ('[hl7.fields]\n"MSH-2" = "keep"\n', "MSH-2", "keep"),
         # The check reads the final rule set: this keep replaces the rule the table set.
-        '[hl7.fields]\n"MSH-2" = "id"\n\n[hl7]\nkeep = ["MSH-2"]\n',
+        ('[hl7.fields]\n"MSH-2" = "id"\n\n[hl7]\nkeep = ["MSH-2"]\n', "MSH-2", "keep"),
         # MSH-3 is the lowest MSH field a rule may rewrite.
-        '[hl7]\ndrop = ["MSH-3"]\n',
+        ('[hl7]\ndrop = ["MSH-3"]\n', "MSH-3", "drop"),
     ],
     ids=["keep-msh-2", "keep-both", "fields-keep", "keep-over-fields", "drop-msh-3"],
 )
 def test_a_keep_on_a_delimiter_field_still_loads(
-    rules_module: ModuleType, body: str, tmp_path: Path
+    rules_module: ModuleType, body: str, path: str, kind: str, tmp_path: Path
 ) -> None:
+    """The control: these loaded before the fix and must load after it."""
     rules = rules_module.load_rules(_overlay(tmp_path, body))
 
-    assert rules_module._unwritable_fields(rules) == ()
+    assert {rule.path: rule.kind.value for rule in rules}[path] == kind
 
 
 @_BOTH

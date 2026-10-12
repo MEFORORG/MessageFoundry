@@ -83,7 +83,8 @@ def _run(db: str, out: Path, *extra: str) -> int:
 @pytest.mark.parametrize(
     ("body", "reason"),
     [
-        ('[hl7]\nkeep = ["PID-5"\n', "invalid TOML at line 3, column 1"),
+        # The parser's own answer is line 3 of a two-line file (BACKLOG #3003).
+        ('[hl7]\nkeep = ["PID-5"\n', "invalid TOML at the end of the file, line 2"),
         (b'[hl7]\nkeep = ["EVN-1"]\n# \xff\xfe\n', "UTF-8"),
         ('[hl7]\nkeep = ["PID-5.1"]\n', "PID-5.1"),
         ("[fhir]\n", "fhir"),

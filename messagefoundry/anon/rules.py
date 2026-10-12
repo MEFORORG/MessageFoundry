@@ -291,7 +291,8 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
     an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
-    and column. It quotes nothing from the file, and it chains no other exception.
+    and column. TOML that stops early names the last line. A path the system refuses to open is
+    reported as the path's fault. It quotes nothing from the file, and it chains no other exception.
 
     An overlay whose final rule set would rewrite ``MSH-1`` or ``MSH-2`` is refused here too, once,
     with the field named (BACKLOG #2997). A ``keep`` on either still loads.
@@ -309,19 +310,27 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     # Each arm keeps one content-free fact. A TOMLDecodeError holds the whole file on ``.doc`` and
     # a UnicodeDecodeError holds its bytes on ``.object``, so neither may reach the refusal's chain.
+    # The read and the parse are two steps, so an error about the PATH is never reported as one
+    # about the file's content (BACKLOG #3003).
     refusal: str | None = None
+    text = ""
     try:
-        data = tomllib.loads(overlay.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        refusal = f"invalid TOML at line {exc.lineno}, column {exc.colno}"
-    except UnicodeDecodeError:  # a ValueError, not an OSError
+        text = overlay.read_text(encoding="utf-8")
+    except UnicodeDecodeError:  # a ValueError, not an OSError, so it goes before the plain arm
         refusal = "the file is not UTF-8 text"
-    except RecursionError:  # tomllib recurses on nested arrays and tables
-        refusal = "the file nests too deeply to parse"
-    except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
-        refusal = "the file holds a value the TOML parser refused"
     except OSError as exc:
         refusal = exc.strerror or type(exc).__name__
+    except ValueError:  # the path was refused before any byte was read: at least an embedded NUL
+        refusal = "the path is not one the system can open"
+    if refusal is None:
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:  # a ValueError, so it goes before the plain arm
+            refusal = _toml_refusal(exc)
+        except RecursionError:  # tomllib recurses on nested arrays and tables
+            refusal = "the file nests too deeply to parse"
+        except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
+            refusal = "the file holds a value the TOML parser refused"
     if refusal is not None:
         # Raised AFTER the handler, so neither __cause__ nor __context__ is set. ``from None``
         # would not do: it leaves __context__ populated (BACKLOG #2310).
@@ -372,6 +381,19 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
             cancelled.kind.value,
         )
     return rules
+
+
+def _toml_refusal(exc: tomllib.TOMLDecodeError) -> str:
+    """Where the TOML went wrong, as a line and column. Nothing from the file is quoted.
+
+    For text that stops early the parser reports the position after the last character. When the
+    text ends in a newline that is the line AFTER the last one, which no editor shows. So that
+    case names the last line and says the file ended (BACKLOG #3003).
+    """
+    if exc.pos >= len(exc.doc):
+        last_line = exc.lineno - 1 if exc.doc.endswith("\n") else exc.lineno
+        return f"invalid TOML at the end of the file, line {last_line}"
+    return f"invalid TOML at line {exc.lineno}, column {exc.colno}"
 
 
 def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
