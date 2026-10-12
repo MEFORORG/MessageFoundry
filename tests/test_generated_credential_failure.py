@@ -138,7 +138,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
         issue_rows_before = [
             r["action"]
             for r in await store.list_audit(limit=200)
-            if r["action"] in ("user.created", "auth.password_reset")
+            if r["action"] in service_module._ISSUE_ROW_KEYS
         ]
 
         service = AuthService(store, _unissuable())
@@ -174,7 +174,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
             (ADMIN_USERNAME, {"op": "password_reset", "username": "holder", "user_id": target}),
         ]
         issue_rows_after = [
-            r["action"] for r in rows if r["action"] in ("user.created", "auth.password_reset")
+            r["action"] for r in rows if r["action"] in service_module._ISSUE_ROW_KEYS
         ]
         assert issue_rows_after == issue_rows_before
     finally:

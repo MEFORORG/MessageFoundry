@@ -1005,7 +1005,8 @@ def generate_policy_password(
     # or the username, and the suffix keeps either one. Read from the policy, not from four field
     # names, so a class rule added later is not skipped here (BACKLOG #2359). The suffix still
     # covers only the four classes today: a new class it misses needs the suffix extended too, and
-    # until then the screen refuses that candidate rather than issuing it.
+    # until then the screen refuses that candidate rather than issuing it. A test issues one under
+    # every ``require_*`` rule, so such a rule fails there before it refuses every reset (#3160).
     class_rules = policy.requires_character_class
     for _ in range(_RESET_GENERATION_ATTEMPTS):
         token = secrets.token_urlsafe(length)[:chars]
@@ -1971,20 +1972,22 @@ _BACKGROUND_DRAIN_SECONDS: Final = 2.0
 _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 
 #: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_credential_issuer` finds the audit row
-#: that issued an account's current temporary password. The two issuing paths stamp
+#: that issued an account's current temporary password. The three issuing paths stamp
 #: ``password_changed_at`` first and write their audit row a moment later, both off the same Python
-#: clock, so the row sits just after the stamp; only one or two store writes lie between them. The
+#: clock, so the row sits just after the stamp; only a few store writes lie between them. The
 #: window allows a slow store on the late side and a clock step on the early side, and no more,
 #: because every create and reset in it counts against the page. A page that comes back full may
 #: have dropped the row that matters, so a full page is treated as unresolved rather than read. Each
 #: action maps to the detail key that names the account: ``user.created`` carries only the username.
+#: ``auth.mfa_reset`` issues one too, on a local account (BACKLOG #3160): leaving it out meant the
+#: administrator who reset a factor was never sent the expiry reminder.
 _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
-    {"user.created": "username", "auth.password_reset": "user_id"}
+    {"user.created": "username", "auth.password_reset": "user_id", "auth.mfa_reset": "user_id"}
 )
 #: BACKLOG #2359: the row a refused credential issue writes, when the generator raises
 #: :class:`TemporaryPasswordUnavailable` on account creation or either reset. A name of its own, and
-#: never ``user.created`` or ``auth.password_reset``: :data:`_ISSUE_ROW_KEYS` reads those two as
-#: "this administrator issued the credential", so a refusal written under either would name an issuer
+#: never an action :data:`_ISSUE_ROW_KEYS` names: it reads each of those as
+#: "this administrator issued the credential", so a refusal written under one would name an issuer
 #: for a credential that was never set. Its detail's ``op`` says which of the three refused.
 CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
 #: The ``op`` values that row carries, one per issuing operation.
@@ -11360,9 +11363,10 @@ class AuthService:
 
         Read from the AUDIT row the issuing path wrote, and not from ``user_roles.assigned_by``:
         ``set_user_roles`` rewrites every row of the account on each role change, so that column
-        names whoever last set the roles, not whoever issued the credential. Two paths issue one:
-        :meth:`create_local_user` writes ``user.created``, and :meth:`admin_reset_password` writes
-        ``auth.password_reset``. Each stamps ``password_changed_at`` just before its row, so the row
+        names whoever last set the roles, not whoever issued the credential. Three paths issue one:
+        :meth:`create_local_user` writes ``user.created``, :meth:`admin_reset_password` writes
+        ``auth.password_reset``, and :meth:`admin_reset_mfa` writes ``auth.mfa_reset`` on a local
+        account (BACKLOG #3160). Each stamps ``password_changed_at`` just before its row, so the row
         is found in a short window after the stamp; ``_ISSUE_ROW_*`` states the window.
 
         The matching rows in that window must all name ONE actor. None, or two different actors,

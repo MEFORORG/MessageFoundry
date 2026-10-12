@@ -386,6 +386,36 @@ async def test_a_reset_reminds_the_resetting_administrator_not_the_creator() -> 
         await store.close()
 
 
+async def test_a_factor_reset_reminds_the_administrator_who_reset_it() -> None:
+    """BACKLOG #3160. A factor reset on a local account issues a temporary credential too, so the
+    administrator who ran it is its issuer. RED when ``_ISSUE_ROW_KEYS`` leaves ``auth.mfa_reset``
+    out: the lookup then finds no row in the window and tells nobody."""
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        await _account(service, "sam", email="sam@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        await _age_audit_rows(store, "user.created", 2 * _HOUR)
+        issued = await service.admin_reset_mfa(alice, actor="sam")
+        assert issued is not None
+        deadline = await _pass(store, service, alice)
+        issuer = [
+            r
+            for r in notifier.reminders("alice")
+            if r[0] == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER
+        ]
+        assert issuer == [
+            (
+                TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
+                "sam",
+                "sam@example.org",
+                {"expires_at": deadline, "holder": "alice"},
+            )
+        ]
+    finally:
+        await store.close()
+
+
 async def test_each_recipient_is_reminded_once_per_credential() -> None:
     store, service, notifier = await _notified_service()
     try:

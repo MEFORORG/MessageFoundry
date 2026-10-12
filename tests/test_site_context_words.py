@@ -18,6 +18,7 @@ supplies them. These tests pin at least these properties:
 from __future__ import annotations
 
 import dataclasses
+import secrets
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -379,6 +380,44 @@ def test_the_generator_reads_every_require_field_as_a_class_rule() -> None:
 
     assert LaterPolicy(check_breached=False, require_extra=True).requires_character_class
     assert LaterPolicy(check_breached=False).requires_character_class is False
+
+
+def _issue_under_each_class_rule(policy_cls: type[PasswordPolicy]) -> None:
+    """Generate one credential with each ``require_*`` field of ``policy_cls`` on alone, then with
+    all of them on, and screen each. The caller pins the token to lowercase letters only, so every
+    other class has to come from the generator's suffix."""
+    names = [f.name for f in dataclasses.fields(policy_cls) if f.name.startswith("require_")]
+    base = policy_cls(check_breached=False)
+    assert service_module.generate_policy_password(base) == "xq" * 16  # the bare token passes
+    every: dict[str, Any] = dict.fromkeys(names, True)
+    for changes in [{name: True} for name in names] + [every]:
+        policy = dataclasses.replace(base, **changes)
+        issued = service_module.generate_policy_password(policy, log_failure=False)
+        assert not policy.violations(issued, suppress_breach_check=True), changes
+
+
+def test_the_generator_can_meet_every_class_rule_the_policy_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3160, item 3. The generator's suffix is a fixed ``aA1!``, and the ``require_``
+    prefix is reserved for class rules only by a docstring. A later ``require_*`` rule the suffix
+    cannot meet would make every create and reset refuse. RED when one is added: this issues a
+    credential under each rule, and the control below shows such a rule fails here."""
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda n: "xq" * n)
+    _issue_under_each_class_rule(PasswordPolicy)
+
+    @dataclasses.dataclass(frozen=True)
+    class LaterPolicy(PasswordPolicy):
+        require_tilde: bool = False
+
+        def violations(self, password: str, **kwargs: Any) -> list[str]:
+            problems = super().violations(password, **kwargs)
+            if self.require_tilde and "~" not in password:
+                problems.append("contain a tilde")
+            return problems
+
+    with pytest.raises(TemporaryPasswordUnavailable):
+        _issue_under_each_class_rule(LaterPolicy)
 
 
 async def test_a_site_term_formed_across_the_suffix_is_screened(
