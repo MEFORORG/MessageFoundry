@@ -175,15 +175,18 @@ makes one, so a call can allocate around the cap that way. It was never a bound 
 that sets out to evade it; it is a backstop against a runaway. Linux before 4.7 counted only the
 `brk` heap against `RLIMIT_DATA`, so on those kernels the worker keeps the absolute `RLIMIT_AS`
 cap. A kernel booted with `ignore_rlimit_data` does not enforce it either, and the worker does not
-detect that. The free-threaded
-build was not measured: if its allocator maps memory writable before use, its reservations would
-count. Only a `MemoryError` recycles the worker. A call that fails in another way near the cap, such
+detect that. The free-threaded build was not measured: if its allocator maps memory writable
+before use, its reservations would count. Only a `MemoryError` recycles the worker. A call that fails in another way near the cap, such
 as a thread that cannot start, or a Handler that catches the `MemoryError` itself, keeps its worker.
 
 `tests/test_sandbox.py` pins the change on Linux; the absolute `RLIMIT_AS` arm has no test:
 `test_a_graph_larger_than_mem_mb_does_not_fail_an_innocent_call`,
 `test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker` and
-`test_threads_a_call_joined_do_not_spend_the_memory_cap`.
+`test_threads_a_call_joined_do_not_spend_the_memory_cap`. In the thread test, four threads take
+turns growing malloc arenas, which the worker's `MALLOC_ARENA_MAX=2` makes them share. Its positive
+control, `test_without_the_arena_limit_threads_do_spend_the_memory_cap`, runs the same calls with
+`MALLOC_ARENA_MAX=64`, so each thread grows its own arena, and expects the innocent call after them
+to run out of memory. The control runs only on glibc, the GIL build, and overcommit not in mode 2.
 
 ### IPC codec (amendment — MFW2, replaces the pickle pipe)
 
@@ -403,11 +406,13 @@ target, no `pickle` import left to mis-suppress:
   → `tests/test_sandbox.py::test_a_mutating_router_is_the_one_documented_mode_divergence`
 - **AC-16** — WHERE `[sandbox].mode=subprocess` on Linux, THE SYSTEM SHALL measure `[sandbox].mem_mb`
   as headroom above the worker's memory once its graph is loaded, SHALL NOT count address space that
-  a joined thread only reserved, and IF a call runs out of memory THEN SHALL report the memory cap and
-  start a fresh worker for the next message (amendment of 2026-10-11).
+  a joined thread only reserved, SHALL NOT let joined threads' malloc arenas keep more than two
+  arenas' peak counted, and IF a call runs out of memory THEN SHALL report the memory cap and start a
+  fresh worker for the next message (amendment of 2026-10-11).
   → `tests/test_sandbox.py::test_a_graph_larger_than_mem_mb_does_not_fail_an_innocent_call`,
   `tests/test_sandbox.py::test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker`,
-  `tests/test_sandbox.py::test_threads_a_call_joined_do_not_spend_the_memory_cap`
+  `tests/test_sandbox.py::test_threads_a_call_joined_do_not_spend_the_memory_cap`,
+  `tests/test_sandbox.py::test_without_the_arena_limit_threads_do_spend_the_memory_cap`
 
 ## Options considered
 

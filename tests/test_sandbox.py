@@ -411,22 +411,37 @@ def h_runaway(msg):
 
 @handler("h_threads")
 def h_threads(msg):
-    # Eight threads alive at once, so each gets its own malloc arena, then all joined.
+    # Four threads, all alive until the barrier, so with no arena limit each gets its own malloc
+    # arena. Each in turn holds 2000 x 32 KiB, about 62.5 MiB, and then lets it go. 32 KiB is under
+    # glibc's 128 KiB mmap threshold, so the blocks come from the thread's arena and grow it. Taking
+    # turns keeps the memory live at any moment to one thread's worth, so only what the arenas KEEP
+    # can add up. Stacks are pinned at 2 MiB so the host's RLIMIT_STACK does not move the sums. The
+    # reply counts the threads that failed.
     import threading
 
-    barrier = threading.Barrier(8)
+    turn = threading.Lock()
+    barrier = threading.Barrier(4)
+    failed = []
 
     def work():
-        block = bytearray(1024 * 1024)
-        barrier.wait()
-        del block
+        try:
+            with turn:
+                blocks = [bytearray(32 * 1024) for _ in range(2000)]
+                del blocks
+            barrier.wait(timeout=20)
+        except (MemoryError, threading.BrokenBarrierError):
+            failed.append(1)
 
-    threads = [threading.Thread(target=work) for _ in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    return Send("OB_T", "JOINED")
+    previous = threading.stack_size(2 * 1024 * 1024)
+    try:
+        threads = [threading.Thread(target=work) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        threading.stack_size(previous)
+    return Send("OB_T", f"JOINED:{len(failed)}")
 """
 
 
@@ -440,11 +455,18 @@ def _mem_graph(tmp_path: Path, ballast_mib: int) -> tuple[Registry, str]:
     return registry, str(tmp_path)
 
 
-def _mem_session(config_dir: str, mem_mb: int) -> SandboxSession:
+def _mem_session(
+    config_dir: str, mem_mb: int, pass_environment: tuple[str, ...] = ()
+) -> SandboxSession:
     return _session(
         config_dir,
         "IB_M",
-        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0, mem_mb=mem_mb),
+        SandboxPolicy(
+            mode=SandboxMode.SUBPROCESS,
+            wall_seconds=30.0,
+            mem_mb=mem_mb,
+            pass_environment=pass_environment,
+        ),
     )
 
 
@@ -484,21 +506,91 @@ def test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker(tmp_pa
         session.close()
 
 
+#: The cap for the two thread tests below; the first one's docstring gives the arithmetic.
+_THREADS_MEM_MB = 320
+
+
+def _run_threads(
+    tmp_path: Path, pass_environment: tuple[str, ...] = ()
+) -> tuple[Registry, list[tuple[str, str]], SandboxSession]:
+    """Run ``h_threads`` on a fresh worker capped at :data:`_THREADS_MEM_MB`; return the registry,
+    what the call delivered, and the still-open session, whose worker is the one that ran it."""
+    registry, config_dir = _mem_graph(tmp_path, ballast_mib=0)
+    session = _mem_session(config_dir, _THREADS_MEM_MB, pass_environment)
+    try:
+        delivered = _deliveries(registry, "h_threads", sandbox=session, run_context=RunContext())
+    except BaseException:
+        session.close()
+        raise
+    return registry, delivered, session
+
+
+def _glibc_arenas_keep_their_peak() -> bool:
+    """Whether the control below can see the defect: glibc malloc reached through the GIL build's
+    ``PyMem_Malloc``, with overcommit not in mode 2, where glibc gives a trimmed arena back instead."""
+    import platform
+    import sysconfig
+
+    if platform.libc_ver()[0] != "glibc" or sysconfig.get_config_var("Py_GIL_DISABLED"):
+        return False
+    try:
+        return Path("/proc/sys/vm/overcommit_memory").read_text(encoding="ascii").strip() != "2"
+    except OSError:
+        return False
+
+
 @_LINUX_ONLY
 def test_threads_a_call_joined_do_not_spend_the_memory_cap(tmp_path: Path) -> None:
-    # Eight arenas of about 64 MiB of reserved address space is 512 MiB, twice this cap. Under an
-    # RLIMIT_AS cap the reservations stay counted after the join, and the 100 MiB call fails.
-    registry, config_dir = _mem_graph(tmp_path, ballast_mib=0)
-    session = _mem_session(config_dir, mem_mb=256)
+    """Four threads each grow a malloc arena by about 62.5 MiB, in turn, and are joined. Then the
+    same worker serves an innocent 100 MiB call.
+
+    The cap is 320 MiB of headroom. The arithmetic, by reasoning; it was not measured before this
+    test was written (vault BACKLOG #3133 part 2). Stacks are 2 MiB, so four live stacks are 8 MiB,
+    and glibc's cache of about 40 MiB keeps all four after the join.
+
+    - With the worker's ``MALLOC_ARENA_MAX=2``, the threads share the main arena and one thread
+      arena. The thread arena keeps at most its first heap, 64 MiB; the main arena is the ``brk``
+      heap, which glibc trims, so it adds at most a further 64 MiB and usually far less. So at most
+      about 136 MiB is held after the join, and the 100 MiB call needs at most about 236 of the 320.
+    - Without it, each thread gets its own arena. glibc trims an arena with ``MADV_DONTNEED``, which
+      leaves its peak writable and counted in ``VmData``. Four arenas keep about 250 MiB, which with
+      the stacks is about 258 MiB during the call, under the cap. After the join the same 258 MiB is
+      still held, so the 100 MiB call needs about 358 MiB and fails. The test below runs that case.
+
+    Under the old ``RLIMIT_AS`` cap the four arenas' 64 MiB reservations, 256 MiB, would have spent
+    it as well."""
+    registry, delivered, session = _run_threads(tmp_path)
     try:
-        assert _deliveries(registry, "h_threads", sandbox=session, run_context=RunContext()) == [
-            ("OB_T", "JOINED")
-        ]
+        assert delivered == [("OB_T", "JOINED:0")]
         assert session._proc is not None
         pid = session._proc.pid
         assert _alloc(registry, session) == [("OB_T", "ALLOCATED")]
         # The same worker served both calls: the second was not rescued by a respawn.
         assert session._proc is not None and session._proc.pid == pid
+    finally:
+        session.close()
+
+
+@_LINUX_ONLY
+@pytest.mark.skipif(
+    sys.platform.startswith("linux") and not _glibc_arenas_keep_their_peak(),
+    reason="needs glibc arenas that keep their peak: glibc, the GIL build, overcommit not mode 2",
+)
+def test_without_the_arena_limit_threads_do_spend_the_memory_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The positive control for the test above: the same calls, with ``MALLOC_ARENA_MAX=64`` passed
+    through ``[sandbox].pass_environment``, which the worker's own default does not override. Each
+    thread gets its own arena, the four arenas keep about 250 MiB counted after the join, and the
+    innocent 100 MiB call on the same worker runs out of memory. No thread fails during the call, so
+    it is what the arenas KEPT that fails the next one. Setting the variable in this test process
+    changes nothing here: glibc reads it only when a process starts."""
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "64")
+    registry, delivered, session = _run_threads(tmp_path, pass_environment=("MALLOC_ARENA_MAX",))
+    try:
+        assert delivered == [("OB_T", "JOINED:0")]
+        with pytest.raises(SandboxError, match="ran out of memory"):
+            _alloc(registry, session)
     finally:
         session.close()
 
