@@ -4770,20 +4770,22 @@ jobs:
           # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
           # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine. The host
           # python has no `cryptography`, so the CA+CRL is minted by the image's own interpreter.
+          # This step leaves the directory root-owned (see below). So clear one left by an earlier
+          # run on the same machine, which the runner's own account could not reuse.
+          sudo rm -rf "${RUNNER_TEMP:?}/syslog-ca"
           mkdir -p "$RUNNER_TEMP/syslog-ca" && chmod 755 "$RUNNER_TEMP/syslog-ca"
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/syslog-ca:/out" \
             --entrypoint python messagefoundry:smoke /repo/scripts/ci/make_syslog_ca_crl.py /out
-          # THE CA GOES TO ROOT BEFORE THE ENGINE READS IT. An enforcing start runs the anchor
-          # preflight over `[logging].forward_tls_ca_file`. It refuses a CA file, or a directory
-          # above it, that any account other than root or the engine owns, because that account
-          # could swap the CA. The mint above runs as the runner so it can write into RUNNER_TEMP,
-          # which leaves the directory and the bundle owned by the runner's uid. The engine runs
-          # as uid 10001, so it refused to start: "it is owned by uid 1001, not root or the
-          # engine". The refusal is right and the rig was wrong. These two commands are the ones
-          # docker/README.md gives an operator for a read-only mount: everyone may read, and only
-          # root may write. The mode change runs first, while the runner still owns the files.
-          # Nothing later in this job writes to this directory, and the engine mounts it
-          # read-only. The last line prints the owner and mode the engine will see.
+          # THE CA GOES TO ROOT BEFORE THE ENGINE READS IT. An enforcing start checks who owns
+          # `[logging].forward_tls_ca_file` and each directory above it. The owner must be root or
+          # the engine's own account, because any other owner could swap the CA. The rule is
+          # `posix_path_verdict` in messagefoundry/auth/anchor_path.py. The mint above runs as the
+          # runner, which lets it write into RUNNER_TEMP. That left the runner owning the directory
+          # and the bundle, and the engine refused to start. The refusal is right and the rig was
+          # wrong. docker/README.md gives these two commands for a read-only config mount, and the
+          # same owner rule applies here: everyone may read, and only root may write. The mode
+          # change runs first, while the runner still owns the files. The last line prints the
+          # owner and mode the engine will see.
           chmod -R a+rX,go-w "$RUNNER_TEMP/syslog-ca"
           sudo chown -R root:root "$RUNNER_TEMP/syslog-ca"
           stat -c '%u:%g %a %n' "$RUNNER_TEMP/syslog-ca" "$RUNNER_TEMP/syslog-ca"/*
@@ -4997,8 +4999,8 @@ jobs:
         run: |
           docker rm -f mefor || true
           docker volume rm mefor-data || true
-          # The syslog CA directory is root-owned by the time the engine starts, so the runner's
-          # own account can no longer delete it. `:?` stops the command if RUNNER_TEMP is unset.
+          # The serve step leaves the syslog CA directory root-owned, so the runner's own account
+          # cannot delete it. If RUNNER_TEMP is unset, `:?` ends this step with an error.
           sudo rm -rf "${RUNNER_TEMP:?}/syslog-ca" || true
 
   packaging-build:
