@@ -114,7 +114,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
-    report_unmarked,
+    report_sealed_surface,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -6429,8 +6429,8 @@ class MessageStore:
         persisted marker) OR it holds at least one marked value. The data check stays as a second
         signal, so a lost marker row cannot reopen the gap on a surface that still holds ciphertext.
 
-        **When the marker is written.** Every keyed open visits every surface, and leaves each one
-        marked:
+        **When the marker is written.** Every writable keyed open that completes this sweep visits
+        every surface, and leaves each one marked:
 
         1. Nothing to seal (empty, all blank or NULL, or all marked): the marker is written in its
            own transaction. This is what keys an empty surface at the first keyed open.
@@ -6439,13 +6439,17 @@ class MessageStore:
         3. Unsealed, with legacy plaintext: the marker is written FIRST, inside the seal's one
            transaction, then every value is sealed and the whole thing commits once. A crash rolls back
            the seal and the marker together, so the next open still sees legacy rows and seals them.
-           On the server backends the marker insert also serializes concurrent first opens: the
-           second waits on the first's key, and seals nothing if the first already keyed the surface.
+           If the marker turns out to exist already, another process keyed the surface after this
+           open read it, so this open seals nothing. On every backend it counts again and reports
+           whatever is still unmarked. On the server backends the insert also serializes
+           concurrent first opens: the second waits on the first's uncommitted key.
 
         **Edge cases.** An existing store holding only legacy plaintext gets it sealed exactly once,
-        at its first keyed open. A value written into a marked surface by a later KEYLESS run of the
-        same store, or by hand, is refused even if the table had emptied out; the opt-out below seals
-        it for one open. A read-only open writes no marker. A store restored from a file copy keeps
+        at the first keyed open that records the surface. A value planted before that open, on a
+        surface that holds no ciphertext, looks exactly like legacy plaintext, so that open seals
+        it. On a surface that already holds ciphertext the data check refuses it instead. A value
+        written into a marked surface by a later KEYLESS run of the same store, or by hand, is
+        refused even if the table had emptied out; the opt-out below seals it for one open. A read-only open writes no marker. A store restored from a file copy keeps
         the copy's markers. ``rotate-key`` changes no marker, because a surface stays keyed under any
         key. The uploaded-file store (``uploads.py``) is a directory, not a table, and has no marker.
 
@@ -6550,34 +6554,28 @@ class MessageStore:
            charge without the persisted total ever trailing an encrypt.
         3. **Write the marker, seal every batch, then commit once.** Any failure rolls the whole
            surface back, marker included. If the marker was already there, another process keyed the
-           surface since step 1, so this one seals nothing (unless the opt-out is on).
+           surface since step 1, so this one seals nothing (unless the opt-out is on). It counts
+           again instead, and reports whatever that process left unmarked.
+
+        Step 1 probes for ciphertext only when there is something to seal and no marker, and then
+        counts again. A peer that seals between the count and the probe then shows up as nothing
+        pending, never as a false plant beside its own new ciphertext.
         """
         keys = key_cols if key_cols is not None else aad_cols
         pending_where = f"{column} NOT LIKE ? AND {column} <> ''"
-        keyed = await self._surface_keyed(table, column)
-        cur = await self._db.execute(
-            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
-        )
-        row = await cur.fetchone()
-        pending = int(row["n"]) if row is not None else 0
         strict = not allows_unmarked(self._cipher)
-        # Short-circuit keeps the ciphertext probe lazy: it runs only for an unmarked, strict surface.
-        if not pending or (
-            strict and (keyed or await self._surface_holds_ciphertext(table, column, like))
-        ):
+        keyed = await self._surface_keyed(table, column)
+        pending = await self._count_unmarked(table, pending_where, like)
+        is_sealed = keyed
+        if pending and strict and not keyed:
+            is_sealed = await self._surface_holds_ciphertext(table, column, like)
+            if is_sealed:
+                # A peer may have sealed the rows between the count and the probe; count again so
+                # its legitimate seal is not reported as a plant.
+                pending = await self._count_unmarked(table, pending_where, like)
+        if not pending or (strict and is_sealed):
             if pending:
-                log.warning(
-                    "cipher column %s.%s is sealed and holds %d unmarked value(s); they were NOT "
-                    "sealed and every read of them is refused (a stripped marker or a planted "
-                    "row). Set [store].allow_unmarked_ciphertext only if they are known to be "
-                    "legitimate",
-                    table,
-                    column,
-                    pending,
-                )
-                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
-                # invisible except in the log. Names the cell only (BACKLOG #1169).
-                report_unmarked(self._cipher, table, column)
+                report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._insert_keyed_marker(table, column)
                 await self._commit()
@@ -6589,10 +6587,12 @@ class MessageStore:
         try:
             # The marker goes in FIRST, in the seal's own transaction, so a crash undoes both.
             if not await self._insert_keyed_marker(table, column) and strict:
-                # Another process keyed this surface after step 1, so its legacy rows are sealed.
-                # Whatever is still unmarked is refused at read; the next open's sweep reports it.
+                # Another process keyed this surface after step 1, so it sealed the legacy rows.
+                left = await self._count_unmarked(table, pending_where, like)
                 await self._db.rollback()  # the insert changed nothing; this closes the transaction
                 log.debug("cipher column %s.%s was keyed by another process", table, column)
+                if left:
+                    report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
@@ -6641,6 +6641,14 @@ class MessageStore:
             f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
         )
         return await cur.fetchone() is not None
+
+    async def _count_unmarked(self, table: str, pending_where: str, like: str) -> int:
+        """How many values ``pending_where`` matches in ``table``: the non-blank unmarked ones."""
+        cur = await self._db.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
+        )
+        row = await cur.fetchone()
+        return int(row["n"]) if row is not None else 0
 
     async def _insert_keyed_marker(self, table: str, column: str) -> bool:
         """Write ``table.column``'s marker in the caller's transaction, unless it exists. Returns

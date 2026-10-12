@@ -657,6 +657,38 @@ async def test_the_opt_out_seals_a_plant_on_a_keyed_surface(tmp_path: Path) -> N
     assert ("messages", "error") in _keyed_surfaces(db)
 
 
+async def test_a_peer_seal_between_the_count_and_the_probe_is_not_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An engine shard's peer can seal a surface's legacy rows after this open counted them and
+    before it probed for ciphertext. The probe then finds the peer's ciphertext. Reporting the
+    first count would raise a false plant alert, so the open counts again and stays quiet."""
+    db = tmp_path / "race.db"
+    ids = await _seed(db, 2)
+    for mid in ids:
+        _set_cell(db, "error", mid, "legacy parse failure")
+    cipher = _keyed(generate_key())
+    seen: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
+    real_probe = MessageStore._surface_holds_ciphertext
+
+    async def peer_seals_first(self: MessageStore, table: str, column: str, like: str) -> bool:
+        if (table, column) == ("messages", "error"):
+            for mid in ids:  # the peer's seal lands between this open's count and its probe
+                sealed = cipher.encrypt("legacy parse failure", aad=cell_aad(table, column, mid))
+                await self._db.execute("UPDATE messages SET error=? WHERE id=?", (sealed, mid))
+        return await real_probe(self, table, column, like)
+
+    monkeypatch.setattr(MessageStore, "_surface_holds_ciphertext", peer_seals_first)
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        assert seen == [], "a peer's legitimate seal was reported as a plant"
+        assert ("messages", "error") in _keyed_surfaces(db)
+        assert (await store.get_message(ids[0]) or {})["error"] == "legacy parse failure"
+    finally:
+        await store.close()
+
+
 async def test_a_surface_keyed_by_another_process_mid_open_is_not_sealed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -674,9 +706,14 @@ async def test_a_surface_keyed_by_another_process_mid_open_is_not_sealed(
         return False
 
     monkeypatch.setattr(MessageStore, "_surface_keyed", unkeyed_read)
-    store = await MessageStore.open(db, cipher=_keyed(key))
+    cipher = _keyed(key)
+    seen: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
+    store = await MessageStore.open(db, cipher=cipher)
     try:
         assert _cell_at_rest(db, "error", planted) == _PLANT  # the claim lost; nothing was sealed
+        # The losing open counted again and reported the plant the peer left, not silence.
+        assert seen == [("messages", "error")]
         with pytest.raises(CipherError, match=r"messages\.error"):
             await store.get_message(planted)
     finally:

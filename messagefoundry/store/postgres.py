@@ -118,7 +118,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
-    report_unmarked,
+    report_sealed_surface,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -2314,6 +2314,11 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn:
             return await conn.fetchrow(sql, *params)
 
+    async def _fetchval(self, sql: str, *params: Any) -> Any:
+        """The first column of the first row ``sql`` returns, or ``None``."""
+        async with self._timed_acquire(record=False) as conn:
+            return await conn.fetchval(sql, *params)
+
     async def _execute(self, sql: str, *params: Any) -> int:
         """Run one write on a bounded borrow and return its row count, read from asyncpg's status
         tag. Most callers ignore it; the session purge and the session cap read it (BACKLOG
@@ -2663,34 +2668,20 @@ class PostgresStore:
         wait, and a committed one makes it insert nothing, and then this open seals nothing."""
         keys = key_cols if key_cols is not None else aad_cols
         pending_where = f"{column} NOT LIKE $1 AND {column} <> ''"
-        keyed = await self._surface_keyed(table, column)
-        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", like)
-        pending = int(row["n"]) if row is not None else 0
+        count_sql = f"SELECT COUNT(*) FROM {table} WHERE {pending_where}"
         strict = not allows_unmarked(self._cipher)
-        # Short-circuit keeps the ciphertext probe lazy: it runs only for an unmarked, strict surface.
-        if not pending or (
-            strict
-            and (
-                keyed
-                or await self._fetchone(
-                    f"SELECT 1 AS x FROM {table} WHERE {column} LIKE $1 LIMIT 1", like
-                )
-                is not None
-            )
-        ):
+        keyed = await self._surface_keyed(table, column)
+        pending = int(await self._fetchval(count_sql, like) or 0)
+        is_sealed = keyed
+        if pending and strict and not keyed:
+            is_sealed = await self._surface_holds_ciphertext(table, column, like)
+            if is_sealed:
+                # As on SQLite: a peer may have sealed the rows between the count and the probe,
+                # so count again rather than report its legitimate seal as a plant.
+                pending = int(await self._fetchval(count_sql, like) or 0)
+        if not pending or (strict and is_sealed):
             if pending:
-                log.warning(
-                    "cipher column %s.%s is sealed and holds %d unmarked value(s); they were NOT "
-                    "sealed and every read of them is refused (a stripped marker or a planted "
-                    "row). Set [store].allow_unmarked_ciphertext only if they are known to be "
-                    "legitimate",
-                    table,
-                    column,
-                    pending,
-                )
-                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
-                # invisible except in the log. Names the cell only (BACKLOG #1169).
-                report_unmarked(self._cipher, table, column)
+                report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._execute(_INSERT_KEYED_MARKER, table, column, time.time())
             return 0
@@ -2703,9 +2694,12 @@ class PostgresStore:
         async with self._timed_acquire() as conn, conn.transaction():
             claimed = await conn.fetchval(_INSERT_KEYED_MARKER, table, column, time.time())
             if claimed is None and strict:
-                # A peer keyed this surface after the reads above, so its legacy rows are sealed.
-                # Whatever is still unmarked is refused at read; the next open's sweep reports it.
+                # A peer keyed this surface after the reads above, so it sealed the legacy rows.
+                # READ COMMITTED: this count sees the peer's committed seal.
+                left = int(await conn.fetchval(count_sql, like) or 0)
                 log.debug("cipher column %s.%s was keyed by another process", table, column)
+                if left:
+                    report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
             while True:
                 rows = await conn.fetch(
@@ -2734,6 +2728,13 @@ class PostgresStore:
             "SELECT 1 AS x FROM keyed_surface WHERE surface_table = $1 AND surface_column = $2",
             table,
             column,
+        )
+        return row is not None
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
+        """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
+        row = await self._fetchone(
+            f"SELECT 1 AS x FROM {table} WHERE {column} LIKE $1 LIMIT 1", like
         )
         return row is not None
 

@@ -97,7 +97,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
-    report_unmarked,
+    report_sealed_surface,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -496,6 +496,12 @@ async def _retry_idempotent_merge[T](
         except Exception as exc:
             if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS:
                 raise
+            log.debug(
+                "insert-if-absent MERGE hit a %s, attempt %d of %d; retrying",
+                "lock timeout (HYT00)" if "HYT00" in str(exc) else "deadlock (1205)",
+                attempt,
+                _CIPHER_MERGE_ATTEMPTS,
+            )
         if on_retry is not None:
             await on_retry()
         await asyncio.sleep(_CIPHER_MERGE_BACKOFF * attempt)
@@ -3523,36 +3529,20 @@ class SqlServerStore:
         # FALSE and a whitespace-only value would be skipped here and then refused forever at read,
         # where the cipher treats only a true '' as blank.
         pending_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
-        keyed = await self._surface_keyed(table, column)
-        row = await self._fetchone(
-            f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}", (like,)
-        )
-        pending = int(row["n"]) if row is not None else 0
+        count_sql = f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}"
         strict = not allows_unmarked(self._cipher)
-        # Short-circuit keeps the ciphertext probe lazy: it runs only for an unmarked, strict surface.
-        if not pending or (
-            strict
-            and (
-                keyed
-                or await self._fetchone(
-                    f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
-                )
-                is not None
-            )
-        ):
+        keyed = await self._surface_keyed(table, column)
+        pending = await self._count_unmarked(count_sql, like)
+        is_sealed = keyed
+        if pending and strict and not keyed:
+            is_sealed = await self._surface_holds_ciphertext(table, column, like)
+            if is_sealed:
+                # As on SQLite: a peer may have sealed the rows between the count and the probe,
+                # so count again rather than report its legitimate seal as a plant.
+                pending = await self._count_unmarked(count_sql, like)
+        if not pending or (strict and is_sealed):
             if pending:
-                log.warning(
-                    "cipher column %s.%s is sealed and holds %d unmarked value(s); they were NOT "
-                    "sealed and every read of them is refused (a stripped marker or a planted "
-                    "row). Set [store].allow_unmarked_ciphertext only if they are known to be "
-                    "legitimate",
-                    table,
-                    column,
-                    pending,
-                )
-                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
-                # invisible except in the log. Names the cell only (BACKLOG #1169).
-                report_unmarked(self._cipher, table, column)
+                report_sealed_surface(log, self._cipher, table, column, pending)
             if not keyed:
                 await self._mark_surface_keyed(table, column)
             return 0
@@ -3563,11 +3553,30 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 if not await self._claim_keyed_surface(conn, cur, table, column) and strict:
-                    # A peer keyed this surface after the reads above, so its legacy rows are
-                    # sealed. Whatever is still unmarked is refused at read; the next open's sweep
-                    # reports it. The MERGE changed nothing, so this only ends the transaction.
+                    # A peer keyed this surface after the reads above, so it sealed the legacy
+                    # rows. Count what it left unmarked, then end the transaction: the MERGE
+                    # changed nothing.
+                    left = 0
+                    try:
+                        await cur.execute(count_sql, (like,))
+                        counted = await cur.fetchone()
+                        left = int(counted[0]) if counted is not None else 0
+                    except Exception as exc:
+                        # A diagnostic count must not fail the open. The next open's sweep counts
+                        # again and reports anything left.
+                        if not _is_transient_write_conflict(exc):
+                            raise
+                        log.warning(
+                            "could not recount %s.%s after another process keyed it (%s); the "
+                            "next open reports anything left unmarked",
+                            table,
+                            column,
+                            type(exc).__name__,
+                        )
                     await conn.rollback()
                     log.debug("cipher column %s.%s was keyed by another process", table, column)
+                    if left:
+                        report_sealed_surface(log, self._cipher, table, column, left)
                     return 0
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
@@ -3609,6 +3618,18 @@ class SqlServerStore:
             (table, column),
         )
         return row is not None
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
+        """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
+        row = await self._fetchone(
+            f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
+        )
+        return row is not None
+
+    async def _count_unmarked(self, count_sql: str, like: str) -> int:
+        """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``like``."""
+        row = await self._fetchone(count_sql, (like,))
+        return int(row["n"]) if row is not None else 0
 
     async def _mark_surface_keyed(self, table: str, column: str) -> None:
         """Write ``table.column``'s marker in its own transaction, unless it exists.

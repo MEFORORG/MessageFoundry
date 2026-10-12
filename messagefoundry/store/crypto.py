@@ -389,6 +389,25 @@ def report_unmarked(cipher: Cipher, table: str, column: str) -> None:
         report(table, column)
 
 
+def report_sealed_surface(
+    logger: logging.Logger, cipher: Cipher, table: str, column: str, pending: int
+) -> None:
+    """Log and alert that the at-open sweep left ``pending`` unmarked values on a SEALED surface.
+
+    One text for all three backends' sweeps, logged under the calling backend's ``logger``. The
+    alert names the cell only, never a row or a value (BACKLOG #1169). It fires now, not only on a
+    read, so a planted row nobody reads still reaches an alert."""
+    logger.warning(
+        "cipher column %s.%s is sealed and holds %d unmarked value(s); they were NOT sealed and "
+        "every read of them is refused (a stripped marker or a planted row). Set "
+        "[store].allow_unmarked_ciphertext only if they are known to be legitimate",
+        table,
+        column,
+        pending,
+    )
+    report_unmarked(cipher, table, column)
+
+
 # --- in-use memory hygiene (ASVS 13.3.3 / 11.7.2) — all best-effort, see the module docstring -------
 #
 # These operate on the *mutable* bytearrays this module owns (the raw DEK, transient plaintext) so the
