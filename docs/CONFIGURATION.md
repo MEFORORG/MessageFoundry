@@ -1449,24 +1449,25 @@ engine setting** (BACKLOG #1125). The sources include at least `http_proxy`, `ht
 - The alert webhook, the OIDC sign-in requests and the AI broker follow the same proxies. They
   have no proxy setting of their own.
 - The Vault and OpenBao clients (see `[secrets]`) follow an `https` or `all` proxy to an `https://`
-  Vault. An `http` proxy alone carries no Vault hop, and an `http://` Vault behind any proxy is
-  refused. They have no loopback rule, so an `https://` Vault on a loopback address is proxied too.
+  Vault. They have no loopback rule, so an `https://` Vault on a loopback address is proxied too.
+  An `http` proxy alone carries no Vault hop. An `http` or `all` proxy does make the clients
+  refuse an `http://` Vault, loopback included, because they refuse that address behind any proxy.
 
 So `serve` and `supervise` each log one WARNING at start when such a proxy is set. Under
 `supervise`, every engine shard logs its own. The WARNING names each proxy's scheme, host and port,
-never a user or password from its URL. It lists only the hops above that can use that proxy. With
+never a user or password from its URL. It then gives one list of the hops above that can use at
+least one of those proxies, and says when the Vault clients would refuse an `http://` Vault. With
 no proxy set, or a `NO_PROXY` of exactly `*`, it logs nothing. Other commands that reach these
 hops, such as `check-privileges` and `verify`, do not log this warning.
 
 The urllib hops, which are every hop above except Vault, dial a loopback host direct. A host on
 `NO_PROXY` or the system bypass list goes direct too. A proxy URL that carries credentials and is
-not `https://` is refused on each request ([CONNECTIONS.md](CONNECTIONS.md)).
+not `https://` is refused on each request.
 
-**The scheme the WARNING names is not a TLS leg to the proxy for the urllib hops.** For an `https`
-target, they reach any proxy over plain TCP, even one written `https://`. They send `CONNECT`, and
-any credential from the proxy URL, in cleartext. Only an `http` target, with no `https` proxy set,
-gets a TLS leg to an `https://` proxy. The Vault clients do open TLS to an `https://` proxy (see
-`[secrets]`).
+**The scheme the WARNING names is not always a TLS leg to the proxy.** For an `https` target, the
+urllib hops send `CONNECT` before any TLS, even to a proxy written `https://`.
+[CONNECTIONS.md](CONNECTIONS.md) has the detail, and the WARNING says so too. The Vault clients do
+open TLS to an `https://` proxy (see `[secrets]`).
 
 To stop the proxy, clear `http_proxy`, `https_proxy` and `all_proxy`, in either case, and the
 system proxy, for the account the engine runs as. An address in `[egress].proxy_url` or a
@@ -1857,8 +1858,9 @@ the CA that issued your Vault server's certificate to verify that hop against yo
 public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin is
 `MEFOR_STORE_VAULT_CA_FILE`) — a path, not a secret, and unset leaves the hop exactly as it was.
 **A web proxy reaches both Vault clients with no engine setting.** They honour `HTTPS_PROXY`,
-`HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, and on Windows the system proxy, and `serve` names such a
-proxy at start ([`[egress]`](#serve-names-an-environment-proxy-at-start)). Through an `https://` proxy,
+`HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, and the Windows or macOS system proxy. `serve` names
+such a proxy at start; [`[egress]`](#serve-names-an-environment-proxy-at-start) says which proxy
+each Vault address can use. Through an `https://` proxy,
 the TLS leg to the proxy uses the same approved suites as the Vault leg. It is verified against the
 same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
 public bundle otherwise. There is no separate proxy anchor, on purpose (BACKLOG #2318). The proxy

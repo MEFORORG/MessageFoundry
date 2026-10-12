@@ -3,9 +3,8 @@
   and `supervise` each log one WARNING at start. It names each proxy's host and port, never a user
   or password from its URL, and at least the engine hops that can go through it. Those include
   HTTP-family connections where no explicit `proxy_url` applies, the alert webhook and, for an
-  `https` or `all` proxy, the Vault and OpenBao clients. It also says that the urllib hops send
-  `CONNECT` to the proxy in cleartext for an `https` target, even when the proxy is written
-  `https://`. With no proxy set it logs nothing. See
+  `https` or `all` proxy, the Vault and OpenBao clients. It also says when the leg to the proxy is
+  not TLS, even for a proxy written `https://`. With no proxy set it logs nothing. See
   [CONFIGURATION.md](../docs/CONFIGURATION.md#serve-names-an-environment-proxy-at-start).
   ([BACKLOG #1125](../docs/BACKLOG.md))
 - **The deployment documents now state what a proxy in front of the engine must do about request
