@@ -4617,7 +4617,9 @@ class PostgresStore:
             await self._after_fenced_write(exc)
             return
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> None:
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(4)  # ADR 0157 C1 — TERMINAL
         try:
@@ -4654,6 +4656,15 @@ class PostgresStore:
                     f"attempt {row['attempts']}",
                     now,
                 )
+                if reply_dropped is not None:
+                    await self._event(
+                        conn,
+                        row["message_id"],
+                        "reply_dropped",
+                        row["destination_name"],
+                        reply_dropped,
+                        now,
+                    )
                 await self._maybe_finalize_message(conn, row["message_id"], now)
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)

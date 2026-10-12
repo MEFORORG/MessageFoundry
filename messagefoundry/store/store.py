@@ -3500,8 +3500,10 @@ def not_deployed_detail(destination: str) -> str:
 #: "off" would lose exactly the record needed to answer that, on exactly the deployments most likely
 #: to be asked. ``reply_returned`` is the routine happy-path counterpart and is deliberately NOT in
 #: the floor: it is thinnable like ``delivered``.
+#: ``reply_dropped`` joins it for the same reason (vault BACKLOG #3040 item 5): it is the one row
+#: that answers "you ignored our reply", and the delivery worker's WARNING says it was written.
 _AUDIT_FLOOR_EVENTS = frozenset(
-    {VIEWED_EVENT, "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout"}
+    {VIEWED_EVENT, "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout", "reply_dropped"}
 )
 
 #: The COMPLETE ``message_events.event`` vocabulary, shared by all three backends.
@@ -3542,6 +3544,10 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         # out of every log, event and exception).
         "reply_returned",
         "reply_timeout",
+        # vault BACKLOG #3040 item 5: a delivered row whose 2xx reply body was over the byte bound
+        # and dropped. Written by mark_done with the "delivered" row. Status and bound only, never
+        # a byte of the reply.
+        "reply_dropped",
     }
 )
 
@@ -9285,7 +9291,9 @@ class MessageStore:
             return
         await self._run_grouped(_body)
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> None:
         now = time.time() if now is None else now
 
         async def _body() -> None:
@@ -9315,6 +9323,10 @@ class MessageStore:
                 f"attempt {row['attempts']}",
                 now,
             )
+            if reply_dropped is not None:
+                await self._event(
+                    row["message_id"], "reply_dropped", row["destination_name"], reply_dropped, now
+                )
             await self._maybe_finalize_message(row["message_id"], now)
 
         await self._run_grouped(_body)

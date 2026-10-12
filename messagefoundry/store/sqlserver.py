@@ -9385,7 +9385,9 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> None:
         now = time.time() if now is None else now
         output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9427,6 +9429,10 @@ class SqlServerStore:
                 await self._event(
                     cur, message_id, "delivered", destination_name, f"attempt {attempts}", now
                 )
+                if reply_dropped is not None:
+                    await self._event(
+                        cur, message_id, "reply_dropped", destination_name, reply_dropped, now
+                    )
                 await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
             except Exception:

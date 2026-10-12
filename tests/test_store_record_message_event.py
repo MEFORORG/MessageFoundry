@@ -77,6 +77,54 @@ async def test_the_reply_kinds_are_declared(tmp_path: Path) -> None:
     assert "reply_returned" not in _AUDIT_FLOOR_EVENTS
 
 
+async def test_the_reply_dropped_kind_is_declared_and_kept_at_every_verbosity() -> None:
+    """vault BACKLOG #3040 item 5: ``mark_done`` writes it on a delivered row whose 2xx reply body
+    was dropped. The delivery worker's WARNING says it was written, so a thinned instance must
+    still write it, as it writes ``reply_timeout``."""
+    from messagefoundry.store.store import _AUDIT_FLOOR_EVENTS, MESSAGE_EVENT_KINDS
+
+    assert "reply_dropped" in MESSAGE_EVENT_KINDS
+    assert "reply_dropped" in _AUDIT_FLOOR_EVENTS
+
+
+@pytest.mark.parametrize("verbosity", ["all", "errors", "off"])
+async def test_mark_done_writes_reply_dropped_with_the_delivery(
+    tmp_path: Path, verbosity: str
+) -> None:
+    """The drop rides the DONE flip, so it commits or rolls back with it. ``delivered`` is the
+    control: it is thinned below ``all``, and ``reply_dropped`` is not."""
+    from messagefoundry.store.store import Stage
+
+    db = tmp_path / "drop.db"
+    store = await MessageStore.open(db, message_events=verbosity)
+    try:
+        mid = await store.enqueue_message(channel_id="IB_HTTP", raw=ADT, deliveries=[("OB_A", ADT)])
+        item = await store.claim_next_fifo("OB_A", stage=Stage.OUTBOUND.value)
+        assert item is not None
+        await store.mark_done(item.id, reply_dropped="HTTP 200; reply body over the 64-byte bound")
+        plain = await store.enqueue_message(
+            channel_id="IB_HTTP", raw=ADT, deliveries=[("OB_A", ADT)]
+        )
+        other = await store.claim_next_fifo("OB_A", stage=Stage.OUTBOUND.value)
+        assert other is not None
+        await store.mark_done(other.id)
+    finally:
+        await store.close()
+
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT message_id, event, destination, detail FROM message_events"
+            " WHERE event IN ('delivered', 'reply_dropped') ORDER BY id"
+        ).fetchall()
+    finally:
+        con.close()
+    dropped = [(m, d, x) for m, e, d, x in rows if e == "reply_dropped"]
+    assert dropped == [(mid, "OB_A", "HTTP 200; reply body over the 64-byte bound")]
+    delivered = sorted(m for m, e, _, _ in rows if e == "delivered")
+    assert delivered == (sorted([mid, plain]) if verbosity == "all" else [])
+
+
 async def test_the_floor_kind_survives_verbosity_off(tmp_path: Path) -> None:
     # The whole point of the floor. `off` drops the routine kind and keeps the diagnostic one.
     db = tmp_path / "off.db"
