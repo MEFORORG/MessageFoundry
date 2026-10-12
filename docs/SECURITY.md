@@ -3661,7 +3661,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   longer has this problem: its step-up is the IdP leg above. See ADR 0142 *Consequences* and
   Amendment B.
 - **Out of scope:** SAML 2.0, cloud-only (non-hybrid) users, a JSON/API federated path (`/ui` only),
-  refresh tokens, and RP-initiated logout.
+  refresh tokens, RP-initiated logout, and back-channel logout.
+  [The engine session is independent of the IdP session](#the-engine-session-is-independent-of-the-idp-session-asvs-761)
+  says what does and does not end an engine session.
 
 Check the deployed posture with `messagefoundry verify --section federation`
 ([VERIFY.md](testing/VERIFY.md)), which can also replay a captured `id_token` offline through the
@@ -3781,7 +3783,7 @@ On a first deployment, each would let a caller keep acting on a withdrawn grant 
 |---|---|---|
 | The IDE extension's AI policy, in `byo` mode | The IDE asks the engine when it holds a live session. Withdrawing `ai:assist` revokes that session. The engine then answers with the grant unknown, and `byo` mode treats unknown as allowed. When the engine is unreachable, the extension reuses its last cached answer. An answer that disables assistance stands at any age. One that enables it stands for 12 hours from the engine's answer, then the extension disables assistance (BACKLOG #1154). | Until the IDE signs in again. While the engine is unreachable, up to 12 hours. In `managed_endpoint` mode the engine checks `ai:assist` on each chat request. |
 | An engine-side edit that narrows an AD account's grant | An edit to the AD group-to-role or group-to-scope map revokes every unrevoked session of each enabled directory account. That includes sessions the clock already calls expired, and the audit row's `sessions_revoked` counts them all. At the next login the engine re-derives roles from the groups. It re-derives scope by the rule under *Per-channel scoping* above. | A per-user scope an admin narrowed on a user in a scope-mapped group: the next login restores the group scope. A scope-map row removed so that no mapped group matches: the map edit revokes the session, and the next login applies that rule. A service-certificate identity mapped to an AD account has no session to revoke. A narrowed role or scope map reaches its next request, because the engine keeps only the stored roles and channels the current groups still map to. A scope an administrator set stays as stored when none of the groups is in the scope map (BACKLOG #2316). |
-| A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent. It revokes after one pass when the directory groups would withdraw or narrow the channel scope, and leaves the scope for the next login to write. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. | A role change, or a withdrawn or narrowed scope: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, all of these last until the absolute session cap, 12 hours by default. A widened scope waits for the next login, within that cap. The live session then holds less than the directory grants, not more. |
+| A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent or disabled. It revokes after one pass when the directory groups would withdraw or narrow the channel scope, and leaves the scope for the next login to write. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. | A role change, or a withdrawn or narrowed scope: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, all of these last until the absolute session cap, 12 hours by default. A widened scope waits for the next login, within that cap. The live session then holds less than the directory grants, not more. |
 
 No alert fires when a caller acts inside one of these windows, and the engine reverts nothing done
 there. The reconciler's `ad_session_revoked` alert reports a revocation, not an action taken after one.
@@ -3930,6 +3932,81 @@ read, fails open for that one account (BACKLOG #2241). It is logged at WARNING b
 pass, and the rest of the estate is still reconciled. **The cost:** while it repeats, that account's
 sessions are never revoked by the reconciler, and no alert is raised. If it hits every probe, the
 pass reads as a directory outage.
+
+### The engine session is independent of the IdP session (ASVS 7.6.1)
+
+The engine mints its own session at sign-in. That session does not follow the identity provider
+(IdP) session that started it. The engine has at least two IdPs. One is the OIDC issuer behind federated sign-in.
+The other is the on-premises Kerberos key distribution center (KDC) behind Windows SSO. Both
+sign-in legs ship off (`[auth].oidc_enabled` and `[auth].kerberos_enabled` default to `false`), so
+this describes a site that turns one on.
+
+At least these events bear on a live engine session:
+
+| Event | What it does to a live engine session |
+|---|---|
+| The user signs out at the IdP, or the IdP ends or revokes its own session | Nothing. The engine has no back-channel logout receiver, so it hears nothing from the IdP. |
+| The user signs out of the engine | Ends the engine session only. The engine sends no RP-initiated logout, so the IdP session stays. |
+| The Kerberos ticket the user signed in with expires | Nothing. The engine does not read the ticket's lifetime, so no cap depends on it. The directory rows below can still end the session. |
+| Time passes | The session ends at the soonest of its caps: the idle and absolute limits for every session, plus the federated caps for an OIDC one. The *Session age* row of the [signal table](#contextual-and-environmental-security-inputs-asvs-813--814) names them. |
+| The wall clock steps backward | Every session last used after the new time fails the engine's session check until the clock passes that use again. A failed check revokes the session. The engine fails closed rather than age it wrongly. |
+| The directory disables or deletes the account | The directory reconciler can end every session of the account. The row for a change made in Active Directory, in the [revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832), gives the rule. Each engine process keeps its count in memory, so a restart sets it back to 0. |
+| A directory group change alters the account's roles, or withdraws or narrows its channel scope | The reconciler ends every session of the account on the first pass that sees the change. A pass can revoke nothing, as *Directory session reconciliation* explains. The account's next sign-in also ends its other sessions. |
+| An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of every enabled directory account. |
+| An administrator binds, rebinds or unbinds the account's federated identity | Ends every session of the account, a first bind included. |
+| An administrator signs the user out with `DELETE /users/{user_id}/sessions` | Ends every session of the account. |
+| An administrator disables the user in the engine | Ends every session of the account. Each request also refuses a disabled account. |
+
+**For OIDC, the engine does bound the time since the IdP authentication event.** It sends `max_age`
+and requires `auth_time`, as [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)
+says under *Time since the IdP sign-in is bounded too*. **A Kerberos session has no such bound.**
+
+**Besides the reconciler, at least two paths that consult the directory can end a live
+session.** A sign-in that finds the roles or the channel scope changed ends the account's other
+sessions. At the directory re-bind, enough wrong passwords end the session through its re-proof
+budget (BACKLOG #1138). A disabled account's sign-in is refused, and ends no session. The step-up,
+MFA and passkey legs also look the account up in the directory. They refuse an account the
+directory does not confirm, and that refusal ends no session. Every federated
+account is also a directory account, so the reconciler reaches both legs. One exception: it skips a
+federated binding on a row with no directory id. When it revokes, it never disables or deletes the
+engine account itself.
+[Directory session reconciliation](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
+has the full rule, including when a pass revokes nothing. For the timing, see the row for a change
+made in Active Directory, in the
+[revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832). The
+reconciler does not see at least these: a sign-out or revocation at the IdP, a password reset in
+the directory, and an account expiry or lockout. Of the account's status flags, the pass reads only
+the disabled flag.
+
+**Why the engine keeps its own session.** The owner kept back-channel logout out of scope
+([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
+Amendment B.2). A receiver would add a new unauthenticated POST surface. The reconciler already ends
+a disabled account's sessions. Windows SSO hands the engine its Kerberos ticket through the Simple
+and Protected GSSAPI Negotiation Mechanism (SPNEGO). The engine's SPNEGO library, pyspnego, does
+not expose the ticket's lifetime. The project declined to fork or patch it to get one. A fixed
+fallback in its place would look like a directory bound when it is not
+([ADR 0079](adr/0079-kerberos-idp-session-coordination.md), amendment of 2026-07-21). So the
+engine bounds its own sessions with short caps, and the reconciler carries directory changes.
+
+**To narrow the gap, an operator can at least:**
+
+- lower `[security].max_session_hours` or `[security].sign_out_after_idle_minutes`, which bound every
+  session on both legs;
+- for OIDC, set `[auth].oidc_session_max_hours`, or lower `[auth].oidc_max_age_seconds`;
+- keep the reconciler on, and shorten its window: lower `[auth].ad_session_recheck_seconds`, or raise
+  `[auth].ad_session_recheck_max_users` on a large estate. Setting the interval to `0` turns the
+  reconciler off, and that is a declared loosening. Lowering `ad_session_recheck_strikes` also
+  shortens it, but weakens one of the safety properties that
+  [Directory session reconciliation](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
+  lists;
+- end another user's sessions at once with `DELETE /users/{user_id}/sessions`, or by disabling the
+  user in the engine. Both refuse the caller's own account with `400` (BACKLOG #1149 for the
+  route). For your own sessions, Sign out ends the current one. `DELETE /me/sessions` ends the
+  others, but asks for a fresh step-up first. With `[auth].require_action_step_up` on (the
+  default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
+  passwordless or smartcard-only account cannot end its other sessions this way.
+
+[CONFIGURATION.md](CONFIGURATION.md) documents each setting.
 
 ### Session inventory & targeted revocation (WP-10)
 
