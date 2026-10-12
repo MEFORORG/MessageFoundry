@@ -48,9 +48,8 @@ drop that one report and pass every other one on. Code that replaces ``sys.unrai
 afterwards brings the interpreter's lines back.
 
 **Cost.** An audit hook runs on every audited operation in the process, not only this event.
-Measured on one Windows development machine, CPython 3.14.6: about 60 to 90 ns for each audited
-operation. Where the interface is already disabled the event cannot fire, so no hook is installed
-and nothing is paid.
+Where the interface is already disabled the event cannot fire, so no hook is installed and nothing
+is paid.
 
 The cost for each message was measured once, on one machine (vault BACKLOG #2742). It is a
 reading, not a contract and not a bound. It was taken on 2026-10-12, on Windows 11 (10.0.26300)
@@ -68,7 +67,7 @@ be removed, so each reading came from a child process of its own.
 - *Time.* Two more children timed ``sys.audit`` for an event this hook does not match, in 18
   rounds of 2,000,000 calls each. With no audit hook the median was 36 ns a call (30 to 52).
   With this hook, installed as the command line installs it, it was 110 ns (91 to 133). The
-  medians differ by 74 ns.
+  medians differ by 74 ns. An earlier reading, taken when the hook was written, was 60 to 90 ns.
 
 So on that feed the hook cost about 0.1 microseconds for each message. That figure is the two
 readings multiplied, not a timed message. Other feeds were not measured: at least a File
