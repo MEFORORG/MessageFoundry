@@ -321,8 +321,8 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
 
 
 def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[str, str]) -> None:
-    """The default refusal offers ``[tls].crl_file`` and an egress proxy. Neither can cross an ECH
-    hop, so its refusal names the attestation alone, in fixed text."""
+    """The default refusal offers ``[tls].crl_file``, which cannot cross an ECH hop, so its refusal
+    names the attestation alone, in fixed text."""
     text = _refused("REST", crl=pki["crl"], extra=_ECH)
     assert ECH_HOP_WAYS_ACROSS in text
     assert "tls_revocation_attested=true" in text and "tls_revocation_attested_reason" in text
@@ -333,8 +333,11 @@ def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[st
     default = _refused("REST")
     assert ECH_HOP_WAYS_ACROSS not in default
     assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in default
-    assert "egress proxy" in default
+    # BACKLOG #2987: the default no longer offers an egress proxy, a lever no call site can set.
+    assert "egress proxy" not in default
     assert "tls_revocation_attested=true" in default
+    # The destination wording the lookup's own description must not change (BACKLOG #2987).
+    assert "delivers over verified https" in default
 
 
 def test_opener_is_a_required_keyword() -> None:
