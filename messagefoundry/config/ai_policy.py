@@ -33,11 +33,11 @@ serialize :class:`EffectivePolicy` to the shared snake_case wire shape.
 
 Note: the ``deidentified`` scope needs runtime de-identification wired into the AI-assist path,
 which does not exist yet (roadmap only). A de-id framework *does* live in the repo
-(:mod:`messagefoundry.anon`, ADR 0030), but it builds de-identified test datasets from captured
-traffic — not message bodies flowing to the assistant — so :func:`resolve_effective_policy`
-always clamps this scope down rather than pretending it is reachable. A de-identified dataset is
-not guaranteed free of PHI: ``docs/PHI.md`` section 9 says what the framework's leak-check refuses
-and what it lets through.
+(:mod:`messagefoundry.anon`, ADR 0030), but it de-identifies captured traffic for building test
+datasets — not message bodies flowing to the assistant — so :func:`resolve_effective_policy`
+always clamps this scope down rather than pretending it is reachable. A de-identified test dataset
+is not guaranteed free of PHI: ``docs/PHI.md`` section 9 says what the framework's leak-check
+refuses and what it lets through.
 """
 
 from __future__ import annotations

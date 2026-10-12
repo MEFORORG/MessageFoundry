@@ -77,12 +77,13 @@ _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]
 
 def _load_scan_forbidden() -> object:
     # scripts/security/, not the retired scripts/publish/. The scanner is COMMITTED now, so this skip
-    # should effectively never fire in a source checkout — it remains only for an installed wheel with
-    # no scripts/ tree above it. Leaving the old path here silently skipped the parity assertions
-    # below, which are the only thing keeping tee/anon/leak.py's tables identical to the guard's.
+    # should effectively never fire in a source checkout — it remains only for a tree that has no
+    # scripts/security under its root. Leaving the old path here silently skipped the parity
+    # assertions below, which are the only thing keeping tee/anon/leak.py's tables identical to the
+    # guard's.
     path = _ROOT / "scripts" / "security" / "scan_forbidden.py"
     if not path.exists():
-        pytest.skip("scan_forbidden.py not found above this tree", allow_module_level=True)
+        pytest.skip("scan_forbidden.py not found at scripts/security", allow_module_level=True)
     spec = importlib.util.spec_from_file_location("scan_forbidden", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

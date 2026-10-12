@@ -59,7 +59,7 @@ _SITES = (
     pytest.param(
         "messagefoundry/config/ai_policy.py",
         ("PHI-free test datasets",),
-        "de-identified test datasets",
+        "not guaranteed free of PHI",
         1,
         id="ai-policy-docstring",
     ),
@@ -79,7 +79,12 @@ _SITES = (
     ),
     pytest.param(
         "tests/test_anon_parity.py",
-        ("scripts/ above it", "scripts/security above it"),
+        (
+            "scripts/ above it",
+            "scripts/security above it",
+            "scripts/ tree above it",
+            "not found above this tree",
+        ),
         "scripts/security beside the package",
         2,
         id="parity-test-comments",
@@ -87,10 +92,12 @@ _SITES = (
     # The module docstring of messagefoundry/anon/__init__.py still makes the blanket claim, and
     # another change in the same pull request corrects it. The mark is strict on purpose: the
     # correction turns this case red until the mark is removed, so the site cannot stay unguarded.
+    # The floor here is wording the docstring holds before and after, so the retired phrase is the
+    # only reason this case fails today.
     pytest.param(
         "messagefoundry/anon/__init__.py",
         ("a byte-identical tee/anon/",),
-        "tests/test_anon_parity.py",
+        "tee/anon/",
         1,
         marks=pytest.mark.xfail(
             strict=True, reason="the anon/__init__.py docstring is corrected in a later commit"
@@ -138,7 +145,10 @@ def test_adr_0201_carries_the_correction_under_its_dated_sentence() -> None:
         "ADR 0201 says the anonymizer's loaders walk up from __file__, with no dated correction "
         "after it. Neither loader walks: each builds one fixed path (BACKLOG #2996)."
     )
-    assert _flat("one fixed path") in flat[note:], "the correction must say what the loaders do"
+    # Read the note itself, not the rest of the ADR: a later section could hold the same words.
+    assert _flat("one fixed path") in flat[note : note + 400], (
+        "the correction must say what the loaders do"
+    )
 
 
 def test_the_flattening_joins_what_a_wrapped_phrase_splits() -> None:
