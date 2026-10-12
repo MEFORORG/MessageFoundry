@@ -18,9 +18,11 @@ row now.
 
 These tests drive the REAL wrapper (``spnego._negotiate.NegotiateProxy``) with real crafted tokens,
 not a stub that raises on cue. The tokens were found by mutating valid SPNEGO tokens against
-pyspnego 0.12.4; ``StopIteration`` and ``KeyError`` were the only types outside the old except
-tuple. The directory double fails the test if it is asked anything: a refused token must never
-reach it.
+pyspnego 0.12.4. A first search found ``StopIteration`` and ``KeyError`` outside the old except
+tuple, and a second found ``IndexError``, which is why ``kerberos_principal`` now treats ANY
+exception from the acceptor's step as a refused token. The directory double fails the test if it is
+asked anything: a refused token must never reach it. The pyspnego names imported below are private;
+if a release moves them, this file fails at collection, which is the signal to re-derive the tokens.
 
 PHI-free: synthetic tokens and names only.
 """
@@ -38,7 +40,7 @@ import pytest
 import spnego
 from spnego._context import GSSMech
 from spnego._negotiate import NegotiateProxy
-from spnego._spnego import NegTokenResp
+from spnego._spnego import NegTokenInit, NegTokenResp
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import KerberosTokenRefused, kerberos_principal
@@ -54,10 +56,16 @@ _STOP_ITERATION = NegTokenResp(response_token=b"x").pack()
 _KEY_ERROR = NegTokenResp(supported_mech=GSSMech.kerberos.value, response_token=b"x").pack()
 #: One naming an OID pyspnego does not know: the ValueError's message quotes the caller's OID.
 _VALUE_ERROR = NegTokenResp(supported_mech=_LEAK, response_token=b"x").pack()
+#: A truncated NegTokenResp the mutation search found: pyspnego's ASN.1 reader runs off its buffer.
+_INDEX_ERROR = base64.b64decode("oQYwEqADCgECoQsGCSsGAQQBgfRpBw==")
+#: A NegTokenInit offering only that OID: the provider refuses it with its own SpnegoError text.
+_SPNEGO_ERROR = NegTokenInit(mech_types=[_LEAK], mech_token=b"x").pack()
 _CRAFTED = [
     pytest.param(_STOP_ITERATION, "StopIteration", id="StopIteration"),
     pytest.param(_KEY_ERROR, "KeyError", id="KeyError"),
     pytest.param(_VALUE_ERROR, "ValueError", id="ValueError-quoting-the-token"),
+    pytest.param(_INDEX_ERROR, "IndexError", id="IndexError"),
+    pytest.param(_SPNEGO_ERROR, "BadMechanismError", id="BadMechanismError"),
 ]
 #: The row both Kerberos routes write for a header that is not base64.
 _MALFORMED = {"provider": "ad", "mech": "kerberos", "reason": "malformed_token"}
@@ -95,19 +103,33 @@ def test_kerberos_principal_refuses_a_crafted_token_by_type_only(
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
-def test_the_refusal_keeps_its_diagnostic_in_the_log(
-    real_wrapper: None, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The audit row names only the type, so the log is where an operator reads a bad keytab,
-    which on a host without SSPI fails the same way a crafted token does."""
+def _refusal_log_line(token: bytes, caplog: pytest.LogCaptureFixture) -> str:
     with (
         caplog.at_level("WARNING", logger="messagefoundry.auth.ldap"),
         pytest.raises(KerberosTokenRefused),
     ):
-        kerberos_principal(_VALUE_ERROR, AuthSettings())
+        kerberos_principal(token, AuthSettings())
     [record] = [r for r in caplog.records if r.name == "messagefoundry.auth.ldap"]
     assert record.levelname == "WARNING"
-    assert record.getMessage().startswith("Kerberos sign-in refused the SPNEGO token: ValueError")
+    return record.getMessage()
+
+
+def test_a_parse_error_logs_its_type_and_none_of_the_token(
+    real_wrapper: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The parser's message quotes the caller's OID, so the log line names the type and stops."""
+    line = _refusal_log_line(_VALUE_ERROR, caplog)
+    assert line == "Kerberos sign-in refused the SPNEGO token: ValueError"
+
+
+def test_a_provider_error_keeps_its_diagnostic_in_the_log(
+    real_wrapper: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The audit row names only the type. On a host without SSPI a missing keytab entry fails the
+    same way, so the provider's own text is what tells an operator it is configuration."""
+    line = _refusal_log_line(_SPNEGO_ERROR, caplog)
+    assert "BadMechanismError" in line and "Unable to negotiate common mechanism" in line
+    assert _LEAK not in line
 
 
 # --- where an operator meets it: the service and both routes -----------------------------------
@@ -202,6 +224,16 @@ async def test_both_routes_refuse_a_crafted_token_with_a_row(
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=sso_failed"
     # The ASGI transport presents the client as 127.0.0.1.
     await _assert_refused_rows(engine, error, "127.0.0.1", count=2)
+
+
+async def test_negotiate_writes_no_malformed_row_while_kerberos_is_off(engine: Engine) -> None:
+    """``GET /ui/sso`` writes none in that state, and nothing then needs this route to."""
+    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    await service.initialize()
+    async with _client(engine, service) as c:
+        r = await c.post("/auth/negotiate", headers={"Authorization": "Negotiate !!!"})
+    assert r.status_code == 400, r.text
+    assert await _rows(engine, "auth.login_failed") == []
 
 
 async def test_both_routes_write_the_same_row_for_a_token_that_is_not_base64(

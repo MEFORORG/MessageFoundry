@@ -1418,14 +1418,18 @@ def _kerberos_acceptor(settings: AuthSettings) -> Any:
 
     pyspnego takes the SPN as two arguments, ``hostname`` and ``service``, and joins them itself.
     Passing the whole ``HTTP/host`` as ``service=`` built ``HTTP/host/unspecified`` (BACKLOG #275).
-    A malformed value raises ``ValueError``; the settings validator refuses it at load first.
+    A malformed value raises :class:`LdapError`; the settings validator refuses it at load first.
+    Building the acceptor reads settings only, never a token, so every failure here is configuration.
     """
     import spnego
 
-    if not settings.kerberos_spn:
-        return spnego.server()
-    service, hostname = split_kerberos_spn(settings.kerberos_spn)
-    return spnego.server(hostname=hostname, service=service)
+    try:
+        if not settings.kerberos_spn:
+            return spnego.server()
+        service, hostname = split_kerberos_spn(settings.kerberos_spn)
+        return spnego.server(hostname=hostname, service=service)
+    except (spnego.exceptions.SpnegoError, ValueError) as exc:
+        raise LdapError(str(exc)) from exc
 
 
 def _kerberos_context_complete(server: Any) -> bool:
@@ -1477,37 +1481,25 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     """
     import spnego
 
-    try:
-        server = _kerberos_acceptor(settings)
-    except (spnego.exceptions.SpnegoError, ValueError) as exc:
-        # Building the acceptor reads settings only, never the token: a configuration fault.
-        raise LdapError(str(exc)) from exc
+    server = _kerberos_acceptor(settings)
     refused: str | None = None
     principal = None
     try:
         server.step(token)
         principal = server.client_principal if _kerberos_context_complete(server) else None
-    except (
-        spnego.exceptions.SpnegoError,
-        ValueError,
-        struct.error,
-        KeyError,
-        StopIteration,
-    ) as exc:
-        # SpnegoError is the SSPI/GSSAPI (Windows/Linux-krb5) rejection; the pure-Python provider
-        # instead raises a bare ValueError/struct.error while parsing an untrusted token, and
-        # StopIteration or KeyError on a first NegTokenResp, which names a mechanism it never set up
-        # (BACKLOG #3186). Each is a refused token, so authenticate_kerberos audits it (AUTH-K-AUDIT)
-        # rather than letting it escape as an unaudited 500. A StopIteration must not reach
-        # asyncio.to_thread at all: a Future refuses it. Only the TYPE crosses: the message can
-        # quote the token, such as an unknown mechanism OID the attacker chose (BACKLOG #3196).
+    except Exception as exc:
+        # Deliberately broad. step() parses bytes the caller chose, and a list of types is what
+        # BACKLOG #3186 found wanting: pyspnego's wrapper raised StopIteration and KeyError outside
+        # it, and a mutation search later found IndexError too. Any exception here is a refused
+        # token, audited (AUTH-K-AUDIT) instead of an unaudited 500. A StopIteration must not reach
+        # asyncio.to_thread at all, because a Future refuses it.
         refused = type(exc).__name__
-        # The operator's diagnostic stays in the log. Where pyspnego's wrapper is the acceptor, a
-        # missing keytab entry also fails here, as BadMechanismError or a GSSAPI error, so a run of
-        # these rows can be configuration. The text is redacted, bounded and scrubbed.
-        logger.warning(
-            "Kerberos sign-in refused the SPNEGO token: %s", scrub_log_argument(safe_exc(exc))
-        )
+        # Only the TYPE crosses into the refusal: the parser's messages can quote the token, as
+        # ValueError quotes an unknown mechanism OID the caller chose (BACKLOG #3196). A SpnegoError
+        # carries the provider's own diagnostic instead, and on the wrapper it is the only signal
+        # of a configuration fault such as a missing keytab entry, so its text goes to the log.
+        detail = safe_exc(exc) if isinstance(exc, spnego.exceptions.SpnegoError) else refused
+        logger.warning("Kerberos sign-in refused the SPNEGO token: %s", scrub_log_argument(detail))
     if refused is not None:
         # Raised outside the except block, so neither __cause__ nor __context__ keeps the original.
         raise KerberosTokenRefused(refused)
@@ -1550,14 +1542,9 @@ def kerberos_acceptor_preflight(settings: AuthSettings) -> None:
     hidden, ``GET /ui/sso`` → ``e=sso_unavailable``) instead of advertising a dead link or failing
     per-request. Boot-once by design — a transient failure sticks until restart (recorded ADR 0068
     open item)."""
-    import spnego
-
     if not _kerberos_capable():
         raise LdapError(
             "no Kerberos-capable SPNEGO provider on this host — SSPI (Windows) or the GSSAPI/krb5 "
             "libraries (Linux) are required; the pure-Python NTLM fallback cannot validate a ticket"
         )
-    try:
-        _kerberos_acceptor(settings)
-    except (spnego.exceptions.SpnegoError, ValueError) as exc:
-        raise LdapError(str(exc)) from exc
+    _kerberos_acceptor(settings)

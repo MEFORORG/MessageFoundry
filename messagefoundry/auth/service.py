@@ -3962,8 +3962,8 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:
-            # Reached from settings or from the directory, never from the token: every failure of
-            # the acceptor's step is the arm above, so this text is the engine's or the directory's.
+            # Reached from settings or from the directory, never from the token: kerberos_principal
+            # turns every failure of the acceptor's step into the arm above.
             await self._audit(
                 "auth.login_error",
                 actor="<kerberos>",
