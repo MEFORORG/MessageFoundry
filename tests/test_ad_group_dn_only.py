@@ -353,15 +353,15 @@ def test_resolve_groups_counts_a_dropped_dn_at_debug(caplog: pytest.LogCaptureFi
 
 
 async def test_a_key_too_long_once_canonical_is_refused(engine: Engine) -> None:
-    """A key within the request model's 512 characters whose canonical form passes the 256 the
+    """A key within the request model's 512 characters whose canonical form passes the 512 the
     SQL Server column holds is refused with a 400, not stored partway. Each non-ASCII letter takes
     six or more characters once escaped."""
     transport = await _admin_transport(engine)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         login = {"username": "boss", "password": PW, "provider": "local"}
         h = {"Authorization": f"Bearer {(await c.post('/auth/login', json=login)).json()['token']}"}
-        key = "CN=" + "\u00e4" * 60 + ",OU=Groups,DC=example,DC=invalid"
-        assert len(key) < 512
+        key = "CN=" + "\u00e4" * 90 + ",OU=Groups,DC=example,DC=invalid"
+        assert len(key) < 512 < len(canonical_group_dn(key) or "")
         body = {"entries": [{"ad_group": key, "role": Role.OPERATOR.value}]}
         r = await c.put("/ad-group-map", json=body, headers=h)
         assert r.status_code == 400, r.text
@@ -500,6 +500,90 @@ async def test_a_group_with_a_sharp_in_its_name_can_be_mapped(engine: Engine, ke
     member = _groups_of([SHARP])
     assert await engine.store.roles_for_ad_groups(member) == {Role.OPERATOR.value}
     assert await engine.store.channels_for_ad_groups(member) == {"IB_DEV"}
+
+
+# --- BACKLOG #3187: the API's key widths and every store's columns agree --------------------------
+
+#: An ASCII group DN already in canonical form, exactly the 512 characters the API and SQL Server's
+#: ``ad_group NVARCHAR(512)`` share.
+AT_WIDTH = "cn=" + "a" * 477 + ",ou=groups,dc=example,dc=invalid"
+
+
+def test_the_sql_server_group_map_keys_fit_the_api_widths() -> None:
+    """SQL Server's two group-map tables hold every key the API accepts. The DN column is as wide
+    as the route's canonical cap, which is the request model's cap; the channel column is the
+    route's channel cap; and each composite primary key is NONCLUSTERED and inside that index's
+    1700-byte limit. Fails on the unfixed tree: the DN column was ``NVARCHAR(256)`` against a
+    512-character request, and the scope map's clustered key, 2 x (256 + 256) = 1024 bytes, was
+    past the 900 a clustered key may hold."""
+    import re
+
+    from messagefoundry.api import auth_models, auth_routes
+    from messagefoundry.store import sqlserver
+
+    assert auth_routes._STORED_GROUP_MAX == auth_models._GROUP_MAX == 512
+    widths = {"ad_group": auth_routes._STORED_GROUP_MAX, "channel": auth_routes._STORED_CHANNEL_MAX}
+    for table, other in (("ad_group_role_map", "role_id"), ("ad_group_scope_map", "channel")):
+        (ddl,) = [s for s in sqlserver._SCHEMA if f"CREATE TABLE {table} (" in s]
+        cols = {
+            m.group(1): int(m.group(2))
+            for m in re.finditer(r"(\w+) NVARCHAR\((\d+)\) NOT NULL", ddl)
+        }
+        assert cols["ad_group"] == widths["ad_group"], table
+        if other in widths:
+            assert cols[other] == widths[other], table
+        assert f"CONSTRAINT pk_{table} PRIMARY KEY NONCLUSTERED (ad_group, {other})" in ddl
+        assert 2 * (cols["ad_group"] + cols[other]) <= 1700, table
+
+
+@pytest.mark.parametrize(
+    ("path", "field", "value"),
+    [
+        ("/ad-group-map", "role", Role.OPERATOR.value),
+        ("/ad-group-scope-map", "channel", "C" * 256),
+    ],
+)
+async def test_a_dn_at_the_width_maps_and_one_past_it_is_a_4xx(
+    engine: Engine, path: str, field: str, value: str
+) -> None:
+    """A 512-character DN stores and reads back on both routes, beside a 256-character channel on
+    the scope map. One character more is refused by the request model with a 422, and nothing is
+    stored. Fails on the unfixed tree: the route refused the 512-character DN with a 400."""
+    assert canonical_group_dn(AT_WIDTH) == AT_WIDTH and len(AT_WIDTH) == 512
+    transport = await _admin_transport(engine)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        login = {"username": "boss", "password": PW, "provider": "local"}
+        h = {"Authorization": f"Bearer {(await c.post('/auth/login', json=login)).json()['token']}"}
+        over = {"entries": [{"ad_group": AT_WIDTH + "a", field: value}]}
+        assert (await c.put(path, json=over, headers=h)).status_code == 422
+        assert (await c.get(path, headers=h)).json()["entries"] == []
+        at = {"entries": [{"ad_group": AT_WIDTH, field: value}]}
+        r = await c.put(path, json=at, headers=h)
+        assert r.status_code == 200, r.text
+        assert (await c.get(path, headers=h)).json()["entries"] == [
+            {"ad_group": AT_WIDTH, field: value}
+        ]
+
+
+async def test_a_channel_is_measured_in_the_columns_units(engine: Engine) -> None:
+    """SQL Server's ``channel NVARCHAR(256)`` counts UTF-16 units, and a character outside the
+    Basic Multilingual Plane takes two. So 129 such characters, 258 units, are refused with a 400
+    although the request model, which counts code points, accepts them. CONTROL: 128 of them,
+    exactly 256 units, store."""
+    astral = "\U0001d51e"
+    transport = await _admin_transport(engine)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        login = {"username": "boss", "password": PW, "provider": "local"}
+        h = {"Authorization": f"Bearer {(await c.post('/auth/login', json=login)).json()['token']}"}
+        over = {"entries": [{"ad_group": LEGIT, "channel": astral * 129}]}
+        r = await c.put("/ad-group-scope-map", json=over, headers=h)
+        assert r.status_code == 400, r.text
+        assert "UTF-16" in r.json()["detail"]
+        assert (await c.get("/ad-group-scope-map", headers=h)).json()["entries"] == []
+        at = {"entries": [{"ad_group": LEGIT, "channel": astral * 128}]}
+        assert (await c.put("/ad-group-scope-map", json=at, headers=h)).status_code == 200
+        got = (await c.get("/ad-group-scope-map", headers=h)).json()["entries"]
+        assert got == [{"ad_group": LEGIT.lower(), "channel": astral * 128}]
 
 
 # --- review point (c): an incomplete SPNEGO context names no client ------------------------------

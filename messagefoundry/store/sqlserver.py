@@ -2120,11 +2120,19 @@ _SCHEMA: list[str] = [
         user_id NVARCHAR(64) NOT NULL, role_id NVARCHAR(64) NOT NULL, assigned_at FLOAT NOT NULL,
         assigned_by NVARCHAR(256) NULL, CONSTRAINT pk_user_roles PRIMARY KEY (user_id, role_id))""",
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
-        ad_group NVARCHAR(256) NOT NULL, role_id NVARCHAR(64) NOT NULL,
-        CONSTRAINT pk_ad_group_role_map PRIMARY KEY (ad_group, role_id))""",
+        -- BACKLOG #3187: 512 is the API's group-DN cap, measured on the canonical key the route
+        -- stores (api/auth_routes.py _STORED_GROUP_MAX). The key is then 2 x (512 + 64) = 1152
+        -- bytes: past the 900-byte clustered limit, inside the 1700-byte nonclustered one, so the
+        -- primary key is NONCLUSTERED, as pk_reference is above. No step re-types a table made
+        -- at the old width: with zero deployments there is none to carry (CLAUDE.md section 0).
+        ad_group NVARCHAR(512) NOT NULL, role_id NVARCHAR(64) NOT NULL,
+        CONSTRAINT pk_ad_group_role_map PRIMARY KEY NONCLUSTERED (ad_group, role_id))""",
     """IF OBJECT_ID('ad_group_scope_map','U') IS NULL CREATE TABLE ad_group_scope_map (
-        ad_group NVARCHAR(256) NOT NULL, channel NVARCHAR(256) NOT NULL,
-        CONSTRAINT pk_ad_group_scope_map PRIMARY KEY (ad_group, channel))""",
+        -- BACKLOG #3187: the same DN cap beside a channel of up to 256 UTF-16 units
+        -- (_STORED_CHANNEL_MAX) is 2 x (512 + 256) = 1536 bytes. A clustered key failed here even
+        -- at the old 256-character DN, since 2 x (256 + 256) = 1024 is past 900.
+        ad_group NVARCHAR(512) NOT NULL, channel NVARCHAR(256) NOT NULL,
+        CONSTRAINT pk_ad_group_scope_map PRIMARY KEY NONCLUSTERED (ad_group, channel))""",
     """IF OBJECT_ID('sessions','U') IS NULL CREATE TABLE sessions (
         token_hash NVARCHAR(64) NOT NULL PRIMARY KEY, user_id NVARCHAR(64) NOT NULL,
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,
