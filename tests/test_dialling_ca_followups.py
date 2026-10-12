@@ -37,17 +37,18 @@ from messagefoundry.config.wiring import (
     env,
 )
 from messagefoundry.pipeline import Engine, wiring_runner
-from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.dr import DrActivationError, _caused_by_trust_anchor
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
-from tests.test_dr_outlive_deadline import _admin_client, _rows, _seed
+from tests.test_dr_outlive_deadline import _admin_client, _coordinator, _rows, _seed
+from tests.test_dr_passive_followups import _PASSIVE_UNCHECKED, _runner
 from tests.test_outbound_ca_anchors import _ca, _CountingSink, _sha
 from tests.test_trust_anchors import _block, _path_ok
 
 _IB = "IB_FTPS"
 _PIN_MISMATCH = "does not match its configured SHA-256 pin"
 #: What a step-4 abort says in place of the refusal's own text.
-_ABORT_LINE = "a trust anchor was refused; the server log and the auth.trust_anchor audit rows"
+_ABORT_LINE = "a trust anchor was refused; the server log says which one and why"
 #: A pin no file here has, so the lane check refuses the CA.
 _WRONG_PIN = "00" * 32
 
@@ -94,17 +95,6 @@ def _poller_graph(
     return reg
 
 
-def _runner(store: MessageStore, reg: Registry, **kw: Any) -> RegistryRunner:
-    return RegistryRunner(
-        reg,
-        store,
-        poll_interval=0.02,
-        egress=EgressSettings(deny_by_default=False),
-        lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),
-        **kw,
-    )
-
-
 # --- item 1: a refused DR activation names no CA path -------------------------------------
 
 
@@ -141,18 +131,13 @@ def _short_ca(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     using one passes against the unfixed code. A path of an ordinary length did reach it."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / _CA_DIR).mkdir()
-    _ca(tmp_path / _CA_DIR)
-    return Path(_CA_DIR) / "partner-ca.pem"
+    return _ca(tmp_path / _CA_DIR).relative_to(tmp_path)
 
 
 def _leaks(ca: Path, text: str) -> list[str]:
     """The parts of the CA's path found in ``text``: its file name and its folder. Neither
     needle holds a path separator, since a quoted Windows path doubles each one."""
     return [part for part in (ca.name, ca.parent.name) if part in text]
-
-
-def _dr_log(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.name == "messagefoundry.pipeline.dr"]
 
 
 async def test_a_dr_activation_a_poller_ca_refuses_answers_and_records_no_path(
@@ -183,9 +168,26 @@ async def test_a_dr_activation_a_poller_ca_refuses_answers_and_records_no_path(
         assert "could not bind the priority feeds" in text  # the reload refused, not the preflight
     # The control for the two zeros above: the same needles find the path in the server log,
     # which keeps the refusal's own text.
-    refusals = [line for line in _dr_log(caplog) if _PIN_MISMATCH in line]
+    logged = [r.getMessage() for r in caplog.records if r.name == "messagefoundry.pipeline.dr"]
+    refusals = [line for line in logged if _PIN_MISMATCH in line]
     assert refusals and all(_leaks(ca, line) == [ca.name, _CA_DIR] for line in refusals), refusals
     assert dr_engine.dr_active is False
+
+
+async def _refused_in_its_preflight(
+    dr_engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refuse: Any
+) -> tuple[DrActivationError, str]:
+    """Activate a box whose registry preflight is ``refuse``. Returns what the abort leaves: the
+    error the route answers with, and the audit row's reason."""
+    ca = _ca(tmp_path)
+    dr_engine.add_registry(_poller_graph(ca, _sha(ca)))
+    await dr_engine.start()
+    monkeypatch.setattr(dr_engine, "preflight_registry", refuse)
+    with pytest.raises(DrActivationError) as caught:
+        await _coordinator(dr_engine).activate(actor="alice")
+    assert caught.value.kind == "profile"
+    (row,) = await _rows(dr_engine.store, "dr_activation_aborted")
+    return caught.value, str(row["reason"])
 
 
 async def test_a_dr_activation_its_preflight_refuses_names_no_path(
@@ -193,28 +195,25 @@ async def test_a_dr_activation_its_preflight_refuses_names_no_path(
 ) -> None:
     """The other arm of step 4: the trust-anchor preflight refuses before any reload. The
     refusal is raised the way ``make_registry_anchor_preflight`` raises a listener's or a
-    ``FhirLookup``'s. Red under the same mutation as the test above."""
-    dr_engine.add_registry(_poller_graph(_ca(tmp_path), _sha(_ca(tmp_path))))
-    await dr_engine.start()
+    ``FhirLookup``'s. Red under the same mutation as the test above.
+
+    The abort is raised outside the handler that caught the refusal, as the connection-start
+    route raises its 409, so the refusal is not left on the abort for a later reader of the
+    chain. Red under: the abort raised inside the handler."""
+    named = Path(_CA_DIR) / "partner-ca.pem"
 
     async def refuse(_registry: object) -> None:
         error = ta.refused_connection_anchor(
-            TrustAnchorError(f"the trust anchor '{_CA_DIR}/partner-ca.pem' {_PIN_MISMATCH}")
+            TrustAnchorError(f"the trust anchor '{named.as_posix()}' {_PIN_MISMATCH}")
         )
         raise error from error.__cause__
 
-    monkeypatch.setattr(dr_engine, "preflight_registry", refuse)
-    coord = dr_engine.dr_coordinator
-    assert coord is not None
-    with pytest.raises(DrActivationError) as caught:
-        await coord.activate(actor="alice")
-
-    assert caught.value.kind == "profile"
-    (row,) = await _rows(dr_engine.store, "dr_activation_aborted")
-    for text in (str(caught.value), str(row["reason"])):
-        assert _CA_DIR not in text and "partner-ca.pem" not in text, text
+    abort, reason = await _refused_in_its_preflight(dr_engine, tmp_path, monkeypatch, refuse)
+    for text in (str(abort), reason):
+        assert _leaks(named, text) == [], text
         assert _ABORT_LINE in text
         assert "stopped at its trust-anchor preflight" in text
+    assert abort.__context__ is None and abort.__cause__ is None
 
 
 async def test_a_dr_activation_refused_by_anything_else_keeps_its_own_text(
@@ -223,8 +222,6 @@ async def test_a_dr_activation_refused_by_anything_else_keeps_its_own_text(
     """The control for the two above, and the limit of the repair: only a refusal a trust anchor
     caused loses its text. An error raised while one was being handled is not such a refusal, so
     it keeps its own. Red under: the chain walk following ``__context__``."""
-    dr_engine.add_registry(_poller_graph(_ca(tmp_path), _sha(_ca(tmp_path))))
-    await dr_engine.start()
 
     async def refuse(_registry: object) -> None:
         try:
@@ -232,22 +229,15 @@ async def test_a_dr_activation_refused_by_anything_else_keeps_its_own_text(
         except TrustAnchorError:
             raise WiringError(f"a config value under {_CA_DIR} is not readable")  # noqa: B904
 
-    monkeypatch.setattr(dr_engine, "preflight_registry", refuse)
-    coord = dr_engine.dr_coordinator
-    assert coord is not None
-    with pytest.raises(DrActivationError) as caught:
-        await coord.activate(actor="alice")
-
-    (row,) = await _rows(dr_engine.store, "dr_activation_aborted")
-    for text in (str(caught.value), str(row["reason"])):
+    abort, reason = await _refused_in_its_preflight(dr_engine, tmp_path, monkeypatch, refuse)
+    for text in (str(abort), reason):
         assert f"a config value under {_CA_DIR} is not readable" in text
         assert _ABORT_LINE not in text
+    assert isinstance(abort.__context__, WiringError)  # such an abort keeps what caused it
 
 
 def test_the_chain_walk_follows_explicit_causes_only_and_ends_on_a_cycle() -> None:
     """``_caused_by_trust_anchor`` on each shape step 4 can be handed."""
-    from messagefoundry.pipeline.dr import _caused_by_trust_anchor
-
     refusal = TrustAnchorError("refused")
     assert _caused_by_trust_anchor(refusal)
     wrapped = ta.refused_connection_anchor(refusal)
@@ -263,10 +253,6 @@ def test_the_chain_walk_follows_explicit_causes_only_and_ends_on_a_cycle() -> No
 # --- item 5: the advice a refused setting gets, and a kept failure that stops resolving --------
 
 _FIX_THE_FILE = "Fix the file"
-_SETTING_LINE = (
-    f"inbound connection '{_IB}': its tls_ca_pin or tls_ca_file setting was refused. Fix the "
-    "setting, then reload; the server log says why"
-)
 
 
 def _blank_pin_runner(store: MessageStore, tmp_path: Path, **kw: Any) -> RegistryRunner:
@@ -285,7 +271,10 @@ async def test_a_refused_pin_setting_is_not_told_to_fix_the_file(
     await runner.start()
     try:
         reason = runner.inbound_failed(_IB) or ""
-        assert reason == f"TrustAnchorError: {_SETTING_LINE}"
+        assert reason == (
+            f"TrustAnchorError: inbound connection '{_IB}': its tls_ca_pin or tls_ca_file "
+            "setting was refused. Fix the setting, then reload; the server log says why"
+        )
         assert _FIX_THE_FILE not in reason
     finally:
         await runner.stop()
@@ -329,18 +318,11 @@ async def test_a_passive_check_that_could_not_run_is_not_told_to_fix_the_file(
         raise RuntimeError("the audit store did not answer")
 
     reg = _poller_graph(_ca(tmp_path), _WRONG_PIN)
-    runner = RegistryRunner(
-        reg,
-        store,
-        poll_interval=0.02,
-        egress=EgressSettings(deny_by_default=False),
-        lane_anchor_check=cannot_run,
-        dr_standby=Priority.CRITICAL,
-    )
+    runner = _runner(store, reg, lane_anchor_check=cannot_run, dr_standby=Priority.CRITICAL)
     await runner.start()
     try:
         reason = runner.inbound_failed(_IB) or ""
-        assert "its tls_ca_file could not be checked on this passive DR standby" in reason
+        assert _PASSIVE_UNCHECKED in reason
         assert "reload once the cause is fixed" in reason
         assert _FIX_THE_FILE not in reason
     finally:
@@ -386,7 +368,8 @@ async def test_a_connection_test_of_a_failed_poller_does_not_let_the_next_reload
     test checks it and must not mark it, or the next reload would keep the failure and skip the
     check. The outbound arm has this test in ``tests/test_outbound_ca_anchors.py``. Red under:
     ``fails_lane=False`` dropped from the inbound call in ``check_test_anchor``."""
-    real = wiring_runner.build_source
+    from messagefoundry.transports import build_source as real
+
     calls = 0
 
     def flaky(cfg: Any, **kw: Any) -> Any:

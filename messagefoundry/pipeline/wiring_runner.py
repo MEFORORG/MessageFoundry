@@ -3560,15 +3560,13 @@ class RegistryRunner:
                 raise
             self._anchor_refused[(direction, name)] = _anchor_key(settings)
             log.warning("%s connection %r: trust anchor refused: %s", direction, name, exc)
-            if isinstance(exc, ValueError):
-                raise TrustAnchorError(
-                    f"{direction} connection '{name}': its {_ANCHOR_SETTING_REFUSED}. "
-                    f"{_ANCHOR_SETTING_ADVICE}"
-                ) from exc
-            raise TrustAnchorError(
-                f"{direction} connection '{name}': its tls_ca_file was refused. Fix the file, then "
-                "start the connection; the server log and the auth.trust_anchor audit rows say why"
-            ) from exc
+            tail = (
+                f"{_ANCHOR_SETTING_REFUSED}. {_ANCHOR_SETTING_ADVICE}"
+                if isinstance(exc, ValueError)
+                else "tls_ca_file was refused. Fix the file, then start the connection; the "
+                "server log and the auth.trust_anchor audit rows say why"
+            )
+            raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
@@ -3808,8 +3806,11 @@ class RegistryRunner:
             await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)
             # vault BACKLOG #2371: a CA refusal on a lane already recorded failed is not alerted
-            # again. A calendar window open reaches here once per window, and the refusal was
-            # alerted when the lane first failed. Other build failures alert as before.
+            # again. A calendar window open reaches here once per window, and the lane was
+            # alerted when it first failed. Other build failures alert as before. A lane that
+            # first failed for another reason keeps that older reason in its status; the CA
+            # refusal is in the server log and the auth.trust_anchor rows (vault BACKLOG #3224,
+            # item 3, declined: recording it again is what the alert-storm test pins against).
             if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
                 self._record_failed(name, exc, kind="outbound")
             return

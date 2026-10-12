@@ -99,11 +99,9 @@ def _vip_note(cause: str) -> str:
 
 
 #: What a step-4 abort says in place of a trust-anchor refusal's own text (vault BACKLOG #3224).
-#: That text names the CA's path, the folders above it and its SHA-256.
-_ANCHOR_REFUSED = (
-    "a trust anchor was refused; the server log and the auth.trust_anchor audit rows say which "
-    "one and why"
-)
+#: That text names the CA's path, the folders above it and its SHA-256. It points at the server
+#: log alone: a refused setting, such as a blank ``tls_ca_pin``, writes no audit row.
+_ANCHOR_REFUSED = "a trust anchor was refused; the server log says which one and why"
 
 
 def _caused_by_trust_anchor(exc: BaseException) -> bool:
@@ -456,20 +454,19 @@ class DrCoordinator:
         # own arm puts the flag back, and the engine's reload rolls its intake back (vault BACKLOG
         # #2751).
         progress.step = "profile"
+        anchor_abort: str | None = None
         try:
             self._active = True
             self._last_release = None  # an earlier fail-back's outcome no longer describes this box
             await self._activate_profile()
         except Exception as exc:
             self._active = False
-            if _caused_by_trust_anchor(exc):
+            anchored = _caused_by_trust_anchor(exc)
+            if anchored:
                 # The refusal's own text goes to the server log only. The reason below reaches
                 # the API caller and the dr_activation_aborted row, which is teed off the box
                 # (vault BACKLOG #3224; BACKLOG #1142 for the connection-test route's same rule).
                 log.warning("DR activation refused by a trust anchor: %s", exc)
-                cause = _ANCHOR_REFUSED
-            else:
-                cause = safe_exc(exc)
             # A preflight that refused or timed out bound nothing, so its reason must not say a
             # bind failed (vault BACKLOG #3094).
             reason = (
@@ -477,14 +474,20 @@ class DrCoordinator:
                 if progress.in_preflight
                 else "DR run-profile activation failed (the engine could not bind the priority "
                 "feeds)"
-            ) + f": {cause}"
+            ) + f": {_ANCHOR_REFUSED if anchored else safe_exc(exc)}"
             if progress.hook_ran:
                 reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
             # abort, so a retry's own marker reads as a second attempt (vault BACKLOG #3094, item
             # 11). The takeover is not undone: a release hook could hand the address to a primary
             # that is down, so the runbook leaves that to the operator.
-            await self._record_aborted("profile", reason, actor, now)
+            if not anchored:
+                await self._record_aborted("profile", reason, actor, now)
+            anchor_abort = reason
+        if anchor_abort is not None:
+            # Raised here, outside the handler, so the refusal is not left on the abort's
+            # __context__, which the API route chains its own error from.
+            await self._record_aborted("profile", anchor_abort, actor, now)
         progress.profile_applied = True
 
         # Owed from here: a write cut short is made good by the next activate or release call.
