@@ -3919,8 +3919,8 @@ At least these events bear on a live engine session:
 | The user signs out of the engine | Ends the engine session only. The engine sends no RP-initiated logout, so the IdP session stays. |
 | The Kerberos ticket the user signed in with expires | Nothing. The engine does not read the ticket's lifetime, so no cap depends on it. The directory rows below can still end the session. |
 | Time passes | The session ends at the soonest of its caps: the idle and absolute limits for every session, plus the federated caps for an OIDC one. The *Session age* row of the [signal table](#contextual-and-environmental-security-inputs-asvs-813--814) names them. |
-| The wall clock steps backward | Every session last used after the new time fails the engine's session check until the clock passes that use again. A request on such a session in that span revokes it. The engine fails closed rather than age it wrongly. |
-| The directory disables or deletes the account | The directory reconciler ends every session of the account after enough passes. The row for a change made in Active Directory, in the [revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832), gives the rule. Each engine process keeps its count in memory, so a restart sets it back to 0. |
+| The wall clock steps backward | Every session last used after the new time fails the engine's session check until the clock passes that use again. A failed check revokes the session. The engine fails closed rather than age it wrongly. |
+| The directory disables or deletes the account | The directory reconciler can end every session of the account. The row for a change made in Active Directory, in the [revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832), gives the rule. Each engine process keeps its count in memory, so a restart sets it back to 0. |
 | A directory group change alters the account's roles, or withdraws or narrows its channel scope | The reconciler ends every session of the account on the first pass that sees the change. A pass can revoke nothing, as *Directory session reconciliation* explains. The account's next sign-in also ends its other sessions. |
 | An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of every enabled directory account. |
 | An administrator binds, rebinds or unbinds the account's federated identity | Ends every session of the account, a first bind included. |
@@ -3933,8 +3933,8 @@ says under *Time since the IdP sign-in is bounded too*. **A Kerberos session has
 
 **Besides the reconciler, at least two paths that consult the directory can end a live
 session.** A sign-in that finds the roles or the channel scope changed ends the account's other
-sessions. A disabled account's sign-in is refused, and ends no session. At the directory re-bind,
-enough wrong passwords end the session through its re-proof budget (BACKLOG #1138). The step-up,
+sessions. At the directory re-bind, enough wrong passwords end the session through its re-proof
+budget (BACKLOG #1138). A disabled account's sign-in is refused, and ends no session. The step-up,
 MFA and passkey legs also look the account up in the directory. They refuse an account the
 directory does not confirm, and that refusal ends no session. Every federated
 account is also a directory account, so the reconciler reaches both legs. One exception: it skips a
