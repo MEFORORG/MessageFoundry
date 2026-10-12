@@ -4,8 +4,8 @@
 
 Owner ruling 2026-10-11: an ambient proxy must not attach silently, or must be disclosed. The
 engine's urllib openers follow ``HTTP_PROXY``, ``HTTPS_PROXY`` and the system proxy, and its Vault
-clients follow those and ``ALL_PROXY``. So ``serve`` and ``supervise`` name each proxy entry in
-force, and the hops that may read one, in one WARNING per process.
+clients follow those and ``ALL_PROXY``. So ``serve`` and ``supervise`` name each proxy entry that
+is set, and the hops that may read one, in one WARNING per process.
 
 The warning is static: it names entries and a fixed list of hops, and claims nothing about which
 hop uses which entry or what the leg to the proxy protects. So no warning may use a word that makes
@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import contextlib
 import importlib.machinery
+import importlib.util
 import logging
 import os
 import random
 import sys
 import types
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -139,7 +140,7 @@ def test_the_vault_clients_are_named_only_when_hvac_is_importable(
     _hide_hvac(monkeypatch)
     text = ambient_proxy_warning(proxies=proxies)
     assert text is not None and "Vault" not in text, text
-    # The entry is still in force, so it is still named.
+    # The entry is still set, so it is still named.
     assert text.count(" proxy is ") == len(proxies), text
 
 
@@ -262,21 +263,110 @@ def _kept(logger: logging.Logger) -> Iterator[list[logging.LogRecord]]:
         logger.setLevel(old)
 
 
-def test_a_failure_to_build_the_warning_logs_one_debug_line_and_no_value(
-    no_ambient_proxy: pytest.MonkeyPatch,
-) -> None:
-    def _broken() -> dict[str, object]:
-        return {"https": object(), "http": _PROXY}
+def _a_reader_that_returns_no_mapping() -> dict[str, str]:
+    return None  # type: ignore[return-value]
 
+
+def _a_reader_that_raises() -> dict[str, str]:
+    raise OSError(f"registry read failed near {_PROXY}")
+
+
+@pytest.mark.parametrize(
+    ("reader", "error"),
+    [(_a_reader_that_returns_no_mapping, "AttributeError"), (_a_reader_that_raises, "OSError")],
+)
+def test_a_failure_to_build_the_warning_still_warns_with_no_value(
+    no_ambient_proxy: pytest.MonkeyPatch, reader: Callable[[], dict[str, str]], error: str
+) -> None:
+    """The ruling says an ambient proxy must not attach silently, so the failure path warns too,
+    at a level a production box logs, and names no value it failed on."""
     # The module reads urllib.request.getproxies at call time, so this is the reader it calls.
-    no_ambient_proxy.setattr(urllib.request, "getproxies", _broken)
+    no_ambient_proxy.setattr(urllib.request, "getproxies", reader)
     logger = logging.getLogger("tests.ambient_proxy.broken")
     with _kept(logger) as records:
         logger.setLevel(logging.DEBUG)
         warn_ambient_proxy(logger)
-    assert [r.levelno for r in records] == [logging.DEBUG], records
+    assert [r.levelno for r in records] == [logging.WARNING], records
+    assert records[0].exc_info is None
     message = records[0].getMessage()
-    assert "proxy.example" not in message and _SECRET not in message and not records[0].args
+    assert message.startswith(
+        "a web proxy from the environment or the system proxy settings may be set; the "
+        f"disclosure could not be built ({error}). "
+    ), message
+    for part in (_HOPS, _POINTER, "To stop it, clear http_proxy"):
+        assert message.count(part) == 1, (part, message)
+    assert "proxy.example" not in message and "registry" not in message, message
+    _assert_claims_nothing(message)
+
+
+def test_the_warning_and_its_fallback_share_one_searchable_opening(
+    no_ambient_proxy: pytest.MonkeyPatch,
+) -> None:
+    """A search keyed on the normal warning's opening finds the fallback too."""
+    text = ambient_proxy_warning(proxies={"https": _P})
+    assert text is not None
+    opening = text.split(" is set. ", 1)[0]
+    no_ambient_proxy.setattr(urllib.request, "getproxies", _a_reader_that_raises)
+    logger = logging.getLogger("tests.ambient_proxy.opening")
+    with _kept(logger) as records:
+        logger.setLevel(logging.DEBUG)
+        warn_ambient_proxy(logger)
+    assert records[0].getMessage().startswith(f"{opening} may be set; "), records[0].getMessage()
+
+
+class _NoTruth:
+    def __bool__(self) -> bool:
+        raise ValueError("no truth value")
+
+
+class _BadText(str):
+    """Text whose strip raises, as a str subclass from an odd system reader might."""
+
+    def strip(self, chars: str | None = None) -> str:
+        raise UnicodeError("cannot strip")
+
+
+def test_a_lower_case_key_wins_over_its_upper_case_twin_whatever_the_order() -> None:
+    """urllib's own read of the environment prefers the lower-case variable."""
+    for proxies in ({"https": _P, "HTTPS": _Q}, {"HTTPS": _Q, "https": _P}):
+        assert environment_proxy_hosts(proxies) == {"https": _P}, proxies
+
+
+def test_a_broken_hvac_lookup_leaves_out_the_vault_clients_and_keeps_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _broken_find_spec(name: str, package: str | None = None) -> None:
+        raise RuntimeError("a broken finder")
+
+    monkeypatch.setattr(importlib.util, "find_spec", _broken_find_spec)
+    text = ambient_proxy_warning(proxies={"https": _P})
+    assert text is not None and f"The https proxy is {_P}. " in text, text
+    assert "Vault" not in text and text.count(_HOPS) == 1, text
+
+
+@pytest.mark.parametrize(
+    "odd",
+    [
+        pytest.param({"https": object()}, id="a-value-that-is-not-text"),
+        pytest.param({"https": _NoTruth()}, id="a-value-whose-truth-test-raises"),
+        pytest.param({"https": _BadText("http://oddkey-three.example:3")}, id="a-str-that-raises"),
+        pytest.param(
+            {1: "http://oddkey-one.example:1", b"https": "http://oddkey-two.example:2"},
+            id="odd-keys",
+        ),
+    ],
+)
+def test_an_entry_that_is_not_text_does_not_stop_the_rest_being_disclosed(
+    odd: dict[object, object],
+) -> None:
+    proxies: dict[object, object] = {"http": _PROXY, **odd}
+    text = ambient_proxy_warning(proxies=proxies)
+    assert text is not None
+    assert f"The http proxy is {_P}. " in text, text
+    if "https" in odd:
+        assert f"The https proxy is {_UNREADABLE}. " in text, text
+    assert "oddkey" not in text, text
+    _assert_claims_nothing(text)
 
 
 def _serve_warnings(

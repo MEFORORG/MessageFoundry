@@ -1460,11 +1460,18 @@ that may read an environment proxy, and says they include at least those. It nam
 OpenBao clients only when the `[vault]` extra is installed. It does not say which hop uses which
 proxy, or what reaches the proxy. This section says that, and the WARNING points here.
 
-It logs nothing with no proxy set, or with a `NO_PROXY` of exactly `*`. It does not check whether
-a hop reads a proxy, so it still logs for a proxy no hop reads, such as a lone `all` proxy without
-the `[vault]` extra. Nor does it read any other `NO_PROXY` entry, so it still logs when a bypass
-list covers every host the engine reaches. Other commands that reach these hops, such as
-`check-privileges` and `verify`, do not log this warning.
+It logs nothing with no proxy set, or with a `NO_PROXY` of exactly `*`, unless building the
+WARNING fails. A failure logs a different WARNING instead, whether or not a proxy is set. urllib's
+own system proxy readers swallow many of their errors and report no proxy, so a broken read can
+also log nothing. It says a proxy may be set and names only the error's
+class, then gives the same hop sentence, pointer and remedy. One odd entry is meant not to cause
+that failure. The WARNING names a value it cannot label as "an unreadable value", treats an empty
+string or `None` as no entry, and skips an entry whose key is not text.
+
+The WARNING does not check whether a hop reads a proxy, so it still logs for a proxy no hop reads,
+such as a lone `all` proxy without the `[vault]` extra. Nor does it read any other `NO_PROXY` entry,
+so it still logs when a bypass list covers every host the engine reaches. Other commands that reach
+these hops, such as `check-privileges` and `verify`, do not log this warning.
 
 **Some hosts go direct.** Both families send a host on `NO_PROXY` or the system bypass list
 direct. The urllib hops also dial a loopback host direct. The Vault clients have no loopback rule,

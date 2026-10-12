@@ -273,7 +273,7 @@ silently, or must be disclosed. This ADR's proxy is of the last two kinds.
   frame. The rules are in [CONFIGURATION.md, `[egress]`](../CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries).
 - **An environment proxy is ambient, and `serve` now names it.** Amendment B kept the urllib
   openers reading the environment, for the reason it gives. So the ruling's other branch applies:
-  `serve` and `supervise` each log one static WARNING at start, naming each proxy in force and
+  `serve` and `supervise` each log one static WARNING at start, naming each proxy that is set and
   the hops that may read one (`transports/ambient_proxy.py`, `tests/test_ambient_proxy_disclosure.py`).
   It makes no per-hop claim. What it says, and the per-hop facts, are in
   [CONFIGURATION.md](../CONFIGURATION.md#serve-names-an-environment-proxy-at-start).

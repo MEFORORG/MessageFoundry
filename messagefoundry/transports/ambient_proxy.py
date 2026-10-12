@@ -21,6 +21,7 @@ import importlib.util
 import logging
 import urllib.request
 from collections.abc import Mapping
+from typing import Any
 
 # Private to wiring, and imported the way config/static_credentials.py imports its sibling
 # _peer_label: the one secret-safe address parser, so a proxy URL is read the same way everywhere.
@@ -54,7 +55,11 @@ _REMEDY = (
 )
 
 
-def _address_of(value: str) -> str:
+#: Shared by the warning and its fallback, so one search finds both.
+_OPENING = "a web proxy from the environment or the system proxy settings"
+
+
+def _address_of(value: object) -> str:
     """One proxy URL as ``scheme://host:port``, or a fixed placeholder when it does not parse.
 
     Read by the peer-label parser the posture read-out uses for a proxy URL, so the two agree, and
@@ -63,6 +68,8 @@ def _address_of(value: str) -> str:
     whitespace does too, though the parser strips it: urllib reads the raw value, so a clean label
     would name an address the hop does not dial. A value with no scheme is read as ``http`` by both
     libraries, so it is named that way."""
+    if not isinstance(value, str):  # a system reader that hands back something else
+        return _UNREADABLE
     parts = _split_address(value) if value == value.strip() else None
     if parts is None:
         return _UNREADABLE
@@ -70,35 +77,68 @@ def _address_of(value: str) -> str:
     return f"{scheme or 'http'}://{host}" + (f":{port}" if port else "")
 
 
-def _read_entries(found: Mapping[str, str]) -> dict[str, str]:
+def _read_entries(found: Mapping[Any, object]) -> dict[str, object]:
     """The entries of ``found`` an engine HTTP hop can read, keyed in lower case, in key order.
 
-    An empty value is no entry: urllib skips it, and requests treats it as no proxy. A value of
-    only whitespace is kept, because both libraries would try to use it, and is labelled
-    unreadable."""
-    return {
-        scheme.lower(): value
-        for scheme, value in sorted(found.items())
-        if scheme.lower() in _READ_KEYS and value
-    }
+    A key that is not text is skipped, since no hop can look it up, so one odd key cannot stop the
+    rest being disclosed. An empty string or ``None`` is no entry: urllib skips it, and requests
+    treats it as no proxy. A value of only whitespace is kept, because both libraries would try to
+    use it, and is labelled unreadable. Any other value that is not text is kept and labelled
+    unreadable too, with no truth test that could raise on it.
+
+    Where two set keys differ only in case, the lower-case one wins: the sort puts ``HTTPS`` before
+    ``https``, and the later entry replaces it. ``getproxies()`` has already folded the case, so
+    this matters only for a mapping a caller passes in."""
+    entries = [
+        (key.lower(), key, value)
+        for key, value in found.items()
+        if isinstance(key, str)
+        and key.lower() in _READ_KEYS
+        and value is not None
+        and not (isinstance(value, str) and not value)
+    ]
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    return {lowered: value for lowered, _, value in entries}
 
 
-def environment_proxy_hosts(proxies: Mapping[str, str] | None = None) -> dict[str, str]:
+def _label(value: object) -> str:
+    """:func:`_address_of`, with any failure on one value labelled unreadable, so it cannot stop
+    the other entries being disclosed."""
+    try:
+        return _address_of(value)
+    except Exception:  # noqa: BLE001 - one odd value must not hide the rest
+        return _UNREADABLE
+
+
+def environment_proxy_hosts(proxies: Mapping[Any, object] | None = None) -> dict[str, str]:
     """The ``http``, ``https`` and ``all`` proxies from the environment or the system settings,
     each as ``scheme://host:port``. ``proxies`` defaults to ``urllib.request.getproxies()``."""
     found = urllib.request.getproxies() if proxies is None else proxies
-    return {key: _address_of(value) for key, value in _read_entries(found).items()}
+    return {key: _label(value) for key, value in _read_entries(found).items()}
 
 
 def _vault_importable() -> bool:
-    """Whether the Vault clients could run at all: they need the ``[vault]`` extra's ``hvac``."""
+    """Whether the Vault clients could run at all: they need the ``[vault]`` extra's ``hvac``.
+
+    Any failure of the lookup reads as no: the Vault clients are then left out, and the rest of
+    the disclosure still logs."""
     try:
         return importlib.util.find_spec("hvac") is not None
-    except (ImportError, ValueError):  # a broken entry in sys.modules, or a parent that fails
+    except Exception:  # noqa: BLE001 - a broken finder or sys.modules entry must not hide the rest
         return False
 
 
-def ambient_proxy_warning(proxies: Mapping[str, str] | None = None) -> str | None:
+def _hops_sentence() -> str:
+    """The fixed hop sentence. It reads no proxy value, so the fallback can carry it too."""
+    hops = [*_HOPS, _VAULT] if _vault_importable() else list(_HOPS)
+    return (
+        "The hops that may read an environment proxy include at least "
+        + ", ".join(hops[:-1])
+        + f", and {hops[-1]}. "
+    )
+
+
+def ambient_proxy_warning(proxies: Mapping[Any, object] | None = None) -> str | None:
     """The startup warning for an environment proxy, or ``None`` when there is none to disclose.
 
     ``proxies`` defaults to ``urllib.request.getproxies()``. A ``NO_PROXY`` of exactly ``*`` sends
@@ -113,28 +153,30 @@ def ambient_proxy_warning(proxies: Mapping[str, str] | None = None) -> str | Non
     if not hosts:
         return None
     lines = "".join(f"The {key} proxy is {address}. " for key, address in hosts.items())
-    hops = [*_HOPS, _VAULT] if _vault_importable() else list(_HOPS)
     return (
-        "a web proxy from the environment or the system proxy settings is set. "
-        + lines
-        + "The hops that may read an environment proxy include at least "
-        + ", ".join(hops[:-1])
-        + f", and {hops[-1]}. "
-        + _POINTER
-        + _REMEDY
-        + "(BACKLOG #1125)"
+        f"{_OPENING} is set. " + lines + _hops_sentence() + _POINTER + _REMEDY + "(BACKLOG #1125)"
     )
 
 
 def warn_ambient_proxy(logger: logging.Logger) -> None:
     """Log :func:`ambient_proxy_warning` at WARNING if there is one. Never raises.
 
-    The disclosure must not stop an engine from starting. A failure to build it logs one DEBUG
-    line carrying no value, because the values it failed on may hold a proxy credential."""
+    The disclosure must not stop an engine from starting, and a proxy must not attach silently. So
+    a failure to build it still logs one WARNING, with the hop sentence, the pointer and the
+    remedy. It carries no value, because the values it failed on may hold a proxy credential, and
+    names only the exception's class. The fixed text goes in as arguments, so a ``%`` in it can
+    never break the format."""
     try:
         text = ambient_proxy_warning()
-    except Exception:  # noqa: BLE001 - a startup disclosure must never stop serve or supervise
-        logger.debug("the ambient proxy disclosure could not be built (BACKLOG #1125)")
+    except Exception as exc:  # noqa: BLE001 - a startup disclosure must never stop serve or supervise
+        logger.warning(
+            "%s may be set; the disclosure could not be built (%s). %s%s%s(BACKLOG #1125)",
+            _OPENING,
+            type(exc).__name__,
+            _hops_sentence(),  # cannot raise: _vault_importable catches every failure
+            _POINTER,
+            _REMEDY,
+        )
         return
     if text is not None:
         logger.warning("%s", text)
