@@ -148,6 +148,83 @@ _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: bound is what keeps a linear scan from being charged 16 MiB of a peer's choosing.
 _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
 
+#: A credential label that ENDS a field run's token, which the run then leaves in place (BACKLOG
+#: #2968). The run takes a whole token, so in ``x|y|z;password: <value>`` it took the label too.
+#: The credential filters run after this module and key on the label, so they found none and the
+#: value reached the log. :func:`_field_run_replacement` now writes the placeholder for the rest of
+#: the token and keeps this tail, so ``[redacted]password: <value>`` reaches those filters.
+#:
+#: **What it keeps, and why no more.** The label word with an optional closing quote, then the
+#: ``:`` or ``=`` and an auth scheme word when the token holds them. Never the label's dotted or
+#: underscored prefix, which is data: ``DOE_JANE_password:`` keeps ``password:`` only. A word with no
+#: separator in the token (``x|y|z;password = <value>``, ``x|y|z;Bearer <value>``) is kept only where
+#: a credential filter would read it: a ``:`` or ``=`` after the whitespace, or the scheme word
+#: ``bearer``. A bare word directly after one of the run's own separators is a component, so it is
+#: data and goes with the run.
+#:
+#: **The words are a copy of the label arm of :data:`_CREDENTIAL_AHEAD`**, in the same order, plus
+#: ``MEFOR_`` names. A plain literal, so the static regex gate reads it, and
+#: ``tests/test_redaction_glued_credential_label.py`` holds it to that arm. The start is "no ASCII
+#: letter or digit before", wider than the credential filters' ``\b`` after a prefix, since a tail
+#: kept here starts after the placeholder and so is read there anyway.
+#:
+#: **Linear.** It is searched only over the last :data:`_TRAILING_LABEL_SPAN` characters of a token
+#: the run already matched, so each match costs a bounded scan. A ``MEFOR_`` name too long to fit is
+#: not kept, which is what the run did before.
+_TRAILING_CREDENTIAL_LABEL = re.compile(
+    r"""(?<![A-Za-z0-9])(?:MEFOR_[A-Z0-9_]+|(?i:"""
+    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
+    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
+    r"""|token|pass|pwd))['"]?(?:[:=](?P<scheme>(?i:bearer|basic|digest))?+|(?P<bare>))\Z"""
+)
+#: How far back from a token's end :data:`_TRAILING_CREDENTIAL_LABEL` looks: the longest word, a
+#: quote, a separator and a scheme word fit with room to spare, and so does a ``MEFOR_`` name of
+#: ordinary length.
+_TRAILING_LABEL_SPAN = 64
+#: What must follow a kept label that holds no separator of its own: whitespace, then one.
+_SEPARATOR_AFTER = re.compile(r"\s++[:=]")
+
+
+def _field_run_replacement(match: re.Match[str], delimiters: frozenset[str]) -> str:
+    """The placeholder for a field run's token, followed by the credential label that ends it, if
+    one does (:data:`_TRAILING_CREDENTIAL_LABEL`). ``delimiters`` are the run's own separators.
+
+    A scheme word is written in lower case, so the name run cannot start on it: a capitalised
+    ``Bearer`` before ``Jane Doe Smith Roe`` would join a four-word name match and leave the last
+    name, which the run alone scrubbed. The credential filters read the scheme in any case."""
+    text, start, end = match.string, match.start(), match.end()
+    tail = _TRAILING_CREDENTIAL_LABEL.search(text, max(start, end - _TRAILING_LABEL_SPAN), end)
+    if tail is None or tail.start() == start:
+        return _REDACTED
+    kept = tail.group()
+    if tail.group("bare") is not None:
+        if text[tail.start() - 1] in delimiters:
+            return _REDACTED  # a whole component, so data
+        if kept.lower() == "bearer":
+            return _REDACTED + "bearer"
+        if _SEPARATOR_AFTER.match(text, end) is None:
+            return _REDACTED
+        return _REDACTED + kept
+    scheme = tail.start("scheme")
+    if scheme != -1:
+        kept = kept[: scheme - tail.start()] + kept[scheme - tail.start() :].lower()
+    return _REDACTED + kept
+
+
+def _default_field_run_replacement(match: re.Match[str]) -> str:
+    """:func:`_field_run_replacement` over the default separators."""
+    return _field_run_replacement(match, _DEFAULT_DELIMITERS)
+
+
+#: A label :func:`_field_run_replacement` kept, as it stands in that function's output: right after
+#: the placeholder. :func:`redact` looks for one before it pays for a second look at its switch.
+_KEPT_LABEL = re.compile(
+    r"""\[redacted\](?:MEFOR_|(?i:"""
+    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
+    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
+    r"""|token|pass|pwd))"""
+)
+
 #: A field run whose separators are PERCENT-ENCODED, in a URL or a form body: ``%7C``, ``%5E``,
 #: ``%7E`` and ``%26`` for ``| ^ ~ &``, either case (BACKLOG #2171). A FHIR search such as
 #: ``identifier=MRN%7C12345&name=DOE%5EJANE`` carries one literal separator and two encoded ones, so
@@ -181,9 +258,9 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: anything the widened stage reads (:func:`redact` says why), which is left as the two stages
 #: leave it;
 #: a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter that MSH declares
-#: (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern has no such rule:
-#: a credential label glued to a pipe run still goes with it, which is older than this pattern and
-#: is not fixed here.
+#: (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern keeps a
+#: credential label glued to the end of its token since BACKLOG #2968
+#: (:data:`_TRAILING_CREDENTIAL_LABEL`); this one does not, and leaves such a text to the switch.
 _HL7_ENCODED_FIELD_RUN = re.compile(
     r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
     r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
@@ -1729,6 +1806,14 @@ def redact(text: str) -> str:
     The screen is a C-speed search, so text without an encoded separator pays nothing more, and the
     credential scan runs only once a qualifying run is found.
 
+    **A label the literal field run kept does not switch the run off (BACKLOG #2968).** Since #2968
+    the run leaves a credential label that ends its token (:data:`_TRAILING_CREDENTIAL_LABEL`), so
+    the filters after this module can read it. Read by the switch, that label would turn the run
+    off on text where it applied before, and the run's PHI would print. So where the output may hold
+    a kept label (:data:`_KEPT_LABEL`), the switch reads the stages as they ran before #2968, which
+    costs a second pass of the stages on that text only. A kept label sits in a token with no
+    separator left in it, so the run cannot take it.
+
     **A text the widened stage could read is left alone too** (:func:`_needs_widened_stage`). Those
     rules keep some values by their surroundings: a bare value under a JSON ``name`` stays while more
     text follows it, and goes once it ends the text. :func:`safe_text` strips and cuts, so a second
@@ -1741,27 +1826,34 @@ def redact(text: str) -> str:
         return out
     if _HL7_ENCODED_FIELD_RUN.search(out) is None:
         return out
+    # BACKLOG #2968: a label the field run kept is a credential shape the switch below would read,
+    # and it would switch the run off on text where it applied before, so the run's PHI would
+    # print. So where one may be in ``out``, the switch reads the stages as they ran before #2968.
+    gate = out
+    if _CREDENTIAL_AHEAD.search(out) is not None and _KEPT_LABEL.search(out) is not None:
+        gate = _redact_stages(text, keep_labels=False)
     # This module's own bound note is joined by a line break (:data:`_TRAILING_NOTES`). It is the one
     # unprintable character that is not a peer's, so it is set aside before the test below.
-    note = _TRAILING_NOTES.search(out) if out.endswith("unscanned]") else None
-    body = out if note is None else out[: note.start()]
+    note = _TRAILING_NOTES.search(gate) if gate.endswith("unscanned]") else None
+    body = gate if note is None else gate[: note.start()]
     if (
         not body.isprintable()
-        or _USERINFO_OPENER in out
-        or _needs_widened_stage(out)
-        or _CREDENTIAL_AHEAD.search(out) is not None
+        or _USERINFO_OPENER in gate
+        or _needs_widened_stage(gate)
+        or _CREDENTIAL_AHEAD.search(gate) is not None
     ):
         return out
     return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
 
 
-def _redact_stages(text: str) -> str:
+def _redact_stages(text: str, *, keep_labels: bool = True) -> str:
     """The two stages of :func:`redact`: the #1711 passes to their fixed point, then the widened ones
-    when :func:`_needs_widened_stage` says a widened rule could match."""
-    first = _redact_rounds(text, widened=False)
+    when :func:`_needs_widened_stage` says a widened rule could match. ``keep_labels=False`` runs the
+    field run as it was before BACKLOG #2968, taking a trailing credential label with its token."""
+    first = _redact_rounds(text, widened=False, keep_labels=keep_labels)
     if not _needs_widened_stage(first):
         return first
-    return _redact_rounds(first, widened=True)
+    return _redact_rounds(first, widened=True, keep_labels=keep_labels)
 
 
 #: A JSON key the widened stage reads differently: ``name``/``address`` (the shape rule) and a group
@@ -1802,17 +1894,17 @@ def _needs_widened_stage(text: str) -> bool:
     return "mrn" in text.lower() and _MRN_LABELLED.search(text) is not None
 
 
-def _redact_rounds(text: str, *, widened: bool) -> str:
+def _redact_rounds(text: str, *, widened: bool, keep_labels: bool = True) -> str:
     """One stage of :func:`redact`: the flat and structured passes, repeated to a fixed point."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
             return text
-        flat = _redact_flat(text, widened=widened, credentials=credentials)
+        flat = _redact_flat(text, widened=widened, credentials=credentials, keep_labels=keep_labels)
         text = _redact_structured(flat, widened=widened)
         if text == flat:
             return text
-    return _redact_flat(text, widened=widened, credentials=credentials)
+    return _redact_flat(text, widened=widened, credentials=credentials, keep_labels=keep_labels)
 
 
 #: The most rounds one stage of :func:`redact` takes. A call runs two stages, and runs both again when
@@ -1824,7 +1916,7 @@ def _redact_rounds(text: str, *, widened: bool) -> str:
 _STRUCTURED_ROUNDS = 8
 
 
-def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
+def _redact_flat(text: str, *, widened: bool, credentials: bool, keep_labels: bool = True) -> str:
     """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN
     (``widened`` only), dates and names. One stage of :func:`redact` is this plus
     :func:`_redact_structured`, repeated to a fixed point.
@@ -1849,7 +1941,13 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
-    scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
+    # BACKLOG #2968: a credential label that ends the run's token stays for the filters after this
+    # module (:data:`_TRAILING_CREDENTIAL_LABEL`). ``keep_labels=False`` is the run before #2968,
+    # which :func:`redact` needs once, to read its switch as it was read then.
+    run_replacement: Callable[[re.Match[str]], str] | str = (
+        _default_field_run_replacement if keep_labels else _REDACTED
+    )
+    scrubbed = _HL7_FIELD_RUN.sub(run_replacement, scrubbed)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
@@ -1860,9 +1958,13 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     # declaration with it) by this point.
     declared = _sniff_delimiters(text)
     if not declared <= _DEFAULT_DELIMITERS:
-        segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
+        delimiters = declared | _DEFAULT_DELIMITERS
+        segment, field_run = _delimiter_patterns(delimiters)
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
-        scrubbed = field_run.sub(_REDACTED, scrubbed)
+        scrubbed = field_run.sub(
+            (lambda m: _field_run_replacement(m, delimiters)) if keep_labels else _REDACTED,
+            scrubbed,
+        )
     # Before the name run, which would otherwise take the label of `PATIENT MRN 12345` and leave the
     # number behind (BACKLOG #2079).
     if widened:
