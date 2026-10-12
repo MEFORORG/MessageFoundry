@@ -474,8 +474,11 @@ def _alloc(registry: Registry, session: SandboxSession) -> list[tuple[str, str]]
     return _deliveries(registry, "h_alloc", sandbox=session, run_context=RunContext())
 
 
+#: The platform predicate behind :data:`_LINUX_ONLY`, shared with the GitHub Actions guard below.
+_ON_LINUX = sys.platform.startswith("linux")
+
 _LINUX_ONLY = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
+    not _ON_LINUX,
     reason="mem_mb is headroom above the loaded graph only on Linux, which has /proc/self/status",
 )
 
@@ -525,18 +528,29 @@ def _run_threads(
     return registry, delivered, session
 
 
-def _glibc_arenas_keep_their_peak() -> bool:
-    """Whether the control below can see the defect: glibc malloc reached through the GIL build's
-    ``PyMem_Malloc``, with overcommit not in mode 2, where glibc gives a trimmed arena back instead."""
+def _is_glibc() -> bool:
     import platform
+
+    return platform.libc_ver()[0] == "glibc"
+
+
+def _is_gil_build() -> bool:
     import sysconfig
 
-    if platform.libc_ver()[0] != "glibc" or sysconfig.get_config_var("Py_GIL_DISABLED"):
-        return False
+    return not sysconfig.get_config_var("Py_GIL_DISABLED")
+
+
+def _overcommit_not_mode_2() -> bool:
     try:
         return Path("/proc/sys/vm/overcommit_memory").read_text(encoding="ascii").strip() != "2"
     except OSError:
         return False
+
+
+def _glibc_arenas_keep_their_peak() -> bool:
+    """Whether the control below can see the defect: glibc malloc reached through the GIL build's
+    ``PyMem_Malloc``, with overcommit not in mode 2, where glibc gives a trimmed arena back instead."""
+    return _is_glibc() and _is_gil_build() and _overcommit_not_mode_2()
 
 
 @_LINUX_ONLY
@@ -573,7 +587,7 @@ def test_threads_a_call_joined_do_not_spend_the_memory_cap(tmp_path: Path) -> No
 
 @_LINUX_ONLY
 @pytest.mark.skipif(
-    sys.platform.startswith("linux") and not _glibc_arenas_keep_their_peak(),
+    _ON_LINUX and not _glibc_arenas_keep_their_peak(),
     reason="needs glibc arenas that keep their peak: glibc, the GIL build, overcommit not mode 2",
 )
 def test_without_the_arena_limit_threads_do_spend_the_memory_cap(
@@ -593,6 +607,42 @@ def test_without_the_arena_limit_threads_do_spend_the_memory_cap(
             _alloc(registry, session)
     finally:
         session.close()
+
+
+@pytest.mark.skipif(
+    not (_ON_LINUX and os.environ.get("GITHUB_ACTIONS") == "true"),
+    reason="asserts the thread tests' preconditions only on a GitHub Actions Linux runner",
+)
+def test_on_github_actions_linux_both_thread_tests_run(
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    """Evidence that the two thread tests above RAN on the hosted Linux leg, not skipped.
+
+    That leg runs ``pytest -q`` and uploads no per-test report, so a green run cannot tell a pass
+    from a skip. This test fails, rather than skips, if any condition either test skips on is false
+    there. It calls the same predicate functions their decorators call, so a change to one of
+    those predicates reaches both. A NEW skip condition on either test does not: add it here too.
+    It also asserts what the worker needs to take its ``RLIMIT_DATA`` path rather than the absolute
+    ``RLIMIT_AS`` fallback: Linux 4.7 or later, and a ``VmData`` line in ``/proc/self/status``. It
+    reads those through the worker's own functions, in this process, on the kernel the worker
+    shares. So a green ubuntu leg with this test passing proves both decisive tests ran (vault
+    BACKLOG #3133 part 2). The cost is deliberate: if a runner image ever sets overcommit mode 2
+    or hides ``/proc``, this test reds every ubuntu leg with no code change, and that is the signal
+    that the decisive tests stopped running, not a flake."""
+    from messagefoundry.pipeline import _sandbox_worker
+
+    preconditions = {
+        "Linux": _ON_LINUX,
+        "glibc": _is_glibc(),
+        "the GIL build": _is_gil_build(),
+        "overcommit not in mode 2": _overcommit_not_mode_2(),
+        "Linux 4.7 or later": _sandbox_worker._rlimit_data_counts_mmap(),
+        "VmData in /proc/self/status": _sandbox_worker._proc_status_kib("VmData") is not None,
+    }
+    assert all(preconditions.values()), (
+        "the thread memory-cap tests would skip or misfire here; unmet: "
+        f"{[name for name, met in preconditions.items() if not met]}"
+    )
 
 
 @pytest.mark.parametrize(
