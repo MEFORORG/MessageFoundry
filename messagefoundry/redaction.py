@@ -2150,18 +2150,20 @@ def _text_codec_names() -> set[str]:
     return modules | aliases
 
 
-#: The rule: a name is rendered if it is a stdlib TEXT codec's module name or a non-numeric alias of
-#: one, normalized, or if it is ``cp`` plus one to five digits (:data:`_CODE_PAGE`). Built from the
-#: ``encodings`` package rather than by ``codecs.lookup``, which runs third-party search functions
-#: and caches each name it misses: the very value this check declines to echo would stay in process
-#: memory. A third-party codec is not named. The build costs under 1 ms at import (measured 0.7 to
-#: 0.9 ms), so it is not deferred.
+#: The rule: a name is rendered only from a closed set. That set is each stdlib TEXT codec's module
+#: name and its non-numeric aliases, normalized, plus :data:`_WINDOWS_ERROR_NAMES`. No pattern
+#: admits a name, so a caller cannot choose digits that print. Built from the ``encodings`` package
+#: rather than by ``codecs.lookup``, which runs third-party search functions and caches each name it
+#: misses: the very value this check declines to echo would stay in process memory. A third-party
+#: codec is not named. The build costs under 1 ms at import (measured 0.7 to 0.9 ms), so it is not
+#: deferred.
 _KNOWN_CODECS = frozenset(_codec_key(n) for n in _text_codec_names())
 
-#: A Windows code page as the code-page codecs report one: real ``oem`` errors carry ``cp1``, and
-#: ``codecs.code_page_encode`` carries ``cp<number>`` for pages with no ``encodings`` module. The
-#: shape is two fixed letters and at most five digits, so it is accepted by pattern.
-_CODE_PAGE = re.compile(r"cp[0-9]{1,5}")
+#: Names a real Windows error reports that no ``encodings`` module or alias carries, written out one
+#: by one and matched exactly. ``cp1``: what ``str.encode("oem")`` reports, the OEM code page's
+#: constant (measured on Windows 11, Python 3.14). Python 3.14 on Windows also reports ``cp<number>``
+#: for a code page with no module, such as ``cp20127``. That family is open, so it is not named.
+_WINDOWS_ERROR_NAMES = frozenset({"cp1"})
 
 
 def _names_a_codec(encoding: object) -> bool:
@@ -2169,7 +2171,7 @@ def _names_a_codec(encoding: object) -> bool:
     :data:`_KNOWN_CODECS` for the rule). ``type(...) is str``, as for the reason below."""
     if type(encoding) is not str or not _CODEC_NAME.fullmatch(encoding):
         return False
-    return _codec_key(encoding) in _KNOWN_CODECS or _CODE_PAGE.fullmatch(encoding) is not None
+    return _codec_key(encoding) in _KNOWN_CODECS or encoding in _WINDOWS_ERROR_NAMES
 
 
 #: ``.reason`` phrases known to be fixed text. At least the stdlib idna and punycode codecs put the
@@ -2214,9 +2216,9 @@ def _unicode_error_text(exc: UnicodeError) -> str:
 
     The class name alone is the fallback: a bare ``UnicodeError``, or one whose attributes are missing,
     not the standard types, or raise when read. A bare one's message is free text this function cannot
-    vouch for. ``.encoding`` is rendered only when it names a stdlib text codec or has a Windows code
-    page's shape (:func:`_names_a_codec`), so other text someone set there is not echoed. A value of
-    that shape is echoed whatever set it: at most ``cp`` and five digits. ``.reason`` is rendered only from a fixed list.
+    vouch for. ``.encoding`` is rendered only when it is in a closed set of names
+    (:func:`_names_a_codec`), so a value someone else set there is echoed only if it is one of those
+    names. ``.reason`` is rendered only from a fixed list.
 
     An empty span (``start == end``) prints no position (vault BACKLOG #3206). Windows ``mbcs`` and
     ``oem`` raise with ``start == end == 0`` wherever the character sat, so the index is not one."""

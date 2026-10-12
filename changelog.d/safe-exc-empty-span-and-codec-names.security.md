@@ -2,11 +2,11 @@
   rule.** Windows `mbcs` and `oem` errors raise with an empty span at index 0, wherever the
   character sat. `safe_exc` printed that as `position 0`. It now prints no position for an empty
   span, as in `'mbcs' codec cannot encode: invalid character`. A span of one or more characters
-  reads as before. The codec name is printed only for a stdlib text codec or a non-numeric alias of
-  one, or for `cp` plus one to five digits, the form Windows code pages report. So a real `oem`
-  error now names `cp1`. A digit-only alias such as `1252`, the `aliases` helper module and the
-  bytes-to-bytes transforms such as `base64` are no longer printed. (vault `BACKLOG #3206`,
-  items 1, 2 and 4)
+  reads as before. The codec name is printed only from a closed set: a stdlib text codec, a
+  non-numeric alias of one, or the literal `cp1`, which a real `oem` error reports. No pattern
+  admits a name, so `cp12345` prints no name. A digit-only alias such as `1252`, the `aliases`
+  helper module and the bytes-to-bytes transforms such as `base64` are no longer printed. (vault
+  `BACKLOG #3206`, items 1, 2 and 4)
 - **The Email destination refuses, at load, a subject whose encoded word decodes to a control
   character.** The header parser decodes RFC 2047 encoded words in the configured subject. So
   `=?utf-8?b?AA==?=` held no control character as text, and the message would have gone out with

@@ -157,10 +157,67 @@ def test_an_empty_decode_span_prints_no_position_either() -> None:
     assert safe_exc(exc) == "UnicodeDecodeError: 'cp932' codec cannot decode: invalid character"
 
 
-@pytest.mark.parametrize("encoding", ["cp1", "cp20127", "cp65001", "latin-1", "utf-16-le", "idna"])
-def test_a_text_codec_or_a_code_page_is_named(encoding: str) -> None:
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        "cp1",  # the one literal outside the stdlib names: what a real oem error reports
+        "cp1252",  # stdlib code pages, each an encodings module or an alias of one
+        "cp437",
+        "cp932",
+        "cp65001",
+        "latin-1",
+        "utf-16-le",
+        "idna",
+    ],
+)
+def test_a_name_in_the_closed_set_is_named(encoding: str) -> None:
     exc = UnicodeEncodeError(encoding, _TEXT, _POSITION, _POSITION + 1, "invalid character")
     assert f"{encoding!r} codec cannot encode at position {_POSITION}" in safe_exc(exc)
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        "cp12345",
+        "cp90210",
+        "cp99999",
+        "cp20127",  # a real Windows code page with no encodings module: the family is open
+        "cp2",
+        "cp0",
+        "cp11",
+        "CP1",  # the literal is matched exactly, so no other spelling of it prints
+        "cp-1",
+        "cp_1",
+    ],
+)
+def test_a_code_page_shape_outside_the_closed_set_is_dropped(encoding: str) -> None:
+    """No pattern admits a name, so a hand-built error cannot put chosen digits through (vault
+    BACKLOG #3206). ``main`` printed no name for these either."""
+    for exc in (
+        UnicodeEncodeError(encoding, _TEXT, _POSITION, _POSITION + 1, "invalid character"),
+        UnicodeDecodeError(
+            encoding, _TEXT.encode(), _POSITION, _POSITION + 1, "invalid start byte"
+        ),
+    ):
+        text = safe_exc(exc)
+        assert "codec" not in text and encoding not in text, text
+        assert not any(ch.isdigit() for ch in text.replace(f"position {_POSITION}", "")), text
+
+
+def test_the_names_outside_the_stdlib_set_are_a_fixed_list() -> None:
+    """The closed set is the stdlib names plus literals written out one by one. A new literal is a
+    decision someone makes here, with the measurement that justifies it."""
+    assert frozenset({"cp1"}) == redaction._WINDOWS_ERROR_NAMES
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="oem is a Windows-only codec")
+def test_a_real_oem_error_reports_the_literal_the_closed_set_holds() -> None:
+    """The measurement behind ``cp1``: the real ``oem`` codec reports that name, not ``oem``. A
+    machine whose OEM code page is UTF-8 would encode the probe and fail here with DID NOT RAISE."""
+    with pytest.raises(UnicodeEncodeError) as caught:
+        (_TEXT + chr(0xFFFF)).encode("oem")
+    assert caught.value.encoding == "cp1"
+    assert safe_exc(caught.value).startswith("UnicodeEncodeError: 'cp1' codec cannot encode")
 
 
 @pytest.mark.parametrize(
@@ -176,7 +233,7 @@ def test_a_text_codec_or_a_code_page_is_named(encoding: str) -> None:
         "rot13",
         "zlib",
         "undefined",
-        "cp123456",  # six digits: longer than any code page number
+        "cp123456",
         "cp",
         "CP1252X",
         "cp-1-2-3",

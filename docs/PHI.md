@@ -1587,8 +1587,10 @@ header. A header just inside the 64 KiB mark is dropped as well as one past it, 
 falls back to whitespace and can leave room for its own marker.
 Text in the default `| ^ ~ &` delimiters is not affected, because the scan matches those with no
 header. Reading the header from the whole text would close the gap. It would also undo the scan
-bound of BACKLOG #1576, which is why the gap is accepted. The convention above remains the control
-here too.
+bound of BACKLOG #1576, which is why the gap is accepted. The convention above would be the control
+only where a Router or Handler author writes the text. It does not bind a remote peer, so where the
+diagnostic quotes text a peer wrote, at least a reply field or a negative acknowledgment, no control
+covers this gap.
 
 **Residual, stated honestly:** `redact()` does **not** scrub a *single-token* identifier. An access line
 carrying `?content=1234567` or `?field_value=MRN12345` would survive the whole filter chain unredacted:
