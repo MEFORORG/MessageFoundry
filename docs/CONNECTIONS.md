@@ -1518,17 +1518,28 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 `bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
 by this rule. It has its own, below.
 
-**A credential in a proxy URL is refused on any leg where it would reach a proxy in cleartext,
-a second proxy included (vault BACKLOG #2572, #3410).** The proxy may come from `proxy_url`, from
+**Engine openers refuse a web-proxy credential on the legs where it could be read on the way,
+with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That covers a user and password in a proxy URL
+and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. A connection with such a `proxy_url` still builds. The error names no part of the proxy
-URL, and `[security].enforcement` does not relax it. A request that goes direct, such as one to a
-loopback host, is not refused. A connection's own `proxy_no_proxy` is not urllib's bypass list. A
-host it names skips the connection's `proxy_url` and still follows a proxy from the environment.
-The rule, an example of a leg it lets through, and what it does not check are stated once, on
-[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). Which legs reach
-the proxy with no TLS is in
+broker. The error names no part of the proxy URL. Which legs are refused, and the one exception
+for a `proxy_user` credential its connection admitted when it was built, which covers cleartext
+legs only, are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
+a leg it lets through and what it does not check.
+
+A credential in a connection's own `proxy_url` is not checked when the connection is built, so its
+sends meet the rule above. With `[security].require_nonstatic_credentials` on, `serve` refuses a
+credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
+the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is checked when
+the connection is built, for a proxy written either way. It is refused there unless the proxy is
+on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`. That check
+follows the posture, so under `[security].enforcement = warn` it logs a WARNING and the connection
+builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
+connection's `proxy_url` and still follows a proxy from the environment.
+
+Which legs reach the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
 out of the proxy URL.
 

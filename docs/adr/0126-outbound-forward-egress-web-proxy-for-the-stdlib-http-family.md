@@ -112,7 +112,7 @@ ACK-on-receipt, and the no-"channel"-element rule are untouched.
   → `tests/test_outbound_forward_proxy.py::test_basic_proxy_auth_preemptive_header`
 - **AC-5** — IF a proxy credential would ride a cleartext `http` proxy hop on a production-PHI instance,
   THEN THE SYSTEM SHALL refuse at construction **regardless of the destination scheme** (a loopback proxy
-  is allowed).
+  is allowed). Widened by Amendment E to a proxy written `https://`.
   → `tests/test_outbound_forward_proxy.py::test_cleartext_proxy_hop_credential_refused`
 - **AC-6** — IF `proxy_auth_type="digest"` targets an https destination, THEN THE SYSTEM SHALL refuse at
   construction (digest-over-`CONNECT` unsupported); IF `proxy_auth_type` ∈ {ntlm, windows}, THEN THE
@@ -239,7 +239,7 @@ for a loopback address. [Corrected 2026-10-12: the operator API client does not;
   INFO. **Not covered:** urllib's own bypass list (`NO_PROXY`, or the system's override list) can
   also send a request direct, and `for_host` does not read that list. A proxy credential header
   can still accompany such a request. That predates this amendment and is a follow-up recorded
-  for the maintainer ledger.
+  for the maintainer ledger. [Corrected 2026-10-12: refused at send time; see Amendment E.]
 - **The ECH sidecar opener passes `ProxyHandler({})`**, so that hop uses no proxy at all. The
   token-endpoint hop is re-addressed to the same sidecar on the token provider's opener, which
   does read the environment, so there the loopback rule is what keeps it direct. For that to hold,
@@ -295,6 +295,16 @@ contradicts. The sentences stay in place, each marked with a pointer here.
   `EngineClient._open_transport` in `apiclient/client.py` builds httpx with `trust_env=False`
   (BACKLOG #2318), and `tests/test_apiclient_ignores_env_proxy.py` pins it. The `tee` tool half of
   the sentence is still true: it calls plain `urlopen`, which reads the environment proxy.
+
+### Amendment E (2026-10-12) — a proxy written `https://` gets no pass
+
+The guard above and AC-5 named only a cleartext `http` proxy hop. A `proxy_url` maps both schemes
+to one proxy. So urllib sends a `proxy_user` credential to it in a `CONNECT` before any TLS, for an
+`https` target and an `http` target alike, even when the proxy is written `https://`. The guard now
+judges that credential as cleartext for a proxy written either way (vault BACKLOG #3416). The
+send-time rule (vault BACKLOG #3417, #3418), with its one exception for a credential this guard
+admitted, is stated once on `ProxyCredentialsRefusedError` in
+[`transports/bounded_read.py`](../../messagefoundry/transports/bounded_read.py).
 
 ## Deviations from the phase doc
 

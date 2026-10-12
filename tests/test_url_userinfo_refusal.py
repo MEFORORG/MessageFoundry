@@ -348,6 +348,9 @@ def test_the_proxy_config_repr_carries_no_credential() -> None:
             "proxy_password": SECRET,
         },
         dest_scheme="https",
+        # The proxy_user credential crosses before any TLS, even to this https:// proxy, so it
+        # builds only with a declaration (vault BACKLOG #3416).
+        attested=True,
         connection="OB_2686",
     )
     assert cfg is not None
