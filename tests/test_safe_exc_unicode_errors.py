@@ -10,8 +10,14 @@ into a stored ``last_error`` or a log line through ``safe_exc``. All payloads he
 
 from __future__ import annotations
 
+import codecs
+import encodings
+import pkgutil
+import sys
+
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry.redaction import safe_exc
 from tests._content_free import escapes
 
@@ -119,12 +125,89 @@ def test_odd_attributes_fall_back_to_the_class_name(exc: UnicodeError) -> None:
     assert safe_exc(exc) == type(exc).__name__
 
 
-def test_an_empty_span_still_names_codec_and_position() -> None:
-    # Windows mbcs raises with start == end, so an empty span is a real shape, not an odd one.
-    exc = UnicodeEncodeError("mbcs", _TEXT, _POSITION, _POSITION, "invalid character")
-    assert safe_exc(exc) == (
-        f"UnicodeEncodeError: 'mbcs' codec cannot encode at position {_POSITION}: invalid character"
+@pytest.mark.parametrize("encoding", ["mbcs", "cp1"])
+def test_an_empty_span_names_its_codec_and_no_position(encoding: str) -> None:
+    """The shape real Windows code-page errors have, built by hand so it runs on every platform
+    (vault BACKLOG #3206). ``mbcs`` reports itself as ``mbcs`` and ``oem`` as ``cp1``, and both
+    raise with ``start == end == 0`` while the character sits at ``_POSITION``. A position of 0
+    would be a false reading, so none is printed."""
+    exc = UnicodeEncodeError(encoding, _TEXT, 0, 0, "invalid character")
+    assert (
+        safe_exc(exc) == f"UnicodeEncodeError: {encoding!r} codec cannot encode: invalid character"
     )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="mbcs is a Windows-only codec")
+def test_a_real_mbcs_error_prints_no_position() -> None:
+    """The real codec, so the hand-built twin above cannot drift from what Windows raises. U+FFFF
+    is a noncharacter that no legacy ANSI code page maps. A machine whose ANSI code page is UTF-8
+    would encode it and fail here with DID NOT RAISE; the hosted Windows runners use cp1252."""
+    with pytest.raises(UnicodeEncodeError) as caught:
+        (_TEXT + chr(0xFFFF)).encode("mbcs")
+    exc = caught.value
+    assert exc.start == exc.end, "the probe must raise the empty span, or it tests nothing"
+    text = safe_exc(exc)
+    _assert_no_content(text)
+    assert "position" not in text, text
+    assert text == "UnicodeEncodeError: 'mbcs' codec cannot encode: invalid character"
+
+
+def test_an_empty_decode_span_prints_no_position_either() -> None:
+    exc = UnicodeDecodeError("cp932", _TEXT.encode(), 0, 0, "invalid character")
+    assert safe_exc(exc) == "UnicodeDecodeError: 'cp932' codec cannot decode: invalid character"
+
+
+@pytest.mark.parametrize("encoding", ["cp1", "cp20127", "cp65001", "latin-1", "utf-16-le", "idna"])
+def test_a_text_codec_or_a_code_page_is_named(encoding: str) -> None:
+    exc = UnicodeEncodeError(encoding, _TEXT, _POSITION, _POSITION + 1, "invalid character")
+    assert f"{encoding!r} codec cannot encode at position {_POSITION}" in safe_exc(exc)
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        "1252",  # a digit-only alias: an identifier's shape, and no codec reports itself so
+        "8859",
+        "aliases",  # a module in the encodings package, not a codec
+        "_win_cp_codecs",
+        "wincpcodecs",
+        "base64",  # bytes-to-bytes transforms, which raise no UnicodeError of their own
+        "hex_codec",
+        "rot13",
+        "zlib",
+        "undefined",
+        "cp123456",  # six digits: longer than any code page number
+        "cp",
+        "CP1252X",
+        "cp-1-2-3",
+    ],
+)
+def test_a_name_that_is_no_text_codec_is_dropped(encoding: str) -> None:
+    exc = UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION + 1, "invalid character")
+    exc.encoding = encoding
+    text = safe_exc(exc)
+    assert "codec" not in text and encoding not in text, text
+    assert f"cannot encode at position {_POSITION}" in text
+
+
+def test_the_non_text_list_matches_the_codec_registry() -> None:
+    """``_NOT_TEXT_CODECS`` is written by hand, so check it against what the stdlib says. A
+    transform added to ``encodings`` in a later Python fails here instead of joining the names."""
+    listed = {m.name for m in pkgutil.iter_modules(encodings.__path__)}
+    assert listed >= redaction._NOT_TEXT_CODECS, "a listed name is no longer a module"
+    transforms = set()
+    for name in listed:
+        try:
+            info = codecs.lookup(name)
+        except LookupError:  # a helper module, or a Windows-only codec on another platform
+            continue
+        if not info._is_text_encoding:
+            transforms.add(name)
+    assert transforms, "the probe must find the transforms, or it tests nothing"
+    assert transforms == redaction._NOT_TEXT_CODECS - {"aliases", "undefined"}
+    for name in redaction._NOT_TEXT_CODECS:
+        assert redaction._codec_key(name) not in redaction._KNOWN_CODECS
+    assert not any(key.isdigit() for key in redaction._KNOWN_CODECS)
 
 
 def test_a_stdlib_codec_whose_label_is_not_a_lookup_name_is_still_named() -> None:
@@ -179,9 +262,11 @@ def test_an_encoding_attribute_naming_no_codec_is_dropped() -> None:
 def test_a_reason_that_quotes_the_input_is_dropped() -> None:
     """The stdlib idna codec puts the offending character INTO ``.reason``, so a reason is kept
     only from a fixed list. Measured on Python 3.14: ``Invalid character '\\ue000'``."""
-    with pytest.raises(UnicodeError) as caught:
+    with pytest.raises(UnicodeEncodeError) as caught:
         f"doe{_CHAR}\ue000jane.example".encode("idna")
-    assert "\\ue000" in str(caught.value), "the probe must quote the character, or it tests nothing"
+    # `.reason`, not `str()`: str() quotes the character a second time outside the reason, so it
+    # would pass even if the reason were clean (vault BACKLOG #3206).
+    assert "\\ue000" in caught.value.reason, "the reason must quote the character"
     text = safe_exc(caught.value)
     _assert_no_content(text)
     for form in escapes("\ue000"):
@@ -191,9 +276,9 @@ def test_a_reason_that_quotes_the_input_is_dropped() -> None:
 
 def test_a_punycode_round_trip_reason_naming_the_label_is_dropped() -> None:
     label = b"xn--" + "doeﬁjane".encode("punycode")
-    with pytest.raises(UnicodeError) as caught:
+    with pytest.raises(UnicodeDecodeError) as caught:
         label.decode("idna")
-    assert "doe" in str(caught.value), "the probe must quote the label, or it tests nothing"
+    assert "doe" in caught.value.reason, "the reason must quote the label, or it tests nothing"
     text = safe_exc(caught.value)
     assert "doe" not in text and "jane" not in text, text
 
