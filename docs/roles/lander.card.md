@@ -49,7 +49,7 @@ re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
 required contexts, nothing else.
 
 **A relayed owner stop gets a confirmation in your own chat, and you keep merging** (owner ruling
-2026-10-11, korus `LANDER.md`). Ask the owner there; the stop does not bind you until they answer.
+2026-10-11, korus `LANDER.md`). Ask in your end-of-turn owner table; merge until the owner answers.
 
 A new authority grant ADDS to what you already hold; it never narrows it. Ask whether you already
 hold more, not what the message covers.
