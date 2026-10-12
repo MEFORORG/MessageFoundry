@@ -486,15 +486,23 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    stripped marker or a planted row: cell binding catches a moved ciphertext because it has a tag to
    fail, and a downgrade to plaintext has no tag, so only this refusal protects it. A purged `''` is
    never refused. The keyed open still seals legacy plaintext, one `(table, column)` surface at a time,
-   but only while that surface holds no ciphertext yet; each surface seals in one transaction, so a
-   crash leaves it all sealed or all unsealed. Setting the switch `true` restores the old behaviour
-   (unmarked values read back as plaintext, and the open seals every one) and is a declared loosening.
-   **At least these limits remain.** The DIRECT S/MIME enveloped body is not covered. And the
-   "sealed" evidence is the surface's own ciphertext, so a surface that holds none at the moment of a
-   keyed open is treated as unsealed and a row planted into it is sealed as legacy data. That covers a
-   table that can legally empty out (`queue.payload`, `state`, `alert_instance`) and any column that
-   has not been written yet (`users.totp_secret` before the first MFA enrolment, for example). A planted
-   row read before that open is still refused. Also note that a planted `state` or `reference` value
+   but only while that surface is unsealed. **A surface is sealed once the store has recorded it as
+   keyed, or once it holds ciphertext** (BACKLOG #3383, owner ruling 2026-10-10). The record is a row
+   in the `keyed_surface` table on all three backends. A writable keyed open that finishes its sweep
+   records every surface, empty ones included. A read-only open records nothing. A surface the open
+   seals gets its record inside that seal's one transaction. So a crash leaves a surface all sealed
+   or all unsealed, record included, and the next open finishes the job. Setting the switch `true`
+   restores the old behaviour and is a declared loosening. Unmarked values then read back as
+   plaintext, and the open seals every one, recorded surface or not.
+   **At least these limits remain.** The DIRECT S/MIME enveloped body is not covered. A row planted
+   before the open that first records its surface, on a surface with no ciphertext, looks exactly
+   like legacy plaintext. So that open seals it. A surface that already holds ciphertext refuses it
+   instead. After that open, a plant is refused even on a surface that holds no ciphertext. That
+   covers a table that has emptied out (`queue.payload`, `state`, `alert_instance`). It also covers a
+   column every purge has blanked, and one never written (`users.totp_secret` before the first MFA
+   enrolment). The earlier design read "sealed" from the surface's own ciphertext alone. It sealed a
+   plant on such a surface as legacy data. Values a later keyless run of the same store writes are
+   refused the same way; the switch above seals them for one open. Also note that a planted `state` or `reference` value
    on a sealed surface stops the store from opening, since the open reads those tables eagerly. `serve`
    arms the alert before the open, so that refusal alerts too, and so does a planted row the open
    finds and leaves in place. The retention document-strip pass skips a refused row and carries on.
