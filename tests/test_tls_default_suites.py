@@ -928,11 +928,7 @@ def test_a_refused_tls12_list_through_a_library_seam_names_its_hop(
 ) -> None:
     """BACKLOG #3096 item 2. The test above drives a TLS 1.3 refusal into the shared helper. This
     one refuses the TLS 1.2 list on the CLASS, so the seam's own factory meets it on a real build."""
-
-    def refuse(self: ssl.SSLContext, cipherlist: str, /) -> None:
-        raise ssl.SSLError("No cipher can be selected.")
-
-    monkeypatch.setattr(ssl.SSLContext, "set_ciphers", refuse)
+    monkeypatch.setattr(ssl.SSLContext, "set_ciphers", _RefusesTls12.set_ciphers)
     with pytest.raises(ValueError) as caught:
         build()
     assert isinstance(caught.value, tls_policy.EngineTlsListRefused)

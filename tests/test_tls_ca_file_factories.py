@@ -30,6 +30,7 @@ from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     CaFileUnreadable,
+    TrustAnchor,
     TrustAnchorPolicy,
     build_anchored_https_handler,
     build_smtp_tls_context,
@@ -364,27 +365,33 @@ def test_a_missing_instance_ca_file_names_the_tls_block(mode: str, tmp_path: Pat
         build_anchored_https_handler(anchor=anchor, connector="test")
 
 
-def test_a_ca_file_that_is_not_pem_names_the_setting_too(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "build",
+    [
+        build_verifying_client_context,
+        lambda anchor: build_anchored_https_handler(anchor=anchor, connector="test"),
+    ],
+    ids=["client-context", "https-handler"],
+)
+def test_a_ca_file_that_is_not_pem_names_the_setting_too(
+    build: Callable[[TrustAnchor], object], tmp_path: Path
+) -> None:
     """Vault BACKLOG #2977 item 10. A file that reads but holds no CA was re-raised as a raw
     SSLError naming nothing. It now gets the same worded error, naming the setting and not the
-    path, on both builders. The cause keeps the SSLError for a reader who needs OpenSSL's reason."""
+    path. The cause keeps the SSLError for a reader who needs OpenSSL's reason."""
     junk = tmp_path / "junk.pem"
     junk.write_text("not a certificate", encoding="utf-8")
     anchor = resolve_trust_anchor(
         connection_ca_file=str(junk), host="10.1.2.3", policy=TrustAnchorPolicy(), connection="OB"
     )
-    for build in (
-        lambda: build_verifying_client_context(anchor),
-        lambda: build_anchored_https_handler(anchor=anchor, connector="test"),
-    ):
-        with pytest.raises(CaFileUnreadable) as caught:
-            build()
-        message = str(caught.value)
-        assert message.startswith(
-            "tls_ca_file of connection 'OB' names a CA file that holds no usable CA certificate"
-        ), message
-        assert "junk.pem" not in message
-        assert isinstance(caught.value.__cause__, ssl.SSLError)
+    with pytest.raises(CaFileUnreadable) as caught:
+        build(anchor)
+    message = str(caught.value)
+    assert message.startswith(
+        "tls_ca_file of connection 'OB' names a CA file that holds no usable CA certificate"
+    ), message
+    assert "junk.pem" not in message
+    assert isinstance(caught.value.__cause__, ssl.SSLError)
 
 
 @pytest.mark.parametrize(

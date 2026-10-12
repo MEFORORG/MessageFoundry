@@ -1161,23 +1161,21 @@ def apply_connection_tls_ciphers(
     :func:`validate_tls_ciphers` speaks about a generic ``tls_ciphers`` and an operator running
     several connections needs to know WHICH one is at fault."""
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
-    if ciphers is None:
-        # Outside the try below, because no operator string is set (BACKLOG #3096). An engine-list
-        # refusal is named for the connector; anything else passes as itself, never as
-        # "tls_ciphers rejected".
-        try:
-            narrow_to_approved_suites(ctx)
-        except EngineTlsListRefused as exc:
-            raise EngineTlsListRefused(f"{connector}: {exc}") from exc
-        return
     try:
-        text = str(ciphers)
-        validate_tls_ciphers(text)
-        apply_operator_tls_ciphers(ctx, text)
+        if ciphers is None:
+            narrow_to_approved_suites(ctx)
+        else:
+            text = str(ciphers)
+            validate_tls_ciphers(text)
+            apply_operator_tls_ciphers(ctx, text)
     except EngineTlsListRefused as exc:
         # The build refused the engine's list, so name the connector without blaming its string.
         raise EngineTlsListRefused(f"{connector}: {exc}") from exc
     except (ValueError, ssl.SSLError) as exc:
+        if ciphers is None:
+            # No operator string is set, so nothing may read as "tls_ciphers rejected" (BACKLOG
+            # #3096). Latent: the narrow raises only EngineTlsListRefused today.
+            raise
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
 
@@ -2670,8 +2668,9 @@ class TrustAnchorPolicy:
     mode: TrustAnchorMode = "system"
     #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
     #: reaches (BACKLOG #299), and to the inbound FTPS poller, which dials out (BACKLOG #2370).
-    #: Independent of ``mode``: revocation is orthogonal to which roots anchor the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
-    #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
+    #: Independent of ``mode``: revocation is orthogonal to which roots anchor the hop, so a
+    #: ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching the
+    #: exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
     crl_file: str | None = None
 
 
