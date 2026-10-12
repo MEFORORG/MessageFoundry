@@ -3563,7 +3563,8 @@ def check_caller_event_kind(event: str) -> None:
     Shared by all three backends so the rule cannot drift between them. Undeclared: see
     :data:`MESSAGE_EVENT_KINDS`. Store-only: :data:`VIEWED_EVENT`, because a caller-written
     ``viewed`` row would carry a detail the error reveal unmasks while the audit leaves it out
-    (BACKLOG #2440)."""
+    (BACKLOG #2440). And ``reply_dropped``, a floor row only ``mark_done`` may write, with the
+    delivery it describes (vault BACKLOG #3040 item 5)."""
     if event not in MESSAGE_EVENT_KINDS:
         raise ValueError(
             f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "

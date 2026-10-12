@@ -8307,31 +8307,26 @@ class RegistryRunner:
             else:
                 # PHASE (b): the store completion round-trip (plain mark_done — the non-capturing path).
                 _done_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                if isinstance(response, ReplyBodyDropped):
-                    # vault BACKLOG #3040 items 2 and 5: the partner answered 2xx and its reply
-                    # body was dropped over the byte bound. The reply_dropped event commits with
-                    # the DONE flip, and the WARNING follows that write and says what it did.
-                    # Status, bound and names only.
-                    recorded = await self.store.mark_done(
-                        item.id,
-                        reply_dropped=(
-                            f"HTTP {response.status}; reply body over the "
-                            f"{response.limit}-byte bound"
-                        ),
-                    )
+                # vault BACKLOG #3040 items 2 and 5: a ReplyBodyDropped means the partner answered
+                # 2xx and its reply body was dropped over the byte bound. The reply_dropped event
+                # commits with the DONE flip, and the WARNING follows that write and says what it
+                # did. Status, bound and names only.
+                dropped = response if isinstance(response, ReplyBodyDropped) else None
+                if dropped is None:
+                    await self.store.mark_done(item.id)
                 else:
-                    recorded = await self.store.mark_done(item.id)
+                    recorded = await self.store.mark_done(item.id, reply_dropped=dropped.detail)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
-                if isinstance(response, ReplyBodyDropped):
+                if dropped is not None:
                     log.warning(
                         "delivery worker %r: outbox row %s (message %s) answered with status %s "
                         "and a response body over the %d-byte bound; the body is dropped, and %s",
                         name,
                         item.id,
                         item.message_id,
-                        response.status,
-                        response.limit,
+                        dropped.status,
+                        dropped.limit,
                         "the row is recorded as delivered with a reply_dropped event"
                         if recorded
                         else "the store recorded nothing: the row was gone or the write was fenced",

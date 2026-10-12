@@ -2421,7 +2421,7 @@ class RestDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # Read the body (drains the connection for clean close; returned for capture). 2xx ⇒
                 # delivered. Decoding a drained body is cheap, so this stays byte-identical when capture
-                # is off (the worker just ignores the return).
+                # is off (send() returns None), except for an over-cap body: see below.
                 # ASVS 15.2.2: bounded on the socket read, so the drain cannot be turned into an
                 # unbounded buffer by a partner that answers a POST with an arbitrarily large body.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not re-send.

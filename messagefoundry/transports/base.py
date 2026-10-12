@@ -825,6 +825,11 @@ class ReplyBodyDropped:
     status: int
     limit: int
 
+    @property
+    def detail(self) -> str:
+        """The ``reply_dropped`` event's detail: the status and the bound, nothing else."""
+        return f"HTTP {self.status}; reply body over the {self.limit}-byte bound"
+
 
 class SourceConnector(abc.ABC):
     """Inbound connector. ``start`` sets the source up, begins delivering received
