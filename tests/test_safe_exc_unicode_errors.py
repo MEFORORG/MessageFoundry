@@ -185,7 +185,7 @@ def test_a_name_in_the_closed_set_is_named(encoding: str) -> None:
         "cp2",
         "cp0",
         "cp11",
-        "CP1",  # the literal is matched exactly, so no other spelling of it prints
+        "CP1",  # every name is matched exactly, so no other spelling of the literal prints
         "cp-1",
         "cp_1",
     ],
@@ -204,10 +204,58 @@ def test_a_code_page_shape_outside_the_closed_set_is_dropped(encoding: str) -> N
         assert not any(ch.isdigit() for ch in text.replace(f"position {_POSITION}", "")), text
 
 
-def test_the_names_outside_the_stdlib_set_are_a_fixed_list() -> None:
-    """The closed set is the stdlib names plus literals written out one by one. A new literal is a
-    decision someone makes here, with the measurement that justifies it."""
-    assert frozenset({"cp1"}) == redaction._WINDOWS_ERROR_NAMES
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        "UTF-8",
+        "Utf-8",
+        "u-t-f-8",
+        "u-_--tf8",
+        "utf--8",
+        "CP1252",
+        "cp_1252",
+        "C-P-0-3-7",
+        "L-1-0",
+        "iSo_8859_15",
+    ],
+)
+def test_another_spelling_of_a_known_name_is_dropped(encoding: str) -> None:
+    """The name prints as given, so the match is on the exact string. A match on a normalized key
+    printed every one of these: case and separators are text a caller chooses."""
+    exc = UnicodeEncodeError(encoding, _TEXT, _POSITION, _POSITION + 1, "invalid character")
+    text = safe_exc(exc)
+    assert "codec" not in text and encoding not in text, text
+
+
+def test_every_name_a_stdlib_text_codec_reports_is_in_the_closed_set() -> None:
+    """The exact match must not cost a real name. Every stdlib text codec this platform can load
+    is made to fail, and each name an error reports must be a string the closed set holds."""
+    texts = [chr(0xDC80), chr(0x10FFFF) + chr(0x15A), chr(0x15A) + chr(0x4E00)]
+    blobs = [bytes.fromhex(h) for h in ("fffe80", "80", "1b24ff", "5c7834", "2bff", "81")]
+    reported: set[str] = set()
+    for module in pkgutil.iter_modules(encodings.__path__):
+        name = module.name
+        if name.startswith("_") or name in redaction._NOT_TEXT_CODECS:
+            continue
+        try:
+            codecs.lookup(name)
+        except LookupError:  # a Windows-only codec on another platform
+            continue
+        for text in texts:
+            try:
+                text.encode(name)
+            except UnicodeError as exc:
+                reported.add(getattr(exc, "encoding", ""))
+        for blob in blobs:
+            try:
+                blob.decode(name)
+            except UnicodeError as exc:
+                reported.add(getattr(exc, "encoding", ""))
+    reported.discard("")  # a bare UnicodeError carries no encoding
+    assert reported >= {"ascii", "utf-8", "latin-1", "charmap", "unicodeescape", "shift_jis"}, (
+        "the sweep must provoke real errors, or it tests nothing"
+    )
+    assert reported <= redaction._KNOWN_CODECS, sorted(reported - redaction._KNOWN_CODECS)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="oem is a Windows-only codec")
@@ -263,7 +311,7 @@ def test_the_non_text_list_matches_the_codec_registry() -> None:
     assert transforms, "the probe must find the transforms, or it tests nothing"
     assert transforms == redaction._NOT_TEXT_CODECS - {"aliases", "undefined"}
     for name in redaction._NOT_TEXT_CODECS:
-        assert redaction._codec_key(name) not in redaction._KNOWN_CODECS
+        assert not set(redaction._spellings(name)) & redaction._KNOWN_CODECS
     assert not any(key.isdigit() for key in redaction._KNOWN_CODECS)
 
 
