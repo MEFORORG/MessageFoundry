@@ -353,7 +353,7 @@ class CertExpiryRunner:
                     try:
                         # Vault BACKLOG #2319: the other rows naming this file. A held copy is
                         # matched by its file, not its hop, so it is reported under each of them.
-                        shared = sharing.get(crl_path_key(check.path), ()) if sharing else ()
+                        shared = sharing.get(crl_path_key(check.path), ())
                         shared_with = tuple(label for label in shared if label != check.label)
                         self._alert_sink.crl_expiry(
                             check.label,
@@ -476,12 +476,13 @@ def _ca_file_crl_refusal(
     pem: bytes, now: float, file_facts: CrlFacts | None
 ) -> tuple[str, str] | None:
     """Why a restart into this CA file would refuse peers, as ``(why, remedy)``, or ``None`` when
-    its CRLs pass the checks a CRL setting meets at start, or it holds none (BACKLOG #3176).
+    its CRLs pass the checks below, or it holds none (BACKLOG #3176).
 
-    Nothing judges a CA file's CRL at start, so a restart loads it whatever it is. The checks are
-    the start's own (:func:`~messagefoundry.config.tls_policy.judge_crl_bytes`, then
-    :func:`~messagefoundry.config.tls_policy.crl_not_in_effect`), then OpenSSL loading exactly the
-    CRLs judged, and each CRL signed by the CA OpenSSL loads from this file for its issuer. A CRL
+    Nothing judges a CA file's CRL at start, so a restart loads it whatever it is. The checks are a
+    CRL setting's start rules (:func:`~messagefoundry.config.tls_policy.judge_crl_bytes`, then
+    :func:`~messagefoundry.config.tls_policy.crl_not_in_effect` with no clock skew), then OpenSSL
+    loading exactly the CRLs judged, then the reload's signature check: each CRL signed by the CA
+    OpenSSL loads from this file for its issuer. A CRL
     whose issuer this file does not hold is not refused: the issuer can be an intermediate the peer
     sends, which the reload treats the same way. ``file_facts`` is the lenient reading, which tells
     an expired CRL from one that cannot be judged. Each remedy leads, because the alert instance
@@ -517,17 +518,24 @@ def _ca_file_crl_refusal(
         # OpenSSL's own reading of these bytes, not of the file again, which may have changed.
         with staged_crl(pem) as copy:
             scratch = crl_scratch_context(str(copy), blocks, label="the CA file")
-    except (ValueError, ssl.SSLError):
-        return unjudged  # OpenSSL loads other CRLs than judged, or none at all
-    except OSError as exc:
-        # The private copy could not be written: nothing about the file. Said, rather than
-        # raised, so the held copy's date still stands this pass.
+        unsigned = crl_signature_refusal(pem, scratch.get_ca_certs(binary_form=True))
+    except ValueError:
+        return unjudged  # OpenSSL loads other CRLs than were judged
+    except ssl.SSLError as exc:
+        # Any block can cause it, a certificate as well as a CRL, and a restart fails on it too.
+        return (
+            "whose CA file OpenSSL cannot load",
+            f"Fix the CA file before restarting: OpenSSL cannot load it ({exc.reason or exc})",
+        )
+    except Exception as exc:
+        # Not a verdict on the file, such as a disk that refuses the private copy. Said, rather
+        # than raised, so the held copy's date still stands this pass.
+        log.warning("cert_expiry: could not check the CRL in a CA file", exc_info=True)
         return (
             "whose CA file the scan could not check",
-            "Check the CRL in the CA file before restarting: the scan could not stage a copy to "
-            f"check it ({exc.strerror or type(exc).__name__}), and tries again each pass",
+            "Check the CRL in the CA file before restarting: the scan could not check it "
+            f"({type(exc).__name__}), and tries again each pass",
         )
-    unsigned = crl_signature_refusal(pem, scratch.get_ca_certs(binary_form=True))
     if unsigned is not None:
         _, issuer_found = unsigned
         if issuer_found:
@@ -612,12 +620,12 @@ def _judge_crl(
                 why = "that differs from the file, which the engine refused to apply to it"
                 # The remedy leads: the alert instance keeps only the start of it (#2319).
                 remedy = f"{refused.remedy}. Reason: {refused.reason}"
-                if some_bundle:
+                if some_bundle and "Restart the engine" not in refused.remedy:
                     # BACKLOG #3176: after the remedy, not instead of it, and never "either way":
                     # a refused reload can say to wait before any restart.
                     remedy += (
-                        ". Once the reload applies it, a hop that loaded this file as its CA file "
-                        "still needs a restart"
+                        ". Once the file is applied, a hop that loaded it as its CA file still "
+                        "needs a restart"
                     )
             elif some_bundle:
                 # BACKLOG #3176: the reload will apply the file to the CRL-setting hops, but only a

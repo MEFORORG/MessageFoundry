@@ -680,6 +680,7 @@ def test_a_ca_file_the_scan_cannot_stage_keeps_the_held_copy_date(
     detail = _bundle_detail(bundle)
 
     assert detail.startswith("Check the CRL in the CA file before restarting")
+    assert "PermissionError" in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -750,8 +751,25 @@ def test_a_refused_reload_of_such_a_file_keeps_its_remedy_first(ca: _Ca, tmp_pat
     finally:
         clear_reload_refusal(both)
 
-    assert detail.startswith(f"{remedy}. Reason: why. Once the reload applies it, a hop that ")
+    assert detail.startswith(f"{remedy}. Reason: why. Once the file is applied, a hop that ")
     assert "either way" not in detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+
+
+def test_a_refusal_that_already_says_restart_gets_no_second_restart(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # A reload refused with "Restart the engine" never applies the file, so a clause that waits for
+    # it to be applied would send the operator after an event that never comes.
+    hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
+    remedy = "Restart the engine to apply the file"
+    record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), "why", remedy))
+    try:
+        detail = _row_detail(both)
+    finally:
+        clear_reload_refusal(both)
+
+    assert detail.startswith(f"{remedy}. Reason: why. Held by: ")
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
