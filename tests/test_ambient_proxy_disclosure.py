@@ -20,7 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from requests.utils import select_proxy
+from requests.utils import get_environ_proxies, select_proxy
 
 from messagefoundry.transports.ambient_proxy import ambient_proxy_warning, environment_proxy_hosts
 
@@ -113,8 +113,8 @@ def test_a_no_proxy_of_star_means_no_warning() -> None:
     assert ambient_proxy_warning(proxies={"https": _PROXY, "no": " *"}) is not None
 
 
-def test_the_proxy_scheme_is_named() -> None:
-    """An https:// proxy leg is TLS and an http:// one is not, so the warning says which."""
+def test_the_proxy_scheme_is_named_as_the_libraries_read_it() -> None:
+    """The scheme is named as written, and a value with none as ``http``, which both read it as."""
     assert environment_proxy_hosts({"https": "https://proxy.example:443"}) == {
         "https": "https://proxy.example:443"
     }
@@ -123,11 +123,58 @@ def test_the_proxy_scheme_is_named() -> None:
     }
 
 
-def test_the_warning_does_not_promise_the_vault_a_loopback_bypass() -> None:
-    """requests has no loopback-direct rule, so an https Vault on 127.0.0.1 is proxied."""
-    assert select_proxy("https://127.0.0.1:8200", {"https": "http://p.example:1"}) == (
-        "http://p.example:1"
-    )
+def test_the_warning_does_not_claim_a_tls_proxy_leg_for_the_urllib_hops() -> None:
+    """Naming ``https://proxy`` must not read as an encrypted leg (SDS-3.7).
+
+    For an https target, urllib reaches even an ``https://`` proxy over plain TCP, and sends
+    ``CONNECT`` and any proxy credential in cleartext. ``tests/test_proxy_url_credentials_refused.py``
+    measures that on the wire. Only the Vault clients get a TLS leg, so only they are said to."""
+    text = ambient_proxy_warning(proxies={"https": "https://u:pw@proxy.example:443"})
+    assert text is not None and "https targets via https://proxy.example:443" in text
+    assert "An https:// one is not refused, and is not safe either." in text
+    assert "the urllib hops reach any proxy over plain TCP" in text
+    assert "and any credential from the proxy URL, in cleartext" in text
+    assert "The Vault and OpenBao clients do open TLS to an https:// proxy" in text
+    for claim in ("is TLS", "encrypted", "is safe"):
+        assert claim not in text, claim
+    # With only an http entry, no Vault hop follows the proxy, so no TLS leg is claimed at all.
+    http_only = ambient_proxy_warning(proxies={"http": "https://proxy.example:443"})
+    assert http_only is not None and "open TLS" not in http_only
+    # With only an all entry, no urllib hop follows it, so their sentences are left out.
+    all_only = ambient_proxy_warning(proxies={"all": "https://proxy.example:443"})
+    assert all_only is not None and "urllib" not in all_only and "open TLS" in all_only
+
+
+def test_an_http_only_proxy_does_not_list_the_vault_clients() -> None:
+    """requests picks no ``http`` entry for an ``https://`` Vault, and ``strict_requests`` refuses an
+    ``http://`` Vault behind any proxy. So an ``http``-only proxy carries no Vault hop."""
+    assert select_proxy("https://vault.example:8200", {"http": "http://p.example:1"}) is None
+    text = ambient_proxy_warning(proxies={"http": _PROXY})
+    assert text is not None and "http targets via http://proxy.example:3128" in text
+    assert "Vault" not in text
+    for hop in ("HTTP-family", "alert webhook", "OIDC", "AI broker"):
+        assert hop in text, hop
+
+
+def test_the_remedy_says_proxy_url_does_not_stop_the_warning() -> None:
+    """``[egress].proxy_url`` moves only the HTTP family, and the warning reads no settings."""
+    text = ambient_proxy_warning(proxies={"https": _PROXY})
+    assert text is not None
+    assert "[egress].proxy_url to an address names a proxy for the HTTP family only" in text
+    assert "The other hops keep this proxy, and this warning still logs" in text
+
+
+def test_the_warning_does_not_promise_the_vault_a_loopback_bypass(
+    no_ambient_proxy: pytest.MonkeyPatch,
+) -> None:
+    """requests has no loopback-direct rule, so an https Vault on 127.0.0.1 is proxied.
+
+    ``get_environ_proxies`` runs requests' own bypass check, which ``select_proxy`` never does."""
+    no_ambient_proxy.setenv("HTTPS_PROXY", "http://p.example:1")
+    assert get_environ_proxies("https://127.0.0.1:8200").get("https") == "http://p.example:1"
+    # Control: the same call does honour a bypass rule when one names the host.
+    no_ambient_proxy.setenv("NO_PROXY", "127.0.0.1")
+    assert "https" not in get_environ_proxies("https://127.0.0.1:8200")
     text = ambient_proxy_warning(proxies={"https": _PROXY})
     assert text is not None
     assert "Vault and OpenBao clients, loopback addresses included" in text
