@@ -88,6 +88,9 @@ async def store() -> AsyncIterator[object]:
                 "message_events",
                 "audit_log",
                 "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
+                "keyed_surface",  # BACKLOG #3383 markers (no FK): a keyed test leaves every surface
+                #                   marked, and a later keyless-then-keyed migration would then
+                #                   refuse, not seal
                 "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
                 #                      runs and break the key-rotation reencrypt scan (persistent contamination)
                 "state",
@@ -2785,6 +2788,45 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -
         with pytest.raises(CipherError, match=r"messages\.raw"):
             await reopened.get_message(planted)
         assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
+    finally:
+        await reopened.close()
+
+
+async def test_a_plant_on_a_never_written_keyed_surface_is_refused_ss(store) -> None:
+    """BACKLOG #3383 (owner ruling 2026-10-10), the ``sqlserver-store`` twin of the same-named test
+    in ``tests/test_store_strict_ciphertext.py``. ``messages.error`` is never written here, so it
+    holds no ciphertext. The keyed open still writes its ``keyed_surface`` marker, the marker
+    survives a restart, and a plant written there afterwards is refused rather than sealed."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher, CipherError
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    plant = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\r"
+    keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(bytearray(b"k" * 32)))
+    try:
+        mid = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
+        )
+        row = (await keyed._fetchall("SELECT error FROM messages WHERE id=?", (mid,)))[0]
+        assert row["error"] in (None, "")  # the surface holds no ciphertext
+        await keyed._execute("UPDATE messages SET error=? WHERE id=?", (plant, mid))
+    finally:
+        await keyed.close()
+    rows = await store._fetchall("SELECT surface_table, surface_column FROM keyed_surface")
+    marks = {(r["surface_table"], r["surface_column"]) for r in rows}
+    assert {("messages", "error"), ("messages", "raw")} <= marks  # survived the close
+
+    cipher = AesGcmCipher(bytearray(b"k" * 32))
+    refused: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda t, c: refused.append((t, c)))
+    reopened = await SqlServerStore.open(settings, cipher=cipher)
+    try:
+        assert refused == [("messages", "error")], "the open must find the plant once"
+        row = (await reopened._fetchall("SELECT error FROM messages WHERE id=?", (mid,)))[0]
+        assert row["error"] == plant, "the keyed reopen sealed a plant on a keyed surface"
+        with pytest.raises(CipherError, match=r"messages\.error"):
+            await reopened.get_message(mid)
     finally:
         await reopened.close()
 

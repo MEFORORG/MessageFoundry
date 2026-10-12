@@ -301,8 +301,9 @@ class _UnmarkedPolicy:
     ASVS 11.3.3).
 
     **It refuses, by default.** A keyed store writes only marked ciphertext into a cipher-covered
-    column, and the at-open sweep seals legacy plaintext only on a surface that holds no ciphertext
-    yet. So once a key is configured, a non-blank unmarked value in a covered column is a stripped
+    column, and the at-open sweep seals legacy plaintext only on a surface that is still unsealed:
+    not yet recorded in the store's ``keyed_surface`` table and holding no ciphertext (BACKLOG
+    #3383). So once a key is configured, a non-blank unmarked value in a covered column is a stripped
     marker or a planted row. Returning it as plaintext -- what this seam did before -- is exactly where
     the AEAD tag's protection against modification was lost: substitution has a tag to fail, and a
     downgrade to plaintext has none, so only a refusal can stop it.

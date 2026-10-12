@@ -19,6 +19,10 @@ fail; a downgrade to plaintext has none, so only a refusal protects it.
   ``tests/test_uploads_strict_ciphertext.py``.
 * A crash part-way through a first keyed open leaves the surface all sealed or all unsealed, and the
   AES-GCM invocation bound (ASVS 11.3.4) still leads every encrypt of the one-transaction seal.
+* The persisted ``keyed_surface`` marker (BACKLOG #3383, owner ruling 2026-10-10): once a keyed open
+  has visited a surface, a plaintext value planted there later is refused, even when the surface held
+  no ciphertext -- a column never written, or one every purge has blanked. Legacy plaintext is still
+  sealed once, at the first keyed open, in the same transaction as its marker.
 
 SQLite only. The server-backend runtime twins live in ``tests/test_postgres_store.py`` and
 ``tests/test_sqlserver_store.py`` and run only on the hosted ``postgres-store`` / ``sqlserver-store``
@@ -84,12 +88,30 @@ def _raw_at_rest(db: Path, mid: str) -> str | None:
 
 
 def _set_raw(db: Path, mid: str, value: str) -> None:
+    _set_cell(db, "raw", mid, value)
+
+
+def _set_cell(db: Path, column: str, mid: str, value: str | None) -> None:
+    """Write ``messages.<column>`` for one row behind the store's back -- a plant, or a purge."""
     conn = sqlite3.connect(db)
     try:
-        conn.execute("UPDATE messages SET raw=? WHERE id=?", (value, mid))
+        conn.execute(f"UPDATE messages SET {column}=? WHERE id=?", (value, mid))
         conn.commit()
     finally:
         conn.close()
+
+
+def _cell_at_rest(db: Path, column: str, mid: str) -> str | None:
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(f"SELECT {column} FROM messages WHERE id=?", (mid,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _keyed_surfaces(db: Path) -> set[tuple[str, str]]:
+    """The persisted ``keyed_surface`` markers (BACKLOG #3383), read behind the store's back."""
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("SELECT surface_table, surface_column FROM keyed_surface").fetchall()
+    return {(str(t), str(c)) for t, c in rows}
 
 
 class _Sink:
@@ -118,7 +140,7 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_and_alerts(
     try:
         # The keyed open did NOT seal the plant: sealing would launder it into genuine ciphertext.
         assert _raw_at_rest(db, planted) == _PLANT
-        assert "messages.raw holds 1 unmarked value(s) beside sealed ones" in caplog.text
+        assert "messages.raw is sealed and holds 1 unmarked value(s)" in caplog.text
 
         sink = _Sink()
         engine = Engine(
@@ -313,10 +335,14 @@ async def test_a_crash_mid_seal_leaves_the_surface_all_unsealed(tmp_path: Path) 
             "SELECT COUNT(*) FROM messages WHERE raw LIKE ?", (f"{MARKER_PREFIX}%",)
         ).fetchone()
     assert marked == 0, f"{marked} of 600 rows committed sealed: the surface is half-sealed"
+    # The marker rolled back with the seal (BACKLOG #3383): a marker that survived the crash would
+    # make the next open refuse the 600 legitimate legacy rows instead of sealing them.
+    assert ("messages", "raw") not in _keyed_surfaces(db)
 
     healthy = _keyed(key)
     store = await MessageStore.open(db, cipher=healthy)
     try:
+        assert ("messages", "raw") in _keyed_surfaces(db)
         assert all((_raw_at_rest(db, m) or "").startswith(MARKER_PREFIX) for m in ids)
         assert (await store.get_message(ids[0]) or {})["raw"] == _RAW.format(i=0)
         assert (await store.get_message(ids[-1]) or {})["raw"] == _RAW.format(i=599)
@@ -528,5 +554,130 @@ async def test_the_open_reports_a_surface_once_and_each_refused_read_once(tmp_pa
         with pytest.raises(CipherError, match=r"messages\.raw"):
             await store.get_message(planted)
         assert seen == [("messages", "raw")] * 2  # plus one per refused read
+    finally:
+        await store.close()
+
+
+# --- the persisted keyed-surface marker (BACKLOG #3383, owner ruling 2026-10-10) ------------------
+
+
+async def test_a_plant_on_a_never_written_keyed_surface_is_refused(tmp_path: Path) -> None:
+    """The gap #3383 closes. ``messages.error`` is never written on these rows, so it holds no
+    ciphertext. Before the marker, the next keyed open read that as unsealed and sealed the plant as
+    legacy data, which then read back as genuine content."""
+    db = tmp_path / "never.db"
+    key = generate_key()
+    _good, planted = await _seed(db, 2, _keyed(key))
+    assert ("messages", "error") in _keyed_surfaces(db)  # keyed while empty
+    _set_cell(db, "error", planted, _PLANT)
+
+    cipher = _keyed(key)
+    seen: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        assert _cell_at_rest(db, "error", planted) == _PLANT  # NOT sealed into ciphertext
+        assert seen == [("messages", "error")]  # the open found it and alerted
+        with pytest.raises(CipherError, match=r"messages\.error"):
+            await store.get_message(planted)
+    finally:
+        await store.close()
+
+
+async def test_a_plant_on_a_purged_keyed_surface_is_refused(tmp_path: Path) -> None:
+    """Every row of ``messages.raw`` purged to ``''``, so no ciphertext is left on the surface. The
+    marker still holds it sealed, so a plant written there afterwards is refused, not sealed."""
+    db = tmp_path / "purged.db"
+    key = generate_key()
+    ids = await _seed(db, 2, _keyed(key))
+    for mid in ids:
+        _set_raw(db, mid, "")  # what retention writes
+    _set_raw(db, ids[1], _PLANT)
+
+    store = await MessageStore.open(db, cipher=_keyed(key))
+    try:
+        assert _raw_at_rest(db, ids[1]) == _PLANT
+        assert (await store.get_message(ids[0]) or {})["raw"] == ""
+        with pytest.raises(CipherError, match=r"messages\.raw"):
+            await store.get_message(ids[1])
+    finally:
+        await store.close()
+
+
+async def test_legacy_plaintext_is_sealed_once_then_the_surface_stays_keyed(tmp_path: Path) -> None:
+    """An existing keyless store: its first keyed open seals the legacy rows and writes the marker
+    for every surface, the empty ones included. The markers survive a restart, a keyless open in
+    between, and a later plant is refused rather than sealed."""
+    db = tmp_path / "once.db"
+    ids = await _seed(db, 3)
+    assert _keyed_surfaces(db) == set()  # a keyless open writes no marker
+    key = generate_key()
+
+    store = await MessageStore.open(db, cipher=_keyed(key))
+    try:
+        assert all((_raw_at_rest(db, m) or "").startswith(MARKER_PREFIX) for m in ids)
+    finally:
+        await store.close()
+    keyed = _keyed_surfaces(db)
+    # Every surface the sweep visits, sealed or empty. A floor, not the full list: adding a cipher
+    # column is routine and must not red this test.
+    assert {("messages", "raw"), ("queue", "payload"), ("users", "totp_secret")} <= keyed
+    assert {("state", "value"), ("attachment_chunk", "ciphertext")} <= keyed
+
+    store = await MessageStore.open(db)  # a keyless restart changes nothing
+    await store.close()
+    assert _keyed_surfaces(db) == keyed
+
+    _set_cell(db, "summary", ids[0], _PLANT)  # never written by this seed
+    store = await MessageStore.open(db, cipher=_keyed(key))
+    try:
+        assert _keyed_surfaces(db) == keyed
+        assert _cell_at_rest(db, "summary", ids[0]) == _PLANT
+        with pytest.raises(CipherError, match=r"messages\.summary"):
+            await store.get_message(ids[0])
+    finally:
+        await store.close()
+
+
+async def test_the_opt_out_seals_a_plant_on_a_keyed_surface(tmp_path: Path) -> None:
+    """``[store].allow_unmarked_ciphertext`` keeps its documented meaning: the open seals every
+    unmarked value, the marker notwithstanding, and the marker stays."""
+    db = tmp_path / "optout-marker.db"
+    key = generate_key()
+    _good, planted = await _seed(db, 2, _keyed(key))
+    _set_cell(db, "error", planted, _PLANT)
+
+    cipher = build_store_cipher(StoreSettings(encryption_key=key, allow_unmarked_ciphertext=True))
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        assert (_cell_at_rest(db, "error", planted) or "").startswith(MARKER_PREFIX)
+        assert (await store.get_message(planted) or {})["error"] == _PLANT
+    finally:
+        await store.close()
+    assert ("messages", "error") in _keyed_surfaces(db)
+
+
+async def test_a_surface_keyed_by_another_process_mid_open_is_not_sealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seal writes the marker first, in its own transaction. If the marker is already there,
+    another process keyed the surface after this open read it, so this open seals nothing. Simulated
+    by hiding the marker from the read that precedes the seal, on a surface with no ciphertext, so
+    the data check cannot call it sealed either."""
+    db = tmp_path / "peer.db"
+    key = generate_key()
+    _good, planted = await _seed(db, 2, _keyed(key))
+    _set_cell(db, "error", planted, _PLANT)
+    assert ("messages", "error") in _keyed_surfaces(db)
+
+    async def unkeyed_read(self: MessageStore, table: str, column: str) -> bool:
+        return False
+
+    monkeypatch.setattr(MessageStore, "_surface_keyed", unkeyed_read)
+    store = await MessageStore.open(db, cipher=_keyed(key))
+    try:
+        assert _cell_at_rest(db, "error", planted) == _PLANT  # the claim lost; nothing was sealed
+        with pytest.raises(CipherError, match=r"messages\.error"):
+            await store.get_message(planted)
     finally:
         await store.close()
