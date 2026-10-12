@@ -189,8 +189,12 @@ the route takes a body.
   for a body that does not parse.
 - Nothing is handed from the early check to the gate. A session that ends while the body is
   arriving is refused by the gate. The price is one more identity lookup for a signed-in
-  request to a route with a body. That lookup reads the session, its user and the user's roles.
-  It writes nothing, so it does not move the session's idle clock.
+  request to a route with a body. That lookup reads at least the session, its user and the user's
+  roles. It never moves the session's idle clock, and for a session it accepts it writes nothing.
+  It can revoke a session it refuses, as the gate's own lookup would. At least two cases do: a
+  session past its idle or absolute limit, and one whose temporary password lapsed. That second
+  case can also write an `auth.temp_password_expired` audit row. `AuthService.identity_for_token`
+  is the full list. A caller this lookup refuses gets 401 before the body is read.
 - A route with no gate that is declared public is not touched. `POST /auth/login` has to parse a
   body from a caller with no session. A route with no gate and no declaration is refused before
   its body is read, as described below. A gated route that declares no body is not touched either, because FastAPI already
