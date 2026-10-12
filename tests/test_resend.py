@@ -229,10 +229,10 @@ async def test_resend_ambiguous_source_requires_from(store: MessageStore) -> Non
 
 
 async def test_resend_derefs_a_shared_body(store: MessageStore) -> None:
-    # A fanned-out identical body is stored ONCE in shared_body (body_ref set, inline payload ''). The
-    # resend must DEREF it, not ship the '' sentinel (must-fix: deref the shared body).
+    # A fanned-out identical body is stored ONCE in shared_body (body_ref set); the row's own payload
+    # holds only the sealed reference (BACKLOG #2593). The resend must DEREF it, not ship the reference.
     mid = await _seed(store, deliveries=[("OB1", TRANSFORMED), ("OB3", TRANSFORMED)])
-    # confirm the source is genuinely a shared-body row (empty inline payload)
+    # confirm the source is genuinely a shared-body row (its payload is the reference, not the body)
     async with store._read() as db:
         cur = await db.execute(
             "SELECT body_ref, payload FROM queue WHERE message_id=? AND destination_name=?",
@@ -240,7 +240,7 @@ async def test_resend_derefs_a_shared_body(store: MessageStore) -> None:
         )
         src = await cur.fetchone()
         assert src is not None
-    assert src["body_ref"] is not None and src["payload"] == ""
+    assert src["body_ref"] is not None and src["payload"] not in ("", TRANSFORMED)
     out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", from_="OB1")
     assert out.status == "resent"
     payloads = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(mid)}

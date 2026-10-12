@@ -134,6 +134,16 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
+from messagefoundry.store.queue_tag import (
+    QUEUE_TAG_COLUMNS,
+    QUEUE_TAG_SELECT,
+    QueueTagError,
+    alert_queue_tag_failure,
+    open_queue_cell,
+    queue_payload_aad,
+    queue_row_aad,
+    report_queue_tag_failure,
+)
 from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.schema_verify import (
     SchemaMismatchError,
@@ -890,8 +900,10 @@ UPLOAD_RESERVATION_STALE_AFTER = 300.0
 #:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins);
 #: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
 #:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
-#: 3. a store-once row's ``''`` inline payload is a DEREF SENTINEL, not an erasure — it carries a
-#:    live ``body_ref``, and the purge releases that ref *before* it blanks the row.
+#: 3. a store-once row's ``payload`` holds its sealed ``shared_body`` key (BACKLOG #2593), and the
+#:    purge releases that ref *before* it blanks the row. So the ``body_ref`` arm decides nothing
+#:    for a row the store wrote. It is harmless for any other row: a blank payload is never
+#:    delivered, because the claim refuses it (:func:`~messagefoundry.store.queue_tag.open_queue_cell`).
 #:
 #: Spliced into at least :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can
 #: re-queue a delivery whose content no longer exists: the connector would be handed a zero-byte
@@ -985,31 +997,18 @@ class OutboxItem:
     created_at: float | None = None
 
     @classmethod
-    def from_row(
-        cls,
-        row: aiosqlite.Row,
-        cipher: Cipher,
-        *,
-        body_aad: bytes,
-        shared_ciphertext: str | None = None,
-    ) -> OutboxItem:
-        """Build an item from a claimed queue row, decrypting its body for processing/delivery.
+    def from_row(cls, row: aiosqlite.Row, payload: str) -> OutboxItem:
+        """Build an item from a claimed queue row and its already-opened body.
 
-        ``shared_ciphertext`` is the store-once deref seam: when a row carries a ``body_ref`` (its body
-        lives once in ``shared_body``), the caller passes that shared copy's ciphertext here and it is
-        decrypted in place of the row's empty inline ``payload``. ``None`` (no ref) decrypts the inline
-        ``payload`` exactly as before — byte-identical. ``body_aad`` is the cell-binding AAD (ASVS
-        11.3.3) the caller built for the ciphertext's *source* cell: ``cell_aad("shared_body","body",
-        hash)`` for a deref'd shared body, ``cell_aad("queue","payload", row.id)`` for an inline one — so
-        the deref never reconstructs the wrong cell's AAD (a v1 row ignores it via dual-read)."""
-        ciphertext = shared_ciphertext if shared_ciphertext is not None else row["payload"]
+        The caller opens the body: the row's own ``payload`` under its routing tag, or, for a
+        store-once row, the shared body its sealed reference names (BACKLOG #2593,
+        :meth:`MessageStore._outbox_item_from_row`)."""
         return cls(
             id=row["id"],
             message_id=row["message_id"],
             channel_id=row["channel_id"],
             destination_name=row["destination_name"],
-            # decrypt the body for processing/delivery, bound to its source cell (ASVS 11.3.3)
-            payload=cipher.decrypt(ciphertext, aad=body_aad),
+            payload=payload,
             attempts=row["attempts"],
             stage=row["stage"],
             # Plaintext metadata (the handler to run), not a body — never encrypted. NULL off-routed.
@@ -5173,7 +5172,7 @@ CREATE TABLE IF NOT EXISTS queue (
                                       -- pass-through completion marker (#1580); NULL otherwise
     payload          TEXT NOT NULL,   -- stage body (encoded): ingress/routed=raw, outbound=transformed
     body_ref         TEXT,            -- store-once-deliver-many: when set, the body lives ONCE in
-                                      -- shared_body[body_ref] and payload is '' (deref'd at delivery);
+                                      -- shared_body[body_ref] and payload seals that key (#2593);
                                       -- NULL = body is inline in payload (the default, byte-identical)
     status           TEXT NOT NULL,
     attempts         INTEGER NOT NULL DEFAULT 0,
@@ -6550,7 +6549,9 @@ class MessageStore:
     # migration/rotation loops, binding cell_aad(table, column, id). (ASVS 11.3.3, ADR 0019.)
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
-        ("queue", "payload"),
+        # NB: `queue.payload` is cipher-covered but NOT id-keyed: its tag binds the row's routing
+        # fields (BACKLOG #2593, `queue_row_aad`), so it has its own pass in _encrypt_existing_rows
+        # and reencrypt_to_active.
         ("messages", "error"),
         ("queue", "last_error"),
         ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
@@ -6609,6 +6610,15 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
                 total += await self._seal_surface(table, column, like, aad_cols=("id",))
+            # The `queue.payload` cell binds the row's routing fields (BACKLOG #2593).
+            total += await self._seal_surface(
+                "queue",
+                "payload",
+                like,
+                aad_cols=QUEUE_TAG_COLUMNS,
+                key_cols=("id",),
+                aad_of=queue_row_aad,
+            )
             # The `state` table (composite PK, ADR 0005) binds its AAD to (namespace, key).
             total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
             # The `reference` table (composite PK name,version,key — ADR 0006).
@@ -6669,13 +6679,16 @@ class MessageStore:
         *,
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
+        aad_of: Callable[[aiosqlite.Row], bytes] | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext, in ONE transaction; return the count.
 
         The caller holds ``self._lock``. ``aad_cols`` rebuild the cell AAD the write/read path binds;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. All identifiers are code
-        constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. ``aad_of``, when given,
+        builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
+        queue payload's routing tag, BACKLOG #2593). All identifiers are code constants from
+        :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
 
         Three steps, in this order:
 
@@ -6735,7 +6748,12 @@ class MessageStore:
                     [
                         (
                             self._cipher.encrypt(
-                                r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                                r["v"],
+                                aad=(
+                                    aad_of(r)
+                                    if aad_of is not None
+                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
+                                ),
                             ),
                             *(r[c] for c in keys),
                         )
@@ -6820,6 +6838,8 @@ class MessageStore:
                     await self._commit()
                     await self._charge_bound_batch()
                     total += len(rows)
+            # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
+            total += await self._reencrypt_queue_payload_to_active(cipher, active_like, batch)
             # The `state` table has a composite PK (namespace,key), not an `id`, so it can't ride the
             # generic id-keyed loop above — rotate it with its own pass (ADR 0005).
             total += await self._reencrypt_state_to_active(cipher, active_like, batch)
@@ -6861,6 +6881,32 @@ class MessageStore:
         under the cell-bound writer, upgrades to a cell-bound v4 value. The single seam every rotation
         loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
+
+    async def _reencrypt_queue_payload_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
+        (:func:`queue_row_aad`, BACKLOG #2593); caller holds ``self._lock``. The id-keyed loop's
+        shape, with the tag columns selected so the decrypt and the encrypt share one tag. A cell
+        whose tag no longer matches its row raises, so the rotation stops rather than re-seal it."""
+        total = 0
+        while True:
+            cur = await self._db.execute(
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                " WHERE payload NOT LIKE ? AND payload <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                return total
+            updates = [
+                (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
+                for r in rows
+            ]
+            await self._db.executemany("UPDATE queue SET payload=? WHERE id=?", updates)
+            await self._commit()
+            await self._charge_bound_batch()
+            total += len(rows)
 
     async def _reencrypt_attachment_chunks_to_active(
         self, cipher: AesGcmCipher, active_like: str, batch: int
@@ -7923,28 +7969,38 @@ class MessageStore:
 
         ``body_ref`` is the store-once seam: ``None`` (default) inlines the encrypted body in ``payload``
         (byte-identical to the pre-feature path); a non-``None`` content-address hash references the single
-        copy in ``shared_body`` and stores an empty inline ``payload`` (dereferenced at delivery). The
-        caller (:meth:`_insert_outbound_deliveries`) reserves the shared_body row before passing a ref."""
+        copy in ``shared_body``, and ``payload`` holds that hash sealed under the row's tag (BACKLOG
+        #2593), dereferenced at delivery. The caller (:meth:`_insert_outbound_deliveries`) reserves the
+        shared_body row before passing a ref."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
         row_id = uuid4().hex
-        # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
-        # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
+        # BACKLOG #2593: the payload is sealed under the row's own routing tag. A shared-body row seals
+        # its `shared_body` key here instead of leaving the cell blank, so every deliverable row holds
+        # exactly one sealed cell and a blank payload is never delivered on a keyed store.
         #
-        # DO NOT "simplify" the else-arm to `self._enc(...)`. `_enc` short-circuits a falsy value to
-        # itself, so a legitimately EMPTY body would land as '' — indistinguishable at rest from a
-        # retention erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The
-        # direct `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two
-        # apart on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
+        # DO NOT "simplify" this to `self._enc(...)`. `_enc` short-circuits a falsy value to itself,
+        # so a legitimately EMPTY body would land as '' — indistinguishable at rest from a retention
+        # erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The direct
+        # `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two apart
+        # on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
         # guard is replay-only, so a first delivery is unaffected either way.)
-        stored_payload = (
-            ""
-            if body_ref is not None
-            else self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id))
+        stored_payload = self._cipher.encrypt(
+            payload if body_ref is None else body_ref,
+            aad=queue_payload_aad(
+                row_id=row_id,
+                message_id=mid,
+                stage=Stage.OUTBOUND.value,
+                channel_id=channel_id,
+                destination_name=dest_name,
+                handler_name=None,
+                body_ref=body_ref,
+            ),
         )
         if body_ref is None:
-            # A1: an inline body is one durable copy; a shared-body row (body_ref set) stores '' here and
-            # the single copy is counted once in _reserve_shared_body (store-once-aware amplification).
+            # A1: an inline body is one durable copy; a shared-body row (body_ref set) stores only its
+            # sealed reference here, and the single copy is counted once in _reserve_shared_body
+            # (store-once-aware amplification).
             self.body_copies += 1
         await self._db.execute(
             "INSERT INTO queue"
@@ -7991,7 +8047,18 @@ class MessageStore:
                 Stage.ROUTED.value,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+                self._cipher.encrypt(
+                    payload,
+                    aad=queue_payload_aad(
+                        row_id=row_id,
+                        message_id=mid,
+                        stage=Stage.ROUTED.value,
+                        channel_id=channel_id,
+                        destination_name=None,
+                        handler_name=handler_name,
+                        body_ref=None,
+                    ),
+                ),
                 OutboxStatus.PENDING.value,
                 now,
                 created_at,
@@ -8069,7 +8136,18 @@ class MessageStore:
                     mid,
                     Stage.INGRESS.value,
                     channel_id,
-                    self._cipher.encrypt(raw, aad=cell_aad("queue", "payload", ingress_row_id)),
+                    self._cipher.encrypt(
+                        raw,
+                        aad=queue_payload_aad(
+                            row_id=ingress_row_id,
+                            message_id=mid,
+                            stage=Stage.INGRESS.value,
+                            channel_id=channel_id,
+                            destination_name=None,
+                            handler_name=None,
+                            body_ref=None,
+                        ),
+                    ),
                     OutboxStatus.PENDING.value,
                     now,
                     ingress_created_at,
@@ -8655,41 +8733,62 @@ class MessageStore:
             try:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
-                log.warning("dead-lettering undecryptable outbox row %s: %s", row["id"], exc)
                 # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
                 # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
-                await self.dead_letter_now(
-                    row["id"], f"undecryptable payload: {exc}", _standalone=True
-                )
+                await self._dead_letter_unopenable(row, exc)
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
         """Build an :class:`OutboxItem` from a claimed queue row, dereferencing a shared body if any.
 
-        Store-once-deliver-many deref: a row with a non-NULL ``body_ref`` holds its body once in
-        ``shared_body`` (its inline ``payload`` is empty); fetch that single encrypted copy and decrypt it
-        as the row's body. A row with no ``body_ref`` decrypts its inline ``payload`` directly — byte-
-        identical to the pre-feature path (no shared_body read). A missing shared body (corruption /
-        premature GC) raises like any undecryptable payload, so the caller dead-letters that one row
-        rather than stalling the lane."""
-        body_ref = row["body_ref"] if "body_ref" in row.keys() else None  # noqa: SIM118
-        if body_ref is None:
-            # Inline body — bound to this queue row's own cell (ASVS 11.3.3).
-            return OutboxItem.from_row(
-                row, self._cipher, body_aad=cell_aad("queue", "payload", row["id"])
-            )
+        The row's ``payload`` is opened under the tag its own routing fields build (BACKLOG #2593), so
+        a row whose ``stage``, ``channel_id``, ``destination_name``, ``handler_name``, ``message_id``
+        or body kind changed outside the store raises :class:`QueueTagError`. An inline row's cell is
+        its body. A store-once row's cell is the sealed ``shared_body`` key; it must equal the
+        ``body_ref`` column, and the single shared copy it names is then decrypted as the body. A
+        missing shared body (corruption / premature GC) raises like any undecryptable payload, so the
+        caller dead-letters that one row rather than stalling the lane."""
+        if row["body_ref"] is None:
+            return OutboxItem.from_row(row, open_queue_cell(self._cipher, row))
         async with self._read() as db:
-            cur = await db.execute("SELECT body FROM shared_body WHERE hash=?", (body_ref,))
-            br = await cur.fetchone()
+            return OutboxItem.from_row(row, await self._open_queue_body(db, row))
+
+    async def _open_queue_body(
+        self, db: aiosqlite.Connection, row: aiosqlite.Row, *, alert_only: bool = False
+    ) -> str:
+        """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593).
+
+        An inline row's ``payload`` is the body. A store-once row's ``payload`` is the sealed
+        ``shared_body`` key, checked against ``body_ref`` by :func:`open_queue_cell`; the single
+        shared copy that key names is read on ``db`` and decrypted under its content-address cell.
+
+        ``alert_only`` is for a read inside a writer transaction (the resend source), which cannot
+        take the writer lock again for an audit row: a tag failure there raises the alert and
+        propagates, refusing the read."""
+        try:
+            opened = open_queue_cell(self._cipher, row)
+        except QueueTagError:
+            if alert_only:
+                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+            raise
+        if row["body_ref"] is None:
+            return opened
+        cur = await db.execute("SELECT body FROM shared_body WHERE hash=?", (opened,))
+        br = await cur.fetchone()
         if br is None:
-            raise CipherError(f"shared body {body_ref} missing")
+            raise CipherError(f"shared body {opened} missing")
         # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
-        return OutboxItem.from_row(
-            row,
-            self._cipher,
-            body_aad=cell_aad("shared_body", "body", body_ref),
-            shared_ciphertext=br["body"],
-        )
+        return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
+
+    async def _dead_letter_unopenable(self, row: aiosqlite.Row, exc: Exception) -> None:
+        """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
+        runs after the claim committed, so it must never join a group batch). A row that failed its
+        queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
+        (BACKLOG #2593). The lane moves on either way."""
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
+        if isinstance(exc, QueueTagError):
+            await report_queue_tag_failure(self, self._cipher, row)
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
@@ -8808,13 +8907,10 @@ class MessageStore:
             # let the next poll advance to the new head, rather than re-raising into the worker (H-1).
             # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
             # payload is also pushed as an `integrity_drift` alert: the cipher's refusal hook reaches
-            # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its tag still
-            # gets no push alert -- a documented follow-up.
-            log.warning("dead-lettering undecryptable queue row %s: %s", claimed["id"], exc)
+            # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
+            # is audited and alerted too (BACKLOG #2593).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
-            await self.dead_letter_now(
-                claimed["id"], f"undecryptable payload: {exc}", _standalone=True
-            )
+            await self._dead_letter_unopenable(claimed, exc)
             return None
 
     async def claim_next_fifo_batch(
@@ -8892,10 +8988,7 @@ class MessageStore:
             try:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
-                log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-                await self.dead_letter_now(
-                    row["id"], f"undecryptable payload: {exc}", _standalone=True
-                )
+                await self._dead_letter_unopenable(row, exc)
         return items
 
     async def claim_fifo_heads(
@@ -9016,10 +9109,7 @@ class MessageStore:
                 try:
                     items.append(await self._outbox_item_from_row(row))
                 except Exception as exc:
-                    log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-                    await self.dead_letter_now(
-                        row["id"], f"undecryptable payload: {exc}", _standalone=True
-                    )
+                    await self._dead_letter_unopenable(row, exc)
             if items:
                 by_lane[lane] = items
             else:
@@ -9352,7 +9442,18 @@ class MessageStore:
                         reingress_to,
                         None,
                         None,
-                        self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
+                        self._enc(
+                            artifact_ref,
+                            aad=queue_payload_aad(
+                                row_id=work_row_id,
+                                message_id=message_id,
+                                stage=Stage.RESPONSE.value,
+                                channel_id=reingress_to,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        ),
                         OutboxStatus.PENDING.value,
                         0,
                         now,
@@ -9482,7 +9583,18 @@ class MessageStore:
                     pt_channel,
                     None,
                     None,
-                    self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
+                    self._cipher.encrypt(
+                        body,
+                        aad=queue_payload_aad(
+                            row_id=pt_ingress_id,
+                            message_id=new_mid,
+                            stage=Stage.INGRESS.value,
+                            channel_id=pt_channel,
+                            destination_name=None,
+                            handler_name=None,
+                            body_ref=None,
+                        ),
+                    ),
                     OutboxStatus.PENDING.value,
                     0,
                     now,
@@ -9531,7 +9643,18 @@ class MessageStore:
                 pt_name,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
-                self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
+                self._cipher.encrypt(
+                    "",
+                    aad=queue_payload_aad(
+                        row_id=marker_id,
+                        message_id=parent_id,
+                        stage=Stage.OUTBOUND.value,
+                        channel_id=pt_name,
+                        destination_name=pt_name,
+                        handler_name=PASSTHROUGH_MARKER_HANDLER,
+                        body_ref=None,
+                    ),
+                ),
                 status,
                 0,
                 now,
@@ -9590,7 +9713,7 @@ class MessageStore:
         async with _writer_txn(self._db, self._lock):
             # 1. The work-row must still be INFLIGHT (the claim set it so); it carries the artifact ref.
             cur = await self._db.execute(
-                "SELECT message_id, payload FROM queue WHERE id=? AND stage=? AND status=?",
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=? AND status=?",
                 (response_row_id, Stage.RESPONSE.value, OutboxStatus.INFLIGHT.value),
             )
             wr = await cur.fetchone()
@@ -9599,13 +9722,7 @@ class MessageStore:
                 return False
             origin_id = wr["message_id"]
             try:
-                ref = (
-                    self._dec(
-                        wr["payload"],
-                        aad=cell_aad("queue", "payload", response_row_id),
-                    )
-                    or ""
-                )
+                ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
             except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
@@ -9740,7 +9857,16 @@ class MessageStore:
                             None,
                             None,
                             self._cipher.encrypt(
-                                body, aad=cell_aad("queue", "payload", reingress_row_id)
+                                body,
+                                aad=queue_payload_aad(
+                                    row_id=reingress_row_id,
+                                    message_id=new_mid,
+                                    stage=Stage.INGRESS.value,
+                                    channel_id=loopback_channel_id,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
                             ),
                             OutboxStatus.PENDING.value,
                             0,
@@ -9781,13 +9907,13 @@ class MessageStore:
         for the message raw, so the peek and the raw always agree."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT payload FROM queue WHERE id=? AND stage=?",
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
                 (response_row_id, Stage.RESPONSE.value),
             )
             row = await cur.fetchone()
             if row is None:
                 return None
-            ref = self._dec(row["payload"], aad=cell_aad("queue", "payload", response_row_id)) or ""
+            ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
             try:
                 mid, dest, seq_s = ref.split("\x1f")
             except ValueError:
@@ -10731,10 +10857,8 @@ class MessageStore:
                     src_where += " AND destination_name=?"
                     src_params.append(from_)
                 cur = await self._db.execute(
-                    "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
-                    " COALESCE(sb.body, q.payload) AS _body_ciphertext"
-                    " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
-                    f" WHERE {src_where} ORDER BY q.destination_name",
+                    f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                    f" WHERE {src_where} ORDER BY destination_name",
                     tuple(src_params),
                 )
                 rows = list(await cur.fetchall())
@@ -10752,17 +10876,16 @@ class MessageStore:
                 src = rows[0]
                 src_channel = str(src["channel_id"])
                 src_dest = str(src["destination_name"])
-                # The body's cell depends on its source: a store-once shared body (body_ref set) binds
-                # to the shared_body content-address; an inline payload binds to the queue row (11.3.3).
-                body_aad = (
-                    cell_aad("shared_body", "body", src["body_ref"])
-                    if src["body_ref"] is not None
-                    else cell_aad("queue", "payload", src["id"])
-                )
-                decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
                 # must-fix #2 / §5: a retention-nulled ('') source body would ship a zero-length body
-                # recorded PROCESSED. Reject rather than resend nothing. (A '' inline payload is exactly
-                # what purge_message_bodies leaves; the deref COALESCE already resolved any shared body.)
+                # recorded PROCESSED. Reject rather than resend nothing. A '' payload is exactly what
+                # purge_message_bodies leaves; a store-once row holds its sealed reference there.
+                # Otherwise the body is opened under the source row's own tag (BACKLOG #2593), and a
+                # store-once row's sealed reference decides which shared body is read.
+                decoded = (
+                    ""
+                    if src["payload"] == ""
+                    else await self._open_queue_body(self._db, src, alert_only=True)
+                )
                 if not decoded:
                     raise ResendSourceEmpty(
                         f"message {message_id} source body was purged by retention -- cannot resend"
@@ -10926,7 +11049,16 @@ class MessageStore:
                         Stage.INGRESS.value,
                         channel_id,
                         self._cipher.encrypt(
-                            raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                            raw,
+                            aad=queue_payload_aad(
+                                row_id=resubmit_row_id,
+                                message_id=new_mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=channel_id,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
                         ),
                         OutboxStatus.PENDING.value,
                         now,
@@ -11401,27 +11533,23 @@ class MessageStore:
         each outbound delivery — the parity-comparison read path (#14). Kept separate from
         ``outbox_for`` so the metadata-only message-detail view never materializes plaintext bodies;
         the API gates this behind ``MESSAGES_VIEW_RAW`` and audits the access."""
-        # LEFT JOIN the single shared copy so a body_ref row's body is decrypted from shared_body.body;
-        # an inline row (NULL body_ref) keeps its own queue.payload. COALESCE picks the right ciphertext
-        # source per row so store-once is transparent to this PHI-body read (the #14 parity comparison).
+        # Each body is opened under its row's own tag (BACKLOG #2593): an inline row's payload is the
+        # body, and a store-once row's sealed reference names the single shared copy, so store-once is
+        # transparent to this PHI-body read (the #14 parity comparison). A row whose tag fails refuses
+        # the whole read and raises the alert. A purged row ('') reads as an empty body.
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT q.*, "
-                "COALESCE(sb.body, q.payload) AS _body_ciphertext "
-                "FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref "
-                "WHERE q.message_id=? AND q.stage=? ORDER BY q.destination_name",
+                "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
                 (message_id, Stage.OUTBOUND.value),
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
                 d = self._decode_row(r, "queue", (r["id"],), "last_error")
-                # The body's cell depends on its source (store-once shared body vs inline payload).
-                body_aad = (
-                    cell_aad("shared_body", "body", r["body_ref"])
-                    if r["body_ref"] is not None
-                    else cell_aad("queue", "payload", r["id"])
+                d["payload"] = (
+                    ""
+                    if r["payload"] == ""
+                    else await self._open_queue_body(db, r, alert_only=True)
                 )
-                d["payload"] = self._dec(d.pop("_body_ciphertext"), aad=body_aad)
                 out.append(d)
             return out
 

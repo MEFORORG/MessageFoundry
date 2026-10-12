@@ -10,12 +10,14 @@ legs run the same contract from ``tests/test_postgres_store.py`` and ``tests/tes
 
 from __future__ import annotations
 
+import pathlib
 import sqlite3
 from typing import Any
 
 import pytest
 
 from messagefoundry.pipeline.alerts import QUEUE_TAG_SUBJECT, alert_cell_tag_failure
+from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import (
     AesGcmCipher,
     CipherError,
@@ -31,6 +33,7 @@ from messagefoundry.store.queue_tag import (
     queue_payload_aad,
     queue_row_aad,
 )
+from tests._queue_tag_contract import assert_queue_tag_contract
 
 _BASE: dict[str, Any] = {
     "row_id": "row-1",
@@ -154,3 +157,23 @@ def test_queue_tag_columns_are_queue_columns() -> None:
     conn.close()
     # body_ref is added by the migration on SQLite; the rest are in the base schema.
     assert set(QUEUE_TAG_COLUMNS) - {"body_ref"} <= columns
+
+
+async def test_queue_tag_contract_sqlite(tmp_path: pathlib.Path) -> None:
+    db = tmp_path / "queue-tag.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    side = sqlite3.connect(db, timeout=30)  # a writer with no key, outside the store
+    side.row_factory = sqlite3.Row
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            side.execute(sql, params)
+            side.commit()
+
+        async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            return [dict(r) for r in side.execute(sql, params).fetchall()]
+
+        await assert_queue_tag_contract(store, raw, fetch, store_once=True)
+    finally:
+        side.close()
+        await store.close()
