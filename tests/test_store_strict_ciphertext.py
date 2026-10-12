@@ -606,24 +606,36 @@ async def test_a_plant_on_a_purged_keyed_surface_is_refused(tmp_path: Path) -> N
 
 async def test_a_plant_on_the_keyed_queue_payload_is_refused_not_sealed(tmp_path: Path) -> None:
     """``queue.payload`` is sealed under the row's routing tag (BACKLOG #2593), through the same
-    ``_seal_surface`` with its own ``aad_of``. The marker must short-circuit it like any other
-    surface: a plant there is left as it is and reported, never sealed under a genuine tag. Every
-    other payload is purged first, so no ciphertext is left and only the marker can refuse it."""
+    ``_seal_surface`` with its own ``aad_of``. The marker must refuse a plant there like on any other
+    surface: it is left as it is and reported, never sealed under a genuine tag. Every payload is
+    purged, then one row is planted, so no ciphertext is left and only the marker can refuse it.
+    This pins that the marker refuses; it does not pin which of ``_seal_surface``'s marker checks
+    does so."""
     db = tmp_path / "queue.db"
     key = generate_key()
     await _seed(db, 2, _keyed(key))
     assert ("queue", "payload") in _keyed_surfaces(db)
-    with sqlite3.connect(db) as conn:
+    conn = sqlite3.connect(db)
+    try:
         conn.execute("UPDATE queue SET payload=''")  # what retention writes
         qid = conn.execute("SELECT id FROM queue ORDER BY id LIMIT 1").fetchone()[0]
         conn.execute("UPDATE queue SET payload=? WHERE id=?", (_PLANT, qid))
+        conn.commit()
+        # The premise: no ciphertext is left, so the data check alone cannot refuse the plant.
+        marked = conn.execute("SELECT COUNT(*) FROM queue WHERE payload LIKE 'mfenc:%'").fetchone()
+        assert marked[0] == 0
+    finally:
+        conn.close()
     cipher = _keyed(key)
     seen: list[tuple[str, str]] = []
     cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
     store = await MessageStore.open(db, cipher=cipher)
     try:
-        with sqlite3.connect(db) as conn:
+        conn = sqlite3.connect(db)
+        try:
             at_rest = conn.execute("SELECT payload FROM queue WHERE id=?", (qid,)).fetchone()[0]
+        finally:
+            conn.close()
         assert at_rest == _PLANT  # NOT sealed under the row's routing tag
         assert seen == [("queue", "payload")]  # the open found it and alerted
     finally:
