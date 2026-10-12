@@ -209,20 +209,16 @@ def _carrying(entry: _Entry, guid: uuid.UUID, *groups: str) -> _Entry:
 def test_a_stored_object_id_picks_the_entry_that_carries_it(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Either entry is chosen by its own id, in either result order, and in either spelling of it."""
+    """X, which holds the name, is chosen by its id in either result order and either spelling."""
     x, v = _carrying(_X, _GUID_X), _carrying(_V, _GUID_V)
     auth = _authenticator()
-    cases = (
-        (str(_GUID_X), "CN=X,DC=x", _GUID_X),
-        ("{" + str(_GUID_V).upper() + "}", "CN=V,DC=x", _GUID_V),
-    )
     with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.ldap"):
-        for stored, dn, guid in cases:
+        for stored in (str(_GUID_X), "{" + str(_GUID_X).upper() + "}"):
             for order in ([x, v], [v, x]):
                 found = auth._lookup_by_name(_Conn(order), "victor", tie_break_object_id=stored)
                 assert found.answer is DirectoryAnswer.FOUND, (stored, order)
-                assert found.info is not None and found.info["dn"] == dn
-                assert found.info["object_id"] == str(guid)
+                assert found.info is not None and found.info["dn"] == "CN=X,DC=x"
+                assert found.info["object_id"] == str(_GUID_X)
     # The collision is still reported, once per name, and still without the name or either DN.
     records = [r for r in caplog.records if r.name == "messagefoundry.auth.ldap"]
     assert len(records) == 1 and "using the one carrying" in records[0].getMessage()
@@ -252,8 +248,9 @@ def test_both_id_keys_at_once_are_refused() -> None:
 
 
 def test_two_entries_carrying_the_stored_object_id_are_refused() -> None:
-    """An id is meant to name one object. Two entries reading it back prove neither is the account."""
-    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_X)])
+    """An id is meant to name one object. Two entries reading it back prove neither is the account.
+    Both hold the name here, as same-named accounts in two domains under one search base would."""
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_Entry("victor", "CN=V,DC=y"), _GUID_X)])
     found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_X))
     assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
 
@@ -270,6 +267,23 @@ def test_a_stored_object_id_matching_neither_entry_is_refused() -> None:
             _Conn(entries), "victor", tie_break_object_id=str(_GUID_NEITHER)
         )
         assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_a_stored_object_id_on_an_entry_matched_only_by_its_upn_is_refused() -> None:
+    """The recycle case. V was ``victor``, was renamed ``vsmith`` and kept the UPN, and the name went
+    to X. The row still holds V's id, but X holds the ticket's name, so choosing V would sign X in as
+    V. Refused, as before #3228."""
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)])
+    found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_V))
+    assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_the_name_check_ignores_case() -> None:
+    """``sAMAccountName`` compares without case in AD, so a ticket's spelling does not matter."""
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)])
+    found = _authenticator()._lookup_by_name(conn, "VICTOR", tie_break_object_id=str(_GUID_X))
+    assert found.answer is DirectoryAnswer.FOUND
+    assert found.info is not None and found.info["dn"] == "CN=X,DC=x"
 
 
 def test_a_stored_object_id_that_cannot_be_read_breaks_no_tie() -> None:
@@ -331,5 +345,36 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
         ticket["name"] = "vsmith-alias"
         refused = await service.authenticate_kerberos(b"spnego-token")
         assert not refused.ok
+    finally:
+        await store.close()
+
+
+async def test_a_like_named_local_row_breaks_no_tie(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a directory row's id steers the lookup. A local row carrying an id is ignored."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth.identity import AuthProvider
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "local-row.db")
+    try:
+        service = AuthService(store, _settings(kerberos_enabled=True), ldap=_authenticator())
+        await service.initialize()
+        current = SimpleNamespace(
+            auth_provider=AuthProvider.AD.value, directory_object_id=str(_GUID_X)
+        )
+
+        async def _row(_name: str) -> Any:
+            return current
+
+        monkeypatch.setattr(store, "get_user_by_username", _row)
+        assert await service._stored_directory_object_id("victor") == str(_GUID_X)
+        current = SimpleNamespace(
+            auth_provider=AuthProvider.LOCAL.value, directory_object_id=str(_GUID_X)
+        )
+        assert await service._stored_directory_object_id("victor") is None
     finally:
         await store.close()
