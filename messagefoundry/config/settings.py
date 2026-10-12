@@ -4520,7 +4520,8 @@ class EgressSettings(_Section):
     # sends to must sit in one of these domains. `allowed_smtp` gates only the relay HOP; a listed
     # relay forwards to whatever address the connection names, so this list bounds where the mail
     # ends up. Each entry is a bare domain ("hospital.example"), matched exactly and without regard
-    # to case: a subdomain needs its own entry.
+    # to case: a subdomain needs its own entry. The Email sender's domain must be listed too (vault
+    # BACKLOG #2912): bounces and replies go to the sender, and they can carry the message body.
     #
     # DENY-BY-DEFAULT, like `allowed_proxy` below and unlike the permissive-when-empty `allowed_*`
     # destination lists: an EMAIL destination is refused at config load while this list is empty,

@@ -31,6 +31,35 @@
 
 ---
 
+## Amendment 2026-10-10: the sender's domain is gated by the same list
+
+The 2026-10-02 amendment below left one question open: should `[egress].allowed_recipient_domains`
+gate the sender's domain? The batch 290 Manager answered yes on 2026-10-10, under the owner's
+standing rule for such decisions, after an adversarial review upheld it. The owner may overturn it.
+[vault BACKLOG #2912](../BACKLOG.md) records the question.
+
+- **Why.** The sender is `MAIL FROM`, so bounces and replies go to its mailbox. A bounce can carry
+  the message body. The connection's author chooses that mailbox. That author holds `config:deploy`
+  or `code:edit`, which is a different permission from the `service:configure` that sets
+  `[egress]`. The author can also cause a bounce on purpose, for example by naming a recipient that
+  does not exist. An ungated sender would therefore route the body around the recipient gate.
+- **No new setting.** A separate sender list was rejected. Allowing a domain as a sender is as
+  strong as allowing it as a recipient, since either way the body can reach that domain. So the one
+  list gates both.
+- **How.** `check_egress_allowed` checks the sender after the recipients, for every EMAIL
+  destination. It applies the address rule, then requires the domain after the last `@` to match a
+  listed entry exactly, without regard to ASCII case. A subdomain needs its own entry, and an empty
+  list refuses the destination. The refusal names the domain, never the full address. Construction
+  applies only the address rule to the sender, not the domain check. So the domain is gated where
+  `build_destination` runs the check, at load, reload and start, and a build path that skipped that
+  check would not gate it.
+- **Out of scope.** The `[alerts]` sink and the per-user security notifier keep an ungated sender
+  domain. [ADR 0127](0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md)
+  limits alert mail to fields with no PHI, and neither sends a message body. DIRECT stays out too:
+  its bounces carry ciphertext ([ADR 0085](0085-direct-hisp-smime-connector.md)).
+- **If the sender becomes per-message.** Today it is a connection setting, so the check runs at
+  load, reload and start. A sender chosen per message would need the check at send time.
+
 ## Amendment 2026-10-02: the recipients are gated, by domain, and the gate is deny-by-default
 
 D4 below gates the SMTP **host** and nothing else. That bounds the relay hop, not where the mail goes:
@@ -67,7 +96,7 @@ send the Handler's body outside the organisation through a permitted relay.
 - **The transport sends to the checked list.** `EmailDestination` passes the same
   `envelope_recipients` list to `send_message` as `to_addrs`, so a header added later cannot
   widen the RCPT set past what the gate saw.
-- **The envelope sender gets the address rule, not the domain list.** Bounces go to `sender`. Construction holds it to the same plain-address rule as each recipient, builds `From:` from the checked text, and passes that text to `send_message` as `from_addr`, so `smtplib` never derives `MAIL FROM` from a parse of the header (vault BACKLOG #2841). The list does not gate its domain; whether it should is an open question.
+- **The envelope sender got the address rule and, until 2026-10-10, not the domain list.** Bounces go to `sender`. Construction holds it to the same plain-address rule as each recipient, builds `From:` from the checked text, and passes that text to `send_message` as `from_addr`, so `smtplib` never derives `MAIL FROM` from a parse of the header (vault BACKLOG #2841). Since 2026-10-10 the list gates its domain too; the amendment above says why (vault BACKLOG #2912).
 - **Deny-by-default on its own terms.** An empty list refuses every EMAIL destination, whatever
   `[security].block_unlisted_outbound` says. This is the `allowed_proxy` shape, not D4's opt-in shape: a
   permissive-when-empty recipient list would leave the gate off on exactly the default posture.
