@@ -552,16 +552,18 @@ gates a merge**, and no seat has to clear one.
   Builder's QA line under the `qa` label, or other evidence that code review ran against this
   change. Without it, the Lander sends the change to code review. The proof must cover the change
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
-  reads what the review found. **A finding that names a defect the merge would ship no longer goes
-  to the owner by default (owner ruling 2026-10-12, in session).** The Lander may merge when every
-  open finding is filed as a ledger row and none changes behaviour or weakens a control. A finding
-  that does either still goes to the owner for a ruling. A finding named on the PR as queued for
-  the Lander's next ledger pull request counts as filed; that reading is the Lander's, not the
-  owner's words. The ruling does not let the Lander skip the review proof, decline a finding, or
-  choose between two authors' deliberate changes. **CORRECTED 2026-10-12:** this read *"a finding
-  that names a defect the merge would ship goes back to the owner for a ruling."* Korus
-  `roles/LANDER.md` *4a-quinquies* holds the rest; the full text and the owner's words are in
-  [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
+  reads what the review found. **The Lander may merge when every open finding is filed as a ledger
+  row and none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A
+  finding that does either still goes to the owner for a ruling. Until that day, every finding
+  that named a defect the merge would ship went to the owner. Korus lets a row travel beside the
+  merge, so the Lander also counts a finding the PR names as queued for its next ledger pull
+  request. That reading is the Lander's; the owner's words are *"filed as rows"*. The ruling does
+  not let the Lander skip the review proof, or choose between two authors' deliberate changes. Nor
+  may the Lander decline a finding that names a defect the merge would ship. **CORRECTED
+  2026-10-12:** this read *"a finding that names a defect the merge would ship goes back to the
+  owner for a ruling."* Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where it still
+  carries the earlier row, this ruling is the newer one. The full text and the owner's words are
+  in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
