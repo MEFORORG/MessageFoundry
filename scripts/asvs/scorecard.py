@@ -2827,6 +2827,12 @@ def _md_cell(text: str, limit: int | None = None) -> str:
     literally there, so doubling it printed two. A pipe still needs its escape, because GFM splits
     the row before it parses the span. GFM reads ANY backslash right before a pipe as that escape
     and drops only that one, whatever precedes it, so a span's own backslashes need no padding.
+
+    **This stays separate from** ``messagefoundry.terminal_text.escape_for_markdown_cell``,
+    the rule the verify and acceptance reports share (BACKLOG #2897). That rule is for a peer's
+    text, so it turns every backtick into a reference. This one renders the record's own prose,
+    which keeps its code spans, and it cuts to a limit. It also runs with the standard library
+    alone, beside a vault checkout with no engine installed.
     """
     flat = " ".join(text.split())
     if limit is not None and len(flat) > limit:
