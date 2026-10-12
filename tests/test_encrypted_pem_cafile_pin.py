@@ -57,6 +57,7 @@ from tests._encrypted_pem_probe import (
     CONDITIONS,
     ENCRYPTED_SHAPES,
     PLAIN_SHAPE,
+    assert_the_control_reaches_the_prompt,
     run_trial,
     write_shapes,
 )
@@ -97,15 +98,7 @@ def _assert_path_loads_never_wait(shapes: Path, condition: str) -> None:
     plain = run_trial("cafile", shapes / PLAIN_SHAPE, condition, wait=_REFUSE_WITHIN)
     assert plain.outcome == "LOADED", f"the harness could not load a plain certificate: {plain}"
 
-    control = run_trial(
-        "cadata-positional", shapes / "certificate.pem", condition, wait=_CONTROL_WAIT
-    )
-    assert control.outcome != "BROKEN", f"the control child never started: {control}"
-    assert control.reached_the_prompt, (
-        "the positive control did not fire: a cadata load of an encrypted block neither waited "
-        f"nor wrote a password prompt under {condition!r}, so this harness cannot tell a prompt "
-        f"from a refusal on this build. Re-take the BACKLOG #3090 measurement. Saw: {control}"
-    )
+    assert_the_control_reaches_the_prompt(shapes, condition, wait=_CONTROL_WAIT)
 
     for shape, mode in _path_loads():
         trial = run_trial(mode, shapes / shape, condition, wait=_REFUSE_WITHIN)

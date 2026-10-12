@@ -50,8 +50,15 @@ On both, in every condition:
 
 The Linux reading is OFF-VERSION: the engine needs CPython 3.14, and the directory sat on a Windows
 drive mounted in WSL. The on-version POSIX reading is this file's run on the hosted
-``ubuntu-latest`` leg. On Windows a console prompt is not visible to the caller, so "no prompt
-seen" there rests on the handshake returning in under 0.1 s.
+``ubuntu-latest`` leg.
+
+**What this does not show directly.** On Windows a console prompt is not visible to the caller. So
+"no prompt seen" there rests on two things the tests do check: the handshake ended before its
+deadline, and under the same hidden console the ``cadata`` control did wait. The under-0.1 s
+timings in the table were measured, and are not asserted. Nor does anything here show directly
+that OpenSSL opened the encrypted file: its refusal reads the same as a missing file. That rests
+on the control. OpenSSL picks a directory file by its name alone, and it read the plain file under
+the same name in the same condition.
 
 The file name is OpenSSL's subject hash, worked out by ``subject_hash`` with no ``openssl``
 program. For the probe's CA it is ``cd3a2265``. ``openssl x509 -subject_hash`` (OpenSSL 3.0.13) and
@@ -82,6 +89,7 @@ from tests._encrypted_pem_probe import (
     CAPATH_WRONG_NAME,
     CONDITIONS,
     Trial,
+    assert_the_control_reaches_the_prompt,
     run_trial,
     subject_hash,
     tls_server,
@@ -92,8 +100,8 @@ from tests._encrypted_pem_probe import (
 # first assertion fails. The suite's default cap is 60 s.
 pytestmark = pytest.mark.timeout(300)
 
-#: Seconds a handshake may take after the child is ready. It measured under 0.4 s. It must exceed
-#: the child's 15 s socket timeout, so a stalled server reads as a ``TimeoutError`` and not a wait.
+#: Seconds a handshake may take after the child is ready. It measured under 0.4 s. ``run_trial``
+#: refuses a deadline too short to tell a stalled server from a wait for a password.
 _ANSWER_WITHIN = 20.0
 #: Seconds the control is left before it is counted as waiting for a password.
 _CONTROL_WAIT = 3.0
@@ -161,27 +169,29 @@ def _assert_a_ca_directory_never_waits(shapes: Path, port: int, condition: str) 
         f"the harness could not pass a CRL check through a plain CA directory: {with_crl}"
     )
 
-    control = run_trial(
-        "cadata-positional", shapes / "certificate.pem", condition, wait=_CONTROL_WAIT
+    # The premise of the whole file: the load reads nothing, and the handshake reads the file.
+    assert "after the load: x509_ca=0 " in plain.detail, (
+        f"a capath load read a certificate before any handshake, so the premise is gone: {plain}"
     )
-    assert control.outcome != "BROKEN", f"the control child never started: {control}"
-    assert control.reached_the_prompt, (
-        "the positive control did not fire: a cadata load of an encrypted block neither waited "
-        f"nor wrote a password prompt under {condition!r}, so this harness cannot tell a prompt "
-        f"from a refusal on this build. Re-take the BACKLOG #3090 measurement. Saw: {control}"
+    assert "after the handshake: x509_ca=1 " in plain.detail, (
+        f"a verified handshake left no CA in the store: {plain}"
     )
 
+    assert_the_control_reaches_the_prompt(shapes, condition, wait=_CONTROL_WAIT)
+
+    # The third field is text the refusal must carry: the CRL arm must fail on the CRL.
     refusals = (
-        (CAPATH_ENCRYPTED, "capath"),
-        (CAPATH_ENCRYPTED, "capath-positional"),
-        (CAPATH_ENCRYPTED_CRL, "capath-crl"),
+        (CAPATH_ENCRYPTED, "capath", "local issuer"),
+        (CAPATH_ENCRYPTED, "capath-positional", "local issuer"),
+        (CAPATH_ENCRYPTED_CRL, "capath-crl", "CRL"),
     )
-    for shape, mode in refusals:
+    for shape, mode, reason in refusals:
         trial = _handshake(shapes, port, condition, shape, mode)
         where = f"a {mode} handshake through {shape} under {condition!r}"
         _assert_never_waited(trial, where)
-        assert trial.outcome == "RAISED" and _REFUSED_THE_PEER in trial.detail, (
-            f"{where} did not refuse the peer with a verification error: {trial}"
+        refused = trial.outcome == "RAISED" and _REFUSED_THE_PEER in trial.detail
+        assert refused and reason in trial.detail, (
+            f"{where} did not refuse the peer with a verification error naming {reason!r}: {trial}"
         )
 
     # Measured: the encrypted .0 file hides the plain .1 file, and the peer is refused. Only "no

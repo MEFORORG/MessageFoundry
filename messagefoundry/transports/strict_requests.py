@@ -260,10 +260,11 @@ def _narrowed_pool_classes(
             ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
             and terminal conditions, and pins them on each platform CI runs.
 
-            **A CA directory is not refused, because it cannot wait.** ``ca_cert_dir`` reaches
-            OpenSSL as ``capath``. OpenSSL reads a directory's files when it verifies a peer, not
-            when the directory is named, so no check before the load could cover one. So it was
-            measured with a real handshake (2026-10-12), on CPython 3.14.6 / OpenSSL 3.5.7 on
+            **A CA directory is not refused, because it was not seen to wait.** ``ca_cert_dir``
+            reaches OpenSSL as ``capath``. OpenSSL reads a directory's files when it verifies a
+            peer, not when the directory is named, so a check of the text handed to the load,
+            like the one above, does not cover one. So it was measured, for Python's ``ssl`` only,
+            with a real handshake (2026-10-12), on CPython 3.14.6 / OpenSSL 3.5.7 on
             Windows and, off-version, on CPython 3.12.3 / OpenSSL 3.0.13 on Linux. A directory
             file holding an encrypted ``CERTIFICATE`` or ``X509 CRL`` block, under the name
             OpenSSL looks up, wrote no prompt and never waited, in every terminal condition

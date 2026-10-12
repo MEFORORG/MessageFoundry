@@ -39,8 +39,9 @@ peer, and it finds that file by the hash of the issuer's name: ``<hash>.0`` for 
 ``<hash>.r0`` for a CRL. So the ``capath`` modes (:data:`CAPATH_MODES`) load the directory and then
 make a TLS handshake with a loopback server whose certificate chains to the probe's CA.
 :func:`tls_server` runs that server in one more fresh child, so the calling process never
-handshakes. The trial child sets a socket timeout shorter than its deadline, so a server that
-stalls shows as a ``TimeoutError`` and only a child stuck outside the socket shows as ``WAITING``.
+handshakes. The trial child sets a socket timeout, and :func:`run_trial` refuses a deadline that
+does not exceed two of them, one to connect and one to handshake. So a server that stalls shows as
+a ``TimeoutError``, and only a child stuck outside the socket shows as ``WAITING``.
 
 :func:`subject_hash` works the file name out with ``hashlib``, so the probe needs no ``openssl``
 program. Two directory shapes prove the name: the plain CA under that name verifies the server,
@@ -77,6 +78,7 @@ __all__ = [
     "ENCRYPTION_HEADERS",
     "PLAIN_SHAPE",
     "Trial",
+    "assert_the_control_reaches_the_prompt",
     "run_trial",
     "subject_hash",
     "tls_server",
@@ -130,10 +132,12 @@ _START_DEADLINE = 45.0
 _PROMPT = "pass phrase"
 #: Seconds the loopback server lives if nothing kills it first, so an orphan cannot stay.
 _SERVER_LIFETIME = 900.0
+#: Seconds a capath child's socket waits, once to connect and once more to handshake.
+_SOCKET_TIMEOUT = 8.0
 
 # The child. Standard library only, and it must run on any Python 3 this is measured on.
-# A capath mode is handed a directory and the server's port. Its socket timeout is 15 s, which
-# every caller's deadline must exceed, or a stalled server would read as a wait for a password.
+# A capath mode is handed a directory, the server's port and its socket timeout. run_trial keeps
+# the deadline above two timeouts, or a stalled server would read as a wait for a password.
 _TRIAL = r"""
 import socket, ssl, sys, time
 mode, path = sys.argv[1], sys.argv[2]
@@ -158,7 +162,8 @@ try:
         else:
             ctx.load_verify_locations(capath=path)
         note = " store after the load: " + store()
-        with socket.create_connection(("127.0.0.1", int(sys.argv[3])), timeout=15) as raw:
+        address = ("127.0.0.1", int(sys.argv[3]))
+        with socket.create_connection(address, timeout=float(sys.argv[4])) as raw:
             with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
                 version = tls.version()
     elif mode == "cafile":
@@ -409,10 +414,29 @@ def run_trial(
         raise ValueError(
             f"mode {mode!r} and port {port!r}: a capath mode, and only one, has a port"
         )
-    extra = () if port is None else (str(port),)
+    if port is not None and wait <= 2 * _SOCKET_TIMEOUT:
+        raise ValueError(
+            f"a capath trial needs a deadline above {2 * _SOCKET_TIMEOUT:g} s, not {wait:g} s: "
+            "a server that stalls must end as a TimeoutError, not as WAITING"
+        )
+    extra = () if port is None else (str(port), str(_SOCKET_TIMEOUT))
     if condition == "pty":
         return _run_in_a_pty(mode, os.fspath(path), wait, extra)
     return _run_without_a_pty(mode, os.fspath(path), condition, wait, extra)
+
+
+def assert_the_control_reaches_the_prompt(
+    shapes: str | os.PathLike[str], condition: str, *, wait: float
+) -> None:
+    """The positive control both pins run first: a ``cadata`` load of the encrypted certificate
+    waits for a password or writes the prompt. Without it, a harness that saw nothing would pass."""
+    control = run_trial("cadata-positional", Path(shapes, "certificate.pem"), condition, wait=wait)
+    assert control.outcome != "BROKEN", f"the control child never started: {control}"
+    assert control.reached_the_prompt, (
+        "the positive control did not fire: a cadata load of an encrypted block neither waited "
+        f"nor wrote a password prompt under {condition!r}, so this harness cannot tell a prompt "
+        f"from a refusal on this build. Re-take the BACKLOG #3090 measurement. Saw: {control}"
+    )
 
 
 @contextlib.contextmanager
@@ -596,14 +620,19 @@ def _print_table(directory: Path, wait: float) -> None:
         (CAPATH_PLAIN_CRL, "capath-crl"),
         (CAPATH_ENCRYPTED_CRL, "capath-crl"),
     ]
-    # A handshake trial's deadline must exceed the child's 15 s socket timeout; _TRIAL says why.
+    # run_trial says why a handshake trial's deadline has a floor.
     handshake_wait = max(wait, 20.0)
     print(f"deadline : {handshake_wait:g} s after READY for the capath rows")
-    with tls_server(directory) as port:
+    # A directory an older `write` made has no server.pem. Its load rows still print.
+    has_server = (directory / SERVER_CHAIN).is_file()
+    with tls_server(directory) if has_server else contextlib.nullcontext() as port:
         for condition in CONDITIONS:
             print(f"\n== {condition}")
             for shape, mode in rows:
                 _print_row(shape, mode, run_trial(mode, directory / shape, condition, wait=wait))
+            if port is None:
+                print(f"capath rows skipped: no {SERVER_CHAIN} here. Run `write` again.")
+                continue
             for shape, mode in capath_rows:
                 trial = run_trial(
                     mode, directory / shape, condition, wait=handshake_wait, port=port
