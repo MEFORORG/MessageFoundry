@@ -148,301 +148,6 @@ _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: bound is what keeps a linear scan from being charged 16 MiB of a peer's choosing.
 _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
 
-#: A credential label that ENDS a field run's token, which the run then leaves in place (BACKLOG
-#: #2968). The run takes a whole token, so in ``x|y|z;password: <value>`` it took the label too.
-#: The credential filters run after this module and key on the label, so they found none and the
-#: value would reach the log on first deployment. :func:`_field_run_replacement` now writes the
-#: placeholder for the rest of the token and keeps this tail, so ``[redacted]password: <value>``
-#: reaches those filters.
-#:
-#: **What it keeps, and why no more.** The label word with an optional closing quote, then the
-#: ``:`` or ``=`` and an auth scheme word when the token holds them. Never the label's dotted or
-#: underscored prefix, which is data: ``DOE_JANE_password:`` keeps ``password:`` only. A word with no
-#: separator in the token (``x|y|z;password = <value>``, ``x|y|z;Bearer <value>``) is kept only where
-#: a credential filter would read it: a ``:`` or ``=`` after the whitespace, or the scheme word
-#: ``bearer``. A component that is the bare word and nothing else, right after one of the run's own
-#: separators, may be data, so it goes with the run.
-#:
-#: **The words are a copy of the label arm of :data:`_CREDENTIAL_AHEAD`**, in the same order. A plain
-#: literal, so the static regex gate reads it, and ``tests/test_redaction_glued_credential_label.py``
-#: holds it to that arm. The start is "no ASCII letter or digit before", wider than the credential
-#: filters' ``\b`` after a prefix, since a tail kept here starts after the placeholder and so is read
-#: there anyway. **A ``MEFOR_`` name is not kept**, though the filters read one: its name is free
-#: ``[A-Z0-9_]`` text, so ``MEFOR_DOE_JANE_4455667:`` would print what the run scrubbed. Its value
-#: still prints there, as it did before #2968.
-#:
-#: **Linear.** It is searched only over the last :data:`_TRAILING_LABEL_SPAN` characters of a token
-#: the run already matched, so each match costs a bounded scan.
-_TRAILING_CREDENTIAL_LABEL = re.compile(
-    r"""(?<![A-Za-z0-9])(?i:"""
-    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
-    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
-    r"""|token|pass|pwd)['"]?(?:[:=](?P<scheme>(?i:bearer|basic|digest))?+|(?P<bare>))\Z"""
-)
-#: How far back from a token's end :data:`_TRAILING_CREDENTIAL_LABEL` looks: the longest word, a
-#: quote, a separator and a scheme word fit with room to spare.
-_TRAILING_LABEL_SPAN = 64
-#: What must follow a kept label that holds no separator of its own: whitespace, then one.
-_SEPARATOR_AFTER = re.compile(r"\s++[:=]")
-_LEADING_SPACE = re.compile(r"\s*+")
-_VALUE_TOKEN = re.compile(r"\S*+")
-#: The most of a kept label's value :func:`_value_may_hold_a_label` reads. A longer value is not
-#: read, and its label is not kept.
-_VALUE_SPAN = 4096
-#: Substrings at least one of which every credential label holds, folded: each word of
-#: :data:`_TRAILING_CREDENTIAL_LABEL` contains one, and so does a ``MEFOR_`` name, which the filters
-#: read though this module does not keep one. ``tests/test_redaction_glued_credential_label.py``
-#: holds that.
-#:
-#: **A substring and not a label shape, on purpose.** A value that merely contains ``pass``, such as
-#: a weak password, loses its label and prints, as it did before #2968. A shape test would copy
-#: what the filters read as a label start, and that grows: ``secretscrub`` is taking a start after a
-#: ``%XX`` escape that :data:`_CREDENTIAL_AHEAD` deliberately does not. A missed start here would
-#: let a kept label swallow a label the filters read, and print its value.
-_LABEL_HINTS = (
-    "pass",
-    "pwd",
-    "secret",
-    "credential",
-    "authorization",
-    "bearer",
-    "token",
-    "session",
-    "api_key",
-    "api-key",
-    "apikey",
-    "encryption_key",
-    "private_key",
-    "mefor_",
-)
-
-
-#: The two characters ``casefold`` does not turn into a plain "i", though the credential filters'
-#: case-insensitive match reads each as one (``secretscrub._GATE_FOLDS``). Built with ``chr()`` so no
-#: encoding layer can change them.
-_DOTTED_I = (chr(0x0130), chr(0x0131))
-
-
-def _value_span(text: str, pos: int) -> tuple[int, int, bool] | None:
-    """Where the value a label takes from ``pos`` starts and stops, read as the credential filters
-    take it, and whether it is quoted. ``None`` where it cannot be read here.
-
-    From the first character after whitespace: a plain value to the next whitespace, and a quoted one
-    to its closing quote on the same line, or the line's end. A braced value can cross lines, so it is
-    not read, and nor is anything longer than :data:`_VALUE_SPAN`. Each call reads at most that many
-    characters past the whitespace."""
-    found = _LEADING_SPACE.match(text, pos)
-    start = pos if found is None else found.end()
-    if start >= len(text):
-        return start, start, False
-    first, limit = text[start], min(len(text), start + _VALUE_SPAN)
-    if first == "{":
-        return None
-    if first in "'\"":
-        closer = text.find(first, start + 1, limit)
-        bound = limit if closer == -1 else closer
-        ends = [
-            i for i in (text.find("\n", start, bound), text.find("\r", start, bound)) if i != -1
-        ]
-        if ends:  # the line ends before any closer, so the value is read to the line's end
-            return start, min(ends), True
-        if closer != -1:
-            return start, closer + 1, True
-        if limit < len(text):
-            return None
-        return start, limit, True
-    token = _VALUE_TOKEN.match(text, start, limit)
-    stop = limit if token is None else token.end()
-    if stop == limit < len(text) and not text[limit].isspace():
-        return None
-    return start, stop, False
-
-
-def _value_may_hold_a_label(text: str, pos: int) -> bool:
-    """Whether the value a kept label would take, starting at ``pos``, may hold another label.
-
-    **A kept label's value can swallow a later label, and that later label's value then prints.**
-    The credential filters take a plain value up to whitespace and a quoted one to its closing
-    quote, and they do not stop at a label inside it. In ``x|y|z;session: PWD:<tab><value>`` the
-    run used to take ``session:``, so the filters read ``PWD:`` and scrubbed its value. Kept,
-    ``session:`` takes ``PWD:`` as its value and the next value prints. A differential found that
-    shape on the installed chain. So a label is kept only where its value (:func:`_value_span`)
-    holds no label word, and where that value can be read at all.
-
-    The test is a folded substring test, wider than any label: a value that merely contains
-    ``pass`` loses its label, which is what the run did before. Linear: a plain value is the next
-    token, which no other kept label reads, and a quoted one is read for a bounded span."""
-    span = _label_value_span(text, pos)
-    return span is None or _holds_a_label_hint(text[span[0] : span[1]])
-
-
-#: Auth scheme words a token label's value may open with, which the credential filters read past
-#: (``_BEARER``'s ``(?:bearer|basic|digest)\s+``). ``bearer`` is not here: it is a label hint, so a
-#: value that opens with it already holds one.
-_SCHEME_VALUE_WORDS = frozenset({"basic", "digest"})
-
-
-def _label_value_span(text: str, pos: int) -> tuple[int, int, bool] | None:
-    """:func:`_value_span`, read past an opening ``Basic`` or ``Digest`` to the value after it.
-
-    **Code review round 2 measured the reason.** ``x|y|z;Authorization: Digest username=aa,token:
-    <value>`` read as ``Digest`` alone, which holds no hint, so the label was kept. The filters take
-    the scheme and the next token as the value, which swallowed ``token:``, and its value printed.
-    The quoted flag is the second value's."""
-    span = _value_span(text, pos)
-    if span is None or span[2] or text[span[0] : span[1]].casefold() not in _SCHEME_VALUE_WORDS:
-        return span
-    after = _value_span(text, span[1])
-    return None if after is None else (span[0], after[1], after[2])
-
-
-def _inside_an_earlier_value(text: str, pos: int) -> bool:
-    """Whether the token at ``pos`` may sit inside an earlier label's quoted or braced value.
-
-    **A kept label can end an earlier value early, and the rest of that value then prints.** Code
-    review round 2 measured two shapes. In ``password: "aa x|y|z;secret" : <value> "`` the kept
-    ``secret"`` brought back a quote the run had taken, and the earlier value closed on it. In
-    ``password: "aa <value> x|y|z;api_key: "<other>`` the kept label changed where the filters ended
-    the earlier quoted value. Either way a value the run's text kept covered printed.
-
-    So a label is not kept where, in the :data:`_VALUE_SPAN` characters before its token, a quote or
-    a brace follows the last label word. A window with no line break in it cannot show where the
-    line, and so a quoted value, starts, so it counts as yes. Folded as :func:`_holds_a_label_hint`
-    folds, and wider than any real value: a closed quoted value before the token counts too, and
-    its label then goes with the run, as it did before #2968."""
-    start = max(0, pos - _VALUE_SPAN)
-    before = text[start:pos]
-    if start > 0 and "\n" not in before and "\r" not in before:
-        return True
-    if not before.isascii():
-        for dotted in _DOTTED_I:
-            before = before.replace(dotted, "i")
-    folded = before.casefold()
-    last = max(folded.rfind(hint) for hint in _LABEL_HINTS)
-    return last != -1 and any(mark in folded[last:] for mark in "'\"{")
-
-
-def _holds_a_label_hint(text: str) -> bool:
-    """Whether ``text``, folded the way the credential filters match, holds a
-    :data:`_LABEL_HINTS` substring. Every credential label holds one, so ``False`` means none."""
-    if not text.isascii():
-        for dotted in _DOTTED_I:
-            text = text.replace(dotted, "i")
-    folded = text.casefold()
-    return any(hint in folded for hint in _LABEL_HINTS)
-
-
-def _field_run_replacement(match: re.Match[str], delimiters: frozenset[str]) -> str:
-    """The placeholder for a field run's token, followed by the credential label that ends it, if
-    one does (:data:`_TRAILING_CREDENTIAL_LABEL`). ``delimiters`` are the run's own separators.
-
-    A scheme word is written in lower case, so the name run cannot start on it: a capitalised
-    ``Bearer`` before ``Jane Doe Smith Roe`` would join a four-word name match and leave the last
-    name, which the run alone scrubbed. The credential filters read the scheme in any case."""
-    text, start, end = match.string, match.start(), match.end()
-    tail = _TRAILING_CREDENTIAL_LABEL.search(text, max(start, end - _TRAILING_LABEL_SPAN), end)
-    if tail is None or tail.start() == start:
-        return _REDACTED
-    kept, value_at = tail.group(), end
-    if tail.group("bare") is not None:
-        if text[tail.start() - 1] in delimiters:
-            return _REDACTED  # a whole component, so data
-        if kept.lower() == "bearer":
-            kept = "bearer"
-        else:
-            separator = _SEPARATOR_AFTER.match(text, end)
-            if separator is None:
-                return _REDACTED
-            value_at = separator.end()
-    else:
-        scheme = tail.start("scheme")
-        if scheme != -1:
-            kept = kept[: scheme - tail.start()] + kept[scheme - tail.start() :].lower()
-    if _value_may_hold_a_label(text, value_at) or _inside_an_earlier_value(text, start):
-        return _REDACTED
-    return _REDACTED + kept
-
-
-def _default_field_run_replacement(match: re.Match[str]) -> str:
-    """:func:`_field_run_replacement` over the default separators."""
-    return _field_run_replacement(match, _DEFAULT_DELIMITERS)
-
-
-#: A label :func:`_field_run_replacement` kept, as it stands in that function's output: the
-#: placeholder at the start of a token, then the tail. :func:`redact` looks for one before it pays
-#: for a second look at its switch, and :func:`_without_kept_labels` reads it.
-_KEPT_LABEL = re.compile(
-    r"""(?<!\S)\[redacted\](?i:"""
-    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
-    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
-    r"""|token|pass|pwd)['"]?(?P<separator>[:=](?i:bearer|basic|digest)?+)?"""
-)
-
-
-def _without_kept_labels(text: str) -> str:
-    """``text`` with each kept label the percent-encoded run cannot break taken out, for the
-    credential test of :func:`redact`'s switch only. Never returned to a caller.
-
-    **The switch would otherwise read a kept label on a later call.** The engine's error log redacts
-    twice, and a record two handlers filter is redacted once per handler. Before BACKLOG #2968 the
-    first call took the label, so a later call found no credential shape and applied the encoded
-    run. Since #2968 the label stays, the credential filters write ``label=<redacted>`` after it,
-    and a later call read that as a reason to leave the run off. Measured: an encoded run's PHI that
-    the second handler scrubbed before #2968 printed after it.
-
-    **Why taking such a label out is safe.** The switch exists so the encoded run cannot take a mark
-    the credential filters read (:data:`_CREDENTIAL_AHEAD`). A kept label starts its token, and the
-    placeholder replaced every separator before it, so the run cannot take the label. The run takes
-    a whole token or nothing, so it cannot cut a plain value in two. A quoted value can be cut,
-    where one of its tokens holds an encoded separator, and so can one this module cannot read
-    (:func:`_value_span`), so a label before either stays in the test. Any other credential shape
-    in the text still switches the run off."""
-
-    def unless_breakable(match: re.Match[str]) -> str:
-        value_at = _kept_value_at(match)
-        if value_at is None:
-            return match.group()
-        span = _label_value_span(text, value_at)
-        if span is None or (span[2] and _ENCODED_SEPARATOR.search(text, span[0], span[1])):
-            return match.group()
-        return _REDACTED
-
-    return _KEPT_LABEL.sub(unless_breakable, text)
-
-
-def _kept_value_at(match: re.Match[str]) -> int | None:
-    """Where the value of a :data:`_KEPT_LABEL` match starts, or ``None`` where the credential
-    filters would not read it as a label at all: a bare word with no ``:`` or ``=`` after it, other
-    than ``bearer``."""
-    if match.group("separator") is not None or match.group().lower() == "[redacted]bearer":
-        return match.end()
-    separator = _SEPARATOR_AFTER.match(match.string, match.end())
-    return None if separator is None else separator.end()
-
-
-def _a_kept_label_reads_wrong(text: str) -> bool:
-    """Whether a kept label in :func:`redact`'s finished output takes a value that holds a label,
-    or sits inside an earlier value (:func:`_inside_an_earlier_value`).
-
-    :func:`_field_run_replacement` reads both before the passes after the run, and those passes can
-    change them. In ``x|y|z;pwd: Wilhelmina Pemberly,secret: <value>`` the name run replaces the
-    two names, which glues ``,secret:`` to the kept label's value, and that label's value then
-    printed. A differential found that shape once in 145,564 texts. So the finished output is read
-    again, and where this holds, :func:`redact` returns what it returns with no label kept.
-
-    **The whole call falls back, not the one label, and that is the price.** Every other kept label
-    in that text goes too, so its value prints as it did before #2968. The fallback runs the steps
-    the redactor ran before #2968 (``keep_labels=False``), so its output is that redactor's output.
-    Taking out one tail instead would give a text no differential has measured."""
-    for match in _KEPT_LABEL.finditer(text):
-        value_at = _kept_value_at(match)
-        if value_at is None:
-            continue
-        if _value_may_hold_a_label(text, value_at) or _inside_an_earlier_value(text, match.start()):
-            return True
-    return False
-
-
 #: A field run whose separators are PERCENT-ENCODED, in a URL or a form body: ``%7C``, ``%5E``,
 #: ``%7E`` and ``%26`` for ``| ^ ~ &``, either case (BACKLOG #2171). A FHIR search such as
 #: ``identifier=MRN%7C12345&name=DOE%5EJANE`` carries one literal separator and two encoded ones, so
@@ -476,9 +181,9 @@ def _a_kept_label_reads_wrong(text: str) -> bool:
 #: anything the widened stage reads (:func:`redact` says why), which is left as the two stages
 #: leave it;
 #: a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter that MSH declares
-#: (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern keeps a
-#: credential label glued to the end of its token since BACKLOG #2968
-#: (:data:`_TRAILING_CREDENTIAL_LABEL`); this one does not, and leaves such a text to the switch.
+#: (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern has no such rule:
+#: a credential label glued to a pipe run still goes with it, which is older than this pattern and
+#: is not fixed here.
 _HL7_ENCODED_FIELD_RUN = re.compile(
     r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
     r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
@@ -2024,20 +1729,6 @@ def redact(text: str) -> str:
     The screen is a C-speed search, so text without an encoded separator pays nothing more, and the
     credential scan runs only once a qualifying run is found.
 
-    **A label the literal field run kept does not switch the run off (BACKLOG #2968).** Since #2968
-    the run leaves a credential label that ends its token (:data:`_TRAILING_CREDENTIAL_LABEL`), so
-    the filters after this module can read it. Read by the switch, that label would turn the run
-    off on text where it applied before, and the run's PHI would print. So where the output may hold
-    a kept label (:data:`_KEPT_LABEL`), the switch reads the stages as they ran before #2968, which
-    costs a second pass of the stages on that text only. On a later call the label is already in
-    the input, so the credential test also leaves out each kept label whose value the run cannot
-    break (:func:`_without_kept_labels` says why that is safe). And the finished output is read
-    once more: where a kept label's value holds a label, or the label may sit inside an earlier
-    value (:func:`_a_kept_label_reads_wrong`), the call returns what it returns with no label kept.
-    Each rule was found by a before-and-after differential or a code review, and the commits that
-    added them carry the numbers. Those are measurements, not a proof: each rule reads a value the
-    way the credential filters read one, and a filter that learns a new value form can open a gap.
-
     **A text the widened stage could read is left alone too** (:func:`_needs_widened_stage`). Those
     rules keep some values by their surroundings: a bare value under a JSON ``name`` stays while more
     text follows it, and goes once it ends the text. :func:`safe_text` strips and cuts, so a second
@@ -2045,54 +1736,32 @@ def redact(text: str) -> str:
     key glued to its token left that value in view on the second call, where the stages alone scrub
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
-    out = _redact(text, keep_labels=True)
-    if _REDACTED in out and _holds_a_label_hint(out) and _a_kept_label_reads_wrong(out):
-        return _redact(text, keep_labels=False)
-    return out
-
-
-def _redact(text: str, *, keep_labels: bool) -> str:
-    """:func:`redact`, with the field run keeping a trailing credential label or not."""
-    out = _redact_stages(text, keep_labels=keep_labels)
+    out = _redact_stages(text)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
     if _HL7_ENCODED_FIELD_RUN.search(out) is None:
         return out
-    # BACKLOG #2968: a label the field run kept is a credential shape the switch below would read,
-    # and it would switch the run off on text where it applied before, so the run's PHI would
-    # print. So where one may be in ``out``, the switch reads the stages as they ran before #2968,
-    # and its credential test leaves out a kept label already in the input (a later call).
-    # With ``keep_labels=False`` none of this runs, so that call is the redactor before #2968.
-    gate = credential_gate = out
-    if (
-        keep_labels
-        and _CREDENTIAL_AHEAD.search(out) is not None
-        and _KEPT_LABEL.search(out) is not None
-    ):
-        gate = _redact_stages(text, keep_labels=False)
-        credential_gate = _without_kept_labels(gate)
     # This module's own bound note is joined by a line break (:data:`_TRAILING_NOTES`). It is the one
     # unprintable character that is not a peer's, so it is set aside before the test below.
-    note = _TRAILING_NOTES.search(gate) if gate.endswith("unscanned]") else None
-    body = gate if note is None else gate[: note.start()]
+    note = _TRAILING_NOTES.search(out) if out.endswith("unscanned]") else None
+    body = out if note is None else out[: note.start()]
     if (
         not body.isprintable()
-        or _USERINFO_OPENER in gate
-        or _needs_widened_stage(gate)
-        or _CREDENTIAL_AHEAD.search(credential_gate) is not None
+        or _USERINFO_OPENER in out
+        or _needs_widened_stage(out)
+        or _CREDENTIAL_AHEAD.search(out) is not None
     ):
         return out
-    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out), keep_labels=keep_labels)
+    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
 
 
-def _redact_stages(text: str, *, keep_labels: bool = True) -> str:
+def _redact_stages(text: str) -> str:
     """The two stages of :func:`redact`: the #1711 passes to their fixed point, then the widened ones
-    when :func:`_needs_widened_stage` says a widened rule could match. ``keep_labels=False`` runs the
-    field run as it was before BACKLOG #2968, taking a trailing credential label with its token."""
-    first = _redact_rounds(text, widened=False, keep_labels=keep_labels)
+    when :func:`_needs_widened_stage` says a widened rule could match."""
+    first = _redact_rounds(text, widened=False)
     if not _needs_widened_stage(first):
         return first
-    return _redact_rounds(first, widened=True, keep_labels=keep_labels)
+    return _redact_rounds(first, widened=True)
 
 
 #: A JSON key the widened stage reads differently: ``name``/``address`` (the shape rule) and a group
@@ -2133,17 +1802,17 @@ def _needs_widened_stage(text: str) -> bool:
     return "mrn" in text.lower() and _MRN_LABELLED.search(text) is not None
 
 
-def _redact_rounds(text: str, *, widened: bool, keep_labels: bool = True) -> str:
+def _redact_rounds(text: str, *, widened: bool) -> str:
     """One stage of :func:`redact`: the flat and structured passes, repeated to a fixed point."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
             return text
-        flat = _redact_flat(text, widened=widened, credentials=credentials, keep_labels=keep_labels)
+        flat = _redact_flat(text, widened=widened, credentials=credentials)
         text = _redact_structured(flat, widened=widened)
         if text == flat:
             return text
-    return _redact_flat(text, widened=widened, credentials=credentials, keep_labels=keep_labels)
+    return _redact_flat(text, widened=widened, credentials=credentials)
 
 
 #: The most rounds one stage of :func:`redact` takes. A call runs two stages, and runs both again when
@@ -2155,7 +1824,7 @@ def _redact_rounds(text: str, *, widened: bool, keep_labels: bool = True) -> str
 _STRUCTURED_ROUNDS = 8
 
 
-def _redact_flat(text: str, *, widened: bool, credentials: bool, keep_labels: bool = True) -> str:
+def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN
     (``widened`` only), dates and names. One stage of :func:`redact` is this plus
     :func:`_redact_structured`, repeated to a fixed point.
@@ -2180,15 +1849,7 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool, keep_labels: bo
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
-    # BACKLOG #2968: a credential label that ends the run's token stays for the filters after this
-    # module (:data:`_TRAILING_CREDENTIAL_LABEL`). ``keep_labels=False`` is the run before #2968,
-    # which :func:`redact` needs once, to read its switch as it was read then. A text with no label
-    # word keeps the C-speed constant replacement.
-    keep_labels = keep_labels and _holds_a_label_hint(scrubbed)
-    run_replacement: Callable[[re.Match[str]], str] | str = (
-        _default_field_run_replacement if keep_labels else _REDACTED
-    )
-    scrubbed = _HL7_FIELD_RUN.sub(run_replacement, scrubbed)
+    scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
@@ -2199,13 +1860,9 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool, keep_labels: bo
     # declaration with it) by this point.
     declared = _sniff_delimiters(text)
     if not declared <= _DEFAULT_DELIMITERS:
-        delimiters = declared | _DEFAULT_DELIMITERS
-        segment, field_run = _delimiter_patterns(delimiters)
+        segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
-        scrubbed = field_run.sub(
-            (lambda m: _field_run_replacement(m, delimiters)) if keep_labels else _REDACTED,
-            scrubbed,
-        )
+        scrubbed = field_run.sub(_REDACTED, scrubbed)
     # Before the name run, which would otherwise take the label of `PATIENT MRN 12345` and leave the
     # number behind (BACKLOG #2079).
     if widened:

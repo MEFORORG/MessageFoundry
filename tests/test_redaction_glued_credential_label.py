@@ -1,27 +1,35 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #2968: a credential label glued to the end of an HL7 field run's token.
+"""BACKLOG #2968: a credential label glued to the end of an HL7 field run's token. OPEN, PINNED.
 
 The field run replaces a whole token. In ``x|y|z;password: <value>`` the token runs from ``x`` to the
-colon, so the run took the label too. The credential filters run after the redactor and key on the
-label, so they found none and the value would have reached the log on first deployment. The run now
-keeps a trailing credential label (``redaction._TRAILING_CREDENTIAL_LABEL``).
+colon, so the run takes the label too. The credential filters run after the redactor and key on the
+label, so they find none, and the value would reach the log on first deployment. ``safe_text`` and
+``safe_exc`` redact at about 243 call sites before any handler, so a filter reorder (#3005) does not
+close it.
+
+**The xfail arms pin the defect, strictly.** Each goes red, and so fails the suite, the day a fix
+makes it pass, so the fix must remove the mark. A fix that keeps the trailing label was built and
+withdrawn under batch 255: its own differential printed no new value, but a code review's denser
+fuzz still found credential values it printed that this redactor hid. The branch history holds it.
+
+**The other arms are guards a fix must keep green.** Each passes on this redactor. They hold the
+shapes that fix printed and this redactor does not: a kept label taking a later label as its value,
+a kept quote or label ending an earlier quoted value, a scheme word before a later label, an env
+name or a label prefix that is data, and a name run that a kept scheme word would join.
 
 Every arm runs the real filter chain, in the order ``_install_phi_filters`` installs it, by the log
-routes the engine uses: straight to a handler, after ``safe_text`` or ``safe_exc`` (which redact at
-the call site, before any handler), and through two handlers. Values are synthetic. A shape is used
-only where the credential stage alone scrubs it with no run in front, so no arm passes on a shape
-nothing reads."""
+routes the engine uses: straight to a handler, after ``safe_text`` or ``safe_exc``, and through two
+handlers. Values are synthetic. A pinned shape is used only where the credential stage alone scrubs
+it with no run in front, so no arm passes on a shape nothing reads."""
 
 from __future__ import annotations
 
 import logging
-import re
-from typing import Any
 
 import pytest
 
-from messagefoundry import logging_setup, redaction, secretscrub
+from messagefoundry import logging_setup, secretscrub
 from messagefoundry.redaction import redact, safe_exc, safe_text
 
 #: A synthetic credential: lowercase-led with digits, so no name or date pass is what removes it.
@@ -36,6 +44,14 @@ _GLUE = "\"',})(;{[]/.-_|:?#>!*=@+$\\"
 #: takes the value with the token.
 _SEPARATORS = (": ", "= ", ":\t", ":\n  ")
 _LABELS = ("password", "token", "client_secret")
+#: A percent-encoded field run carrying synthetic PHI.
+_ENCODED_PHI = "q=ZQDOE%5EZQJANE%5E4455667"
+_PHI = ("ZQDOE", "ZQJANE", "4455667")
+
+_OPEN = pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #2968 is open: the field run takes a credential label glued to its token",
+)
 
 
 def _through_the_chain(text: str) -> str:
@@ -72,10 +88,14 @@ def _the_credential_stage_reads(shape: str) -> bool:
     return _VALUE in shape and _VALUE not in secretscrub.scrub_credentials(shape)
 
 
+# --- The pin: red on this redactor, by every glue, label, separator and route --------------------
+
+
+@_OPEN
 @pytest.mark.parametrize("separator", _SEPARATORS, ids=repr)
 @pytest.mark.parametrize("run", list(_RUNS.values()), ids=list(_RUNS))
 def test_a_credential_label_glued_to_a_field_run_loses_its_value(run: str, separator: str) -> None:
-    """Red before BACKLOG #2968 on every glue, label and route: the run took the label."""
+    """The run takes the label, so the value prints, under every glue and label here."""
     kept = []
     for glue in _GLUE:
         for label in _LABELS:
@@ -91,6 +111,7 @@ def test_a_credential_label_glued_to_a_field_run_loses_its_value(run: str, separ
     assert not kept, kept[:10]
 
 
+@_OPEN
 @pytest.mark.parametrize(
     "label",
     [
@@ -104,14 +125,13 @@ def test_a_credential_label_glued_to_a_field_run_loses_its_value(run: str, separ
         "Password",
     ],
 )
-def test_every_credential_label_word_is_kept_after_a_field_run(label: str) -> None:
-    """Read from ``secretscrub``'s own tuples, so a word added there and not to the run's tail
-    pattern goes red here by behaviour as well as in the word-list gate below."""
-    shape = f"x ;{label}: {_VALUE}"
-    assert _the_credential_stage_reads(shape)
+def test_every_credential_label_word_glued_to_a_field_run_loses_its_value(label: str) -> None:
+    """Read from ``secretscrub``'s own tuples, so a word added there is pinned here too."""
+    assert _the_credential_stage_reads(f"x ;{label}: {_VALUE}")
     assert not _paths_keeping(f"x {_RUNS['pipe']};{label}: {_VALUE}", _VALUE)
 
 
+@_OPEN
 @pytest.mark.parametrize(
     ("text", "control"),
     [
@@ -121,13 +141,10 @@ def test_every_credential_label_word_is_kept_after_a_field_run(label: str) -> No
         (f'{{"q":"x|y|z","password": "{_VALUE}"}}', f'{{"q":"x","password": "{_VALUE}"}}'),
         (f"x|y|z,Authorization: Basic {_VALUE}", f"x ,Authorization: Basic {_VALUE}"),
         (f"x|y|z,Authorization:Digest {_VALUE}", f"x ,Authorization:Digest {_VALUE}"),
-        (f"x|y|z,Authorization:Bearer {_VALUE}", f"x ,Authorization:Bearer {_VALUE}"),
         (f"x|y|z,Bearer {_VALUE}", f"x ,Bearer {_VALUE}"),
-        (f"x|y|z,BEARER {_VALUE}", f"x ,BEARER {_VALUE}"),
         (f"x|y|z|db_password: {_VALUE}", f"x |db_password: {_VALUE}"),
-        # A quoted value with a long line after it: the value ends at its closing quote.
         (f"x|y|z;password: '{_VALUE}' " + "w " * 2_200, f"x ;password: '{_VALUE}' w"),
-        # The separator pass runs over the delimiters MSH declares, and keeps the label the same way.
+        # The separator-aware pass runs over the delimiters MSH declares.
         (f"MSH*$~\\&*APP\nx$y$z;password: {_VALUE}", f"x ;password: {_VALUE}"),
     ],
     ids=[
@@ -137,9 +154,7 @@ def test_every_credential_label_word_is_kept_after_a_field_run(label: str) -> No
         "compact-json",
         "basic-scheme",
         "glued-digest-scheme",
-        "glued-bearer-scheme",
         "bare-bearer",
-        "bare-bearer-upper",
         "prefixed-label-after-a-pipe",
         "quoted-value-on-a-long-line",
         "declared-delimiters",
@@ -150,6 +165,23 @@ def test_other_label_shapes_glued_to_a_field_run_lose_their_value(text: str, con
     auth scheme glued to its label or alone, and a run over the delimiters MSH declares."""
     assert _the_credential_stage_reads(control)
     assert not _paths_keeping(text, _VALUE)
+
+
+@_OPEN
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"x|y|z;password: {_VALUE} {_ENCODED_PHI}",
+        f"x|y|z;password=\n {_VALUE} {_ENCODED_PHI}",
+    ],
+    ids=["one-call", "a-line-break-and-two-handlers"],
+)
+def test_a_glued_label_and_an_encoded_run_both_lose_their_values(text: str) -> None:
+    """The credential half of the guard below: a fix must scrub the value too."""
+    assert not _paths_keeping(text, _VALUE)
+
+
+# --- Guards: green on this redactor, and a fix must keep them green ----------------------------
 
 
 @pytest.mark.parametrize(
@@ -172,72 +204,42 @@ def test_the_controls_answer_as_the_credential_stage_alone_does(text: str, print
     [
         f"x|y|z;MEFOR_ZQDOE_ZQJANE_4455667: {_VALUE}",
         f"x|y|ZQDOE_MEFOR_4455667_ZQJANE= {_VALUE}",
+        f"MRN^4455667^ZQDOE_ZQJANE.password: {_VALUE}",
+        "MRN^ZQDOE^ZQJANE^4455667^PASS = 4",
+        "MRN^ZQDOE^ZQJANE^4455667^BEARER ward",
     ],
+    ids=["env-name", "env-name-after-data", "label-prefix", "bare-component", "bare-scheme"],
 )
-def test_an_env_name_is_not_kept(text: str) -> None:
-    """A ``MEFOR_`` name is free ``[A-Z0-9_]`` text, so keeping one would print the data the run
-    scrubbed. The price, stated: its value prints, as it did before #2968."""
-    assert redact(text).startswith("[redacted] "), redact(text)
-    assert not _paths_keeping(text, "ZQDOE", "ZQJANE", "4455667")
-
-
-def test_the_kept_label_carries_no_prefix() -> None:
-    """A label's dotted or underscored prefix is data, so the run takes it: only the word stays."""
-    text = f"MRN^4455667^ZQDOE_ZQJANE.password: {_VALUE}"
-    out = redact(text)
-    assert out == "[redacted]password: " + _VALUE, out
-    assert not _paths_keeping(text, "ZQDOE", "ZQJANE", "4455667", _VALUE)
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "MRN^ZQDOE^PASS = 4",
-        "MRN^ZQDOE^SECRET : 4",
-        "MRN^ZQDOE^BEARER ward",
-        "x|ZQDOE|Session = 4",
-    ],
-)
-def test_a_bare_component_is_not_kept(text: str) -> None:
-    """A word with no separator in the token, right after one of the run's own separators, is a
-    component of the field, so it is data and goes with the run. The price, stated: a credential
-    written as ``x|y|z|password = <value>`` still prints its value, as it did before #2968."""
-    out = redact(text)
-    assert out.startswith("[redacted] "), out
+def test_data_in_or_before_a_label_is_never_printed(text: str) -> None:
+    """A ``MEFOR_`` name is free ``[A-Z0-9_]`` text, and a label's dotted or underscored prefix is
+    data, so a fix that keeps a label must keep neither. A component that is only a label word may
+    be data too."""
+    assert not _paths_keeping(text, *_PHI)
 
 
 @pytest.mark.parametrize(
     "glued", ["x|y|z;Bearer", "x|y|z;Authorization:Bearer", "x|y|z;token=Basic"]
 )
-def test_a_kept_scheme_word_does_not_join_a_name_run(glued: str) -> None:
-    """The name run takes at most four words. A capitalised scheme word kept in front of a
-    four-word name would take its place in that match and leave the last name. The run alone
-    scrubbed all four, so the scheme word is kept in lower case."""
+def test_a_scheme_word_does_not_join_a_name_run(glued: str) -> None:
+    """The name run takes at most four words. A capitalised scheme word left in front of a
+    four-word name would take its place in that match and leave the last name."""
     names = ("Janelle", "Doering", "Smithson", "Roeland")
-    text = f"{glued} {' '.join(names)}"
-    out = redact(text)
-    assert not [name for name in names if name in out], out
-    assert not _paths_keeping(text, *names)
+    assert not _paths_keeping(f"{glued} {' '.join(names)}", *names)
 
 
-def test_a_kept_label_does_not_switch_the_encoded_run_off() -> None:
+def test_a_glued_label_does_not_leave_an_encoded_run_in_view() -> None:
     """``redact`` leaves the percent-encoded run off a text that holds a credential shape. A label
-    the literal run kept is one, and reading it would leave the encoded run's PHI in view where the
-    run applied before #2968. Both values go."""
-    phi = "ZQDOE%5EZQJANE%5E4455667"
-    text = f"x|y|z;password: {_VALUE} q={phi}"
-    assert redaction._CREDENTIAL_AHEAD.search(redaction._redact_stages(text)) is not None
-    assert not _paths_keeping(text, _VALUE, "ZQDOE", "ZQJANE", "4455667")
+    a fix keeps is one, and it must not leave the run's PHI in view where this redactor scrubs it."""
+    assert not _paths_keeping(f"x|y|z;password: {_VALUE} {_ENCODED_PHI}", *_PHI)
 
 
-def test_a_kept_label_on_a_later_call_does_not_switch_the_encoded_run_off() -> None:
-    """Two handlers filter one record. The line break keeps the encoded run off on the first pass,
-    where the credential filter writes ``password=<redacted>`` over it. Before #2968 the second
-    pass found no credential shape and applied the run; the kept label must not stop it now."""
-    phi = "ZQDOE%5EZQJANE%5E4455667"
-    text = f"x|y|z;password=\n {_VALUE} q={phi}"
-    out = _through_the_chain(_through_the_chain(text))
-    assert not [value for value in (_VALUE, "ZQDOE", "ZQJANE", "4455667") if value in out], out
+def test_a_glued_label_does_not_leave_an_encoded_run_in_view_on_a_second_handler() -> None:
+    """The line break keeps the encoded run off on the first handler, and the control-character
+    filter writes it as visible text, so the second handler applies the run. A label a fix keeps,
+    rewritten to ``password=<redacted>`` by the first handler, must not switch it off there. The
+    first handler prints the PHI on this redactor too, so only the second is held."""
+    out = _through_the_chain(_through_the_chain(f"x|y|z;password=\n {_VALUE} {_ENCODED_PHI}"))
+    assert not [value for value in _PHI if value in out], out
 
 
 @pytest.mark.parametrize(
@@ -246,29 +248,21 @@ def test_a_kept_label_on_a_later_call_does_not_switch_the_encoded_run_off() -> N
         f"x|y|z;session: PWD:\t{_VALUE}",
         f"x|y|z;token= )api-key: {_VALUE}",
         f"x|y|z;secret: 'a password: {_VALUE}'",
-    ],
-    ids=["label-as-value", "glued-label-as-value", "label-in-a-quoted-value"],
-)
-def test_a_label_whose_value_holds_a_label_is_not_kept(text: str) -> None:
-    """The credential filters take a value whole and do not stop at a label inside it. A kept label
-    would take the next label as its value, and that label's value would print, where the run used
-    to take the first label and the filters read the second. So such a label goes with the run."""
-    assert redact(text).startswith("[redacted] "), redact(text)
-    assert not _paths_keeping(text, _VALUE)
-
-
-@pytest.mark.parametrize(
-    ("text", "values"),
-    [
-        (f"x|y|z;Authorization: Digest username=aa,token: {_VALUE}", (_VALUE,)),
-        (f"x|y|z;bearer: Digest zq9aa1z,pwd: {_VALUE}", (_VALUE,)),
-        (f"x|y|z;token: Basic aa,secret: {_VALUE}", (_VALUE,)),
-        (f'password: "aa x|y|z;secret" : {_VALUE} "', (_VALUE,)),
-        (f"password: 'aa x|y|z;token' = {_VALUE} bb'", (_VALUE,)),
-        (f'password: "aa {_VALUE} x|y|z;api_key: "zq9cc3z', (_VALUE, "zq9cc3z")),
-        (f"client_secret='aa {_VALUE} x|y|z;api_key:\t'zq9cc3z", (_VALUE, "zq9cc3z")),
+        f"x|y|z;pwd: Wilhelmina Pemberly,secret: {_VALUE}",
+        f"x|y|z;Authorization: Digest username=aa,token: {_VALUE}",
+        f"x|y|z;bearer: Digest zq9aa1z,pwd: {_VALUE}",
+        f"x|y|z;token: Basic aa,secret: {_VALUE}",
+        f'password: "aa x|y|z;secret" : {_VALUE} "',
+        f"password: 'aa x|y|z;token' = {_VALUE} bb'",
+        f'password: "aa {_VALUE} x|y|z;api_key: "zq9cc3z',
+        f"client_secret='aa {_VALUE} x|y|z;api_key:\t'zq9cc3z",
+        f"d^j^k]Bearer = bearer 'zq9aa1z,(,),a%7Cb%7Cc;client_secret :{_VALUE}",
     ],
     ids=[
+        "label-as-value",
+        "glued-label-as-value",
+        "label-in-a-quoted-value",
+        "name-run-glues-a-label-into-the-value",
         "digest-then-label",
         "bearer-label-digest-then-label",
         "basic-then-label",
@@ -276,34 +270,14 @@ def test_a_label_whose_value_holds_a_label_is_not_kept(text: str) -> None:
         "kept-single-quote-closes-an-earlier-value",
         "inside-an-earlier-open-value",
         "inside-an-earlier-open-single-quoted-value",
+        "bearer-label-with-a-spaced-separator",
     ],
 )
-def test_review_round_two_shapes_print_nothing_new(text: str, values: tuple[str, ...]) -> None:
-    """Code review round 2 measured each of these printing a value the run's text kept covered:
-    a value that opens with a scheme word and swallows a later label, and a kept label inside an
-    earlier label's quoted value. Each value that the redactor before #2968 hid stays hidden."""
-    kept = _paths_keeping(text, *values)
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(redaction, "_TRAILING_CREDENTIAL_LABEL", re.compile(r"(?!)"))
-        before = _paths_keeping(text, *values)
-    assert not set(kept) - set(before), (kept, before)
-
-
-def test_a_label_a_later_pass_glues_into_the_value_is_read_again() -> None:
-    """The value is read when the run keeps the label, and the passes after the run can change it.
-    Here the name run replaces the two names, which glues ``,secret:`` to the kept label's value,
-    so the finished output is read again and the label is not kept."""
-    text = f"x|y|z;pwd: Wilhelmina Pemberly,secret: {_VALUE}"
-    assert redact(text).startswith("[redacted] "), redact(text)
-    assert not _paths_keeping(text, _VALUE, "Wilhelmina", "Pemberly")
-
-
-def test_every_tail_word_holds_a_hint() -> None:
-    """The check on a kept label's value looks for these substrings, so every label word must hold
-    one or a label inside a value would go unseen."""
-    words = _label_words(redaction._TRAILING_CREDENTIAL_LABEL.pattern).split("|")
-    for word in [*words, "MEFOR_X"]:
-        assert any(hint in word.casefold() for hint in redaction._LABEL_HINTS), word
+def test_a_later_label_keeps_its_value_scrubbed(text: str) -> None:
+    """Shapes where the withdrawn fix kept a glued label that then took a later label as its value,
+    or ended an earlier label's quoted value early, and a value this redactor scrubs printed. Found
+    by that fix's differential and by two code review rounds on it."""
+    assert not _paths_keeping(text, _VALUE)
 
 
 def test_a_credential_label_glued_to_an_encoded_run_still_loses_its_value() -> None:
@@ -320,7 +294,7 @@ def test_a_credential_label_glued_to_an_encoded_run_still_loses_its_value() -> N
         f"x|y|z;Bearer {_VALUE}",
         f"x|y|z,Authorization:Basic {_VALUE}",
         f'x|y|z,"password" : "{_VALUE}"',
-        f"x|y|z;password: {_VALUE} q=ZQDOE%5EZQJANE%5E4455667",
+        f"x|y|z;password: {_VALUE} {_ENCODED_PHI}",
         f"MSH*$~\\&*APP\nx$y$z;password: {_VALUE}",
     ],
 )
@@ -328,48 +302,3 @@ def test_a_second_call_changes_nothing(text: str) -> None:
     """``safe_text`` or ``safe_exc`` redacts, then the handler's filter redacts the result again."""
     once = redact(text)
     assert redact(once) == once
-
-
-def _label_words(pattern: str) -> str:
-    """The credential word alternation inside a pattern's source."""
-    found = re.search(r"encryption_keys_retired[a-z_|-]*?\|pwd\b", pattern)
-    assert found is not None, pattern
-    return found.group()
-
-
-def test_the_tail_words_are_the_credential_arm_words() -> None:
-    """Both tail patterns hold a copy of the label arm of ``_CREDENTIAL_AHEAD``, which is in turn
-    held to ``secretscrub``. A plain literal each, so the static regex gate reads them."""
-    words = _label_words(redaction._CREDENTIAL_AHEAD.pattern)
-    assert _label_words(redaction._TRAILING_CREDENTIAL_LABEL.pattern) == words
-    assert _label_words(redaction._KEPT_LABEL.pattern) == words
-    every = (
-        *secretscrub._CREDENTIAL_WORDS,
-        *secretscrub._TOKEN_WORDS,
-        *secretscrub._KEY_MATERIAL_WORDS,
-    )
-    assert set(every) <= set(words.split("|"))
-
-
-class _Recorder:
-    """Stands in for the tail pattern and records how much of the text each search may read."""
-
-    def __init__(self, pattern: re.Pattern[str]) -> None:
-        self.pattern = pattern
-        self.spans: list[int] = []
-
-    def search(self, text: str, pos: int, endpos: int) -> Any:
-        self.spans.append(endpos - pos)
-        return self.pattern.search(text, pos, endpos)
-
-
-def test_the_tail_search_reads_a_bounded_span_of_each_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The run's own scan is linear, and the tail search must not give that back: it reads at most
-    a fixed span from the end of each token, however long the token is."""
-    recorder = _Recorder(redaction._TRAILING_CREDENTIAL_LABEL)
-    monkeypatch.setattr(redaction, "_TRAILING_CREDENTIAL_LABEL", recorder)
-    text = "a|b|" + "c" * 200_000 + f";password: {_VALUE} " + "d|e|f " * 2_000
-    assert redact(text).startswith("[redacted]password: ")
-    assert recorder.spans and max(recorder.spans) <= redaction._TRAILING_LABEL_SPAN
