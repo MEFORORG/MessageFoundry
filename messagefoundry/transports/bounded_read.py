@@ -792,14 +792,16 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     for a proxy on a loopback address, like the Vault hop's twin,
     ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). Nothing refuses a
     connection's own ``proxy_url`` when the connection is built: such a connection builds, and
-    each send is refused.
+    its sends are refused as below.
 
     **Refused:** a request that would carry a credential from any of the opener's proxy URLs to a
     proxy on any leg but one: an ``http`` target handed to an ``https://`` proxy that no ``https``
     proxy follows. That is the one leg on which urllib was measured to open TLS first. For an
     ``https`` target it sends ``CONNECT`` with the header before any TLS, whatever the proxy's
-    scheme. A connection's ``proxy_url`` serves both schemes, so a credentialed ``proxy_url`` is
-    refused for every request sent through it, written ``https://`` or not. The handler checks at
+    scheme. A connection's ``proxy_url`` serves both schemes. So when it is written ``https://``,
+    its ``https`` entry follows an ``http`` target, and the request is refused. The exception is
+    when urllib's bypass list matches the proxy's own host. Then the request goes to the proxy
+    over TLS, and is not refused. Nothing in this check verifies that TLS. The handler checks at
     every proxy it hands a request to, and reads the header already on the request as well as the
     current proxy's URL, because urllib keeps that header when it hands the request on to a second
     proxy (vault BACKLOG #3410). A value with no scheme counts as not ``https://``. So

@@ -1489,15 +1489,18 @@ header, and it keeps that header when it hands a request on to a second proxy. S
 refused before it is sent, whether the proxy comes from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. A connection with such a `proxy_url` still builds, and each send then fails with this
-error. The error names no part of the proxy URL, and `[security].enforcement` does not relax it. A
+broker. A connection with such a `proxy_url` still builds, and its sends are refused as below. The
+error names no part of the proxy URL, and `[security].enforcement` does not relax it. A
 request that goes direct is not refused: one to a loopback host, or to a host that `NO_PROXY` or the
 system bypass list names. A connection's own `proxy_no_proxy` is not that list. A host it names
 skips the connection's `proxy_url` and still follows a proxy from the environment.
 **Writing the proxy `https://` does not get a credential past this rule:** for an `https` target,
 `urllib` sends `CONNECT`, with the credential header, before any TLS. A connection's `proxy_url`
-serves both schemes, so a credentialed `proxy_url` is refused for every request sent through it.
-Which legs pass, and what the check does not cover, is listed once, on
+serves both schemes, so every send to an `https` target through a credentialed `proxy_url` is
+refused. So is a send to an `http` target, with at least one exception. If the proxy is written
+`https://` and urllib's bypass list matches the proxy's own host, an `http` send goes to the proxy
+over TLS. Nothing in this check verifies that TLS.
+The legs that pass, and what the check does not cover, are listed in full on
 `ProxyCredentialsRefusedError` in `messagefoundry/transports/bounded_read.py`. Take the credentials out of the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the

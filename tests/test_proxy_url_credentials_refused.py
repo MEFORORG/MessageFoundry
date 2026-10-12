@@ -18,12 +18,14 @@ proxy written ``https://``, because the controls below depend on it:
   credential header in cleartext. ``http.client`` has no TLS leg to a proxy.
 * For an ``http`` target on an opener that also maps ``https`` to a proxy, the same happens. urllib
   re-enters the opener with the request re-addressed to the proxy, and the ``https`` entry then
-  tunnels to the proxy itself.
-* Only an ``http`` target on an opener with no ``https`` proxy starts TLS first.
+  tunnels to the proxy itself. It does not when urllib's bypass list matches the proxy's own host.
+* An ``http`` target on an opener with no ``https`` proxy starts TLS first. So does that
+  bypass-list case, measured once by hand. The ``no_ambient_proxy`` fixture turns bypass off, so no
+  test here pins it.
 
-So the one accepted control for a credentialed ``https://`` proxy is that last shape, and its test
-reads the wire as well as the result. The first two shapes are refused (vault BACKLOG #3410), and
-so is the same leak across two DIFFERENT proxies: urllib keeps the first proxy's header when it
+So the accepted control tested here for a credentialed ``https://`` proxy is the
+no-``https``-proxy shape, and its test reads the wire as well as the result. The first two
+shapes are refused (vault BACKLOG #3410), the bypass case aside, and so is the same leak across two DIFFERENT proxies: urllib keeps the first proxy's header when it
 hands the request on, so the second proxy got it in a cleartext ``CONNECT``. The two-proxy section
 below runs two recording sockets at once. If a later CPython opens TLS to a proxy, the measurement
 goes red and says so.
@@ -175,8 +177,8 @@ def test_measured_urllib_opens_tls_first_for_an_http_target_with_no_https_proxy(
 def test_a_credentialed_cleartext_proxy_is_refused_before_anything_is_sent(
     target: str, proxy_form: str
 ) -> None:
-    """With one proxy for both schemes every leg is cleartext, ``https://`` included: the first two
-    measured shapes above (vault BACKLOG #3410)."""
+    """With one proxy for both schemes, and no bypass list naming it, every leg is cleartext,
+    ``https://`` included: the first two measured shapes above (vault BACKLOG #3410)."""
     with _WireProxy() as proxy:
         value = proxy_form.format(cred=_CRED, address=proxy.address)
         opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
