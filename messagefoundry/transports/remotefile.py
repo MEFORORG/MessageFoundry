@@ -215,7 +215,8 @@ def _is_other_listing_form(name: str, remote_dir: str) -> bool:
     traversal attempt (BACKLOG #1130).
 
     Two tests, both needed. The name has none of the traversal shapes: no ``..`` anywhere, no
-    ``\\``, no ``:`` (a drive or a stream), and no control character. And its parent directory's
+    ``\\``, no ``:`` (a drive or a stream), no leading ``//`` (a network path, which names another
+    host), and no control character. And its parent directory's
     last part is ``remote_dir``'s last part. So for ``remote_dir = "/in"``, a resolved absolute path
     (``/srv/ftp/in/a.hl7``) or one relative to the server's current directory (``in/a.hl7``)
     qualifies, and ``/etc/a.hl7``, ``//host/share/a.hl7`` and ``in/sub/a.hl7`` do not. It is refused
@@ -227,6 +228,7 @@ def _is_other_listing_form(name: str, remote_dir: str) -> bool:
         bool(leaf)
         and "/" in name
         and parent.rpartition("/")[2] == leaf
+        and not name.startswith("//")
         and ".." not in name
         and "\\" not in name
         and ":" not in name
@@ -430,18 +432,22 @@ def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
     Some servers send that reply for a missing directory too, and a mistyped ``remote_dir`` must
     not poll as empty for good. So the directory is confirmed with ``CWD`` first, then the session
     is returned to where ``PWD`` found it, since later commands may use relative paths. A refused
-    ``CWD`` raises the original ``NLST`` reply. The three round trips are paid only on this reply."""
+    or unreadable reply to any of the three raises the original ``NLST`` reply, as before this
+    check; a transient one raises as itself. The round trips are paid only on this reply.
+
+    A directory the account may enter but not list still reads as empty, if the server answers
+    it with this reply: ``CWD`` cannot tell that case apart."""
     try:
         return ftp.nlst(remote_dir)
     except ftplib.error_perm as exc:
         if not _NLST_EMPTY_REPLY.match(str(exc)):
             raise
-        home = ftp.pwd()
         try:
+            home = ftp.pwd()
             ftp.cwd(remote_dir)
-        except ftplib.error_perm:
+            ftp.cwd(home)
+        except (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto):
             raise exc from None
-        ftp.cwd(home)
         # The reply text past the match is the server's, and may name a path: not logged.
         logger.debug("REMOTEFILE NLST answered 550 No files found; read as an empty directory")
         return []
@@ -479,11 +485,17 @@ class _Listed(NamedTuple):
     """One regular file in a remote listing. ``size`` is 0 where the server reports none. ``mtime``
     is the server's own modification-time text (SFTP ``st_mtime`` in seconds, FTP ``MLSD``
     ``modify``), or ``None`` where it reports none. It is compared for equality only, never parsed,
-    so a server's own format and resolution carry through unchanged."""
+    so a server's own format and resolution carry through unchanged.
+
+    ``other_form`` is set only by the FTP ``NLST`` fallback, on an entry the listing guard will
+    refuse that :func:`_is_other_listing_form` reads as an unsupported listing form (BACKLOG #1130).
+    Every other listing leaves it False, so a refused name from SFTP or ``MLSD`` always logs as
+    traversal."""
 
     name: str
     size: int
     mtime: str | None
+    other_form: bool = False
 
 
 class _RemoteClient(abc.ABC):
@@ -996,7 +1008,7 @@ class _FtpClient(_RemoteClient):
             # server-chosen name the guard has not judged. It still lists, unsized, so the poll
             # loop's own _is_contained_name refusal counts and logs it.
             if not _is_contained_name(base):
-                out.append(_Listed(base, 0, None))
+                out.append(_Listed(base, 0, None, _is_other_listing_form(base, remote_dir)))
                 continue
             # A directory or an un-sizable entry lists as 0 (the oversize check skips it).
             size = _ftp_size(ftp, posixpath.join(remote_dir, base))
@@ -2459,14 +2471,14 @@ class RemoteFileSource(SourceConnector):
         # Keyed so two entries that list one name never compare a None mtime with a str.
         listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
         self._prune_settle(listing)
-        # Taken over the whole listing, not in the loop below, which can stop early. Every such name
-        # has a "/", so _is_contained_name refuses it there.
-        other_form = {
-            entry.name for entry in listing if _is_other_listing_form(entry.name, self._remote_dir)
-        }
-        self._log_other_form(sum(1 for entry in listing if entry.name in other_form))
+        # Counted over the whole listing, not in the loop below, which can stop early. Only an entry
+        # the pattern would have read counts, so a subdirectory or a stray file never raises it.
+        self._log_other_form(
+            sum(1 for e in listing if e.other_form and fnmatch.fnmatch(e.name, self._pattern))
+        )
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
-        for position, (name, size, mtime) in enumerate(listing):
+        for position, entry in enumerate(listing):
+            name, size, mtime = entry.name, entry.size, entry.mtime
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
             if self._at_ceiling(disposed, len(listing) - position):
@@ -2489,10 +2501,10 @@ class RemoteFileSource(SourceConnector):
                 # sites now route through `safe_name`, so the claim would be true today — it is gone
                 # anyway, because this arm's reason never depended on what the others do.
                 #
-                # A name in another listing form, with no traversal shape, was counted and logged
-                # once above instead (BACKLOG #1130), so an operator can tell a server's listing
-                # format from an attack. It is refused here all the same.
-                if name not in other_form:
+                # An FTP NLST entry in another listing form, with no traversal shape, was counted
+                # and logged once above instead (BACKLOG #1130), so an operator can tell a server's
+                # listing format from an attack. It is refused here all the same.
+                if not entry.other_form:
                     logger.warning(
                         "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
                         "(not a single safe name); left in place, not retrieved",
@@ -2810,8 +2822,9 @@ class RemoteFileSource(SourceConnector):
         return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
 
     def _log_other_form(self, count: int) -> None:
-        """WARN that ``count`` entries this poll were refused for naming a path in another listing
-        form (BACKLOG #1130; see :func:`_is_other_listing_form`). At most one WARNING per
+        """WARN that ``count`` FTP ``NLST`` entries this poll, each one the pattern would have read,
+        were refused for naming a path in another listing form (BACKLOG #1130; see
+        :func:`_is_other_listing_form`). At most one WARNING per
         :data:`OTHER_FORM_WARNING_SECONDS`, DEBUG on the polls between, and a poll with none clears
         the clock so a recurrence warns at once. No name is logged, for the reason the unsafe-name
         arm in :meth:`_poll_once` gives: the guard has refused these names."""
@@ -2825,10 +2838,9 @@ class RemoteFileSource(SourceConnector):
             self._other_form_warned_at = now
         logger.log(
             logging.WARNING if warn else logging.DEBUG,
-            "REMOTEFILE %s%s: %d listing entr%s named a path, not a bare name or one under "
-            "remote_dir/, so the server's listing form looks unsupported (on FTP, an NLST reply in "
-            "another form); refused and left in place, not retrieved. This WARNING repeats at most "
-            "every %d s while it persists",
+            "REMOTEFILE %s%s: %d NLST listing entr%s named a path, not a bare name or one under "
+            "remote_dir/, so the server's listing form looks unsupported; refused and left in "
+            "place, not retrieved. Logged at WARNING at most every %d s while it persists",
             f"{self._connection} " if self._connection else "",
             _where(self._host, self._remote_dir),
             count,

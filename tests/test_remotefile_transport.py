@@ -63,6 +63,7 @@ from messagefoundry.transports.remotefile import (
     _ftps_ssl_context,
     _is_contained_name,
     _is_other_listing_form,
+    _Listed,
     _RemoteClient,
     _RemoteError,
     _RemoteOversize,
@@ -2315,16 +2316,21 @@ async def test_a_folded_nlst_entry_is_refused_by_the_poll_loop(
 class _NlstRefusingFtp(_NlstOnlyFtp):
     """An NLST-only server that answers ``NLST`` with one permanent reply (BACKLOG #1130)."""
 
-    def __init__(self, reply: str, *, dir_exists: bool = True) -> None:
+    def __init__(
+        self, reply: str, *, dir_exists: bool = True, pwd_reply: str | None = None
+    ) -> None:
         super().__init__([])
         self._reply = reply
         self._dir_exists = dir_exists
+        self._pwd_reply = pwd_reply
         self.cwds: list[str] = []
 
     def nlst(self, path: str) -> list[str]:
         raise ftplib.error_perm(self._reply)
 
     def pwd(self) -> str:
+        if self._pwd_reply is not None:
+            raise ftplib.error_perm(self._pwd_reply)
         return "/home"
 
     def cwd(self, path: str) -> str:
@@ -2355,6 +2361,14 @@ def test_an_nlst_empty_reply_for_a_missing_directory_still_fails() -> None:  # #
         _FtpClient._list(ftp, "/inbx")  # type: ignore[arg-type]
     with pytest.raises(ftplib.error_perm, match="No files found"):
         _FtpClient._names(ftp, "/inbx")  # type: ignore[arg-type]
+
+
+def test_a_refused_pwd_raises_the_original_nlst_reply() -> None:  # #1130
+    # The check confirms nothing, so the NLST reply raises as it did before the check existed.
+    ftp = _NlstRefusingFtp("550 No files found", pwd_reply="502 Command not implemented")
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert ftp.cwds == []
 
 
 @pytest.mark.parametrize(
@@ -2535,6 +2549,14 @@ _TRAVERSAL_LINE = "refused as an unsafe path component"
 _OTHER_FORM_LINE = "the server's listing form looks unsupported"
 
 
+class _NlstListingClient(_HostileListingClient):
+    """A client whose listing is what ``_FtpClient._list`` makes of an NLST-only server's reply,
+    so each entry carries the ``other_form`` flag the real NLST fallback sets."""
+
+    def list_entries(self, remote_dir: str) -> list[_Listed]:
+        return _FtpClient._list(_NlstOnlyFtp(self._names), remote_dir)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("remote_dir", "name"),
     [
@@ -2542,7 +2564,6 @@ _OTHER_FORM_LINE = "the server's listing form looks unsupported"
         ("/in", "in/a.hl7"),  # relative to the server's current directory
         ("/in/", "/data/in/a.hl7"),
         ("in", "/srv/ftp/in/a.hl7"),
-        ("/data/in", "//srv/in/a.hl7"),
     ],
 )
 def test_a_path_into_remote_dir_with_no_traversal_shape_is_another_listing_form(
@@ -2564,6 +2585,7 @@ def test_a_path_into_remote_dir_with_no_traversal_shape_is_another_listing_form(
         "/srv/in/a\nb.hl7",
         "/etc/a.hl7",  # another directory
         "//host/share/a.hl7",
+        "//srv/in/a.hl7",  # a network path, even with a share named like remote_dir
         "in/sub/a.hl7",  # a subdirectory
         "./a.hl7",
         "/",
@@ -2582,13 +2604,22 @@ def test_no_entry_is_another_listing_form_of_the_root() -> None:  # #1130
     assert _is_other_listing_form("/srv/a.hl7", "/") is False
 
 
+def test_only_the_nlst_fallback_flags_another_listing_form() -> None:  # #1130
+    listed = _FtpClient._list(_NlstOnlyFtp(["/srv/in/a.hl7", "/etc/b.hl7", "c.hl7"]), "/in")  # type: ignore[arg-type]
+    assert [(e.name, e.other_form) for e in listed] == [
+        ("/srv/in/a.hl7", True),
+        ("/etc/b.hl7", False),
+        ("c.hl7", False),
+    ]
+
+
 async def test_another_listing_form_logs_its_own_warning_without_a_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # #1130
     # A server whose NLST names entries as resolved absolute paths gets them refused. The operator
     # sees one name-free WARNING with the connection and the count, not the traversal one.
     names = ["/data/in/MRN123456789_ADT.hl7", "/data/in/MRN987654321_ORU.hl7"]
-    client = _HostileListingClient(names)
+    client = _NlstListingClient(names)
     src = _src(monkeypatch, client)
     src._connection = "inbound:IB_ACME_ADT"
     src._handler = _RecordingHandler()
@@ -2596,11 +2627,38 @@ async def test_another_listing_form_logs_its_own_warning_without_a_name(
         await src._poll_once()
     assert _OTHER_FORM_LINE in sink.text
     assert "inbound:IB_ACME_ADT" in sink.text
-    assert "2 listing entries" in sink.text
+    assert "2 NLST listing entries" in sink.text
     assert _TRAVERSAL_LINE not in sink.text
     assert "MRN" not in sink.text
     assert SAFE_NAME_LABEL.search(sink.text) is None
     assert client.ops == []
+
+
+async def test_another_listing_form_counts_only_entries_the_pattern_would_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # A subdirectory or a stray file in the other form loses nothing, so it raises neither line.
+    client = _NlstListingClient(["/data/in/archive", "/data/in/README.txt"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _OTHER_FORM_LINE not in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+
+
+async def test_a_path_from_any_other_listing_still_logs_as_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # Only the FTP NLST fallback can carry a path legitimately. The same name from SFTP or MLSD
+    # keeps the per-poll traversal WARNING.
+    client = _HostileListingClient(["/data/in/a.hl7"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _TRAVERSAL_LINE in sink.text
+    assert _OTHER_FORM_LINE not in sink.text
 
 
 async def test_another_listing_form_warning_is_rate_limited(
@@ -2608,7 +2666,7 @@ async def test_another_listing_form_warning_is_rate_limited(
 ) -> None:  # #1130
     # The clock is moved by back-dating the last WARNING, not by patching time.monotonic, which
     # the event loop reads too.
-    client = _HostileListingClient(["/data/in/a.hl7"])
+    client = _NlstListingClient(["/data/in/a.hl7"])
     src = _src(monkeypatch, client)
     src._handler = _RecordingHandler()
 
@@ -2638,7 +2696,7 @@ async def test_a_traversal_name_beside_another_form_still_logs_the_traversal_war
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # #1130
     # An absolute path outside remote_dir is traversal-shaped too: it keeps the per-poll WARNING.
-    client = _HostileListingClient(
+    client = _NlstListingClient(
         ["../../drops/MRN123456789_ADT.hl7", "/etc/MRN555555555.hl7", "/data/in/a.hl7"]
     )
     src = _src(monkeypatch, client)
@@ -2646,7 +2704,7 @@ async def test_a_traversal_name_beside_another_form_still_logs_the_traversal_war
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
     assert sink.text.count(_TRAVERSAL_LINE) == 2
-    assert "1 listing entry named a path" in sink.text
+    assert "1 NLST listing entry named a path" in sink.text
     assert "MRN" not in sink.text
     assert client.ops == []
 

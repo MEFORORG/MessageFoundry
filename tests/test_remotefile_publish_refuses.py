@@ -481,6 +481,14 @@ class _ScriptedFtp:
         self.files[toname] = self.files.pop(self._rnfr)
         return "250 Rename successful"
 
+    def pwd(self) -> str:
+        self.calls.append("PWD")
+        return "/"
+
+    def cwd(self, path: str) -> str:
+        self.calls.append(f"CWD {path}")
+        return "250 OK"
+
     def quit(self) -> str:
         return "221 Goodbye"
 
@@ -625,6 +633,18 @@ def test_ftp_publish_listing_failure_is_transient(monkeypatch: pytest.MonkeyPatc
     assert caught.value.permanent is False
     assert caught.value.connection_fault is False
     assert ftp.files == {"/in/.t.part": b"new"}
+
+
+def test_ftp_publish_reads_an_nlst_empty_reply_as_no_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    """An NLST-only server that answers ``550 No files found`` lists no names, once ``CWD``
+    confirms the directory, and the session is put back before ``RNFR``, so the publish goes on."""
+    ftp = _ScriptedFtp({"/in/.t.part": b"new"})
+    ftp.list_reply = "550 No files found"
+    assert _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7"]) == "/in/msg.hl7"
+    assert ftp.files == {"/in/msg.hl7": b"new"}
+    assert ftp.calls == ["MLSD /in", "PWD", "CWD /in", "CWD /", "RNTO /in/msg.hl7"]
 
 
 # === an SFTP rename whose outcome is unknown is never a collision ==============
