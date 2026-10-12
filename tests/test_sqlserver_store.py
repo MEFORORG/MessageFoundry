@@ -788,19 +788,10 @@ async def test_auth_users_roles_sessions(store) -> None:
 
 
 async def test_group_map_keys_at_the_api_widths_store(store) -> None:
-    """BACKLOG #3187: a group DN at the API's 512 characters stores in both group maps, beside a
-    role id at 64 and a channel at 256. On SQL Server the role map's key is 2 x (512 + 64) bytes and the
-    scope map's 2 x (512 + 256), each past a clustered key's 900 and inside a nonclustered one's
-    1700. One test, both tables, so the two keys are sized together."""
-    dn = "cn=" + "a" * 477 + ",ou=groups,dc=example,dc=invalid"
-    assert len(dn) == 512
-    channel = "C" * 256
-    await store.set_ad_group_role_map([(dn, "operator")])
-    assert await store.roles_for_ad_groups([dn]) == {"operator"}
-    await store.set_ad_group_scope_map([(dn, channel)])
-    assert await store.channels_for_ad_groups([dn]) == {channel}
-    rows = [dict(r) for r in await store.list_ad_group_scope_map()]
-    assert rows == [{"ad_group": dn, "channel": channel}]
+    """BACKLOG #3187: the contract is in ``tests/_ad_group_map_store_contract.py``."""
+    from tests._ad_group_map_store_contract import assert_group_map_keys_at_width_store
+
+    await assert_group_map_keys_at_width_store(store)
 
 
 async def test_last_admin_guard_contract(store) -> None:

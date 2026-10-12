@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 # api._ui_seam — never the console package), so it imports and the engine boots with the console ABSENT.
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
+    _GROUP_MAX,
     AdGroupMap,
     AdGroupMapEntry,
     AdGroupScopeEntry,
@@ -397,15 +398,9 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
 _GROUPS_NAMED = 3
 
 #: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(512)``,
-#: the request model's own 512 (BACKLOG #3187). Canonical form can be longer than what was typed,
-#: so a key past this would fail inside the store's write with a 500 rather than a 400. The key is
-#: printable ASCII, so its characters and the column's UTF-16 units are one count.
-_STORED_GROUP_MAX = 512
-
-#: The longest channel ``ad_group_scope_map`` can hold, in UTF-16 units: SQL Server's ``channel
-#: NVARCHAR(256)``. The request model counts code points, and a character outside the Basic
-#: Multilingual Plane takes two units, so a channel the model accepts could still overflow it.
-_STORED_CHANNEL_MAX = 256
+#: the request model's cap (BACKLOG #3187). Canonical form can outgrow what was typed, so the
+#: route checks it again; past this, the store's write would fail with a 500, not a 400.
+_STORED_GROUP_MAX = _GROUP_MAX
 
 
 def _canonical_group_dns(groups: list[str]) -> list[str]:
@@ -434,23 +429,6 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
         "non-ASCII character is written as several escapes",
     )
     return [c or "" for c in canonical]
-
-
-def _refuse_long_channels(channels: list[str]) -> None:
-    """A 400 if any channel, stripped as the store strips it, is past :data:`_STORED_CHANNEL_MAX`.
-
-    The request model refuses a lone surrogate first; "surrogatepass" keeps one a count here
-    rather than a 500 should it ever get this far."""
-    _refuse_group_keys(
-        sorted(
-            {
-                c
-                for c in (ch.strip() for ch in channels)
-                if len(c.encode("utf-16-le", "surrogatepass")) // 2 > _STORED_CHANNEL_MAX
-            }
-        ),
-        f"channel is longer than {_STORED_CHANNEL_MAX} UTF-16 code units",
-    )
 
 
 def _refuse_group_keys(bad: list[str], reason: str) -> None:
@@ -1778,7 +1756,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         groups = _canonical_group_dns([e.ad_group for e in body.entries])
-        _refuse_long_channels([e.channel for e in body.entries])
         await service.set_ad_group_scope_map(
             [(g, e.channel) for g, e in zip(groups, body.entries, strict=True)],
             actor=identity.username,
