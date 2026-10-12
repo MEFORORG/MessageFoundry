@@ -262,7 +262,7 @@ def test_the_poll_ceiling_reads_a_string_zero_as_unlimited_like_the_toml_zero() 
         with pytest.raises(ValueError, match="positive number of items per poll"):
             resolve_poll_ceiling(bad, knob="poll_max_files", transport="file source")
     # A fraction is not a count at all, so it is refused before the range check (BACKLOG #3431).
-    with pytest.raises(ValueError, match="poll_max_files=0.5 is not a valid int value"):
+    with pytest.raises(ValueError, match="poll_max_files is not a valid int value"):
         resolve_poll_ceiling(0.5, knob="poll_max_files", transport="file source")
     assert _file({"poll_max_files": "0"}).poll_max_files is None
 
@@ -324,9 +324,13 @@ def test_positive_cap_refuses_what_is_left_after_zero_reads_as_off() -> None:
     assert positive_cap("3", int, knob="k", transport="t") == 3
     # 0.5 is not a whole count (BACKLOG #3431), and NaN, inf, "1e3", text and a list are not counts
     # at all. Each refusal must still name the setting.
-    for bad in (-1, "-1", 0.5, math.nan, "1e3", "lots", [1], math.inf):
-        with pytest.raises(ValueError, match="t k="):
+    for bad in (0.5, math.nan, "1e3", "lots", [1], math.inf):
+        with pytest.raises(ValueError, match=r"^t k is not a valid int value \(value withheld\)"):
             positive_cap(bad, int, knob="k", transport="t")
+    # A whole negative is a range refusal, which still quotes the value.
+    for negative in (-1, "-1"):
+        with pytest.raises(ValueError, match="t k="):
+            positive_cap(negative, int, knob="k", transport="t")
     for bad_seconds in (-0.5, "-0.5", math.nan):
         with pytest.raises(ValueError, match="t k="):
             positive_cap(bad_seconds, float, knob="k", transport="t")
@@ -458,7 +462,7 @@ def test_an_integer_setting_refuses_a_bool_or_a_fraction(
     ``int()`` back on any ``_COUNT_ONLY`` site. That site's ``True``, ``1.9``, ``Decimal`` and
     ``Fraction`` cases build cleanly."""
     del attr
-    with pytest.raises(ValueError, match=f"{key}=.* is not a valid int value"):
+    with pytest.raises(ValueError, match=rf"{key} is not a valid int value \(value withheld\)"):
         build({key: bad})
 
 
@@ -496,7 +500,7 @@ async def test_the_reference_sync_pool_size_is_a_count(monkeypatch: pytest.Monke
     monkeypatch.setattr(database, "_make_pool", _no_pool)
     base = {"server": "db.example", "database": "d", "statement": "SELECT a", "key_column": "a"}
     for bad in (True, 1.9, Decimal("1.9"), Fraction(19, 10)):
-        with pytest.raises(ValueError, match="reference source pool_max=.* is not a valid int"):
+        with pytest.raises(ValueError, match="reference source pool_max is not a valid int"):
             await _load_database_source(
                 {**base, "pool_max": bad}, EgressSettings(deny_by_default=False)
             )
@@ -558,5 +562,55 @@ def test_a_float_cap_refuses_a_bool(build: Build, key: str, bad: bool) -> None:
     ``False`` read as "off". Neither is what a bool means here, so both are refused, naming the key.
 
     Red mutation: drop the bool refusal from ``cap_setting``'s float path. Every case builds."""
-    with pytest.raises(ValueError, match=f"{key}={bad!r} is not a valid float value"):
+    refusal = rf"{key} is not a valid float value \(value withheld\): it is a bool"
+    with pytest.raises(ValueError, match=refusal):
         build({key: bad})
+
+
+# The int-valued rows of _OFF_BY_ZERO: caps where a zero, in any exact spelling, turns the cap off.
+_INT_OFF_BY_ZERO = [
+    pytest.param(_TCP_IN, "max_connections", id="tcp-in-max_connections"),
+    pytest.param(_MLLP_OUT, "max_frame_bytes", id="mllp-out-max_frame_bytes"),
+    pytest.param(_HTTP_IN, "max_body_bytes", id="http-in-max_body_bytes"),
+    pytest.param(_file, "max_file_bytes", id="file-max_file_bytes"),
+]
+
+
+@pytest.mark.parametrize(("build", "key"), _INT_OFF_BY_ZERO)
+def test_text_that_only_rounds_to_zero_does_not_turn_an_integer_cap_off(
+    build: Build, key: str
+) -> None:
+    """``float("1e-400")`` is ``0.0``, so a zero test run through ``float()`` read this text as "off"
+    and silently disabled the cap. It is not a whole count in digits, so it is refused, naming the key.
+
+    Red mutation: test an ``int`` cap's text with ``float(value) == 0`` again. Every case builds."""
+    with pytest.raises(ValueError, match=rf"{key} is not a valid int value \(value withheld\)"):
+        build({key: "1e-400"})
+
+
+def test_an_integer_cap_reads_only_an_exact_zero_as_off() -> None:
+    """The control for the refusal above: every exact spelling of zero is still "off"."""
+    for zero in ("0", " 0 ", "00", "0.0", "-0.0", "+0", ".0", 0, 0.0, -0.0, Decimal(0), None, ""):
+        assert cap_setting(zero, int, knob="k", transport="t") is None, repr(zero)
+    for not_zero in ("1e-400", "0e0", "0x0", "zero"):
+        with pytest.raises(ValueError, match=r"^t k is not a valid int value"):
+            cap_setting(not_zero, int, knob="k", transport="t")
+    # A float cap is not a count, so text float() reads as zero is still "off" there.
+    assert cap_setting("0e0", float, knob="k", transport="t") is None
+
+
+@pytest.mark.parametrize("kind", [int, float])
+def test_a_refusal_withholds_the_value(kind: type[int] | type[float]) -> None:
+    """A setting arrives ``env()``-resolved, so its value stays out of the error (BACKLOG #1183), and
+    off the exception chain too, where ``int()``'s or ``float()``'s own message would quote it
+    (BACKLOG #1796). The message still names the transport and the key.
+
+    Red mutation: put ``{value!r}`` back in either refusal, or raise it ``from`` the conversion error."""
+    sentinel = "SENTINEL-3431-not-a-number"
+    with pytest.raises(ValueError) as caught:
+        cap_setting(sentinel, kind, knob="k", transport="t")
+    assert str(caught.value).startswith("t k is not a valid"), str(caught.value)
+    assert "value withheld" in str(caught.value)
+    assert sentinel not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None

@@ -27,6 +27,7 @@ import contextlib
 import math
 import numbers
 import operator
+import re
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -109,6 +110,12 @@ __all__ = [
 DEFAULT_MAX_ITEMS_PER_POLL = 500
 
 
+#: Text that spells zero in plain digits: ``"0"``, ``"00"``, ``"0.0"``, ``"-0.0"``, ``".0"``. An
+#: ``int`` cap reads this as "off" without ``float()``, so text that ``float()`` merely rounds to
+#: zero, such as ``"1e-400"``, reaches :func:`count_setting` and is refused there (BACKLOG #3431).
+_ZERO_TEXT = re.compile(r"[+-]?(?:0+(?:\.0*)?|\.0+)")
+
+
 def count_setting(value: Any, *, knob: str, transport: str) -> int:
     """Read one integer setting as a whole count, or refuse it naming the key (BACKLOG #3431).
 
@@ -131,7 +138,12 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
     Zero and negatives come back as they are. What a zero means, and whether a negative is a typo, is
     each caller's own question, answered with a message naming its own key.
 
-    The refusal quotes the value, as the range refusals in :func:`positive_cap` do."""
+    The refusal names the transport, the key and the reason, and withholds the value. Settings arrive
+    here already ``env()``-resolved, and a resolved value stays out of an error, as it does in
+    ``_lookup_max_rows`` in ``transports/database.py`` (BACKLOG #1183). Every raise below sits outside
+    the handler, so ``int()``'s own message, which quotes the value, is not left on ``__context__``
+    (BACKLOG #1796). This covers the type refusals here and in :func:`cap_setting` only. At least the
+    range refusals in :func:`positive_cap` and :func:`resolve_poll_ceiling` still quote the value."""
     reason: str
     if isinstance(value, bool):
         reason = "a count is not a bool"
@@ -156,7 +168,7 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
             reason = "a count is a whole number, and int() would truncate this one"
     else:
         reason = f"a count is a number or text, not {type(value).__name__}"
-    raise ValueError(f"{transport} {knob}={value!r} is not a valid int value: {reason}")
+    raise ValueError(f"{transport} {knob} is not a valid int value (value withheld): {reason}")
 
 
 def cap_setting[NumT: (int, float)](
@@ -180,31 +192,44 @@ def cap_setting[NumT: (int, float)](
 
     **An ``int`` cap is read by :func:`count_setting`, and only its exact zero is "off".** That
     refuses a bool and every fraction, so nothing truncates to zero: a ``max_connections_per_host`` of
-    ``-0.5`` cannot silently disable a security cap the caller's guard is supposed to refuse. Text
-    that spells zero, such as ``"0.0"``, is off on either kind of cap, and so is a float ``-0.0``. A
-    ``float`` cap refuses a bool too, ``False`` included.
+    ``-0.5`` cannot silently disable a security cap the caller's guard is supposed to refuse. On an
+    ``int`` cap, text is off when it spells zero in plain digits, such as ``"0"``, ``" 0 "``,
+    ``"0.0"`` or ``"-0.0"``, or when ``int()`` reads it as ``0``. Text is never tested with
+    ``float()`` there, which would round ``"1e-400"`` to ``0.0`` and read it as off; that text goes to
+    :func:`count_setting`, which refuses it, as it refuses ``"0e0"``. A number that equals zero, such
+    as ``0.0`` or ``-0.0``, is off too. On a ``float`` cap, any text ``float()`` reads as zero is off.
+    A ``float`` cap refuses a bool too, ``False`` included.
 
     A negative value is returned as-is, for the callers that refuse one at build with a message naming
     their own key; :func:`positive_cap` is that caller for most sites. It is a different mistake with a
     different answer, and folding it into "off" here would swallow the typo. A value that is not a
-    number is refused here, naming the key.
+    number is refused here, naming the key and withholding the value, by the rule in
+    :func:`count_setting`.
     """
     if value is None or value == "":
         return None
+    if kind is int:
+        if isinstance(value, str) and _ZERO_TEXT.fullmatch(value.strip()):
+            return None
+        count = count_setting(value, knob=knob, transport=transport)
+        return None if count == 0 else count
     if isinstance(value, str):
         with contextlib.suppress(ValueError):
             if float(value) == 0:  # at least "0", " 0 ", "0.0" and "-0.0"
                 return None
-    if kind is int:
-        count = count_setting(value, knob=knob, transport=transport)
-        return None if count == 0 else count
     if isinstance(value, bool):
         # float(True) is 1.0, so a bool would build a one-second timeout or a rate of one per second.
-        raise ValueError(f"{transport} {knob}={value!r} is not a valid float value: it is a bool")
+        raise ValueError(
+            f"{transport} {knob} is not a valid float value (value withheld): it is a bool"
+        )
+    cap: NumT | None
     try:
         cap = kind(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{transport} {knob}={value!r} is not a valid float value") from exc
+    except (TypeError, ValueError, OverflowError):
+        cap = None
+    if cap is None:
+        # Raised after the handler ends: float()'s own message quotes the value (BACKLOG #1796).
+        raise ValueError(f"{transport} {knob} is not a valid float value (value withheld)")
     # A NaN is not zero, so it comes back for the caller's range check to refuse.
     return None if cap == 0 else cap
 

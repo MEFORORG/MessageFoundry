@@ -860,11 +860,11 @@ async def test_a_negative_ceiling_is_refused_at_build_on_every_poll_source(
         _remote_source(monkeypatch, _FakeRemoteClient({}), poll_max_files=-1)
     with pytest.raises(ValueError, match="positive number of items per poll"):
         _db_source(poll_max_rows=-1)
-    with pytest.raises(ValueError, match="poll_max_files='many' is not a valid int value"):
+    with pytest.raises(ValueError, match="poll_max_files is not a valid int value"):
         _file_source(inbox, poll_max_files="many")
-    with pytest.raises(ValueError, match="poll_max_files='many' is not a valid int value"):
+    with pytest.raises(ValueError, match="poll_max_files is not a valid int value"):
         _remote_source(monkeypatch, _FakeRemoteClient({}), poll_max_files="many")
-    with pytest.raises(ValueError, match="poll_max_rows='many' is not a valid int value"):
+    with pytest.raises(ValueError, match="poll_max_rows is not a valid int value"):
         _db_source(poll_max_rows="many")
 
 

@@ -806,7 +806,7 @@ def test_a_sub_one_cap_is_still_refused_and_is_not_swallowed_as_off() -> None:
     because the whole subject of this group is a spelling nobody expected to be reachable either.
     """
     for bad in (-0.5, 0.5):
-        with pytest.raises(ValueError, match=r"max_connections_per_host=-?0\.5 is not a valid int"):
+        with pytest.raises(ValueError, match="max_connections_per_host is not a valid int"):
             _mllp(max_connections_per_host=bad)
     with pytest.raises(ValueError, match="max_connections_per_host must be at least 1"):
         _mllp(max_connections_per_host=-1)
