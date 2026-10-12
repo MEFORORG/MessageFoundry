@@ -107,13 +107,14 @@ refused before anything enters the tunnel.
 is about the request, not the reply. It lives here because :func:`build_strict_opener` is the one
 place every engine urllib opener is built. See :class:`LoopbackDirectProxyHandler`.
 
-**A proxy URL that carries credentials is refused unless it is written** ``https://`` (vault
-BACKLOG #2572, ASVS 12.2.1). The same handler makes that check, for the same reason. See
-:class:`ProxyCredentialsRefusedError`, which also says what the check does not cover.
+**A credential from a proxy URL never reaches a proxy in cleartext** (vault BACKLOG #2572, #3410,
+ASVS 12.2.1). The same handler makes that check, for the same reason. See
+:class:`ProxyCredentialsRefusedError`, which says which legs that refuses and what it does not cover.
 """
 
 from __future__ import annotations
 
+import base64
 import email.message
 import email.parser
 import functools
@@ -747,9 +748,10 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
 
     :func:`build_strict_opener` puts this on every opener it builds, in place of the stock class.
 
-    **It also refuses a proxy whose URL carries credentials and is not written** ``https://``
-    (vault BACKLOG #2572). :class:`ProxyCredentialsRefusedError` says what is refused and what is
-    not. The check is made here, per request, because this method sees the proxy from every source:
+    **It also refuses a request that would carry a credential from a proxy URL to a proxy in
+    cleartext** (vault BACKLOG #2572, #3410). :class:`ProxyCredentialsRefusedError` says what is
+    refused and what is not. The check is made here, per request and per proxy, because this method
+    sees every proxy a request is handed to, from every source:
     the environment, the system settings, and a ``proxy_url`` an operator configured. It is not
     made when the handler is built. Shared openers are built at import, and a refusal there would
     stop the engine starting over a proxy that many of its hops never use.
@@ -763,7 +765,7 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
             host = None
         if is_never_proxied_host(host):
             return None  # not rewritten, so the scheme's own handler dials the host itself
-        _refuse_cleartext_proxy_credentials(req, proxy)
+        _refuse_cleartext_proxy_credentials(req, proxy, _proxies_of(self))
         return super().proxy_open(req, proxy, type)
 
 
@@ -771,14 +773,15 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
 #: part it is about is a password. It does not suggest an ``https://`` proxy either, for the reason
 #: :class:`ProxyCredentialsRefusedError` gives.
 _CLEARTEXT_PROXY_CREDENTIALS = (
-    "the web proxy for this request carries credentials in its URL and is not an https:// proxy, "
-    "or its URL cannot be read. Those credentials would cross to the proxy in cleartext. Take the "
-    "credentials out of the proxy URL; refusing to send (vault BACKLOG #2572)"
+    "a web proxy URL for this request carries credentials, and they would cross to a proxy in "
+    "cleartext: on a leg with no TLS, on a CONNECT sent before any TLS, or from a URL that "
+    "cannot be read. Take the credentials out of the proxy URL; refusing to send "
+    "(vault BACKLOG #2572, #3410)"
 )
 
 
 class ProxyCredentialsRefusedError(urllib.error.URLError):
-    """A request would send credentials from its proxy's URL to that proxy in cleartext.
+    """A request would send credentials from a proxy URL to a proxy in cleartext.
 
     urllib turns a user and a password in a proxy URL into a ``Proxy-Authorization: Basic``
     header. Refused by :class:`LoopbackDirectProxyHandler`, on every opener
@@ -791,18 +794,34 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     connection's own ``proxy_url`` when the connection is built: such a connection builds, and
     each send is refused.
 
-    **Refused:** a proxy URL holding a user and a password, unless it is written ``https://``. A
-    value with no scheme counts as not ``https://``. So does a value urllib cannot parse, when it
-    holds an ``@``: urllib would refuse that one itself, with text that quotes it.
+    **Refused:** a request that would carry a credential from any of the opener's proxy URLs to a
+    proxy on any leg but one: an ``http`` target handed to an ``https://`` proxy that no ``https``
+    proxy follows. That is the one leg on which urllib was measured to open TLS first. For an
+    ``https`` target it sends ``CONNECT`` with the header before any TLS, whatever the proxy's
+    scheme. A connection's ``proxy_url`` serves both schemes, so a credentialed ``proxy_url`` is
+    refused for every destination, written ``https://`` or not. The handler
+    checks at every proxy it hands a request to, and reads the header already on the request as
+    well as the current proxy's URL, because urllib keeps that header when it hands the request on
+    to a second proxy (vault BACKLOG #3410). A value with no scheme counts as not ``https://``. So
+    does a value urllib cannot parse, when it holds an ``@``: urllib would refuse that one itself,
+    with text that quotes it.
 
-    **Not refused:** a request that sends the proxy nothing. That is a loopback target, a host on
-    urllib's own bypass list, and a URL with a user and no password, which urllib does not turn
-    into a header.
+    **Not refused:** that one TLS leg, and a request that sends a proxy nothing. That is a
+    loopback target, a host on urllib's own bypass list, and a URL with a user and no password,
+    which urllib does not turn into a header. ``tests/test_proxy_url_credentials_refused.py``
+    measures the legs on the wire.
 
-    **Not refused, and not safe either:** a credentialed proxy written ``https://``. urllib opens
-    TLS to such a proxy only for an ``http`` target on an opener with no ``https`` proxy. For an
-    ``https`` target it opens plain TCP and sends ``CONNECT`` with the credential header before
-    any TLS. ``tests/test_proxy_url_credentials_refused.py`` measures both on the wire.
+    **Not covered by this check:**
+
+    * A ``Proxy-Authorization`` header a caller set itself, such as the one a connection's
+      ``proxy_user`` makes. ``transports.rest.refuse_cleartext_credential_hop`` judges that one
+      when the connection is built, and it refuses only a proxy written ``http://``. So a
+      ``proxy_user`` credential sent to a proxy written ``https://`` still crosses in a cleartext
+      ``CONNECT``, and nothing here refuses it.
+    * A carried header on a request that goes direct, past every proxy: a loopback or bypassed
+      host, or a scheme with no proxy entry. urllib's redirect handler copies the header onto the
+      new request. The engine's own openers refuse redirects, but :func:`build_strict_opener` does
+      not.
 
     A :class:`urllib.error.URLError`, on purpose. It is the class urllib raises for a request it
     could not send, so each hop treats this refusal as it treats that. At least the REST, SOAP,
@@ -814,16 +833,22 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     """
 
 
-def _refuse_cleartext_proxy_credentials(req: urllib.request.Request, proxy: str) -> None:
-    """Raise :class:`ProxyCredentialsRefusedError` if ``req`` would send ``proxy`` the credentials
-    in its URL in cleartext. Called after the loopback rule, which sends the proxy nothing."""
+def _refuse_cleartext_proxy_credentials(
+    req: urllib.request.Request, proxy: str, proxies: Mapping[str, str]
+) -> None:
+    """Raise :class:`ProxyCredentialsRefusedError` if ``req`` would carry a credential from a proxy
+    URL to ``proxy`` in cleartext. ``proxies`` is the handler's own map. Called after the loopback
+    rule, which sends the proxy nothing."""
     # Raised here, outside any handler, so no parser error that quotes the URL rides on the refusal.
-    if _sends_cleartext_proxy_credentials(req, proxy):
+    if _sends_cleartext_proxy_credentials(req, proxy, proxies):
         raise ProxyCredentialsRefusedError(_CLEARTEXT_PROXY_CREDENTIALS)
 
 
-def _sends_cleartext_proxy_credentials(req: urllib.request.Request, proxy: str) -> bool:
-    """The reading behind the refusal, made exactly as ``ProxyHandler.proxy_open`` reads ``proxy``."""
+def _sends_cleartext_proxy_credentials(
+    req: urllib.request.Request, proxy: str, proxies: Mapping[str, str]
+) -> bool:
+    """The reading behind the refusal. ``proxy`` is read exactly as ``ProxyHandler.proxy_open``
+    reads it, and the request's own ``Proxy-authorization`` header is read as well."""
     try:
         # Private, but it is the parser proxy_open runs, so the two readings cannot differ.
         scheme, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
@@ -831,10 +856,37 @@ def _sends_cleartext_proxy_credentials(req: urllib.request.Request, proxy: str) 
         # urllib raises this error itself, for every request, and its text quotes the value. So a
         # value that could hold credentials is refused first, in fixed text. Any other is left to it.
         return "@" in proxy
-    if not (user and password) or (scheme or "").lower() == "https":
+    # A header an earlier proxy_open put on this request rides along to this proxy (vault BACKLOG
+    # #3410), and so does one a redirect copied onto a new request that reaches a proxy.
+    carried = req.get_header("Proxy-authorization")
+    if not (user and password) and (
+        carried is None or carried not in _proxy_url_credentials(proxies)
+    ):
         return False
     # urllib dials a host on its own bypass list direct, and adds no proxy header to that request.
-    return not (req.host and urllib.request.proxy_bypass(req.host))
+    if req.host and urllib.request.proxy_bypass(req.host):
+        return False
+    # The TLS leg. urllib then hands the request back to the opener, so an https proxy that takes
+    # it is checked here again, with req.type now "https".
+    return not (req.type == "http" and (scheme or "").lower() == "https")
+
+
+def _proxy_url_credentials(proxies: Mapping[str, str]) -> set[str]:
+    """Each ``Proxy-authorization`` value urllib would make from a URL in ``proxies``.
+
+    Built the way ``ProxyHandler.proxy_open`` builds it, so a header on a request can be matched to
+    a proxy URL. A value that will not parse makes no header, so it adds nothing here.
+    """
+    made: set[str] = set()
+    for value in proxies.values():
+        try:
+            _, user, password, _ = urllib.request._parse_proxy(value)  # type: ignore[attr-defined]
+        except ValueError:
+            continue
+        if user and password:
+            pair = f"{urllib.parse.unquote(user)}:{urllib.parse.unquote(password)}"
+            made.add("Basic " + base64.b64encode(pair.encode()).decode("ascii"))
+    return made
 
 
 #: The handler types that may open an ``http`` or ``https`` URL on a strict opener. The proxy
