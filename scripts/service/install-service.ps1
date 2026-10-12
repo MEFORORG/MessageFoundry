@@ -1319,16 +1319,18 @@ function ConvertTo-NativeArgument {
     <#
       $Value as one argument that reaches a native program unchanged. With -Legacy (see
       Test-LegacyNativeArgumentPassing), each double quote is escaped as the program's parser reads
-      it: the backslashes before it are doubled and a backslash goes in front of it. Trailing
-      backslashes are doubled too, because the host adds a closing quote after them. Without
-      -Legacy the host escapes, so $Value goes as it is.
+      it: the backslashes before it are doubled and a backslash goes in front of it. When $Value
+      holds white space, the host adds quotes around it, so its trailing backslashes are doubled
+      as well. Without -Legacy the host escapes, so $Value goes as it is.
 
-      This is what keeps the quotes in AppParameters. Measured 2026-10-11 on Windows PowerShell
+      Invoke-Nssm sends every argument through this. Measured 2026-10-11 on Windows PowerShell
       5.1.26100: without it, nssm received --config "D:\hl7 cfg\config" as two words with no quotes.
     #>
-    param([Parameter(Mandatory)][string]$Value, [switch]$Legacy)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value, [switch]$Legacy)
     if (-not $Legacy) { return $Value }
-    return (($Value -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1')
+    $escaped = $Value -replace '(\\*)"', '$1$1\"'
+    if ($escaped -match '\s') { $escaped = $escaped -replace '(\\+)$', '$1$1' }
+    return $escaped
 }
 
 function Test-ListenHost {
@@ -1362,11 +1364,9 @@ function Get-LockPathProblem {
     $trimmed = $Path.TrimEnd('\')
     $root = [System.IO.Path]::GetPathRoot($Path)
     if ($root -and $trimmed -eq $root.TrimEnd('\')) { return "it is the root of a volume" }
-    if (Test-Path -LiteralPath $Path) {
-        $item = Get-Item -LiteralPath $Path -Force
-        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-            return "it is a junction, a link or a mounted volume"
-        }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        return "it is a junction, a link or a mounted volume"
     }
     $prefix = $trimmed + '\'
     foreach ($kept in @($Holds | Where-Object { $_ })) {
@@ -1432,27 +1432,26 @@ else { $DbPath = Resolve-AbsolutePath $DbPath }
 
 $NssmDir = Resolve-AbsolutePath $NssmDir
 
-# --- what goes on the service's command line, checked before anything acts (vault BACKLOG #2626) -----
-# The paths go in quoted, and Format-QuotedPath refuses a double quote; asking here refuses it
-# before the NSSM copy below. -ListenHost goes in unquoted.
-foreach ($named in @(@('Config', $Config), @('DbPath', $DbPath), @('ServiceConfig', $ServiceConfig),
-        @('ProjectRoot', $ProjectRoot))) {
-    if ($named[1] -and $named[1].Contains('"')) {
-        throw "-$($named[0]) cannot contain a double quote: $($named[1])"
-    }
-}
+# --- the service's command line, built before anything acts (vault BACKLOG #2626) --------------------
+# Built here, so a value it refuses stops the install before the NSSM copy below. -ListenHost goes
+# in unquoted, so it is checked; Format-QuotedPath refuses a path holding a double quote.
 if (-not (Test-ListenHost $ListenHost)) {
     throw ("invalid -ListenHost '$ListenHost': pass an IP address, such as 127.0.0.1, or a host " +
         "name of letters, digits, hyphens and dots.")
 }
+$AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath) --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
+# Absolute, so the file the service reads does not depend on its working directory (vault BACKLOG
+# #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
+if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }
+if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
 
 # --- what -LockConfigDir may lock (vault BACKLOG #2626) ------------------------------------------------
 # Set-SecureConfigAcl re-owns everything below the folder it locks, so it must never reach these.
 # A -Config that holds one, or is a volume root or a junction, is refused here, before anything
 # acts. The value and settings folders are checked again where they are locked, below.
-$LockKeepOut = @($DataDir, (Split-Path -Parent $DbPath), $NssmDir, $RepoRoot, $AppDirectory,
-    $(if ($PythonExe) { Split-Path -Parent $PythonExe }), $env:SystemRoot)
 if ($LockConfigDir) {
+    $LockKeepOut = @($DataDir, (Split-Path -Parent $DbPath), $NssmDir, $RepoRoot, $AppDirectory,
+        $(if ($PythonExe) { Split-Path -Parent $PythonExe }), $env:SystemRoot)
     $configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut
     if ($configLockProblem) {
         throw ("-LockConfigDir will not lock the config directory '$Config': $configLockProblem. " +
@@ -1517,11 +1516,6 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 
 $StdoutLog = Join-Path $LogDir "service.out.log"
 $StderrLog = Join-Path $LogDir "service.err.log"
-$AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath) --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
-# Absolute, so the file the service reads does not depend on its working directory (vault BACKLOG
-# #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
-if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }
-if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
 
 # --- install -----------------------------------------------------------------
 
@@ -1573,8 +1567,13 @@ function Invoke-Nssm {
     # Built BEFORE the call, from the non-secret arguments only.
     $shown = @($NssmArgs)
     if ($hasSecret) { $shown += '<redacted>' }
+    # Each argument escaped for this host, so a quote or a trailing backslash reaches nssm as it
+    # is on Windows PowerShell 5.1 too (vault BACKLOG #2626).
+    $legacy = Test-LegacyNativeArgumentPassing
+    $sent = @($NssmArgs | ForEach-Object { ConvertTo-NativeArgument "$_" -Legacy:$legacy })
     $global:LASTEXITCODE = $null
-    if ($hasSecret) { & $NssmPath @NssmArgs $Secret } else { & $NssmPath @NssmArgs }
+    if ($hasSecret) { & $NssmPath @sent (ConvertTo-NativeArgument $Secret -Legacy:$legacy) }
+    else { & $NssmPath @sent }
     $exit = $LASTEXITCODE
     if ($null -eq $exit) {
         throw ("nssm $($shown -join ' ') failed (no exit code: '$NssmPath' did not run)")
@@ -1705,8 +1704,7 @@ try {
 
 # The interpreter, with the options in $AppParams ahead of `-m messagefoundry` (vault BACKLOG #2701).
 Invoke-Nssm set $ServiceName Application $PythonExe
-# Escaped for this host, so the quotes around each path reach nssm on Windows PowerShell 5.1 too.
-Invoke-Nssm set $ServiceName AppParameters (ConvertTo-NativeArgument $AppParams -Legacy:(Test-LegacyNativeArgumentPassing))
+Invoke-Nssm set $ServiceName AppParameters $AppParams
 Invoke-Nssm set $ServiceName AppDirectory $AppDirectory
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"
 Invoke-Nssm set $ServiceName Description "MessageFoundry HL7 v2 integration engine."

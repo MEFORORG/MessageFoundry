@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.service as svc
+from messagefoundry.tray.config import _split_command_line
 from tests.test_service_install_manifest import _extract, _ok, _psq
 
 _SCRIPT = svc.install_script_path()
@@ -229,7 +230,7 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
     assert _SCRIPT is not None
     text = _text()
     first_act = text.index("$NssmPath = Resolve-Nssm")
-    assert text.index("cannot contain a double quote: $($named[1])") < first_act
+    assert text.index("$AppParams = ") < first_act
     assert text.index("if (-not (Test-ListenHost $ListenHost)) {") < first_act
     body = (
         "  $quote = try { Format-QuotedPath 'D:\\x\" --host 0.0.0.0 \"' } catch { 'refused' }\n"
@@ -249,8 +250,31 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
     assert got == {"quote": "refused", "good": [True] * 5, "bad": [False] * 6}
 
 
-def _hosts() -> list[str]:
-    return [host for host in ("pwsh", "powershell") if shutil.which(host)]
+def test_a_legacy_escape_doubles_trailing_backslashes_only_where_the_host_adds_quotes(
+    tmp_path: Path,
+) -> None:
+    """A legacy host quotes an argument only when it holds white space. Doubling the trailing
+    backslash of one it does not quote would change the path nssm stores."""
+    assert _SCRIPT is not None
+    body = (
+        "  [pscustomobject]@{\n"
+        "    bare = (ConvertTo-NativeArgument 'C:\\data\\' -Legacy)\n"
+        "    spaced = (ConvertTo-NativeArgument 'C:\\my data\\' -Legacy)\n"
+        "    quoted = (ConvertTo-NativeArgument 'a \"b\\\\\" c' -Legacy)\n"
+        "    standard = (ConvertTo-NativeArgument 'a \"b\" c\\')\n"
+        "  } | ConvertTo-Json -Compress\n"
+    )
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["ConvertTo-NativeArgument"], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
+    )
+    assert got == {
+        "bare": "C:\\data\\",
+        "spaced": "C:\\my data\\\\",
+        "quoted": 'a \\"b\\\\\\\\\\" c',
+        "standard": 'a "b" c\\',
+    }
 
 
 def _run_on(host: str, script: str, tmp_path: Path) -> str:
@@ -294,16 +318,18 @@ def test_each_path_reaches_the_service_whole_on_each_host(host: str, tmp_path: P
     if not shutil.which(host):
         pytest.skip(f"SKIP (nothing run): {host} not on PATH")
     assert _SCRIPT is not None
-    assert (
-        "Invoke-Nssm set $ServiceName AppParameters (ConvertTo-NativeArgument $AppParams "
-        "-Legacy:(Test-LegacyNativeArgumentPassing))"
-    ) in _text()
+    text = _text()
+    assert "Invoke-Nssm set $ServiceName AppParameters $AppParams" in text
+    invoke = text.index("function Invoke-Nssm {")
+    assert "ConvertTo-NativeArgument" in text[invoke : text.index("\n}\n", invoke)]
     paths = {
         "--config": "D:\\hl7 cfg\\config",
         "--db": "C:\\Mefor Data\\messagefoundry.db",
         "--service-config": "D:\\hl7 cfg\\messagefoundry.toml",
         "--project-root": "D:\\",
     }
+    echo = tmp_path / "echo.py"
+    echo.write_text("import sys, json; print(json.dumps(sys.argv[1]))\n", encoding="utf-8")
     body = (
         "  $EngineInterpreterOptions = '-I -X disable-remote-debug'\n"
         f"  $Config = {_psq(paths['--config'])}\n"
@@ -313,17 +339,23 @@ def test_each_path_reaches_the_service_whole_on_each_host(host: str, tmp_path: P
         "  $ListenHost = '127.0.0.1'; $Port = 8765; $LogLevel = 'INFO'; $Environment = 'prod'\n"
         + _app_params_lines()
         + "\n"
-        f"  $py = {_psq(sys.executable)}\n"
-        "  $echo = 'import sys, json; print(json.dumps(sys.argv[1]))'\n"
+        # Invoke-Nssm runs $NssmPath, so the echo stands in for nssm.exe.
+        f"  $NssmPath = {_psq(sys.executable)}\n"
+        f"  $echo = {_psq(str(echo))}\n"
         "  $legacy = Test-LegacyNativeArgumentPassing\n"
-        "  $sent = & $py -c $echo (ConvertTo-NativeArgument $AppParams -Legacy:$legacy)\n"
-        "  $raw = & $py -c $echo $AppParams\n"
+        "  $sent = Invoke-Nssm $echo $AppParams\n"
+        "  $raw = if ($legacy) { & $NssmPath $echo $AppParams | ConvertFrom-Json } else { $null }\n"
         "  [pscustomobject]@{ legacy = $legacy; built = $AppParams; sent = ($sent | ConvertFrom-Json);"
-        " raw = ($raw | ConvertFrom-Json) } | ConvertTo-Json -Compress\n"
+        " raw = $raw } | ConvertTo-Json -Compress\n"
     )
     script = _extract(
         _SCRIPT,
-        ["Format-QuotedPath", "Test-LegacyNativeArgumentPassing", "ConvertTo-NativeArgument"],
+        [
+            "Format-QuotedPath",
+            "Test-LegacyNativeArgumentPassing",
+            "ConvertTo-NativeArgument",
+            "Invoke-Nssm",
+        ],
         body,
     )
     got = json.loads(_run_on(host, script, tmp_path).strip().splitlines()[-1])
@@ -331,27 +363,13 @@ def test_each_path_reaches_the_service_whole_on_each_host(host: str, tmp_path: P
     if host == "powershell":
         assert got["legacy"] is True
         assert got["raw"] != got["built"], "the positive control: 5.1 strips unescaped quotes"
-    argv = _split_like_the_service(got["sent"])
+    # Split as CommandLineToArgvW splits the service's command line; tests/test_tray_config.py
+    # checks this splitter against that call.
+    argv = _split_command_line(got["sent"])
     for flag, path in paths.items():
         assert argv[argv.index(flag) + 1] == path, (flag, argv)
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
     assert argv.count("--host") == 1
-
-
-def _split_like_the_service(params: str) -> list[str]:
-    """``params`` split by CommandLineToArgvW, the rule a Windows program's arguments follow."""
-    import ctypes
-    from ctypes import wintypes
-
-    shell32 = ctypes.WinDLL("shell32")  # type: ignore[attr-defined,unused-ignore]
-    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
-    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
-    count = ctypes.c_int()
-    argv = shell32.CommandLineToArgvW("python.exe " + params, ctypes.byref(count))
-    try:
-        return [argv[i] for i in range(1, count.value)]
-    finally:
-        ctypes.windll.kernel32.LocalFree(argv)  # type: ignore[attr-defined,unused-ignore]
 
 
 def test_the_default_settings_file_is_the_one_serve_would_read(tmp_path: Path) -> None:

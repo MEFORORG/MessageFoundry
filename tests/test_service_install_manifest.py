@@ -352,7 +352,14 @@ def _invoke_nssm_arms(tmp_path: Path) -> dict[str, str]:
   $out | ConvertTo-Json -Depth 4 -Compress
 """
     )
-    raw = _ok(_extract(_SCRIPT, ["Invoke-Nssm"], body), tmp_path)
+    raw = _ok(
+        _extract(
+            _SCRIPT,
+            ["Invoke-Nssm", "Test-LegacyNativeArgumentPassing", "ConvertTo-NativeArgument"],
+            body,
+        ),
+        tmp_path,
+    )
     parsed: dict[str, str] = json.loads(raw.strip().splitlines()[-1])
     return parsed
 
