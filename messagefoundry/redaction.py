@@ -2214,8 +2214,9 @@ def _unicode_error_text(exc: UnicodeError) -> str:
 
     The class name alone is the fallback: a bare ``UnicodeError``, or one whose attributes are missing,
     not the standard types, or raise when read. A bare one's message is free text this function cannot
-    vouch for. ``.encoding`` is rendered only when it names a stdlib codec, so a value someone else set
-    there is not echoed. ``.reason`` is rendered only from a fixed list.
+    vouch for. ``.encoding`` is rendered only when it names a stdlib text codec or has a Windows code
+    page's shape (:func:`_names_a_codec`), so other text someone set there is not echoed. A value of
+    that shape is echoed whatever set it: at most ``cp`` and five digits. ``.reason`` is rendered only from a fixed list.
 
     An empty span (``start == end``) prints no position (vault BACKLOG #3206). Windows ``mbcs`` and
     ``oem`` raise with ``start == end == 0`` wherever the character sat, so the index is not one."""

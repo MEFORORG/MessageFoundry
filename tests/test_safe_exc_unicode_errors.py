@@ -140,9 +140,10 @@ def test_an_empty_span_names_its_codec_and_no_position(encoding: str) -> None:
 @pytest.mark.skipif(sys.platform != "win32", reason="mbcs is a Windows-only codec")
 def test_a_real_mbcs_error_prints_no_position() -> None:
     """The real codec, so the hand-built twin above cannot drift from what Windows raises. U+FFFF
-    is a noncharacter: no ANSI code page maps it, whichever one this machine runs."""
+    is a noncharacter that no legacy ANSI code page maps. A machine whose ANSI code page is UTF-8
+    would encode it and fail here with DID NOT RAISE; the hosted Windows runners use cp1252."""
     with pytest.raises(UnicodeEncodeError) as caught:
-        f"{_TEXT}￿".encode("mbcs")
+        (_TEXT + chr(0xFFFF)).encode("mbcs")
     exc = caught.value
     assert exc.start == exc.end, "the probe must raise the empty span, or it tests nothing"
     text = safe_exc(exc)
