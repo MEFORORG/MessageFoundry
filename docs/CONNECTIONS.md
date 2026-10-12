@@ -951,7 +951,8 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
   first. So the codec counts each member as it starts, and refuses the one past the cap before it
   inflates. Each decompressor checks its caps in a trial pass before the real one (BACKLOG #1129).
   The trial pass inflates the whole input in bounded chunks, keeps none of the output, and refuses a
-  stream the moment it would pass the byte ceiling or the member cap. Only a stream it admits is
+  stream the moment it would pass the byte ceiling or, for gzip, the member cap. The zip member cap
+  is read from the central directory before either pass. Only a stream it admits is
   inflated again for real, so an over-cap stream is refused with no output kept. The cost is that an
   admitted stream is inflated twice. That is less than double the time, because the real pass also
   copies its output; [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)

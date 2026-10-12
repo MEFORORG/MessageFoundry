@@ -396,9 +396,9 @@ def zip_decompress(
     lying central-directory size cannot force full expansion. With a ceiling, a trial pass reads every
     member that way and keeps nothing, so an over-ceiling archive is refused before any member is kept;
     see the module docstring. Every member name is checked before either pass reads a byte. Content
-    is checked only in the real pass, so an archive with both an over-ceiling total and a member
-    whose content is refused is refused for the ceiling. That also means an archive refused for
-    its content costs one trial inflate first, which the byte ceiling bounds. A corrupt
+    is checked only in the real pass. So an archive over the ceiling is refused for the ceiling,
+    even when a member's content would be refused too. An archive refused for its content costs
+    one trial inflate first, which the byte ceiling bounds. A corrupt
     archive, too many members, an over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption, a
     compression method, a format version) raises :class:`CompressionError`, which names a member by
     its position and never by its filename. Duplicate file member names also refuse the whole

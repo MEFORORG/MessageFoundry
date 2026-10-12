@@ -120,8 +120,9 @@ the **codec and the byte ceiling only** — never any decompressed content.
 > stream is refused before the real decompression starts, and no output is kept. Only an admitted
 > stream is inflated again for real. The owner ruled on 2026-10-11 that a bounded inflate that
 > discards its output counts as checking "before uncompressing". The DICOM guard,
-> `guard_part10_deflate`, already worked this way. The caps are the existing `max_output_bytes`,
-> `max_members` and `max_entries`, and no new default is added. **The cost is a second inflate of
+> `guard_part10_deflate`, already worked this way. The trial pass checks the existing
+> `max_output_bytes` and `max_members`, and no new default is added. `max_entries` stays a
+> central-directory check. **The cost is a second inflate of
 > every admitted stream.** It is less than double, because the real pass also spends time copying
 > its output. Measured on 2026-10-11 on one Windows workstation, on a 64 MiB synthetic HL7 stream
 > that compresses about 10 to 1: the trial pass alone took about 47 ms of CPU against about 234 ms
