@@ -20,14 +20,15 @@ FIVE PASSES, over the gated HTTP rows derived by ``scripts/security/route_gates.
   NEGATIVE     every gated operation, twice: no credential, and an invalid bearer. Not-401 is a
                finding. Always covered every verb — an unauthenticated probe executes nothing.
   REACH        every gated GET, with the administrator bearer. Reached = a status outside
-               {401, 403, 429}.
+               {401, 403, 429}. A 403 naming an action in ``X-Step-Up-Action`` is re-proved for
+               that action once and the probe sent again, as a first-party client does.
   BFLA         every gated GET whose permission set the low-privilege role does NOT hold, with the
                viewer bearer. Refused = {401, 403, 429}; anything else is a finding, INCLUDING 404 —
                the path template matched, so a 404 means the caller got past authorization into
                resource lookup.
   WRITE BFLA   the same rule over the non-GET candidate rows.
-  WRITE REACH  every gated non-GET row, with the administrator bearer. Runs LAST, so no earlier
-               measurement can depend on state a write probe left behind.
+  WRITE REACH  every gated non-GET row, with the administrator bearer, re-proving as REACH does.
+               Runs LAST, so no earlier measurement can depend on state a write probe left behind.
 
 WHY THE WRITE PASSES ARE SAFE, since a probe carrying a VALID privileged token really does execute:
 
@@ -135,6 +136,10 @@ VALIDATION_STATUS = 422
 
 _PREFIX = "dast_auth_sweep"
 
+#: The header an action-bound step-up gate names its action in (ADR 0077). Read only to decide
+#: whether to re-prove; its value is never written to the receipt.
+STEP_UP_ACTION_HEADER = "X-Step-Up-Action"
+
 
 class PolicyError(RuntimeError):
     """The policy file is missing, unreadable or structurally wrong — a fail-closed condition, because
@@ -238,6 +243,36 @@ async def _probe(client: httpx.AsyncClient, method: str, url: str, token: str | 
     return response.status_code
 
 
+async def _reach_probe(
+    client: httpx.AsyncClient,
+    row: route_gates.RouteRow,
+    url: str,
+    token: str,
+    *,
+    target: DastTarget,
+    reproved: list[str],
+) -> tuple[int, str]:
+    """One privileged probe that passes an action-bound step-up wall: ``(status, live token)``.
+
+    Vault BACKLOG #3241. A route bound to an action (ADR 0077) refuses a fresh password login with
+    403 and names the action in ``X-Step-Up-Action``. Before this, the sweep scored those rows as
+    unreached and exempted each one in the policy, so the reach pass never measured them. Now it
+    re-proves for the named action ONCE, as the IDE and the harness do, and sends the probe again.
+    A second refusal is scored like any other, so a wall that a re-proof cannot pass still reds.
+
+    The re-proof re-keys the session, so the caller must carry the returned token forward. Only
+    the method and path template go into ``reproved``, never the action: it is a header value.
+    """
+    response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
+    action = response.headers.get(STEP_UP_ACTION_HEADER)
+    if response.status_code != 403 or not action:
+        return response.status_code, token
+    token = await target.reprove(token, action)
+    reproved.append(f"{row.method} {row.path}")
+    response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
+    return response.status_code, token
+
+
 async def _write_pass(
     client: httpx.AsyncClient,
     rows: Sequence[route_gates.RouteRow],
@@ -248,8 +283,14 @@ async def _write_pass(
     placeholder: str,
     max_rebuilds: int,
     rebuilt: list[str],
-) -> list[tuple[route_gates.RouteRow, int]]:
+    reproved: list[str] | None = None,
+) -> tuple[list[tuple[route_gates.RouteRow, int]], str]:
     """Probe ``rows`` with ``username``'s session, keeping that session alive across side effects.
+    Returns the results and the session's token as the pass left it.
+
+    With ``reproved`` given, each probe passes an action-bound step-up wall through
+    :func:`_reach_probe`, which records the row there. The privileged reach pass passes it; the
+    BFLA pass does not, because a low-privilege caller must be refused before any step-up is asked.
 
     THE PROBLEM THIS SOLVES, measured rather than imagined: ``POST /auth/logout`` answers a valid
     administrator token with 200 and revokes the session. Every row probed after it then answers 401,
@@ -271,7 +312,12 @@ async def _write_pass(
     results: list[tuple[route_gates.RouteRow, int]] = []
     for row in rows:
         url = route_gates.concrete_path(row.path, placeholder)
-        status = await _probe(client, row.method, url, token)
+        if reproved is None:
+            status = await _probe(client, row.method, url, token)
+        else:
+            status, token = await _reach_probe(
+                client, row, url, token, target=target, reproved=reproved
+            )
         results.append((row, status))
 
         # The liveness probe is a plain GET on the preflight route, so it can never itself mutate
@@ -286,7 +332,7 @@ async def _write_pass(
                     "measurement, so this run measured nothing."
                 )
             token = await target.relogin(username)
-    return results
+    return results, token
 
 
 async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dict[str, Any]:
@@ -318,7 +364,10 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
         write_bfla_violations = 0
         write_outcomes = {"refused": 0, "stopped-at-validation": 0, "executed": 0}
         rebuilt: list[str] = []
+        reproved: list[str] = []
         max_rebuilds = int(policy.get("max_write_session_rebuilds", 0))
+        # The administrator's session as the reach passes leave it: a re-proof re-keys it.
+        admin_token = target.admin_token
 
         # Every gated row is a BFLA CANDIDATE when the low-privilege role does not hold its whole
         # permission set. Both the GET subset and the write subset are probed, so the receipt asserts
@@ -348,7 +397,9 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
 
             for row in get_rows:
                 url = route_gates.concrete_path(row.path, placeholder)
-                status = await _probe(client, "GET", url, target.admin_token)
+                status, admin_token = await _reach_probe(
+                    client, row, url, admin_token, target=target, reproved=reproved
+                )
                 if is_reached(status):
                     reached += 1
                 elif (row.method, row.path) in allowlisted:
@@ -382,7 +433,7 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             # depend on state a write probe left behind, and the low-privilege pass — which should be
             # refused everywhere and so should execute nothing — runs before the privileged one that
             # deliberately does execute.
-            for row, status in await _write_pass(
+            write_bfla_results, _viewer_token = await _write_pass(
                 client,
                 write_bfla_candidates,
                 target=target,
@@ -391,7 +442,8 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
                 placeholder=placeholder,
                 max_rebuilds=max_rebuilds,
                 rebuilt=rebuilt,
-            ):
+            )
+            for row, status in write_bfla_results:
                 write_bfla_probes += 1
                 if not is_refused(status):
                     # A missing body cannot manufacture a false PASS here, which is what makes the
@@ -402,16 +454,18 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
                         _finding(row.method, row.path, "bfla-write", status, "401, 403 or 429")
                     )
 
-            for row, status in await _write_pass(
+            write_reach_results, admin_token = await _write_pass(
                 client,
                 write_rows,
                 target=target,
                 username=ADMIN_USERNAME,
-                token=target.admin_token,
+                token=admin_token,
                 placeholder=placeholder,
                 max_rebuilds=max_rebuilds,
                 rebuilt=rebuilt,
-            ):
+                reproved=reproved,
+            )
+            for row, status in write_reach_results:
                 write_outcomes[write_probe_outcome(status)] += 1
                 if is_reached(status):
                     write_reached += 1
@@ -464,6 +518,10 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             "write_session_rebuilds": len(rebuilt),
             # Method + path template only, the same body-free shape as a finding.
             "write_session_rebuild_rows": list(rebuilt),
+            # Rows reached only after an action-bound re-proof (vault BACKLOG #3241). Method + path
+            # template only; the action the gate named is a header value and stays out.
+            "step_up_reproofs": len(reproved),
+            "step_up_reproof_rows": list(reproved),
             "findings": findings,
             "canary": canary,
         }
@@ -702,6 +760,9 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"{outcomes.get('executed', 0)} executed a handler on the throwaway target; "
         f"{receipt.get('write_session_rebuilds')} probe(s) destroyed the scan session and it was "
         f"re-minted -- {receipt.get('write_session_rebuild_rows') or 'none'}",
+        f"step-up re-proofs -- {receipt.get('step_up_reproofs', 0)} row(s) refused the "
+        "administrator with an action-bound step-up, were re-proved for that action and probed "
+        f"again -- {receipt.get('step_up_reproof_rows') or 'none'}",
         f"floors -- {floor_text} unexplained<="
         f"{policy.get('max_unexplained_unreached', 0)} "
         f"{'ok' if int(receipt.get('unreached_unexplained', 0)) <= int(policy.get('max_unexplained_unreached', 0)) else 'FAIL'}"
