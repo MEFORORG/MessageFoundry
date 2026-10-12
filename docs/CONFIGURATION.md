@@ -1456,9 +1456,10 @@ So `serve` and `supervise` each log one WARNING at start when such a proxy is se
 `supervise`, every engine shard logs its own. For each proxy, the WARNING names its scheme, host
 and port, never a user or password from its URL. It then says which of these hops use it and which
 refuse it, and for which target scheme. The engine works that out by running a request to a
-reserved host through each family's own proxy code, stopped before anything is sent. With no proxy
-set, or a `NO_PROXY` of exactly `*`, it logs nothing. Other commands that reach these hops, such as
-`check-privileges` and `verify`, do not log this warning.
+reserved host through each family's own proxy code, stopped before anything is sent. It logs
+nothing with no proxy set, with a `NO_PROXY` of exactly `*`, or when no hop reads any proxy that is
+set, such as an `all` proxy without the `[vault]` extra. Other commands that reach these hops, such
+as `check-privileges` and `verify`, do not log this warning.
 
 **Some hosts go direct.** Both families send a host on `NO_PROXY` or the system bypass list
 direct. The urllib hops also dial a loopback host direct. The Vault clients have no loopback rule,
