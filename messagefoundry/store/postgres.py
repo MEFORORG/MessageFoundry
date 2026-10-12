@@ -8878,11 +8878,21 @@ class PostgresStore:
         # record=False: a login is not a per-lane worker, and the acquire-wait histogram exists to
         # show how long those workers queue for a connection as the pool saturates. This is the
         # exemption the low-frequency helpers take.
+        # An unguarded sign-in takes FOR SHARE: it still waits behind a revoke's users UPDATE, and
+        # parallel sign-ins of one account do not wait on each other.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1 FOR UPDATE",
-                user_id,
-            )
+            if require_federated_subject is None:
+                row = await conn.fetchrow(
+                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
+                    " FOR SHARE",
+                    user_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
+                    " FOR UPDATE",
+                    user_id,
+                )
             if require_federated_subject is not None:
                 bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
                 if bound != require_federated_subject:

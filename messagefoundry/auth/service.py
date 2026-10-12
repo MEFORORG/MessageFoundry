@@ -128,7 +128,7 @@ from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
-from messagefoundry.store.row_seal import SESSION_KIND, RowSealError
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -7505,8 +7505,11 @@ class AuthService:
             )
             return None
         # BACKLOG #2592: a whole-account revoke raised the account's epoch after this session was
-        # sealed, so the session belongs to sessions that were ended. Refused before the touch.
+        # sealed, so the session belongs to sessions that were ended. That revoke blanked every
+        # seal under the account's lock, so no write of the store's own leaves such a row live:
+        # it is ended and reported like a row that fails its seal. Refused before the touch.
         if user is not None and session.user_epoch != user.session_epoch:
+            await self._session_seal_failed(session.token_hash)
             return None
         if activity:
             await self._store.touch_session(session.token_hash, now=now)
@@ -7528,13 +7531,19 @@ class AuthService:
         session = await self._store.get_session(token_hash)
         if session is None or session.revoked_at is not None:
             return None
-        sealer = self._store.row_sealer()
-        if not session_seal_ok(sealer, session):
-            await self._session_seal_failed(
-                session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
-            )
+        if not await self._session_row_holds(session, self._store.row_sealer()):
             return None
         return session
+
+    async def _session_row_holds(self, session: SessionRecord, sealer: RowSealer | None) -> bool:
+        """Whether an unrevoked session row's seal verifies; a row that fails is handed to
+        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592)."""
+        if session_seal_ok(sealer, session):
+            return True
+        await self._session_seal_failed(
+            session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
+        )
+        return False
 
     async def _session_seal_failed(self, token_hash: str, *, key_changed: bool = False) -> None:
         """End a session row that failed its integrity seal, and report it (BACKLOG #2592).
@@ -7570,7 +7579,7 @@ class AuthService:
         if len(self._seal_failures_reported) >= _SEAL_FAILURE_TRACK_MAX:
             self._seal_failures_reported.pop(next(iter(self._seal_failures_reported)))
         self._seal_failures_reported[ref] = now
-        reason = f"a {SESSION_KIND} row failed its integrity seal and was ended (session {ref})"
+        reason = f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})"
         _log.warning("%s", reason)
         await write_audit_soft(
             lambda: self._audit(
@@ -7890,12 +7899,12 @@ class AuthService:
         sealer = self._store.row_sealer()
         kept: list[SessionRecord] = []
         for row in rows:
-            if not session_seal_ok(sealer, row):
-                await self._session_seal_failed(
-                    row.token_hash, key_changed=session_sealed_by_retired_key(sealer, row)
-                )
-            elif row.user_epoch == epoch:
+            if not await self._session_row_holds(row, sealer):
+                continue
+            if row.user_epoch == epoch:
                 kept.append(row)
+            elif epoch is not None:
+                await self._session_seal_failed(row.token_hash)  # see identity_for_token
         return kept
 
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
@@ -7918,20 +7927,23 @@ class AuthService:
     ) -> int:
         """Revoke all of ``identity``'s sessions **except** the caller's current one ("sign out
         everywhere else"). Returns the count revoked. Audited when any were revoked."""
+        scope = "self_others"
         try:
             revoked = await self._store.revoke_user_sessions(
                 identity.user_id, except_token_hash=current_token_hash
             )
         except RowSealError:
             # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
-            # The caller asked to end every other session and its own is suspect: end them all.
+            # The caller asked to end every other session and its own is suspect: end them all,
+            # and audit that scope, since the caller's own session is ended too.
             await self._session_seal_failed(current_token_hash)
             revoked = await self._store.revoke_user_sessions(identity.user_id)
+            scope = "self_all"
         if revoked:
             await self._audit(
                 "auth.session_revoked",
                 actor=actor,
-                detail=_json({"scope": "self_others", "count": revoked}),
+                detail=_json({"scope": scope, "count": revoked}),
             )
         return revoked
 

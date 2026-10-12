@@ -129,31 +129,39 @@ class RowSealer:
         """Whether ``stored`` is a valid seal over ``fields`` under a RETIRED key's seal key: a row
         sealed before the store key changed. Such a row is still not accepted; this only lets the
         caller end it quietly rather than report it as an integrity failure."""
-        if not stored or not stored.startswith(SEAL_PREFIX):
-            return False
-        key_id, sep, mac = stored[len(SEAL_PREFIX) :].partition(":")
-        key = self._retired.get(key_id)
-        if not sep or key is None or len(mac) != _MAC_HEX_LEN:
-            return False
-        expected = hmac.new(key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(mac.encode("utf-8", "surrogatepass"), expected.encode("ascii"))
+        parsed = self._parse(stored)
+        key = None if parsed is None else self._retired.get(parsed[0])
+        return (
+            parsed is not None and key is not None and self._matches(key, kind, fields, parsed[1])
+        )
 
-    def _mac(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
-        return hmac.new(self._key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
+    @staticmethod
+    def _parse(stored: str | None) -> tuple[str, str] | None:
+        """``(key id, mac)`` from a stored seal, or ``None`` when it is missing or malformed."""
+        if not stored or not stored.startswith(SEAL_PREFIX):
+            return None
+        key_id, sep, mac = stored[len(SEAL_PREFIX) :].partition(":")
+        if not sep or len(mac) != _MAC_HEX_LEN:
+            return None
+        return key_id, mac
+
+    @staticmethod
+    def _matches(key: bytes, kind: str, fields: Iterable[tuple[str, object]], mac: str) -> bool:
+        expected = hmac.new(key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
+        # As bytes: compare_digest refuses a str holding non-ASCII, which a stored value may.
+        return hmac.compare_digest(mac.encode("utf-8", "surrogatepass"), expected.encode("ascii"))
 
     def seal(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
         """The stored seal for a row of ``kind`` holding ``fields``."""
-        return f"{SEAL_PREFIX}{self.key_id}:{self._mac(kind, fields)}"
+        mac = hmac.new(self._key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
+        return f"{SEAL_PREFIX}{self.key_id}:{mac}"
 
     def verify(self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None) -> bool:
         """Whether ``stored`` is this sealer's seal over ``fields``. A missing, empty or malformed
         seal fails, and so does one that names another key. The MAC compare is constant-time."""
-        if not stored or not stored.startswith(SEAL_PREFIX):
-            return False
-        key_id, sep, mac = stored[len(SEAL_PREFIX) :].partition(":")
-        if not sep or key_id != self.key_id or len(mac) != _MAC_HEX_LEN:
-            return False
-        # As bytes: compare_digest refuses a str holding non-ASCII, which a stored value may.
-        return hmac.compare_digest(
-            mac.encode("utf-8", "surrogatepass"), self._mac(kind, fields).encode("ascii")
+        parsed = self._parse(stored)
+        return (
+            parsed is not None
+            and parsed[0] == self.key_id
+            and self._matches(self._key, kind, fields, parsed[1])
         )

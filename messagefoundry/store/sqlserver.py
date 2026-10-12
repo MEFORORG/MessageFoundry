@@ -12870,11 +12870,21 @@ class SqlServerStore:
         # register_failed_login and consume_totp_step take it.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
-                    " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                    (user_id,),
-                )
+                # An unguarded sign-in takes a shared lock held to the commit (HOLDLOCK): it still
+                # waits behind a revoke's users UPDATE, and parallel sign-ins of one account do not
+                # wait on each other.
+                if require_federated_subject is None:
+                    await cur.execute(
+                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
+                        " WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+                        (user_id,),
+                    )
+                else:
+                    await cur.execute(
+                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
+                        " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (user_id,),
+                    )
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
                 # closes the cursor before the pooled connection is reused (EF-6).
                 rows = await cur.fetchall()

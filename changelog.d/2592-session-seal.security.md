@@ -10,6 +10,7 @@
   account's session epoch, and a session minted under an older epoch resolves to nothing.
   `rotate-key` now ends every session, so every operator signs in again after a rotation. New
   columns `sessions.user_epoch`, `sessions.seal` and `users.session_epoch` on SQLite, Postgres and
-  SQL Server. A session row written before this change has no seal, so a keyed store refuses,
-  reports and ends it once. A keyless store, and the `vault_transit` provider, write and check no
+  SQL Server. A session row written before this change, or before the store had a local key, has
+  no seal, so a keyed store refuses, reports and ends it once. A session that carries an older
+  epoch than its account is ended and reported the same way. A keyless store, and the `vault_transit` provider, write and check no
   seal yet. (vault BACKLOG #2592)
