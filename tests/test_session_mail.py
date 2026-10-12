@@ -1293,12 +1293,11 @@ def test_a_body_shaped_like_a_message_payload_is_withheld(repo: Path, tmp_path: 
     """DEFECT 7's backstop. It catches the realistic accident -- somebody pasting an ADT into a
     handoff note -- and its presence is NOT evidence that the queue is PHI-safe.
 
-    The patient id carries letters because the hook prints time stamps near the withheld body: the
-    message id (digits, lowercase, ``T`` and ``-``) and the sent time (digits and ``-:.TZ``). A
-    digits-only id, ``123456``, sat inside the id's stamp at 12:34:56 UTC and failed a run (BACKLOG
-    #3087). The stem below is that run's id, pinned so every run meets that moment, not only a run
-    that lands on it by chance. ``QR123456K`` holds the same six digits, so the letters are what keep
-    it apart from any stamp."""
+    The patient id holds capital letters on purpose. The hook prints runs of digits near the withheld
+    body, at least in the message id, the sent time and the on-disk path. A digits-only id,
+    ``123456``, sat inside the id's time stamp at 12:34:56 UTC and failed a run (BACKLOG #3087). The
+    stem below is that run's id, pinned so every run meets that moment. ``QR123456K`` holds the same
+    six digits. No stamp carries a capital other than ``T`` or ``Z``, so Q, R and K keep it apart."""
     mrn = "QR123456K"
     body = f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5\nPID|1||{mrn}||DOE^JOHN"
     stem = "20261006T123456171-csxyd6"
