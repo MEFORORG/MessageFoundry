@@ -87,6 +87,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    float_setting,
     intake_open,
     positive_cap,
     probe_tcp_reachable,
@@ -750,8 +751,12 @@ class MLLPDestination(DestinationConnector):
             raise ValueError("MLLP destination requires a 'host' setting (the downstream peer)")
         self.host: str = host
         self.port: int = int(s["port"])
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
-        self.connect_timeout: float = float(s.get("connect_timeout", 10.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="MLLP destination"
+        )
+        self.connect_timeout: float = float_setting(
+            s.get("connect_timeout", 10.0), knob="connect_timeout", transport="MLLP destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         # Per-outbound frame cap. This bounds ONLY the ACK-read decoder (the reply we read back); the
         # OUTGOING frame written by send() is deliberately UNCAPPED (frame() never truncates), so a
@@ -1797,8 +1802,8 @@ class MLLPSource(SourceConnector):
             # it: the unbounded table this control is not allowed to contain. Refuse at build, where
             # dry-run and `check` surface it, rather than at the first connection.
             raise ValueError(
-                "MLLP max_connections_per_host must be at least 1 (use None or 0 to disable the "
-                f"per-host cap), got {self.max_connections_per_host}"
+                "MLLP max_connections_per_host must be at least 1 (value withheld; use None or 0 to "
+                "disable the per-host cap)"
             )
         self.receive_timeout: float | None = positive_cap(
             s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT),
@@ -1818,16 +1823,13 @@ class MLLPSource(SourceConnector):
             knob="max_frame_seconds",
             transport="MLLP",
         )
-        if self.max_frame_seconds is not None and not self.max_frame_seconds >= 0:
-            # Negative reaches here too, and would expire every frame the instant one opened — a
+        if self.max_frame_seconds is not None and self.max_frame_seconds < 0:
+            # Negative reaches here, and would expire every frame the instant one opened — a
             # listener that drops every sender, configured from a value the author meant as "off".
-            # Written `not >= 0` rather than `< 0` so NaN is refused as well: TOML can spell `nan`,
-            # `_cap_setting` cannot recognise it (`nan != 0`), and every comparison with it is false
-            # — so `min()` against the idle bound would silently drop the deadline and a bare
-            # `wait_for(..., nan)` would fire at once.
+            # `_cap_setting` has already refused a NaN (BACKLOG #3432).
             raise ValueError(
-                "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
-                f"disable the frame deadline), got {self.max_frame_seconds}"
+                "MLLP max_frame_seconds must be a number of seconds, zero or more (value withheld; "
+                "use None or 0 to disable the frame deadline)"
             )
         # BACKLOG #1725 act 3. Read through `positive_cap`, which also names the key when the value
         # is not a number; a negative one would let no frame be handled at all.

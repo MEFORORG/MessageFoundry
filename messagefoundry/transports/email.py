@@ -80,6 +80,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     NegativeAckError,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -335,7 +336,9 @@ class EmailDestination(DestinationConnector):
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
         self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="Email destination"
+        )
         self.encoding: str = str(s.get("encoding", "utf-8"))
 
         # STARTTLS-by-default posture, mirroring RestDestination's verify_tls /
