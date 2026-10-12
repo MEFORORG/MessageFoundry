@@ -1664,10 +1664,10 @@ def _attribute_swaps(source: str) -> tuple[str, ...]:
                 owner = _dotted(node.args[0], aliases)
                 name = node.args[1] if len(node.args) > 1 else None
                 literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
-                if owner is not None and literal:
-                    swaps.append(f"{owner}.{ast.literal_eval(node.args[1])}")
-                elif owner is not None:
-                    swaps.append(f"{owner}.<computed>")
+                if owner is not None:
+                    swaps.append(
+                        f"{owner}.{getattr(name, 'value', '') if literal else '<computed>'}"
+                    )
             continue
         if isinstance(node, ast.Assign):
             targets = node.targets
@@ -1700,10 +1700,6 @@ def _modules_calling(sources: Mapping[str, str], names: frozenset[str]) -> set[s
             for node in ast.walk(_parse(source))
         )
     }
-
-
-def _harness_parse_sites(sources: Mapping[str, str]) -> set[str]:
-    return {rel for rel, source in sources.items() if _is_parse_site(source)}
 
 
 def _harness_region(text: str, lead: str) -> str:
@@ -1787,7 +1783,7 @@ def _harness_drift(text: str, sources: Mapping[str, str]) -> list[str]:
         ),
         *_harness_list_drift(text, _HARNESS_LOADS_LEAD, _modules_calling(sources, _CONFIG_LOADERS)),
         *_harness_swap_drift(text, _harness_swaps(sources)),
-        *_harness_parse_drift(text, _harness_parse_sites(sources)),
+        *_harness_parse_drift(text, _parse_sites(sources)),
         *_harness_absent_problems(sources),
     ]
 
@@ -1823,7 +1819,7 @@ def test_the_harness_scans_fire() -> None:
     assert _modules_calling(sources, _DYNAMIC_IMPORTS), "no harness import by name found"
     assert _modules_calling(sources, _CONFIG_LOADERS), "no harness config load found"
     assert _harness_swaps(sources), "no harness attribute swap found: the scan is dead"
-    assert _harness_parse_sites(sources), "no harness parse site found: the scan is dead"
+    assert _parse_sites(sources), "no harness parse site found: the scan is dead"
     quiet = (
         '"""cli.read = fake, importlib.import_module(name) and load_config(path)."""\n'
         "import os\n"
