@@ -8818,12 +8818,15 @@ def _rotate_key(args: argparse.Namespace) -> int:
         print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
         return 2
     except ValueError as exc:
-        # vault BACKLOG #3247: under key_provider=vault the provider builds its Vault client outside
-        # its own `try`, and at least the outbound length bound, the TLS suite assertion and the
-        # strict-reader mount refuse with a bare ValueError. Only the key is resolved here: no store
-        # is open and nothing was changed, so this is "could not start", exit 2. It reached the
-        # dispatch floor and exited 1, an aborted rotation's code. Rendered through `safe_exc`, as
-        # that floor renders it, so this arm prints nothing the floor would not.
+        # vault BACKLOG #3247: under key_provider=vault the Vault client build can refuse with a
+        # bare ValueError, which is not in `_key_unresolved()`. Only the key is resolved here: no
+        # store is open and nothing was changed, so exit 2 as above, never an aborted rotation's
+        # exit 1. Exactly ValueError, as `privilege_probes._why` reads the same refusals: those
+        # carry engine-written text, and a subclass can quote what a parser or a server read, so
+        # it still goes to the dispatch floor. Rendered through `safe_exc`, as that floor would.
+        # The arm can go once the provider raises its own type for a client it cannot build.
+        if type(exc) is not ValueError:
+            raise
         from messagefoundry.redaction import safe_exc
 
         print(f"error: cannot load the active key for rotation: {safe_exc(exc)}", file=sys.stderr)

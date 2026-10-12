@@ -71,17 +71,12 @@ anything enters the tunnel, and
 own would turn that test red.
 
 **A refusal of the hop is one type at both phases (BACKLOG #2318).** Every check on the hop itself,
-its address, its proxy, its TLS leg or its pool, raises
+its address, its proxy, its TLS leg or its pool, raises :class:`VaultHopRefused`, an
 :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, whether it fires when the client is
 built or before a send. A refusal of the REPLY is an
 :class:`~messagefoundry.transports.bounded_read.EgressReplyError`. Both carry fixed text only, and
 :func:`vault_failure_text` is how the providers' catch-all handlers keep that text rather than
 shrinking it to a type name.
-
-**This module raises the hop refusal as** :class:`VaultHopRefused` **(vault BACKLOG #3247).** It is
-an ``InsecureHopRefused``, so every handler written for the base type still catches it. The
-subclass marks a refusal built here from fixed text, and :func:`vault_failure_text` keeps the text
-of that subclass only.
 """
 
 from __future__ import annotations
@@ -105,8 +100,8 @@ import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
 from messagefoundry.config.tls_policy import (
+    HopDisposition,
     InsecureHopRefused,
-    enforce_insecure_hop,
     insecure_hop_disposition,
     is_loopback_hop_host,
 )
@@ -136,9 +131,11 @@ class VaultHopRefused(InsecureHopRefused):
     echo a host (``transports/rest.py``). So :func:`vault_failure_text` keeps this type's text and
     no other hop refusal's.
 
-    **Raise it only in this module, and only with fixed text.**
-    ``tests/test_vault_hop_refusal_marker.py`` reads the source for both: no other module under
-    ``messagefoundry/`` builds one, and this module raises no bare ``InsecureHopRefused``.
+    Still an ``InsecureHopRefused``, so a handler written for the base type catches it.
+
+    **Build it only in this module, and only from fixed text.**
+    ``tests/test_vault_hop_refusal_marker.py`` reads the source for both halves: no other module
+    under ``messagefoundry/`` builds one, and this module builds no bare ``InsecureHopRefused``.
     """
 
 
@@ -522,10 +519,8 @@ def vault_failure_text(exc: BaseException) -> str:
     other failure gives only its type name, as before, because its text can echo ciphertext, a
     request body or a URL.
 
-    **A hop refusal of any other type gives only its type name (vault BACKLOG #3247).** The test
-    used to accept every ``InsecureHopRefused``. Elsewhere in the engine one can echo a host
-    (``transports/rest.py``), so a handler that met one would have printed that host.
-    :class:`VaultHopRefused` is raised only in this module, so its text is this module's.
+    **A bare** ``InsecureHopRefused`` **gives only its type name too (vault BACKLOG #3247).**
+    :class:`VaultHopRefused` says why.
 
     **The reply half is still by type.** An ``EgressReplyError`` is built in this module and in
     ``bounded_read`` only, at least today, and both use fixed text. Call this only from a handler
@@ -600,27 +595,23 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     host direct (``bounded_read.LoopbackDirectProxyHandler``, vault BACKLOG #2579). requests
     has no such handler, which is why this hop refuses instead.
 
-    Raises :class:`VaultHopRefused`, an ``InsecureHopRefused`` and so a ``ValueError``, with fixed
-    text."""
+    Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a ``ValueError``, with
+    fixed text."""
     scheme, host = _vault_scheme_and_host(url)
     if scheme == "https":
         return
     on_box = scheme == "http" and not proxy and bool(host) and is_loopback_hop_host(host)
-    try:
-        enforce_insecure_hop(
-            insecure_hop_disposition(
-                enforcing=True,  # no posture in scope (docstring); fail closed
-                is_loopback_hop=on_box,
-                hop_attested=False,
-                cleartext_accepted=False,
-            ),
-            message=_CLEARTEXT_VAULT_HOP,
-            cell=connector,
-        )
-    except InsecureHopRefused as exc:
-        # The shared authority raises the base type. Its text here is the two fixed arguments
-        # above and nothing else, so it is raised again as this module's marked type.
-        raise VaultHopRefused(str(exc)) from exc
+    disposition = insecure_hop_disposition(
+        enforcing=True,  # no posture in scope (docstring); fail closed
+        is_loopback_hop=on_box,
+        hop_attested=False,
+        cleartext_accepted=False,
+    )
+    # Raised here, not by `enforce_insecure_hop`, which raises the unmarked base type (vault
+    # BACKLOG #3247). With these arguments the authority answers ALLOW or REFUSE only, so that
+    # function's warn arm was never reached; anything but ALLOW refuses.
+    if disposition is not HopDisposition.ALLOW:
+        raise VaultHopRefused(f"{connector}: {_CLEARTEXT_VAULT_HOP}")
 
 
 #: The fixed text of the proxy-credential refusal. Like the cleartext one, it names no part of the

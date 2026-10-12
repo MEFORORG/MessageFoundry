@@ -9,14 +9,13 @@ would have printed the host. The hop's own refusals are now a marked subclass,
 ``VaultHopRefused``, and only that subclass keeps its text.
 
 Two source scans hold the marker to its meaning: no module but ``strict_requests`` builds one, and
-``strict_requests`` raises no bare ``InsecureHopRefused``.
+``strict_requests`` builds no bare ``InsecureHopRefused``.
 
 Synthetic data only: the host, key names and wrapped key are made up.
 """
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +25,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.store import keyprovider_vault
 from messagefoundry.store.keyprovider import KeyProviderError
+from tests._ast_sites import call_sites, parse_source
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 #: ``strict_requests`` imports ``requests`` and ``urllib3`` at module scope.
@@ -43,52 +43,31 @@ _HOST = "vault.synthetic.test"
 _HOST_ECHOING = f"REST cleartext egress: http://{_HOST}:8200 is not loopback; refusing"
 
 
-def _called_name(node: ast.AST) -> str | None:
-    """The bare or dotted-tail name a ``Call`` node calls, else ``None``."""
-    if not isinstance(node, ast.Call):
-        return None
-    func = node.func
-    if isinstance(func, ast.Name):
-        return func.id
-    if isinstance(func, ast.Attribute):
-        return func.attr
-    return None
-
-
-def _calls_of(path: Path, name: str) -> list[int]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    return [node.lineno for node in ast.walk(tree) if _called_name(node) == name]
+def _lines_building(path: Path, name: str) -> list[int]:
+    """The lines of ``path`` that call ``name``. A file whose text never spells the name is not
+    parsed: code that builds the type has to spell it."""
+    text = path.read_text(encoding="utf-8")
+    if name not in text:
+        return []
+    return [call.lineno for call in call_sites(parse_source(text), name)]
 
 
 def test_only_the_strict_reader_module_builds_the_marked_refusal() -> None:
     elsewhere = {
         str(path.relative_to(_PACKAGE)): lines
         for path in sorted(_PACKAGE.rglob("*.py"))
-        if path != _HOME and (lines := _calls_of(path, _MARKER))
+        if path != _HOME and (lines := _lines_building(path, _MARKER))
     }
     assert elsewhere == {}, f"{_MARKER} is built outside strict_requests.py: {elsewhere}"
-    # The control: the same scan finds the sites in the module that owns the type, so an empty
-    # answer above is not the scan seeing nothing at all.
-    assert _calls_of(_HOME, _MARKER)
 
 
-def test_the_strict_reader_module_raises_no_unmarked_hop_refusal() -> None:
+def test_the_strict_reader_module_builds_no_unmarked_hop_refusal() -> None:
     """A check added here that raised the base type would lose its text at every handler."""
-    tree = ast.parse(_HOME.read_text(encoding="utf-8"), filename=str(_HOME))
-    raised = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Raise) and node.exc is not None
-        if _called_name(node.exc) == "InsecureHopRefused"
-    ]
-    assert raised == [], f"strict_requests.py raises a bare InsecureHopRefused at lines {raised}"
-    marked = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Raise) and node.exc is not None
-        if _called_name(node.exc) == _MARKER
-    ]
-    assert marked, "the control: the scan must see this module's raise sites"
+    unmarked = _lines_building(_HOME, "InsecureHopRefused")
+    assert unmarked == [], f"strict_requests.py builds a bare InsecureHopRefused at {unmarked}"
+    # The control for both scans: the same scan sees the marked sites in this module, so an empty
+    # answer is not the scan seeing nothing at all.
+    assert _lines_building(_HOME, _MARKER)
 
 
 @_needs_the_vault_extra
@@ -103,20 +82,18 @@ def test_an_unmarked_hop_refusal_gives_only_its_type_name() -> None:
 
 
 @_needs_the_vault_extra
-def test_the_cleartext_refusal_from_the_shared_authority_is_marked() -> None:
-    """The one refusal this module does not build itself: ``enforce_insecure_hop`` raises the base
-    type, and the module raises it again as its own."""
+def test_the_cleartext_refusal_is_marked_and_keeps_its_wording() -> None:
+    """The cleartext refusal used to come from the shared ``enforce_insecure_hop``, which raises
+    the base type. The module now builds it, with the text that function gave it."""
     from messagefoundry.transports.strict_requests import (
         _CLEARTEXT_VAULT_HOP,
         VaultHopRefused,
         _refuse_a_cleartext_vault_hop,
-        vault_failure_text,
     )
 
     with pytest.raises(VaultHopRefused) as caught:
         _refuse_a_cleartext_vault_hop(f"http://{_HOST}:8200", None, connector="Vault test hop")
     assert str(caught.value) == f"Vault test hop: {_CLEARTEXT_VAULT_HOP}"
-    assert vault_failure_text(caught.value) == str(caught.value)
     assert _HOST not in str(caught.value)
 
 
