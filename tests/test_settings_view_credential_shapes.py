@@ -69,6 +69,43 @@ def test_a_headers_table_default_keeps_a_public_header_readable() -> None:
     assert view["headers"] == {"env": "h", "default": {"Accept": "application/fhir+json"}}
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"env": f"Bearer {MARK}"},  # a literal table whose one header is named "env"
+        env("h", default=f"Bearer {MARK}"),  # a header value outside a table
+        [f"Bearer {MARK}"],
+    ],
+)
+def test_a_credential_shaped_header_value_outside_a_table_is_masked(headers: object) -> None:
+    """Review of this build: each of these was masked on main by the table walk, or reached a
+    string arm that only applied the URL rule."""
+    assert MARK not in json.dumps(_shown({"headers": headers}))
+
+
+def test_a_raw_marker_keeps_its_named_cast() -> None:
+    """The control for the marker rendering: a named cast is public, so the view keeps it."""
+    assert _shown({"port": {"env": "p", "cast": "int"}})["port"] == {"env": "p", "cast": "int"}
+
+
+# --- a nested key with a rule of its own ------------------------------------------------------
+
+
+def test_a_nested_key_takes_its_own_rule() -> None:
+    """The walk reads a nested key as a setting name when it has a rule: a credential key masks,
+    a URL key withholds, and a nested ``headers`` table gets the header rule."""
+    view = _shown(
+        {
+            "options": {"password": MARK, "timeout": 5},
+            "fhir": {"base_url": f"https://u:{MARK}@h.example.invalid/x"},
+            "fallbacks": [{"headers": {"Authorization": f"Basic {MARK}"}}],
+        }
+    )
+    assert view["options"] == {"password": "***", "timeout": 5}
+    assert view["fhir"] == {"base_url": "https://<redacted>"}
+    assert view["fallbacks"] == [{"headers": {"Authorization": "***"}}]
+
+
 # --- shape 2: a reference-valued default --------------------------------------------------------
 
 
@@ -112,6 +149,7 @@ def test_a_plain_default_is_still_shown() -> None:
         f"x_api_key_v2={MARK}",
         f"fmt=json&clientSecretValue={MARK}",
         f"a=1;tokenvalue={MARK}",
+        f"pageToken[password]={MARK}",  # a credential word outside the benign ending
     ],
 )
 def test_a_compound_query_name_holding_a_credential_word_is_withheld(query: str) -> None:
@@ -187,6 +225,12 @@ def test_an_encoded_separator_withholds_the_url(escape: str) -> None:
     """A reader that decodes twice takes the escape as a separator and the text after it as a name.
     Matched in any case, and with tab, CR and LF removed first, as ``urlsplit`` removes them."""
     url = f"https://h.example.invalid/x?a=1{escape}api_key={MARK}"
+    assert _shown({"url": url})["url"] == "https://<redacted>"
+
+
+def test_a_double_encoded_credential_name_withholds_the_url() -> None:
+    """Review of this build: ``api%255Fkey`` is ``api_key`` to the same reader that decodes twice."""
+    url = f"https://h.example.invalid/x?api%255Fkey={MARK}"
     assert _shown({"url": url})["url"] == "https://<redacted>"
 
 

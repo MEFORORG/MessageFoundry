@@ -1631,8 +1631,9 @@ _WITHHELD_URL = CREDENTIAL_PLACEHOLDER
 
 #: Percent-escapes that withhold a URL setting whatever surrounds them: ``@`` and ``:`` (userinfo),
 #: and ``&``, ``;``, ``?`` and ``#`` (BACKLOG #2721 shape 5), which a reader that decodes twice takes
-#: as a separator, so ``a=1%26api_key=SECRET`` hides a credential name from a single decode.
-_WITHHELD_URL_ESCAPES = ("%40", "%3a", "%26", "%3b", "%3f", "%23")
+#: as a separator, so ``a=1%26api_key=SECRET`` hides a credential name from a single decode. And
+#: ``%25``, an escaped ``%``, for the same reader: ``api%255Fkey`` is ``api_key`` after two decodes.
+_WITHHELD_URL_ESCAPES = ("%40", "%3a", "%26", "%3b", "%3f", "%23", "%25")
 
 #: Credential words a DISPLAY name may hold ANYWHERE, compared casefolded with ``_``, ``-``, ``.``
 #: and spaces removed (BACKLOG #2721 shape 3: ``sslpassword``, ``user[password]``,
@@ -1658,9 +1659,10 @@ _DISPLAY_CREDENTIAL_WORDS = (
 
 #: Short credential words a PATH segment may BE, whole, after a trailing ``s`` is dropped. Too
 #: short for the anywhere rule above, but a whole segment that is ``key`` or ``session`` names what
-#: the next segment holds. ``auth`` is left out on purpose: a Keycloak token endpoint lives under
-#: ``/auth/realms/``, and withholding every one of those would hide the OAuth endpoints the shape-4
-#: ruling keeps readable.
+#: the next segment holds. ``auth`` is left out on purpose: an older Keycloak puts every endpoint
+#: under ``/auth/realms/``, and withholding all of them would hide the OAuth endpoints the shape-4
+#: ruling keeps readable. The ruling still withholds an endpoint BELOW a credential word, such as
+#: ``/token/introspect`` or ``/sessions/123/messages``: over-masking is its safe direction.
 _DISPLAY_CREDENTIAL_SEGMENTS = frozenset({"key", "pass", "session", "sig"})
 
 
@@ -1673,16 +1675,17 @@ def _names_a_credential(name: str) -> bool:
     """Whether a decoded query or path NAME holds a credential word anywhere in it.
 
     A name that ends in a known non-secret (:data:`~messagefoundry.secretscrub._QUERY_NOT_CREDENTIAL_TAILS`,
-    such as ``pageToken``) is not one, unless a credential word also sits before that ending. The
+    such as ``pageToken``) is not one, unless a credential word also sits outside that ending. The
     ending is judged without a trailing index or digits, as the warning detector judges it, so
-    ``pageToken[0]`` is a cursor and ``user[password]`` is not."""
+    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not."""
     squashed = _squash_name(name)
     if not any(word in squashed for word in _DISPLAY_CREDENTIAL_WORDS):
         return False
     base = _squash_name(_base_name(name))
     for tail in _QUERY_NOT_CREDENTIAL_TAILS:
         if base.endswith(tail):
-            return any(word in base[: -len(tail)] for word in _DISPLAY_CREDENTIAL_WORDS)
+            before, _tail, after = squashed.rpartition(tail)
+            return any(word in before + after for word in _DISPLAY_CREDENTIAL_WORDS)
     return True
 
 
@@ -1723,7 +1726,7 @@ def _url_may_carry_a_credential(value: str) -> bool:
     one statement of the rule; the docs point here.
 
     Any of these withholds it: an ``@`` anywhere in it; a ``%40``, ``%3A``, ``%26``, ``%3B``,
-    ``%3F`` or ``%23`` anywhere in it, any case (:data:`_WITHHELD_URL_ESCAPES`); a value
+    ``%3F``, ``%23`` or ``%25`` anywhere in it, any case (:data:`_WITHHELD_URL_ESCAPES`); a value
     ``urlsplit`` refuses; a credential-looking query name by the warning detector
     (:func:`~messagefoundry.secretscrub.credential_query_params`); a credential-looking name in any
     ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
@@ -1798,9 +1801,13 @@ _MAX_VIEW_DEPTH = 8
 
 def _marker_key(marker: Mapping[str, Any]) -> str:
     """A raw marker's env KEY for a view. A key that is not text is no key anyone set on purpose,
-    and rendering it could carry a nested default, so it renders as ``"***"``."""
+    and rendering it could carry a nested default, so it renders as ``"***"``. So does a key that
+    looks like a credential: a code-first ``headers`` table whose one header is named ``env`` has
+    the marker's shape, and its value is the header's (review of the #2721 build)."""
     key = marker["env"]
-    return key if isinstance(key, str) else "***"
+    if not isinstance(key, str) or _looks_like_a_credential_value(key):
+        return "***"
+    return key
 
 
 def _view_stop(value: object, depth: int) -> object | None:
@@ -1868,12 +1875,16 @@ def _view_value(name: str, value: object, depth: int = 0) -> object:
     default has no reading anyone needs in a view, and showing it is how
     ``env("a", default=env("b", default=SECRET))`` printed the secret and how the raw
     :class:`EnvRef` it left behind made ``json.dumps`` refuse the whole view. A string under a URL
-    setting is withheld by :func:`_mask_url`, in a list as at the top. A ``headers`` table and an
-    ``odbc_params`` bag get their own key rules, wherever they sit, so a whole-table ``env()``
-    default is scrubbed like a literal table."""
+    setting is withheld by :func:`_mask_url`, in a list as at the top, and a credential-shaped
+    string under ``headers`` is masked. A ``headers`` table and an ``odbc_params`` bag get their own
+    key rules, so a whole-table ``env()`` default is scrubbed like a literal table. Inside any other
+    mapping, a key with a rule of its own takes that rule (:func:`_view_entry`)."""
     if (stop := _view_stop(value, depth)) is not None:
         return stop
     if isinstance(value, str):
+        if name == "headers" and _looks_like_a_credential_value(value):
+            # A header value reached outside a table: an env() default or a list item.
+            return "***"
         # BACKLOG #1207 and ASVS 14.2.1: withheld whole when it may carry a credential; the
         # rule is stated once, on _url_may_carry_a_credential.
         return _mask_url(value) if _is_url_setting(name) else value
@@ -1916,7 +1927,24 @@ def _view_value(name: str, value: object, depth: int = 0) -> object:
             )
             for k, v in value.items()
         }
+    if isinstance(value, Mapping):
+        return {
+            _redact_header_name(k): _view_entry(name, k, v, depth + 1) for k, v in value.items()
+        }
     return _view_items(value, lambda item: _view_value(name, item, depth + 1))
+
+
+def _view_entry(parent: str, key: object, value: object, depth: int) -> object:
+    """One entry of a nested mapping under setting ``parent``. A key that is a credential setting
+    name masks its value; a key that is a URL setting, ``headers`` or ``odbc_params`` takes that
+    rule; any other key keeps the parent's rule, so a URL under ``fallback_url`` is still a URL."""
+    if not isinstance(key, str):
+        return _view_value(parent, value, depth)
+    if _is_secret_setting(key):
+        return "***"
+    if key in ("headers", "odbc_params") or _is_url_setting(key):
+        return _view_value(key, value, depth)
+    return _view_value(parent, value, depth)
 
 
 def _view_setting(name: str, value: object) -> object:
@@ -1940,6 +1968,9 @@ def _view_setting(name: str, value: object) -> object:
     ref: dict[str, Any] = {"env": key}
     if default is not _UNSET and not is_secret:
         ref["default"] = _view_value(name, default, 1)
+    cast = value.get("cast") if _is_env_marker(value) else None
+    if isinstance(cast, str) and cast in _NAMED_CASTS:
+        ref["cast"] = cast  # a named cast is public, and the IDE graph view shows it
     return ref
 
 
