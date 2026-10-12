@@ -1077,6 +1077,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:via messagefoundry.auth.totp",
             "sign_verify:via messagefoundry.auth.oidc.claims",
             "sign_verify:via messagefoundry.auth.webauthn",
+            # BACKLOG #2592: the session loader checks each session row's integrity seal.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:via messagefoundry.auth.oidc_http",
         }
     ),
@@ -1361,6 +1363,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "kdf:via messagefoundry.store.crypto",
             "key_cert:via messagefoundry.config.tls_policy",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:.check_hostname = False",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
@@ -1377,6 +1381,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.store",
             "kdf:via messagefoundry.store.crypto",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/store/store.py": frozenset(
@@ -1389,6 +1395,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
+            "sign_verify:.verify()",
         }
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)

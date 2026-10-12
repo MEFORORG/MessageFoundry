@@ -5416,6 +5416,39 @@ async def test_session_rotation_contract(store) -> None:
     await assert_session_rotation_contract(store)
 
 
+async def test_session_seal_contract(store) -> None:
+    """BACKLOG #2592: session-row integrity seals, the same contract the SQLite suite runs, on a
+    keyed handle. ``raw`` runs each statement on a pooled connection, outside the store's helpers.
+    The fixture clears the session and user tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._session_seal_contract import assert_session_columns, assert_session_seal_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        async def columns() -> set[str]:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(
+                    "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('sessions')"
+                )
+                return {str(r[0]) for r in await cur.fetchall()}
+
+        await assert_session_seal_contract(keyed, raw)
+        assert_session_columns(await columns())
+    finally:
+        await keyed.close()
+
+
 async def test_session_supersession_contract(store) -> None:
     """BACKLOG #2146: supersede_session revokes and returns in one statement, so a rotation after it
     fails closed. Extra-free shared contract, run here as on SQLite."""

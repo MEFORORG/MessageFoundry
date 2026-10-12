@@ -142,6 +142,20 @@ def test_the_key_id_moves_with_the_store_id() -> None:
     assert row_seal_key_id(derive_row_seal_key(root, NO_STORE_ID)) == row_seal_key_id(unpinned)
 
 
+def test_a_retired_key_seal_is_recognised_but_never_accepted() -> None:
+    old, new = generate_key(), generate_key()
+    stored = _sealer(old).seal("session", _FIELDS)
+    rekeyed = RowSealer.for_cipher(make_cipher(new, [old]))
+    assert rekeyed is not None
+    assert not rekeyed.verify("session", _FIELDS, stored)
+    assert rekeyed.sealed_by_retired_key("session", _FIELDS, stored)
+    # Controls: a changed row, or a key the cipher never held, is not a key change.
+    assert not rekeyed.sealed_by_retired_key("session", _FIELDS[:-1], stored)
+    stranger = _sealer().seal("session", _FIELDS)
+    assert not rekeyed.sealed_by_retired_key("session", _FIELDS, stranger)
+    assert not _sealer(new).sealed_by_retired_key("session", _FIELDS, stored)
+
+
 def test_the_cipher_root_is_the_active_keys() -> None:
     active, retired = generate_key(), generate_key()
     cipher = make_cipher(active, [retired])

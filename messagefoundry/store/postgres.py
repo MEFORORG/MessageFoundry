@@ -67,9 +67,10 @@ from collections.abc import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, assert_never
+from typing import Any, Final, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -143,6 +144,7 @@ from messagefoundry.store.privilege import (
     classify_audit_writes,
     postgres_excess,
 )
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -225,15 +227,22 @@ from messagefoundry.store.store import (
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
+    mfa_stamp,
+    new_session_record,
     next_lockout_state,
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
     password_claim_set,
     read_transit_bound_attestation_rows,
+    reauth_stamp,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    seal_session,
+    session_insert_params,
+    session_reseal_params,
+    session_seal_ok,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -746,7 +755,9 @@ _SCHEMA: list[str] = [
         second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,
         -- ADR 0197 Amendment A (BACKLOG #1131): TRUE while the credential in force is
         -- engine-generated; wrong passwords arm no sign-in lock then.
-        password_generated   BOOLEAN NOT NULL DEFAULT FALSE
+        password_generated   BOOLEAN NOT NULL DEFAULT FALSE,
+        -- BACKLOG #2592: raised by every whole-account session revoke.
+        session_epoch        INTEGER NOT NULL DEFAULT 0
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -791,7 +802,9 @@ _SCHEMA: list[str] = [
         reauth_at    DOUBLE PRECISION,
         mfa_verified_at DOUBLE PRECISION,
         auth_mechanism TEXT,
-        idp_auth_time DOUBLE PRECISION
+        idp_auth_time DOUBLE PRECISION,
+        user_epoch   INTEGER NOT NULL DEFAULT 0,
+        seal         TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -962,6 +975,12 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
 # the IdP step-up refuses as step_up_idp_auth_time_missing.
 _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
+# BACKLOG #2592: the account epoch a session was minted under, its integrity seal, and the account's
+# own epoch, for tables created before the columns. Gated and in _SCHEMA, as idp_auth_time above.
+# An existing session gets epoch 0 and an empty seal, which a keyed store refuses.
+_SCHEMA.append(_gated_add_column("sessions", "user_epoch", "INTEGER NOT NULL DEFAULT 0"))
+_SCHEMA.append(_gated_add_column("sessions", "seal", "TEXT NOT NULL DEFAULT ''"))
+_SCHEMA.append(_gated_add_column("users", "session_epoch", "INTEGER NOT NULL DEFAULT 0"))
 # Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table. Gated, because a bare
 # ADD COLUMN IF NOT EXISTS would hold ACCESS EXCLUSIVE on the hottest table through the batch even when
 # the column is there. In _SCHEMA, so adding it moves _schema_hash() and needs no _MIGRATION_REV bump.
@@ -1023,6 +1042,27 @@ def _pg_session_cap_keep_sql(split_mfa_pending: bool) -> str:
         ")"
         for group in _session_cap_groups(split_mfa_pending)
     )
+
+
+# BACKLOG #2592: store.py's _SESSION_INSERT and _SESSION_RESEAL respelled for `$n`. Each binds the
+# parameters store.py's session_insert_params / session_reseal_params build, in the same order.
+_PG_SESSION_INSERT: Final = (
+    "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
+    " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
+    " user_epoch, seal)"
+    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11)"
+)
+_PG_SESSION_RESEAL: Final = (
+    "UPDATE sessions SET token_hash=$1, user_id=$2, created_at=$3, expires_at=$4, revoked_at=$5,"
+    " client=$6, reauth_at=$7, mfa_verified_at=$8, auth_mechanism=$9, idp_auth_time=$10,"
+    " user_epoch=$11, seal=$12 WHERE token_hash=$13 AND seal=$14"
+)
+#: The whole-account session sweep: revoke and blank the seal (BACKLOG #2592). Each caller raises
+#: the account's session epoch in the same transaction.
+_PG_REVOKE_USER_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
+)
+_PG_BUMP_SESSION_EPOCH_SQL: Final = "UPDATE users SET session_epoch=session_epoch+1 WHERE id=$1"
 
 
 def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
@@ -1333,6 +1373,8 @@ class PostgresStore:
         self._pool = pool
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
+        # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
+        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
         # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
         # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
         # sites funnel through single helpers; Postgres commits implicitly via ``async with
@@ -2302,14 +2344,18 @@ class PostgresStore:
     async def _execute(self, sql: str, *params: Any) -> int:
         """Run one write on a bounded borrow and return its row count, read from asyncpg's status
         tag. Most callers ignore it; the session purge and the session cap read it (BACKLOG
-        #2283). Two session writes that need the count borrow without the bound instead, for the
-        reason :meth:`_execute_after_commit` gives."""
+        #2283). Two session writes borrow without the bound instead, for the reason
+        :meth:`_after_commit_txn` gives."""
         async with self._timed_acquire(record=False) as conn:
             return _rowcount(await conn.execute(sql, *params))
 
-    async def _execute_after_commit(self, sql: str, *params: Any) -> int:
-        """Run one session write that FOLLOWS a write its caller has already committed, and return
-        its row count. **The borrow is unbounded on purpose (BACKLOG #2283).**
+    @asynccontextmanager
+    async def _after_commit_txn(self) -> AsyncIterator[Any]:
+        """A transaction for a session write that FOLLOWS a write its caller has already committed.
+        **The borrow is unbounded on purpose (BACKLOG #2283).**
+
+        BACKLOG #2592 made each of these writes a transaction rather than one statement: it raises
+        the account's session epoch, or reads and re-seals the row. The borrow is unchanged.
 
         ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
         password, a disabled account, a changed role, a completed factor ceremony. By the time they
@@ -2333,10 +2379,15 @@ class PostgresStore:
         A bounded retry that fell back to this wait would end the same way, later, since each retry
         rejoins the back of asyncpg's queue. Moving each write into its caller's transaction would
         close the gap entirely, but every caller commits through a different store method on three
-        backends. ``self._pool.execute`` borrows inside asyncpg with no timeout and returns the
-        status tag the count is read from. ``tests/test_store_pool_acquire_timeout.py`` counts this
-        site among the pinned unbounded borrows, and pins which methods call it."""
-        return _rowcount(await self._pool.execute(sql, *params))
+        backends. ``self._pool.acquire`` with no timeout is the unbounded borrow spelled out.
+        ``tests/test_store_pool_acquire_timeout.py`` counts this site among the pinned unbounded
+        borrows, and pins which methods use it."""
+        conn = await self._pool.acquire()
+        try:
+            async with conn.transaction():
+                yield conn
+        finally:
+            await self._pool.release(conn)
 
     async def _count(self, table: str) -> int:
         row = await self._pool.fetchrow(f"SELECT COUNT(*) AS n FROM {table}")  # table is a constant
@@ -2815,6 +2866,10 @@ class PostgresStore:
         )
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
+        # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
+        ended = await self._execute("DELETE FROM sessions")
+        if ended:
+            log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
     async def _reencrypt_composite(
@@ -8129,11 +8184,8 @@ class PostgresStore:
             )
             if _rowcount(result) <= 0:
                 return None  # nothing written, so nothing is revoked or audited
-            revoked = await conn.execute(
-                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
-                now,
-                user_id,
-            )
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            revoked = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
             appended = await self._append_audits(conn, (audit,), now=now)
         tee_audits((audit,), appended, ts=now)
         return _rowcount(revoked)
@@ -8690,11 +8742,8 @@ class PostgresStore:
             )
             if _rowcount(result) <= 0:
                 return None  # nothing written, so nothing is revoked
-            revoked = await conn.execute(
-                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
-                now,
-                user_id,
-            )
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            revoked = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
         return _rowcount(revoked)
 
     async def clear_user_federated_subject(
@@ -8742,11 +8791,8 @@ class PostgresStore:
                 now,
                 user_id,
             )
-            result = await conn.execute(
-                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
-                now,
-                user_id,
-            )
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            result = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
             return FederatedUnbind(
                 username=row["username"],
                 issuer=issuer,
@@ -8822,44 +8868,72 @@ class PostgresStore:
         idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
-        # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
-        insert = (
-            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
-            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7,$8)"
-        )
-        params = (
-            token_hash,
-            user_id,
-            now,
-            expires_at,
-            client,
-            now if seed_reauth else None,
-            auth_mechanism,
-            None if idp_auth_time is None else float(idp_auth_time),
-        )
-        if require_federated_subject is None:
-            await self._execute(insert, *params)
-            return True
-        # BACKLOG #1474. FOR UPDATE, not a plain read: the row lock is the whole guard here. Either
-        # a concurrent unbind committed first and this read sees the cleared pair (so the insert is
-        # refused), or this transaction holds the row and the unbind waits behind it — and its
-        # session sweep, which runs after its own users UPDATE, then sees this session and revokes
-        # it. A plain SELECT under READ COMMITTED admits the interleaving that loses the session.
+        # BACKLOG #1474 and #2592. FOR UPDATE, not a plain read: the row lock is the guard. Either a
+        # concurrent unbind or whole-account revoke committed first, and this read sees the cleared
+        # pair (so the insert is refused) and the raised session epoch; or this transaction holds
+        # the row and that writer waits behind it, and its session sweep, which runs after its own
+        # users UPDATE, then sees this session and revokes it. A plain SELECT under READ COMMITTED
+        # admits the interleaving that loses the session.
         #
         # record=False: a login is not a per-lane worker, and the acquire-wait histogram exists to
         # show how long those workers queue for a connection as the pool saturates. This is the
         # exemption the low-frequency helpers take.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT oidc_issuer, oidc_subject FROM users WHERE id=$1 FOR UPDATE", user_id
+                "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1 FOR UPDATE",
+                user_id,
             )
-            bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-            if bound != require_federated_subject:
-                return False
-            await conn.execute(insert, *params)
+            if require_federated_subject is not None:
+                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
+                if bound != require_federated_subject:
+                    return False
+            record = new_session_record(
+                token_hash=token_hash,
+                user_id=user_id,
+                now=now,
+                expires_at=expires_at,
+                client=client,
+                seed_reauth=seed_reauth,
+                auth_mechanism=auth_mechanism,
+                idp_auth_time=idp_auth_time,
+                user_epoch=0 if row is None else int(row["session_epoch"]),
+            )
+            record = seal_session(self._row_sealer, record)
+            await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
         return True
+
+    async def _write_session(
+        self,
+        conn: Any,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+    ) -> SessionRecord | None:
+        """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
+        ``MessageStore._write_session`` states the contract. Call it inside ``conn``'s transaction.
+        The read takes the row lock, so the compare on the seal is a second guard, not the only one."""
+        row = await conn.fetchrow(
+            "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", token_hash
+        )
+        if row is None:
+            return None
+        current = SessionRecord.from_mapping(dict(row))
+        if current.revoked_at is not None:
+            return None
+        if not session_seal_ok(self._row_sealer, current):
+            raise RowSealError(SESSION_KIND)
+        updated = seal_session(self._row_sealer, change(current))
+        status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
+        return updated if _rowcount(status) > 0 else None
+
+    async def _session_epoch(self, conn: Any, user_id: str) -> int:
+        """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
+        row = await conn.fetchrow("SELECT session_epoch FROM users WHERE id=$1", user_id)
+        return 0 if row is None else int(row["session_epoch"])
+
+    def row_sealer(self) -> RowSealer | None:
+        """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
+        :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
+        return self._row_sealer
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
@@ -8902,42 +8976,31 @@ class PostgresStore:
         client: str | None = None,
         idp_auth_time: float | None = None,
     ) -> None:
-        now = time.time() if now is None else now
-        # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
-        # only moves forward, and a NULL leaves it (BACKLOG #2143; store.py's
-        # _IDP_AUTH_TIME_FORWARD_SQL says why). GREATEST ignores a NULL argument on Postgres.
-        await self._execute(
-            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client),"
-            " idp_auth_time=GREATEST($3::double precision, idp_auth_time) WHERE token_hash=$4",
-            now,
-            client,
-            None if idp_auth_time is None else float(idp_auth_time),
-            token_hash,
-        )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await self._write_session(conn, token_hash, stamp)
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE sessions SET mfa_verified_at=$1 WHERE token_hash=$2", now, token_hash
-        )
+        stamp = mfa_stamp(time.time() if now is None else now)
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await self._write_session(conn, token_hash, stamp)
 
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Through ``self._execute_after_commit``, which returns the rowcount this op's contract is.
-        Why that borrow has no timeout is its docstring's to say (BACKLOG #2283)."""
-        changed = await self._execute_after_commit(
-            "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
-            new_token_hash,
-            token_hash,
-        )
-        return changed > 0
+        The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
+        #2592). The answer is read after the transaction has committed. The borrow is
+        :meth:`_after_commit_txn`'s, for the reason it gives."""
+        async with self._after_commit_txn() as conn:
+            rotated = await self._write_session(
+                conn, token_hash, lambda s: replace(s, token_hash=new_token_hash)
+            )
+        return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE sessions SET revoked_at=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
+            "UPDATE sessions SET revoked_at=$1, seal='' WHERE token_hash=$2 AND revoked_at IS NULL",
             now,
             token_hash,
         )
@@ -8945,7 +9008,7 @@ class PostgresStore:
     async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
         """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`."""
         d = await self._fetchone(
-            "UPDATE sessions SET revoked_at=$1 WHERE token_hash=$2 AND revoked_at IS NULL"
+            "UPDATE sessions SET revoked_at=$1, seal='' WHERE token_hash=$2 AND revoked_at IS NULL"
             " RETURNING *",
             now,
             token_hash,
@@ -8955,16 +9018,30 @@ class PostgresStore:
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+
+        Raises the account's session epoch and re-seals the kept session in the same transaction
+        (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
+        runs first, so it takes the account row's lock before any session row is touched, the order
+        ``create_session`` takes them in. The borrow is :meth:`_after_commit_txn`'s, for the reason
+        it gives."""
         now = time.time() if now is None else now
-        # Unbounded; `_execute_after_commit` says why (BACKLOG #2283).
-        return await self._execute_after_commit(
-            "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
-            " AND ($3::text IS NULL OR token_hash != $3)",
-            now,
-            user_id,
-            except_token_hash,
-        )
+        async with self._after_commit_txn() as conn:
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            status = await conn.execute(
+                _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
+                now,
+                user_id,
+                except_token_hash,
+            )
+            if except_token_hash is not None:
+                epoch = await self._session_epoch(conn, user_id)
+                await self._write_session(
+                    conn,
+                    except_token_hash,
+                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+                )
+        return _rowcount(status)
 
     async def enforce_session_cap(
         self,
@@ -8986,7 +9063,7 @@ class PostgresStore:
             return 0
         now = time.time() if now is None else now
         return await self._execute(
-            "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
+            "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
             " AND COALESCE(mfa_verified_at, created_at) <= $1"
             f"{_pg_session_cap_keep_sql(split_mfa_pending)}",

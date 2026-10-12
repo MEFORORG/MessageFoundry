@@ -2329,7 +2329,8 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
             mfa_verified_at="2026-09-30T00:00:00Z" if stamped else None,
         )
 
-        async def get_session(_hash: str) -> object:
+        async def load_session(_hash: str) -> object:
+            # The service's one session loader (BACKLOG #2592), which checks the row's seal.
             return session
 
         async def get_user(_user_id: str) -> object:
@@ -2343,9 +2344,8 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
 
         fake = SimpleNamespace(
             _settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope),
-            _store=SimpleNamespace(
-                get_session=get_session, get_user=get_user, get_user_role_ids=role_ids
-            ),
+            _store=SimpleNamespace(get_user=get_user, get_user_role_ids=role_ids),
+            _load_session=load_session,
             _second_factor_enrolled=second_factor,
         )
         fake._mfa_required_for = functools.partial(

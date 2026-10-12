@@ -611,6 +611,8 @@ class Cipher(Protocol):
 
     def authz_root(self) -> bytes | None: ...
 
+    def retired_authz_roots(self) -> Sequence[bytes]: ...
+
 
 def _fingerprint(key: bytes | bytearray) -> str:
     """A stable, self-identifying ``key_id``: first ``_KEY_ID_LEN`` hex of SHA-256(key). One-way
@@ -964,6 +966,10 @@ class IdentityCipher:
         """No DEK, so no authorization root: a keyless store writes and checks no row seals."""
         return None
 
+    def retired_authz_roots(self) -> Sequence[bytes]:
+        """No DEK, so no retired roots either."""
+        return ()
+
 
 class AesGcmCipher(_UnmarkedPolicy):
     """AES-256-GCM **keyring** cipher with M9 crypto-agility. Encrypts with the active key; decrypts
@@ -1000,6 +1006,9 @@ class AesGcmCipher(_UnmarkedPolicy):
         # BACKLOG #2592: the authorization root, from the same live active DEK at the same point. Only
         # the ACTIVE key's root: a session seal verifies under the newest root generation alone.
         self._authz_root = _derive_authz_root(active_key)
+        # The retired keys' roots, derived at the same point. A seal never verifies under one: they
+        # only let a row sealed before a key change be recognised as such (BACKLOG #2592).
+        self._retired_authz_roots = tuple(_derive_authz_root(key) for key in retired_keys)
         # BACKLOG #1904: one audit key per keyring entry, RETIRED keys included, derived the same way and
         # at the same point (before _install_key zeroizes the DEK). A chain keyed under a key that has
         # since been rotated to retired must still verify; deriving from the active key alone made the
@@ -1178,6 +1187,11 @@ class AesGcmCipher(_UnmarkedPolicy):
         """The authorization root derived from the ACTIVE DEK (BACKLOG #2592). Row seals are keyed
         from it (:func:`derive_row_seal_key`). Held in-process like the audit key; never logged."""
         return self._authz_root
+
+    def retired_authz_roots(self) -> Sequence[bytes]:
+        """The authorization roots of the retired keys (BACKLOG #2592). No seal is verified under
+        one; they only name the keys a row sealed before a key change was sealed under."""
+        return self._retired_authz_roots
 
     # --- persisted per-key invocation bound (ASVS 11.3.4) --------------------
 

@@ -50,6 +50,7 @@ from collections.abc import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from dataclasses import replace
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
@@ -122,6 +123,7 @@ from messagefoundry.store.privilege import (
     classify_audit_writes,
     sqlserver_excess,
 )
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -130,9 +132,10 @@ from messagefoundry.store.sealed_cache import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
-    _IDP_AUTH_TIME_FORWARD_SQL,
+    _BUMP_SESSION_EPOCH_SQL,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
+    _SESSION_INSERT,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     _SQL_ADMIN_GUARD_COUNTS,
@@ -215,15 +218,22 @@ from messagefoundry.store.store import (
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
+    mfa_stamp,
+    new_session_record,
     next_lockout_state,
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
     password_claim_set,
     read_transit_bound_attestation_rows,
+    reauth_stamp,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    seal_session,
+    session_insert_params,
+    session_reseal_params,
+    session_seal_ok,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -600,6 +610,21 @@ def _mssql_session_cap_keep_sql(split_mfa_pending: bool) -> str:
         ")"
         for group in _session_cap_groups(split_mfa_pending)
     )
+
+
+# BACKLOG #2592: store.py's _SESSION_RESEAL with an OUTPUT clause, so the compare's outcome is read
+# from a rowset that a session-wide SET NOCOUNT ON cannot hide (BACKLOG #2283). Same parameters.
+_MSSQL_SESSION_RESEAL: Final = (
+    "UPDATE sessions SET token_hash=?, user_id=?, created_at=?, expires_at=?, revoked_at=?,"
+    " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
+    " seal=? OUTPUT inserted.token_hash WHERE token_hash=? AND seal=?"
+)
+#: The whole-account session sweep, counted from ``OUTPUT``: revoke and blank the seal (BACKLOG
+#: #2592). Each caller raises the account's session epoch in the same transaction.
+_MSSQL_REVOKE_USER_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
+    " WHERE user_id=? AND revoked_at IS NULL"
+)
 
 
 # --- ADR 0071 B5 PR1: hoisted handoff SQL + pure param-builders (async/sync shared) --------------
@@ -1970,7 +1995,9 @@ _SCHEMA: list[str] = [
         second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0,
         -- ADR 0197 Amendment A (BACKLOG #1131): 1 while the credential in force is
         -- engine-generated; wrong passwords arm no sign-in lock then.
-        password_generated BIT NOT NULL DEFAULT 0)""",
+        password_generated BIT NOT NULL DEFAULT 0,
+        -- BACKLOG #2592: raised by every whole-account session revoke.
+        session_epoch INT NOT NULL DEFAULT 0)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -2016,6 +2043,10 @@ _SCHEMA: list[str] = [
     # holder chose this credential", which keeps the account LOCKABLE -- the closed direction.
     """IF COL_LENGTH('users','password_generated') IS NULL
         ALTER TABLE users ADD password_generated BIT NOT NULL DEFAULT 0""",
+    # BACKLOG #2592: the account's session epoch. 0 on an existing row, which every existing
+    # session's epoch matches, so the add signs nobody out.
+    """IF COL_LENGTH('users','session_epoch') IS NULL
+        ALTER TABLE users ADD session_epoch INT NOT NULL DEFAULT 0""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -2088,7 +2119,8 @@ _SCHEMA: list[str] = [
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,
         revoked_at FLOAT NULL, client NVARCHAR(256) NULL, reauth_at FLOAT NULL,
         mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL,
-        idp_auth_time FLOAT NULL)""",
+        idp_auth_time FLOAT NULL, user_epoch INT NOT NULL DEFAULT 0,
+        seal NVARCHAR(128) NOT NULL DEFAULT N'')""",
     """IF COL_LENGTH('sessions','reauth_at') IS NULL
         ALTER TABLE sessions ADD reauth_at FLOAT NULL""",
     """IF COL_LENGTH('sessions','mfa_verified_at') IS NULL
@@ -2102,6 +2134,12 @@ _SCHEMA: list[str] = [
     # step_up_idp_auth_time_missing.
     """IF COL_LENGTH('sessions','idp_auth_time') IS NULL
         ALTER TABLE sessions ADD idp_auth_time FLOAT NULL""",
+    # BACKLOG #2592: the account epoch a session was minted under, and the row's integrity seal. An
+    # existing row gets epoch 0 and an empty seal, which a keyed store refuses.
+    """IF COL_LENGTH('sessions','user_epoch') IS NULL
+        ALTER TABLE sessions ADD user_epoch INT NOT NULL DEFAULT 0""",
+    """IF COL_LENGTH('sessions','seal') IS NULL
+        ALTER TABLE sessions ADD seal NVARCHAR(128) NOT NULL DEFAULT N''""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
@@ -2533,6 +2571,8 @@ class SqlServerStore:
         # the weakened-TLS clamp against the real production-PHI posture (not the unclamped escape).
         self._posture = posture
         self._cipher: Cipher = cipher or IdentityCipher()
+        # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
+        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
         # #190 audit-chain HMAC key (HKDF-derived; None, with no MAC provider, is the keyless mode).
         self._audit_mac_key = audit_mac_key
         # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit ``generate_hmac``) keying the
@@ -7625,6 +7665,11 @@ class SqlServerStore:
         )
         if total:
             log.info("re-encrypted %d row(s) to the active key", total)
+        # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
+        # Counted from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (BACKLOG #2283).
+        ended = len(await self._execute_output("DELETE FROM sessions OUTPUT deleted.token_hash"))
+        if ended:
+            log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
@@ -11965,11 +12010,8 @@ class SqlServerStore:
                             # Nothing written, so nothing is revoked or audited.
                             await conn.rollback()
                             return None
-                        await cur.execute(
-                            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
-                            " WHERE user_id=? AND revoked_at IS NULL",
-                            (now, user_id),
-                        )
+                        await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+                        await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                         revoked = len(await cur.fetchall())
                         appended = await self._append_audits(cur, (audit,), now=now)
                         await self._commit(conn)
@@ -12656,8 +12698,9 @@ class SqlServerStore:
                     # Nothing written, so nothing is revoked. The rollback frees the connection.
                     await conn.rollback()
                     return None
+                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
                 await cur.execute(
-                    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
                     (now, user_id),
                 )
                 revoked = cur.rowcount
@@ -12723,8 +12766,9 @@ class SqlServerStore:
                     "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
                     (now, user_id),
                 )
+                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
                 await cur.execute(
-                    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
                     (now, user_id),
                 )
                 count = cur.rowcount
@@ -12817,53 +12861,92 @@ class SqlServerStore:
         idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # reauth_at seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves it
-        # NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
-        insert = (
-            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
-            " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
-        )
-        params = (
-            token_hash,
-            user_id,
-            now,
-            expires_at,
-            now,
-            client,
-            now if seed_reauth else None,
-            auth_mechanism,
-            idp_auth_time,
-        )
-        if require_federated_subject is None:
-            await self._execute(insert, params)
-            return True
-        # BACKLOG #1474. UPDLOCK/ROWLOCK, not a plain read: the lock is the whole guard. Either a
-        # concurrent unbind committed first and this read sees the cleared pair (so the insert is
-        # refused), or this transaction holds the users row and the unbind waits behind it — and its
-        # session sweep, which runs after its own users UPDATE, then sees this session and revokes
-        # it. An unlocked read admits the interleaving that loses the session. The hint pair is this
-        # file's FOR UPDATE analog, as register_failed_login and consume_totp_step take it.
+        # BACKLOG #1474 and #2592. UPDLOCK/ROWLOCK, not a plain read: the lock is the guard. Either a
+        # concurrent unbind or whole-account revoke committed first, and this read sees the cleared
+        # pair (so the insert is refused) and the raised session epoch; or this transaction holds
+        # the users row and that writer waits behind it, and its session sweep, which runs after its
+        # own users UPDATE, then sees this session and revokes it. An unlocked read admits the
+        # interleaving that loses the session. The hint pair is this file's FOR UPDATE analog, as
+        # register_failed_login and consume_totp_step take it.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT oidc_issuer, oidc_subject FROM users"
+                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
                     " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
                 # closes the cursor before the pooled connection is reused (EF-6).
                 rows = await cur.fetchall()
-                bound = None if not rows else (rows[0][0], rows[0][1])
-                if bound != require_federated_subject:
-                    await conn.rollback()
-                    return False
-                await cur.execute(insert, params)
+                if require_federated_subject is not None:
+                    bound = None if not rows else (rows[0][0], rows[0][1])
+                    if bound != require_federated_subject:
+                        await conn.rollback()
+                        return False
+                record = new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    user_epoch=0 if not rows else int(rows[0][2]),
+                )
+                record = seal_session(self._row_sealer, record)
+                await cur.execute(_SESSION_INSERT, session_insert_params(record))
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
         return True
+
+    async def _write_session(
+        self,
+        cur: Any,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+    ) -> SessionRecord | None:
+        """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
+        ``MessageStore._write_session`` states the contract. Call it on ``cur`` inside an open
+        transaction. The read takes ``UPDLOCK, ROWLOCK``, so the compare on the seal is a second
+        guard, not the only one. The write reports through ``OUTPUT``, which a session-wide
+        ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
+        await cur.execute(
+            "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?", (token_hash,)
+        )
+        columns = [c[0] for c in cur.description]
+        rows = await cur.fetchall()
+        if not rows:
+            return None
+        current = SessionRecord.from_mapping(dict(zip(columns, rows[0])))  # noqa: B905
+        if current.revoked_at is not None:
+            return None
+        if not session_seal_ok(self._row_sealer, current):
+            raise RowSealError(SESSION_KIND)
+        updated = seal_session(self._row_sealer, change(current))
+        await cur.execute(_MSSQL_SESSION_RESEAL, session_reseal_params(updated, current))
+        written = await cur.fetchall()
+        return updated if written else None
+
+    async def _write_session_txn(
+        self, token_hash: str, change: Callable[[SessionRecord], SessionRecord]
+    ) -> SessionRecord | None:
+        """:meth:`_write_session` in a transaction of its own, committed before it returns."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                updated = await self._write_session(cur, token_hash, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return updated
+
+    def row_sealer(self) -> RowSealer | None:
+        """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
+        :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
+        return self._row_sealer
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
@@ -12903,43 +12986,28 @@ class SqlServerStore:
         client: str | None = None,
         idp_auth_time: float | None = None,
     ) -> None:
-        now = time.time() if now is None else now
-        # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
-        # only moves forward, and a NULL leaves it (BACKLOG #2143): the clause is store.py's, which
-        # says why.
-        await self._execute(
-            "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
-            f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
-            (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
-        )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        await self._write_session_txn(token_hash, stamp)
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE sessions SET mfa_verified_at=? WHERE token_hash=?", (now, token_hash)
-        )
+        await self._write_session_txn(token_hash, mfa_stamp(time.time() if now is None else now))
 
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        This op's whole contract is whether a row was re-keyed, so it reads an ``OUTPUT`` rowset and
-        never ``cursor.rowcount`` (BACKLOG #2283). A session-wide ``SET NOCOUNT ON`` can leave the
-        count at ``-1`` for a zero-match UPDATE, and ``bool(-1)`` would report a revoked session
-        as re-keyed; ``_exec_terminal`` reads its fence the same way for the same reason.
-        ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
+        The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
+        #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
+        #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
         clustered-PK row move is width-safe."""
-        rows = await self._execute_output(
-            "UPDATE sessions SET token_hash=? OUTPUT inserted.token_hash"
-            " WHERE token_hash=? AND revoked_at IS NULL",
-            (new_token_hash, token_hash),
+        rotated = await self._write_session_txn(
+            token_hash, lambda s: replace(s, token_hash=new_token_hash)
         )
-        return bool(rows)
+        return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+            "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
             (now, token_hash),
         )
 
@@ -12949,7 +13017,7 @@ class SqlServerStore:
         Through ``_execute_output`` rather than ``_fetchone``, which commits as a READ, while this is
         a durable write (BACKLOG #2283)."""
         rows = await self._execute_output(
-            "UPDATE sessions SET revoked_at=? OUTPUT inserted.*"
+            "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.*"
             " WHERE token_hash=? AND revoked_at IS NULL",
             (now, token_hash),
         )
@@ -12962,17 +13030,38 @@ class SqlServerStore:
 
         Counted from an ``OUTPUT`` rowset, as ``rotate_session`` is (BACKLOG #2283). The count is
         audited and returned to the API caller, and ``cursor.rowcount`` under a session-wide
-        ``SET NOCOUNT ON`` would report ``-1``. The rowset is one row per session of one user."""
+        ``SET NOCOUNT ON`` would report ``-1``. The rowset is one row per session of one user.
+
+        Raises the account's session epoch and re-seals the kept session in the same transaction
+        (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
+        runs first, so it takes the account row's lock before any session row, the order
+        ``create_session`` takes them in."""
         now = time.time() if now is None else now
-        sql = (
-            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
-            " WHERE user_id=? AND revoked_at IS NULL"
-        )
-        params: list[Any] = [now, user_id]
-        if except_token_hash is not None:
-            sql += " AND token_hash != ?"
-            params.append(except_token_hash)
-        return len(await self._execute_output(sql, tuple(params)))
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+                if except_token_hash is None:
+                    await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+                else:
+                    await cur.execute(
+                        _MSSQL_REVOKE_USER_SESSIONS_SQL + " AND token_hash != ?",
+                        (now, user_id, except_token_hash),
+                    )
+                revoked = len(await cur.fetchall())
+                if except_token_hash is not None:
+                    await cur.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
+                    epoch_rows = await cur.fetchall()
+                    epoch = int(epoch_rows[0][0]) if epoch_rows else 0
+                    await self._write_session(
+                        cur,
+                        except_token_hash,
+                        lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+                    )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return revoked
 
     async def enforce_session_cap(
         self,
@@ -12997,7 +13086,7 @@ class SqlServerStore:
         per_group = (keep, user_id, *_session_live_params(now, idle_seconds), now)
         groups = len(_session_cap_groups(split_mfa_pending))
         rows = await self._execute_output(
-            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+            "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
             " WHERE user_id=? AND revoked_at IS NULL"
             f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
             f"{_mssql_session_cap_keep_sql(split_mfa_pending)}",

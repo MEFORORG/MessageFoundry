@@ -101,12 +101,17 @@ def seal_bytes(kind: str, fields: Iterable[tuple[str, object]]) -> bytes:
 class RowSealer:
     """Seals and checks rows under one derived row-seal key. Construct with :meth:`for_cipher`."""
 
-    __slots__ = ("_key", "key_id")
+    __slots__ = ("_key", "_retired", "key_id")
 
-    def __init__(self, key: bytes) -> None:
+    def __init__(self, key: bytes, *, retired_keys: Iterable[bytes] = ()) -> None:
         self._key = bytes(key)
         #: The non-secret id every seal this sealer writes names.
         self.key_id: str = row_seal_key_id(self._key)
+        # The seal keys the retired store keys derive, by id. Nothing is ACCEPTED under them; they
+        # only tell a row a retired key genuinely sealed from one nobody sealed.
+        self._retired: dict[str, bytes] = {
+            row_seal_key_id(k): bytes(k) for k in retired_keys if bytes(k) != self._key
+        }
 
     @classmethod
     def for_cipher(cls, cipher: Cipher, *, store_id: bytes = NO_STORE_ID) -> RowSealer | None:
@@ -115,7 +120,23 @@ class RowSealer:
         root = cipher.authz_root()
         if root is None:
             return None
-        return cls(derive_row_seal_key(root, store_id))
+        retired = [derive_row_seal_key(r, store_id) for r in cipher.retired_authz_roots()]
+        return cls(derive_row_seal_key(root, store_id), retired_keys=retired)
+
+    def sealed_by_retired_key(
+        self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
+    ) -> bool:
+        """Whether ``stored`` is a valid seal over ``fields`` under a RETIRED key's seal key: a row
+        sealed before the store key changed. Such a row is still not accepted; this only lets the
+        caller end it quietly rather than report it as an integrity failure."""
+        if not stored or not stored.startswith(SEAL_PREFIX):
+            return False
+        key_id, sep, mac = stored[len(SEAL_PREFIX) :].partition(":")
+        key = self._retired.get(key_id)
+        if not sep or key is None or len(mac) != _MAC_HEX_LEN:
+            return False
+        expected = hmac.new(key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(mac.encode("utf-8", "surrogatepass"), expected.encode("ascii"))
 
     def _mac(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
         return hmac.new(self._key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()

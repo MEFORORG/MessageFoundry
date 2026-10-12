@@ -63,6 +63,7 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
+from dataclasses import fields as _dc_fields
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -133,6 +134,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.schema_verify import (
     SchemaMismatchError,
     is_schema_step_error,
@@ -1222,24 +1224,163 @@ class ConnectionEventWrite(TypedDict):
     now: NotRequired[float | None]
 
 
-# The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
+#: The session columns a session seal leaves out, each with the reason (BACKLOG #2592). Everything
+#: else in :class:`SessionRecord` is sealed, so a column added later is covered by default.
+#: ``tests/test_session_seal.py`` pins this list.
+SESSION_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "last_used_at": "written on every request, by parallel requests on one session",
+        "seal": "the seal itself",
+    }
+)
+
+# The one sessions INSERT, shared by every backend's create_session (BACKLOG #2592: it writes the
+# whole sealed row, so the account's epoch and the seal go in with it).
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-    " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
-    " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
+    " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
+    " user_epoch, seal)"
+    " VALUES (?,?,?,?,?,NULL,?,?,NULL,?,?,?,?)"
 )
 
-
-# BACKLOG #2143: the IdP step-up's write-back of the auth_time it accepted, in the `?` dialect SQLite
-# and SQL Server share. Bind the new value three times. It only ever moves FORWARD, so two step-ups on
-# one session that land out of order cannot leave the older value behind for a replay to pass. A
-# NULL (every password re-proof) leaves the stored value as it was. Each placeholder is CAST, because
-# inside an expression SQL Server has no column to infer a NULL parameter's type from.
-_IDP_AUTH_TIME_FORWARD_SQL: Final = (
-    "CASE WHEN CAST(? AS FLOAT) IS NOT NULL"
-    " AND (idp_auth_time IS NULL OR CAST(? AS FLOAT) > idp_auth_time)"
-    " THEN CAST(? AS FLOAT) ELSE idp_auth_time END"
+# BACKLOG #2592: the one statement that rewrites a session's sealed columns, used only by the store's
+# session write helper. It writes every sealed column and the new seal, and only over the exact row
+# the helper read and verified: the compare on `seal` makes a concurrent change lose cleanly.
+_SESSION_RESEAL: Final = (
+    "UPDATE sessions SET token_hash=?, user_id=?, created_at=?, expires_at=?, revoked_at=?,"
+    " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
+    " seal=? WHERE token_hash=? AND seal=?"
 )
+
+#: Raises an account's session epoch, which ends every session minted under the old one (BACKLOG
+#: #2592). Run beside every whole-account revoke.
+_BUMP_SESSION_EPOCH_SQL: Final = "UPDATE users SET session_epoch=session_epoch+1 WHERE id=?"
+
+
+def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
+    """The parameters :data:`_SESSION_RESEAL` binds, in order: ``new``'s sealed columns and seal,
+    then the key and the seal of the row as it was read."""
+    return (
+        new.token_hash,
+        new.user_id,
+        new.created_at,
+        new.expires_at,
+        new.revoked_at,
+        new.client,
+        new.reauth_at,
+        new.mfa_verified_at,
+        new.auth_mechanism,
+        new.idp_auth_time,
+        new.user_epoch,
+        new.seal,
+        old.token_hash,
+        old.seal,
+    )
+
+
+def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
+    """The parameters :data:`_SESSION_INSERT` binds, in order."""
+    return (
+        record.token_hash,
+        record.user_id,
+        record.created_at,
+        record.expires_at,
+        record.last_used_at,
+        record.client,
+        record.reauth_at,
+        record.auth_mechanism,
+        record.idp_auth_time,
+        record.user_epoch,
+        record.seal,
+    )
+
+
+def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
+    """``record`` with its seal set: the sealer's seal over its sealed fields, or empty on a store
+    with no sealer (BACKLOG #2592)."""
+    seal = "" if sealer is None else sealer.seal(SESSION_KIND, record.seal_fields())
+    return replace(record, seal=seal)
+
+
+def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
+    """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
+    key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
+    return sealer is None or sealer.verify(SESSION_KIND, record.seal_fields(), record.seal)
+
+
+def session_sealed_by_retired_key(sealer: RowSealer | None, record: SessionRecord) -> bool:
+    """Whether ``record`` carries a genuine seal made under a RETIRED store key: a session minted
+    before the key changed and not yet ended by ``rotate-key``. It is refused like any other row
+    that fails; this only says the refusal is a key change, not an integrity failure."""
+    return sealer is not None and sealer.sealed_by_retired_key(
+        SESSION_KIND, record.seal_fields(), record.seal
+    )
+
+
+def new_session_record(
+    *,
+    token_hash: str,
+    user_id: str,
+    now: float,
+    expires_at: float,
+    client: str | None,
+    seed_reauth: bool,
+    auth_mechanism: str | None,
+    idp_auth_time: float | None,
+    user_epoch: int,
+) -> SessionRecord:
+    """The row ``create_session`` writes, with every float as the backend will read it back, so the
+    seal made over it verifies after the round trip (BACKLOG #2592).
+
+    ``reauth_at = now`` seeds the step-up window from sign-in (ASVS 7.5.3). ``seed_reauth=False``
+    (an MFA-pending session, WP-14) leaves it NULL, so enrolment or step-up needs an explicit
+    password re-proof: a stolen pre-MFA token cannot ride the sign-in's step-up freshness."""
+    now = float(now)
+    return SessionRecord(
+        token_hash=token_hash,
+        user_id=user_id,
+        created_at=now,
+        expires_at=float(expires_at),
+        last_used_at=now,
+        revoked_at=None,
+        client=client,
+        reauth_at=now if seed_reauth else None,
+        mfa_verified_at=None,
+        auth_mechanism=auth_mechanism,
+        idp_auth_time=_opt_float(idp_auth_time),
+        user_epoch=int(user_epoch),
+    )
+
+
+def reauth_stamp(
+    now: float, client: str | None, idp_auth_time: float | None
+) -> Callable[[SessionRecord], SessionRecord]:
+    """The change ``mark_session_reauthed`` makes to a session row, for the session write helper.
+
+    ``reauth_at`` becomes ``now``. A ``client`` re-anchors the session's address; ``None`` keeps the
+    stored one (WP-L3-13). ``idp_auth_time`` only ever moves FORWARD (BACKLOG #2143), so two
+    step-ups landing out of order cannot leave the older value behind for a replay to pass."""
+    when = float(now)
+    idp = _opt_float(idp_auth_time)
+
+    def apply(s: SessionRecord) -> SessionRecord:
+        forward = s.idp_auth_time
+        if idp is not None and (forward is None or idp > forward):
+            forward = idp
+        return replace(
+            s,
+            reauth_at=when,
+            client=s.client if client is None else client,
+            idp_auth_time=forward,
+        )
+
+    return apply
+
+
+def mfa_stamp(now: float) -> Callable[[SessionRecord], SessionRecord]:
+    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14)."""
+    when = float(now)
+    return lambda s: replace(s, mfa_verified_at=when)
 
 
 # The session-cap predicates, in the `?` dialect SQLite and SQL Server share (BACKLOG #1900). Each
@@ -1569,9 +1710,11 @@ _SET_FEDERATED_IF_UNBOUND_SQL: Final = (
     "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
     " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
 )
-#: The session sweep a bind and an unbind each run inside their own transaction.
+#: The session sweep a bind and an unbind each run inside their own transaction. A revoke blanks
+#: the seal (BACKLOG #2592): that needs no key, and a revoked row then fails its seal even with
+#: ``revoked_at`` put back to NULL. Each caller also raises the account's session epoch.
 _REVOKE_USER_SESSIONS_SQL: Final = (
-    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
 )
 
 
@@ -1691,6 +1834,12 @@ class UserRecord:
     # ``must_change_password``, for ADR 0164's reason: record a lifecycle fact, never infer it from
     # mutable credential state. The login-time rehash (``set_password_hash``) never writes it.
     password_generated: bool = False
+    # THE ACCOUNT'S SESSION EPOCH (BACKLOG #2592). Every whole-account session revoke raises it by
+    # one, and a session resolves only while its own ``user_epoch`` equals it. The session's copy is
+    # sealed; this column is not yet, because the account row has no seal of its own. Until it does,
+    # the epoch orders the store's own writes (a sign-in racing an "end every session") and is not
+    # an integrity control on its own.
+    session_epoch: int = 0
 
     def sign_in_locked(self, now: float) -> bool:
         """Whether the SIGN-IN lock is live at ``now``."""
@@ -1751,6 +1900,9 @@ class UserRecord:
             # A ``.get()``: a missing key decodes as "chosen", which keeps the account LOCKABLE --
             # the closed direction for guessing.
             password_generated=bool(d.get("password_generated", 0)),
+            # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
+            # session minted before a revoke also carries, so it is the OPEN direction.
+            session_epoch=int(d["session_epoch"]),
         )
 
 
@@ -1818,6 +1970,13 @@ class SessionRecord:
     #: written before the column existed, which the IdP step-up refuses as
     #: ``step_up_idp_auth_time_missing``.
     idp_auth_time: float | None = None
+    #: The account's ``users.session_epoch`` when this session was minted or last re-sealed
+    #: (BACKLOG #2592). A whole-user revoke raises the account's epoch, so a session that carries an
+    #: older one resolves to nothing.
+    user_epoch: int = 0
+    #: The row's integrity seal (``mfseal:v1:...``, BACKLOG #2592) over every field above except the
+    #: ones :data:`SESSION_SEAL_EXCLUDED` names. Empty on a revoked row and on a keyless store.
+    seal: str = ""
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -1833,6 +1992,20 @@ class SessionRecord:
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
             auth_mechanism=d.get("auth_mechanism"),
             idp_auth_time=_opt_float(d.get("idp_auth_time")),
+            # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
+            user_epoch=int(d["user_epoch"]),
+            seal=d["seal"] or "",
+        )
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        """The ``(name, value)`` pairs a session seal covers, in field order (BACKLOG #2592).
+
+        Built from the dataclass's own fields, so a field added later is sealed by default and
+        only an entry in :data:`SESSION_SEAL_EXCLUDED` leaves one out."""
+        return tuple(
+            (f.name, getattr(self, f.name))
+            for f in _dc_fields(self)
+            if f.name not in SESSION_SEAL_EXCLUDED
         )
 
     def is_live(self, *, now: float, idle_seconds: float) -> bool:
@@ -5428,7 +5601,8 @@ CREATE TABLE IF NOT EXISTS users (
     second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: failures from a caller who already proved one factor
     second_step_locked_until REAL,             -- ADR 0197: the second-step lock expiry; NULL = not locked
     second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: how many times the second-step lock was set
-    password_generated   INTEGER NOT NULL DEFAULT 0  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
+    password_generated   INTEGER NOT NULL DEFAULT 0,  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
+    session_epoch        INTEGER NOT NULL DEFAULT 0  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -5470,7 +5644,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     reauth_at    REAL,                         -- last credential re-verification (login / /me/reauth)
     mfa_verified_at REAL,                      -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
     auth_mechanism TEXT,                       -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
-    idp_auth_time REAL                         -- the IdP's auth_time for an oidc session (BACKLOG #2143)
+    idp_auth_time REAL,                        -- the IdP's auth_time for an oidc session (BACKLOG #2143)
+    user_epoch   INTEGER NOT NULL DEFAULT 0,   -- users.session_epoch at mint (BACKLOG #2592)
+    seal         TEXT NOT NULL DEFAULT ''      -- integrity seal over the row; '' once revoked (#2592)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
@@ -5697,6 +5873,10 @@ class MessageStore:
         # load — so this is a permanent 0 and there is no increment site in this module.
         self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
+        # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None when the
+        # cipher holds no in-process authorization root (keyless), and then no seal is written or
+        # checked.
+        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
         # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
         # may already count for another store, so close() must not settle its reserve here.
         self._cipher_foreign = False
@@ -5847,6 +6027,11 @@ class MessageStore:
     def cipher(self) -> Cipher:
         """This store's LIVE at-rest cipher — see :meth:`messagefoundry.store.base.Store.cipher`."""
         return self._cipher
+
+    def row_sealer(self) -> RowSealer | None:
+        """This store's row sealer, or ``None`` on a keyless store. See
+        :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
+        return self._row_sealer
 
     def _decode_row(
         self, row: aiosqlite.Row, table: str, pk: tuple[object, ...], *columns: str
@@ -6655,8 +6840,16 @@ class MessageStore:
             total += await self._reencrypt_message_events_to_active(cipher, active_like, batch)
             total += await self._reencrypt_connection_events_to_active(cipher, active_like, batch)
             total += await self._reencrypt_alert_instances_to_active(cipher, active_like, batch)
+            # BACKLOG #2592: a rotation ends every session. A session seal verifies only under the
+            # active key's root, so a row sealed before the rotation would otherwise be refused, and
+            # alerted on, the next time it was presented.
+            cur = await self._db.execute("DELETE FROM sessions")
+            await self._commit()
+            ended = cur.rowcount if cur.rowcount is not None else 0
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
+        if ended:
+            log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
     @staticmethod
@@ -7018,6 +7211,9 @@ class MessageStore:
             # this credential", which keeps the account LOCKABLE -- the closed direction. The
             # startup census names any such account that has no way past the lock.
             ("password_generated", "INTEGER NOT NULL DEFAULT 0"),
+            # BACKLOG #2592: the account's session epoch. 0 on an existing row, which every
+            # existing session (user_epoch 0 below) matches, so nothing is signed out by the add.
+            ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -7125,6 +7321,15 @@ class MessageStore:
         # NULL as step_up_idp_auth_time_missing.
         if "idp_auth_time" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN idp_auth_time REAL")
+        # BACKLOG #2592: the account epoch a session was minted under, and the row's integrity seal.
+        # An existing row gets epoch 0 and an empty seal: it still resolves on a keyless store, and a
+        # keyed store refuses it, since a keyed process treats a missing seal as a failed one.
+        if "user_epoch" not in session_cols:
+            await db.execute(
+                "ALTER TABLE sessions ADD COLUMN user_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+        if "seal" not in session_cols:
+            await db.execute("ALTER TABLE sessions ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -12745,6 +12950,7 @@ class MessageStore:
                 # transaction, as set_user_federated_subject does.
                 await self._commit()
                 return None
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             appended = await self._append_audits((audit,), now=now)
             await self._commit()
@@ -13361,6 +13567,7 @@ class MessageStore:
                 # Nothing written, so nothing is revoked. The commit ends the empty transaction.
                 await self._commit()
                 return None
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return int(revoked.rowcount)
@@ -13410,6 +13617,7 @@ class MessageStore:
                 "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
                 (now, user_id),
             )
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return FederatedUnbind(
@@ -13498,43 +13706,62 @@ class MessageStore:
         idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
-        # MFA-PENDING session (WP-14) leaves it NULL, so enrollment/step-up needs an explicit
-        # password re-verify — a stolen pre-MFA token can't ride the login's step-up freshness.
-        params = (
-            token_hash,
-            user_id,
-            now,
-            expires_at,
-            now,
-            client,
-            now if seed_reauth else None,
-            auth_mechanism,
-            idp_auth_time,
-        )
-        if require_federated_subject is None:
-            async with _writer_guard(self._db, self._lock):
-                await self._db.execute(_SESSION_INSERT, params)
-                await self._commit()
-            return True
-        # _writer_txn for the GUARDED path, not the _writer_guard the unguarded one uses (BACKLOG
-        # #1474). The lock alone is what makes the read and the INSERT atomic against
-        # clear_user_federated_subject, which takes the same lock — but this branch is a
-        # MULTI-statement writer with an explicit transaction, so it goes through _writer_txn, which
-        # unwinds on BaseException (ADR 0159). The refusal below rolls back itself, as that helper's
-        # contract requires.
+        # _writer_txn, not a short writer: the account's row is read first in the same transaction
+        # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
+        # path's binding check). The lock alone is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject and every whole-account revoke, which take the same lock.
+        # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
+                "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=?", (user_id,)
             )
             row = await cur.fetchone()
-            bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-            if bound != require_federated_subject:
-                await self._db.rollback()
-                return False
-            await self._db.execute(_SESSION_INSERT, params)
+            if require_federated_subject is not None:
+                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
+                if bound != require_federated_subject:
+                    await self._db.rollback()
+                    return False
+            record = new_session_record(
+                token_hash=token_hash,
+                user_id=user_id,
+                now=now,
+                expires_at=expires_at,
+                client=client,
+                seed_reauth=seed_reauth,
+                auth_mechanism=auth_mechanism,
+                idp_auth_time=idp_auth_time,
+                user_epoch=0 if row is None else int(row["session_epoch"]),
+            )
+            record = seal_session(self._row_sealer, record)
+            await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True
+
+    async def _write_session(
+        self,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+    ) -> SessionRecord | None:
+        """The one writer of a session's sealed columns (BACKLOG #2592). Call it inside a writer
+        transaction on ``self._db``.
+
+        Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
+        every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
+        there is no unrevoked row or the compare lost to a concurrent write. Raises
+        :class:`RowSealError`, and writes nothing, when the row it read does not verify: re-sealing
+        it would turn a change made outside this helper into a sealed row."""
+        cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        current = SessionRecord.from_mapping(dict(row))
+        if current.revoked_at is not None:
+            return None
+        if not session_seal_ok(self._row_sealer, current):
+            raise RowSealError(SESSION_KIND)
+        updated = seal_session(self._row_sealer, change(current))
+        cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
+        return updated if cur.rowcount == 1 else None
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         async with self._read() as db:
@@ -13580,46 +13807,38 @@ class MessageStore:
         client: str | None = None,
         idp_auth_time: float | None = None,
     ) -> None:
-        now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-            # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
-            await self._db.execute(
-                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
-                f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
-                (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
-            )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        async with _writer_txn(self._db, self._lock):
+            await self._write_session(token_hash, stamp)
             await self._commit()
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
         """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
         issuance for an MFA-delegated AD/Kerberos login."""
-        now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE sessions SET mfa_verified_at=? WHERE token_hash=?", (now, token_hash)
-            )
+        stamp = mfa_stamp(time.time() if now is None else now)
+        async with _writer_txn(self._db, self._lock):
+            await self._write_session(token_hash, stamp)
             await self._commit()
 
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
-        old hash stops resolving in the same transaction. Reports its rowcount so the caller can fail
-        closed when the session was revoked out from under it."""
-        async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE sessions SET token_hash=? WHERE token_hash=? AND revoked_at IS NULL",
-                (new_token_hash, token_hash),
+        old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
+        re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
+        when the session was revoked out from under it."""
+        async with _writer_txn(self._db, self._lock):
+            rotated = await self._write_session(
+                token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             await self._commit()
-            return bool(cur.rowcount)
+        return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
                 (now, token_hash),
             )
             await self._commit()
@@ -13635,7 +13854,7 @@ class MessageStore:
         re-key the row between them."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
                 (now, token_hash),
             )
             row = None
@@ -13651,17 +13870,38 @@ class MessageStore:
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
-        caller's current session — "sign out everywhere else"). Returns the number revoked."""
+        caller's current session — "sign out everywhere else"). Returns the number revoked.
+
+        Raises the account's session epoch in the same transaction (BACKLOG #2592), so an older copy
+        of any of those rows resolves to nothing. The kept session is re-sealed under the new epoch
+        through :meth:`_write_session`; if its own seal does not verify, that raises
+        :class:`RowSealError` and the whole transaction, revokes included, rolls back."""
         now = time.time() if now is None else now
-        sql = _REVOKE_USER_SESSIONS_SQL
-        params: list[object] = [now, user_id]
-        if except_token_hash is not None:
-            sql += " AND token_hash != ?"
-            params.append(except_token_hash)
-        async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(sql, params)
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+            if except_token_hash is None:
+                cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+            else:
+                cur = await self._db.execute(
+                    _REVOKE_USER_SESSIONS_SQL + " AND token_hash != ?",
+                    (now, user_id, except_token_hash),
+                )
+            revoked = int(cur.rowcount)
+            if except_token_hash is not None:
+                epoch = await self._session_epoch(user_id)
+                await self._write_session(
+                    except_token_hash,
+                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+                )
             await self._commit()
-            return int(cur.rowcount)
+        return revoked
+
+    async def _session_epoch(self, user_id: str) -> int:
+        """The account's session epoch, read on the writer connection inside the caller's
+        transaction (BACKLOG #2592). 0 for an account that is not there."""
+        cur = await self._db.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
+        row = await cur.fetchone()
+        return 0 if row is None else int(row["session_epoch"])
 
     async def enforce_session_cap(
         self,
@@ -13685,7 +13925,7 @@ class MessageStore:
             # `tests/test_writer_txn_is_the_only_begin.py` cannot read a local and pins how many it
             # cannot read.
             cur = await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
                 f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
                 f"{_sqlite_session_cap_keep_sql(split_mfa_pending)}",
                 (now, user_id, now, now, now, *(per_group * groups)),
