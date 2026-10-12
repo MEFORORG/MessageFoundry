@@ -466,7 +466,9 @@ class DrCoordinator:
                 # The refusal's own text goes to the server log only. The reason below reaches
                 # the API caller and the dr_activation_aborted row, which is teed off the box
                 # (vault BACKLOG #3224; BACKLOG #1142 for the connection-test route's same rule).
-                log.warning("DR activation refused by a trust anchor: %s", exc)
+                # The traceback prints every cause, so the log holds the refusal even where a
+                # wrapper's own message does not repeat it.
+                log.warning("DR activation refused by a trust anchor: %s", exc, exc_info=exc)
             # A preflight that refused or timed out bound nothing, so its reason must not say a
             # bind failed (vault BACKLOG #3094).
             reason = (
@@ -481,9 +483,10 @@ class DrCoordinator:
             # abort, so a retry's own marker reads as a second attempt (vault BACKLOG #3094, item
             # 11). The takeover is not undone: a release hook could hand the address to a primary
             # that is down, so the runbook leaves that to the operator.
-            if not anchored:
+            if anchored:
+                anchor_abort = reason
+            else:
                 await self._record_aborted("profile", reason, actor, now)
-            anchor_abort = reason
         if anchor_abort is not None:
             # Raised here, outside the handler, so the refusal is not left on the abort's
             # __context__, which the API route chains its own error from.

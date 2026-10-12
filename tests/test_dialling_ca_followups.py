@@ -273,7 +273,8 @@ async def test_a_refused_pin_setting_is_not_told_to_fix_the_file(
         reason = runner.inbound_failed(_IB) or ""
         assert reason == (
             f"TrustAnchorError: inbound connection '{_IB}': its tls_ca_pin or tls_ca_file "
-            "setting was refused. Fix the setting, then reload; the server log says why"
+            "setting was refused. Fix the setting, then reload and start the connection; the "
+            "server log says why"
         )
         assert _FIX_THE_FILE not in reason
     finally:

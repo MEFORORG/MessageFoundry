@@ -3452,7 +3452,9 @@ class RegistryRunner:
                     exc_info=not refused,
                 )
                 if isinstance(exc, ValueError):
-                    what, advice = _ANCHOR_SETTING_REFUSED, _ANCHOR_SETTING_ADVICE
+                    # No lane is marked here, so a reload reads the changed setting.
+                    what = _ANCHOR_SETTING_REFUSED
+                    advice = "Fix the setting, then reload; the server log says why"
                 elif refused:
                     what = "tls_ca_file was refused"
                     advice = (
@@ -3560,8 +3562,12 @@ class RegistryRunner:
                 raise
             self._anchor_refused[(direction, name)] = _anchor_key(settings)
             log.warning("%s connection %r: trust anchor refused: %s", direction, name, exc)
+            # The setting's advice names both steps. The reload takes in the changed value. It
+            # also rebuilds the lane when the CA path or the pin changed. A change to any other
+            # value, such as the url, leaves the failure kept, and the start then builds the lane.
             tail = (
-                f"{_ANCHOR_SETTING_REFUSED}. {_ANCHOR_SETTING_ADVICE}"
+                f"{_ANCHOR_SETTING_REFUSED}. Fix the setting, then reload and start the "
+                "connection; the server log says why"
                 if isinstance(exc, ValueError)
                 else "tls_ca_file was refused. Fix the file, then start the connection; the "
                 "server log and the auth.trust_anchor audit rows say why"
@@ -3640,11 +3646,12 @@ class RegistryRunner:
         try:
             settings = self._anchor_lane_settings(new)
         except Exception as exc:  # noqa: BLE001 - an unresolvable value is a change
-            # The build reports the fault itself. This line says why the reload reads a CA it
-            # had been leaving alone (vault BACKLOG #3224).
+            # A reload's build check resolves the same settings first and refuses on them, so
+            # this arm is a backstop. It no longer ends a kept failure with no line saying so
+            # (vault BACKLOG #3224).
             log.info(
                 "%s connection %r: its settings no longer resolve, so its trust-anchor failure "
-                "is not kept and this reload builds it again: %s",
+                "is not kept: %s",
                 direction,
                 name,
                 safe_exc(exc),
@@ -11007,12 +11014,11 @@ def _insecure_bind_cause(source: Source) -> str:
     return "--allow-insecure-bind / require_encryption_for_remote = false"
 
 
-#: A lane's fixed refusal line for a ``ValueError`` from its CA check (vault BACKLOG #3224). That is
-#: a setting the check refused, such as a blank or unread ``tls_ca_pin`` or a ``tls_ca_file`` value
-#: that is no path. Mending the file does nothing for it, and a start reads the same setting again.
-#: A reload reads the changed one, since a changed setting ends a kept failure.
+#: What a lane's fixed refusal line says for a ``ValueError`` from its CA check (vault BACKLOG
+#: #3224). That is a setting the check refused, such as a blank or unread ``tls_ca_pin`` or a
+#: ``tls_ca_file`` value that is no path. Mending the file does nothing for it, and a start alone
+#: reads the same setting again. Each site adds its own advice.
 _ANCHOR_SETTING_REFUSED = "tls_ca_pin or tls_ca_file setting was refused"
-_ANCHOR_SETTING_ADVICE = "Fix the setting, then reload; the server log says why"
 
 
 def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:
