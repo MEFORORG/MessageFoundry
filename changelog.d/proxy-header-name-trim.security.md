@@ -9,6 +9,7 @@
   rule calls it too, and so does the build-time refusal of a static `Proxy-Authorization` beside
   `proxy_user`. A connection's admission of its own `proxy_user` header covers the plain
   spelling only, and the opener reads every matching header on a request, so one cannot hide
-  another. A spelling `http.client` can never send still fails as it did, with that library's
-  own error, which each connector maps to a permanent refusal. The rule is stated on
+  another. A spelling `http.client` can never send still fails with a `ValueError`, after every
+  credential refusal has run, so at least the REST send still maps it to a permanent refusal.
+  The rule is stated on
   [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).

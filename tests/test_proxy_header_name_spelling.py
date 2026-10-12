@@ -24,10 +24,11 @@ in another control character or in a punctuation mark, and one that starts with 
 character its pattern does not count as whitespace. ``_SENDABLE`` and ``_UNSENDABLE`` are that
 measurement, and ``test_measured_*`` pin it on the wire with urllib's own opener.
 
-**A spelling that can never be sent is a fault in the configuration, not a leak.** The rule
-lets ``http.client`` refuse it with its own error, as it did before the fix, so a connector
-maps it to a permanent refusal and does not retry it. A sendable spelling is refused by the
-rule, and that refusal is retried like the plain name's.
+**A spelling that can never be sent is a fault in the configuration, not a leak.** Before the
+fix ``http.client`` refused it with a ``ValueError``, after every credential refusal had run.
+The opener keeps that class and that order, with fixed text, so the REST send maps it to a
+permanent refusal and does not retry it. A sendable spelling is refused by the rule, and that
+refusal is retried like the plain name's.
 
 Each refusal is read at a loopback socket that records what reaches it, as well as in the result.
 
@@ -179,18 +180,88 @@ def test_measured_http_client_refuses_the_spelling_before_it_connects(spelling: 
     assert destination.connections == 0
 
 
-@pytest.mark.parametrize("admitted", [False, True])
-@pytest.mark.parametrize("spelling", list(_UNSENDABLE))
-def test_an_unsendable_spelling_never_reaches_a_proxy(spelling: str, admitted: bool) -> None:
-    """The rule reads these as the proxy header too, and then lets ``http.client`` speak for
-    itself: the engine opener raises exactly what the stock one does, and not the retryable
-    refusal it keeps for a name that could be sent. The error holds no part of the value."""
-    name, raised_by_http_client = _UNSENDABLE[spelling]
-    with _WireProxy() as proxy, pytest.raises(raised_by_http_client) as raised:
-        _opener(proxy, admitted=admitted).open(_request(name, _HTTP_TARGET), timeout=5)
-    assert type(raised.value) is raised_by_http_client
-    for part in ("u5er", "pa55w0rd", _VALUE):
+def _never_sent(opener: urllib.request.OpenerDirector, request: urllib.request.Request) -> None:
+    """The opener raises its fixed ``ValueError``, which holds no part of the name or the value."""
+    with pytest.raises(ValueError, match="can never be sent") as raised:
+        opener.open(request, timeout=5)
+    assert type(raised.value) is ValueError
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    for part in ("u5er", "pa55w0rd", _VALUE, "made", "127.0.0.1", "partner"):
         assert part not in f"{raised.value!s} {raised.value!r}", part
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("target", [_HTTP_TARGET, _HTTPS_TARGET])
+@pytest.mark.parametrize("spelling", list(_UNSENDABLE))
+def test_an_unsendable_spelling_never_reaches_a_proxy(
+    spelling: str, target: str, admitted: bool
+) -> None:
+    """The rule reads these as the proxy header too. No request could carry one, so the opener
+    raises a ``ValueError``, the class ``http.client`` raised before the fix, and not the
+    retryable refusal it keeps for a name that could be sent."""
+    name, raised_by_http_client = _UNSENDABLE[spelling]
+    assert issubclass(raised_by_http_client, ValueError)
+    with _WireProxy() as proxy:
+        _never_sent(_opener(proxy, admitted=admitted), _request(name, target))
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("spelling", list(_UNSENDABLE))
+def test_an_unsendable_spelling_on_a_direct_request_is_never_sent(spelling: str) -> None:
+    name, _ = _UNSENDABLE[spelling]
+    with _WireProxy() as destination:
+        opener = build_strict_opener(urllib.request.ProxyHandler({}))
+        _never_sent(opener, _request(name, f"http://{destination.address}/x"))
+    assert destination.connections == 0
+
+
+@pytest.mark.parametrize("value", ["made\nup", "made\u4e0aup"], ids=["line-feed", "not-latin-1"])
+def test_a_sendable_spelling_with_a_value_that_can_never_be_sent_is_never_sent(value: str) -> None:
+    """``http.client`` refuses a header by its value too. Before the fix that was a
+    ``ValueError`` for these spellings, which the rule did not read."""
+    with _WireProxy() as proxy:
+        request = urllib.request.Request(_HTTP_TARGET, headers={_NAME + " ": value})
+        _never_sent(_opener(proxy), request)
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("value", ["made\nup", "made\u4e0aup"], ids=["line-feed", "not-latin-1"])
+def test_control_the_plain_name_with_such_a_value_is_still_refused_by_the_rule(value: str) -> None:
+    """The plain name was refused by the rule before ``http.client`` saw its value, and is."""
+    with _WireProxy() as proxy:
+        request = urllib.request.Request(_HTTP_TARGET, headers={_NAME: value})
+        _refused(_opener(proxy), request, "#3416")
+    assert proxy.connections == 0
+
+
+def test_a_credential_refusal_comes_before_the_unsendable_one() -> None:
+    """A plain header the handler does not admit, beside a spelling that can never be sent.
+    Before the fix the rule refused the plain one first, and it still does: that refusal is the
+    retried kind, and it names the credential fault."""
+    with _WireProxy() as proxy:
+        request = urllib.request.Request(_HTTP_TARGET, headers={" " + _NAME: _VALUE})
+        request.headers[_NAME.upper()] = _VALUE
+        _refused(_opener(proxy), request, "#3416")
+    assert proxy.connections == 0
+
+
+def test_a_proxy_url_credential_refusal_comes_before_the_unsendable_one() -> None:
+    with _WireProxy() as proxy:
+        value = f"http://{_URL_CRED}@{proxy.address}"
+        opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
+        _refused(opener, _request(" " + _NAME, _HTTP_TARGET), "#2572")
+    assert proxy.connections == 0
+
+
+def test_a_name_is_judged_as_do_open_would_send_it() -> None:
+    """``do_open`` title-cases a name before it sends it. A name stored with a leading sharp s
+    will not encode as ASCII as stored, and does once title-cased, so ``http.client`` would
+    send it. The rule judges it as a sendable spelling and refuses it."""
+    with _WireProxy() as proxy:
+        request = urllib.request.Request(_HTTP_TARGET)
+        request.headers[chr(0xDF) + _NAME] = _VALUE
+        _refused(_opener(proxy), request, "#3416")
     assert proxy.connections == 0
 
 
@@ -402,7 +473,8 @@ def test_a_rest_send_with_a_name_that_can_never_be_sent_fails_permanently(name: 
             asyncio.run(dest.send('{"a": 1}'))
     assert raised.value.permanent is True
     assert raised.value.code == "bad-request-value"
-    assert isinstance(raised.value.__cause__, ValueError)
+    assert type(raised.value.__cause__) is ValueError
+    assert "can never be sent" in str(raised.value.__cause__)
     for part in ("u5er", "pa55w0rd", _VALUE):
         assert part not in str(raised.value), part
     assert proxy.connections == 0
