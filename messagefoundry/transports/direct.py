@@ -81,6 +81,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     NegativeAckError,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.email import checked_envelope
@@ -264,7 +265,9 @@ class DirectDestination(DestinationConnector):
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
         self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="Direct destination"
+        )
         self.encoding: str = str(s.get("encoding", "utf-8"))
 
         # S/MIME material — the whole point of Direct. Loaded and cross-checked at construction so a

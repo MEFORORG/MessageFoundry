@@ -671,9 +671,8 @@ def test_a_negative_cap_is_refused_at_build_not_discovered_at_the_first_connecti
     ):
         _mllp(max_frame_seconds=-1.0)
     # NaN is truthy and fails every comparison, so a `< 0` test let it through as a live deadline.
-    with pytest.raises(
-        ValueError, match="max_frame_seconds must be a number of seconds, zero or more"
-    ):
+    # The cap reader now refuses it before that guard runs (BACKLOG #3432).
+    with pytest.raises(ValueError, match=r"max_frame_seconds is not a valid float value"):
         _mllp(max_frame_seconds=float("nan"))
     # 0 stays the documented "off" spelling for both, and is NOT caught by the refusal above.
     assert _mllp(max_connections_per_host=0).max_connections_per_host is None
