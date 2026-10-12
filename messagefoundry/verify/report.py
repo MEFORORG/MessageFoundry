@@ -26,12 +26,11 @@ def exit_code(results: Sequence[CheckResult]) -> int:
 def _shown(text: str) -> str:
     # A detail can carry what a peer wrote: a JWKS key id, an ACK, an exception naming a peer's
     # reply. Escaped HERE, at the console sink (the Markdown cell rule starts from this same call),
-    # and not in CheckResult, so the JSON
-    # report keeps the value as it was (it is data, not a terminal or a rendered page). Every field
-    # gets the same rule, so a detail added later is covered without anyone deciding it is peer
-    # text. One line per check, so a newline is escaped too, or a peer's text could start a line
-    # reading as a check that passed; printable Unicode is kept, so the engine's own em dashes print
-    # as themselves.
+    # and not in CheckResult, so the JSON report keeps the value as it was (it is data, not a
+    # terminal or a rendered page). Every field gets the same rule, so a detail added later is
+    # covered without anyone deciding it is peer text. One line per check, so a newline is escaped
+    # too, or a peer's text could start a line reading as a check that passed; printable Unicode
+    # is kept, so the engine's own em dashes print as themselves.
     return escape_for_terminal(text, single_line=True, keep_printable_unicode=True)
 
 

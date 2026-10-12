@@ -216,11 +216,15 @@ def escape_json_for_terminal(text: str) -> str:
 #: backtick would open a code span, inside which no reference decodes, so it goes too, and the
 #: engine's own code spans render as plain backticks. ``$`` opens GitHub math, which could draw a
 #: large coloured PASS in a FAIL row.
-#: NOT covered, at least: a bare URL still autolinks (its text is its target); GitHub still
-#: resolves an ``@name`` or ``#N`` reference in a pasted report; emphasis, strikethrough and emoji
-#: shortcodes still restyle the rendered text within its cell; a viewer that runs a MathJax-style
-#: auto-render over the rendered page can still find ``\(...\)``; and an invisible printable
-#: character such as U+3164 is kept, as it is on the console.
+#: ``@`` and ``#`` become references, so the source carries no raw ``@name`` mention or ``#N``
+#: issue reference, and the ``:`` of ``://`` does too, so no raw ``scheme://`` URL is left to
+#: autolink (BACKLOG #2897). Each keeps the raw character out of the Markdown SOURCE. Whether a
+#: renderer that looks for mentions, references or links AFTER it decodes references is stopped
+#: was NOT measured; GitHub's mention handling may work that way.
+#: NOT covered, at least: a ``www.`` autolink; emphasis, strikethrough and emoji shortcodes, which
+#: still restyle the rendered text within its cell; a viewer that runs a MathJax-style
+#: auto-render over the rendered page, which can still find ``\(...\)``; and every invisible
+#: printable character but the four Hangul fillers at :data:`_MD_INVISIBLE`.
 _MD_CELL = {
     "&": "&amp;",
     "<": "&lt;",
@@ -229,11 +233,19 @@ _MD_CELL = {
     "](": "]&#40;",
     "`": "&#96;",
     "$": "&#36;",
+    "@": "&#64;",
+    "#": "&#35;",
+    "://": "&#58;//",
 }
 #: Spelled as a literal, not joined from the keys, so the ReDoS scan in
 #: ``tests/test_security_static.py`` can read it; ``tests/test_terminal_text_console_sinks.py``
 #: holds it to the keys above.
-_MD_CELL_RE = re.compile(r"[&<>|`$]|\]\(")
+_MD_CELL_RE = re.compile(r"[&<>|`$@#]|\]\(|://")
+#: Printable characters that render as blank space (Unicode category ``Lo``, so
+#: ``keep_printable_unicode`` keeps them): U+115F, U+1160, U+3164 and U+FFA0, the Hangul fillers.
+#: One can pad a cell so it reads as empty, or stand in for a space in a name. The cell shows
+#: each as a visible ``\uNNNN`` escape. The console keeps them; this is the cell's rule only.
+_MD_INVISIBLE = re.compile(r"[\u115f\u1160\u3164\uffa0]")
 #: A backslash run Markdown would eat: two or more (each pair reads as one), or one before ASCII
 #: punctuation, the references above included. Doubled, it renders as written, so the terminal
 #: rule's odd/even backslash convention and a UNC path survive the renderer.
@@ -245,9 +257,14 @@ def escape_for_markdown_cell(text: str) -> str:
 
     The console rule first, with ``single_line`` and ``keep_printable_unicode``: ESC, C1 and bidi
     controls become visible escapes, and so do newline and CR, so a peer cannot start a forged
-    row and the file is safe to ``cat``. Then the Markdown escapes at :data:`_MD_CELL`, then the
-    backslash runs at :data:`_MD_BACKSLASHES`. Printable Unicode such as an em dash is kept, so
-    the caller writes the file as UTF-8."""
+    row and the file is safe to ``cat``. Then the blank fillers at :data:`_MD_INVISIBLE` as
+    visible escapes, then the Markdown escapes at :data:`_MD_CELL`, then the backslash runs at
+    :data:`_MD_BACKSLASHES`. Other printable Unicode, such as an em dash, is kept, so the caller
+    writes the file as UTF-8.
+
+    A filler's escape needs no backslash handling of its own: in that mode the console rule has
+    already doubled any backslash run standing before a non-ASCII character."""
     shown = escape_for_terminal(text, single_line=True, keep_printable_unicode=True)
+    shown = _MD_INVISIBLE.sub(lambda m: _visible(m.group()), shown)
     cell = _MD_CELL_RE.sub(lambda m: _MD_CELL[m.group()], shown)
     return _MD_BACKSLASHES.sub(lambda m: m.group() * 2, cell)

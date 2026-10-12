@@ -136,12 +136,13 @@ def test_render_markdown_keeps_a_hostile_detail_in_one_row() -> None:
 
 def test_render_markdown_uses_the_verify_reports_cell_rule() -> None:
     from messagefoundry.verify.model import CheckResult
+    from messagefoundry.verify.model import Status as VerifyStatus
     from messagefoundry.verify.report import render_markdown as render_verify_markdown
 
     detail = "C:\\Users\\svc \u2014 see [store].path; a\\|b & `x`"
     row = RowResult(MATRIX[0], Status.FAIL, detail)
     acceptance = _md_data_rows(render_markdown([row]))
-    verify = render_verify_markdown([CheckResult("a", "t", Status.FAIL, detail)])
+    verify = render_verify_markdown([CheckResult("a", "t", VerifyStatus.FAIL, detail)])
     assert len(acceptance) == 1
     cell = escape_for_markdown_cell(detail)
     assert acceptance[0].endswith(f"| {cell} |")

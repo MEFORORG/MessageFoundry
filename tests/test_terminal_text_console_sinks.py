@@ -23,7 +23,11 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.apiclient import ApiError
-from messagefoundry.terminal_text import CONTROL_CATEGORIES, escape_for_terminal
+from messagefoundry.terminal_text import (
+    CONTROL_CATEGORIES,
+    escape_for_markdown_cell,
+    escape_for_terminal,
+)
 from messagefoundry.verify.model import CheckResult, Status
 from messagefoundry.verify.report import render_console, render_json, render_markdown
 
@@ -221,8 +225,8 @@ def test_verify_markdown_neutralises_a_hostile_jwks_kid_in_one_row() -> None:
         assert _HOSTILE_SHOWN in cell
         assert "\\x0a&#124; fed.replay &#124; forged" in cell
         assert "&lt;img src=x onerror=alert(1)&gt;" in cell
-        assert "&amp;#x202e;" in cell  # a peer's reference cannot decode to the control
-        assert "![x]&#40;https://e.invalid/b.png)" in cell  # no image to fetch on view
+        assert "&amp;&#35;x202e;" in cell  # a peer's reference cannot decode to the control
+        assert "![x]&#40;https&#58;//e.invalid/b.png)" in cell  # no image to fetch on view
         assert "&#96;&lt;b&gt;&#96;" in cell  # no code span, so the references still decode
         assert (
             "&#36;\\color{green}PASS&#36;" in cell
@@ -259,6 +263,34 @@ def test_verify_markdown_doubles_only_the_backslashes_markdown_would_eat(
     text: str, written: str
 ) -> None:
     assert f"| {written} |" in render_markdown([CheckResult("a", "t", Status.PASS, text)])
+
+
+@pytest.mark.parametrize(
+    ("text", "written"),
+    [
+        ("ask @octocat", "ask &#64;octocat"),  # a mention
+        ("see #2897", "see &#35;2897"),  # an issue reference
+        ("at https://e.invalid/x", "at https&#58;//e.invalid/x"),  # a bare-URL autolink
+        ("C:/x a:b", "C:/x a:b"),  # a colon alone, or before one slash, stays as typed
+    ],
+)
+def test_markdown_cell_writes_mentions_references_and_url_schemes_as_references(
+    text: str, written: str
+) -> None:
+    # BACKLOG #2897, item 3. Each keeps the raw character out of the Markdown source; what a
+    # renderer does after it decodes the reference is unmeasured, as _MD_CELL says.
+    assert escape_for_markdown_cell(text) == written
+
+
+@pytest.mark.parametrize("filler", ["\u115f", "\u1160", "\u3164", "\uffa0"])
+def test_markdown_cell_shows_a_blank_hangul_filler_as_an_escape(filler: str) -> None:
+    # A filler is printable (Lo), so the console keeps it; in a cell it could pad a value to read
+    # as blank, so the cell shows it. A backslash the peer sent before it stays text: an odd run
+    # before the escape reads as one literal backslash and then the escape.
+    shown = f"\\u{ord(filler):04x}"
+    assert _keep(f"a{filler}b") == f"a{filler}b"
+    assert escape_for_markdown_cell(f"a{filler}b") == f"a{shown}b"
+    assert escape_for_markdown_cell(f"\\{filler}") == "\\" * 6 + shown[1:]
 
 
 # --- harness one-line verdicts ------------------------------------------------------------------
@@ -496,19 +528,23 @@ def test_the_markdown_cell_pattern_matches_exactly_its_replacement_keys() -> Non
     from messagefoundry import terminal_text
 
     table, pattern = terminal_text._MD_CELL, terminal_text._MD_CELL_RE
-    assert len(table) >= 7
+    assert len(table) >= 10
     for key in table:
         assert pattern.fullmatch(key), key
     # Every match must be a key, or escape_for_markdown_cell raises KeyError: walk every single
-    # code point and every ASCII pair, which covers each key's length.
-    assert max(len(key) for key in table) == 2
+    # code point, every ASCII pair and every ASCII triple, which covers each key's length.
+    assert max(len(key) for key in table) == 3
     for code in range(0x110000):
         char = chr(code)
         assert (pattern.fullmatch(char) is not None) is (char in table), code
-    for first in range(0x80):
-        for second in range(0x80):
-            pair = chr(first) + chr(second)
+    ascii_chars = [chr(code) for code in range(0x80)]
+    for first in ascii_chars:
+        for second in ascii_chars:
+            pair = first + second
             assert (pattern.fullmatch(pair) is not None) is (pair in table), pair
+            for third in ascii_chars:
+                triple = pair + third
+                assert (pattern.fullmatch(triple) is not None) is (triple in table), triple
 
 
 @pytest.mark.parametrize(
