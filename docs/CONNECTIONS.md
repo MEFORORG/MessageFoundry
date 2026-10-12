@@ -1330,6 +1330,41 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `remotefile._ftp_connect_refusal`, and the 4xx rule in `remotefile._FtpClient._connect`. Why an
   unclear login refusal is read as a credential fault is in `remotefile._names_connection_limit`.
   A busy reply that also carries a credential word stops the lane too.
+- **An FTP server without `MLSD` must name `NLST` entries in one of two forms (BACKLOG #1130).** The
+  poller lists with `MLSD` and falls back to `NLST` when the server refuses it. It accepts an `NLST`
+  entry in only two forms:
+  - a bare name, such as `a.hl7`;
+  - `remote_dir` exactly as configured, then `/` and a bare name, such as `/in/a.hl7`. A trailing
+    slash on `remote_dir` may be kept or dropped.
+
+  Any other form is refused, which is deliberate. That covers at least a resolved absolute path
+  (`/srv/ftp/in/a.hl7` for `remote_dir = "in"`) and a path relative to the server's current
+  directory (`in/a.hl7` for `remote_dir = "/in"`). Rewriting a path to its last part would read
+  `../x/a.hl7` as `a.hl7`, so the poller refuses rather than rewrites. A refused entry stays on the
+  server and is never read.
+
+  Only an `NLST` entry can name a path legitimately, so only an `NLST` entry can get the WARNING
+  that the server's listing form looks unsupported. The entry must pass three tests:
+  - its parent directory has the same last part as `remote_dir`;
+  - it has no `..`, `\`, `:`, leading `//` or control character;
+  - `pattern` matches its file name, the part after the last `/`. An entry ending in `/` or `/.`
+    has no file name, so it never passes.
+
+  That WARNING names the connection and a count, never a file. It repeats at most every 15 minutes
+  while the condition lasts. An entry that passes the first two tests but not the third is refused
+  with no line, as is any file the pattern skips. Any other refused name, such as `/etc/a.hl7`, is
+  treated as traversal. It logs its own WARNING on every poll, also with no file name. Where a
+  server's `NLST` form is refused, set `remote_dir` to the spelling the server echoes back, or
+  enable `MLSD` on the server.
+- **An empty directory is not an error on an `NLST`-only FTP server (BACKLOG #1130).** Some such
+  servers answer `NLST` on an empty directory with `550 No files found`. The connector reads that
+  exact reply as an empty listing. Any other permanent reply still fails, including `550 No such
+  file or directory`, since that also answers a directory that is not there. Some servers send
+  `550 No files found` for a missing directory too, so the connector first confirms the directory
+  exists with `CWD`, then returns to the directory `PWD` reported. A mistyped `remote_dir` still
+  fails. So does a server whose `PWD` reply quotes no directory, since the connector could not
+  return to it. `CWD` cannot tell an empty directory from one the account may enter but not list,
+  so that one polls as empty if the server answers it the same way.
 - **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
   `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
   nothing else. A server missing either fails the handshake with a permanent `SFTP connection
