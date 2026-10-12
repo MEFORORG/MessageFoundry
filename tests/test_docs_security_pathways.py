@@ -3552,17 +3552,23 @@ _LINKING_SCOPES: dict[str, tuple[Callable[[], str], str, int]] = {
         "(EARLY-ADOPTER-GUIDE.md",
         3,
     ),
+    "docs/PHI.md known limitations": (
+        lambda: _doc("docs/PHI.md").split("\n## 12. Known limitations", 1)[1].split("\n## ", 1)[0],
+        "(EARLY-ADOPTER-GUIDE.md",
+        5,
+    ),
 }
 
 
 @pytest.mark.parametrize("scope", sorted(_LINKING_SCOPES))
 def test_the_pages_that_restated_the_security_facts_link_to_the_table(scope: str) -> None:
-    """README.md, sections 1 and 6 of the early-adopter guide and docs/PHI.md section 1 each said
-    which security controls are built. Four copies drifted, and engine PR 2015 had to correct and
-    guard each one (vault BACKLOG #2970, SDS-3.5). Each now links to the one table. A clause there
-    that names a control beside a status or a default is a copy coming back.
+    """README.md, sections 1 and 6 of the early-adopter guide and docs/PHI.md sections 1 and 12
+    each said which security controls are built. The copies drifted, and engine PR 2015 had to
+    correct and guard each one (vault BACKLOG #2970, SDS-3.5). Each now links to the one table. A
+    clause there that names a control beside a status or a default is a copy coming back.
 
-    It reads these four places only. Other pages still state some of the same facts."""
+    It reads the places in ``_LINKING_SCOPES`` only. Other pages still state some of the same
+    facts, and so do other sections of docs/PHI.md."""
     cut, link_prefix, floor = _LINKING_SCOPES[scope]
     text = cut()
     clauses = _clauses(text)

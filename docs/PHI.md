@@ -35,7 +35,7 @@ levels:
   subnet); always **authenticated** (RBAC + audit). Smallest surface.
 - **Data plane** (inbound MLLP / TCP / X12 / DB-poll feeds) — **network-bound in any real install**
   (feeds arrive from other systems on the LAN, not `127.0.0.1`), protected by **TLS on the wire**
-  (MLLP-over-TLS, built), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
+  (MLLP-over-TLS), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
   not cross the LAN in cleartext — and can't accidentally: the bind-guards **refuse a non-loopback
   *plaintext* listener**, at least MLLP, raw TCP and X12 (ADR 0002 §0). An off-loopback API bind needs
   an operator certificate or a declared TLS-terminating proxy (§4).
@@ -2353,14 +2353,17 @@ prerequisite (encrypted, access-controlled backups) is the checklist item in
 ## 12. Known limitations (current, honest)
 
 Retention is enforced (`[retention]`, §8) but `audit_days` audit-log pruning is **reserved/keep-forever
-by design** (archive-first pruning is a follow-up) · the exception path is redacted (`safe_exc`, §7,
-WP-6c); structured (JSON) logging + off-box (syslog/SIEM) forwarding + the cross-backend audit-tee are now **built** (sec-offbox-log #357/#361/#363), with **native RFC 5425 TLS-syslog** (ADR 0080) and a posture-gated forwarding hop (#1163) · the
+by design** (archive-first pruning is a follow-up) · the
 searchable `summary` column stays outside the encryption seam by design (volume encryption covers it;
-`error`/`last_error`/`detail` are now ciphered — WP-5) · a fail-closed outbound/egress allowlist is
-enforced (`[egress]`, WP-11c) and **MLLP-over-TLS is built** (WP-13b, opt-in per connection; a non-loopback plaintext listener is refused) · no
-strict-parse time budget · de-identification is **built** for HL7 v2 (the anonymizer, §9, ADR 0030)
+`error`/`last_error`/`detail` are now ciphered — WP-5) · no
+strict-parse time budget · de-identification covers HL7 v2 only (the anonymizer, §9, ADR 0030),
 with X12/FHIR seams still to come. Each is tracked in
 [§11](#11-hardening-roadmap).
+
+This list holds limitations only, and no control that works. The
+[security controls table](EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
+of the early-adopter guide says which controls are in the engine and which are on by default. §4
+documents transport TLS and the egress allowlist, and §7 documents logging and redaction.
 
 **The test harness's at-rest data falls short of its protection levels.** The harness is in the
 ASVS assessed scope (owner ruling 2026-10-02); its stores, and how far each falls short, are in the

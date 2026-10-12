@@ -90,14 +90,14 @@ when planning. Security controls have a table of their own, the second one below
 
 ### Security controls: built, on by default, and not built
 
-**This table is where these facts are stated.** `README.md`, §1 and §6 of this guide, and
-[PHI.md](PHI.md) §1 link here and do not repeat them. If another page disagrees with a row, trust the
-row and report the page (§15).
+**This table is where these facts are stated.** `README.md`, §1 and §6 of this guide, and the
+off-loopback paragraph of [PHI.md](PHI.md) §1 link here and do not repeat them. A test reads each
+row against the code. If another page disagrees with a row, report it (§15).
 
 It holds at least the controls those pages used to list as built or as missing. It is not a full
-security inventory: [SECURITY.md](SECURITY.md) and [PHI.md](PHI.md) are, and the last column names
-the page that documents each control. **Built is not the same as on**, so read the third column
-before you plan around a row.
+security inventory. [SECURITY.md](SECURITY.md) and [PHI.md](PHI.md) go further, and the last column
+names the page that documents each control. **Built is not the same as on**, so read the third
+column before you plan around a row.
 
 | Control | Status | Shipped default, or what to do instead | Documented in |
 |---|---|---|---|
@@ -438,7 +438,7 @@ Guidance for a clean first flow:
 Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DEPLOYMENT.md](DEPLOYMENT.md)**
 (network exposure). What is built, what is on by default and what is missing is stated once, in the
 [security controls table](#security-controls-built-on-by-default-and-not-built) in §2. The steps
-below say what to do about each row. Complete this checklist **before any real PHI flows**:
+below are what you do about it. Complete this checklist **before any real PHI flows**:
 
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,
