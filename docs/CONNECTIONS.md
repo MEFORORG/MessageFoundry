@@ -1539,6 +1539,13 @@ follows the posture, so under `[security].enforcement = warn` it logs a WARNING 
 builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
 connection's `proxy_url` and still follows a proxy from the environment.
 
+A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
+proxy override list) sends direct with no proxy credential, and logs a WARNING (vault BACKLOG
+#3442). A connection that sets `proxy_user` and also writes a `Proxy-Authorization` into `headers`
+fails to build (vault BACKLOG #3443). Its proxy handler admits any caller-set header once the
+`proxy_user` credential passes, so it could not tell the static header from its own. The rule is
+on [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
+
 Which legs reach the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
 out of the proxy URL.

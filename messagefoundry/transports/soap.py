@@ -395,10 +395,7 @@ class SoapDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        dest_host = urllib.parse.urlsplit(self.url).hostname or ""
-        proxy_dest = (
-            self._proxy.for_host(dest_host, url=self.url) if self._proxy is not None else None
-        )
+        proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)

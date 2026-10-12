@@ -21,7 +21,10 @@ def _drain_body(conn: socket.socket, head: bytes) -> None:
     for line in headers.split(b"\r\n")[1:]:
         name, _, value = line.partition(b":")
         if name.strip().lower() == b"content-length":
-            length = int(value.strip() or 0)
+            try:
+                length = int(value.strip() or 0)
+            except ValueError:
+                return  # a bad length: answer without reading on, rather than kill the thread
     while len(body) < length:
         more = conn.recv(8192)
         if not more:

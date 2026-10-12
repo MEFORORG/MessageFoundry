@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import logging
 import threading
 import urllib.error
 import urllib.request
@@ -676,6 +677,52 @@ def test_the_token_and_lookup_hops_read_urllibs_bypass_list(
         assert "Proxy-Authorization" not in provider._proxy_auth
         _assert_kept_uncredentialed(provider._opener)
     _assert_kept_uncredentialed(ex._opener["epic"])
+
+
+_OVERRIDE_WARNING = "urllib's own bypass list"
+
+
+def _override_warnings(
+    caplog: pytest.LogCaptureFixture, level: int = logging.WARNING
+) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno == level and _OVERRIDE_WARNING in r.getMessage()]
+
+
+def test_an_explicit_credentialed_proxy_the_environment_overrides_warns_once(
+    no_proxy_names_the_target: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.rest"):
+        _build(
+            ConnectorType.REST,
+            _URLLIB_BYPASSED,
+            proxy=LOOPBACK_PROXY,
+            proxy_user="pu",
+            proxy_password="pw",
+        )
+    records = _override_warnings(caplog)
+    assert len(records) == 1
+    assert "OB" in records[0].getMessage()
+    for part in ("svc.partner.invalid", "127.0.0.1", "pu", "pw"):
+        assert part not in records[0].getMessage().replace("OB", ""), part
+
+
+@pytest.mark.parametrize(
+    ("proxy", "infos"),
+    [
+        pytest.param("default", 0, id="default"),
+        pytest.param(LOOPBACK_PROXY, 1, id="explicit-no-credential"),
+    ],
+)
+def test_no_override_warning_without_an_explicit_credentialed_proxy(
+    no_proxy_names_the_target: None, caplog: pytest.LogCaptureFixture, proxy: str, infos: int
+) -> None:
+    """``proxy_url = "default"`` means "follow the system's proxy settings", bypass list included,
+    so following it is not an override and is not logged. An explicit proxy with no credential to
+    withhold is overridden all the same, so it is logged at INFO, as a loopback target is."""
+    with caplog.at_level(logging.INFO, logger="messagefoundry.transports.rest"):
+        _build(ConnectorType.REST, _URLLIB_BYPASSED, proxy=proxy)
+    assert _override_warnings(caplog) == []
+    assert len(_override_warnings(caplog, logging.INFO)) == infos
 
 
 def test_control_a_port_the_entry_does_not_name_is_proxied_with_its_credential(
