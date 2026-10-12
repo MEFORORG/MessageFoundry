@@ -1153,7 +1153,7 @@ def refuse_unrevoked_verified_hop(
     ``description`` says what the hop does over verified https, in the refusal's own words. The
     default fits a destination. A hop that only reads, such as the ``FhirLookup`` read path, passes
     its own, so its refusal does not say it delivers (BACKLOG #2987). The refusal appends
-    ``to <host>``, so the text must read well before it.
+    ``to <host>`` to it.
 
     A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
     BACKLOG #1924)."""

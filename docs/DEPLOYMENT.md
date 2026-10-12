@@ -980,7 +980,7 @@ attestation:
    itself and the listener gate never fires. **There is no outbound equivalent you can configure.** The
    authority has a "declared revocation-checking egress terminator" input, but no call site ever sets it
    — routing your egress through such a proxy is good practice and does not change the engine's
-   decision, so an outbound hop still needs option 2 or 3.
+   decision, so an outbound hop still needs option 2's per-connection attestation or option 3.
 2. **Attest it** — set the environment variable `MEFOR_TLS_REVOCATION_ATTESTED=1`. **It no longer
    clears the OUTBOUND gate on an enforcing instance, and this bullet said for a while that it did.**
    BACKLOG #299 clamped it: the env is held apart from a per-connection attestation and ranks *below*

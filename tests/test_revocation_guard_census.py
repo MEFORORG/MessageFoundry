@@ -11,7 +11,7 @@ in review, whether it is guarded or exempt and why.
 
 **What counts as a site.** A function in ``messagefoundry/`` that calls a name in :data:`_BUILDERS`,
 passes one of the engine's own builders as a value (to ``run_in_executor``, say), or reads
-``_NO_REDIRECT_OPENER``. Those names are at least the ways the engine hands out a verifying
+``_NO_REDIRECT_OPENER``, by bare name or through a module. Those names are at least the ways the engine hands out a verifying
 client context today, not all of them (SDS-3.6): a context reached by another name is outside this
 census, which is why :func:`test_every_builder_name_is_still_defined` keeps the list from rotting
 under a rename. A function whose own name is in :data:`_BUILDERS` is not a site. It hands its context
@@ -44,7 +44,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE = _ROOT / "messagefoundry"
 
 #: Names whose call hands the caller a verifying client context, directly or inside an opener.
-#: ``SSLContext`` counts only with ``PROTOCOL_TLS_CLIENT`` in its arguments (see :func:`_is_builder`).
+#: ``SSLContext`` counts unless its arguments name ``PROTOCOL_TLS_SERVER`` (see :func:`_is_builder`).
 _BUILDERS = frozenset(
     {
         # stdlib and truststore
@@ -169,7 +169,8 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
     "messagefoundry/pipeline/alert_sinks.py::send_plain_email": Exempt(
         f"the [alerts] SMTP sink and the security notifier, built outside every "
-        f"active_hop_posture scope, so a guard here could not see the posture: {_UNGATED}"
+        f"active_hop_posture scope. A guard could take the posture explicitly, as the syslog "
+        f"forwarder's does; none is built: {_UNGATED}"
     ),
     "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Exempt(
         f"the AI-broker endpoint: {_UNGATED}"
@@ -237,7 +238,7 @@ class _Scan:
 def _is_builder(call: ast.Call) -> bool:
     name = callee_name(call)
     if name == "SSLContext":
-        return "PROTOCOL_TLS_CLIENT" in ast.unparse(call)
+        return "PROTOCOL_TLS_SERVER" not in ast.unparse(call)
     return name in _BUILDERS
 
 
@@ -287,6 +288,14 @@ class _Visitor(ast.NodeVisitor):
         # A bare-name call to an engine builder lands here too, which is harmless: same site key.
         if node.id == _SHARED_OPENER or node.id in _BUILDERS - _STDLIB_BUILDERS:
             self._sites.add(self._key())
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        # The same, read through a module: ``rest._NO_REDIRECT_OPENER`` or
+        # ``tls_policy.build_verifying_client_context`` passed as a value.
+        is_engine_name = node.attr == _SHARED_OPENER or node.attr in _BUILDERS - _STDLIB_BUILDERS
+        if is_engine_name and isinstance(node.ctx, ast.Load) and not self._in_builder():
+            self._sites.add(self._key())
+        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         if not self._scope and any(

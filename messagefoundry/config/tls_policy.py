@@ -2352,9 +2352,12 @@ def phi_read_hop_disposition(
 # (MLLP-over-TLS, REST/SOAP/FHIR https, the asyncpg store hop): the chain is validated (+ strict RFC
 # 5280 via harden_verify_flags) but a REVOKED-but-unexpired peer cert is still accepted — Python's ssl
 # has no OCSP/CRL fetch and the engine deliberately attempts none (offline-by-default, CLAUDE.md §2).
-# So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction /
-# `messagefoundry check` / dry-run unless the hop's own context checks a CRL or the operator attests a revocation-checking PKI — per-connection `tls_revocation_attested`
-# or the blanket `MEFOR_TLS_REVOCATION_ATTESTED` env (the same opt-out ADR 0078 gave the listener).
+# So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction
+# (`messagefoundry check`, dry-run, reload, and the live build when `serve` starts) unless the hop's
+# own context checks a CRL or the operator attests a revocation-checking PKI for that connection with
+# `tls_revocation_attested`. A loopback hop is never refused. The blanket
+# `MEFOR_TLS_REVOCATION_ATTESTED` env (ADR 0078's listener opt-out) crosses only a non-enforcing
+# instance (BACKLOG #299).
 #
 # COMPOSES with #200 (ADR 0092): #200 refuses the CLEARTEXT / verify-off hop, so revocation only matters
 # on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse the same hop.
@@ -2461,8 +2464,9 @@ class RevocationHopGuard:
 
     The revocation twin of the transports' cleartext :class:`InsecureHopGuard`. Built once at connector
     construction via :meth:`capture`, which snapshots the active hop posture
-    (:func:`current_hop_posture`) and folds the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env into the
-    per-connection attestation. :meth:`enforce_construction` is the ENFORCED gate. It fires wherever
+    (:func:`current_hop_posture`) and reads the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env into its
+    own field, apart from the per-connection attestation (BACKLOG #299).
+    :meth:`enforce_construction` is the ENFORCED gate. It fires wherever
     the derived posture is stamped, and refuses a production-PHI verified-but-unrevoked hop
     off-loopback there: inside ``build_check`` (``messagefoundry check`` / dry-run / reload), and in
     the runner's live builds when ``serve`` starts the graph, which stamp the same posture. So a first

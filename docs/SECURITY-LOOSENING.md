@@ -1297,8 +1297,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What it cannot do:** it never reaches a cleartext or verify-off hop, which keep their own
   refusals. It is a claim about one named connection, which is why it crosses an enforcing instance
   where the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299). That is one hop on
-  a connection with no token endpoint. It is two on a `FhirLookup`, as above, and two on any
-  destination that signs in to a SMART or OAuth2 token endpoint, so the reason has to hold for both.
+  a connection with no token endpoint. It is two on any connection that signs in to a SMART or
+  OAuth2 token endpoint, a `FhirLookup` included, so the reason has to hold for both.
 - **How it is recorded:** a flag without a reason, a blank reason, or a reason without the flag fails
   at load, on both authoring surfaces. Each time the attestation lets a hop through that an enforcing
   instance would otherwise refuse, the engine logs a WARNING naming the hop and your reason, at every
