@@ -758,9 +758,9 @@ def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
     sibling of ``tls_allow_expired`` (:func:`relax_verify_expiry`) and is treated the same way: a
     WARNING at every construction, an advisory ``messagefoundry check`` line, and a
     ``security_loosenings()`` entry. It is NOT refused under ``[security].enforcement = enforce``,
-    because ``tls_allow_expired`` is not either. A credentialed Email, Direct or FTPS hop never
-    reaches this line: they refuse the name check off outright, with no escape, when they carry a
-    login credential (BACKLOG #1314; vault BACKLOG #2636 for FTPS). The ``[alerts]`` SMTP sink
+    because ``tls_allow_expired`` is not either. A hop that carries a credential never reaches this
+    line: it is refused first (docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
+    unverified peer*). The ``[alerts]`` SMTP sink
     exposes no name-check setting, so it does not reach this line either. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01):
     before this, the MLLP, FTPS, Email and Direct hops accepted it with no line at all, which the
     owner's answer to vault #2006 calls a silent weakening.

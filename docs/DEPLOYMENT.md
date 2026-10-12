@@ -568,7 +568,11 @@ self-signed placeholder).
 | **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. **WARNING:** `use_tls=false` is gated by the **raw** `MEFOR_ALLOW_INSECURE_TLS` — it does **not** route through the cleartext-hop authority and is **not clamped** by `enforcement` (AUTH credentials stay refused) | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
 | **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-enforced or verified** — a hop with no TLS keyword, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and connects anyway, on any posture | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
 | **File destination** | local filesystem | n/a (no network) | n/a | `[egress].allowed_file_dirs` |
-| **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused outright, vault BACKLOG #2636) | username/password or SSH key | `[egress].allowed_remote` |
+| **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused) | username/password or SSH key | `[egress].allowed_remote` |
+
+No escape sends a credential on these rows to a peer the engine has not verified, except on the hops
+that rule does not reach yet (the DATABASE login among them). The rule and those hops are in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
 
 Above and beyond each row: an **off-loopback cleartext outbound hop is decided by one authority** for
 every connector **that routes through `InsecureHopGuard`** (ADR 0092, amended by ADR 0153) — loopback
@@ -656,9 +660,9 @@ there is for MLLP:
 
 - **Raw TCP source/destination** — plaintext, arbitrary framing.
 - **X12 source/destination** — plaintext ISA/IEA-framed EDI interchanges.
-- **Plain FTP** (RemoteFile `protocol=ftp`, as opposed to SFTP/FTPS) — cleartext protocol; credentials
-  and file contents cross the wire in the clear (the connector refuses credentials over plain FTP
-  outright, with no escape, vault BACKLOG #2636; an anonymous hop is governed below).
+- **Plain FTP** (RemoteFile `protocol=ftp`, as opposed to SFTP/FTPS) — cleartext protocol; file
+  contents cross the wire in the clear. A credential is refused (see the rule linked above the
+  table); an anonymous hop is governed below.
 
 **Two more channels can carry PHI in cleartext even though they are not "no-TLS" by protocol** — the
 engine will not refuse either one for you:
@@ -684,8 +688,7 @@ responsibility**. On the **outbound** side these are cleartext *hops*, so they a
 authority instead: off-loopback they **refuse** on an enforcing instance unless the connection declares
 `cleartext_accepted` + `cleartext_reason`. For raw TCP and X12 that declaration is **permanent, not
 transitional** — there is no `tls = true` for them to migrate to ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
-decision 4; TLS support for them is BACKLOG #311). Credentialed plain FTP is refused outright in
-every posture, with no escape (it puts the credential itself on the wire; vault BACKLOG #2636).
+decision 4; TLS support for them is BACKLOG #311).
 
 ---
 
@@ -695,34 +698,26 @@ Several connectors **fail closed** on a weakened-TLS or cleartext configuration 
 environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. It exists for **dev / trusted-lab** use
 only.
 
-Two connector logins are absent from the list below because the escape cannot release them. SMTP
-AUTH on an `Email` or `Direct` destination is refused outright over cleartext, or over a TLS session
-with the certificate or hostname check off. So is an FTP or FTPS `username`/`password` (vault
-BACKLOG #2636). **This is not a rule that no credential crosses an unverified or cleartext hop.** At
-least these still can, wherever the escape or another lever releases the cell that carries them
-(a per-connection `cleartext_accepted` or `tls_hop_attested` declaration with its reason, or a named
-service setting): a REST/SOAP auth header over plain `http` under `cleartext_accepted`, or over
-`https` under `verify_tls = false`; a SQL Server login under `TrustServerCertificate=true` or
-`Encrypt=false`; the AD service-account and user binds under `ad_tls_verify = false`, or over plain
-`ldap://` under `ad_allow_insecure_ldap = true`; the `[alerts]` SMTP relay login under
-`email_tls_verify = false` (it is refused over cleartext); and an SFTP password sent to an unknown
-host key.
+The escape does not release a credential to a peer the engine has not verified, except on the hops
+that rule does not reach yet. The rule and those hops are stated once in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
+Each bullet below releases a hop with no credential, unless it says otherwise.
 
 With `MEFOR_ALLOW_INSECURE_TLS` set, these otherwise-refused settings become permitted (each logs a
 loud warning):
 
-- REST/SOAP `verify_tls = false`. *(Clamped.)*
-- MLLP outbound `tls_verify = false`; FTPS `tls_verify = false` on an **anonymous** hop. *(Clamped.
-  A credentialed FTPS hop with `tls_verify = false` or `tls_check_hostname = false` stays refused
-  outright either way, vault BACKLOG #2636.)*
+- REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped.)*
+- MLLP outbound `tls_verify = false`; FTPS `tls_verify = false`. *(Clamped.)*
 - DATABASE destination / store: `Encrypt=false` or `TrustServerCertificate=true` (SQL Server),
-  `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped.)*
-- RemoteFile SFTP: accepting an unknown host key. *(Clamped since #329.)*
-- Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Not clamped; AUTH credentials over
-  cleartext stay refused outright either way.)*
+  `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped. These carry the
+  database login, and the credential rule does not reach them yet.)*
+- RemoteFile SFTP: accepting an unknown host key on a login with no `password`. *(Clamped since
+  #329.)*
+- Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Not clamped.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop, plus LDAPS, the webhook alert sink and the
-  AI-broker endpoint. *(All clamped — LDAPS / the webhook sink / the AI broker since #329.)*
+  forwarder and the API PHI-read serve hop, plus the webhook alert sink and the AI-broker endpoint.
+  *(All clamped — the webhook sink and the AI broker since #329. LDAPS was on this list until vault
+  BACKLOG #3230 made `ad_tls_verify = false` a refusal with no escape.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -734,7 +729,7 @@ the opposite claim, "secure by other means", and ALLOWs the hop. It is reported 
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`, and for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-LDAPS, the SFTP host key, the webhook sink and the AI broker — the clamp additionally requires the
+the SFTP host key, the webhook sink and the AI broker — the clamp additionally requires the
 instance to be PHI, which is also the default. Either way, on the shipped posture those cells are inert;
 the bullets marked *not clamped* are the exceptions that still honour the raw variable.
 

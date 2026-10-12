@@ -3983,8 +3983,7 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
-    # unless a hand-built spec sets tls_check_hostname=False. That key, and tls_verify=False, are
-    # refused outright when a username or password is set (vault BACKLOG #2636).
+    # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -4010,12 +4009,9 @@ def Ftp(
     """An **FTP** (``tls=False``) or **FTPS** (``tls=True`` — explicit TLS) endpoint, source **and**
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
-    Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
-    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
-    the server certificate is verified, name included: a hand-built spec that sets
-    ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
-    refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    A ``username`` or ``password`` is **refused** over plain ``ftp`` (use ``tls=True`` for FTPS, or
+    :func:`Sftp`), and over FTPS with a check off; docs/SECURITY-LOOSENING.md, *No escape sends a
+    credential to an unverified peer*, states the rule. Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
     ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
 

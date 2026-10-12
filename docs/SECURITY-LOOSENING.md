@@ -35,6 +35,49 @@ section reference.
 
 ---
 
+## No escape sends a credential to an unverified peer
+
+The engine will not send a credential to a peer whose identity it has not checked. This section is
+the one statement of that rule; other pages link here.
+
+A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
+or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
+or starts the service. **No lever in this guide lifts it.** That covers `MEFOR_ALLOW_INSECURE_TLS`,
+`[security].enforcement = warn`, `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each
+refusal names the connection and the settings that do fix it.
+
+| Hop | Refused when it carries a credential and | What fixes it |
+|---|---|---|
+| `Email`, `Direct` (SMTP AUTH) | the hop is cleartext, or `tls_verify` or `tls_check_hostname` is off | turn TLS and both checks on; pin a private CA with `tls_ca_file` |
+| `Ftp` | it is plain FTP (`tls = false`) | use FTPS (`tls = true`) or `Sftp` |
+| `Ftp` with `tls = true` (FTPS) | `tls_verify` or `tls_check_hostname` is off | turn both checks on; pin a private CA with `tls_ca_file` |
+| `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
+| `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
+| `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
+
+A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
+pair, a static `Authorization` header, and a SOAP WS-Security UsernameToken or body secret. The HTTP
+family reads that list from the same reader as the static-credential inventory, so the two cannot
+disagree. A hop with no credential is not refused by this rule. Its own loosening entry decides it.
+
+An AD bind always carries a credential, because the service account must bind first. So
+`ad_tls_verify = false` over LDAPS is refused in every case.
+
+**The rule does not reach every hop yet.** At least these still send a credential to a peer the
+engine has not verified, when the lever named beside each is set:
+
+- an HTTP-family credential over plain `http`, under `cleartext_accepted`;
+- the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
+- a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
+  `encrypt = false`;
+- the AD binds over plain `ldap://`, under `ad_allow_insecure_ldap = true`;
+- the `[alerts]` SMTP relay login, under `email_tls_verify = false`.
+
+An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
+leaves the engine.
+
+---
+
 ## The switches
 
 | Group | Switch | Secure default |
@@ -1160,8 +1203,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   At least the connector verify-off cells keep the clamped `MEFOR_ALLOW_INSECURE_TLS` escape; the
   `[alerts]` SMTP hop is governed instead by the `allow_unverified_alert_smtp_tls` acknowledgment above
   (its construction sits outside the posture scope the clamp reads), so "the clamped escape" is not a
-  universal statement about verify-off hops and should not be read as one. Nor does this declaration
-  reach an SMTP `AUTH` over cleartext, which is refused outright.
+  universal statement about verify-off hops and should not be read as one. Nor does it lift a
+  credential refusal: see [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
 
 ### `tls_hop_attested = true` on a connection — a hop attested secure by means the engine cannot see
 > **Connection-scoped**, like `cleartext_accepted` above, and settable in both directions. It is a
@@ -1174,7 +1217,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
   and nothing about the hop looks wrong afterwards.
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
@@ -1197,7 +1240,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `messagefoundry security show` never loads the connection graph, and the `serve`-time warning fires
   before the graph loads. Both say so in their scope text.
 - **What it cannot do:** it does not reach a revocation refusal. That is `tls_revocation_attested`, a
-  different claim. It does not permit SMTP `AUTH` over cleartext, which is refused outright.
+  different claim. It does not lift a credential refusal: see
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
+  CORRECTED 2026-10-12 (vault BACKLOG #3230): it used to let a credentialed `verify_tls = false`
+  HTTP-family hop cross.
 
 ### `tls_allow_expired = true` on a connection — an expired certificate accepted indefinitely
 > **Connection-scoped**, like `cleartext_accepted` above: a parameter on one outbound connection —
@@ -1252,15 +1298,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **When acceptable:** a partner whose certificate names a different host than the one you dial, such
   as an IP address, while they reissue it. Prefer a private trust anchor in `tls_ca_file`, which narrows
   "any certificate from the anchor" to the partner's own CA.
-- **Compensating controls:** a private `tls_ca_file` is the one that matters. With credentials it is
-  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential,
-  and FTPS refuses it outright, in both directions, when a `username` or `password` is set (vault
-  BACKLOG #2636). No escape variable or posture unlocks either refusal. CORRECTED 2026-10-06: FTPS
-  was warned and not refused here, so a credentialed FTPS hop with the name check off would have
-  sent its login to any peer holding a certificate from the anchor. The weaker FTPS posture is
-  refused the same way: a credentialed FTPS hop with `tls_verify = false` is refused outright, as
-  `Email` and `Direct` refuse it, and the clamped `MEFOR_ALLOW_INSECURE_TLS` escape governs only an
-  anonymous FTPS hop.
+- **Compensating controls:** a private `tls_ca_file` is the one that matters. On a hop that carries
+  a credential this loosening is not available at all: see
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
+  CORRECTED 2026-10-06 (vault BACKLOG #2636): FTPS was warned and not refused here.
 - **It is never silent:** a WARNING at each construction naming the connection and the host; a
   `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
   and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a
@@ -1273,7 +1314,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   fires before the graph is loaded, as for `tls_allow_expired`.
 - **What it cannot do:** on a hop with no credential it is **advisory only**, on the
   `tls_allow_expired` precedent. No posture gate keys on it, and `[security].enforcement = enforce`
-  does not refuse it. The credentialed refusals above are absolute and do not depend on enforcement. Where it is NOT reported is the
+  does not refuse it. Where it is NOT reported is the
   same list as `cleartext_accepted` above: `messagefoundry security show` and a graphless
   `GET /security/posture` say so in `loosenings_scope`.
 
