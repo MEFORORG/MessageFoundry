@@ -258,7 +258,9 @@ def test_a_negative_cap_is_refused_with_the_scps_own_text(bad: object) -> None:
 
 
 def test_an_unparseable_cap_is_refused_naming_the_setting() -> None:
-    with pytest.raises(ValueError, match="DICOM-SCP source max_object_bytes='lots'"):
+    with pytest.raises(
+        ValueError, match="DICOM-SCP source max_object_bytes is not a valid int value"
+    ):
         _scp("lots")  # type: ignore[arg-type]
 
 
