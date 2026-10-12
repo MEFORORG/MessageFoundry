@@ -1,6 +1,6 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling)
 
 > **Amendment A (2026-09-28, BACKLOG #2078, #2348):** `mark_failed`'s retry branch, and
 > `mark_batch_failed`'s, now carry a status term on all three backends, by owner ruling. It was

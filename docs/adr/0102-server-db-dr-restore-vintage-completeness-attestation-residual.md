@@ -1,6 +1,6 @@
 # 0102 — Server-DB DR restore vintage/completeness: accept the residual (+ an opt-in restore-token vintage floor)
 
-- **Status:** Accepted (2026-07-12) — design + risk-acceptance recorded; optional restore-token cross-check built  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** Accepted (2026-07-12) — design + risk-acceptance recorded; optional restore-token cross-check built. **Amended 2026-10-11** (BACKLOG #1502): option (a) is not scheduled; see the amendment at the end. Seat decision under owner delegation 2026-10-08, not an owner ruling  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-12
 - **Related:** [ADR 0048](0048-third-tier-disaster-recovery-standby.md) (third-tier DR standby — owns the
   activation refusal this residual lives inside; the `_verify_live_server_seed` gate + the cold-restore

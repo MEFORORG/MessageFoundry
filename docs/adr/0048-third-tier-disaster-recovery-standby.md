@@ -697,7 +697,8 @@ truncated/aborted restore); and (iii) **optionally** set `[dr].restore_token` to
 (`{"expected_backup_archive": "<the most-recent engine dr_backup archive name the restored DB should carry,
 sourced from the PRIMARY's `dr_backup` record — NOT read back from the restored DB>"}`) so the gate enforces a
 **vintage floor** (a mismatching/stale restore is then refused closed). The full engine-driven server-DB seed that
-would make vintage engine-verifiable is deferred (ADR 0102 option (a), an owner decision).
+would make vintage engine-verifiable is ADR 0102 option (a), and it is not scheduled: see the 2026-10-11
+amendment at the end of ADR 0102. That is a seat decision under owner delegation 2026-10-08, not an owner ruling.
 
 ## Acceptance Criteria
 
