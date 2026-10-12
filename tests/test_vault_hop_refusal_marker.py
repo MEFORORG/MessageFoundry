@@ -213,6 +213,45 @@ def test_the_cleartext_refusal_is_marked_and_keeps_its_wording() -> None:
     assert _HOST not in str(caught.value)
 
 
+@_needs_the_vault_extra
+def test_a_proxy_url_the_stdlib_parser_rejects_is_refused_with_fixed_text() -> None:
+    """The client build read the proxy's scheme with ``urllib.parse.urlsplit``. That parser rejects
+    some URLs ``urllib3`` accepts, and its error quotes the user and password. The error left the
+    build as a bare ``ValueError``, which a command such as ``rotate-key`` prints.
+
+    The proxy below reads as ``https://`` to ``urllib3``, so the credential check passes it. Its
+    user name holds U+2100, which NFKC normalization turns into text with a ``/``."""
+    import urllib.parse
+
+    import requests
+
+    from messagefoundry.transports.strict_requests import (
+        VaultHopRefused,
+        _refuse_an_insecure_vault_hop,
+        _unverifiable_proxy_leg,
+    )
+
+    proxy = "https://us℀er:synthetic-pw@proxy.synthetic.test:3128"
+    # The premise: the standard parser does reject this URL, and its error does quote the password.
+    with pytest.raises(ValueError, match="synthetic-pw"):
+        urllib.parse.urlsplit(proxy)
+
+    session = requests.Session()
+    session.trust_env = False  # only the proxy passed below applies
+    with pytest.raises(VaultHopRefused) as caught:
+        _refuse_an_insecure_vault_hop(
+            session,
+            "http://127.0.0.1:8200",
+            connector="Vault test hop",
+            request_proxies={"http": proxy},
+        )
+    assert type(caught.value) is VaultHopRefused
+    # The whole text is the helper's fixed one, so no part of the proxy URL can be in it.
+    assert str(caught.value) == _unverifiable_proxy_leg("Vault test hop")
+    for fragment in ("synthetic-pw", "proxy.synthetic.test", "3128"):
+        assert fragment not in str(caught.value)
+
+
 class _Transit:
     """A Transit backend whose first call fails with ``exc``."""
 

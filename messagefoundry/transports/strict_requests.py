@@ -544,6 +544,25 @@ def _scheme_of(url: str | None) -> str:
     return urllib.parse.urlsplit(url or "").scheme.lower()
 
 
+def _proxy_scheme(proxy: str) -> str:
+    """The scheme requests would read for ``proxy``, lower-cased, or ``""`` when its URL will not
+    parse.
+
+    Read as :func:`_proxy_carries_cleartext_credentials` reads it, with ``urllib3``'s parser and
+    its error caught. **Never** :func:`_scheme_of` **on a proxy URL (vault BACKLOG #3247).** That
+    is ``urllib.parse.urlsplit``, which rejects some URLs ``urllib3`` accepts, and its error
+    quotes the whole network location, user and password included. One such URL has a character
+    in its user name that NFKC normalization turns into a ``/``. The error would leave the client
+    build as a bare ``ValueError``, which a command prints."""
+    try:
+        scheme = urllib3.util.parse_url(
+            requests.utils.prepend_scheme_if_needed(proxy, "http")
+        ).scheme
+    except ValueError:  # LocationParseError
+        return ""
+    return (scheme or "").lower()
+
+
 def _unverifiable_proxy_leg(connector: str) -> str:
     return (
         f"{connector}: an http:// Vault address would be reached through an https:// proxy "
@@ -753,7 +772,9 @@ def _refuse_an_insecure_vault_hop(
     hop = _prepared_vault_hop(session, url, request_proxies)
     sent, proxy = hop if hop is not None else ("", None)
     _refuse_cleartext_proxy_credentials(proxy, connector=connector)
-    if _scheme_of(sent) == "http" and proxy and _scheme_of(proxy) == "https":
+    # A proxy URL that will not parse reads as not https here, and the cleartext check below then
+    # refuses it: an http:// address behind any proxy is refused, with fixed text.
+    if _scheme_of(sent) == "http" and proxy and _proxy_scheme(proxy) == "https":
         raise VaultHopRefused(_unverifiable_proxy_leg(connector))
     _refuse_a_cleartext_vault_hop(sent, proxy, connector=connector)
 
