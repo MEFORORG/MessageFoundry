@@ -1670,6 +1670,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # A correct code on a session revoked underneath it: there is nothing to re-render the
             # gate for, and the cookie is dead. Land on login like any other post-termination exit.
             return login_redirect_response()
+        if elevation.idp_step_up_required:
+            # BACKLOG #2142: an oidc session that already met its factor owes no code, as the GET
+            # says for any satisfied session. Nothing rotated, so the cookie is still live.
+            return RedirectResponse("/ui", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
