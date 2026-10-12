@@ -91,7 +91,8 @@ $hookEvent = ''
 $hookCwd = ''
 try {
     if ([Console]::IsInputRedirected) {
-        $raw = [Console]::In.ReadToEnd()
+        # UTF-8 bytes, not the console code page, so a non-ASCII `cwd` survives the read.
+        $raw = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)).ReadToEnd()
         if ($raw) {
             $payload = $raw | ConvertFrom-Json -ErrorAction Stop
             $names = $payload.PSObject.Properties.Name

@@ -134,13 +134,18 @@ $hookInput = ''
 try {
     # As UTF-8 bytes, not through [Console]::In: that decodes with the console code page, which
     # would mangle a non-ASCII cwd and send the hook quietly back to -WorktreeRoot.
-    $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
-    $hookInput = $reader.ReadToEnd()
+    if ([Console]::IsInputRedirected) {
+        $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
+        $hookInput = $reader.ReadToEnd()
+    }
 }
 catch { }
 try {
     $fromInput = Get-InputWorktree $hookInput
     if ($fromInput) { $WorktreeRoot = $fromInput }
+    elseif ($hookInput -match '"cwd"\s*:\s*"[^"]') {
+        Write-Output "[role-card] The hook input names a cwd that is missing or inside no checkout, so the seat below comes from $WorktreeRoot."
+    }
 }
 catch {
     # Said aloud, because falling back in silence is the fault this read exists to fix.

@@ -791,9 +791,10 @@ class TheHookReadsTheSessionsOwnWorktree(unittest.TestCase):
         """The control. With no input the same call reads the primary, so the arms here can fail."""
         self.assertIn("SEAT: builder", self._as_the_desktop_app_runs_it(""))
 
-    def test_an_input_cwd_that_does_not_exist_falls_back(self):
+    def test_an_input_cwd_that_does_not_exist_falls_back_and_says_so(self):
         out = self._as_the_desktop_app_runs_it(json.dumps({"cwd": str(self.primary / "gone")}))
         self.assertIn("SEAT: builder", out)
+        self.assertIn("names a cwd that is missing or inside no checkout", out)
 
     def test_an_input_that_is_not_json_falls_back(self):
         self.assertIn("SEAT: builder", self._as_the_desktop_app_runs_it("not json {"))
