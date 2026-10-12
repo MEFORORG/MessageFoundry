@@ -1460,9 +1460,9 @@ class FhirLookupExecutor:
         """Refuse a read or a probe on a lookup that failed to build, before anything is sent. The
         Handler sees a :class:`FhirLookupError`, so the message takes the error path. The reason
         stays in the server log, because this text reaches the message's error record."""
-        from messagefoundry.config.fhir_lookup import FhirLookupError
-
         if connection in self._failed:
+            from messagefoundry.config.fhir_lookup import FhirLookupError
+
             raise FhirLookupError(
                 f"{prefix}: this lookup failed to start and is isolated, so nothing was sent. "
                 "Fix the cause, then reload or restart; the server log says why"

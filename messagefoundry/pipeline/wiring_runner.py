@@ -2352,10 +2352,10 @@ class RegistryRunner:
         # Logged and alerted only once the survivors have built, so no alert says the engine went on
         # when this last build raised and unwound the start instead.
         for name, err in errors.items():
-            self._record_fhir_lookup_failed(name, err)
+            self._record_fhir_lookup_failed(name, failed[name], err)
         return executor
 
-    def _record_fhir_lookup_failed(self, name: str, exc: BaseException) -> None:
+    def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
         does for a connection (ADR 0031, vault BACKLOG #3008). The executor keeps the record. The
         alert names the lookup by its record name, so it is not taken for a connection of the same
@@ -2364,6 +2364,7 @@ class RegistryRunner:
             f"fhir lookup {name!r}",
             fhir_lookup_record_name(name),
             "reload or restart; every Handler call to it fails closed meanwhile",
+            reason,
             exc,
         )
 
@@ -4380,20 +4381,22 @@ class RegistryRunner:
         ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
         bare name: an alert row is addressed to the operator's connection, and the detail says which
         direction failed to start."""
-        self._failed[(kind, name)] = self._log_and_alert_start_failure(
+        reason = safe_exc(exc)
+        self._failed[(kind, name)] = reason  # stored before the alert fires, so a sink reads it
+        self._log_and_alert_start_failure(
             f"{kind} connection {name!r}",
             name,
             "reload or restart it" if kind == "inbound" else "reload",
+            reason,
             exc,
         )
 
     def _log_and_alert_start_failure(
-        self, subject: str, alert_name: str, recovery: str, exc: BaseException
-    ) -> str:
+        self, subject: str, alert_name: str, recovery: str, reason: str, exc: BaseException
+    ) -> None:
         """The ADR 0031 signal for one thing that failed to start and was isolated: an ERROR line
-        and a ``connection_stopped`` alert. Returns the scrubbed reason. Shared by a connection
+        and a ``connection_stopped`` alert. ``reason`` is ``safe_exc(exc)``. Shared by a connection
         (:meth:`_record_failed`) and a ``FhirLookup`` (:meth:`_record_fhir_lookup_failed`)."""
-        reason = safe_exc(exc)
         log.error(
             "%s failed to start — ISOLATED, engine continues (fix the cause, then %s): %s",
             subject,
@@ -4405,7 +4408,6 @@ class RegistryRunner:
             self._alert_sink.connection_stopped(alert_name, detail=f"failed to start: {reason}")
         except Exception:
             log.exception("alert sink raised on connection_stopped for %r", alert_name)
-        return reason
 
     # --- #122 / ADR 0162: fail-closed application-log write guard ------------
 
@@ -5131,19 +5133,24 @@ class RegistryRunner:
                     self._dr_standby.value,
                 )
             failed_lookups = self.degraded_fhir_lookups()
-            if self._failed or failed_lookups:
+            if failed_lookups:
+                # Vault BACKLOG #3008: a lookup is not a connection, so it is not in the count below.
+                log.warning(
+                    "wiring started with %d FhirLookup(s) failed to start (isolated, engine "
+                    "running; every Handler call to one fails closed): %s",
+                    len(failed_lookups),
+                    ", ".join(f"{n} ({r})" for n, r in sorted(failed_lookups.items())),
+                )
+            if self._failed:
                 log.warning(
                     "wiring started DEGRADED: %d inbound, %d outbound connection(s); "
                     "%d failed to start (isolated, engine running): %s",
                     len(self.registry.inbound),
                     len(self.registry.outbound),
-                    len(self._failed) + len(failed_lookups),
+                    len(self._failed),
                     # Named WITH the direction — an operator reading this has to know which half
                     # of a dual-role name to go and fix.
-                    ", ".join(
-                        [f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())]
-                        + [f"fhir lookup {n} ({r})" for n, r in sorted(failed_lookups.items())]
-                    ),
+                    ", ".join(f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())),
                 )
             else:
                 log.info(

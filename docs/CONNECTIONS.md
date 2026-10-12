@@ -291,10 +291,10 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > the connector, not to pass the posture. So are `DICOM(..., tls=True)`, an `Ftp(..., tls=True)`
 > upload, a `Direct()` relay with a `username`, and an `https://` `FhirLookup()`.
 >
-> **At start, a refused hop costs only its own connection or lookup** (vault BACKLOG #3008). A
+> **At start, a hop refused here costs its own connection or lookup** (vault BACKLOG #3008). A
 > refused outbound is recorded failed and the rest of the graph starts. A refused `FhirLookup` is
 > isolated the same way. It is recorded failed, alerted under `fhir_lookup:<name>` and named in
-> `/status`. Every Handler call to it raises `FhirLookupError` before anything is sent, so a
+> `/status` to an estate-wide caller. Every Handler call to it raises `FhirLookupError` before anything is sent, so a
 > message whose Handler lets that error through takes the error path. A Handler that catches
 > `FhirLookupError` decides for itself, as it does for any failed read. The other feeds start.
 > That holds on every start, a restart and a clustered node's start included. `messagefoundry
