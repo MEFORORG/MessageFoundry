@@ -197,6 +197,9 @@ def test_the_outcome_page_words_a_duplicate_apart_from_a_send() -> None:
     assert "Resend queued" in sent and "nothing new was queued" not in sent
     assert "Already resent" in dup and "nothing new was queued" in dup
     assert "Resend queued" not in dup
+    # No source names none, rather than an empty pair of quotes.
+    bare = str(message_resend_done("m1", "OB2", "", duplicate=False))
+    assert "copied from" not in bare and "“OB2”." in bare
 
 
 def test_the_outcome_page_carries_the_tail_warning_too() -> None:
@@ -802,6 +805,16 @@ async def test_a_crafted_outcome_link_reports_no_resend(engine: Engine, tmp_path
             f"/ui/messages/{mid}/resend-done", params={"to": "OB2", "key": "k-real"}
         )
         assert hidden.status_code == 404 and "No such resend" in hidden.text
+    # CONTROL: scope on the target alone renders it, and shows no source, since the origin
+    # channel is not checked here.
+    await _add(service, "target_only", Role.OPERATOR.value, channels=["OB2"])
+    async with _client(engine, service) as c:
+        await _login(c, "target_only")
+        shown = await c.get(
+            f"/ui/messages/{mid}/resend-done", params={"to": "OB2", "key": "k-real"}
+        )
+        assert shown.status_code == 200 and "Resend queued" in shown.text
+        assert "copied from" not in shown.text
 
 
 async def test_a_malformed_name_costs_no_proof(engine: Engine) -> None:

@@ -1356,6 +1356,17 @@ _NOT_STEP_UP_GATES = frozenset(
 )
 
 
+#: The step-up gates that skip the MFA gate (the factor-enrolment and session-terminate lanes).
+_MFA_DROPPING_GATES = frozenset(
+    {
+        "require_reauth_only",
+        "require_reauth_only_action",
+        "require_ui_reauth_only",
+        "require_ui_reauth_only_action",
+    }
+)
+
+
 def _is_step_up(gate: str) -> bool:
     return gate in _STEP_UP_GATES
 
@@ -1364,6 +1375,7 @@ def test_every_gate_is_classed_as_step_up_or_not() -> None:
     """The parity tests below sort gates by these two sets, so a gate in neither is unreviewed."""
     pytest.importorskip("messagefoundry_webconsole")
     seen = {gate for gate, _perms, _action in _gates_by_operation().values()}
+    assert _MFA_DROPPING_GATES <= _STEP_UP_GATES
     assert seen <= _STEP_UP_GATES | _NOT_STEP_UP_GATES, (
         f"gate factories classed as neither step-up nor not: {sorted(seen - _STEP_UP_GATES - _NOT_STEP_UP_GATES)}"
     )
@@ -1380,8 +1392,8 @@ def _parity_breaks(
     gate drops it); and require every permission the JSON route requires.
 
     It reads the gate, not the route body, so it cannot see ``spend=False``: a /ui gate that only
-    holds the proof leaves the spend to the route. ``test_ui_bound_step_up.py`` pins that each such
-    lane spends its proof once."""
+    holds the proof leaves the spend to the route, and this does not check that the route spends it.
+    That is each lane's own tests' job."""
     breaks: list[str] = []
     for ui, json_op in sorted(pairs.items()):
         if ui not in gates or json_op not in gates:
@@ -1393,7 +1405,11 @@ def _parity_breaks(
             breaks.append(f"{ui}: {ui_gate} takes no step-up; {json_op} takes {json_gate}")
         if json_action is not None and ui_action != json_action:
             breaks.append(f"{ui}: bound to {ui_action!r}; {json_op} is bound to {json_action!r}")
-        if json_gate.startswith("require_step_up") and "reauth_only" in ui_gate:
+        if (
+            _is_step_up(json_gate)
+            and json_gate not in _MFA_DROPPING_GATES
+            and (ui_gate in _MFA_DROPPING_GATES)
+        ):
             breaks.append(f"{ui}: {ui_gate} drops the MFA gate {json_op}'s {json_gate} keeps")
         if not json_perms <= ui_perms:
             breaks.append(f"{ui}: lacks {sorted(json_perms - ui_perms)}, which {json_op} requires")

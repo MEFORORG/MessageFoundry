@@ -1224,7 +1224,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     #
     # Same permission as the POST, plus the caller's channel scope on the target. It reads the
     # store's record of the resend's key (vault BACKLOG #3241), so a link that names no resend this
-    # engine ran answers 404 "No such resend", and the target and source shown are the record's.
+    # engine ran answers 404 "No such resend", and the target shown is the record's. It does not read
+    # the message, so it does not check scope on the origin channel. That is why it shows no source:
+    # a caller scoped to the target alone learns only that a resend to it ran under this key.
     # The `duplicate` flag still rides the query and only picks the wording: "queued" and "already
     # resent" are both true of a key whose resend ran. Before #3241 the page echoed the query alone,
     # so a crafted link showed "queued" for a resend that never ran.
@@ -1248,14 +1250,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             message_id=message_id,
             to=to,
         )
-        # Out of scope reads as no record, so the page is no oracle for another channel's resends.
+        # A target out of the caller's scope reads as no record at all.
         if prior is None or not identity.can_access_channel(prior.to_destination):
             return HTMLResponse(pages.message_resend_unknown(message_id), status_code=404)
-        # `from_destination` may be empty: a key first used over the JSON API without a source.
         return HTMLResponse(
-            pages.message_resend_done(
-                message_id, prior.to_destination, prior.from_destination, duplicate=duplicate
-            )
+            pages.message_resend_done(message_id, prior.to_destination, "", duplicate=duplicate)
         )
 
     # NEITHER OUTCOME GOES TO THE MESSAGE DETAIL PAGE. That page is `require_ui(MESSAGES_VIEW_RAW)`,

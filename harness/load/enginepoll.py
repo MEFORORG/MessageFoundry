@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -56,6 +57,8 @@ from messagefoundry.apiclient import ApiError, EngineClient
 
 #: Hosts whose engine this harness could have spawned itself. Mirrors apiclient's own loopback set;
 #: kept local rather than importing a private name from that package.
+_log = logging.getLogger(__name__)
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 _T = TypeVar("_T")
@@ -765,7 +768,13 @@ class EnginePoller:
             # The action id is spelled out: the harness does not import engine internals.
             client.set_token(rigadmin.sign_in(url, cacert=cacert))
             client.reauth(rigadmin.rig_admin().password, purpose="config_reload")
-        except SIGN_IN_ERRORS:
+        except SIGN_IN_ERRORS as exc:
+            # The class and status only: an ApiError's text can carry the engine's reply.
+            _log.warning(
+                "reload probe: the rig could not prove for the reload: %s (HTTP %s)",
+                type(exc).__name__,
+                getattr(exc, "status", None),
+            )
             self._end_reload_client_sync(client)
             return None
         except BaseException:

@@ -652,10 +652,12 @@ def message_resend_done(message_id: str, to: str, source: str, *, duplicate: boo
     "queued" for it would be the same lie as answering a refusal with the success response, so the
     two outcomes are worded apart. The ways out are LINKS, not redirects — a role that cannot open
     the detail page simply does not follow that one."""
+    # An empty `source` names none: the outcome route shows the target alone (vault BACKLOG #3241).
+    copied = f", copied from “{source}”" if source else ""
     said = (
         "That key was already used, so nothing new was queued. The earlier resend stands."
         if duplicate
-        else f"A new delivery of this message is queued to “{to}”, copied from “{source}”."
+        else f"A new delivery of this message is queued to “{to}”{copied}."
     )
     return page(
         "Resend message",
