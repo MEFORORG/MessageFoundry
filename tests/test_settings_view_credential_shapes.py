@@ -106,6 +106,28 @@ def test_a_nested_key_takes_its_own_rule() -> None:
     assert view["fallbacks"] == [{"headers": {"Authorization": "***"}}]
 
 
+def test_a_nested_credential_name_or_value_is_masked() -> None:
+    """Second review of this build: a nested key the fixed setting set does not name, and a
+    credential-shaped value under an ordinary key."""
+    view = _shown(
+        {
+            "auth": {
+                "client_secret": MARK,
+                "x_api_key_v2": MARK,
+                "Authorization": f"Bearer {MARK}",
+            },
+            "odbc_params": {"proxy_url": f"http://u:{MARK}@h.example.invalid", "Encrypt": "yes"},
+        }
+    )
+    assert MARK not in json.dumps(view), view
+    assert view["odbc_params"]["Encrypt"] == "yes"
+
+
+def test_a_headers_list_of_pairs_gets_the_header_rule() -> None:
+    view = _shown({"headers": [("X-Api-Key", MARK), ("Accept", "application/json")]})
+    assert view["headers"] == [("X-Api-Key", "***"), ("Accept", "application/json")]
+
+
 # --- shape 2: a reference-valued default --------------------------------------------------------
 
 
@@ -193,6 +215,13 @@ def test_the_warning_detector_is_unchanged_by_the_display_rule() -> None:
         f"/key/{MARK}",
         f"/hooks/client-secret/{MARK}",
         f"/x/token%2F{MARK}",  # an escaped "/" splits too
+        # Second review of this build:
+        f"/private_key/{MARK}/x",  # a name the warning detector knows
+        f"/sessionid/{MARK}/x",
+        f"/x\\token\\{MARK}",  # a WHATWG reader takes "\" for "/"
+        f"/x%5Ctoken%5C{MARK}",
+        f"/key;v=1/{MARK}",  # a segment judged without its ";" parameters
+        f"/app#/token/{MARK}/x",  # a hash route
     ],
 )
 def test_a_credential_word_segment_with_a_segment_after_it_is_withheld(path: str) -> None:

@@ -101,6 +101,7 @@ from messagefoundry.secretscrub import (
     _SEGMENT_SEPARATORS,
     CREDENTIAL_PLACEHOLDER,
     _base_name,
+    _is_credential_param,
     credential_query_params,
     has_credential_like_segment,
     scrub_credentials,
@@ -1665,6 +1666,10 @@ _DISPLAY_CREDENTIAL_WORDS = (
 #: ``/token/introspect`` or ``/sessions/123/messages``: over-masking is its safe direction.
 _DISPLAY_CREDENTIAL_SEGMENTS = frozenset({"key", "pass", "session", "sig"})
 
+#: What splits a decoded path into segments for the shape-4 rule: ``/``, and ``\``, which a WHATWG
+#: reader of an ``http`` URL takes for ``/``.
+_PATH_SEPARATORS = re.compile(r"[/\\]")
+
 
 def _squash_name(name: str) -> str:
     """``name`` casefolded, without the separators the warning detector splits a name on."""
@@ -1709,14 +1714,22 @@ def _has_credential_path_segment(path: str) -> bool:
 
     MANAGER RULING (batch 255): the LAST segment is not read, so ``/oauth2/token`` stays readable;
     a credential word with nothing after it names an endpoint rather than introducing a value. The
-    path is percent-decoded before it is split, so an escaped ``/`` splits too, and empty segments
-    are skipped, so ``/token/`` ends in ``token``."""
-    segments = [s for s in urllib.parse.unquote(path).split("/") if s]
+    path is percent-decoded before it is split, so an escaped ``/`` splits too. A ``\\`` splits as
+    well, as a WHATWG reader of an ``http`` URL takes it for ``/``. Empty segments are skipped, so
+    ``/token/`` ends in ``token``, and a segment is judged without its ``;`` parameters. A segment
+    is a credential word by the short whole-word set, by the anywhere rule, or by the warning
+    detector's own name test (``private_key``, ``sessionid``)."""
+    segments = [s for s in _PATH_SEPARATORS.split(urllib.parse.unquote(path)) if s]
     for segment in segments[:-1]:
-        word = _squash_name(segment)
+        bare = segment.partition(";")[0]
+        word = _squash_name(bare)
         if {word, word.removesuffix("s")} & _DISPLAY_CREDENTIAL_SEGMENTS:
             return True
-        if _names_a_credential(segment):
+        if _names_a_credential(bare):
+            return True
+        # The detector reads a bare ``auth`` as a credential name; as a path segment it is the
+        # Keycloak prefix the comment on _DISPLAY_CREDENTIAL_SEGMENTS keeps readable.
+        if word != "auth" and _is_credential_param(bare):
             return True
     return False
 
@@ -1732,7 +1745,8 @@ def _url_may_carry_a_credential(value: str) -> bool:
     ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
     (:func:`~messagefoundry.secretscrub.has_credential_like_segment`), or a credential word anywhere
     in such a name (:func:`_has_credential_named_segment`); or a path segment that is a credential
-    word with another segment after it (:func:`_has_credential_path_segment`). It does not try to
+    word with another segment after it, in the path or a hash-route fragment
+    (:func:`_has_credential_path_segment`). It does not try to
     find WHERE a secret is: three review rounds on PR 1912 each found a URL reader that disagreed
     with a mask that did. The cost is the view: a URL with an ``@`` in its path or query, such as an
     email address, is withheld too, and so is ``/v1/secret/data/app``, which names a secret's path.
@@ -1750,14 +1764,16 @@ def _url_may_carry_a_credential(value: str) -> bool:
     if any(escape in folded for escape in _WITHHELD_URL_ESCAPES):
         return True
     try:
-        path = urllib.parse.urlsplit(value).path
+        parts = urllib.parse.urlsplit(value)
     except ValueError:
         return True
     return (
         has_credential_like_segment(value)
         or bool(credential_query_params(value))
         or _has_credential_named_segment(value)
-        or _has_credential_path_segment(path)
+        or _has_credential_path_segment(parts.path)
+        # A hash route, ``#/token/SECRET/x``, is a path to the page that reads it.
+        or _has_credential_path_segment(parts.fragment)
     )
 
 
@@ -1923,10 +1939,21 @@ def _view_value(name: str, value: object, depth: int = 0) -> object:
         # folded in, because it changes the resolution path and what the refusal above means.
         return {
             _redact_header_name(k): (
-                "***" if _is_secret_odbc_key(k) else _view_value(name, v, depth + 1)
+                "***" if _is_secret_odbc_key(k) else _view_value(_rule_name(name, k), v, depth + 1)
             )
             for k, v in value.items()
         }
+    if (
+        name == "headers"
+        and isinstance(value, list | tuple)
+        and len(value) == 2
+        and isinstance(value[0], str)
+    ):
+        # A (name, value) pair, the list form httpx takes: the header rule, judged by its name.
+        # The name is value-tested too, so two bare values are not read as name and value.
+        header = "***" if _looks_like_a_credential_value(value[0]) else value[0]
+        pair = [header, _redact_header_value(value[0], value[1], depth + 1)]
+        return tuple(pair) if isinstance(value, tuple) else pair
     if isinstance(value, Mapping):
         return {
             _redact_header_name(k): _view_entry(name, k, v, depth + 1) for k, v in value.items()
@@ -1935,16 +1962,29 @@ def _view_value(name: str, value: object, depth: int = 0) -> object:
 
 
 def _view_entry(parent: str, key: object, value: object, depth: int) -> object:
-    """One entry of a nested mapping under setting ``parent``. A key that is a credential setting
-    name masks its value; a key that is a URL setting, ``headers`` or ``odbc_params`` takes that
-    rule; any other key keeps the parent's rule, so a URL under ``fallback_url`` is still a URL."""
-    if not isinstance(key, str):
-        return _view_value(parent, value, depth)
-    if _is_secret_setting(key):
+    """One entry of a nested mapping under setting ``parent``. A key that is a URL setting,
+    ``headers`` or ``odbc_params`` takes that rule. Otherwise a key that is a credential setting
+    name, or holds a credential word (:func:`_names_a_credential`, so ``client_secret``), masks
+    its value, as does a credential-shaped value (``Bearer ...``). Any other key keeps the
+    parent's rule, so a URL under ``fallback_url`` is still a URL."""
+    if _has_own_rule(key):
+        return _view_value(str(key), value, depth)
+    if isinstance(key, str) and (
+        _is_secret_setting(key) or _names_a_credential(key) or _looks_like_a_credential_value(value)
+    ):
         return "***"
-    if key in ("headers", "odbc_params") or _is_url_setting(key):
-        return _view_value(key, value, depth)
     return _view_value(parent, value, depth)
+
+
+def _has_own_rule(key: object) -> bool:
+    """Whether a nested key is a setting name with a rule of its own: a URL setting, ``headers`` or
+    ``odbc_params``."""
+    return isinstance(key, str) and (key in ("headers", "odbc_params") or _is_url_setting(key))
+
+
+def _rule_name(parent: str, key: object) -> str:
+    """The setting name whose rule a nested entry under ``parent`` takes."""
+    return str(key) if _has_own_rule(key) else parent
 
 
 def _view_setting(name: str, value: object) -> object:
