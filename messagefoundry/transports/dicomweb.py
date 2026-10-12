@@ -52,6 +52,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -218,7 +219,9 @@ class DicomWebDestination(DestinationConnector):
             # BACKLOG #1241: and the control-char screen alone is not enough for a value that becomes a
             # path SEGMENT — refuse at construction, where the operator sees it, not at the URL layer.
             _reject_non_uid(self.study_uid, "study_uid")
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOMweb destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the STOW-RS dicom+json response. Default False → returns None, byte-identical.
         self.capture_response: bool = bool(s.get("capture_response", False))

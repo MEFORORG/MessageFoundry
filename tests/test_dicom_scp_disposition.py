@@ -251,14 +251,16 @@ def test_a_negative_cap_is_refused_with_the_scps_own_text(bad: object) -> None:
     with pytest.raises(ValueError) as caught:
         _scp(bad)  # type: ignore[arg-type]
     message = str(caught.value)
-    assert "DICOM-SCP source max_object_bytes=" in message
+    assert "DICOM-SCP source max_object_bytes must be above zero (value withheld" in message
     assert "disable" not in message.replace("does not disable", "")
     assert "does not disable" in message
     assert str(ingress_guards.INGRESS_MAX_BYTES) in message
 
 
 def test_an_unparseable_cap_is_refused_naming_the_setting() -> None:
-    with pytest.raises(ValueError, match="DICOM-SCP source max_object_bytes='lots'"):
+    with pytest.raises(
+        ValueError, match="DICOM-SCP source max_object_bytes is not a valid int value"
+    ):
         _scp("lots")  # type: ignore[arg-type]
 
 

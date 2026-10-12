@@ -14,6 +14,7 @@ refusal that cannot.
 
 from __future__ import annotations
 
+import datetime
 import json
 import subprocess
 import sys
@@ -1773,7 +1774,7 @@ def test_an_anchor_repair_on_a_cell_frozen_by_a_glyph_still_applies(tmp_path: Pa
     rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
     live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
     assert live["1.1.1"]["reviewed_by"] == carried, "the fixture splice did not land"
-    repair = _cell_111(anchor_repair=True, reviewed_by=carried)
+    repair = _cell_111(anchor_repair=True, reviewed_by=carried, anchor_repaired_at="2026-08-12")
     rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
     assert rc == 0, "a byte-identical anchor repair must survive the widened scan"
     # READ IT BACK, as the carrying-forward arm does. This write is the more complex of the two --
@@ -1936,9 +1937,15 @@ def test_END_TO_END_a_successful_retirement_leaves_no_declaration_behind(tmp_pat
 # `anchor_repaired_at` instead: the same fact, carrying the date, instruction to nobody.
 
 
+#: The date the repair payloads below state. Deliberately NOT the fixture's `last_verified`
+#: (2026-08-09), so a writer that dated the witness from that field again would show (BACKLOG #2865).
+_REPAIR_DATE = "2026-08-12"
+
+
 def _cell_with_repair(**over: object) -> dict:
-    """An anchor-repair payload for `1.1.1` -- prose byte-identical to the fixture, anchors moved."""
-    cell = _cell_111(anchor_repair=True, reviewed_by=_RB_FIXTURE)
+    """An anchor-repair payload for `1.1.1` -- prose byte-identical to the fixture, anchors moved,
+    and dated, since a repair that states no date is refused (BACKLOG #2865)."""
+    cell = _cell_111(anchor_repair=True, reviewed_by=_RB_FIXTURE, anchor_repaired_at=_REPAIR_DATE)
     cell.update(over)
     return cell
 
@@ -1954,6 +1961,7 @@ def test_anchor_repair_is_CONSUMED_and_never_stored() -> None:
                 "last_verified": "2026-08-27",
                 "verified_at": "0" * 40,
                 "anchor_repair": True,
+                "anchor_repaired_at": "2026-08-29",
             }
         )
     )["cell"][0]
@@ -1961,7 +1969,9 @@ def test_anchor_repair_is_CONSUMED_and_never_stored() -> None:
     # "anchor_repair", so a substring check cannot tell the control from its replacement and would
     # red on a correct fix. Exactly the presence-equals-meaning trap the glyph rule names.
     assert "anchor_repair" not in parsed, parsed
-    assert parsed["anchor_repaired_at"] == "2026-08-27", parsed
+    # The payload's own date, not its `last_verified`. This pinned "2026-08-27", the date the writer
+    # used to take from `last_verified`, which can be older than the repair (BACKLOG #2865).
+    assert parsed["anchor_repaired_at"] == "2026-08-29", parsed
 
 
 def test_a_cell_that_was_NOT_repaired_gets_no_witness() -> None:
@@ -2006,7 +2016,9 @@ def test_a_cell_ALREADY_CARRYING_the_persisted_control_is_still_WRITABLE(tmp_pat
     assert rc == 0, "the persisted control made the cell unwritable"
     after = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
     assert "anchor_repair" not in after["1.1.1"], "the control was persisted again"
-    assert after["1.1.1"]["anchor_repaired_at"] == "2026-08-09", after["1.1.1"]
+    # The repair's stated date. This pinned "2026-08-09", the fixture's `last_verified`, which the
+    # writer no longer uses as a repair date (BACKLOG #2865).
+    assert after["1.1.1"]["anchor_repaired_at"] == _REPAIR_DATE, after["1.1.1"]
     # ...and the repair itself happened, so this is not passing by writing nothing.
     assert after["1.1.1"]["evidence"][0]["line"] == 11
 
@@ -2114,11 +2126,11 @@ def test_an_UNDECLARING_rewrite_still_carries_the_repair_WITNESS_FORWARD(
     assert got["residual"] == "a later, ordinary correction"
 
     if persisted:
-        # THE DATE IS THE RECORD'S, NOT THE PAYLOAD'S. A legacy flag carries no date of its own, so
-        # the honest value is the `last_verified` the record already held for that cell -- the date
-        # of the pass that set the flag. Stamping the migrating run's own date would move a
-        # measurement to the day somebody happened to rewrite the cell.
-        assert got["anchor_repaired_at"] == "2026-08-09", got
+        # NO DATE IS INVENTED. A legacy flag carries no date of its own. This pinned "2026-08-09",
+        # the record's `last_verified`, but that date can be older or newer than the repair, so it
+        # is not the repair's date (BACKLOG #2865). Stamping the migrating run's own date would be
+        # wrong too. The witness says the date is unrecorded, and the repair stays countable.
+        assert got["anchor_repaired_at"] == "unrecorded", got
         assert "records anchor_repaired_at in its place" in capsys.readouterr().out, (
             "a conversion the operator never sees is a conversion nobody can check"
         )
@@ -2131,7 +2143,7 @@ def test_an_EXISTING_witness_is_not_overwritten_by_a_legacy_flag(tmp_path: Path)
 
     A cell mid-transition can hold BOTH a dated `anchor_repaired_at` from the new writer and the
     legacy undated flag. The legacy branch FILLS ONLY: a dated witness is strictly better evidence
-    than a flag with no date, so migrating must not roll it back to the cell's `last_verified`.
+    than a flag with no date, so migrating must not overwrite it.
     """
     rec = tmp_path / "asvs-scorecard.toml"
     rec.write_text(
@@ -3282,3 +3294,302 @@ def test_the_writer_accepts_a_table_naming_nobody_backed_by_notes(
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
     got = _cell_after_apply(rec)
     assert got["reviewed_by"] == _NOBODY_RB and got["review_notes"] == "migrated: fixture"
+
+
+# --- BACKLOG #2865: the repair witness took its date from `last_verified`, and comments vanished ---
+#
+# Two writer defects. `render` stamped `anchor_repaired_at` from the payload's `last_verified`, which
+# can be older than the repair, and overwrote a later witness with it. Cell 1.2.2 is the measured
+# case: `last_verified` 2026-09-28, an earlier repair dated 2026-10-01, and a fresh repair rewrote
+# the witness to 2026-09-28, backwards. A repair now states its own date, and no write moves the
+# witness earlier. And `main` splices `render`'s text over the whole cell, which is built from the
+# parsed cell, so a comment inside the cell was lost with nothing reporting it. Such a write is now
+# refused, naming the cell and the comment lines.
+
+
+def _record_with_witness(tmp_path: Path) -> Path:
+    """Cell 1.1.1 with cell 1.2.2's dates: verified 2026-09-28, already repaired on 2026-10-01."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    text = FIXTURE.replace('last_verified = "2026-08-09"', 'last_verified = "2026-09-28"', 1)
+    text = text.replace(_FIX_LINE, _FIX_LINE + 'anchor_repaired_at = "2026-10-01"\n', 1)
+    rec.write_text(text, encoding="utf-8")
+    return rec
+
+
+def test_a_repair_never_dates_its_witness_from_last_verified(tmp_path: Path) -> None:
+    """Cell 1.2.2's real dates. The old writer wrote 2026-09-28 here, a date before the earlier
+    repair it overwrote."""
+    rec = _record_with_witness(tmp_path)
+    repair = _cell_with_repair(last_verified="2026-09-28", anchor_repaired_at="2026-10-03")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    got = _cell_after_apply(rec)
+    assert got["anchor_repaired_at"] == "2026-10-03", got
+    assert got["last_verified"] == "2026-09-28", got
+    assert "anchor_repair" not in got
+
+
+def test_a_repair_that_states_no_date_is_refused(tmp_path: Path) -> None:
+    """The writer no longer guesses the date, so a repair that does not say when is refused."""
+    rec = _record_with_witness(tmp_path)
+    before = rec.read_bytes()
+    repair = _cell_with_repair(last_verified="2026-09-28")
+    del repair["anchor_repaired_at"]
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+
+
+@pytest.mark.parametrize("bad", ["", "unrecorded", "2026-10-3", "20261003", "2026-02-30", 20261003])
+def test_a_repair_dated_with_something_other_than_a_real_date_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: object
+) -> None:
+    rec = _record_with_witness(tmp_path)
+    before = rec.read_bytes()
+    repair = _cell_with_repair(last_verified="2026-09-28", anchor_repaired_at=bad)
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert "anchor_repaired_at" in capsys.readouterr().out
+    assert rec.read_bytes() == before
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_no_write_moves_the_witness_backwards(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], declared: bool
+) -> None:
+    """Both paths: a fresh repair, and an ordinary rewrite that edits the witness by hand."""
+    rec = _record_with_witness(tmp_path)
+    before = rec.read_bytes()
+    make = _cell_with_repair if declared else _cell_111
+    cell = make(last_verified="2026-09-28", anchor_repaired_at="2026-09-30")
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "2026-10-01" in out and "2026-09-30" in out, out
+    assert rec.read_bytes() == before
+
+
+def test_an_ordinary_rewrite_echoing_or_omitting_the_witness_keeps_it(tmp_path: Path) -> None:
+    """The must-not-fire arm: carrying the live date forward, or omitting it, is not a move."""
+    rec = _record_with_witness(tmp_path)
+    echo = _cell_111(last_verified="2026-10-11", anchor_repaired_at="2026-10-01")
+    assert main([str(_payload(tmp_path, [echo])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after_apply(rec)["anchor_repaired_at"] == "2026-10-01"
+    omit = _cell_111(last_verified="2026-10-11", residual="later")
+    assert main([str(_payload(tmp_path, [omit])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after_apply(rec)["anchor_repaired_at"] == "2026-10-01"
+
+
+@pytest.mark.parametrize("date", [None, "", "not a date"])
+def test_render_refuses_a_repair_with_no_date(date: object) -> None:
+    """`main` refuses first; this keeps a direct caller of `render` from writing a guess."""
+    cell = _cell_with_repair()
+    if date is None:
+        del cell["anchor_repaired_at"]
+    else:
+        cell["anchor_repaired_at"] = date
+    with pytest.raises(ValueError, match="anchor_repaired_at"):
+        render(cell)
+
+
+def test_an_ordinary_rewrite_cannot_add_a_witness_to_an_unrepaired_cell(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A witness on a cell nobody repaired would be counted as a repair that never happened."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(anchor_repaired_at="2026-10-03")
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert "without declaring anchor_repair" in capsys.readouterr().out
+    assert rec.read_bytes() == before
+
+
+def test_an_ordinary_rewrite_cannot_move_a_dated_witness_forward(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Forward is no better than backwards without a repair: it dates one that never ran."""
+    rec = _record_with_witness(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(last_verified="2026-10-11", anchor_repaired_at="2026-10-11")
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert "without declaring anchor_repair" in capsys.readouterr().out
+    assert rec.read_bytes() == before
+
+
+def test_an_ordinary_rewrite_may_date_an_unrecorded_witness(tmp_path: Path) -> None:
+    """The migration fills `unrecorded`; whoever learns the date may supply it later."""
+    rec = _record_with_witness(tmp_path)
+    rec.write_text(
+        rec.read_text(encoding="utf-8").replace('"2026-10-01"', '"unrecorded"', 1), "utf-8"
+    )
+    cell = _cell_111(last_verified="2026-10-11", anchor_repaired_at="2026-10-01")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after_apply(rec)["anchor_repaired_at"] == "2026-10-01"
+
+
+def test_an_undated_echo_of_the_legacy_flag_is_told_to_drop_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A payload copied from a legacy cell carries the flag. The refusal must say to drop it,
+    or the easy fix is to type in a date nobody knows."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + "anchor_repair = true\n", 1), "utf-8")
+    echo = _cell_111(anchor_repair=True, reviewed_by=_RB_FIXTURE)
+    rc = main([str(_payload(tmp_path, [echo])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert "drop it and the writer records anchor_repaired_at as 'unrecorded'" in (
+        capsys.readouterr().out
+    )
+
+
+def test_a_legacy_flagged_cell_may_take_a_stated_date(tmp_path: Path) -> None:
+    """The exception: the legacy flag records a repair and lacks only its date, so an ordinary
+    payload may supply one in place of the `unrecorded` fill."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + "anchor_repair = true\n", 1), "utf-8")
+    cell = _cell_111(anchor_repaired_at="2026-08-12")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after_apply(rec)["anchor_repaired_at"] == "2026-08-12"
+
+
+def test_a_repair_dated_in_the_future_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A typo such as 2062 would otherwise land, and refuse every real repair after it."""
+    rec = _record_with_witness(tmp_path)
+    before = rec.read_bytes()
+    repair = _cell_with_repair(anchor_repaired_at="2062-10-03")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert "in the future" in capsys.readouterr().out
+    assert rec.read_bytes() == before
+
+
+def test_an_unquoted_witness_still_holds_the_backwards_check(tmp_path: Path) -> None:
+    """`tomllib` reads `anchor_repaired_at = 2026-10-01` as a date, not a string. The check must
+    still see it, or this is the 1.2.2 defect again through a hand edit."""
+    rec = _record_with_witness(tmp_path)
+    rec.write_text(
+        rec.read_text(encoding="utf-8").replace('"2026-10-01"', "2026-10-01", 1), encoding="utf-8"
+    )
+    assert _cell_after_apply(rec)["anchor_repaired_at"] == datetime.date(2026, 10, 1)
+    before = rec.read_bytes()
+    repair = _cell_with_repair(last_verified="2026-09-28", anchor_repaired_at="2026-09-28")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert rec.read_bytes() == before
+
+
+def test_a_repair_restating_the_records_date_is_noted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Allowed, since two repairs can share a day, but a copied date is the likely mistake."""
+    rec = _record_with_witness(tmp_path)
+    repair = _cell_with_repair(last_verified="2026-09-28", anchor_repaired_at="2026-10-01")
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    assert "the same date as the repair the record already holds" in capsys.readouterr().out
+
+
+#: A comment inside cell 1.1.1, one on its own line and one after a value.
+_COMMENTED = FIXTURE.replace(
+    '  expect = "verify_mode"\n',
+    '  # a reviewer note the record keeps\n  expect = "verify_mode"  # inline note\n',
+    1,
+)
+
+
+def test_a_rewrite_that_would_drop_comments_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_COMMENTED, encoding="utf-8")
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert rec.read_bytes() == before
+    assert "1.1.1" in out
+    assert "# a reviewer note the record keeps" in out
+    assert "# inline note" in out
+    # The file's own line numbers, so the author can find each one.
+    for n, line in enumerate(_COMMENTED.splitlines(), start=1):
+        if "#" in line:
+            assert f"line {n}:" in out, out
+
+
+def test_every_commented_cell_is_named_in_one_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(_COMMENTED.replace("  line = 30\n", "  # two\n  line = 30\n", 1), "utf-8")
+    cells = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
+    rc = main([str(_payload(tmp_path, [_cell_111(), cells["5.4.3"]])), "--scorecard", str(rec)])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "cell 1.1.1," in out and "cell 5.4.3, line" in out and "# two" in out, out
+
+
+def test_a_comment_between_cells_survives_the_rewrite_of_the_cell_above(tmp_path: Path) -> None:
+    """A section divider sits after a cell's last line, so it belongs to the file, not the cell."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(
+        FIXTURE.replace('[[cell]]\nid = "5.4.3"', '\n# --- V5 ---\n[[cell]]\nid = "5.4.3"', 1)
+        + "# end of record\n",
+        encoding="utf-8",
+    )
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    after = rec.read_text(encoding="utf-8")
+    assert '\n# --- V5 ---\n[[cell]]\nid = "5.4.3"' in after, after
+    assert after.endswith("# end of record\n")
+    assert _cell_after_apply(rec)["evidence"][0]["line"] == 11
+
+
+def test_an_indented_comment_after_a_cells_last_entry_still_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An indented comment there belongs to the last entry, which a rewrite may move or retire,
+    so it stays inside the span and the write stops rather than keep it in the wrong place."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(
+        FIXTURE.replace('  expect = "verify_mode"\n', '  expect = "verify_mode"\n  # moved\n', 1),
+        encoding="utf-8",
+    )
+    before = rec.read_bytes()
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 1
+    assert "cell 1.1.1, line" in capsys.readouterr().out
+    assert rec.read_bytes() == before
+
+
+def test_a_comment_in_a_cell_the_payload_does_not_write_blocks_nothing(tmp_path: Path) -> None:
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(
+        FIXTURE.replace('  expect = "_no_scan"\n', '  expect = "_no_scan"\n  # kept\n', 1),
+        encoding="utf-8",
+    )
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0
+    assert "  # kept\n" in rec.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"see #1369 and # this"',
+        "'literal # not a comment'",
+        '"""\n# a line inside a multi-line string\n"""',
+        "'''\n# a literal multi-line line\n'''",
+        '"an escaped \\" quote, then # still inside"',
+    ],
+)
+def test_a_hash_inside_a_string_is_not_a_comment(tmp_path: Path, value: str) -> None:
+    """The must-not-fire arm. A refusal on a `#` inside a value would make that cell unwritable."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE.replace(_FIX_LINE, _FIX_LINE + f"note = {value}\n", 1), encoding="utf-8")
+    assert "note" in _cell_after_apply(rec), "the fixture splice did not parse"
+    rc = main([str(_payload(tmp_path, [_cell_111()])), "--scorecard", str(rec), "--apply"])
+    assert rc == 0

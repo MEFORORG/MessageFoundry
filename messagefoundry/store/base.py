@@ -63,6 +63,7 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
+from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdminRemoval,
@@ -2596,6 +2597,17 @@ class AuthStore(Protocol):
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
     # --- sessions ------------------------------------------------------------
+    def row_sealer(self) -> RowSealer | None:
+        """The sealer this store writes authority-row integrity seals with, or ``None`` when its
+        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG #2592).
+
+        The store writes the seals: every session write that changes a sealed column goes through
+        one helper per backend, which verifies the row it read before it re-seals it and raises
+        :class:`~messagefoundry.store.row_seal.RowSealError` rather than re-seal a row that fails.
+        A revoke blanks the seal, which needs no key. :class:`AuthService` checks the seals, in its
+        one session loader; the store's readers return rows unchecked."""
+        ...
+
     async def create_session(
         self,
         *,

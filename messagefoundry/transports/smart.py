@@ -60,7 +60,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, float_setting
 from messagefoundry.transports.bounded_read import (
     MAX_TOKEN_RESPONSE_BYTES,
     EgressReplyError,
@@ -696,8 +696,16 @@ def token_provider_from_settings(
         private_key_password=(
             str(s["smart_private_key_password"]) if s.get("smart_private_key_password") else None
         ),
-        expiry_skew_seconds=float(s.get("smart_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW)),
-        timeout_seconds=float(s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT)),
+        expiry_skew_seconds=float_setting(
+            s.get("smart_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW),
+            knob="smart_expiry_skew_seconds",
+            transport="SMART",
+        ),
+        timeout_seconds=float_setting(
+            s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
+            knob="smart_timeout_seconds",
+            transport="SMART",
+        ),
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
         attested=attested,

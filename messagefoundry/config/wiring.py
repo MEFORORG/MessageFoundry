@@ -37,6 +37,7 @@ import importlib.util
 import inspect
 import ipaddress
 import logging
+import math
 import os
 import re
 import sys
@@ -875,6 +876,23 @@ def DatabaseRef(
             check_db_connect_timeout(connect_timeout, "DatabaseRef")
         except ValueError as exc:
             raise WiringError(str(exc)) from None
+    # The same holds for acquire_timeout: a bool or a NaN would otherwise be refused only at the first
+    # sync, after start, so `messagefoundry check` passed it (BACKLOG #3432). The sync reads it again,
+    # by the same rule, because an env() ref is resolved only then.
+    if not isinstance(acquire_timeout, EnvRef):
+        # Imported here: messagefoundry.transports imports this module at its top level.
+        from messagefoundry.transports.base import float_setting
+
+        # The refusal is raised outside the handler, so it carries no exception chain.
+        refusal: str | None = None
+        try:
+            float_setting(
+                acquire_timeout, knob="acquire_timeout", transport="DATABASE reference source"
+            )
+        except ValueError as exc:
+            refusal = str(exc)
+        if refusal is not None:
+            raise WiringError(refusal)
     return ReferenceSourceSpec(
         "database",
         {
@@ -2494,10 +2512,29 @@ def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
 
     for name in ("reply_timeout", "reply_write_timeout"):
         value = settings[name]
-        if not isinstance(value, int | float) or value <= 0:
+        # A bool is an int, and NaN and inf pass `<= 0`, so each is refused by name (BACKLOG #3432).
+        # The connector reads the same keys by the rule in transports/base.py float_setting.
+        # math.isfinite() raises OverflowError on an int too large for a float, such as 10**400 or a
+        # long TOML integer, so that int is refused by name here instead, outside the handler.
+        too_large = False
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                float(value)
+            except OverflowError:
+                too_large = True
+        if too_large:
             raise WiringError(
-                f"Http {name} must be a positive number of seconds — got {value!r}. It bounds a "
-                "blocked HTTP turn; an unbounded or zero budget is not a timeout"
+                f"Http {name} is not a valid float value (value withheld): it is too large for a float"
+            )
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise WiringError(
+                f"Http {name} must be a finite positive number of seconds (value withheld). It "
+                "bounds a blocked HTTP turn; an unbounded or zero budget is not a timeout"
             )
 
     if settings["reply_on_timeout"] not in ("504", "202"):
@@ -2654,6 +2691,8 @@ def File(
     decompress: Literal["gzip"]
     | None = None,  # inbound: "gzip" gunzips each drop before the sniff/scan/split
     max_decompressed_bytes: int | None = 64 * 1024 * 1024,  # inbound: decompression-bomb ceiling
+    max_decompressed_members: int
+    | None = 1024,  # inbound: gzip members one drop may hold; None = the default, never off
 ) -> ConnectionSpec:
     """A File endpoint. Inbound polls ``directory`` for ``pattern``; outbound writes ``filename``
     (atomically). ``encoding`` is the file charset (outbound). ``max_file_bytes`` mirrors
@@ -2687,7 +2726,9 @@ def File(
     body and appends ``.gz`` to the rendered name. Inbound ``decompress="gzip"`` gunzips each dropped
     file **before** the HL7 sniff, the pre-ingest AV scan, and the batch split; ``max_decompressed_bytes``
     (default 64 MiB, None/0 disables) caps the *decompressed* size — a decompression-bomb guard the
-    compressed-only ``max_file_bytes`` cannot provide. A corrupt/oversized archive is moved to
+    compressed-only ``max_file_bytes`` cannot provide. ``max_decompressed_members`` (default 1024)
+    caps how many gzip members one drop may hold, and cannot be turned off; raise it for a BGZF feed,
+    which is one member per 64 KiB block. A corrupt/oversized archive is moved to
     ``.error`` (never accept-and-dropped). Multi-entry zip / raw deflate stay Handler-composed via
     ``messagefoundry.parsing.compression``."""
     settings: dict[str, Any] = {
@@ -2709,6 +2750,7 @@ def File(
         "compress": compress,
         "decompress": decompress,
         "max_decompressed_bytes": max_decompressed_bytes,
+        "max_decompressed_members": max_decompressed_members,
     }
     if credential_username is not None or credential_password is not None:
         # A share credential is being configured — the password is a secret and must never be inline
@@ -2918,6 +2960,10 @@ def FHIR(
     update_url_form: Literal[
         "transaction", "path"
     ] = "transaction",  # how an update/if-match is sent; "path" puts the id in the URL (a listed loosening)
+    allowed_entry_methods: list[str]
+    | None = None,  # transaction/batch only, and no default there: the entry verbs a Bundle may carry (#2804)
+    allowed_entry_types: list[str]
+    | None = None,  # transaction/batch only: the entry resource types it may name; unset = any (#2804)
     headers: dict[str, str]
     | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (SMART/OAuth; use env())
@@ -2955,7 +3001,9 @@ def FHIR(
     ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``POST {base}`` with a one-entry
     ``transaction`` Bundle whose entry is ``PUT {ResourceType}/{id}`` (so the message-derived id never
     appears in the request URL; vault BACKLOG #1965), ``transaction``/``batch`` → ``POST {base}`` with the
-    Bundle. ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
+    Bundle, whose every entry must fit ``allowed_entry_methods`` (required there, no default) and the
+    optional ``allowed_entry_types``, or the message is dead-lettered unsent (vault BACKLOG #2804).
+    ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
     idempotency/concurrency levers: ``if-none-exist`` (conditional create, ``If-None-Exist`` header),
     ``conditional-update`` (search-based ``PUT`` with ``conditional_query`` in the URL), ``if-match``
     (version-aware update, sent like ``update``, whose ETag is derived from the resource's
@@ -2988,6 +3036,24 @@ def FHIR(
         "FHIR",
         capture_response_headers=capture_response_headers,
         proxy_no_proxy=proxy_no_proxy,
+        allowed_entry_methods=allowed_entry_methods,
+        allowed_entry_types=allowed_entry_types,
+    )
+    # vault BACKLOG #2804: checked here as well as in FhirDestination, so the loaded graph cannot
+    # hold a transaction/batch connection with no entry allow-list. Lazy, as the smart-scope
+    # advisory's import of the same module is.
+    from messagefoundry.transports.fhir import DEFERRED_ENTRY_LIST, entry_screen_settings
+
+    def load_time(value: object) -> object:
+        # An env() standing for the whole list: its default is what an unset key resolves to, so
+        # that is checked now. With no default its items are known only at build, where
+        # FhirDestination checks them; it still counts as set.
+        if isinstance(value, EnvRef):
+            return DEFERRED_ENTRY_LIST if value.default is _UNSET else value.default
+        return value
+
+    entry_screen_settings(
+        interaction, load_time(allowed_entry_methods), load_time(allowed_entry_types)
     )
     return ConnectionSpec(
         ConnectorType.FHIR,
@@ -2999,6 +3065,8 @@ def FHIR(
             "conditional": conditional,
             "conditional_query": conditional_query,
             "update_url_form": update_url_form,
+            "allowed_entry_methods": allowed_entry_methods,
+            "allowed_entry_types": allowed_entry_types,
             "headers": headers or {},
             "bearer_token": bearer_token,
             "basic_user": basic_user,

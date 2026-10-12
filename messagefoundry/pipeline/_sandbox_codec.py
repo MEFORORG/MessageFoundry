@@ -1163,6 +1163,11 @@ def encode_ok(*, request_id: str, phase: str, name: str, result: object) -> byte
     return encode_frame(header, blobs.items)
 
 
+#: The ``fail`` kind for a call that ran out of memory. The worker exits after sending it, and the
+#: parent reaps it, so the next message gets a fresh worker (vault BACKLOG #3133 part 2).
+FAIL_MEMORY: Final = "memory"
+
+
 def encode_fail(*, request_id: str, phase: str, name: str, kind: str, error: str) -> bytes:
     blobs = _Blobs()
     header = _envelope(
@@ -1212,7 +1217,7 @@ def decode_response(body: bytes, *, request_id: str, phase: str, name: str) -> R
         reader.finish()
         return Response(ok=True, result=result, kind="", error="")
     fail_kind = header.get("kind")
-    if fail_kind not in ("denied", "error"):
+    if fail_kind not in ("denied", "error", FAIL_MEMORY):
         raise SandboxCodecError(f"unknown sandbox failure kind {fail_kind!r}")
     error = reader.text(header.get("error"))
     reader.finish()

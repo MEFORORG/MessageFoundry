@@ -363,7 +363,8 @@ def _repairs_declared(record_text: str) -> int:
     defect on its own row, and it FROZE the cell it landed on, because the next ordinary correction
     authored from that live cell carried the flag forward and was refused. ``apply.py`` now consumes
     the instruction and records ``anchor_repaired_at`` in its place: the same fact, carrying the date
-    of the pass, read as an instruction by nothing.
+    the repair payload states (BACKLOG #2865), read as an instruction by nothing. A cell migrated
+    from the old key carries the literal ``unrecorded`` there instead, not a date.
 
     Counting only the new key would report a collapse that never happened -- cells the new writer has
     not rewritten still carry the old one. Counting only the old key would watch the number decay as

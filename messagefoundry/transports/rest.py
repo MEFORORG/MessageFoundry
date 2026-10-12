@@ -76,10 +76,13 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     NegativeAckError,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
     EgressReplyError,
+    LoopbackDirectProxyHandler,
+    NoRedirectHandler,
     build_strict_opener,
     drain_bounded,
     hop_identity,
@@ -217,8 +220,9 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
     key is the header name. **Header-injection-safe:** a name that is not a valid RFC 7230 token is
     dropped (it can never be emitted), and CR/LF/NUL/other control chars are stripped from the value via
     :func:`_strip_header_control_chars`, so a message-derived value cannot split the request or inject an
-    extra header. **``Authorization`` is never settable per-message** — auth is connection config only, so
-    a message-derived value can neither weaken nor replace the connection's credential. **Pure:** the
+    extra header. **``Authorization`` and ``Proxy-Authorization`` are never settable per-message** —
+    auth is connection config only, so a message-derived value can neither weaken nor replace the
+    connection's credential, nor ride a proxy handler's admission (vault BACKLOG #3416). **Pure:** the
     result is a deterministic function of ``metadata`` (itself pure from the transform), so an
     at-least-once re-run yields byte-identical headers. ``None``/empty → ``{}`` (the default,
     byte-identical) — no per-message headers.
@@ -254,8 +258,11 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        if name.lower() == "authorization":
-            continue  # auth is connection-configured only — a message never sets/overrides it
+        if name.lower() in ("authorization", "proxy-authorization"):
+            # Auth is connection-configured only: a message never sets or overrides it. A proxy
+            # handler's admission covers the connection's own proxy_user header, so a message must
+            # not be able to supply one (vault BACKLOG #3416).
+            continue
         if not isinstance(value, str):
             continue  # SetMeta enforces str, but stay defensive against a hand-built bag
         safe = _strip_header_control_chars(value)
@@ -341,21 +348,10 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     )
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _NoRedirectHandler(NoRedirectHandler):
     """Refuse to follow HTTP redirects (ASVS 15.3.2): a 3xx could divert a PHI-bearing POST to an
     unintended host. Returning ``None`` makes urllib raise the 3xx as an ``HTTPError`` instead of
     following it, so the delivery is classified (permanent) rather than silently redirected."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
 
 
 #: The operator-recognisable connector label the HTTP-family TLS assertions name in their errors. The
@@ -1638,8 +1634,14 @@ class ProxyConfig:
 
     def _build_proxy_handler(self) -> urllib.request.ProxyHandler:
         if self.use_default:
-            return urllib.request.ProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
-        return urllib.request.ProxyHandler(dict(self.proxies))
+            return LoopbackDirectProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
+        # A credential is here only because it passed the posture-keyed guard in
+        # proxy_auth_handler_from_settings, so the handler may let that caller-set header across a
+        # cleartext proxy leg: the one exception bounded_read.ProxyCredentialsRefusedError states
+        # (vault BACKLOG #3416). An unverified TLS leg is refused regardless.
+        return LoopbackDirectProxyHandler(
+            dict(self.proxies), caller_header_admitted=bool(self.auth_header or self.digest)
+        )
 
     def for_host(self, host: str) -> _HostProxy | None:
         """The proxy resolved for ``host``, or ``None`` if the host is bypassed (#128) — a bypassed host
@@ -1701,11 +1703,16 @@ def proxy_auth_handler_from_settings(
     ``smart → http_auth`` import cycle; ``http_auth.py`` re-exports the name.)
 
     Basic (the default when a credential is set) → a pre-emptive ``Proxy-Authorization: Basic`` header,
-    which works for BOTH http and https destinations (urllib moves it into the CONNECT tunnel for https).
+    sent for BOTH http and https destinations. For an https destination urllib moves it into the
+    ``CONNECT`` that opens the tunnel, and that ``CONNECT`` crosses to the proxy in cleartext, before
+    any TLS, even to a proxy written ``https://``. A ``proxy_url`` serves both schemes, so an http
+    destination reaches the proxy through such a ``CONNECT`` too.
     Digest → the reactive stdlib handler, **refused for an https destination** (the 407 is inside the
     CONNECT tunnel; digest-over-CONNECT is unsupported). NTLM/Windows → **refused** (deferred, ADR 0126).
-    A cleartext ``http`` proxy hop carrying the credential is refused REGARDLESS of destination scheme via
-    the ONE posture-keyed authority (:func:`refuse_cleartext_credential_hop`)."""
+    So the credential is judged as crossing in cleartext whatever the proxy's scheme, by the ONE
+    posture-keyed authority (:func:`refuse_cleartext_credential_hop`), REGARDLESS of destination
+    scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
+    send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
@@ -1726,10 +1733,18 @@ def proxy_auth_handler_from_settings(
     # ADR 0153: the proxy hop is a distinct crossing from the destination hop, but it belongs to the
     # SAME connection, so it is governed by that connection's one declaration. Threaded explicitly (like
     # `attested` beside it) rather than read off the settings mapping — one declaration, one source.
+    # Judged as http whatever proxy_scheme says (vault BACKLOG #3416). A proxy_url serves both schemes,
+    # so urllib sends the credential in a CONNECT before any TLS for either destination scheme. The one
+    # exception, urllib's bypass list naming the proxy's own host, is not knowable here, so it is not
+    # relied on. `proxy_scheme` now only words the refusal.
     refuse_cleartext_credential_hop(
-        proxy_scheme,
+        "http",
         proxy_url,
-        credential="web-proxy credential",
+        credential=(
+            "web-proxy credential"
+            if proxy_scheme == "http"
+            else "web-proxy credential (urllib sends it before any TLS, even to an https:// proxy)"
+        ),
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
@@ -1997,7 +2012,9 @@ class RestDestination(DestinationConnector):
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("REST", config.name)
         self.method: str = str(s.get("method", "POST")).upper()
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="REST destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the HTTP response body. Default False → returns None, byte-identical. A 2xx
         # with a body → outcome='accepted'; a 2xx with an empty body → outcome='no_reply' (a successful

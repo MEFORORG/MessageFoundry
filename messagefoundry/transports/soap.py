@@ -78,7 +78,9 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    count_setting,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -330,7 +332,9 @@ class SoapDestination(DestinationConnector):
         self.url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("SOAP", config.name)
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="SOAP destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         self.version: str = str(s.get("soap_version", "1.1"))
         if self.version not in ("1.1", "1.2"):
@@ -356,7 +360,11 @@ class SoapDestination(DestinationConnector):
         self.ws_username: str | None = s.get("ws_username") or s.get("basic_user") or None
         self.ws_password: str | None = s.get("ws_password") or s.get("basic_password") or None
         self.ws_password_type: str = str(s.get("ws_password_type", "text"))
-        self.ws_timestamp_ttl_seconds: int = int(s.get("ws_timestamp_ttl_seconds", 300))
+        self.ws_timestamp_ttl_seconds: int = count_setting(
+            s.get("ws_timestamp_ttl_seconds", 300),
+            knob="ws_timestamp_ttl_seconds",
+            transport="SOAP destination",
+        )
         self._ws_mode: bool = self.ws_addressing or self.ws_security
 
         # Non-deterministic generators — instance attributes so tests can inject a fixed clock / UUID /

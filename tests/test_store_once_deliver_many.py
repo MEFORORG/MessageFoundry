@@ -94,10 +94,11 @@ async def test_identical_body_to_many_destinations_stored_once(store: MessageSto
 
     rows = await _outbound_rows(store, mid)
     assert [r["destination_name"] for r in rows] == dests
-    # Every outbound row references the ONE shared copy (same hash) and stores no inline payload.
+    # Every outbound row references the ONE shared copy (same hash). Its own payload holds only that
+    # reference, sealed under the row's tag (BACKLOG #2593), never the body.
     refs = {r["body_ref"] for r in rows}
     assert len(refs) == 1 and None not in refs
-    assert all(r["payload"] == "" for r in rows)
+    assert all(r["payload"] != "" and BODY not in r["payload"] for r in rows)
     # Exactly one shared body, refcount == fan-out.
     assert await _shared_count(store) == 1
     cur = await store._db.execute("SELECT refcount FROM shared_body")

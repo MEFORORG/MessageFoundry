@@ -20,7 +20,7 @@ argon2-cffi-bindings==26.1.0
     # via argon2-cffi
 ast-serialize==0.12.1
     # via mypy
-asyncpg==0.31.0
+asyncpg==0.32.0
     # via messagefoundry
 atheris==3.1.0 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via messagefoundry
@@ -110,7 +110,7 @@ mypy==2.4.0
     # via messagefoundry
 mypy-extensions==1.1.0
     # via mypy
-opentelemetry-api==1.45.0
+opentelemetry-api==1.45.1
     # via
     #   fastapi
     #   opentelemetry-exporter-http-transport
@@ -118,34 +118,34 @@ opentelemetry-api==1.45.0
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
-opentelemetry-exporter-http-transport==0.66b0
+opentelemetry-exporter-http-transport==0.66b1
     # via opentelemetry-exporter-otlp-proto-http
-opentelemetry-exporter-otlp==1.45.0
+opentelemetry-exporter-otlp==1.45.1
     # via messagefoundry
-opentelemetry-exporter-otlp-common==0.66b0
+opentelemetry-exporter-otlp-common==0.66b1
     # via
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-exporter-otlp-proto-common==1.45.0
+opentelemetry-exporter-otlp-proto-common==1.45.1
     # via
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-exporter-otlp-proto-grpc==1.45.0
+opentelemetry-exporter-otlp-proto-grpc==1.45.1
     # via opentelemetry-exporter-otlp
-opentelemetry-exporter-otlp-proto-http==1.45.0
+opentelemetry-exporter-otlp-proto-http==1.45.1
     # via opentelemetry-exporter-otlp
-opentelemetry-proto==1.45.0
+opentelemetry-proto==1.45.1
     # via
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-sdk==1.45.0
+opentelemetry-sdk==1.45.1
     # via
     #   messagefoundry
     #   opentelemetry-exporter-otlp-common
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-semantic-conventions==0.66b0
+opentelemetry-semantic-conventions==0.66b1
     # via opentelemetry-sdk
 packaging==26.2
     # via
@@ -205,7 +205,7 @@ pyside6-essentials==6.11.2
     # via
     #   pyside6
     #   pyside6-addons
-pyspnego==0.12.3
+pyspnego==0.12.4
     # via messagefoundry
 pytest==9.1.1
     # via
@@ -232,6 +232,8 @@ requests==2.34.2
     # via
     #   hvac
     #   messagefoundry
+    #   opentelemetry-exporter-http-transport
+    #   opentelemetry-exporter-otlp-proto-http
 ruff==0.15.22
     # via messagefoundry
 shiboken6==6.11.2
@@ -274,9 +276,7 @@ typing-inspection==0.4.4
 tzdata==2026.5
     # via messagefoundry
 urllib3==2.8.0
-    # via
-    #   opentelemetry-exporter-http-transport
-    #   requests
+    # via requests
 uvicorn==0.54.0
     # via messagefoundry
 uvloop==0.23.0 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'

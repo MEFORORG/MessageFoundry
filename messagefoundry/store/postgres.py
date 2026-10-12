@@ -67,9 +67,10 @@ from collections.abc import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, assert_never
+from typing import Any, Final, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -143,6 +144,18 @@ from messagefoundry.store.privilege import (
     classify_audit_writes,
     postgres_excess,
 )
+from messagefoundry.store.queue_tag import (
+    QUEUE_TAG_COLUMNS,
+    QUEUE_TAG_SELECT,
+    QueueTagError,
+    alert_queue_tag_failure,
+    is_tag_failure,
+    open_queue_cell,
+    queue_payload_aad,
+    queue_row_aad,
+    report_queue_tag_failure,
+)
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -225,15 +238,22 @@ from messagefoundry.store.store import (
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
+    mfa_stamp,
+    new_session_record,
     next_lockout_state,
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
     password_claim_set,
     read_transit_bound_attestation_rows,
+    reauth_stamp,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    seal_session,
+    session_insert_params,
+    session_reseal_params,
+    session_seal_ok,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -746,7 +766,9 @@ _SCHEMA: list[str] = [
         second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,
         -- ADR 0197 Amendment A (BACKLOG #1131): TRUE while the credential in force is
         -- engine-generated; wrong passwords arm no sign-in lock then.
-        password_generated   BOOLEAN NOT NULL DEFAULT FALSE
+        password_generated   BOOLEAN NOT NULL DEFAULT FALSE,
+        -- BACKLOG #2592: raised by every whole-account session revoke.
+        session_epoch        INTEGER NOT NULL DEFAULT 0
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -791,7 +813,9 @@ _SCHEMA: list[str] = [
         reauth_at    DOUBLE PRECISION,
         mfa_verified_at DOUBLE PRECISION,
         auth_mechanism TEXT,
-        idp_auth_time DOUBLE PRECISION
+        idp_auth_time DOUBLE PRECISION,
+        user_epoch   INTEGER NOT NULL DEFAULT 0,
+        seal         TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -962,6 +986,12 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
 # the IdP step-up refuses as step_up_idp_auth_time_missing.
 _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
+# BACKLOG #2592: the account epoch a session was minted under, its integrity seal, and the account's
+# own epoch, for tables created before the columns. Gated and in _SCHEMA, as idp_auth_time above.
+# An existing session gets epoch 0 and an empty seal, which a keyed store refuses.
+_SCHEMA.append(_gated_add_column("sessions", "user_epoch", "INTEGER NOT NULL DEFAULT 0"))
+_SCHEMA.append(_gated_add_column("sessions", "seal", "TEXT NOT NULL DEFAULT ''"))
+_SCHEMA.append(_gated_add_column("users", "session_epoch", "INTEGER NOT NULL DEFAULT 0"))
 # Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table. Gated, because a bare
 # ADD COLUMN IF NOT EXISTS would hold ACCESS EXCLUSIVE on the hottest table through the batch even when
 # the column is there. In _SCHEMA, so adding it moves _schema_hash() and needs no _MIGRATION_REV bump.
@@ -1023,6 +1053,27 @@ def _pg_session_cap_keep_sql(split_mfa_pending: bool) -> str:
         ")"
         for group in _session_cap_groups(split_mfa_pending)
     )
+
+
+# BACKLOG #2592: store.py's _SESSION_INSERT and _SESSION_RESEAL respelled for `$n`. Each binds the
+# parameters store.py's session_insert_params / session_reseal_params build, in the same order.
+_PG_SESSION_INSERT: Final = (
+    "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
+    " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
+    " user_epoch, seal)"
+    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11)"
+)
+_PG_SESSION_RESEAL: Final = (
+    "UPDATE sessions SET token_hash=$1, user_id=$2, created_at=$3, expires_at=$4, revoked_at=$5,"
+    " client=$6, reauth_at=$7, mfa_verified_at=$8, auth_mechanism=$9, idp_auth_time=$10,"
+    " user_epoch=$11, seal=$12 WHERE token_hash=$13 AND seal=$14"
+)
+#: The whole-account session sweep: revoke and blank the seal (BACKLOG #2592). Each caller raises
+#: the account's session epoch in the same transaction.
+_PG_REVOKE_USER_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
+)
+_PG_BUMP_SESSION_EPOCH_SQL: Final = "UPDATE users SET session_epoch=session_epoch+1 WHERE id=$1"
 
 
 def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
@@ -1306,7 +1357,8 @@ class PostgresStore:
     # passes — see _encrypt_existing_rows / reencrypt_to_active (mirrors MessageStore._CIPHER_COLUMNS).
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
-        ("queue", "payload"),
+        # NB: `queue.payload` binds the row's routing fields, not its id alone (BACKLOG #2593), so it
+        # has its own pass in _encrypt_existing_rows / reencrypt_to_active.
         ("messages", "error"),
         ("queue", "last_error"),
         ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
@@ -1333,6 +1385,8 @@ class PostgresStore:
         self._pool = pool
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
+        # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
+        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
         # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
         # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
         # sites funnel through single helpers; Postgres commits implicitly via ``async with
@@ -2302,14 +2356,18 @@ class PostgresStore:
     async def _execute(self, sql: str, *params: Any) -> int:
         """Run one write on a bounded borrow and return its row count, read from asyncpg's status
         tag. Most callers ignore it; the session purge and the session cap read it (BACKLOG
-        #2283). Two session writes that need the count borrow without the bound instead, for the
-        reason :meth:`_execute_after_commit` gives."""
+        #2283). Two session writes borrow without the bound instead, for the reason
+        :meth:`_after_commit_txn` gives."""
         async with self._timed_acquire(record=False) as conn:
             return _rowcount(await conn.execute(sql, *params))
 
-    async def _execute_after_commit(self, sql: str, *params: Any) -> int:
-        """Run one session write that FOLLOWS a write its caller has already committed, and return
-        its row count. **The borrow is unbounded on purpose (BACKLOG #2283).**
+    @asynccontextmanager
+    async def _after_commit_txn(self) -> AsyncIterator[Any]:
+        """A transaction for a session write that FOLLOWS a write its caller has already committed.
+        **The borrow is unbounded on purpose (BACKLOG #2283).**
+
+        BACKLOG #2592 made each of these writes a transaction rather than one statement: it raises
+        the account's session epoch, or reads and re-seals the row. The borrow is unchanged.
 
         ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
         password, a disabled account, a changed role, a completed factor ceremony. By the time they
@@ -2333,10 +2391,15 @@ class PostgresStore:
         A bounded retry that fell back to this wait would end the same way, later, since each retry
         rejoins the back of asyncpg's queue. Moving each write into its caller's transaction would
         close the gap entirely, but every caller commits through a different store method on three
-        backends. ``self._pool.execute`` borrows inside asyncpg with no timeout and returns the
-        status tag the count is read from. ``tests/test_store_pool_acquire_timeout.py`` counts this
-        site among the pinned unbounded borrows, and pins which methods call it."""
-        return _rowcount(await self._pool.execute(sql, *params))
+        backends. ``self._pool.acquire`` with no timeout is the unbounded borrow spelled out.
+        ``tests/test_store_pool_acquire_timeout.py`` counts this site among the pinned unbounded
+        borrows, and pins which methods use it."""
+        conn = await self._pool.acquire()
+        try:
+            async with conn.transaction():
+                yield conn
+        finally:
+            await self._pool.release(conn)
 
     async def _count(self, table: str) -> int:
         row = await self._pool.fetchrow(f"SELECT COUNT(*) AS n FROM {table}")  # table is a constant
@@ -2571,6 +2634,15 @@ class PostgresStore:
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             total += await self._seal_surface(table, column, like, aad_cols=("id",))
+        # The `queue.payload` cell binds the row's routing fields (BACKLOG #2593).
+        total += await self._seal_surface(
+            "queue",
+            "payload",
+            like,
+            aad_cols=QUEUE_TAG_COLUMNS,
+            key_cols=("id",),
+            aad_of=queue_row_aad,
+        )
         total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
         total += await self._seal_surface(
             "reference", "value", like, aad_cols=("name", "version", "key")
@@ -2629,6 +2701,7 @@ class PostgresStore:
         *,
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
+        aad_of: Callable[[Any], bytes] | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -2636,7 +2709,8 @@ class PostgresStore:
         The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
         surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
         11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. Identifiers are code
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD
+        from the row instead (the queue payload's routing tag, BACKLOG #2593). Identifiers are code
         constants; only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
@@ -2685,7 +2759,12 @@ class PostgresStore:
                     await conn.execute(
                         f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
                         self._cipher.encrypt(
-                            r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                            r["v"],
+                            aad=(
+                                aad_of(r)
+                                if aad_of is not None
+                                else cell_aad(table, column, *(r[c] for c in aad_cols))
+                            ),
                         ),
                         *(r[c] for c in keys),
                     )
@@ -2695,6 +2774,56 @@ class PostgresStore:
         return sealed
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
+
+    async def _reencrypt_queue_payload_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
+        (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
+        selected so the decrypt and the encrypt share one tag.
+        A cell that does not open under its own tag with a key this process holds
+        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
+        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
+        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
+        ``id``, since a skipped row still matches the marker filter."""
+        total = skipped = 0
+        after = ""
+        while True:
+            rows = await self._fetchall(
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                " WHERE payload NOT LIKE $1 AND payload <> '' AND id > $2 ORDER BY id LIMIT $3",
+                active_like,
+                after,
+                batch,
+            )
+            if not rows:
+                break
+            after = rows[-1]["id"]
+            updates: list[tuple[str, str]] = []
+            for r in rows:
+                try:
+                    updates.append(
+                        (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
+                    )
+                except CipherError:
+                    if not is_tag_failure(cipher, r["payload"]):
+                        raise
+                    skipped += 1
+            if updates:
+                async with self._timed_acquire() as conn, conn.transaction():
+                    for new_value, rid in updates:
+                        await conn.execute(
+                            "UPDATE queue SET payload=$1 WHERE id=$2", new_value, rid
+                        )
+                await self._charge_bound_batch()
+                total += len(updates)
+        if skipped:
+            log.warning(
+                "rotation left %d queue row(s) whose payload does not open under its own tag"
+                " under a held key; no claim or read opens them (BACKLOG #2593)",
+                skipped,
+            )
+        return total
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation
@@ -2757,6 +2886,8 @@ class PostgresStore:
                         )
                 await self._charge_bound_batch()
                 total += len(rows)
+        # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
+        total += await self._reencrypt_queue_payload_to_active(cipher, active_like, batch)
         total += await self._reencrypt_composite(
             cipher, "state", ("namespace", "key"), active_like, batch
         )
@@ -2815,6 +2946,10 @@ class PostgresStore:
         )
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
+        # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
+        ended = await self._execute("DELETE FROM sessions")
+        if ended:
+            log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
     async def _reencrypt_composite(
@@ -3070,7 +3205,18 @@ class PostgresStore:
             Stage.OUTBOUND.value,
             channel_id,
             dest_name,
-            self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+            self._cipher.encrypt(
+                payload,
+                aad=queue_payload_aad(
+                    row_id=row_id,
+                    message_id=mid,
+                    stage=Stage.OUTBOUND.value,
+                    channel_id=channel_id,
+                    destination_name=dest_name,
+                    handler_name=None,
+                    body_ref=None,
+                ),
+            ),
             OutboxStatus.PENDING.value,
             now,
             created_at,
@@ -3084,7 +3230,7 @@ class PostgresStore:
         """Insert one ``stage='routed'`` queue row (one handler assignment awaiting transform)."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
         created_at = now
-        # Hoist the row id so the payload binds to its own (queue, payload, id) cell (ASVS 11.3.3).
+        # Hoist the row id so the payload binds to its own row tag (ASVS 11.3.3).
         row_id = uuid4().hex
         await conn.execute(
             "INSERT INTO queue"
@@ -3096,7 +3242,18 @@ class PostgresStore:
             Stage.ROUTED.value,
             channel_id,
             handler_name,
-            self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+            self._cipher.encrypt(
+                payload,
+                aad=queue_payload_aad(
+                    row_id=row_id,
+                    message_id=mid,
+                    stage=Stage.ROUTED.value,
+                    channel_id=channel_id,
+                    destination_name=None,
+                    handler_name=handler_name,
+                    body_ref=None,
+                ),
+            ),
             OutboxStatus.PENDING.value,
             now,
             created_at,
@@ -3184,7 +3341,7 @@ class PostgresStore:
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
-            # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+            # Hoist the row id so the payload binds to its own row tag.
             pt_ingress_id = uuid4().hex
             await conn.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -3194,7 +3351,18 @@ class PostgresStore:
                 new_mid,
                 Stage.INGRESS.value,
                 pt_channel,
-                self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
+                self._cipher.encrypt(
+                    body,
+                    aad=queue_payload_aad(
+                        row_id=pt_ingress_id,
+                        message_id=new_mid,
+                        stage=Stage.INGRESS.value,
+                        channel_id=pt_channel,
+                        destination_name=None,
+                        handler_name=None,
+                        body_ref=None,
+                    ),
+                ),
                 OutboxStatus.PENDING.value,
                 now,
                 ingress_created,
@@ -3232,7 +3400,7 @@ class PostgresStore:
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
         created_at = now
-        # Hoist the row id so the (empty) marker payload binds to its own (queue, payload, id) cell.
+        # Hoist the row id so the (empty) marker payload binds to its own row tag.
         marker_id = uuid4().hex
         await conn.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
@@ -3244,7 +3412,18 @@ class PostgresStore:
             pt_name,
             pt_name,
             PASSTHROUGH_MARKER_HANDLER,  # the stamp replay keys on (BACKLOG #1580)
-            self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
+            self._cipher.encrypt(
+                "",
+                aad=queue_payload_aad(
+                    row_id=marker_id,
+                    message_id=parent_id,
+                    stage=Stage.OUTBOUND.value,
+                    channel_id=pt_name,
+                    destination_name=pt_name,
+                    handler_name=PASSTHROUGH_MARKER_HANDLER,
+                    body_ref=None,
+                ),
+            ),
             status,
             now,
             created_at,
@@ -3399,7 +3578,7 @@ class PostgresStore:
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created_at = now
-            # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+            # Hoist the row id so the ingress payload binds to its own row tag.
             ingress_row_id = uuid4().hex
             await conn.execute(
                 "INSERT INTO queue"
@@ -3410,7 +3589,18 @@ class PostgresStore:
                 mid,
                 Stage.INGRESS.value,
                 channel_id,
-                self._cipher.encrypt(raw, aad=cell_aad("queue", "payload", ingress_row_id)),
+                self._cipher.encrypt(
+                    raw,
+                    aad=queue_payload_aad(
+                        row_id=ingress_row_id,
+                        message_id=mid,
+                        stage=Stage.INGRESS.value,
+                        channel_id=channel_id,
+                        destination_name=None,
+                        handler_name=None,
+                        body_ref=None,
+                    ),
+                ),
                 OutboxStatus.PENDING.value,
                 now,
                 ingress_created_at,
@@ -3787,8 +3977,7 @@ class PostgresStore:
             try:
                 items.append(self._outbox_item(row))
             except CipherError as exc:
-                log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-                await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+                await self._dead_letter_unopenable(row, exc)
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -4332,9 +4521,39 @@ class PostgresStore:
         except CipherError as exc:
             # An undecryptable head must not stall the lane — dead-letter it and let the next poll
             # advance, rather than raising into the worker (mirrors SQLite).
-            log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+            await self._dead_letter_unopenable(row, exc)
             return None
+
+    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> None:
+        """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
+        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way."""
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        if isinstance(exc, QueueTagError):
+            await report_queue_tag_failure(self, self._cipher, row)
+
+    async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
+        """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
+        twin is :meth:`MessageStore._open_queue_body`. This backend writes no store-once rows, but a
+        row whose ``body_ref`` is set is still dereferenced. The column picks the body kind and the
+        tag binds that kind, so a column changed outside the store fails the tag rather than
+        choosing another body. A tag failure raises the alert when ``alert`` is set, and
+        propagates, refusing the read. ``conn`` is the caller's connection, or ``None`` for the
+        pool."""
+        try:
+            opened = open_queue_cell(self._cipher, row)
+        except QueueTagError:
+            if alert:
+                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+            raise
+        if row["body_ref"] is None:
+            return opened
+        sql = "SELECT body FROM shared_body WHERE hash=$1"
+        source = conn if conn is not None else self._pool
+        br = await source.fetchrow(sql, opened)
+        if br is None:
+            raise CipherError(f"shared body {opened} missing")
+        return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
     def _outbox_item(self, row: Any) -> OutboxItem:
         """Build an :class:`OutboxItem` from a claimed ``queue`` record, decrypting the payload (may
@@ -4344,16 +4563,22 @@ class PostgresStore:
             message_id=row["message_id"],
             channel_id=row["channel_id"],
             destination_name=row["destination_name"],
-            # Inline body bound to its own queue cell (ASVS 11.3.3); Postgres keeps bodies inline
-            # (body_ref always NULL this increment), so there is no shared_body deref here.
-            payload=self._cipher.decrypt(
-                row["payload"], aad=cell_aad("queue", "payload", row["id"])
-            ),
+            # Opened under the row's own routing tag (BACKLOG #2593). This backend writes no
+            # store-once rows, so a claimed row that names a shared body is refused.
+            payload=self._open_inline_payload(row),
             attempts=row["attempts"],
             stage=row["stage"],
             handler_name=row["handler_name"],
             created_at=row["created_at"],  # claim RETURNING q.* includes it (ingest-time, ADR 0009)
         )
+
+    def _open_inline_payload(self, row: Any) -> str:
+        """An inline claimed row's body, opened under its tag; a row whose sealed kind is ``ref``
+        raises :class:`QueueTagError`, since no claim on this backend dereferences one (#2593)."""
+        opened = open_queue_cell(self._cipher, row)
+        if row["body_ref"] is not None:
+            raise QueueTagError("integrity: a store-once row is not delivered on this backend")
+        return opened
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
         """Force one row terminal (``DEAD``) immediately — fail-fast, no retry consumed. Serializes
@@ -4572,7 +4797,7 @@ class PostgresStore:
                         artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
                         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
                         work_created = now
-                        # Hoist the row id so the artifact-ref payload binds to its own (queue, payload, id) cell.
+                        # Hoist the row id so the artifact-ref payload binds to its own row tag.
                         work_row_id = uuid4().hex
                         await conn.execute(
                             "INSERT INTO queue"
@@ -4583,7 +4808,18 @@ class PostgresStore:
                             message_id,
                             Stage.RESPONSE.value,
                             reingress_to,
-                            self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
+                            self._enc(
+                                artifact_ref,
+                                aad=queue_payload_aad(
+                                    row_id=work_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.RESPONSE.value,
+                                    channel_id=reingress_to,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            ),
                             OutboxStatus.PENDING.value,
                             now,
                             work_created,
@@ -4641,7 +4877,8 @@ class PostgresStore:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
                     wr = await conn.fetchrow(
-                        "SELECT message_id, payload FROM queue WHERE id=$1 AND stage=$2 AND status=$3",
+                        f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                        " WHERE id=$1 AND stage=$2 AND status=$3",
                         response_row_id,
                         Stage.RESPONSE.value,
                         OutboxStatus.INFLIGHT.value,
@@ -4650,13 +4887,7 @@ class PostgresStore:
                         raise _Noop()  # already consumed by a committed prior run
                     origin_id = wr["message_id"]
                     try:
-                        ref = (
-                            self._dec(
-                                wr["payload"],
-                                aad=cell_aad("queue", "payload", response_row_id),
-                            )
-                            or ""
-                        )
+                        ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
                         origin_msg_id, dest, seq_s = ref.split("\x1f")
                         seq = int(seq_s)
                     except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
@@ -4784,7 +5015,7 @@ class PostgresStore:
                         if not peek_failed:
                             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
                             ingress_created = now
-                            # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                            # Hoist the row id so the payload binds to its own row tag.
                             reingress_row_id = uuid4().hex
                             await conn.execute(
                                 "INSERT INTO queue (id, message_id, stage, channel_id,"
@@ -4796,7 +5027,16 @@ class PostgresStore:
                                 Stage.INGRESS.value,
                                 loopback_channel_id,
                                 self._cipher.encrypt(
-                                    body, aad=cell_aad("queue", "payload", reingress_row_id)
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=reingress_row_id,
+                                        message_id=new_mid,
+                                        stage=Stage.INGRESS.value,
+                                        channel_id=loopback_channel_id,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
                                 ),
                                 OutboxStatus.PENDING.value,
                                 now,
@@ -4842,13 +5082,13 @@ class PostgresStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013) — the Postgres
         twin of :meth:`MessageStore.response_body_for_work_row`."""
         row = await self._pool.fetchrow(
-            "SELECT payload FROM queue WHERE id=$1 AND stage=$2",
+            f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=$1 AND stage=$2",
             response_row_id,
             Stage.RESPONSE.value,
         )
         if row is None:
             return None
-        ref = self._dec(row["payload"], aad=cell_aad("queue", "payload", response_row_id)) or ""
+        ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
         except ValueError:
@@ -6518,10 +6758,8 @@ class PostgresStore:
                         src_where += " AND destination_name=$3"
                         src_args.append(from_)
                     src_rows = await conn.fetch(
-                        "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
-                        " COALESCE(sb.body, q.payload) AS _body_ciphertext"
-                        " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
-                        f" WHERE {src_where} ORDER BY q.destination_name",
+                        f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                        f" WHERE {src_where} ORDER BY destination_name",
                         *src_args,
                     )
                     if not src_rows:
@@ -6538,13 +6776,14 @@ class PostgresStore:
                     src = src_rows[0]
                     src_channel = str(src["channel_id"])
                     src_dest = str(src["destination_name"])
-                    # The body's cell depends on its source (store-once shared body vs inline payload).
-                    body_aad = (
-                        cell_aad("shared_body", "body", src["body_ref"])
-                        if src["body_ref"] is not None
-                        else cell_aad("queue", "payload", src["id"])
+                    # A '' payload is what retention leaves. Otherwise the body is opened under the
+                    # source row's own tag (BACKLOG #2593); the body_ref column picks the kind
+                    # and the tag binds it, so a changed column fails the tag.
+                    decoded = (
+                        ""
+                        if src["payload"] == "" and src["body_ref"] is None
+                        else await self._open_queue_body(conn, src)
                     )
-                    decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
                     if not decoded:
                         raise ResendSourceEmpty(
                             f"message {message_id} source body was purged by retention -- cannot resend"
@@ -6681,7 +6920,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
-                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    # Hoist the row id so the payload binds to its own row tag.
                     resubmit_row_id = uuid4().hex
                     await conn.execute(
                         "INSERT INTO queue"
@@ -6693,7 +6932,16 @@ class PostgresStore:
                         Stage.INGRESS.value,
                         channel_id,
                         self._cipher.encrypt(
-                            raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                            raw,
+                            aad=queue_payload_aad(
+                                row_id=resubmit_row_id,
+                                message_id=new_mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=channel_id,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
                         ),
                         OutboxStatus.PENDING.value,
                         now,
@@ -7131,9 +7379,25 @@ class PostgresStore:
             message_id,
             Stage.OUTBOUND.value,
         )
-        # Postgres keeps bodies inline (body_ref always NULL this increment), so payload is decoded as
-        # queue.payload directly — no shared_body deref (mirrors _outbox_item). Both cols key on queue.id.
-        return [self._decode_record(r, "queue", (r["id"],), "last_error", "payload") for r in rows]
+        # Each body is opened under its row's own tag (BACKLOG #2593), as SQLite does: a purged
+        # row ('') reads as an empty body, a live row whose tag fails refuses the read and alerts,
+        # and a dead row whose tag fails is left out, since its claim already reported it.
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = self._decode_record(r, "queue", (r["id"],), "last_error")
+            dead = r["status"] == OutboxStatus.DEAD.value
+            try:
+                d["payload"] = (
+                    ""
+                    if r["payload"] == "" and r["body_ref"] is None
+                    else await self._open_queue_body(None, r, alert=not dead)
+                )
+            except QueueTagError:
+                if not dead:
+                    raise
+                continue
+            out.append(d)
+        return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
         rows = await self._fetchall(
@@ -8129,11 +8393,8 @@ class PostgresStore:
             )
             if _rowcount(result) <= 0:
                 return None  # nothing written, so nothing is revoked or audited
-            revoked = await conn.execute(
-                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
-                now,
-                user_id,
-            )
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            revoked = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
             appended = await self._append_audits(conn, (audit,), now=now)
         tee_audits((audit,), appended, ts=now)
         return _rowcount(revoked)
@@ -8690,11 +8951,8 @@ class PostgresStore:
             )
             if _rowcount(result) <= 0:
                 return None  # nothing written, so nothing is revoked
-            revoked = await conn.execute(
-                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
-                now,
-                user_id,
-            )
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            revoked = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
         return _rowcount(revoked)
 
     async def clear_user_federated_subject(
@@ -8742,11 +9000,8 @@ class PostgresStore:
                 now,
                 user_id,
             )
-            result = await conn.execute(
-                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
-                now,
-                user_id,
-            )
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            result = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
             return FederatedUnbind(
                 username=row["username"],
                 issuer=issuer,
@@ -8822,44 +9077,82 @@ class PostgresStore:
         idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
-        # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
-        insert = (
-            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
-            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7,$8)"
-        )
-        params = (
-            token_hash,
-            user_id,
-            now,
-            expires_at,
-            client,
-            now if seed_reauth else None,
-            auth_mechanism,
-            None if idp_auth_time is None else float(idp_auth_time),
-        )
-        if require_federated_subject is None:
-            await self._execute(insert, *params)
-            return True
-        # BACKLOG #1474. FOR UPDATE, not a plain read: the row lock is the whole guard here. Either
-        # a concurrent unbind committed first and this read sees the cleared pair (so the insert is
-        # refused), or this transaction holds the row and the unbind waits behind it — and its
-        # session sweep, which runs after its own users UPDATE, then sees this session and revokes
-        # it. A plain SELECT under READ COMMITTED admits the interleaving that loses the session.
+        # BACKLOG #1474 and #2592. FOR UPDATE, not a plain read: the row lock is the guard. Either a
+        # concurrent unbind or whole-account revoke committed first, and this read sees the cleared
+        # pair (so the insert is refused) and the raised session epoch; or this transaction holds
+        # the row and that writer waits behind it, and its session sweep, which runs after its own
+        # users UPDATE, then sees this session and revokes it. A plain SELECT under READ COMMITTED
+        # admits the interleaving that loses the session.
         #
         # record=False: a login is not a per-lane worker, and the acquire-wait histogram exists to
         # show how long those workers queue for a connection as the pool saturates. This is the
         # exemption the low-frequency helpers take.
+        # An unguarded sign-in takes FOR SHARE: it still waits behind a revoke's users UPDATE, and
+        # parallel sign-ins of one account do not wait on each other.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT oidc_issuer, oidc_subject FROM users WHERE id=$1 FOR UPDATE", user_id
+            if require_federated_subject is None:
+                row = await conn.fetchrow(
+                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
+                    " FOR SHARE",
+                    user_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
+                    " FOR UPDATE",
+                    user_id,
+                )
+            if require_federated_subject is not None:
+                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
+                if bound != require_federated_subject:
+                    return False
+            record = new_session_record(
+                token_hash=token_hash,
+                user_id=user_id,
+                now=now,
+                expires_at=expires_at,
+                client=client,
+                seed_reauth=seed_reauth,
+                auth_mechanism=auth_mechanism,
+                idp_auth_time=idp_auth_time,
+                user_epoch=0 if row is None else int(row["session_epoch"]),
             )
-            bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-            if bound != require_federated_subject:
-                return False
-            await conn.execute(insert, *params)
+            record = seal_session(self._row_sealer, record)
+            await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
         return True
+
+    async def _write_session(
+        self,
+        conn: Any,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+    ) -> SessionRecord | None:
+        """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
+        ``MessageStore._write_session`` states the contract. Call it inside ``conn``'s transaction.
+        The read takes the row lock, so the compare on the seal is a second guard, not the only one."""
+        row = await conn.fetchrow(
+            "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", token_hash
+        )
+        if row is None:
+            return None
+        current = SessionRecord.from_mapping(dict(row))
+        if current.revoked_at is not None:
+            return None
+        if not session_seal_ok(self._row_sealer, current):
+            raise RowSealError(SESSION_KIND)
+        updated = seal_session(self._row_sealer, change(current))
+        status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
+        return updated if _rowcount(status) > 0 else None
+
+    async def _session_epoch(self, conn: Any, user_id: str) -> int:
+        """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
+        row = await conn.fetchrow("SELECT session_epoch FROM users WHERE id=$1", user_id)
+        return 0 if row is None else int(row["session_epoch"])
+
+    def row_sealer(self) -> RowSealer | None:
+        """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
+        :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
+        return self._row_sealer
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
@@ -8902,42 +9195,31 @@ class PostgresStore:
         client: str | None = None,
         idp_auth_time: float | None = None,
     ) -> None:
-        now = time.time() if now is None else now
-        # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
-        # only moves forward, and a NULL leaves it (BACKLOG #2143; store.py's
-        # _IDP_AUTH_TIME_FORWARD_SQL says why). GREATEST ignores a NULL argument on Postgres.
-        await self._execute(
-            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client),"
-            " idp_auth_time=GREATEST($3::double precision, idp_auth_time) WHERE token_hash=$4",
-            now,
-            client,
-            None if idp_auth_time is None else float(idp_auth_time),
-            token_hash,
-        )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await self._write_session(conn, token_hash, stamp)
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE sessions SET mfa_verified_at=$1 WHERE token_hash=$2", now, token_hash
-        )
+        stamp = mfa_stamp(time.time() if now is None else now)
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await self._write_session(conn, token_hash, stamp)
 
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Through ``self._execute_after_commit``, which returns the rowcount this op's contract is.
-        Why that borrow has no timeout is its docstring's to say (BACKLOG #2283)."""
-        changed = await self._execute_after_commit(
-            "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
-            new_token_hash,
-            token_hash,
-        )
-        return changed > 0
+        The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
+        #2592). The answer is read after the transaction has committed. The borrow is
+        :meth:`_after_commit_txn`'s, for the reason it gives."""
+        async with self._after_commit_txn() as conn:
+            rotated = await self._write_session(
+                conn, token_hash, lambda s: replace(s, token_hash=new_token_hash)
+            )
+        return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE sessions SET revoked_at=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
+            "UPDATE sessions SET revoked_at=$1, seal='' WHERE token_hash=$2 AND revoked_at IS NULL",
             now,
             token_hash,
         )
@@ -8945,7 +9227,7 @@ class PostgresStore:
     async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
         """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`."""
         d = await self._fetchone(
-            "UPDATE sessions SET revoked_at=$1 WHERE token_hash=$2 AND revoked_at IS NULL"
+            "UPDATE sessions SET revoked_at=$1, seal='' WHERE token_hash=$2 AND revoked_at IS NULL"
             " RETURNING *",
             now,
             token_hash,
@@ -8955,16 +9237,30 @@ class PostgresStore:
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+
+        Raises the account's session epoch and re-seals the kept session in the same transaction
+        (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
+        runs first, so it takes the account row's lock before any session row is touched, the order
+        ``create_session`` takes them in. The borrow is :meth:`_after_commit_txn`'s, for the reason
+        it gives."""
         now = time.time() if now is None else now
-        # Unbounded; `_execute_after_commit` says why (BACKLOG #2283).
-        return await self._execute_after_commit(
-            "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
-            " AND ($3::text IS NULL OR token_hash != $3)",
-            now,
-            user_id,
-            except_token_hash,
-        )
+        async with self._after_commit_txn() as conn:
+            await conn.execute(_PG_BUMP_SESSION_EPOCH_SQL, user_id)
+            status = await conn.execute(
+                _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
+                now,
+                user_id,
+                except_token_hash,
+            )
+            if except_token_hash is not None:
+                epoch = await self._session_epoch(conn, user_id)
+                await self._write_session(
+                    conn,
+                    except_token_hash,
+                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+                )
+        return _rowcount(status)
 
     async def enforce_session_cap(
         self,
@@ -8986,7 +9282,7 @@ class PostgresStore:
             return 0
         now = time.time() if now is None else now
         return await self._execute(
-            "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
+            "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
             " AND COALESCE(mfa_verified_at, created_at) <= $1"
             f"{_pg_session_cap_keep_sql(split_mfa_pending)}",
