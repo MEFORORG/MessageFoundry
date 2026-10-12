@@ -1047,6 +1047,7 @@ class LdapAuthenticator:
         if not conn.entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
         e = conn.entries[0]
+        own: str | None = None
         if len(conn.entries) > 1:
             # Vault BACKLOG #2778. The name filter matches sAMAccountName OR userPrincipalName, and
             # a directory may legally give one account a UPN prefix equal to another's
@@ -1059,32 +1060,28 @@ class LdapAuthenticator:
             # entry that reads it back is the account the engine row is bound to, so it is used.
             # Refusing it too let anyone able to write a colliding entry lock the account out. No
             # match, or more than one, still proves nothing, so it is refused as before.
+            # The `is not None` test is load-bearing: an entry with no readable id reads back
+            # None, which must never match a caller that holds no id.
             label = safe_name(fallback_username)
-            matching = (
-                [x for x in conn.entries if _object_guid(x) == tie_break_object_id]
-                if tie_break_object_id is not None
-                else []
-            )
-            if len(matching) != 1:
-                _warn_once(
-                    f"ambiguous:{label}",
-                    "AD user search for %s matched %d directory entries; refusing it as ambiguous "
-                    "(logged once per name)",
-                    label,
-                    len(conn.entries),
-                )
-                return _Lookup(DirectoryAnswer.AMBIGUOUS)
-            # Still reported: the collision is in the directory, and an operator should clear it.
+            matching = [
+                x
+                for x in conn.entries
+                if tie_break_object_id is not None and _object_guid(x) == tie_break_object_id
+            ]
+            chosen = len(matching) == 1
+            # Reported either way: the collision is in the directory, and an operator should clear it.
             _warn_once(
-                f"ambiguous-chosen:{label}",
-                "AD user search for %s matched %d directory entries; using the one carrying the "
-                "account's stored %s (logged once per name)",
+                f"ambiguous-chosen:{label}" if chosen else f"ambiguous:{label}",
+                "AD user search for %s matched %d directory entries; %s (logged once per name)",
                 label,
                 len(conn.entries),
-                _OBJECT_GUID_ATTR,
+                f"using the one carrying the account's stored {_OBJECT_GUID_ATTR}"
+                if chosen
+                else "refusing it as ambiguous",
             )
-            e = matching[0]
-        own: str | None = None
+            if not chosen:
+                return _Lookup(DirectoryAnswer.AMBIGUOUS)
+            e, own = matching[0], tie_break_object_id
         if expected_object_id is not None:
             own = _object_guid(e)
             if own != expected_object_id:
@@ -1110,8 +1107,9 @@ class LdapAuthenticator:
                 # BACKLOG #1471. Read through _object_guid, never _attr: that helper str()s whatever it
                 # is given, which would render the raw 16 bytes as a Python bytes repr and store a
                 # second, non-canonical spelling of the same identity.
-                # An id-keyed lookup has already read it, and proved it equal to the id asked for.
-                "object_id": own if expected_object_id is not None else _object_guid(e),
+                # An id-keyed lookup or a tie-break has already read it, and proved it equal to
+                # the id the caller holds.
+                "object_id": own if own is not None else _object_guid(e),
                 "display_name": _attr(e, "displayName"),
                 "email": _attr(e, "mail"),
                 "memberOf": _multi(e, "memberOf"),
@@ -1139,11 +1137,7 @@ class LdapAuthenticator:
                 f"(userPrincipalName={_escape_filter(upn)}))"
             ),
             fallback_username=username,
-            tie_break_object_id=(
-                normalise_object_guid(tie_break_object_id)
-                if tie_break_object_id is not None
-                else None
-            ),
+            tie_break_object_id=normalise_object_guid(tie_break_object_id),
         )
 
     def _lookup_by_object_id(self, conn: Any, object_id: str, *, fallback_username: str) -> _Lookup:
@@ -1329,7 +1323,8 @@ class LdapAuthenticator:
 
         ``tie_break_object_id`` serves a name-keyed caller that already holds the account's stored
         ``objectGUID``: when the name matches several entries, the one carrying that id is used
-        (vault BACKLOG #3228, :meth:`_lookup_by_name`). It is ignored when ``object_id`` is given.
+        (vault BACKLOG #3228, :meth:`_lookup_by_name`). Passing it with ``object_id`` is a
+        programming error and raises :class:`ValueError`: an id-keyed search has no tie to break.
         """
         return self.probe_principal(
             username, object_id=object_id, tie_break_object_id=tie_break_object_id
@@ -1355,6 +1350,8 @@ class LdapAuthenticator:
         """
         import ldap3
 
+        if object_id is not None and tie_break_object_id is not None:
+            raise ValueError("pass object_id or tie_break_object_id, not both")
         try:
             with self._service_conn() as svc:
                 found = (

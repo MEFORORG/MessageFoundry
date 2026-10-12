@@ -3997,8 +3997,8 @@ class AuthService:
         name that matches several entries is refused (vault BACKLOG #2778). That refusal let anyone
         able to write a colliding entry lock the account out. This id lets the lookup pick the entry
         the row is already bound to, and only that one. The directory search stays keyed by the
-        name, so the id never chooses an account the name does not match. A local row holds no
-        directory id, and is refused at the sign-in anyway, so it breaks no tie.
+        name, so the id never chooses an account the name does not match. Only a directory row's
+        id is read: a like-named local row is refused at the sign-in, and must not steer the lookup.
         """
         row = await self._store.get_user_by_username(username)
         if row is None or row.auth_provider != AuthProvider.AD.value:

@@ -63,17 +63,20 @@ class _Conn:
         return True
 
 
-def _authenticator() -> LdapAuthenticator:
-    return LdapAuthenticator(
-        AuthSettings(
-            ad_enabled=True,
-            ad_server="ldaps://x",
-            ad_user_search_base="DC=x",
-            ad_bind_dn="CN=svc,DC=x",
-            ad_bind_password="x",
-            ad_domain="example.org",
-        )
+def _settings(**over: Any) -> AuthSettings:
+    return AuthSettings(
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+        ad_domain="example.org",
+        **over,
     )
+
+
+def _authenticator() -> LdapAuthenticator:
+    return LdapAuthenticator(_settings())
 
 
 @pytest.fixture(autouse=True)
@@ -229,10 +232,23 @@ def test_a_stored_object_id_picks_the_entry_that_carries_it(
 
 
 def test_with_no_stored_object_id_two_entries_are_still_refused() -> None:
-    """Both entries carry a readable id, but the caller holds none, so nothing tells them apart."""
-    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)])
-    found = _authenticator()._lookup_by_name(conn, "victor")
-    assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+    """The caller holds no id, so nothing tells the entries apart. The second case pins that an
+    entry with no readable id is not "matched" by a caller holding none."""
+    auth = _authenticator()
+    for entries in (
+        [_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)],
+        [_carrying(_X, _GUID_X), _V],
+    ):
+        found = auth._lookup_by_name(_Conn(entries), "victor")
+        assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_both_id_keys_at_once_are_refused() -> None:
+    """An id-keyed search has no tie to break, so a caller passing both made a mistake."""
+    with pytest.raises(ValueError, match="not both"):
+        _authenticator().probe_principal(
+            "victor", object_id=str(_GUID_X), tie_break_object_id=str(_GUID_X)
+        )
 
 
 def test_two_entries_carrying_the_stored_object_id_are_refused() -> None:
@@ -296,15 +312,7 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
     _install_directory(monkeypatch, [], answer)
     store = await MessageStore.open(tmp_path / "tie-break.db")
     try:
-        settings = AuthSettings(
-            ad_enabled=True,
-            ad_server="ldaps://x",
-            ad_user_search_base="DC=x",
-            ad_bind_dn="CN=svc,DC=x",
-            ad_bind_password="x",
-            ad_domain="example.org",
-            kerberos_enabled=True,
-        )
+        settings = _settings(kerberos_enabled=True)
         service = AuthService(store, settings, ldap=LdapAuthenticator(settings))
         await service.initialize()
         await service.set_ad_group_map([(group.lower(), "operator")], actor="admin")
