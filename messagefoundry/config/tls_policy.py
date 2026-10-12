@@ -346,6 +346,10 @@ def harden_crl_check(
     ``OSError`` must still discard the context, which by then holds the CRL and may not have the
     check flag set.
 
+    A sixth, since vault BACKLOG #2905 (owner ruling 2026-10-05): a CRL that is proven badly
+    signed. :func:`_refuse_bad_crl_signature` says what counts as proof. It runs last of all, once
+    OpenSSL is known to hold exactly the CRLs judged, so it hides none of the refusals above.
+
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
     a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
@@ -381,6 +385,9 @@ def harden_crl_check(
 
     before = ctx.cert_store_stats()
     certs_before = before["x509"]  # a missing key raises: fail closed
+    # Vault BACKLOG #2905: the hop's CA list, read before the CRL file is loaded, so the list a
+    # CRL's signature is checked against holds nothing that file brought.
+    anchors = ctx.get_ca_certs(binary_form=True)
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
     stats = ctx.cert_store_stats()
     added = stats["x509"] - certs_before
@@ -436,6 +443,8 @@ def harden_crl_check(
                 "Check that the engine's account can write to its temporary directory, and that "
                 "there is room for the file"
             ) from exc
+    # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged.
+    _refuse_bad_crl_signature(pem, anchors, label=label)
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
@@ -540,6 +549,31 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
         )
 
 
+def _refuse_bad_crl_signature(pem: bytes, anchors: Sequence[bytes], *, label: str) -> None:
+    """Refuse the judged CRL bytes ``pem`` when a CRL in them is proven badly signed against
+    ``anchors``, the hop's own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
+
+    **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
+    ``bad``: the CRL names a listed CA's key by key identifier, and that key does not verify it.
+    OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
+    and then failed every handshake it judged, with a TLS error that does not name the CRL. An
+    unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
+
+    Everything short of proof loads: a CRL that names no key, a key the engine cannot check with,
+    and an issuer the hop does not list. There is no setting that turns this off and none that
+    widens it, as for the expired-CRL refusal in :func:`judge_crl_bytes`."""
+    from messagefoundry.pki import judge_crl_signatures
+
+    for signature in judge_crl_signatures(pem, anchors):
+        if signature.state == "bad":
+            raise ValueError(
+                f"{label}: {signature.where} names the key of a CA certificate this hop trusts, "
+                "and that key does not verify the CRL's signature. Loaded, it would make every "
+                "handshake it judges fail with 'CRL signature failure'. Give this setting the CRL "
+                "that CA signed"
+            )
+
+
 class _CrlStagingFailed(OSError, ValueError):
     """:func:`harden_crl_check` could not make, write or read its private copy of a CRL file (vault
     BACKLOG #2866). The text leads with the setting and the file, as its other refusals do.
@@ -597,7 +631,11 @@ def judge_crl_bytes(
     load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
     ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`), unless
     ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
-    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``."""
+    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``.
+
+    No signature is checked here, because this has no CA list. A start checks it in
+    :func:`_refuse_bad_crl_signature`, and the reload in
+    :func:`~messagefoundry.pki.crl_signature_refusal`. The two do not refuse the same files."""
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:

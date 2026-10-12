@@ -1228,7 +1228,7 @@ def test_a_file_to_fix_is_reported_for_a_context_at_the_cap(
     pki: _Pki, tmp_path: Path, bad: str
 ) -> None:
     # A context the cap holds back still gets the file checks: a restart would refuse a planted
-    # CA, and would load a forged CRL that then fails every handshake it judges.
+    # CA, and since vault BACKLOG #2905 it refuses this forged CRL too, which names the CA's key.
     hop = pki.outbound_hop()
     pki.crl.write_bytes(_fresher(pki, revoke=False))
     assert (first := _reload(pki, max_reloads=1)) is not None and first.reloaded == 1

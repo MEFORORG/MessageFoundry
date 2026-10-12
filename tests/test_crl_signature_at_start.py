@@ -1,0 +1,385 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Vault BACKLOG #2905: a start checks each CRL's signature, and refuses only a proven bad one.
+
+The owner ruling of 2026-10-05: refuse at start only a CRL whose signature fails against a CA the
+CRL names by key identifier. Everything short of that loads, with one warning.
+
+What this file proves, and the instrument for each:
+
+* **The proven case refuses, and names the setting.** ``harden_crl_check`` on a real context. The
+  control is OpenSSL itself: it loads the same bytes without complaint, and then a real handshake
+  fails with a signature error that does not name the CRL file.
+* **Two CAs with one subject and different keys.** No test covered that before. The table runs
+  every pairing of listed CAs, signing key and key identifier through the judgment and through a
+  start.
+* **What OpenSSL does with those files.** Real handshakes. Both CAs listed, OpenSSL takes the CRL's
+  issuer from the peer's chain, whichever same-name CA the file lists first. One CA listed and the
+  peer sending the renewed CA, a CRL that names no key still judges the peer. Each is one chain
+  shape, measured on this interpreter's OpenSSL, not a rule about every shape.
+
+All material is synthetic and minted here. No PHI.
+"""
+
+from __future__ import annotations
+
+import datetime
+import ssl
+import weakref
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.x509.oid import NameOID
+
+from messagefoundry import pki as pki_module
+from messagefoundry.config import loaded_crls
+from messagefoundry.config.tls_policy import (
+    TrustAnchor,
+    build_verifying_client_context,
+    harden_crl_check,
+)
+from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
+from tests.test_crl_bundle_anchors import _ku
+from tests.test_crl_reload import _key_pem, _leaf
+from tests.test_trust_anchor_byte_binding import _handshake
+
+_NOW = datetime.datetime.now(datetime.UTC)
+_DAY = datetime.timedelta(days=1)
+_PEM = serialization.Encoding.PEM
+_NAME = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-twin-ca")])
+_SETTING = "[tls].crl_file"
+
+_CaKey = ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey
+
+
+def _ca(key: _CaKey, signer: _CaKey, *, name: x509.Name = _NAME) -> x509.Certificate:
+    """A CA certificate for ``key`` named ``name``, issued under that same name by ``signer``."""
+    return (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + 365 * _DAY)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
+        )
+        .add_extension(_ku(ca=True), critical=True)
+        .sign(signer, hashes.SHA256())
+    )
+
+
+def _crl(
+    signer: _CaKey,
+    *,
+    names: _CaKey | None,
+    revoke: int | None = None,
+    name: x509.Name = _NAME,
+) -> bytes:
+    """A CRL from ``name`` in effect now, signed by ``signer``. Its key identifier is that of
+    ``names``, or it carries none. ``revoke`` is a serial number to list."""
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(name)
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + 30 * _DAY)
+        .add_extension(x509.CRLNumber(1), False)
+    )
+    if names is not None:
+        builder = builder.add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(names.public_key()), False
+        )
+    if revoke is not None:
+        builder = builder.add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(revoke)
+            .revocation_date(_NOW - _DAY)
+            .build()
+        )
+    return builder.sign(signer, hashes.SHA256()).public_bytes(_PEM)
+
+
+@dataclass
+class _Twins:
+    """Two CAs with ONE subject and different keys, as a CA that renewed its key leaves behind.
+    ``old`` and ``new`` are each self-signed. ``renewed`` is the new key certified by the old one,
+    which a peer can send in its chain. The leaf is issued under the new key."""
+
+    old_key: ec.EllipticCurvePrivateKey
+    new_key: ec.EllipticCurvePrivateKey
+    stranger: ec.EllipticCurvePrivateKey
+    old_ca: Path
+    new_ca: Path
+    both: Path
+    leaf_serial: int
+    leaf_chain: Path
+    leaf_alone: Path
+    leaf_key: Path
+    crl: Path
+
+    def keys(self, which: str | None) -> ec.EllipticCurvePrivateKey | None:
+        return {
+            "old": self.old_key,
+            "new": self.new_key,
+            "stranger": self.stranger,
+            None: None,
+        }[which]
+
+    def ca_file(self, listed: str) -> Path:
+        return {"old": self.old_ca, "new": self.new_ca, "both": self.both}[listed]
+
+    def write_crl(self, signer: str, names: str | None, *, revoke: bool = False) -> bytes:
+        key = self.keys(signer)
+        assert key is not None
+        pem = _crl(key, names=self.keys(names), revoke=self.leaf_serial if revoke else None)
+        self.crl.write_bytes(pem)
+        return pem
+
+    def hop(self, listed: str) -> ssl.SSLContext:
+        """An outbound hop whose CA file is ``listed``, with the CRL loaded as every hop does."""
+        return build_verifying_client_context(
+            TrustAnchor(
+                cafile=str(self.ca_file(listed)), load_system_roots=False, crl_file=str(self.crl)
+            )
+        )
+
+    def server(self, *, sends_renewed: bool) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.leaf_chain if sends_renewed else self.leaf_alone, self.leaf_key)
+        return ctx
+
+
+@pytest.fixture(autouse=True)
+def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No held copy from another test, so nothing here depends on what ran before it."""
+    monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary())
+
+
+@pytest.fixture
+def twins(tmp_path: Path) -> _Twins:
+    old_key = ec.generate_private_key(ec.SECP256R1())
+    new_key = ec.generate_private_key(ec.SECP256R1())
+    old, new = _ca(old_key, old_key), _ca(new_key, new_key)
+    renewed = _ca(new_key, old_key)
+    leaf, leaf_key = _leaf(_NAME, new_key)
+    made = _Twins(
+        old_key,
+        new_key,
+        ec.generate_private_key(ec.SECP256R1()),
+        tmp_path / "old.pem",
+        tmp_path / "new.pem",
+        tmp_path / "both.pem",
+        leaf.serial_number,
+        tmp_path / "leaf-and-renewed.pem",
+        tmp_path / "leaf.pem",
+        tmp_path / "leaf-key.pem",
+        tmp_path / "crl.pem",
+    )
+    made.old_ca.write_bytes(old.public_bytes(_PEM))
+    made.new_ca.write_bytes(new.public_bytes(_PEM))
+    made.both.write_bytes(old.public_bytes(_PEM) + new.public_bytes(_PEM))  # the old CA first
+    made.leaf_chain.write_bytes(leaf.public_bytes(_PEM) + renewed.public_bytes(_PEM))
+    made.leaf_alone.write_bytes(leaf.public_bytes(_PEM))
+    made.leaf_key.write_bytes(_key_pem(leaf_key))
+    return made
+
+
+def _ders(ca_file: Path) -> list[bytes]:
+    return [
+        cert.public_bytes(serialization.Encoding.DER)
+        for cert in x509.load_pem_x509_certificates(ca_file.read_bytes())
+    ]
+
+
+def _raw_hop(ca_file: Path, crl: Path) -> ssl.SSLContext:
+    """What OpenSSL does with a CRL file when the engine's checks are left out: load it, and turn
+    leaf revocation checking on."""
+    ctx = ssl.create_default_context(cafile=str(ca_file))
+    ctx.load_verify_locations(cafile=str(crl))
+    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    return ctx
+
+
+# --- the refuse arm ------------------------------------------------------------------------------
+
+
+def test_a_crl_that_names_a_listed_cas_key_and_is_not_signed_by_it_refuses_the_start(
+    twins: _Twins,
+) -> None:
+    twins.write_crl("stranger", "new")  # right issuer name, right key identifier, wrong key
+
+    # Control: OpenSSL loads the bytes without complaint. The failure comes at the handshake, and
+    # its text does not name the file. This is the gap the start check closes.
+    with pytest.raises(ssl.SSLError, match="signature") as at_handshake:
+        _handshake(_raw_hop(twins.new_ca, twins.crl), twins.server(sends_renewed=False))
+    assert twins.crl.name not in str(at_handshake.value)
+
+    with pytest.raises(ValueError, match="does not verify the CRL's signature") as refused:
+        twins.hop("new")
+    text = str(refused.value)
+    assert text.startswith(f"{_SETTING} ({str(twins.crl)!r})")
+    assert "CRL block 1 of 1" in text and "mefor-2905-twin-ca" in text
+
+
+def test_the_refusal_needs_no_named_ca_file(twins: _Twins) -> None:
+    # A listener loads its CA from memory (``cadata=``), so no CA file is named anywhere. The
+    # ruling of 2026-10-05 dropped the "named CA file only" condition, and so does the code.
+    twins.write_crl("stranger", "new")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_verify_locations(cadata=twins.new_ca.read_text("ascii"))
+    ctx.verify_mode = ssl.CERT_REQUIRED
+
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        harden_crl_check(ctx, str(twins.crl), setting="[api].tls_client_crl_file")
+    assert not ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_badly_signed_block_refuses_wherever_it_sits_in_the_file(twins: _Twins) -> None:
+    other = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2905-unlisted-ca")])
+    unlisted = _crl(twins.stranger, names=twins.stranger, name=other)
+    forged = _crl(twins.stranger, names=twins.new_key)
+    twins.crl.write_bytes(unlisted + forged)
+
+    with pytest.raises(ValueError, match="CRL block 2 of 2"):
+        twins.hop("new")
+
+
+def test_a_planted_certificate_is_still_reported_as_that(twins: _Twins) -> None:
+    # The file is wrong twice: a CA the hop does not trust, and a forged CRL. The BACKLOG #1890
+    # refusal comes first, so the signature check cannot hide a planted trust anchor.
+    planted = _ca(twins.stranger, twins.stranger, name=_NAME)
+    twins.crl.write_bytes(planted.public_bytes(_PEM) + _crl(twins.stranger, names=twins.new_key))
+
+    with pytest.raises(ValueError, match="BACKLOG #1890"):
+        twins.hop("new")
+
+
+# --- two CAs with one subject --------------------------------------------------------------------
+
+#: (the CAs the hop lists, the key that signs the CRL, the key the CRL names, the judgment).
+_TWIN_CASES = [
+    pytest.param("both", "new", "new", "verified", id="both-listed-names-the-signer"),
+    pytest.param("both", "new", None, "verified", id="both-listed-names-no-key"),
+    pytest.param("both", "old", None, "verified", id="both-listed-old-key-signs"),
+    pytest.param("old", "new", "new", "unlisted", id="old-listed-crl-names-the-new-key"),
+    pytest.param("old", "new", None, "unproven", id="old-listed-crl-names-no-key"),
+    pytest.param("both", "stranger", None, "unproven", id="both-listed-forged-names-no-key"),
+    pytest.param("old", "stranger", "old", "bad", id="old-listed-forged-names-the-old-key"),
+    pytest.param("both", "new", "old", "bad", id="both-listed-names-the-key-that-did-not-sign"),
+]
+
+
+@pytest.mark.parametrize(("listed", "signer", "names", "state"), _TWIN_CASES)
+def test_two_cas_with_one_subject(
+    twins: _Twins, listed: str, signer: str, names: str | None, state: str
+) -> None:
+    pem = twins.write_crl(signer, names)
+
+    judged = list(judge_crl_signatures(pem, _ders(twins.ca_file(listed))))
+    assert [signature.state for signature in judged] == [state]
+
+    if state == "bad":
+        with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+            twins.hop(listed)
+    else:
+        # Everything short of proof loads, and the hop checks revocation.
+        assert twins.hop(listed).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+@pytest.mark.parametrize(("listed", "signer", "names", "state"), _TWIN_CASES)
+def test_the_reload_verdict_is_what_it_was(
+    twins: _Twins, listed: str, signer: str, names: str | None, state: str
+) -> None:
+    # The reload's flag is wider than what a start refuses, on purpose: it is unchanged.
+    verdict = crl_signature_refusal(twins.write_crl(signer, names), _ders(twins.ca_file(listed)))
+    expected = {"verified": None, "unlisted": False}.get(state, True)
+    assert (verdict if verdict is None else verdict[1]) == expected
+
+
+# --- what OpenSSL does with those files ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("names", ["new", None])
+def test_with_both_cas_listed_openssl_takes_the_crl_issuer_from_the_peers_chain(
+    twins: _Twins, names: str | None
+) -> None:
+    # The old CA sits first in the CA file. A check that tried only the first CA of that name
+    # would call this CRL badly signed. OpenSSL does not: it judges the peer by it.
+    twins.write_crl("new", names)
+    _handshake(twins.hop("both"), twins.server(sends_renewed=False))  # raises if refused
+
+    twins.write_crl("new", names, revoke=True)
+    with pytest.raises(ssl.SSLError, match="revoked"):
+        _handshake(twins.hop("both"), twins.server(sends_renewed=False))
+
+
+def test_a_crl_that_names_no_key_judges_a_peer_whose_chain_carries_the_renewed_ca(
+    twins: _Twins,
+) -> None:
+    # The hop lists the old CA alone. The peer sends the new key, certified by the old one. The
+    # CRL is signed by the new key and names no key, so the old CA "fits" it and does not verify
+    # it. This one chain shape is why that case warns and does not refuse.
+    twins.write_crl("new", None)
+    _handshake(twins.hop("old"), twins.server(sends_renewed=True))  # raises if refused
+
+    twins.write_crl("new", None, revoke=True)
+    with pytest.raises(ssl.SSLError, match="revoked"):
+        _handshake(twins.hop("old"), twins.server(sends_renewed=True))
+
+
+# --- "cannot check" is not "does not verify" -----------------------------------------------------
+
+
+def test_a_key_of_another_kind_than_the_signature_is_cannot_check_not_bad(tmp_path: Path) -> None:
+    # An RSA CA, and a CRL that names its key but carries an ECDSA signature. ``cryptography``
+    # answers False for that pair without running a verification, so it is no proof.
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca = _ca(rsa_key, rsa_key)
+    pem = _crl(ec.generate_private_key(ec.SECP256R1()), names=rsa_key)
+    crl = x509.load_pem_x509_crl(pem)
+
+    assert crl.is_signature_valid(rsa_key.public_key()) is False
+    assert pki_module._verifies(crl, ca) is None
+    der = ca.public_bytes(serialization.Encoding.DER)
+    assert [s.state for s in judge_crl_signatures(pem, [der])] == ["uncheckable"]
+
+    (tmp_path / "ca.pem").write_bytes(ca.public_bytes(_PEM))
+    (tmp_path / "crl.pem").write_bytes(pem)
+    hop = build_verifying_client_context(
+        TrustAnchor(
+            cafile=str(tmp_path / "ca.pem"),
+            load_system_roots=False,
+            crl_file=str(tmp_path / "crl.pem"),
+        )
+    )
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+@pytest.mark.parametrize("error", [ValueError, TypeError])
+def test_an_error_from_the_verification_is_cannot_check(
+    twins: _Twins, monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+) -> None:
+    # Manager decision for this row: ``ValueError`` is the warn arm too, with ``TypeError`` and
+    # ``UnsupportedAlgorithm``.
+    def refuse(key: object, crl: x509.CertificateRevocationList) -> None:
+        raise error("not a pair this can check")
+
+    monkeypatch.setattr(pki_module, "_verify_with", refuse)
+    pem = twins.write_crl("stranger", "new")
+
+    judged = list(judge_crl_signatures(pem, _ders(twins.new_ca)))
+    assert [signature.state for signature in judged] == ["uncheckable"]
+    assert twins.hop("new").verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_that_does_not_parse_is_ignored(twins: _Twins) -> None:
+    pem = twins.write_crl("new", "new")
+    judged = list(judge_crl_signatures(pem, [b"not a certificate", *_ders(twins.new_ca)]))
+    assert [signature.state for signature in judged] == ["verified"]
