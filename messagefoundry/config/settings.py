@@ -2214,8 +2214,9 @@ class DiagnosticsSettings(_Section):
     # adds 9 more. The ceiling is ONE row per request per require() dependency, because
     # _grant_audit_permission returns a single permission. So the growth is bounded by JSON-API client
     # polling cadence (the harness polls /stats), not by console page views. Nothing prunes the chain:
-    # `[retention].audit_days` is reserved and unenforced by design, so `[retention].max_db_mb` (an
-    # advisory warning, never a delete) is the only size signal.
+    # `[retention].audit_days` is reserved and unenforced by design. The size signals that warn and
+    # never delete include `[retention].audit_log_warn_rows`, on by default since BACKLOG #1421,
+    # which measures this table, and `[retention].max_db_mb`, off by default, the whole store.
     #
     # THE COST IS A COMMIT, NOT JUST A ROW, and that is the half a storage estimate misses. `require()`
     # AWAITS `record_audit` before the route body runs, and `record_audit` takes the store's write lock,
@@ -2577,10 +2578,11 @@ class RetentionSettings(_Section):
     survives; its PHI *columns* do not. Tiers that carry nothing but PHI and back no count (transform
     state, connection events) are DELETEd outright instead.
 
-    Two knobs here are default-ON rather than off. ``min_free_disk_mb``, the low-disk storage floor
+    At least three knobs here are default-ON rather than off. ``min_free_disk_mb``, the low-disk storage floor
     (BACKLOG #290), refuses a ``serve`` start and warns at runtime; it never purges anything.
     ``wal_checkpoint_seconds`` truncates the SQLite ``-wal`` file once an hour, so a purged body
-    does not outlive the purge there (vault BACKLOG #2619).
+    does not outlive the purge there (vault BACKLOG #2619). ``audit_log_warn_rows`` warns while
+    ``audit_log`` holds more rows than it (BACKLOG #1421); it never purges anything either.
     """
 
     # Past N days, null inbound bodies (raw/summary/error/metadata) of fully-resolved messages,
@@ -2671,6 +2673,18 @@ class RetentionSettings(_Section):
     # logs one INFO line and skips it. 0 = off. Unlike `max_db_mb` this measures the VOLUME, not the
     # store's own size, so the two do not overlap.
     min_free_disk_mb: int = 1024
+    # Audit-log growth warning (BACKLOG #1421), in ROWS of `audit_log`. DEFAULT-ON at 4,000,000. Each
+    # retention pass reads the newest row's sequence number (the row count on an intact chain) and
+    # logs one WARNING while it is above this. It never deletes, drops or seals anything, and it
+    # writes no audit row of its own. It exists because nothing bounds audit_log -- `audit_days`
+    # above is unenforced, and the grant trail writes one row per authenticated request -- while
+    # `max_db_mb` ships 0, so on stock settings nothing warned. ROWS, not bytes, because the newest
+    # sequence number is one cheap index seek on all three backends and is the unit the grant trail
+    # grows in. The 4,000,000 default is a seat decision under owner delegation
+    # 2026-10-08, not an owner ruling: no precedent in the tree fixes one. It is about 1.1 GB of
+    # SQLite at the ~270 bytes a grant row measured on 2026-10-11. docs/CONFIGURATION.md says how to
+    # size it. 0 = off.
+    audit_log_warn_rows: int = 4_000_000
     # How often the purge/maintenance loop runs a pass (seconds).
     purge_interval_seconds: float = 3600.0
     # Maximum wall-clock seconds one maintenance pass may spend (#121, ADR 0137). A BETWEEN-PHASE soft
@@ -2710,6 +2724,7 @@ class RetentionSettings(_Section):
         "audit_days",
         "max_db_mb",
         "min_free_disk_mb",
+        "audit_log_warn_rows",
         "state_max_age_days",
         "connection_event_retention_hours",
         "app_log_days",
