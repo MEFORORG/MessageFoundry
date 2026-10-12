@@ -1251,6 +1251,18 @@ def read_bounded_text(
 REPLY_TOO_LARGE_CODE = "reply-too-large"
 
 
+def shown_2xx_status(reader: object) -> int | None:
+    """``reader.status`` when it is an integer from 200 to 299, else ``None``.
+
+    The guard an over-cap body after a 2xx takes before it is dropped rather than raised. It fails
+    closed: a reader with no status, or one it cannot show as an integer, is not taken for a 2xx.
+    Shared by :func:`read_2xx_reply_text` and the alert webhook (#3040 item 1), so the rule has
+    one copy.
+    """
+    status = getattr(reader, "status", None)
+    return status if isinstance(status, int) and 200 <= status < 300 else None
+
+
 def read_2xx_reply_text(
     reader: _SupportsRead,
     *,
@@ -1274,7 +1286,9 @@ def read_2xx_reply_text(
 
     * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
       without it. Returns ``""`` and logs a WARNING. The WARNING carries ``connector``, the
-      status and the bound, and no byte of the reply.
+      status and the bound, and no byte of the reply. It says nothing of the store record,
+      because it is logged before the caller writes one, and that write can still fail (#3040
+      item 2).
     * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
       permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
       :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
@@ -1288,26 +1302,26 @@ def read_2xx_reply_text(
     try:
         return read_bounded_text(reader, limit=limit, connector=connector, encoding=encoding)
     except ResponseTooLargeError:
-        status = getattr(reader, "status", None)
-        if not (isinstance(status, int) and 200 <= status < 300):
+        status = shown_2xx_status(reader)
+        if status is None:
             raise
         # A 2xx is handled below, outside the handler. The traceback reaches the frame that holds
         # the bytes read so far, a whole bound of them, and an error raised in here would keep
         # that frame alive on its __context__ until the worker let go of it.
     if body_is_needed:
-        # The stored error is cut at 200 characters, so the code and "not sent again" come first
-        # and the advice last. It does not say the partner accepted the request: the body that
-        # could not be read is where a Fault, a failed-instance list or a failed entry status
-        # would be.
+        # The row keeps only 200 characters of this, so the code and the advice come first and
+        # the connection name, which has no length cap, comes last (#3040 items 4 and 6). It
+        # does not say the partner accepted the request: the body that could not be read is
+        # where a Fault, a failed-instance list or a failed entry status would be.
         raise NegativeAckError(
-            f"{connector}: {REPLY_TOO_LARGE_CODE}, not sent again. A 2xx reply body is over the "
-            f"{limit}-byte bound and is needed here. Check the partner before a replay",
+            f"{REPLY_TOO_LARGE_CODE}, not sent again. A 2xx reply body is over the {limit}-byte "
+            f"bound and is needed here. Check the partner before a replay ({connector})",
             code=REPLY_TOO_LARGE_CODE,
             permanent=True,
         )
     logger.warning(
         "%s answered with status %s and a response body over the %d-byte bound; "
-        "the body is dropped and the message is recorded as delivered",
+        "the body is dropped and the 2xx is taken as the partner's answer",
         connector,
         status,
         limit,

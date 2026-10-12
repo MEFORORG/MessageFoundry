@@ -2005,7 +2005,7 @@ unrecognized fault is treated as permanent (so a rejected request can't loop the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
 + HTTP status. A 2xx whose body is over the byte bound cannot be inspected, so it is a permanent refusal
-and is not sent again: see *A 2xx reply over the byte bound* under REST.
+and is not sent again: see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, secrets via `env()`). Delivery is **at-least-once**, so a retry **re-sends** —
@@ -2363,7 +2363,7 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
-  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under REST.
+  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
@@ -2441,7 +2441,7 @@ never an error). On an error status the HTTP code decides, refined by the `Opera
 `incomplete`), or `408`/`429` → retry; any other 4xx / refused 3xx → **dead-letter**. The HTTP status wins
 when in doubt (a 5xx stays transient). `OperationOutcome`/reply bodies are **not** echoed into errors/logs
 (they may carry PHI) — only the HTTP status + a redacted URL. For a 2xx whose body is over the byte bound,
-see *A 2xx reply over the byte bound* under REST.
+see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, cleartext-credential refusal, optional detached-JWS signing, secrets via `env()`).
@@ -2787,7 +2787,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
 a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
 over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
-again: see *A 2xx reply over the byte bound* under REST. **PHI:** the response can
+again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python

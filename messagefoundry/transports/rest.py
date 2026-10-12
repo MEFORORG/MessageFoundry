@@ -2346,7 +2346,8 @@ class RestDestination(DestinationConnector):
                     encoding=self.encoding,
                     body_is_needed=self.capture_response,
                 )
-                status = int(getattr(resp, "status", 200))
+                # No default: a missing status is not guessed to be 200 (#3040 item 10).
+                status = int(resp.status)
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(
                     getattr(resp, "headers", None), self.capture_response_headers

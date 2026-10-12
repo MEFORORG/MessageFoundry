@@ -517,16 +517,53 @@ def test_ai_broker_maps_an_over_cap_reply_onto_its_own_error_type() -> None:
 # --- the alert webhook --------------------------------------------------------------------------
 
 
-def test_alert_webhook_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_alert_webhook_drain_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The drain stops one byte past the bound. Before #3040 the over-cap reply then raised, and
+    the notifier reported an alert the host had taken with a 2xx as failed. Owner ruling
+    2026-10-12 (#3040 item 1): it counts as delivered, with a WARNING that carries no reply byte."""
     transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     import messagefoundry.pipeline.alert_sinks as sinks
 
     monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", opener.open)
-    with pytest.raises(ResponseTooLargeError):
+    with caplog.at_level(logging.WARNING, logger=sinks.__name__):
+        transport._post({"type": "queue_buildup", "connection": "OB_X"})  # no raise
+    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
+    (record,) = [r for r in caplog.records if r.name == sinks.__name__]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "alert webhook hooks.example answered with status 200 and a response body over the "
+        f"{DEFAULT_MAX_RESPONSE_BYTES}-byte bound; the body is dropped and the alert counts as "
+        "delivered"
+    )
+
+
+@pytest.mark.parametrize("status", [None, "200", 300, 500], ids=["None", "str", "300", "500"])
+def test_alert_webhook_over_cap_reply_with_no_2xx_to_show_still_raises(
+    status: object,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE CONTROL for the test above: the delivered arm keys on a 2xx the reader shows, and fails
+    closed without one. urllib never hands the webhook such a reader, since it raises every
+    non-2xx as HTTPError first. So it is the 2xx, and not the size alone, that makes the alert
+    delivered."""
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    resp = _UnboundedResp()
+    resp.status = status  # type: ignore[assignment]
+    import messagefoundry.pipeline.alert_sinks as sinks
+
+    monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", _FakeOpener(resp).open)
+    with (
+        caplog.at_level(logging.WARNING, logger=sinks.__name__),
+        pytest.raises(ResponseTooLargeError),
+    ):
         transport._post({"type": "queue_buildup", "connection": "OB_X"})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
+    assert "counts as delivered" not in caplog.text
 
 
 # --- the signing key file (a LOCAL read, not an egress reply) -------------------------------------

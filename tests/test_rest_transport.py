@@ -56,6 +56,10 @@ def _http_error(code: int) -> urllib.error.HTTPError:
 
 
 class _FakeResp:
+    # urllib's response always carries one, and _post no longer supplies a 200 when it is missing
+    # (#3040 item 10).
+    status = 200
+
     def read(self, amt: int = -1) -> bytes:
         return b"" if amt < 0 else (b"")[:amt]
 
