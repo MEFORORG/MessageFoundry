@@ -37,7 +37,7 @@ from typing import Any
 
 import httpx
 import pytest
-import spnego
+import spnego.exceptions
 from spnego._context import GSSMech
 from spnego._negotiate import NegotiateProxy
 from spnego._spnego import NegTokenInit, NegTokenResp
@@ -71,14 +71,16 @@ _CRAFTED = [
 _MALFORMED = {"provider": "ad", "mech": "kerberos", "reason": "malformed_token"}
 
 
-def _wrapper(**_kw: object) -> NegotiateProxy:
+def _wrapper(_settings: object = None) -> NegotiateProxy:
     """The pure-Python Negotiate acceptor, the one every non-SSPI host signs in through."""
     return NegotiateProxy(usage="accept", protocol="negotiate")
 
 
 @pytest.fixture
 def real_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(spnego, "server", _wrapper)
+    # Only the engine's own acceptor is replaced. spnego.server stays real, because the wrapper
+    # calls it to build its inner mechanisms; none of the tokens here reach that far.
+    monkeypatch.setattr("messagefoundry.auth.ldap._kerberos_acceptor", _wrapper)
 
 
 @pytest.mark.parametrize(("token", "error"), _CRAFTED)
@@ -122,14 +124,44 @@ def test_a_parse_error_logs_its_type_and_none_of_the_token(
     assert line == "Kerberos sign-in refused the SPNEGO token: ValueError"
 
 
-def test_a_provider_error_keeps_its_diagnostic_in_the_log(
+def test_a_provider_error_logs_its_code(
     real_wrapper: None, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The audit row names only the type. On a host without SSPI a missing keytab entry fails the
-    same way, so the provider's own text is what tells an operator it is configuration."""
     line = _refusal_log_line(_SPNEGO_ERROR, caplog)
-    assert "BadMechanismError" in line and "Unable to negotiate common mechanism" in line
-    assert _LEAK not in line
+    assert line == "Kerberos sign-in refused the SPNEGO token: BadMechanismError code=1"
+
+
+class _GssError(Exception):
+    """GSSAPI's error shape. Its message names the ticket's service principal, which is cleartext
+    in the token, so the caller chose it."""
+
+    def __init__(self) -> None:
+        super().__init__(f"Server HTTP/{_LEAK} not found in keytab")
+        self.maj_code = 851968
+        self.min_code = -1765328203
+
+
+class _KeytabMissServer:
+    complete = False
+
+    def step(self, _token: bytes) -> None:
+        raise spnego.exceptions.NoCredentialError(base_error=_GssError())
+
+
+def test_a_gssapi_error_logs_its_status_codes_and_not_its_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """On a host without SSPI a missing keytab entry fails in the step, as a crafted token does,
+    and the audit row names only the type. The status codes are what tell an operator it is
+    configuration. Round 1 logged the provider's text, which quoted the token."""
+    monkeypatch.setattr(
+        "messagefoundry.auth.ldap._kerberos_acceptor", lambda _s: _KeytabMissServer()
+    )
+    line = _refusal_log_line(b"token", caplog)
+    assert line == (
+        "Kerberos sign-in refused the SPNEGO token: NoCredentialError code=7"
+        " base=_GssError maj_code=851968 min_code=-1765328203"
+    )
 
 
 # --- where an operator meets it: the service and both routes -----------------------------------
@@ -226,10 +258,17 @@ async def test_both_routes_refuse_a_crafted_token_with_a_row(
     await _assert_refused_rows(engine, error, "127.0.0.1", count=2)
 
 
-async def test_negotiate_writes_no_malformed_row_while_kerberos_is_off(engine: Engine) -> None:
-    """``GET /ui/sso`` writes none in that state, and nothing then needs this route to."""
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    await service.initialize()
+@pytest.mark.parametrize("state", ["off", "degraded"])
+async def test_negotiate_writes_no_malformed_row_while_sso_is_unavailable(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """``GET /ui/sso`` writes none in either state, and this route takes the same gate."""
+    if state == "off":
+        service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+        await service.initialize()
+    else:
+        service = await _service(engine, monkeypatch)
+        service.mark_kerberos_unavailable("synthetic preflight failure")
     async with _client(engine, service) as c:
         r = await c.post("/auth/negotiate", headers={"Authorization": "Negotiate !!!"})
     assert r.status_code == 400, r.text

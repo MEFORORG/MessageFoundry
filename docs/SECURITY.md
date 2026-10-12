@@ -3509,11 +3509,11 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   (AUTH-K-AUDIT). A token the acceptor refuses is an `auth.login_failed` row with the reason
   `token_refused` and the error's type. The row never holds the error's message, because the
   message can quote the token (BACKLOG #3196). On a host without SSPI, a missing keytab entry
-  also fails this way. So the engine log keeps a redacted, bounded form of a provider error's
-  message, and only the type of a parse error. While Kerberos is on, a 400 for a token that is
-  not base64 writes the `malformed_token` row `GET /ui/sso` writes. A 400 for a missing
-  `Negotiate` header writes no row. A 429 from the sign-in window is throttle-logged, never
-  audited.
+  also fails this way. So the engine log names the error's class and its numeric GSSAPI or SSPI
+  status, which tell the two apart, and never its text. While browser SSO is available, a 400
+  for a token that is not base64 writes the `malformed_token` row `GET /ui/sso` writes. A 400 for
+  a missing `Negotiate` header writes no row. A 429 from the sign-in window is throttle-logged,
+  never audited.
   **Browser SSO (L5c, ADR 0068 §9):** `GET /ui/sso` adds the RFC 4559 browser flow over the same
   single-leg acceptor — a 401 + `WWW-Authenticate: Negotiate` challenge (deliberately
   unthrottled; the token-bearing leg is rate-limited **first** — an exhausted limiter is

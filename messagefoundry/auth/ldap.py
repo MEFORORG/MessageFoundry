@@ -43,8 +43,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.controlchars import scrub_log_argument
-from messagefoundry.redaction import safe_exc, safe_name
+from messagefoundry.redaction import safe_name
 
 if TYPE_CHECKING:
     from messagefoundry.auth.ldap_tls import NarrowedTls
@@ -100,9 +99,9 @@ class KerberosTokenRefused(Exception):
     """The SPNEGO acceptor refused the client's token (BACKLOG #3186, #3196).
 
     Not an :class:`LdapError`: the directory was never asked, and the caller audits it as a refused
-    sign-in, not an outage. ``error_type`` is the refusing exception's class name: a builtin or one
-    pyspnego defines, never chosen by the token. Its message is dropped, because it can quote the
-    token.
+    sign-in, not an outage. ``error_type`` is the class name of whatever the acceptor's step raised.
+    That set is open, since the step catches every exception, but the token never chooses a name.
+    The message is dropped, because it can quote the token.
     """
 
     def __init__(self, error_type: str) -> None:
@@ -1463,6 +1462,28 @@ def _kerberos_context_complete(server: Any) -> bool:
     )
 
 
+def _refusal_diagnostic(exc: BaseException) -> str:
+    """The log form of a refused token: class names and numeric codes, never message text.
+
+    A provider's message can quote the token too. GSSAPI's names the ticket's service principal,
+    which travels in cleartext, so the caller chose it. The codes still tell a bad keytab from a bad
+    token. ``code`` is pyspnego's ``ErrorCode``. ``maj_code``, ``min_code`` and ``winerror`` are the
+    GSSAPI or SSPI status, which an operator can look up.
+    """
+    parts = [type(exc).__name__]
+    code = getattr(exc, "ERROR_CODE", None)
+    if isinstance(code, int):
+        parts.append(f"code={int(code)}")
+    base = getattr(exc, "base_error", None)
+    if isinstance(base, BaseException):
+        parts.append(f"base={type(base).__name__}")
+        for attr in ("maj_code", "min_code", "winerror"):
+            value = getattr(base, attr, None)
+            if isinstance(value, int):
+                parts.append(f"{attr}={value}")
+    return " ".join(parts)
+
+
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     """Complete one SPNEGO server step and return the authenticated sAMAccountName, or ``None``.
 
@@ -1483,26 +1504,27 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
 
     server = _kerberos_acceptor(settings)
     refused: str | None = None
-    principal = None
     try:
         server.step(token)
-        principal = server.client_principal if _kerberos_context_complete(server) else None
     except Exception as exc:
-        # Deliberately broad. step() parses bytes the caller chose, and a list of types is what
-        # BACKLOG #3186 found wanting: pyspnego's wrapper raised StopIteration and KeyError outside
-        # it, and a mutation search later found IndexError too. Any exception here is a refused
-        # token, audited (AUTH-K-AUDIT) instead of an unaudited 500. A StopIteration must not reach
-        # asyncio.to_thread at all, because a Future refuses it.
+        # Deliberately broad, because step() parses bytes the caller chose. A list of types failed
+        # here before (BACKLOG #3186). pyspnego raised StopIteration and KeyError outside it, and a
+        # mutation search later found IndexError. Each was an unaudited 500. A StopIteration must
+        # not reach asyncio.to_thread at all, because a Future refuses it.
         refused = type(exc).__name__
-        # Only the TYPE crosses into the refusal: the parser's messages can quote the token, as
-        # ValueError quotes an unknown mechanism OID the caller chose (BACKLOG #3196). A SpnegoError
-        # carries the provider's own diagnostic instead, and on the wrapper it is the only signal
-        # of a configuration fault such as a missing keytab entry, so its text goes to the log.
-        detail = safe_exc(exc) if isinstance(exc, spnego.exceptions.SpnegoError) else refused
-        logger.warning("Kerberos sign-in refused the SPNEGO token: %s", scrub_log_argument(detail))
+        # No message text crosses, into the refusal or the log. It can quote the token, as a
+        # ValueError quotes a mechanism OID the caller chose (BACKLOG #3196).
+        logger.warning("Kerberos sign-in refused the SPNEGO token: %s", _refusal_diagnostic(exc))
+        # The traceback, for a pyspnego defect that looks like a refusal. DEBUG, as it holds text.
+        logger.debug("Kerberos acceptor step raised", exc_info=True)
     if refused is not None:
         # Raised outside the except block, so neither __cause__ nor __context__ keeps the original.
         raise KerberosTokenRefused(refused)
+    try:
+        principal = server.client_principal if _kerberos_context_complete(server) else None
+    except spnego.exceptions.SpnegoError as exc:
+        # The step took the token, so this is the provider failing, not the caller's token.
+        raise LdapError(f"Kerberos principal read failed: {_refusal_diagnostic(exc)}") from exc
     if not principal:
         return None
     return str(principal).split("@", 1)[0]
