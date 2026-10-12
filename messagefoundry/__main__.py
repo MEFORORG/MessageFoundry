@@ -7873,7 +7873,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 return ("audit-refused", user.username, str(exc))
             try:
                 await store.set_user_notify_email(user.id, email=address)
-            except OSError as exc:
+            except BaseException as exc:
                 # The row above now records a change that did not happen, so say so in the log too.
                 # Whatever the failure was (BACKLOG #1983), Ctrl-C included: the compensating row
                 # must not depend on this command recognising the error, since a missed class
@@ -8231,7 +8231,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     expected_enrolled_at=target.enrolled_at,
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
-            except OSError as exc:  # noqa: BLE001 - read back, then refused or re-raised
+            except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised
                 # Any error may follow the commit, Ctrl-C included, so every one is read back.
                 # Only a store refusal that the re-read confirms becomes a refusal; anything else
                 # is re-raised, after the re-read has said whether the swap landed.
@@ -8268,7 +8268,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     failure: BaseException | None = None
     try:
         refused = run_guarded(run())
-    except OSError as exc:  # noqa: BLE001 - re-raised below unless the swap may have landed
+    except BaseException as exc:  # noqa: BLE001 - re-raised below unless the swap may have landed
         if not (swapped or unknown):
             # Before the swap, but after the key was shown: nothing written, and the new entry
             # in the app has no seed behind it, so the hint goes with every store failure here.
@@ -8342,7 +8342,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     try:
         report["holder_notice"] = run_guarded(notice())
-    except OSError as exc:  # noqa: BLE001 - best effort, after the commit; the swap stands
+    except BaseException as exc:  # noqa: BLE001 - best effort, after the commit; the swap stands
         # Ctrl-C on a slow relay included: the report below must still say the seed was replaced.
         # The class only, as AuthService._notify_security logs it: the text could name the address.
         print(
