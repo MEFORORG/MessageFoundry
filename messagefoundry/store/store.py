@@ -3552,7 +3552,9 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
 )
 
 #: Kinds only the store itself writes, refused from the public ``record_message_event``.
-_STORE_ONLY_EVENT_KINDS: Final[frozenset[str]] = frozenset({VIEWED_EVENT})
+#: ``reply_dropped`` too: it is a floor row, and only ``mark_done`` may write it, with the
+#: delivery it describes (vault BACKLOG #3040 item 5).
+_STORE_ONLY_EVENT_KINDS: Final[frozenset[str]] = frozenset({VIEWED_EVENT, "reply_dropped"})
 
 
 def check_caller_event_kind(event: str) -> None:
@@ -9293,15 +9295,15 @@ class MessageStore:
 
     async def mark_done(
         self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
 
-        async def _body() -> None:
+        async def _body() -> bool:
             # _row is a read; under group-commit it runs inside the batch's BEGIN. A vanished row is an
             # idempotent no-op (zero mutation) — abort without failing the batch.
             row = await self._row(outbox_id)
             if row is None:
-                raise _AbortMember(None)
+                raise _AbortMember(False)
             await self._db.execute(
                 "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
                 (OutboxStatus.DONE.value, now, outbox_id),
@@ -9328,8 +9330,9 @@ class MessageStore:
                     row["message_id"], "reply_dropped", row["destination_name"], reply_dropped, now
                 )
             await self._maybe_finalize_message(row["message_id"], now)
+            return True
 
-        await self._run_grouped(_body)
+        return bool(await self._run_grouped(_body))
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in ONE transaction — the batch counterpart of

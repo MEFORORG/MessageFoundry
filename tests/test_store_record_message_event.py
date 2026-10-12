@@ -87,6 +87,17 @@ async def test_the_reply_dropped_kind_is_declared_and_kept_at_every_verbosity() 
     assert "reply_dropped" in _AUDIT_FLOOR_EVENTS
 
 
+async def test_only_mark_done_writes_reply_dropped(tmp_path: Path) -> None:
+    """A floor row nobody can thin, so the public writer may not plant one."""
+    store = await MessageStore.open(tmp_path / "only.db")
+    try:
+        mid = await store.enqueue_message(channel_id="IB_HTTP", raw=ADT, deliveries=[])
+        with pytest.raises(ValueError, match="written only by the store itself"):
+            await store.record_message_event(mid, "reply_dropped", detail="HTTP 200")
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("verbosity", ["all", "errors", "off"])
 async def test_mark_done_writes_reply_dropped_with_the_delivery(
     tmp_path: Path, verbosity: str
@@ -101,7 +112,11 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(
         mid = await store.enqueue_message(channel_id="IB_HTTP", raw=ADT, deliveries=[("OB_A", ADT)])
         item = await store.claim_next_fifo("OB_A", stage=Stage.OUTBOUND.value)
         assert item is not None
-        await store.mark_done(item.id, reply_dropped="HTTP 200; reply body over the 64-byte bound")
+        wrote = await store.mark_done(
+            item.id, reply_dropped="HTTP 200; reply body over the 64-byte bound"
+        )
+        # A vanished row writes nothing and says so.
+        gone = await store.mark_done("no-such-row", reply_dropped="HTTP 200")
         plain = await store.enqueue_message(
             channel_id="IB_HTTP", raw=ADT, deliveries=[("OB_A", ADT)]
         )
@@ -119,6 +134,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(
         ).fetchall()
     finally:
         con.close()
+    assert (wrote, gone) == (True, False)
     dropped = [(m, d, x) for m, e, d, x in rows if e == "reply_dropped"]
     assert dropped == [(mid, "OB_A", "HTTP 200; reply body over the 64-byte bound")]
     delivered = sorted(m for m, e, _, _ in rows if e == "delivered")

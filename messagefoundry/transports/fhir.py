@@ -57,7 +57,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple, overload
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -1121,9 +1121,6 @@ class FhirDestination(DestinationConnector):
             base, request, {**self._static_conditionals, **extra_headers}, payload
         )
         body, status, headers = self._post(bundle, "POST", base, outer, wrapped=True)
-        if isinstance(body, ReplyBodyDropped):
-            # Unreachable: a wrapped reply is read as needed, so an over-cap one is refused.
-            raise TypeError("a wrapped update's reply body is never dropped")
         captured, outcome = _unwrap_transaction_reply(body, headers, self.capture_response_headers)
         return body, status, captured, outcome
 
@@ -1205,6 +1202,28 @@ class FhirDestination(DestinationConnector):
                 f"FHIR {_redact_url(self.base_url)} sent a malformed HTTP reply "
                 f"({type(exc).__name__})"
             ) from exc
+
+    @overload
+    def _post(
+        self,
+        payload: str,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str],
+        *,
+        wrapped: Literal[True],
+    ) -> tuple[str, int, dict[str, str]]: ...
+
+    @overload
+    def _post(
+        self,
+        payload: str,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str],
+        *,
+        wrapped: bool = False,
+    ) -> tuple[str | ReplyBodyDropped, int, dict[str, str]]: ...
 
     def _post(
         self,

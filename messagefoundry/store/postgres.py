@@ -4619,14 +4619,14 @@ class PostgresStore:
 
     async def mark_done(
         self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(4)  # ADR 0157 C1 — TERMINAL
         try:
             async with self._timed_acquire() as conn, conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
-                    return
+                    return False
                 await self._exec_terminal(
                     conn,
                     "mark_done",
@@ -4668,7 +4668,8 @@ class PostgresStore:
                 await self._maybe_finalize_message(conn, row["message_id"], now)
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)
-            return
+            return False
+        return True
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in ONE transaction — the batch counterpart of

@@ -564,18 +564,24 @@ class _OrderLog(logging.Handler):
             self._order.append("WARNING")
 
 
-def _spy_on_mark_done(store: MessageStore, order: list[str], fail_done: bool) -> None:
+def _spy_on_mark_done(store: MessageStore, order: list[str], done: str) -> None:
     """Wrap ``mark_done`` so each call enters ``order`` once it returns, as ``"mark_done"`` or,
-    when it carries a drop, ``"mark_done+reply_dropped"``. ``fail_done`` makes it raise before it
-    writes anything, as a store fault would, and enters ``"raised"`` instead."""
+    when it carries a drop, ``"mark_done+reply_dropped"``. ``done="raise"`` makes it raise before
+    it writes anything, as a store fault would, and enters ``"raised"``. ``done="noop"`` makes it
+    write nothing and return ``False``, as a vanished row or a fenced write does, and enters
+    ``"noop"``."""
     real_mark_done = store.mark_done
 
-    async def mark_done(*args: Any, **kwargs: Any) -> None:
-        if fail_done:
+    async def mark_done(*args: Any, **kwargs: Any) -> bool:
+        if done == "raise":
             order.append("raised")
             raise OSError("synthetic store fault")
-        await real_mark_done(*args, **kwargs)
+        if done == "noop":
+            order.append("noop")
+            return False
+        wrote = await real_mark_done(*args, **kwargs)
         order.append("mark_done+reply_dropped" if kwargs.get("reply_dropped") else "mark_done")
+        return wrote
 
     store.mark_done = mark_done  # type: ignore[method-assign]
 
@@ -585,9 +591,7 @@ def _spy_on_mark_done(store: MessageStore, order: list[str], fail_done: bool) ->
 _OFFERS = 3
 
 
-async def _deliver(
-    tmp_path: Path, dest: Any, payload: str, *, fail_done: bool = False
-) -> _Delivery:
+async def _deliver(tmp_path: Path, dest: Any, payload: str, *, done: str = "real") -> _Delivery:
     """Queue one outbound row for ``dest`` and offer it to the delivery worker ``_OFFERS`` times."""
     outcomes: list[_ItemOutcome] = []
     order: list[str] = []
@@ -623,7 +627,7 @@ async def _deliver(
             egress=EgressSettings(deny_by_default=False),
         )
         runner._destinations[DEST] = dest
-        _spy_on_mark_done(store, order, fail_done)
+        _spy_on_mark_done(store, order, done)
         worker_logger.addHandler(order_log)
         for offer in range(1, _OFFERS + 1):
             # A day further on each time: past any backoff the last attempt set.
@@ -633,8 +637,8 @@ async def _deliver(
             try:
                 outcome, _ = await runner._process_delivery_item(DEST, item)
             except OSError:
-                # Only fail_done raises. The worker's caller would re-pend the row; this stops.
-                if not fail_done:
+                # Only done="raise" raises. The worker's caller would re-pend the row; this stops.
+                if done != "raise":
                     raise
                 break
             outcomes.append(outcome)
@@ -815,12 +819,37 @@ async def test_no_dropped_body_warning_when_the_store_write_fails(
     with _Partner(200, over_cap_body) as partner:
         dest = _dest(ctype, f"{partner.url}/x", over)
         with caplog.at_level(logging.WARNING):
-            got = await _deliver(tmp_path, dest, _payload(ctype, over), fail_done=True)
+            got = await _deliver(tmp_path, dest, _payload(ctype, over), done="raise")
     assert len(partner.requests) == 1, partner.requests
     assert got.order == ["raised"]
     assert got.row_status == OutboxStatus.INFLIGHT.value
     assert got.dropped_events == []
     assert _RECORDED_AS_DELIVERED not in caplog.text
+
+
+@pytest.mark.parametrize("case", [c for c in _RULED if c[2] == _DELIVERED], ids=_case_id)
+async def test_the_warning_says_so_when_the_store_recorded_nothing(
+    case: tuple[ConnectorType, dict[str, Any], str],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    over_cap_body: bytes,
+) -> None:
+    """``mark_done`` returns ``False`` for a vanished row or a fenced write, and writes nothing.
+    The WARNING follows what it returned, so it does not claim a record (vault BACKLOG #3040
+    item 2). The matrix above is the control: there it returns ``True`` and the line says so."""
+    ctype, over, _ = case
+    with _Partner(200, over_cap_body) as partner:
+        dest = _dest(ctype, f"{partner.url}/x", over)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype, over), done="noop")
+    assert len(partner.requests) == 1, partner.requests
+    assert got.order == ["noop"]
+    assert got.dropped_events == []
+    (warning,) = [r for r in caplog.records if r.name == _WORKER_LOGGER]
+    line = warning.getMessage()
+    assert f"(message {got.message_id}) answered with status 200" in line
+    assert line.endswith("the store recorded nothing: the row was gone or the write was fenced")
+    assert _RECORDED_AS_DELIVERED not in line
 
 
 @pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)

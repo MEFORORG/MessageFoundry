@@ -215,7 +215,6 @@ from messagefoundry.transports import (
 )
 from messagefoundry.transports.base import (
     ConnectionEventSink,
-    DeliveryResponse,
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
@@ -8259,8 +8258,8 @@ class RegistryRunner:
             # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
             # is the single-writer discipline that yields exactly one captured reply per row.
             # A ReplyBodyDropped is a non-capturing delivery too: plain mark_done, which also
-            # writes the drop.
-            if isinstance(response, DeliveryResponse):
+            # writes the drop. Tested by exclusion, so any other reply is captured as before.
+            if response is not None and not isinstance(response, ReplyBodyDropped):
                 # ADR 0013 Increment 2: if this outbound declares reingress_to, the same
                 # capture transaction also produces a Stage.RESPONSE work-row; wake the
                 # re-ingress worker. Read live from the registry (a reload swaps it).
@@ -8311,29 +8310,32 @@ class RegistryRunner:
                 if isinstance(response, ReplyBodyDropped):
                     # vault BACKLOG #3040 items 2 and 5: the partner answered 2xx and its reply
                     # body was dropped over the byte bound. The reply_dropped event commits with
-                    # the DONE flip, and the WARNING is logged only once that write has returned.
+                    # the DONE flip, and the WARNING follows that write and says what it did.
                     # Status, bound and names only.
-                    await self.store.mark_done(
+                    recorded = await self.store.mark_done(
                         item.id,
                         reply_dropped=(
                             f"HTTP {response.status}; reply body over the "
                             f"{response.limit}-byte bound"
                         ),
                     )
+                else:
+                    recorded = await self.store.mark_done(item.id)
+                if self._delivery_phase_timing:
+                    self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
+                if isinstance(response, ReplyBodyDropped):
                     log.warning(
                         "delivery worker %r: outbox row %s (message %s) answered with status %s "
-                        "and a response body over the %d-byte bound; the body is dropped, and the "
-                        "row is recorded as delivered with a reply_dropped event",
+                        "and a response body over the %d-byte bound; the body is dropped, and %s",
                         name,
                         item.id,
                         item.message_id,
                         response.status,
                         response.limit,
+                        "the row is recorded as delivered with a reply_dropped event"
+                        if recorded
+                        else "the store recorded nothing: the row was gone or the write was fenced",
                     )
-                else:
-                    await self.store.mark_done(item.id)
-                if self._delivery_phase_timing:
-                    self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
             # Emit the throttled per-process summary (send_ack vs mark_done) after a delivered row —
             # a no-op between windows. Only on the delivered path (a retried/dead-lettered row records
             # neither phase, so there is nothing new to summarize).

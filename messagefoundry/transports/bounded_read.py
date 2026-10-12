@@ -1492,9 +1492,9 @@ def drain_2xx_reply(
     The alert webhook's drain. Nothing reads its body, so an over-cap body after a 2xx is dropped
     with a WARNING, which carries ``connector``, the status and the bound, and no byte of the
     reply, and the call returns. The WARNING is logged here, because an alert has no message row
-    for a store write to come first. Vault BACKLOG #3040 items 2 and 5 cover deliveries only. Owner ruling
-    2026-10-12 (#3040 item 1) extends the 2026-10-05 principle, "decide by who reads the body",
-    to the alert webhook. Any other status, or none the reader can show, still raises
+    for a store write to come first. Vault BACKLOG #3040 items 2 and 5 cover deliveries only.
+    Owner ruling 2026-10-12 (#3040 item 1) extends the 2026-10-05 principle, "decide by who reads
+    the body", to the alert webhook. Any other status, or none the reader can show, still raises
     :class:`ResponseTooLargeError`.
 
     A function of its own rather than a change to :func:`drain_bounded`, because the connection

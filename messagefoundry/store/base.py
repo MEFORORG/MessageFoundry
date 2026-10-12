@@ -724,12 +724,14 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def mark_done(
         self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
-    ) -> None:
+    ) -> bool:
         """Mark one delivered outbound row ``DONE``, with its ``delivered`` event, in one
         transaction. ``reply_dropped``, when given, is the detail of a ``reply_dropped`` event
         written in the same transaction: the partner answered 2xx and its reply body was over the
         byte bound and dropped (vault BACKLOG #3040 item 5). It carries the status and the bound,
-        never a byte of the reply. A vanished row is a no-op, and writes neither event."""
+        never a byte of the reply. Returns whether this call flipped the row ``DONE``: a vanished
+        row is a no-op that writes neither event, and so is a write the H1 fence rolled back.
+        Both return ``False`` (vault BACKLOG #3040 item 2)."""
         ...
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
