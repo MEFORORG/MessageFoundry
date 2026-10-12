@@ -275,6 +275,7 @@ def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(crl_reload, "_SEEN", {})
     monkeypatch.setattr(crl_reload, "_UNREADABLE", set())
     monkeypatch.setattr(crl_reload, "_FAILED", {})
+    monkeypatch.setattr(crl_reload, "_LABELS", {})
 
 
 @pytest.fixture
@@ -291,11 +292,14 @@ def _accepts(client: ssl.SSLContext, server: ssl.SSLContext) -> bool:
     return True
 
 
-def _reload(pki: _Pki, *, max_reloads: int = MAX_RELOADS) -> ReloadOutcome | None:
+def _reload(
+    pki: _Pki, *, max_reloads: int = MAX_RELOADS, now: float | None = None
+) -> ReloadOutcome | None:
     """One pass, reduced to this test's file. The fixture empties the registry per test, and
-    collecting first drops this test's own contexts that are gone."""
+    collecting first drops this test's own contexts that are gone. ``now`` is the clock the pass
+    judges by, for a test that needs time to have passed."""
     gc.collect()
-    outcomes = reload_replaced_crls(max_reloads=max_reloads)
+    outcomes = reload_replaced_crls(max_reloads=max_reloads, now=now)
     mine = [o for o in outcomes if Path(o.path) == pki.crl.resolve()]
     return mine[0] if mine else None
 
@@ -392,10 +396,14 @@ def test_the_alert_stays_while_any_held_copy_is_not_current(
 # --- a bad replacement is refused and the old copy kept --------------------------------------------
 
 
-def _planted_bundle(pki: _Pki, tmp_path: Path) -> bytes:
+def _planted_ca(tmp_path: Path) -> _Pki:
+    """A second CA, which no hop trusts unless a test gives it that CA's certificate."""
     (tmp_path / "planted").mkdir()
-    planted = _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
-    return planted.ca_pem + _fresher(pki)
+    return _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
+
+
+def _planted_bundle(pki: _Pki, tmp_path: Path) -> bytes:
+    return _planted_ca(tmp_path).ca_pem + _fresher(pki)
 
 
 @pytest.mark.parametrize(
@@ -899,10 +907,8 @@ def test_a_wait_never_outranks_a_context_at_the_cap(pki: _Pki) -> None:
 
 def test_a_wait_never_outranks_a_file_to_fix(pki: _Pki, tmp_path: Path) -> None:
     hop = pki.outbound_hop()
-    (tmp_path / "planted").mkdir()
-    planted = _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
-    pki.crl.write_bytes(planted.ca_pem + future)
+    pki.crl.write_bytes(_planted_ca(tmp_path).ca_pem + future)
 
     outcome = _reload(pki)
 
@@ -1239,3 +1245,327 @@ def test_a_file_to_fix_is_reported_for_a_context_at_the_cap(
     assert outcome is not None and outcome.refusal is not None
     assert outcome.refusal.remedy == remedy
     assert _accepts(hop, pki.server())
+
+
+# --- vault BACKLOG #2866 item 1: a start that cannot stage its private copy -----------------------
+
+
+def _fail_mkdtemp(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(prefix: str) -> str:
+        raise PermissionError(13, "Permission denied", f"C:/tmp/{prefix}random")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", fail)
+
+
+def _fail_the_private_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = Path.write_bytes
+
+    def fail(self: Path, data: bytes) -> int:
+        if self.parent.name.startswith("mefor-crl-"):
+            raise OSError(28, "No space left on device", str(self))
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail)
+
+
+def _scratch_load_raises(monkeypatch: pytest.MonkeyPatch, exc: OSError) -> None:
+    """Make OpenSSL's read of the private copy raise ``exc``."""
+
+    def fail(crl_file: str, blocks: object, *, label: str) -> ssl.SSLContext:
+        raise exc
+
+    monkeypatch.setattr(tls_policy_module, "crl_scratch_context", fail)
+
+
+def _fail_the_private_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    gone = FileNotFoundError(2, "No such file or directory", "C:/tmp/mefor-crl-random/crl.pem")
+    _scratch_load_raises(monkeypatch, gone)
+
+
+@pytest.mark.parametrize(
+    ("fail", "why"),
+    [
+        (_fail_mkdtemp, "Permission denied"),
+        (_fail_the_private_write, "No space left on device"),
+        (_fail_the_private_read, "No such file or directory"),
+    ],
+    ids=["mkdtemp", "write", "read"],
+)
+def test_a_start_that_cannot_stage_its_private_copy_is_a_refusal_that_names_the_file(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, fail: object, why: str
+) -> None:
+    # The private copy is staged only on a context that already holds a CRL, as a built hop does.
+    hop = pki.outbound_hop()
+    harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")  # control: a second load passes
+    assert callable(fail)
+    fail(monkeypatch)
+
+    with pytest.raises(ValueError, match="private copy") as refused:
+        harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+
+    said = str(refused.value)
+    assert said.startswith(f"[tls].crl_file ({str(pki.crl)!r})")  # the setting and the file
+    assert why in said
+    assert "mefor-crl-" not in said  # never the random path, as the reload's reason leaves it out
+    # Still an OSError, so a caller that carries on or retries on one does what it did before.
+    assert isinstance(refused.value, OSError)
+    assert isinstance(refused.value.__cause__, OSError)
+
+
+def test_an_openssl_error_on_the_private_copy_is_not_reworded_as_a_staging_failure(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ``ssl.SSLError`` is an ``OSError``. It is about the bytes, so it must not read as a full disk.
+    hop = pki.outbound_hop()
+    unreadable = ssl.SSLError(ssl.SSL_ERROR_SSL, "[X509] no certificate or crl found")
+    _scratch_load_raises(monkeypatch, unreadable)
+
+    with pytest.raises(ssl.SSLError, match="no certificate or crl found") as passed:
+        harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+    assert passed.value is unreadable and not isinstance(passed.value, ValueError)
+
+
+# --- vault BACKLOG #2866 item 2: a BEGIN marker inside a comment still refuses the file -----------
+
+
+def test_a_begin_marker_inside_a_comment_line_refuses_the_file_and_says_why(
+    pki: _Pki, tmp_path: Path
+) -> None:
+    # Kept on purpose: OpenSSL loads this file's one CRL, and the engine refuses the file anyway.
+    # ``judge_every_crl`` records why, where it counts the markers.
+    crl = pki.crl.read_bytes()
+    commented = b"# the -----BEGIN X509 CRL----- block below is the root CRL\n" + crl
+    assert _openssl_count(tmp_path, commented) == 1
+    # Control: a comment line without the marker is judged, so the marker is what refuses.
+    assert len(judge_every_crl(b"# the block below is the root CRL\n" + crl, now=time.time())) == 1
+
+    with pytest.raises(ValueError, match="does not start a line") as refused:
+        judge_every_crl(commented, now=time.time())
+    assert "cannot tell it from a CRL" in str(refused.value)  # the reason, in the refusal itself
+
+    pki.crl.write_bytes(commented)
+    with pytest.raises(ValueError, match="text in a comment"):
+        pki.outbound_hop()
+
+
+# --- vault BACKLOG #2866 items 3 and 4: a refusal that holds still across passes -------------------
+
+
+def _refusals_logged(caplog: pytest.LogCaptureFixture) -> int:
+    return sum("refused to apply" in r.getMessage() for r in caplog.records)
+
+
+def _assert_refused_for_good(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two passes over the file as it is now. The first refuses it as a file to fix, for good. The
+    second hands that refusal back without judging the bytes again, and logs nothing more."""
+    judged: list[int] = []
+    real = tls_policy_module.judge_crl_bytes
+
+    def spy(pem: bytes, **kwargs: object) -> object:
+        judged.append(len(pem))
+        return real(pem, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(crl_reload, "judge_crl_bytes", spy)
+    caplog.clear()  # a control pass before this one logged its own refusal
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first, second = _reload(pki), _reload(pki)
+
+    assert first is not None and first.refusal is not None
+    assert first.refusal.remedy == FIX and first.refusal.sticky
+    assert second is not None and second.refusal == first.refusal
+    assert len(judged) == 1  # the second pass did not judge the same bytes again
+    assert _refusals_logged(caplog) == 1
+
+
+def test_a_file_openssl_cannot_load_is_refused_for_good_beside_a_copy_that_lapses_first(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # No context can ever take a file OpenSSL will not load. The hop's copy also lapses before the
+    # file's CRL takes effect, which is recorded first and which time can lift. Red before the
+    # fix: that second refusal alone made the pass judge the same bytes again every minute.
+    hop = pki.outbound_hop()
+    late = pki.crl_pem(issued=-7 * _DAY, lasts=60 * _DAY, revoke=True)
+    pki.crl.write_bytes(late)
+    lapses = _reload(pki)
+    # Control: with a file OpenSSL loads, these dates give the refusal that time can lift.
+    assert lapses is not None and lapses.refusal is not None
+    assert lapses.refusal.remedy == LAPSES_FIRST and not lapses.refusal.sticky
+
+    pki.crl.write_bytes(late.replace(b"-----END X509 CRL", b" -----END X509 CRL"))
+    _assert_refused_for_good(pki, monkeypatch, caplog)
+    assert _accepts(hop, pki.server())
+
+
+def test_a_context_that_waits_and_also_fails_a_file_check_is_refused_for_good(
+    pki: _Pki, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The file's CRL is not in effect yet, and it carries a certificate the hop does not trust.
+    # Waiting cannot help this hop: once the wait lifts, the certificate still refuses the file.
+    # Red before the fix, which left the pass open because a wait had been recorded.
+    hop = pki.outbound_hop()
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
+    pki.crl.write_bytes(future)
+    waits = _reload(pki)
+    # Control: without the certificate, the same CRL is a plain wait, retried every pass.
+    assert waits is not None and waits.refusal is not None
+    assert waits.refusal.remedy == WAIT and not waits.refusal.sticky
+
+    pki.crl.write_bytes(_planted_ca(tmp_path).ca_pem + future)
+    _assert_refused_for_good(pki, monkeypatch, caplog)
+    assert _accepts(hop, pki.server())
+
+
+def test_a_file_check_on_one_context_keeps_the_pass_open_for_one_that_only_waits(
+    pki: _Pki, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Two hops hold the file. ``strict`` does not trust the certificate it carries, which no wait
+    # lifts. ``trusting`` does, so only time holds it back, and it must get the file once the CRL
+    # takes effect. A fix refusal that closed the pass whatever else it held would never give it
+    # the file: the pass would hand back the first refusal for good.
+    planted = _planted_ca(tmp_path)
+    both = tmp_path / "both.pem"
+    both.write_bytes(pki.ca_pem + planted.ca_pem)
+    strict = pki.outbound_hop()
+    trusting = build_verifying_client_context(
+        TrustAnchor(cafile=str(both), load_system_roots=False, crl_file=str(pki.crl))
+    )
+    old = crl_fingerprint(pki.crl.read_bytes())
+    pki.crl.write_bytes(planted.ca_pem + pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True))
+    new = crl_fingerprint(pki.crl.read_bytes())
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        waiting = _reload(pki)
+        # Two days on, the CRL is in effect and both held copies are still in date.
+        later = _reload(pki, now=time.time() + (2 * _DAY).total_seconds())
+
+    assert waiting is not None and waiting.reloaded == 0 and waiting.refusal is not None
+    assert waiting.refusal.remedy == FIX and not waiting.refusal.sticky
+    assert later is not None and later.reloaded == 1
+    assert sorted(held.fingerprint for held in held_crl_copies(pki.crl)) == sorted([old, new])
+    # Only ``strict`` is left, refused for good, with the reason it had while the other waited.
+    assert later.refusal == replace(waiting.refusal, sticky=True)
+    assert _refusals_logged(caplog) == 1
+    assert strict.verify_flags & trusting.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_only_a_refusal_that_stops_a_context_or_is_reported_keeps_a_pass_open() -> None:
+    def sticky(*recorded: tuple[str, bool]) -> bool:
+        refusals = crl_reload._Refusals()
+        for remedy, stops in recorded:
+            refusals.add("why", remedy, stops=stops)
+        return refusals.sticky
+
+    assert sticky((FIX, True))  # control: a file to fix, alone
+    # A refusal time can lift, recorded beside a file check that stops the context for good.
+    assert sticky((LAPSES_FIRST, False), (FIX, True))
+    assert sticky((WAIT, False), (BAD_SIGNATURE, True))
+    # A hop at the cap whose copy lapses first, beside a hop that fails a file check. A restart
+    # stops the first whenever the lapse ends, and the file to fix is what is reported.
+    assert sticky((LAPSES_FIRST, False), (RESTART, True), (FIX, True))
+    # Another context is stopped by the wait alone, so the pass stays open for it.
+    assert not sticky((WAIT, False), (FIX, True), (WAIT, True))
+    assert not sticky((RESTART, False), (NO_ISSUER, True))
+    # The refusal reported is one time can lift, though a restart is what stops the context.
+    assert not sticky((LAPSES_FIRST, False), (RESTART, True))
+
+
+# --- vault BACKLOG #3099 item 2: a retried refusal keeps its label --------------------------------
+
+
+def _holder(pki: _Pki, ca_file: Path, name: str) -> ssl.SSLContext:
+    """A hop that trusts ``ca_file`` and holds ``pki``'s CRL under a setting that names it."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cafile=str(ca_file))
+    harden_crl_check(ctx, str(pki.crl), setting=f"outbound connection '{name}' tls_crl_file")
+    return ctx
+
+
+@pytest.mark.parametrize("held_back_by", [RETRY, NO_ISSUER], ids=["a-defect", "unlisted-issuer"])
+def test_a_retried_refusal_keeps_its_label_once_another_holder_takes_the_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, held_back_by: str
+) -> None:
+    """Two hops with different settings share one CRL. The first pass brings one current and
+    refuses the other, and names the file by its path, since the two settings differ. Red before
+    the fix: the second pass read the label from the one hop still stale, so it led with that
+    hop's setting, the reason changed, and the refusal was logged again."""
+    pki, both = _make_intermediate_pki(tmp_path)
+    taker = _holder(pki, both, "takes-it")
+    # The root alone cannot verify the intermediate's CRL, which the reload retries every pass.
+    refused = _holder(pki, pki.ca_file if held_back_by == NO_ISSUER else both, "refused")
+    if held_back_by == RETRY:
+
+        def boom(binary_form: bool = False) -> list[bytes]:
+            raise RuntimeError("a defect in one context")
+
+        refused.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+    pki.crl.write_bytes(_fresher(pki))
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first, second = _reload(pki), _reload(pki)
+
+    assert first is not None and first.reloaded == 1 and first.refusal is not None
+    assert first.refusal.remedy == held_back_by and not first.refusal.sticky
+    assert f"CRL file {str(pki.crl)!r}" in first.refusal.reason, first.refusal.reason
+    assert "takes-it" not in first.refusal.reason and "'refused'" not in first.refusal.reason
+    # The same bytes, judged again with one holder now current: the same refusal, logged once.
+    assert second is not None and (second.reloaded, second.refusal) == (0, first.refusal)
+    assert _refusals_logged(caplog) == 1
+    assert taker.verify_flags & refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_retried_refusal_keeps_its_label_while_a_short_lived_holder_comes_and_goes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One hop is refused and names its setting. A context built later from the file as it is
+    now, under another setting, holds the file for a while and is then collected, as a context
+    built for one send is. Neither changes the label. Red against a label read from every holder
+    on each pass, which turned into the path while that context lived and back when it went."""
+    pki, both = _make_intermediate_pki(tmp_path)
+    refused = _holder(pki, pki.ca_file, "refused")
+    pki.crl.write_bytes(_fresher(pki))
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first = _reload(pki)
+        passing = _holder(pki, both, "passing")  # current from the start: it read the new file
+        beside = _reload(pki)
+        del passing
+        after = _reload(pki)
+
+    assert first is not None and first.refusal is not None
+    assert first.refusal.remedy == NO_ISSUER
+    assert "outbound connection 'refused' tls_crl_file" in first.refusal.reason
+    assert beside is not None and beside.refusal == first.refusal
+    assert after is not None and after.refusal == first.refusal
+    assert _refusals_logged(caplog) == 1
+    assert refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_bytes_put_back_after_a_change_are_named_by_the_hops_that_hold_the_file_now(
+    pki: _Pki,
+) -> None:
+    # The kept label lasts as long as its refusal. Here the refused file is taken away, the hop
+    # that held it goes, and two others load the file. The same bytes put back must be named by
+    # the two hops stale now, so by the path. Red while the label outlived the refusal: it still
+    # read "outbound connection 'gone' tls_crl_file", a setting no hop had any more.
+    original = pki.crl.read_bytes()
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
+    gone = _holder(pki, pki.ca_file, "gone")
+    pki.crl.write_bytes(future)
+    first = _reload(pki)
+    assert first is not None and first.refusal is not None
+    assert "outbound connection 'gone' tls_crl_file" in first.refusal.reason  # control
+
+    pki.crl.write_bytes(original)
+    assert _reload(pki) is None  # every holder is current again, so the refusal is dropped
+    del gone
+    hops = [_holder(pki, pki.ca_file, "one"), _holder(pki, pki.ca_file, "two")]
+    pki.crl.write_bytes(future)
+    again = _reload(pki)
+
+    assert again is not None and again.refusal is not None
+    assert again.refusal.fingerprint == first.refusal.fingerprint  # the same bytes
+    assert f"CRL file {str(pki.crl)!r}" in again.refusal.reason, again.refusal.reason
+    assert "'gone'" not in again.refusal.reason
+    assert len(hops) == 2  # both contexts stay alive, so both hold the file during the pass

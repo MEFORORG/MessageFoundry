@@ -340,6 +340,12 @@ def harden_crl_check(
     (:func:`_refuse_crl_count`), or the hop would be recorded as checking a CRL it never loaded.
     It runs last, after the #1890 check, so a planted certificate is reported as that.
 
+    A fifth, since vault BACKLOG #2866: on a context that already held a CRL, that count needs a
+    private copy of the file, and the copy could not be staged. This one is an ``OSError`` as well
+    as a ``ValueError`` (:class:`_CrlStagingFailed` says why). A caller that carries on past an
+    ``OSError`` must still discard the context, which by then holds the CRL and may not have the
+    check flag set.
+
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
     a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
@@ -413,8 +419,23 @@ def harden_crl_check(
     if before.get("crl", 0) == 0:
         _refuse_crl_count(loaded, blocks, label=label)
     else:
-        with staged_crl(pem) as copy:
-            crl_scratch_context(str(copy), blocks, label=label)
+        try:
+            with staged_crl(pem) as copy:
+                crl_scratch_context(str(copy), blocks, label=label)
+        except ssl.SSLError:
+            # An OSError too, but about the bytes OpenSSL read, so it is not reworded below.
+            raise
+        except OSError as exc:
+            # Vault BACKLOG #2866: the private copy could not be made, written or read. Caught
+            # here, not in ``staged_crl``: the running-hop reload retries that OSError and does not
+            # retry a ValueError. Like the reload's reason, the text leaves out the random path.
+            raise _CrlStagingFailed(
+                f"{label} could not be checked: the engine could not make or read its private "
+                f"copy of the file in its temporary directory "
+                f"({exc.strerror or type(exc).__name__}). That is not a verdict on the file. "
+                "Check that the engine's account can write to its temporary directory, and that "
+                "there is room for the file"
+            ) from exc
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
@@ -517,6 +538,20 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
             "a context would not hold what the engine judged. Write each CRL as a plain PEM block, "
             "with its BEGIN and END lines each starting a line"
         )
+
+
+class _CrlStagingFailed(OSError, ValueError):
+    """:func:`harden_crl_check` could not make, write or read its private copy of a CRL file (vault
+    BACKLOG #2866). The text leads with the setting and the file, as its other refusals do.
+
+    Both bases on purpose, as :class:`CaFileUnreadable` has. It was a bare ``OSError`` before, so a
+    caller catching ``OSError`` still catches it. At least the log forwarder's start does: it
+    carries on without the forwarder, where a plain ``ValueError`` would turn a full temp disk into
+    a refused start. The store counts ``OSError`` as a connect error too. A seam that surfaces a
+    ``ValueError`` as a configuration refusal now gets one that names the file.
+
+    Only the type carries over. ``errno``, ``strerror`` and the ``OSError`` subclass of the cause
+    are not copied, so read those from ``__cause__``."""
 
 
 @contextmanager
