@@ -1929,9 +1929,15 @@ def _clear_of_own_notes(text: str, kept: int) -> int:
 
     **The result does not always hold one count (vault BACKLOG #3034).** This sentence read "so the
     result ends in one count", and that was false. A note that closes before the cut, with other text
-    after it, is not touched here. It stays in the kept head, and the result then holds that count and
-    the new one. ``tests/test_redaction.py`` pins both halves under *what a second cut does to an
-    earlier note*.
+    after it, stays in the kept head unless that text itself ends on the closer at the cut. The result
+    then holds that count and the new one. ``tests/test_redaction.py`` pins it under *what a second
+    cut does to an earlier note*, and ``docs/PHI.md``, *The store's 200-character bound*, is the
+    operator's statement.
+
+    **The two checks run once each, in that order.** So the count check can move the cut back into a
+    bound note the first check already passed, and part of that note is then kept. Measured on text a
+    peer can write: a count opener inside a bound note. Found while building vault BACKLOG #3034, not
+    fixed, and unfiled when this was written.
 
     Residuals, at least these. Only the last opener of each kind before the cut is read. One a peer
     wrote, with no closer after it, moves the cut back as far as itself, possibly to nothing. That
@@ -1973,14 +1979,14 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
     ordinary case, so the ordinary result is byte-identical to its pre-#1576 self.
 
-    **Both counts describe the text THIS call was handed, earlier notes included (vault BACKLOG
-    #3034).** The store calls this again on a value an emit site already bounded. ``N`` is then how
-    much of that bounded value this call held back, and an earlier note it dropped is counted as plain
-    characters. It is NOT how much of the original text the result lacks. An earlier bound note the
-    cut drops takes its unscanned figure with it, and this call writes none of its own unless its own
-    input passed the window. Measured: a first result ending ``(+65334 chars) [redaction bound:
-    dropped 4_468 more chars unscanned]``, cut again at 200, ends ``(+81 chars)``. Neither earlier
-    number is carried forward, because that would mean parsing a number out of text a peer can write.
+    **Both counts are about THIS call's input (vault BACKLOG #3034).** The store calls this again on a
+    value an emit site already bounded, and an earlier note this call drops counts as plain
+    characters. So ``N`` is NOT how much of the original text the result lacks, and a dropped bound
+    note takes its unscanned figure with it. Neither earlier number is carried forward, because that
+    would mean parsing a number out of text a peer can write. ``docs/PHI.md``, *The store's
+    200-character bound*, states the rule; ``tests/test_redaction.py`` pins a first result ending
+    ``(+65334 chars) [redaction bound: dropped 6_001 more chars unscanned]`` that ends ``(+81
+    chars)`` after a second cut at 200.
 
     **It is not strictly idempotent, and the known exceptions all only add redaction or shorten the
     text.** At least these: a truncated result re-truncates with a new ``(+N chars)`` count; the

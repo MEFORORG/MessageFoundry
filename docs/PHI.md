@@ -826,19 +826,22 @@ per tier which of those its code provides, and an operator carries the rest
   held back. When its own input is over its 64 KiB scan window, it also appends a
   `[redaction bound: dropped N more chars unscanned]` marker. So a stored value can be longer than
   200 characters, by the length of those notes. Each column is `TEXT` on SQLite and Postgres and
-  `NVARCHAR(MAX)` on SQL Server, so no declared width can overflow. The count is per call. It
-  covers the text that call was handed, earlier notes included. Text an earlier call already
-  bounded, such as an emit site's `safe_exc()`, is cut again here, so on such a value N is not how
-  much of the original text the stored value lacks. An earlier note or marker that ends before the
-  new cut is kept whole, so a stored value can hold two counts. The one exception is a count note
-  the kept text would end on: it is dropped. A note or marker the cut would split, or one past
-  the cut, is dropped whole too. Each dropped one is counted inside N as plain characters, and
-  neither earlier number is carried forward. So a dropped marker takes its unscanned figure with
-  it, and a stored value with no marker does not show that every character was scanned. The
-  opening text of a count or marker with no closing text before the cut is read as a split note,
-  whoever wrote it. So text a peer writes can end a stored value early, at least by quoting such an
-  opening. Everything after it is dropped and counted. That drops more text and never keeps more
-  (vault BACKLOG #3034). A note the scrubber itself rewrote, the BACKLOG #2079 case
+  `NVARCHAR(MAX)` on SQL Server, so no declared width can overflow. The count is per call, and
+  an earlier note in the text a call is handed counts as plain characters. Text an earlier call
+  already bounded, such as an emit site's `safe_exc()`, is cut again here, so on such a value N is
+  not how much of the original text the stored value lacks. An earlier note or marker that ends
+  before the new cut, with other text after it, is most often kept whole, so a stored value can
+  hold two counts. An earlier count note is dropped, at least, when the kept text would end on
+  it, or on other text that ends the way a count note does. A note or marker the cut would split,
+  or one past the cut, is dropped too. Each dropped one is counted inside N, and neither earlier
+  number is carried forward. So a dropped marker takes its unscanned figure with it, and a stored
+  value with no marker does not show that every character was scanned. The opening text of a
+  count or marker with no closing text before the cut is read as a split note, whoever wrote it.
+  So text a peer writes can end a stored value early, at least by quoting such an opening.
+  Everything after it is dropped and counted. That drops more text and never keeps more. Only the
+  last opening of each kind before the cut is read, so text a peer writes can also leave part of
+  a marker in a stored value, measured with a count opening written inside a marker (vault
+  BACKLOG #3034). A note the scrubber itself rewrote, the BACKLOG #2079 case
   `safe_text` names, is not recognised and can still be kept in part. Other `safe_text()`
   columns, such as `message_events.detail`, get the same default limit of 200; these three pass it
   explicitly. Until BACKLOG #1797 the store sliced `safe_text(x)[:200]` instead. Once `safe_text`
@@ -1579,7 +1582,9 @@ first 64 KiB of a text, and the delimiter sniff reads only what they read. Those
 `safe_text()`, `safe_exc()` and `redact_untrusted()`. When that bound drops the MSH that declares a
 feed's delimiters, a custom-delimiter run in the kept text is not scrubbed. An unbounded `redact()`
 over the same text would scrub it. So on a first deployment, a diagnostic over 64 KiB that quotes
-such a feed, with the header past the bound, would keep those field values in the log or the store.
+such a feed would keep those field values in the log or the store, whenever the bound drops the
+header. A header just inside the 64 KiB mark is dropped as well as one past it, because the cut
+falls back to whitespace and can leave room for its own marker.
 Text in the default `| ^ ~ &` delimiters is not affected, because the scan matches those with no
 header. Reading the header from the whole text would close the gap. It would also undo the scan
 bound of BACKLOG #1576, which is why the gap is accepted. The convention above remains the control

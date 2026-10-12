@@ -2815,16 +2815,18 @@ def test_a_second_cut_counts_the_text_it_was_handed_and_can_drop_the_unscanned_m
     original text the stored value lacks, and the first call's unscanned marker goes with the cut.
     Carrying either number forward would parse a number out of text a peer can write.
 
-    THE CONTROL: the first result does carry both notes, and its own count is the larger one."""
+    The first result is a ``redact`` fixed point under the scan window, so kept plus count is its
+    whole length here. That sum is not a general rule: a scrub changes lengths, and text past the
+    window is in the marker's figure instead.
+
+    THE CONTROL: the first result does carry both notes, with the figures ``safe_text`` quotes."""
     first = safe_exc(ValueError("ab " * (redaction._REDACT_WINDOW // 3 + 2_000)))
-    assert redaction._BOUND_OPENER in first and len(first) > 200, "no control"
-    first_count = int(first.partition(redaction._COUNT_OPENER)[2].partition(" ")[0])
+    assert first.endswith(f"{_count_note(65_334)} {redaction._clamp_marker(6_001)}"), "no control"
+    assert redact(first) == first and len(first) > 200
     stored = safe_text(first, limit=200)
-    head, opener, rest = stored.partition(redaction._COUNT_OPENER)
-    assert opener and rest.endswith(redaction._COUNT_CLOSER), stored
-    count = int(rest.removesuffix(redaction._COUNT_CLOSER))
-    assert len(head) + count == len(first)
-    assert count < first_count
+    assert stored.endswith(_count_note(81)) and len(stored) - len(_count_note(81)) + 81 == len(
+        first
+    )
     assert redaction._BOUND_OPENER not in stored
 
 
@@ -2843,7 +2845,8 @@ def test_an_unclosed_opener_a_peer_wrote_ends_the_kept_text_at_itself(opener: st
     assert redact(text) == text
     assert redaction._whole_token_prefix(text, 200) > len(lead) + len(opener) + 1, "no control"
     assert safe_text(text, limit=200) == lead + _count_note(len(text) - len(lead))
-    assert safe_text(text[:150], limit=200) == text[:150]
+    short = f"{lead} {opener} {_plain_words(100)}"  # ends on a token: safe_text strips whitespace
+    assert safe_text(short, limit=200) == short
 
 
 # --- BACKLOG #1848: a whole-text dependency the clamp cannot hold ------------------------------------
