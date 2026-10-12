@@ -2772,8 +2772,9 @@ identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
 **rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
-opt-out**: when the instance is **exposed** (an off-loopback bind, or a declared TLS-terminating
-proxy, `[api].tls_terminated_upstream`) with `require_mfa` *turned off*, `serve` makes the
+opt-out**: when the instance is **exposed** (an off-loopback bind, a declared TLS-terminating
+proxy (`[api].tls_terminated_upstream`), or a set `[api].trusted_proxies`; vault BACKLOG #2251)
+with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** under `[security].enforcement = enforce`, the
 default in every environment, and **warns** otherwise or where
 `[security].allow_single_factor_admin_when_exposed` is set, mirroring the keyless-store and
