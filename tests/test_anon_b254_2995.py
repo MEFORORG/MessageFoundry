@@ -27,10 +27,9 @@ from tee.anon import surrogates as tee_surrogates
 
 # The depth table is the scanner loader's own, so the two loaders are held to one set of places.
 # A place is ``module_file.parents[n]``; ``_IMPORT_ROOT`` is the one a token file may be read from.
-from tests.test_anon_b193_2344 import _CHECKOUT_GUARD, _IMPORT_ROOT, _WRONG_PLACES
+from tests.test_anon_b193_2344 import _CHECKOUT_GUARD, _IMPORT_ROOT, _WRONG_PLACES, _module_file
 
 _TOKEN_PARTS = ("scripts", "security", "scan-tokens.local.txt")
-_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _BOTH = pytest.mark.parametrize(
     "module", [engine_surrogates, tee_surrogates], ids=["engine", "tee"]
@@ -51,13 +50,13 @@ def no_token_variable(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 def _stand_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> Path:
-    """Make ``module`` believe it lives under a made-up import root with two folders above it."""
+    """Make ``module`` believe it lives in the scanner tests' made-up tree, so the shared depth
+    table indexes one layout. Only the folders above the file matter to the loader, so that
+    tree's ``leak.py`` file name is left as it is."""
     package = "tee" if module is tee_surrogates else "messagefoundry"
-    path = tmp_path / "above2" / "above1" / "root" / package / "anon" / "surrogates.py"
-    path.parent.mkdir(parents=True)
-    path.write_text("", encoding="utf-8")
-    monkeypatch.setattr(module, "__file__", str(path))
-    return path
+    module_file = _module_file(tmp_path, package)
+    monkeypatch.setattr(module, "__file__", str(module_file))
+    return module_file
 
 
 def _plant(folder: Path, prefix: str) -> str:
@@ -148,4 +147,5 @@ def test_the_variable_still_wins_over_the_token_file(
 def test_the_import_root_of_each_module_is_this_checkout(module: ModuleType) -> None:
     """In a source checkout the one path each loader builds sits under the repository root, beside
     the scanner that reads the same file. Nothing here opens the token file itself."""
-    assert Path(str(module.__file__)).resolve().parents[_IMPORT_ROOT] == _REPO_ROOT
+    import_root = Path(str(module.__file__)).resolve().parents[_IMPORT_ROOT]
+    assert import_root.joinpath(*_TOKEN_PARTS).with_name(_CHECKOUT_GUARD.name) == _CHECKOUT_GUARD

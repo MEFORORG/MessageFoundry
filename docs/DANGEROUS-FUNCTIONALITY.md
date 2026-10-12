@@ -140,9 +140,9 @@ these: `auth/ldap.py` probes two `pyspnego` modules to learn whether Kerberos is
 builds that path from its own location and searches no other folder. In a source checkout the
 folder is the repository root, so the file is the repository's own scanner. From an installed wheel
 the folder is the one that holds the installed package files, normally `site-packages`. The wheel
-ships no such file, so the leak check refuses to run there. The leak check needs a source checkout,
-or an editable install made from one (`pip install -e .`), where that folder is the repository
-root. A file at that path in a folder above
+ships no such file, so the leak check refuses to run there. So the leak check runs only when the
+package is imported from a source checkout, which an editable install (`pip install -e .`) also
+gives. A file at that path in a folder above
 the install is never read. Whoever can write the folder that holds the package can already change
 what the process imports, so that folder is the limit. The loader serves the de-identification
 leak check only, and is not on the message path.
