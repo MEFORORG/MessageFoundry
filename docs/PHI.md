@@ -2160,10 +2160,10 @@ What the `date` kind does to a value:
   because a rule maps it, so nothing refuses these. A message that declares a digit or one of
   `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no numeric
   `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
-  least a value such as `000-12-3456` would still leave whole: the message itself splits it
-  across `OBX-5`, `OBX-6` and `OBX-7`, and each part is kept. The coded types `ID`, `IS`, `CE`
-  and `CWE` are not changed: a single word under one of them, such as a surname, would still
-  leave whole.
+  least a value such as `000-12-3456` would still leave whole. The message itself splits it
+  across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no rule maps the
+  other two fields. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
+  under one of them, such as a surname, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
   kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
