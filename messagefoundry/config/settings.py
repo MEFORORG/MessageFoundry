@@ -2135,7 +2135,11 @@ class SandboxSettings(_Section):
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
     wall_seconds: float = Field(default=5.0, gt=0)
-    # POSIX-only RLIMIT_AS address-space cap (MiB) inside the child (no-op on Windows). None disables it.
+    # POSIX-only memory cap (MiB) inside the child (no-op on Windows). None disables it. On Linux it is
+    # HEADROOM above the loaded graph: RLIMIT_DATA at the worker's VmData after load_config, plus this,
+    # with MALLOC_ARENA_MAX=2 so thread arenas cannot keep spending it.
+    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it dead-letters and its
+    # worker is recycled (ADR 0087, amendment of 2026-10-11).
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
