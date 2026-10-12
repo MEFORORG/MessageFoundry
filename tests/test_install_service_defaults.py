@@ -273,8 +273,11 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
         "'engine-1.example.org', '3par-mgmt', '10.0.0.1x', '1e5' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
         "    bad = @('127.0.0.1 --host 0.0.0.0', '\"127.0.0.1\"', '', '-x', 'a..b', 'a_b', '0', "
-        "'1.2', '0x0', '127.0.0.010', 'a.1', '::1%PATH%', 'fe80::1%TEMP%', 'host%1' |"
+        "'1.2', '0x0', '127.0.0.010', 'a.1', '::1%PATH%', 'fe80::1%TEMP%', 'host%1', "
+        "'fe80::1%١٢' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
+        # Empty is the interpreter not found, which a later, clearer refusal names.
+        "    empty = try { Assert-NoNssmExpansion ''; 'passed' } catch { $_.Exception.Message }\n"
         "  } | ConvertTo-Json -Compress\n"
     )
     got = json.loads(
@@ -294,7 +297,9 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
         # not widen the bind, and a name that does not resolve fails at start.
         "good": [True] * 10,
         # nssm expands %NAME% at start, and PowerShell 7's IPAddress.TryParse takes a named zone.
-        "bad": [False] * 14,
+        # A zone of non-ASCII digits is refused too: .NET's \d would match it.
+        "bad": [False] * 15,
+        "empty": "passed",
     }
 
 
@@ -505,10 +510,12 @@ def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> N
 
 def test_a_path_nssm_expands_is_refused_with_percent_before_anything_acts() -> None:
     """nssm expands %NAME% at start in the interpreter path, the working directory and the log
-    paths under -DataDir, as it does in the arguments."""
+    paths under -DataDir, as it does in the arguments, and the SCM expands the image path."""
     text = _text()
     check = text.index(
-        "foreach ($stored in @($PythonExe, $AppDirectory, $DataDir)) { Assert-NoNssmExpansion $stored }"
+        "foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir)) "
+        "{ Assert-NoNssmExpansion $stored }"
     )
+    assert text.index("$NssmDir = Resolve-AbsolutePath $NssmDir") < check
     assert text.index("$PythonExe = Get-EngineInterpreter") < check
     assert check < text.index("$NssmPath = Resolve-Nssm")

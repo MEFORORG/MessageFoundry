@@ -103,9 +103,10 @@ def test_the_guard_trips_on_every_unstubbed_service_call(
     proved on Linux too."""
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(svc, "install_script_path", lambda: Path("install-service.ps1"))
-    # The CLI passes --config as an absolute host path, which on Linux is not a Windows path, so
+    # The CLI passes --config as an absolute host path, which off Windows is not a Windows path, so
     # the install row would stop at the path check before the elevation this test is about.
-    monkeypatch.setattr(svc, "_install_params", lambda *_a, **_k: "")
+    if os.name != "nt":
+        monkeypatch.setattr(svc, "_install_params", lambda *_a, **_k: "")
     if state is not None:
         monkeypatch.setattr(svc, "service_state", lambda name: state)
 

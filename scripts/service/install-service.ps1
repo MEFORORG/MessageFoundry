@@ -1311,7 +1311,7 @@ function Assert-NoNssmExpansion {
       working directory and log paths as expandable strings and expands %NAME% at start, so the
       service would use a path other than the one this installer checked (vault BACKLOG #2626).
     #>
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
     if ($Path.Contains('%')) { throw "A path nssm stores for the service cannot contain '%': $Path" }
 }
 
@@ -1375,12 +1375,13 @@ function Test-ListenHost {
       ::1%PATH%, so a named one would reach the service as more arguments.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
-    if ($Value -notmatch '^(?=.{1,253}\z)[A-Za-z0-9.:-]+(%\d{1,10})?\z') { return $false }
+    # [0-9], not \d: .NET's \d also matches other scripts' digits.
+    if ($Value -notmatch '^(?=.{1,253}\z)[A-Za-z0-9.:-]+(%[0-9]{1,10})?\z') { return $false }
     $parsed = $null
     if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) {
         if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { return $true }
         # No leading zero: the resolver reads '010' as octal.
-        return $Value -match '^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}\z'
+        return $Value -match '^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}\z'
     }
     $label = '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
     return $Value -match "^($label\.)*(?![0-9]+\z)(?!0[xX])$label\z"
@@ -1502,8 +1503,12 @@ $AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config $(Forma
 # #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
 if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }
 if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
-# The paths nssm stores outside the arguments; the log paths sit under -DataDir.
-foreach ($stored in @($PythonExe, $AppDirectory, $DataDir)) { Assert-NoNssmExpansion $stored }
+# The paths stored outside the arguments: the log paths sit under -DataDir, and the SCM expands the
+# image path, which names nssm.exe in -NssmDir. An empty $PythonExe is refused further down.
+foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir)) { Assert-NoNssmExpansion $stored }
+
+# Before the lock check below, which would report a missing -Config only as a folder it cannot read.
+if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
 
 # --- what -LockConfigDir may lock (vault BACKLOG #2626) ------------------------------------------------
 # Set-SecureConfigAcl re-owns everything below the folder it locks, so it must never reach these.
@@ -1568,7 +1573,6 @@ if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf))
         "messagefoundry.exe launcher. Pass -PythonExe with the python.exe of the install the " +
         "engine is in (docs/SERVICE.md 'The service launch').")
 }
-if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
 if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Leaf)) {
     throw "Service settings file not found at: $ServiceConfig"
 }
