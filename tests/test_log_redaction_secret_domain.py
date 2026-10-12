@@ -3431,3 +3431,77 @@ def test_the_percent_escape_start_grows_linearly_in_line_length() -> None:
                     f"{module.__name__}.{name} grew {growth:.1f}x for 8x the length on "
                     f"{shape(16)!r}, against {control_growth:.1f}x for the quadratic control"
                 )
+
+
+# --- BACKLOG #3038: a token-family label written as a quoted key ---------------------------------
+
+#: A synthetic credential, under ``_LONG_B64``'s length and holding "-" and "_".
+_QK_VALUE = "zq-Qkey_Val-38"
+
+#: The token-family keys: every ``_TOKEN_WORDS`` member, and one reached through the prefix.
+_QK_KEYS = (*scrub_mod._TOKEN_WORDS, "access_token")
+
+
+def _quoted_key_lines(key: str) -> list[str]:
+    """``key`` as a double-quoted JSON key with and without a space, and as a single-quoted dict key,
+    plus a basic-scheme value under it."""
+    return [
+        '{"' + key + '": "' + _QK_VALUE + '", "n": 1}',
+        '{"' + key + '":"' + _QK_VALUE + '"}',
+        "{'" + key + "': '" + _QK_VALUE + "'}",
+        '{"' + key + '": "Basic ' + _QK_VALUE + '"}',
+    ]
+
+
+@pytest.mark.parametrize("key", _QK_KEYS)
+def test_a_token_family_quoted_key_is_read_as_a_label(key: str) -> None:
+    """The closing quote of a JSON or dict key sat between the token label and its colon, and
+    ``_BEARER`` took no quote there, so the value printed on both scrub surfaces. The label is kept,
+    so a reader still sees which credential it was."""
+    for line in _quoted_key_lines(key):
+        for surface, apply in _SWALLOW_SURFACES:
+            out = apply(line)
+            assert _QK_VALUE not in out, f"{surface}: {out!r}"
+            assert key in out, f"{surface}: the label was lost -- {out!r}"
+
+
+def _without_the_quoted_token_head(module: ModuleType) -> dict[str, re.Pattern[str]]:
+    """``module``'s five stopped patterns with the quote taken back out of ``_LABEL_HEAD``'s token
+    alternate, and ``_BEARER`` left as shipped."""
+    head = module._LABEL_HEAD
+    if module is scrub_mod:
+        token = scrub_mod._alternation(scrub_mod._TOKEN_WORDS) + ")"
+    else:
+        token = "bearer|authorization|token|session|api[_-]?key)"
+    quoted = token + r"\b(?:['\"]\s*+:|\s*+[:=])"
+    assert head.count(quoted) == 1, f"{module.__name__}: the token alternate moved"
+    old_head = head.replace(quoted, token + r"\b\s*+[:=]")
+    patterns: dict[str, re.Pattern[str]] = {}
+    for name in _STOPPED_PATTERNS:
+        pattern: re.Pattern[str] = getattr(module, name)
+        patterns[name] = re.compile(pattern.pattern.replace(head, old_head), pattern.flags)
+    return patterns
+
+
+def test_a_later_quoted_token_key_still_stops_a_plain_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_LABEL_HEAD`` takes the same quote, so a plain value before a quoted token key stops there
+    and the key's own pattern reads it. THE CONTROL: with the quote taken back out of that head
+    alone, the plain value runs over the key and its value prints."""
+    line = 'api_token=x;session":"vq1 vq2"'
+    for surface, apply in _SWALLOW_SURFACES:
+        assert "vq1" not in apply(line), surface
+    for module in (scrub_mod, redact_mod):
+        for name, pattern in _without_the_quoted_token_head(module).items():
+            monkeypatch.setattr(module, name, pattern)
+    assert all("vq1" in apply(line) for _surface, apply in _SWALLOW_SURFACES), "control"
+
+
+def test_a_token_quoted_key_takes_no_braced_value() -> None:
+    """``_BEARER`` still takes no braced value (BACKLOG #2966): a dict under a quoted ``session`` key
+    loses only its "{", exactly as the bare ``session={...}`` shape does."""
+    for key_shape in ('{"session": ', "session="):
+        line = key_shape + '{"u": "x"} tail'
+        out = scrub_credentials(line)
+        assert out.endswith(f'session={CREDENTIAL_PLACEHOLDER}"u": "x"}} tail'), out

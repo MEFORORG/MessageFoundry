@@ -135,7 +135,7 @@ _LABEL_HEAD = (
     r"(?=(?i:[abceipst]))"
     r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
     r"|intake_api_key_next)\b['\"]?\s*+[:=]\s*+"
-    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b\s*+[:=]\s*+"
+    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b(?:['\"]\s*+:|\s*+[:=])\s*+"
     r"(?:(?i:bearer|basic|digest)\s++)?"
     r")"
 )
@@ -281,10 +281,12 @@ _PLAIN_SCHEME_VALUE = (
 # the AUTH SCHEME rather than the credential, so "Authorization: Bearer <tok>" redacted the word
 # "Bearer" and emitted <tok> verbatim. Making the group optional keeps the plain "token=<tok>" shape
 # working. A QUOTED value is taken whole when ``_GUARDED_QUOTED_VALUE`` allows it, and a BRACED one
-# never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote.
+# never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote. A
+# QUOTED KEY is a label when a colon follows the quote, here and in ``_LABEL_HEAD`` (BACKLOG #3038);
+# why the colon only is on the same pattern in ``messagefoundry/secretscrub.py``.
 _BEARER = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
-    r"\s*[:=]\s*(?:(?i:bearer|basic|digest)\s+)?"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?i:bearer|basic|digest)\s+)?"
     r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
 )
 

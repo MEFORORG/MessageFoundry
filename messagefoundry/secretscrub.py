@@ -496,11 +496,13 @@ _KEYWORD_INITIALS = "".join(
     sorted({word[0] for word in _CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS + _TOKEN_WORDS})
 )
 #: A label up to where its value starts: the keyword, an optional quote, the ":" or "=", and an auth
-#: scheme word after a token label.
+#: scheme word after a token label. A token label takes the quote only before ":"; ``_BEARER`` says
+#: why.
 _LABEL_HEAD = (
     r"(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
     r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b['\"]?\s*+[:=]\s*+"
-    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b\s*+[:=]\s*+(?:(?i:bearer|basic|digest)\s++)?"
+    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b(?:['\"]\s*+:|\s*+[:=])\s*+"
+    r"(?:(?i:bearer|basic|digest)\s++)?"
     r")"
 )
 _MEFOR_LABEL_HEAD = r"\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
@@ -643,9 +645,20 @@ _PLAIN_SCHEME_VALUE = (
 #
 # A QUOTED value is taken whole when :data:`_GUARDED_QUOTED_VALUE` allows it, and a BRACED one never;
 # the reason is on ``_CREDENTIAL_KV``. Otherwise the plain class takes the value up to its first quote.
+#
+# A QUOTED KEY IS A LABEL (BACKLOG #3038). A quote after the label, then a colon, reads a JSON or dict
+# key, ``{"access_token": "v"}``; without it the closing quote stopped the match and the value
+# printed. ONLY BEFORE A COLON, unlike the other families, which take a quote before "=" too. Taking
+# ``'=`` here as well printed 147 value atoms the patterns before it hid, in
+# ``test_the_change_prints_no_value_the_pre_change_patterns_hid``: a token label in a ``'label'=``
+# echo then ran its plain value over a later key-material label. JSON and dict keys end in a colon,
+# so the colon form is the whole of #3038. :data:`_LABEL_HEAD` takes the same form, so a later quoted
+# token key still stops a plain value. The match is rewritten as ``label=<placeholder>``, as every
+# family's is, so the JSON shape is not kept. It takes no braced value: ``{"session": {"u": 1}}``
+# loses only its "{", exactly as ``session={"u": 1}`` does.
 _BEARER = re.compile(
     r"(?i)" + _LABEL_START + r"(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
-    r"\s*[:=]\s*(?:(?:bearer|basic|digest)\s+)?"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?:bearer|basic|digest)\s+)?"
     r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
 )
 
