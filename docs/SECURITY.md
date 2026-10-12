@@ -3809,9 +3809,9 @@ The dual-control release re-checks the requester's standing too.
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235) describes that
 check and its directory gap.
 
-Two long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
+Three long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
 the route's permissions, no pending password change, a met second factor and a notification address
-on file. Neither asks again for a fresh step-up, the client-network check or the new-address check;
+on file. None asks again for a fresh step-up, the client-network check or the new-address check;
 those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
@@ -3846,6 +3846,15 @@ on that session, for example) ends it as a revocation would.
   stops reading or a store read is slow, the session sits idle. A single stall of about three
   quarters of the idle window can be enough. The next row's check then ends the session and the
   export.
+- The audit export (`GET /audit/export`, and the console's `/ui/audit/export`, which passes its
+  cookie session) asks before every page of up to 1,000 rows, not every row. A page is one store
+  read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the
+  bulk export bullet above says, with the reason `standing_changed`. The pages are read with the
+  identity the export started with. A caller that may now read fewer rows, as after losing
+  `users:manage`, would still receive the lock rows. So that stops it too, with the reason
+  `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  the reason, then aborts the transfer. The idle clock moves as the bulk export's does, at most
+  every quarter of the window.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
