@@ -117,6 +117,14 @@ def _covered_cells(tree: ast.AST) -> set[tuple[str, str]]:
             # BACKLOG #2593: the queue payload's tag has its own builder, not a cell_aad literal.
             found.add(("queue", "payload"))
             continue
+        # BACKLOG #2593: a message cell's and a preset's tags have their own builders too.
+        if name == "preset_criteria_aad":
+            found.add(("search_presets", "criteria"))
+            continue
+        if name == "message_cell_aad":
+            if node.args and isinstance(node.args[0], ast.Constant):
+                found.add(("messages", str(node.args[0].value)))
+            continue
         if name != "cell_aad" or len(node.args) < 2:
             continue
         table, column = node.args[0], node.args[1]

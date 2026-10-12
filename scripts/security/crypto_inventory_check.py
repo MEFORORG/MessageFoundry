@@ -509,6 +509,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: builds the AES-GCM associated data a queue payload cell is sealed under (the
     # row's routing fields) and opens the cell through the store cipher seam. No key of its own.
     "messagefoundry/store/queue_tag.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #2593: builds the AES-GCM associated data a message cell (bound to its channel) and a
+    # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
+    # cipher seam. No key of its own.
+    "messagefoundry/store/cell_tag.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -1355,6 +1359,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
     # tag its row's routing fields build.
     "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()"}),
+    # BACKLOG #2593: opens a message cell or a preset's criteria (AES-GCM decrypt through the store
+    # cipher) under the tag its row's id and channel or owner build.
+    "messagefoundry/store/cell_tag.py": frozenset({"cipher:.decrypt()"}),
     # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
     # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
     # sha256) by store.crypto._install_key.
@@ -1419,6 +1426,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.crypto",
             # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
             "cipher:via messagefoundry.store.queue_tag",
+            # BACKLOG #2593: message cells and preset criteria open under their row tag.
+            "cipher:via messagefoundry.store.cell_tag",
             "compare:hmac.compare_digest",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
