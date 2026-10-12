@@ -43,7 +43,9 @@ it. The live context then loads a private copy of the judged bytes in a director
 can write, never the operator's file a second time. There is no check after the live load: a certificate
 count read then races the lazy loading of a hashed root directory, and nothing found there could be
 undone anyway. A refusal is logged at ERROR once per file version and recorded, so the expiry monitor
-says why the hop's copy is still old. The old copy keeps its ``crl_expiry`` alert.
+says why the hop's copy is still old. The old copy keeps its ``crl_expiry`` alert. That alert speaks
+only once the held copy nears its ``nextUpdate``, so :class:`CrlReloadRunner` also raises
+``crl_reload_refused`` for the refusal itself, once per file version (vault BACKLOG #2904).
 
 **One refusal is reported per file, the strongest.** Hops holding one file can need different things.
 A file to fix outranks a restart, and both outrank a wait (:data:`_PRECEDENCE`), because waiting would
@@ -90,6 +92,7 @@ public CA certificates, never key material or message content.
 from __future__ import annotations
 
 import asyncio
+import binascii
 import contextlib
 import datetime
 import functools
@@ -108,11 +111,13 @@ from messagefoundry.config.loaded_crls import (
     ReloadRefusal,
     clear_reload_refusal,
     crl_fingerprint,
+    crl_path_key,
     has_held_copies,
     held_contexts,
     prune_reload_refusals,
     record_reload_refusal,
     reload_refusal,
+    reload_refusals,
     replace_held_copy,
 )
 from messagefoundry.config.tls_policy import (
@@ -123,10 +128,13 @@ from messagefoundry.config.tls_policy import (
     judge_crl_bytes,
     staged_crl,
 )
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.intake_bound import process_alert_subject
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
 from messagefoundry.redaction import log_timestamp
 
 __all__ = [
+    "ALERT_PATH_MAX_LENGTH",
     "BAD_SIGNATURE",
     "FIX",
     "LAPSES_FIRST",
@@ -139,6 +147,7 @@ __all__ = [
     "WAIT",
     "CrlReloadRunner",
     "ReloadOutcome",
+    "reload_alert_subject",
     "reload_replaced_crls",
     "supersede_refusal",
 ]
@@ -203,6 +212,58 @@ _PRECEDENCE = (FIX, BAD_SIGNATURE, _NOT_PROVABLE, LAPSES_FIRST, RESTART, NO_ISSU
 _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
 #: The remedies that send the operator to a restart, which fails while the file is not in effect.
 _SAYS_RESTART = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE})
+#: A short token per remedy, for the ``crl_reload_refused`` alert (vault BACKLOG #2904). The alert
+#: carries this and the remedy sentence, never the refusal's reason, which quotes CRL issuer
+#: names and dates. ``docs/CONFIGURATION.md`` lists the tokens under ``[cert_monitor]``.
+_REMEDY_CLASS = {
+    RESTART: "restart",
+    FIX: "fix_file",
+    WAIT: "wait",
+    LAPSES_FIRST: "lapses_first",
+    BAD_SIGNATURE: "bad_signature",
+    NO_ISSUER: "no_issuer",
+    RETRY: "retry",
+    _NOT_PROVABLE: "not_provable",
+}
+#: The token for a remedy :data:`_REMEDY_CLASS` does not hold. No pass produces one today. The
+#: alert then carries this token and no remedy sentence, so text the map does not vouch for
+#: never reaches a notifier.
+_OTHER_REMEDY_CLASS = "other"
+
+#: The longest CRL path a ``crl_reload_refused`` alert subject carries whole. With the
+#: ``crl_reload:`` prefix, that leaves
+#: :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject` room to add the process
+#: label inside its own cap, which sits under the SQL Server store's 256-character
+#: ``alert_instance.connection`` column.
+ALERT_PATH_MAX_LENGTH = 120
+#: Hex digits of the CRC-32 that stands in for the head of a longer path. A checksum, not a
+#: cryptographic digest: the path is the operator's own setting, so it only has to tell two
+#: honest paths apart.
+_PATH_DIGEST_HEX = 8
+
+
+def reload_alert_subject(path: str | os.PathLike[str], node: str | None = None) -> str:
+    """The alert subject for one CRL file on one engine process:
+    ``crl_reload:<path>@<node>``, or ``crl_reload:<path>`` for a lone engine (``node`` None).
+
+    ``<path>`` is the file's path key (:func:`~messagefoundry.config.loaded_crls.crl_path_key`):
+    absolute, and case-folded on Windows, so an alert and its clear name the same instance
+    however the path was spelled. A path longer than :data:`ALERT_PATH_MAX_LENGTH` becomes
+    ``~<checksum>~`` and its tail, which holds the file name. One subject per process, because
+    each engine shard and each cluster node holds its own TLS contexts, so one process applying
+    the file must not resolve another's alert. ``node`` is
+    :attr:`~messagefoundry.pipeline.engine.Engine.instance_identity`.
+
+    The colon keeps the subject outside the connection-name grammar, so no rule's default
+    control target can read it as a connection."""
+    key = crl_path_key(path)
+    if len(key) > ALERT_PATH_MAX_LENGTH:
+        # binascii, not zlib, as in process_alert_subject. backslashreplace, so a path with a
+        # lone surrogate still gets a checksum instead of raising.
+        digest = binascii.crc32(key.encode("utf-8", "backslashreplace"))
+        tail = key[-(ALERT_PATH_MAX_LENGTH - _PATH_DIGEST_HEX - len("~~")) :]
+        key = f"~{digest:0{_PATH_DIGEST_HEX}x}~{tail}"
+    return process_alert_subject(f"crl_reload:{key}", node)
 
 
 @dataclass(frozen=True)
@@ -214,6 +275,19 @@ class ReloadOutcome:
     reloaded: int
     #: Why some or all of the stale contexts kept their old copy, or ``None`` when none did.
     refusal: ReloadRefusal | None
+    #: Contexts still on the copy they held when this pass ended. 0 when ``refusal`` is ``None``.
+    stale: int = 0
+    #: True when the remedy names a restart and a start would refuse the file too, until one of
+    #: its CRLs takes effect. The reason says so with the time; an alert carries only this flag.
+    start_refuses: bool = False
+
+    @property
+    def remedy_class(self) -> str | None:
+        """The short token for what the operator does next (:data:`_REMEDY_CLASS`), or ``None``
+        when nothing was refused."""
+        if self.refusal is None:
+            return None
+        return _REMEDY_CLASS.get(self.refusal.remedy, _OTHER_REMEDY_CLASS)
 
 
 def _first_lapse(held: Sequence[CrlBlock]) -> CrlBlock | None:
@@ -349,6 +423,9 @@ class _Refusals:
         self.pending = False
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
+        #: True when the refusal reported names a restart and a start would refuse the file too,
+        #: until one of its CRLs takes effect (:attr:`ReloadOutcome.start_refuses`).
+        self.start_refuses = False
 
     def add(self, reason: str, remedy: str, *, stops: bool = True) -> None:
         """Record one refusal. Pass ``stops=False`` where a check further on may still be what
@@ -602,6 +679,7 @@ def _reload_path(
         )
         # Judged again each pass, so the warning goes once its time has passed.
         refusals.reopen()
+        refusals.start_refuses = True
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
 
 
@@ -699,17 +777,21 @@ def _finish(
     reason, remedy = refusals.strongest
     refusal = ReloadRefusal(fingerprint, reason, remedy, refusals.sticky)
     record_reload_refusal(path, refusal)
+    kept = len(stale) - reloaded
     if prior is None or prior.reason != reason:
         # Once per file version: a retried pass repeats every minute, and the monitor carries it.
+        # The runner raises ``crl_reload_refused`` by the same rule, from the outcome returned
+        # here. Not from this function: it runs in a worker thread, and a notifier's alert-state
+        # write needs the event loop.
         log.error(
             "crl_reload: refused to apply the replaced CRL file to %d running TLS context(s), "
             "which keep the copy they hold: %s. %s",
-            len(stale) - reloaded,
+            kept,
             reason,
             remedy,
             exc_info=refusals.error,
         )
-    return ReloadOutcome(path, reloaded, refusal)
+    return ReloadOutcome(path, reloaded, refusal, kept, refusals.start_refuses)
 
 
 def _held_by_path() -> dict[str, list[tuple[ssl.SSLContext, HeldCrl]]]:
@@ -751,7 +833,10 @@ def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
             _failed(key, exc)
             continue
         if isinstance(verdict, ReloadRefusal):
-            refused.append(ReloadOutcome(_read_path(pairs), 0, verdict))
+            # A verdict the reload treats as final is not judged again, so the count is taken
+            # here: the contexts that do not hold the refused bytes.
+            kept = sum(held.fingerprint != verdict.fingerprint for _, held in pairs)
+            refused.append(ReloadOutcome(_read_path(pairs), 0, verdict, kept))
         elif verdict is not None:
             pending[key] = verdict
     return pending, refused
@@ -816,7 +901,14 @@ class CrlReloadRunner:
 
     Engine-owned like the expiry monitor, but not gated on ``[cert_monitor]``: turning the alert off
     must not also stop revocations reaching a running hop. Not leader-gated: each process holds its
-    own contexts."""
+    own contexts.
+
+    **It raises ``crl_reload_refused`` for a refused file (vault BACKLOG #2904).** Once per file
+    version, by the rule the pass logs its ERROR by: again only when the file's bytes change or
+    the refusal's reason does. The pass runs in a worker thread, so the alert is raised here,
+    on the event loop, from the outcomes the pass returns. ``alert_sink`` defaults to a
+    :class:`~messagefoundry.pipeline.alerts.LoggingAlertSink`, as the expiry monitor's does.
+    ``node`` names this process in the alert subject (:func:`reload_alert_subject`)."""
 
     def __init__(
         self,
@@ -826,6 +918,8 @@ class CrlReloadRunner:
         reload: Callable[[], object] | None = None,
         stop_timeout_seconds: float = STOP_TIMEOUT_SECONDS,
         skip_when_idle: bool = True,
+        alert_sink: AlertSink | None = None,
+        node: str | None = None,
     ) -> None:
         self._interval = interval_seconds
         self._reload = reload or functools.partial(reload_replaced_crls, max_reloads=max_reloads)
@@ -834,6 +928,14 @@ class CrlReloadRunner:
         self._stop_timeout = stop_timeout_seconds
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
+        self._node = node
+        # Per path key, the refusal already alerted: the fingerprint of the refused bytes and the
+        # reason. A pass returns a refused outcome every minute, so this is what keeps the alert
+        # to one per file version. Touched only on the event loop.
+        self._alerted: dict[str, tuple[tuple[int, int], str]] = {}
+        # True while the sink is refusing calls: one WARNING per failing streak, not one a pass.
+        self._sink_failing = False
 
     def start(self) -> None:
         """Spawn the loop (idempotent)."""
@@ -878,7 +980,56 @@ class CrlReloadRunner:
             if self._skip_when_idle and not has_held_copies():
                 _forget_all()
                 continue
+            outcomes: object = None
             try:
-                await asyncio.to_thread(self._reload)
+                outcomes = await asyncio.to_thread(self._reload)
             except Exception:
                 log.exception("crl_reload pass failed; will retry next interval")
+            # After the await, so on the event loop: a notifier schedules its alert-state write
+            # with the running loop, and off the loop that write is dropped without an error.
+            self._report(outcomes)
+
+    def _report(self, outcomes: object) -> None:
+        """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet.
+
+        ``outcomes`` is whatever the pass returned. An injected ``reload`` may return anything,
+        and a pass that raised returns nothing, so only a list of :class:`ReloadOutcome` is read."""
+        for outcome in outcomes if isinstance(outcomes, list) else ():
+            if isinstance(outcome, ReloadOutcome) and outcome.refusal is not None:
+                self._raise_refused(outcome, outcome.refusal)
+        if self._alerted:
+            # A refusal the registry no longer holds was cleared: the file was applied or put
+            # back, or no hop holds it now. Forget it, so the same bytes refused again later
+            # alert again, as they log again.
+            standing = reload_refusals()
+            for key in [key for key in self._alerted if key not in standing]:
+                del self._alerted[key]
+
+    def _raise_refused(self, outcome: ReloadOutcome, refusal: ReloadRefusal) -> None:
+        key = crl_path_key(outcome.path)
+        version = (refusal.fingerprint, refusal.reason)
+        if self._alerted.get(key) == version:
+            return
+        try:
+            self._alert_sink.crl_reload_refused(
+                reload_alert_subject(key, self._node),
+                path=outcome.path,
+                remedy_class=outcome.remedy_class or _OTHER_REMEDY_CLASS,
+                stale_contexts=outcome.stale,
+                # Only a sentence the class map vouches for. Never ``refusal.reason``.
+                remedy=refusal.remedy if refusal.remedy in _REMEDY_CLASS else "",
+                start_refuses=outcome.start_refuses,
+            )
+        except Exception:
+            # Broad on purpose: a sink must never raise, and a broken one must not end the loop
+            # that applies revocations. Not recorded as alerted, so the next pass retries it.
+            if not self._sink_failing:
+                self._sink_failing = True
+                log.warning(
+                    "crl_reload: the refused-reload alert could not be raised; the next pass "
+                    "retries it",
+                    exc_info=True,
+                )
+            return
+        self._sink_failing = False
+        self._alerted[key] = version

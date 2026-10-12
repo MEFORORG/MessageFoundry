@@ -58,6 +58,7 @@ from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
     crl_expiry_detail,
+    crl_reload_refused_detail,
     intake_pause_detail,
 )
 
@@ -992,6 +993,41 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             event["shared_with"] = list(shared_with)
         if note := crl_expiry_detail(held_copy=held_copy, detail=detail, shared_with=shared_with):
             event["detail"] = note
+        self._emit(event)
+
+    def crl_reload_refused(
+        self,
+        name: str,
+        *,
+        path: str,
+        remedy_class: str,
+        stale_contexts: int,
+        remedy: str,
+        start_refuses: bool = False,
+    ) -> None:
+        # Vault BACKLOG #2904: the reload refused a replaced CRL file. `crl_reload:<path>[@<process>]`
+        # stands in for "connection", so each file on each engine process is its own instance and
+        # throttle key. The payload is the path, a class token, a count and fixed words: the
+        # refusal's reason quotes CRL issuer names and dates, so it is never passed in. `detail` is
+        # what the instance's reason column shows, built by the helper the logging sink uses. The
+        # runner raises this once per file version, so a second version refused inside the
+        # cooldown updates the open instance and does not page again.
+        event: dict[str, Any] = {
+            "type": "crl_reload_refused",
+            "connection": name,
+            "path": path,
+            "remedy_class": remedy_class,
+            "stale_contexts": stale_contexts,
+            "detail": crl_reload_refused_detail(
+                remedy_class=remedy_class,
+                stale_contexts=stale_contexts,
+                remedy=remedy,
+                start_refuses=start_refuses,
+            ),
+        }
+        if start_refuses:
+            # Only when there is something to say, as crl_expiry adds its held-copy keys.
+            event["start_refuses"] = True
         self._emit(event)
 
     def secret_rotation_due(
