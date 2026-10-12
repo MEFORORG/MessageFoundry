@@ -96,7 +96,11 @@ from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
+    _QUERY_NAME_SEPARATORS,
+    _QUERY_NOT_CREDENTIAL_TAILS,
+    _SEGMENT_SEPARATORS,
     CREDENTIAL_PLACEHOLDER,
+    _base_name,
     credential_query_params,
     has_credential_like_segment,
     scrub_credentials,
@@ -1601,11 +1605,20 @@ def connector_secret_env_values(
 #: existed, so a `proxy` key was not a URL setting at all.
 #: Review of 0c6b32e5c4: a bare ``uri`` and ``http_proxy``-style names were missed, so the suffix
 #: rule now covers ``uri`` and ``proxy`` too (which also covers a bare ``proxy``).
-_URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy")
+#: BACKLOG #2721: the plurals too, so a list-valued ``fallback_urls`` is read as URLs.
+_URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy", "urls", "uris", "endpoints", "proxies")
+
+#: Names that end in a URL word and hold no URL: a proxy EXCLUSION host list and an on/off flag
+#: (BACKLOG #2721 shape 6). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
+#: of them and ``proxy_url`` is not. The cost of a miss here is only over-masking.
+_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy")
 
 
 def _is_url_setting(name: str) -> bool:
-    return name.lower().endswith(_URL_SETTING_SUFFIXES)
+    low = name.lower()
+    if any(low == tail or low.endswith(f"_{tail}") for tail in _NOT_URL_SETTING_TAILS):
+        return False
+    return low.endswith(_URL_SETTING_SUFFIXES)
 
 
 #: A URL scheme at the very start of a value, ``https://`` and the like. Shown in a withheld URL so
@@ -1616,37 +1629,133 @@ _URL_SCHEME_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 #: spelling of "a credential was here", imported rather than restated.
 _WITHHELD_URL = CREDENTIAL_PLACEHOLDER
 
+#: Percent-escapes that withhold a URL setting whatever surrounds them: ``@`` and ``:`` (userinfo),
+#: and ``&``, ``;``, ``?`` and ``#`` (BACKLOG #2721 shape 5), which a reader that decodes twice takes
+#: as a separator, so ``a=1%26api_key=SECRET`` hides a credential name from a single decode.
+_WITHHELD_URL_ESCAPES = ("%40", "%3a", "%26", "%3b", "%3f", "%23")
+
+#: Credential words a DISPLAY name may hold ANYWHERE, compared casefolded with ``_``, ``-``, ``.``
+#: and spaces removed (BACKLOG #2721 shape 3: ``sslpassword``, ``user[password]``,
+#: ``x_api_key_v2``). Only words too specific to turn up inside an ordinary name: ``key``,
+#: ``auth``, ``pass``, ``sig`` and ``session`` are left out, as ``keyword``, ``author``,
+#: ``compass``, ``design`` and ``sessionCount`` show. Display only: the warning detector in
+#: ``secretscrub`` keeps its narrower tail rule, so ``check`` and the egress warning are unchanged.
+_DISPLAY_CREDENTIAL_WORDS = (
+    "password",
+    "passwd",
+    "passphrase",
+    "pwd",
+    "secret",
+    "credential",
+    "token",
+    "apikey",
+    "accesskey",
+    "bearer",
+    "authorization",
+    "signature",
+    "jwt",
+)
+
+#: Short credential words a PATH segment may BE, whole, after a trailing ``s`` is dropped. Too
+#: short for the anywhere rule above, but a whole segment that is ``key`` or ``session`` names what
+#: the next segment holds. ``auth`` is left out on purpose: a Keycloak token endpoint lives under
+#: ``/auth/realms/``, and withholding every one of those would hide the OAuth endpoints the shape-4
+#: ruling keeps readable.
+_DISPLAY_CREDENTIAL_SEGMENTS = frozenset({"key", "pass", "session", "sig"})
+
+
+def _squash_name(name: str) -> str:
+    """``name`` casefolded, without the separators the warning detector splits a name on."""
+    return "".join(ch for ch in name.casefold() if ch not in _QUERY_NAME_SEPARATORS)
+
+
+def _names_a_credential(name: str) -> bool:
+    """Whether a decoded query or path NAME holds a credential word anywhere in it.
+
+    A name that ends in a known non-secret (:data:`~messagefoundry.secretscrub._QUERY_NOT_CREDENTIAL_TAILS`,
+    such as ``pageToken``) is not one, unless a credential word also sits before that ending. The
+    ending is judged without a trailing index or digits, as the warning detector judges it, so
+    ``pageToken[0]`` is a cursor and ``user[password]`` is not."""
+    squashed = _squash_name(name)
+    if not any(word in squashed for word in _DISPLAY_CREDENTIAL_WORDS):
+        return False
+    base = _squash_name(_base_name(name))
+    for tail in _QUERY_NOT_CREDENTIAL_TAILS:
+        if base.endswith(tail):
+            return any(word in base[: -len(tail)] for word in _DISPLAY_CREDENTIAL_WORDS)
+    return True
+
+
+def _has_credential_named_segment(value: str) -> bool:
+    """Whether any ``name=value`` segment, split at every ``?``, ``&``, ``#`` and ``;``, has a name
+    :func:`_names_a_credential` matches. The same walk as
+    :func:`~messagefoundry.secretscrub.has_credential_like_segment`, with the wider name rule: a name
+    drops tab, CR and LF before it is percent-decoded, as ``urlsplit`` drops them first."""
+    for segment in _SEGMENT_SEPARATORS.split(value):
+        name, equals, _value = segment.partition("=")
+        if equals:
+            name = name.replace("\t", "").replace("\r", "").replace("\n", "")
+            if _names_a_credential(urllib.parse.unquote_plus(name)):
+                return True
+    return False
+
+
+def _has_credential_path_segment(path: str) -> bool:
+    """Whether a path has a credential word as a whole segment with another segment after it, as
+    ``/token/SECRET`` and ``/api_key/SECRET/x`` do (BACKLOG #2721 shape 4).
+
+    MANAGER RULING (batch 255): the LAST segment is not read, so ``/oauth2/token`` stays readable;
+    a credential word with nothing after it names an endpoint rather than introducing a value. The
+    path is percent-decoded before it is split, so an escaped ``/`` splits too, and empty segments
+    are skipped, so ``/token/`` ends in ``token``."""
+    segments = [s for s in urllib.parse.unquote(path).split("/") if s]
+    for segment in segments[:-1]:
+        word = _squash_name(segment)
+        if {word, word.removesuffix("s")} & _DISPLAY_CREDENTIAL_SEGMENTS:
+            return True
+        if _names_a_credential(segment):
+            return True
+    return False
+
 
 def _url_may_carry_a_credential(value: str) -> bool:
     """Whether a URL setting must be withheld from a settings view, by a COARSE rule. This is the
     one statement of the rule; the docs point here.
 
-    Any of these withholds it: an ``@``, ``%40`` or ``%3A`` anywhere in it (any case); a value
+    Any of these withholds it: an ``@`` anywhere in it; a ``%40``, ``%3A``, ``%26``, ``%3B``,
+    ``%3F`` or ``%23`` anywhere in it, any case (:data:`_WITHHELD_URL_ESCAPES`); a value
     ``urlsplit`` refuses; a credential-looking query name by the warning detector
-    (:func:`~messagefoundry.secretscrub.credential_query_params`); or a credential-looking name in
-    any ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
-    (:func:`~messagefoundry.secretscrub.has_credential_like_segment`). It does not try to find WHERE
-    a secret is: three review rounds on PR 1912 each found a URL reader that disagreed with a mask
-    that did. The cost is the view: a URL with an ``@`` in its path or query, such as an email
-    address, is withheld too.
+    (:func:`~messagefoundry.secretscrub.credential_query_params`); a credential-looking name in any
+    ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
+    (:func:`~messagefoundry.secretscrub.has_credential_like_segment`), or a credential word anywhere
+    in such a name (:func:`_has_credential_named_segment`); or a path segment that is a credential
+    word with another segment after it (:func:`_has_credential_path_segment`). It does not try to
+    find WHERE a secret is: three review rounds on PR 1912 each found a URL reader that disagreed
+    with a mask that did. The cost is the view: a URL with an ``@`` in its path or query, such as an
+    email address, is withheld too, and so is ``/v1/secret/data/app``, which names a secret's path.
 
-    The ``@``, ``%40`` and ``%3A`` tests read the value with tab, CR and LF removed, as ``urlsplit``
-    removes them before any reader decodes the host: ``%<TAB>40`` is ``%40`` to that reader.
+    The ``@`` and escape tests read the value with tab, CR and LF removed, as ``urlsplit`` removes
+    them before any reader decodes the host: ``%<TAB>40`` is ``%40`` to that reader.
 
     It covers at least the shapes above, not every place a URL can hold a secret: a secret that is a
-    bare path segment (``/services/T000/B000/SECRET``) has no name to find, and is shown. Each step
-    is one scan of the value, so the rule is linear in its length."""
+    bare path segment with no credential word before it (``/services/T000/B000/SECRET``) has no name
+    to find, and is shown. Each step is one scan of the value, so the rule is linear in its length."""
     cleaned = value.replace("\t", "").replace("\r", "").replace("\n", "")
     if "@" in cleaned:
         return True
     folded = cleaned.casefold()
-    if "%40" in folded or "%3a" in folded:
+    if any(escape in folded for escape in _WITHHELD_URL_ESCAPES):
         return True
     try:
-        urllib.parse.urlsplit(value)
+        path = urllib.parse.urlsplit(value).path
     except ValueError:
         return True
-    return has_credential_like_segment(value) or bool(credential_query_params(value))
+    return (
+        has_credential_like_segment(value)
+        or bool(credential_query_params(value))
+        or _has_credential_named_segment(value)
+        or _has_credential_path_segment(path)
+    )
 
 
 def _mask_url(value: str) -> str:
@@ -1681,7 +1790,48 @@ def _redact_header_name(name: object) -> str:
     return str(name)
 
 
-def _redact_header_value(name: str, value: object) -> object:
+#: How deep a settings view walks a nested value (BACKLOG #2721). Settings nest a level or two; the
+#: cap exists so a structure that holds itself, built in Python, cannot recurse without end. A value
+#: past it renders as ``"***"``, failing closed.
+_MAX_VIEW_DEPTH = 8
+
+
+def _marker_key(marker: Mapping[str, Any]) -> str:
+    """A raw marker's env KEY for a view. A key that is not text is no key anyone set on purpose,
+    and rendering it could carry a nested default, so it renders as ``"***"``."""
+    key = marker["env"]
+    return key if isinstance(key, str) else "***"
+
+
+def _view_stop(value: object, depth: int) -> object | None:
+    """Where a nested walk stops, shared by :func:`_view_value` and :func:`_redact_header_value`:
+    ``"***"`` past :data:`_MAX_VIEW_DEPTH`, ``{"env": key}`` for a nested reference in either shape
+    (its default dropped), and ``None`` to go on."""
+    if depth > _MAX_VIEW_DEPTH:
+        return "***"
+    if isinstance(value, EnvRef):
+        return {"env": value.key}
+    if _is_env_marker(value):
+        return {"env": _marker_key(value)}
+    return None
+
+
+def _view_items(value: object, render: Callable[[object], object]) -> object:
+    """``value`` with ``render`` applied to each item when it is a container, else ``value``.
+
+    A key is named by :func:`_redact_header_name`, so an :class:`EnvRef` key is not a raw object.
+    A set comes back as a list and any other sequence keeps its kind, so ``json.dumps`` takes all
+    of them (BACKLOG #2721 shape 7: a list was never walked)."""
+    if isinstance(value, Mapping):
+        return {_redact_header_name(k): render(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(render(v) for v in value)
+    if isinstance(value, list | set | frozenset):
+        return [render(v) for v in value]
+    return value
+
+
+def _redact_header_value(name: str, value: object, depth: int = 0) -> object:
     """One header's value, scrubbed. Handles the ``EnvRef`` case the headers branch used to miss.
 
     BACKLOG #1207. The headers branch had no ``EnvRef`` arm, so an ``env()`` ref inside a headers
@@ -1700,12 +1850,97 @@ def _redact_header_value(name: str, value: object) -> object:
     before that refusal existed -- so it must drop the default wherever the value came from. The raw
     ``connections.toml`` marker was served verbatim here, fallback secret included, because
     ``parse_env_setting`` never descends into a nested table and so the ``EnvRef`` arm never saw it.
-    """
+
+    A CONTAINER value is walked item by item with these same rules (BACKLOG #2721), so
+    ``["Bearer ..."]`` under an opaque name is caught by the value arm."""
+    if (stop := _view_stop(value, depth)) is not None:
+        return stop
+    if _is_secret_header(name, value):
+        return "***"
+    return _view_items(value, lambda item: _redact_header_value(name, item, depth + 1))
+
+
+def _view_value(name: str, value: object, depth: int = 0) -> object:
+    """A value under setting ``name``, below the setting's own reference layer: a default, an item
+    of a container, or a plain top-level value. BACKLOG #2721 shapes 1, 2 and 7.
+
+    A nested reference renders as ``{"env": key}`` with ITS default dropped. A default inside a
+    default has no reading anyone needs in a view, and showing it is how
+    ``env("a", default=env("b", default=SECRET))`` printed the secret and how the raw
+    :class:`EnvRef` it left behind made ``json.dumps`` refuse the whole view. A string under a URL
+    setting is withheld by :func:`_mask_url`, in a list as at the top. A ``headers`` table and an
+    ``odbc_params`` bag get their own key rules, wherever they sit, so a whole-table ``env()``
+    default is scrubbed like a literal table."""
+    if (stop := _view_stop(value, depth)) is not None:
+        return stop
+    if isinstance(value, str):
+        # BACKLOG #1207 and ASVS 14.2.1: withheld whole when it may carry a credential; the
+        # rule is stated once, on _url_may_carry_a_credential.
+        return _mask_url(value) if _is_url_setting(name) else value
+    if name == "headers" and isinstance(value, Mapping):
+        # Both axes: a header NAME is rendered through _redact_header_name before it is used as
+        # the output key AND before it is handed to the value rule, so a reference in the name
+        # slot neither survives nor reaches _is_secret_header as a repr carrying its default.
+        return {
+            (safe := _redact_header_name(k)): _redact_header_value(safe, v, depth + 1)
+            for k, v in value.items()
+        }
+    if name == "odbc_params" and isinstance(value, Mapping):
+        # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
+        # redactor honoured that by not descending -- so a credential inside it was served verbatim
+        # by /metadata behind MONITORING_READ and printed by graph --json, on the SAME object whose
+        # top-level `password` masked correctly.
+        #
+        # It is not merely operator misuse, which is why this masks rather than warns. The typed
+        # fields carry exactly ONE credential (`username`/`password`, key names configurable via
+        # `odbc_user_key`/`odbc_password_key`), and `_reject_envref_odbc_params` refuses `env()`
+        # here. So a connection needing a SECOND driver credential -- libpq `sslpassword` beside
+        # `PWD` -- has no typed home and no env() form, and the inline literal is the only
+        # expressible shape. A refusal that removes the SAFE expression while leaving the UNSAFE
+        # one is not a mitigation.
+        #
+        # Keys only, by a predicate of their own: real static driver keywords (`Encrypt`,
+        # `TrustServerCertificate`, `ApplicationIntent`) are not credential-shaped, and the ones
+        # that are -- `PWD`, `Password`, `sslpassword` -- are credentials. Values are NOT
+        # shape-tested here: a driver keyword's value is opaque and masking on its content would
+        # hide ordinary configuration with nothing to say so. A nested reference still renders
+        # by its key only (BACKLOG #2721).
+        #
+        # THIS IS A DISPLAY FIX, NOT A STORAGE FIX. The credential remains an inline literal in
+        # the config file. Keeping it out of the file needs `env()` to work here, which needs
+        # nested settings to be env-resolved -- filed as #1206's route-onward, deliberately not
+        # folded in, because it changes the resolution path and what the refusal above means.
+        return {
+            _redact_header_name(k): (
+                "***" if _is_secret_odbc_key(k) else _view_value(name, v, depth + 1)
+            )
+            for k, v in value.items()
+        }
+    return _view_items(value, lambda item: _view_value(name, item, depth + 1))
+
+
+def _view_setting(name: str, value: object) -> object:
+    """One top-level setting as :func:`redacted_settings` shows it.
+
+    An ``env()`` reference shows its key, and its default by :func:`_view_value` unless the setting
+    is a credential, when the default is dropped so a fallback secret can't leak. The RAW
+    ``connections.toml`` marker, ``{"env": ..., "default": ...}``, gets the same treatment when it
+    reaches this view undecoded (a hand-built spec, a stored graph): review of 0c6b32e5c4 found its
+    default served verbatim, and BACKLOG #2721 found the same for a non-URL setting such as
+    ``headers``."""
+    is_secret = _is_secret_setting(name)
     if isinstance(value, EnvRef):
-        return {"env": value.key}
-    if _is_env_marker(value):
-        return {"env": value["env"]}
-    return "***" if _is_secret_header(name, value) else value
+        key, default = value.key, value.default
+    elif is_secret:
+        return "***"
+    elif _is_env_marker(value):
+        key, default = _marker_key(value), value.get("default", _UNSET)
+    else:
+        return _view_value(name, value)
+    ref: dict[str, Any] = {"env": key}
+    if default is not _UNSET and not is_secret:
+        ref["default"] = _view_value(name, default, 1)
+    return ref
 
 
 def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -1714,72 +1949,9 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     credential field rendered inline is replaced with ``"***"`` (an ``env()`` *default* is dropped for
     a credential field so a fallback secret can't leak), a credential header inside a ``headers``
     table is redacted too, and a URL setting that may carry a credential is withheld whole as
-    ``<scheme>://<redacted>`` (:func:`_mask_url`)."""
-    out: dict[str, Any] = {}
-    for name, value in settings.items():
-        is_secret = _is_secret_setting(name)
-        if isinstance(value, EnvRef):
-            ref: dict[str, Any] = {"env": value.key}
-            if value.default is not _UNSET and not is_secret:
-                default = value.default
-                if isinstance(default, str) and _is_url_setting(name):
-                    # A URL default gets the same rule as a literal URL below (ASVS 14.2.1).
-                    default = _mask_url(default)
-                ref["default"] = default
-            out[name] = ref
-        elif is_secret:
-            out[name] = "***"
-        elif _is_env_marker(value) and _is_url_setting(name):
-            # The RAW connections.toml marker, {"env": ..., "default": ...}, when it reaches this view
-            # undecoded (a hand-built spec, a stored graph). Review of 0c6b32e5c4: it fell to the
-            # last arm and its default was served verbatim. Same treatment as an EnvRef above.
-            marker: dict[str, Any] = {"env": value.get("env")}
-            if "default" in value:
-                raw_default = value["default"]
-                marker["default"] = (
-                    _mask_url(raw_default) if isinstance(raw_default, str) else raw_default
-                )
-            out[name] = marker
-        elif isinstance(value, str) and _is_url_setting(name):
-            # BACKLOG #1207 and ASVS 14.2.1: withheld whole when it may carry a credential; the
-            # rule is stated once, on _url_may_carry_a_credential.
-            out[name] = _mask_url(value)
-        elif name == "headers" and isinstance(value, dict):
-            # Both axes: a header NAME is rendered through _redact_header_name before it is used as
-            # the output key AND before it is handed to the value rule, so a reference in the name
-            # slot neither survives nor reaches _is_secret_header as a repr carrying its default.
-            out[name] = {
-                (safe := _redact_header_name(k)): _redact_header_value(safe, v)
-                for k, v in value.items()
-            }
-        elif name == "odbc_params" and isinstance(value, dict):
-            # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
-            # redactor honoured that by not descending -- so a credential inside it was served verbatim
-            # by /metadata behind MONITORING_READ and printed by graph --json, on the SAME object whose
-            # top-level `password` masked correctly.
-            #
-            # It is not merely operator misuse, which is why this masks rather than warns. The typed
-            # fields carry exactly ONE credential (`username`/`password`, key names configurable via
-            # `odbc_user_key`/`odbc_password_key`), and `_reject_envref_odbc_params` refuses `env()`
-            # here. So a connection needing a SECOND driver credential -- libpq `sslpassword` beside
-            # `PWD` -- has no typed home and no env() form, and the inline literal is the only
-            # expressible shape. A refusal that removes the SAFE expression while leaving the UNSAFE
-            # one is not a mitigation.
-            #
-            # Keys only, by the same predicate the rest of this function uses: real static driver
-            # keywords (`Encrypt`, `TrustServerCertificate`, `ApplicationIntent`) are not
-            # credential-shaped, and the ones that are -- `PWD`, `Password`, `sslpassword` -- are
-            # credentials. Values are NOT shape-tested here: a driver keyword's value is opaque and
-            # masking on its content would hide ordinary configuration with nothing to say so.
-            #
-            # THIS IS A DISPLAY FIX, NOT A STORAGE FIX. The credential remains an inline literal in
-            # the config file. Keeping it out of the file needs `env()` to work here, which needs
-            # nested settings to be env-resolved -- filed as #1206's route-onward, deliberately not
-            # folded in, because it changes the resolution path and what the refusal above means.
-            out[name] = {k: ("***" if _is_secret_odbc_key(k) else v) for k, v in value.items()}
-        else:
-            out[name] = value
-    return out
+    ``<scheme>://<redacted>`` (:func:`_mask_url`). Every default and every container is walked by
+    the same rules (:func:`_view_value`), and ``json.dumps`` takes what comes back."""
+    return {name: _view_setting(name, value) for name, value in settings.items()}
 
 
 def display_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
