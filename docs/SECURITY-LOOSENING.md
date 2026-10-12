@@ -1563,7 +1563,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   is there. The engine's hook is then in place and refuses a script, but the entry still reads
   as unguarded. A refusal in that state writes no WARNING, and the interpreter reports it on
   standard error with the script's full path. The entry cannot tell the two cases apart, so read
-  it as the first. The engine's own code adds no other audit hook, so look for what else does.
+  it as the first, and look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

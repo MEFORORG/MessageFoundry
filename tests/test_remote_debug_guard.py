@@ -296,7 +296,11 @@ def test_a_refused_attach_skips_with_a_warning(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(sys, "remote_exec", lambda pid, script: None)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        _inject(target)
+        try:
+            _inject(target)
+        except pytest.skip.Exception:
+            # Named here: a skip that left this test would report the whole test as skipped.
+            pytest.fail("an attach the platform allowed was skipped")
 
 
 def test_a_test_process_that_cannot_inject_skips_with_a_warning(
