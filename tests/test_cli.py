@@ -2260,9 +2260,8 @@ def test_trusted_proxies_only_loopback_warns_mfa_and_not_undeclared_proxy(
     # One unbroken string, from the MFA warning alone (vault BACKLOG #3102). The dual-control warning
     # opens with the same words, and it prints here too because approvals are off. A match on the
     # shared opening passes on that warning, so it never showed which field the MFA warning named.
+    # The next test is the control: it sees the look-alike print with this string absent.
     assert f"{_TRUSTED_PROXY_WARNING_OPENING} [security].require_mfa off" in err
-    # The control: the look-alike did print, so the line above had to tell the two apart.
-    assert f"{_TRUSTED_PROXY_WARNING_OPENING} [approvals].enabled off" in err
     assert "is set with no declared TLS terminator" not in err
 
 
@@ -2314,8 +2313,8 @@ def test_trusted_proxies_only_loopback_meets_the_memory_declaration_opt_in(
 # --- vault BACKLOG #3102: the exposure description reads the exposure predicate ---------------------
 #
 # `exposure_desc` used to work the exposure rule out a second time, beside `instance_exposed`. The two
-# agreed, but only because someone kept them in step by hand. `_exposure_description` now asks
-# `host_is_browser_origin` first, and its branches only choose which field to name.
+# agreed, but only because someone kept them in step by hand. `_exposure_description` now takes
+# `_serve`'s own `instance_exposed`, and its branches only choose which field to name.
 
 
 @pytest.mark.parametrize(
@@ -2350,35 +2349,27 @@ def test_exposure_description_names_the_field_the_operator_set(
     from messagefoundry.config.settings import ApiSettings, ServiceSettings
 
     settings = ServiceSettings(api=ApiSettings.model_validate(api))
-    assert _exposure_description(settings) == expected
-    # Empty exactly when the predicate says the instance is not exposed.
-    assert bool(expected) is (not settings.api.host_is_browser_origin)
+    # `exposed` is passed the way `_serve` passes it: its own `instance_exposed`.
+    exposed = not settings.api.host_is_browser_origin
+    assert _exposure_description(settings, exposed=exposed) == expected
+    # Empty exactly when the instance is not exposed.
+    assert bool(expected) is exposed
 
 
-def test_exposure_description_follows_the_predicate_not_its_own_reading() -> None:
-    # Stand-ins whose predicate disagrees with their fields, which no loaded config can do. They
-    # show which of the two the function reads. Worked out by hand again, both cases come out wrong.
-    from types import SimpleNamespace
-    from typing import cast
-
+def test_exposure_description_follows_the_flag_not_its_own_reading() -> None:
+    # Two calls where the flag disagrees with the fields, which `_serve` never makes. They show
+    # which of the two the function reads. Worked out by hand again, both come out wrong.
     from messagefoundry.__main__ import _exposure_description
-    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.settings import ApiSettings, ServiceSettings
 
-    def describe(*, exposed: bool, trusted_proxies: list[str]) -> str:
-        api = SimpleNamespace(
-            host_is_browser_origin=not exposed,
-            is_loopback=True,
-            host="127.0.0.1",
-            tls_terminated_upstream=False,
-            trusted_proxies=trusted_proxies,
-        )
-        return _exposure_description(cast(ServiceSettings, SimpleNamespace(api=api)))
-
-    # Not exposed by the predicate, with a proxy field set: no description.
-    assert describe(exposed=False, trusted_proxies=["10.0.0.1"]) == ""
-    # Exposed by the predicate through a term this function does not name yet: still a description,
-    # and one that blames none of the three fields it does know.
-    unnamed = describe(exposed=True, trusted_proxies=[])
+    proxied = ServiceSettings(
+        api=ApiSettings(trusted_proxies=["10.0.0.1"], tls_cert_file="operator-cert.pem")
+    )
+    # Not exposed by the flag, with a proxy field set: no description.
+    assert _exposure_description(proxied, exposed=False) == ""
+    # Exposed by the flag through a term this function does not name yet: still a description, and
+    # one that blames none of the three fields it does know.
+    unnamed = _exposure_description(ServiceSettings(), exposed=True)
     assert unnamed
     assert "[api]." not in unnamed
     assert "non-loopback" not in unnamed

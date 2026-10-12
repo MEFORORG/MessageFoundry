@@ -2332,22 +2332,22 @@ def _start_logging(
     return None
 
 
-def _exposure_description(settings: ServiceSettings) -> str:
+def _exposure_description(settings: ServiceSettings, *, exposed: bool) -> str:
     """What made this instance exposed, as the start of a ``serve`` exposure message. Empty when it
     is not exposed.
 
-    Whether the instance is exposed is read from ``host_is_browser_origin``, the predicate
-    ``instance_exposed`` reads in ``_serve``. It is not worked out again here, so this text cannot
-    call an instance exposed that the arms do not, or the reverse (vault BACKLOG #3102). The
-    branches below only choose which field to name. They name the one the operator set, so a
-    loopback bind that only trusts a proxy (re-encrypting to an operator certificate) is told
-    ``[api].trusted_proxies``, not a terminator it never declared (vault BACKLOG #2251).
+    ``exposed`` is ``_serve``'s own ``instance_exposed``, passed in. Whether the instance is exposed
+    is not worked out again here, so this text cannot call an instance exposed that the arms do
+    not, or the reverse (vault BACKLOG #3102). The branches below only choose which field to name.
+    They name the one the operator set, so a loopback bind that only trusts a proxy (re-encrypting
+    to an operator certificate) is told ``[api].trusted_proxies``, not a terminator it never
+    declared (vault BACKLOG #2251).
 
-    The last line covers a term added to the predicate and not named here yet. Its text is true of
-    any exposed instance, so a new term gets a vague message rather than a wrong one."""
-    api = settings.api
-    if api.host_is_browser_origin:
+    The last line covers a term added to the exposure rule and not named here yet. Its text is true
+    of any exposed instance, so a new term gets a vague message rather than a wrong one."""
+    if not exposed:
         return ""
+    api = settings.api
     if not api.is_loopback:
         return f"API bound to non-loopback host {api.host!r}"
     if api.tls_terminated_upstream:
@@ -3499,7 +3499,7 @@ def _serve(args: argparse.Namespace) -> int:
     # commonest shape of this posture it does not print at all. Citing it as the compensating control
     # would have rested that control on a premise measurement contradicts.
 
-    # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
+    # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an exposed instance serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
     # [security].require_mfa adds an engine second factor (TOTP or a passkey) for every account
     # that [security].require_mfa_scope covers: every account under the default, not the
@@ -3533,7 +3533,7 @@ def _serve(args: argparse.Namespace) -> int:
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     directory_exception = ", with the OIDC exception above" if oidc_exception else ""
     # Named once for the MFA and dual-control arms below, and read only when admin_exposed.
-    exposure_desc = _exposure_description(settings)
+    exposure_desc = _exposure_description(settings, exposed=instance_exposed)
     if admin_exposed and not settings.auth.require_mfa:
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
@@ -3712,9 +3712,11 @@ def _serve(args: argparse.Namespace) -> int:
     #  2. The browser's hop still ends at the proxy, as it does behind a terminator. Nothing at
     #     start measures that proxy's floor, and that shape owes no attestation of it either:
     #     the only gate that asks for `proxy_tls_min_version` is the terminator gate.
-    # Widening this gate would add a start refusal and a network dependency to configs that start
-    # today. The terminator case took an owner ruling (BACKLOG #1026), and no ruling covers this
-    # shape, so it is left as it was before #2251 rather than widened in passing.
+    # Widening this gate is a new control: it would add a start refusal for an unset origin on this
+    # shape, and make that start depend on the proxy being reachable. The terminator case took an
+    # owner ruling (BACKLOG #1026). No ruling covers this shape, so the gate is not widened in
+    # passing here; vault BACKLOG #3102 is where the question was raised. The cost to a running site
+    # is not the reason: there are none (CLAUDE.md section 0).
     if settings.api.tls_terminated_upstream and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 
