@@ -32,15 +32,9 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._bound_proof import ReprovingTransport
+from tests._bound_proof import prove, reproving_transport
 
 PW = "a-strong-test-passphrase"  # ≥15, satisfies the ASVS policy
-
-
-def _asgi(**kwargs: Any) -> ReprovingTransport:
-    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
-    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
-    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
 
 
 ADT_A = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSGA|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -94,7 +88,7 @@ def _client(
     # reprove=False is for the tests whose subject is the step-up refusal itself.
     app = create_app(engine, auth=service)
     transport = (
-        _asgi(app=app, raise_app_exceptions=raise_app_exceptions)
+        reproving_transport(PW, app=app, raise_app_exceptions=raise_app_exceptions)
         if reprove
         else httpx.ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
     )
@@ -653,13 +647,7 @@ async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_sessi
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
         # Proved up front: a re-proof re-keys the session, and this test reads that session after.
-        proved = await c.post(
-            "/me/reauth",
-            json={"password": PW, "purpose": "message_export"},
-            headers=_auth(await _login(c, "op")),
-        )
-        assert proved.status_code == 200, proved.text
-        token = str(proved.json()["token"])
+        token = await prove(c, await _login(c, "op"), PW, "message_export")
         monkeypatch.setattr(engine.store, "get_message", slow)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
     assert r.status_code == 200, r.text

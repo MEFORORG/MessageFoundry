@@ -342,10 +342,11 @@ _SUITES_ON_THE_SHIPPED_DEFAULT = (
 
 
 def test_the_bound_route_suites_run_with_the_proof_on() -> None:
-    """A suite that switches the bound proof off again reds here. Only the org opt-out test in
-    test_message_export.py may build a service with it off, and it names the opt-out by hand."""
+    """A suite that switches the bound proof off again reds here. A text check, so it is a tripwire
+    and no more: test_message_export.py's org opt-out test passes ``bound=False`` to its own
+    service helper, which this does not see, and is the one test there that may."""
     here = Path(__file__).resolve().parent
     for name in _SUITES_ON_THE_SHIPPED_DEFAULT:
         source = (here / name).read_text(encoding="utf-8")
         assert "require_action_step_up=False" not in source, f"{name} switches the bound proof off"
-        assert "ReprovingTransport" in source, f"{name} no longer re-proves as a client does"
+        assert "reproving_transport" in source, f"{name} no longer re-proves as a client does"

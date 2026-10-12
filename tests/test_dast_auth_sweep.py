@@ -31,7 +31,6 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi.routing import APIRoute
 
 from messagefoundry.api.app import create_app
 from scripts.security import dast_target as dast_target_module
@@ -694,18 +693,11 @@ def test_every_unreachable_allowlist_entry_names_a_real_row_and_a_reason(
 
 def _action_bound_rows() -> dict[tuple[str, str], str]:
     """``(method, path) -> action`` for every row of the default app whose gate binds an action."""
-    bound: dict[tuple[str, str], str] = {}
-    for route in create_app().routes:
-        if not isinstance(route, APIRoute):
-            continue
-        for dep in route.dependant.dependencies:
-            found = route_gates.gate_of(dep.call)
-            if found is not None:
-                if found[2] is not None:
-                    for method in route.methods or set():
-                        bound[(method, route.path)] = found[2]
-                break
-    return bound
+    return {
+        (row.method, row.path): row.action
+        for row in route_gates.gated_http_rows()
+        if row.action is not None
+    }
 
 
 def test_action_bound_rows_are_reached_by_re_proving(clean_run: tuple[int, dict[str, Any]]) -> None:
@@ -794,7 +786,6 @@ def test_no_route_falls_off_the_end_of_the_walk() -> None:
     Driven with ``expose_docs=True`` and ``serve_ui=True`` on purpose: those are the flags that
     MATERIALISE the route classes the walk used to drop.
     """
-    from messagefoundry.api.app import create_app
     from scripts.security import route_gates
 
     app = create_app(expose_docs=True)

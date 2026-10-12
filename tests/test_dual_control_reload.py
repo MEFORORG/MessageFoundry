@@ -53,16 +53,10 @@ from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._bound_proof import ReprovingTransport
+from tests._bound_proof import reproving_transport
 from tests.test_trust_anchors import _block
 
 PW = "a-strong-test-passphrase"
-
-
-def _asgi(**kwargs: Any) -> ReprovingTransport:
-    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
-    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
-    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
 
 
 # min_dwell_seconds=0: this suite releases a reload within milliseconds of holding it, which the
@@ -109,7 +103,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _service(engine: Engine) -> AuthService:
     # Dual-control reload is a step-up admin flow, not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the reload before the approval path.
-    # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+    # The shipped default: the action-bound proof is on, and reproving_transport re-proves for it
     # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
     # pins the gate itself.
     service = AuthService(
@@ -128,7 +122,7 @@ def _client(
     raise_app_exceptions: bool = True,
 ) -> httpx.AsyncClient:
     app = create_app(engine, auth=service, approvals=approvals)
-    transport = _asgi(app=app, raise_app_exceptions=raise_app_exceptions)
+    transport = reproving_transport(PW, app=app, raise_app_exceptions=raise_app_exceptions)
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -675,7 +669,7 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         await _add(service, "op", Role.ADMINISTRATOR)
         await _add(service, "approver", Role.ADMINISTRATOR)
         app = create_app(engine, auth=service, approvals=GATED)
-        transport = _asgi(app=app, raise_app_exceptions=False)
+        transport = reproving_transport(PW, app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             op, admin = await _token(c, "op"), await _token(c, "approver")
 
@@ -1065,7 +1059,7 @@ async def test_a_released_reload_audits_an_unreadable_inbound_ca_as_trust_anchor
         await _add(service, "op", Role.ADMINISTRATOR)
         await _add(service, "approver", Role.ADMINISTRATOR)
         app = create_app(engine, auth=service, approvals=GATED)
-        transport = _asgi(app=app, raise_app_exceptions=False)
+        transport = reproving_transport(PW, app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             op, admin = await _token(c, "op"), await _token(c, "approver")
 

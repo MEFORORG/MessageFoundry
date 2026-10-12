@@ -1236,19 +1236,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # The idempotency key the resend ran under. The page renders from the store's record of
         # it, never from the query, so a crafted link cannot report a resend that never ran
         # (vault BACKLOG #3241). The key is the unguessable value the confirm page minted.
-        key: str = Query(..., min_length=1, max_length=128),
+        key: Annotated[IdempotencyKey, Query(min_length=1, max_length=128)],
         duplicate: bool = Query(False),
         _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
     ) -> HTMLResponse:
-        prior = (
-            await core.prior_resend(
-                engine=await deps.get_engine(request),
-                idempotency_key=key,
-                message_id=message_id,
-                to=to,
-            )
-            if _fits_key(key)
-            else None
+        prior = await core.prior_resend(
+            engine=await deps.get_engine(request),
+            idempotency_key=key,
+            message_id=message_id,
+            to=to,
         )
         if prior is None:
             return HTMLResponse(pages.message_resend_unknown(message_id), status_code=404)

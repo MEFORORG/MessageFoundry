@@ -12,18 +12,25 @@ through ``POST /me/reauth``, as the IDE, the harness and the DAST sweep do, and 
 once more. ``/me/reauth`` re-keys the session, so the transport also rewrites any later request
 that still carries a re-keyed bearer: a test keeps using the header it built at sign-in.
 
-It changes nothing a test asserts about the gate itself. A request that needs no proof goes
-through untouched, and a refusal it cannot answer (a wrong password, a second refusal) is
-returned as the engine sent it. ``tests/test_bound_step_up_injection.py`` pins the gate.
+A request that needs no proof goes through untouched, and a refusal it cannot answer (a wrong
+password, a second refusal) is returned as the engine sent it. ``tests/test_bound_step_up_injection.py``
+pins the gate itself.
+
+THE REFUSED FIRST TRY IS A REAL REQUEST. It passed the permission check, so it wrote its grant
+audit row and, for a write, charged the admin-write gap. A test that counts those rows or budgets,
+reads the re-keyed session afterwards, or runs under a deadline a password hash outlasts should
+prove up front with :func:`prove` instead, and a suite whose retry would be paced turns
+``admin_write_min_interval_seconds`` off.
 """
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 
-__all__ = ["ReprovingTransport", "reproving_client"]
+__all__ = ["ReprovingTransport", "prove", "reproving_transport"]
 
 _ACTION_HEADER = "X-Step-Up-Action"
 
@@ -36,8 +43,6 @@ class ReprovingTransport(httpx.AsyncBaseTransport):
         self._password = password
         #: Authorization header a test sent -> the header of the session it was re-keyed to.
         self._rekeyed: dict[str, str] = {}
-        #: How many re-proofs this transport made, so a suite can show it exercised the proof.
-        self.reproofs = 0
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         sent = request.headers.get("Authorization")
@@ -61,7 +66,6 @@ class ReprovingTransport(httpx.AsyncBaseTransport):
         if reauth.status_code != 200:
             return response
         await response.aread()
-        self.reproofs += 1
         fresh = f"Bearer {json.loads(body)['token']}"
         for original, current in list(self._rekeyed.items()):
             if current == sent:
@@ -80,9 +84,17 @@ class ReprovingTransport(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
-def reproving_client(
-    app: object, password: str, *, base_url: str = "http://t"
-) -> httpx.AsyncClient:
-    """An ``httpx.AsyncClient`` over the ASGI ``app`` that re-proves as :class:`ReprovingTransport`."""
-    inner = httpx.ASGITransport(app=app)  # type: ignore[arg-type]
-    return httpx.AsyncClient(transport=ReprovingTransport(inner, password), base_url=base_url)
+def reproving_transport(password: str, **asgi_kwargs: Any) -> ReprovingTransport:
+    """An ``httpx.ASGITransport(**asgi_kwargs)`` wrapped in a :class:`ReprovingTransport`."""
+    return ReprovingTransport(httpx.ASGITransport(**asgi_kwargs), password)
+
+
+async def prove(client: httpx.AsyncClient, token: str, password: str, action: str) -> str:
+    """Mint a proof bound to ``action`` up front, as ``POST /me/reauth`` does; the re-keyed token."""
+    r = await client.post(
+        "/me/reauth",
+        json={"password": password, "purpose": action},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+    return str(r.json()["token"])

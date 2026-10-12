@@ -1319,19 +1319,12 @@ _GateInfo = tuple[str, frozenset[str], str | None]
 
 def _gates_by_operation() -> dict[tuple[str, str], _GateInfo]:
     """``(method, path) -> (gate name, permissions, bound action)`` over both planes of a
-    ``create_app(serve_ui=True)``. Only routes with a ``require*()`` gate appear."""
-    gates: dict[tuple[str, str], _GateInfo] = {}
-    for route in create_app(serve_ui=True).routes:
-        if not isinstance(route, APIRoute):
-            continue
-        for dep in route.dependant.dependencies:
-            found = _gate_of(dep.call)
-            if found is not None:
-                for method in route.methods or set():
-                    if method not in ("HEAD", "OPTIONS"):
-                        gates[(method, route.path)] = (found[0], frozenset(found[1]), found[2])
-                break
-    return gates
+    ``create_app(serve_ui=True)``, from the shared route walk. Only gated routes appear."""
+    return {
+        (row.method, row.path): (row.gate, frozenset(row.permissions), row.action)
+        for row in route_rows(create_app(serve_ui=True))
+        if row.gate is not None
+    }
 
 
 def _is_step_up(gate: str) -> bool:

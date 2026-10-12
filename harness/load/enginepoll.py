@@ -599,12 +599,6 @@ def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> Non
     except rigadmin.RigUnreachable as exc:
         raise ApiError(str(exc)) from exc
 
-    # The private session this handler last proved on, as its re-keyed token (vault BACKLOG
-    # #3241). A later step-up re-proves on it rather than signing in again: every sign-in is one
-    # more session against [auth].max_sessions_per_user (5 by default), and the cap revokes the
-    # OLDEST, which is the held session every other client of this process uses.
-    private: list[str | None] = [None]
-
     def _step_up() -> bool:
         # A sensitive route (the reload probe's POST /config/reload) wants a credential proved
         # just now, and since vault BACKLOG #2625 the reload takes a proof bound to its action
@@ -613,20 +607,10 @@ def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> Non
         # `purpose` and adopts the re-keyed token. The rotation touches only that private session,
         # never the one every other client holds, which is why this is not renew_session.
         try:
-            reuse = private[0] is not None and client.token == private[0]
-            if not reuse:
-                client.set_token(rigadmin.sign_in(url, cacert=cacert))
-            try:
-                client.reauth(rigadmin.rig_admin().password)
-            except ApiError as exc:
-                # The private session has ended (idle timeout, revoked): sign in once more.
-                if not reuse or exc.status != 401:
-                    raise
-                client.set_token(rigadmin.sign_in(url, cacert=cacert))
-                client.reauth(rigadmin.rig_admin().password)
+            client.set_token(rigadmin.sign_in(url, cacert=cacert))
+            client.reauth(rigadmin.rig_admin().password)
         except (ApiError, rigadmin.RigAdminError):
             return False
-        private[0] = client.token
         # The refused POST was an admitted admin write, and the engine refuses another from the same
         # actor sooner than [auth].admin_write_min_interval_seconds after it (0.15 s by default,
         # BACKLOG #2301). A rig re-proves at machine speed, so the retry waits the gap out; a person
@@ -746,6 +730,11 @@ class EnginePoller:
         for client in clients:
             await loop.run_in_executor(None, client.close)
 
+    @property
+    def holds_rig_session(self) -> bool:
+        """Whether this poller signs in as the run's rig Administrator, so it can re-prove."""
+        return isinstance(self._token, rigadmin.RigSession)
+
     async def reload_client(self) -> EngineClient | None:
         """A client of its own on the PRIMARY engine, proved for one reload, for a caller about to
         TIME one; ``None`` when this poller holds no rig session.
@@ -761,9 +750,10 @@ class EnginePoller:
         session at a time against ``[auth].max_sessions_per_user``.
 
         A ``--token`` poller gets ``None``: the rig holds no password for an engine it did not
-        start, so it cannot re-prove there. A failed sign-in or proof is also ``None``, and the
-        caller then reloads through :attr:`client`, whose refusal reports it in its own terms."""
-        if not isinstance(self._token, rigadmin.RigSession) or not self._clients:
+        start, so it cannot re-prove there. A failed sign-in or proof is also ``None``; a rig
+        caller then reports the reload unmeasured rather than reloading through :attr:`client`,
+        whose step-up handler would re-key the sampler's session after all."""
+        if not self.holds_rig_session or not self._clients:
             return None
         return await asyncio.get_running_loop().run_in_executor(None, self._reload_client_sync)
 

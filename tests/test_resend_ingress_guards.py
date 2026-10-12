@@ -21,7 +21,6 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -49,15 +48,9 @@ from messagefoundry.pipeline.ingress_guards import (
 from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore, Stage
 from tests._admin_account import create_local_user_chosen
-from tests._bound_proof import ReprovingTransport
+from tests._bound_proof import reproving_transport
 
 PW = "Correct-Horse-Battery-Staple-9"
-
-
-def _asgi(**kwargs: Any) -> ReprovingTransport:
-    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
-    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
-    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
 
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
@@ -122,7 +115,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _operator(engine: Engine) -> AuthService:
-    # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+    # The shipped default: the action-bound proof is on, and reproving_transport re-proves for it
     # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
     # pins the gate itself.
     service = AuthService(
@@ -181,7 +174,9 @@ async def _upload_then_resend(
         uploads_dir=str(tmp_path / "uploads"), max_upload_bytes=max_upload_bytes
     )
     app = create_app(engine, auth=service, store_settings=settings)
-    async with httpx.AsyncClient(transport=_asgi(app=app), base_url="http://t") as c:
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app), base_url="http://t"
+    ) as c:
         h = await _login(c)
         up = await c.post("/uploads", files={"file": ("m.hl7", body, "text/plain")}, headers=h)
         assert up.status_code == 200, up.text
@@ -251,7 +246,9 @@ async def _edit_resend(
         channel_id=origin_channel, raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
     )
     app = create_app(engine, allow_no_auth=True)
-    async with httpx.AsyncClient(transport=_asgi(app=app), base_url="http://t") as c:
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app), base_url="http://t"
+    ) as c:
         return mid, await c.post(f"/messages/{mid}/edit-resend", json=payload)
 
 

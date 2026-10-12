@@ -41,16 +41,10 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import OutboxStatus
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._bound_proof import ReprovingTransport
+from tests._bound_proof import reproving_transport
 from tests._operator_audit_atomic_contract import AppendFailed, failing_append
 
 PW = "a-strong-test-passphrase"
-
-
-def _asgi(**kwargs: Any) -> ReprovingTransport:
-    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
-    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
-    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
 
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -76,7 +70,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _service(engine: Engine) -> AuthService:
     # Approvals is a step-up admin flow, not an MFA test: pin require_mfa=False so the BACKLOG #187
     # secure default (require_mfa now ON) doesn't 403 the request before the approval path is exercised.
-    # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+    # The shipped default: the action-bound proof is on, and reproving_transport re-proves for it
     # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
     # pins the gate itself.
     service = AuthService(
@@ -91,7 +85,7 @@ def _client(
     engine: Engine, service: AuthService, approvals: ApprovalsSettings
 ) -> httpx.AsyncClient:
     app = create_app(engine, auth=service, approvals=approvals)
-    return httpx.AsyncClient(transport=_asgi(app=app), base_url="http://t")
+    return httpx.AsyncClient(transport=reproving_transport(PW, app=app), base_url="http://t")
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
@@ -1286,7 +1280,7 @@ def _app_client(
         return {"requeued": 0}
 
     gate.register("dead_letter_replay", "replay", _counts, permission=Permission.MESSAGES_REPLAY)
-    client = httpx.AsyncClient(transport=_asgi(app=app), base_url="http://t")
+    client = httpx.AsyncClient(transport=reproving_transport(PW, app=app), base_url="http://t")
     return gate, client
 
 

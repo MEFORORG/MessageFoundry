@@ -40,15 +40,9 @@ from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests._bound_proof import ReprovingTransport
+from tests._bound_proof import prove, reproving_transport
 
 PW = "Sup3rSecret!!reload-outlive"
-
-
-def _asgi(**kwargs: Any) -> ReprovingTransport:
-    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
-    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
-    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
 
 
 async def _wait(predicate: Callable[[], Awaitable[bool]], timeout: float = 10.0) -> None:
@@ -179,7 +173,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _deployer(engine: Engine, deadline: float) -> tuple[httpx.AsyncClient, Any]:
-    # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+    # The shipped default: the action-bound proof is on, and reproving_transport re-proves for it
     # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
     # pins the gate itself.
     service = AuthService(
@@ -206,7 +200,7 @@ async def _deployer(engine: Engine, deadline: float) -> tuple[httpx.AsyncClient,
         password_generated=False,
     )
     app = create_app(engine, auth=service)
-    transport = _asgi(app=app)
+    transport = reproving_transport(PW, app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as login:
         r = await login.post(
             "/auth/login", json={"username": "deployer", "password": PW, "provider": "local"}
@@ -214,19 +208,14 @@ async def _deployer(engine: Engine, deadline: float) -> tuple[httpx.AsyncClient,
     assert r.status_code == 200, r.text
     # The reload takes a proof bound to it (vault BACKLOG #2625). Mint it here, before the
     # deadline: a re-proof hashes a password, which alone outlasts the deadlines these tests set.
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as prove:
-        proved = await prove.post(
-            "/me/reauth",
-            json={"password": PW, "purpose": "config_reload"},
-            headers={"Authorization": f"Bearer {r.json()['token']}"},
-        )
-    assert proved.status_code == 200, proved.text
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as proving:
+        proved = await prove(proving, r.json()["token"], PW, "config_reload")
     # After the login: its password hash alone outlasts the deadline these tests set.
     app.state.request_timeout_seconds = deadline
     client = httpx.AsyncClient(
         transport=transport,
         base_url="http://t",
-        headers={"Authorization": f"Bearer {proved.json()['token']}"},
+        headers={"Authorization": f"Bearer {proved}"},
     )
     return client, app
 
