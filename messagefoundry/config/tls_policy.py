@@ -420,11 +420,10 @@ def harden_crl_check(
             # An OSError too, but about the bytes OpenSSL read, so it is not reworded below.
             raise
         except OSError as exc:
-            # Vault BACKLOG #2866: the private copy could not be made, written or read. Refuse as
-            # every other check here does, naming the file. Caught here and not in ``staged_crl``:
-            # the running-hop reload tells this OSError, which it retries, from a ValueError, which
-            # it does not. The random temp path stays out of the text, as it does there.
-            raise ValueError(
+            # Vault BACKLOG #2866: the private copy could not be made, written or read. Caught
+            # here, not in ``staged_crl``: the running-hop reload retries that OSError and does not
+            # retry a ValueError. Like the reload's reason, the text leaves out the random path.
+            raise _CrlStagingFailed(
                 f"{label} could not be checked: the engine could not make or read its private "
                 f"copy of the file in its temporary directory "
                 f"({exc.strerror or type(exc).__name__}). That is not a verdict on the file. "
@@ -533,6 +532,17 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
             "a context would not hold what the engine judged. Write each CRL as a plain PEM block, "
             "with its BEGIN and END lines each starting a line"
         )
+
+
+class _CrlStagingFailed(OSError, ValueError):
+    """:func:`harden_crl_check` could not make, write or read its private copy of a CRL file (vault
+    BACKLOG #2866). The text leads with the setting and the file, as its other refusals do.
+
+    Both bases on purpose, as :class:`CaFileUnreadable` has. It was a bare ``OSError`` before, so a
+    caller catching ``OSError`` still catches it. At least the log forwarder's start does: it
+    carries on without the forwarder, where a plain ``ValueError`` would turn a full temp disk into
+    a refused start. The store counts ``OSError`` as a connect error too. A seam that surfaces a
+    ``ValueError`` as a configuration refusal now gets one that names the file."""
 
 
 @contextmanager

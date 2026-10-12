@@ -268,13 +268,12 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     the delta aside, so revocations only the delta lists are dropped. Give the setting base CRLs
     only."""
     blocks = list(_crl_blocks(pem))
-    # Refused, never skipped, wherever the uncounted marker sits (vault BACKLOG #2866, decided
-    # 2026-10-12). The cost is known: a file OpenSSL loads is refused when its only fault is the
-    # marker text inside a comment line. Two reasons to pay it. The engine cannot tell a comment
-    # from a CRL the operator meant to load: skipped silently, a CRL typed after a space would be
-    # reported as applied while the hop still checks the old one. And :func:`_crl_blocks` models
-    # OpenSSL's reader without being it, and records a marker in mid-line that OpenSSL loads. A
-    # model that undercounts would fail open, by letting in a CRL nothing here judged.
+    # Refused, never skipped, even when the uncounted marker is only text in a comment line and
+    # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine
+    # cannot tell a comment from a CRL the operator meant to load: skipped, a CRL typed after a
+    # space would be reported as applied while the hop still checks the old one. And
+    # :func:`_crl_blocks` is a model with a measured miss, which its docstring records. Skipping
+    # what it does not count would fail open, by letting in a CRL nothing here judged.
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(
             "it has a '-----BEGIN X509 CRL-----' marker that does not start a line, so OpenSSL "
