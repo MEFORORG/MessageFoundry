@@ -345,8 +345,8 @@ The console stays a **host-side process**; only its target URL changes.
   WAL/SHM files. Enable the at-rest cipher: set `MEFOR_STORE_ENCRYPTION_KEY`. An instance already
   **refuses to start** without a key by default (fail-closed). Also set
   `[store].require_encryption = true`, so the audited opt-out (`[security].allow_unencrypted_phi`)
-  cannot start it keyless either ([PHI.md](PHI.md) §3 has the full rule). Back up and restrict the
-  volume like any PHI-at-rest store.
+  cannot start it keyless either ([PHI.md](PHI.md) §3). Back up and restrict the volume like any
+  PHI-at-rest store.
 - **External SQL Server / Postgres store.** The store connection is TLS by default
   (`[store].encrypt = true`, `[store].trust_server_certificate = false`). **`MEFOR_ALLOW_INSECURE_TLS`
   must NOT be set in a real deployment** — it is the single switch that downgrades store TLS (and

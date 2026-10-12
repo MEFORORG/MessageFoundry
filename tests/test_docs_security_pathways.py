@@ -3087,8 +3087,12 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
         )
 
 
-#: `[store].require_encryption`, and not `[security].require_encryption_for_remote`.
-_REQUIRE_ENCRYPTION = re.compile(r"require_encryption(?!_for_remote)")
+#: `[store].require_encryption`, and not `[security].require_encryption_for_remote`. Any case,
+#: so the environment spelling `MEFOR_STORE_REQUIRE_ENCRYPTION` names the key too.
+_REQUIRE_ENCRYPTION = re.compile(r"require_encryption(?!_for_remote)", re.IGNORECASE)
+
+#: The first guard's whole phrase, kept as it was: it reds whatever else the unit says.
+_RETIRED_REQUIRE_PHRASE = "so the engine refuses to start unencrypted"
 
 #: A keyless start being refused, or encryption being made to happen, in the words a doc gives
 #: it. "without a restart" is not among them: only a key can be the thing that is missing.
@@ -3127,14 +3131,16 @@ def _credits_require_encryption_with_the_refusal(units: list[str]) -> list[str]:
     opt-out too. The first guard went red on one phrase, "so the engine refuses to start
     unencrypted", and a reworded return passed it (vault BACKLOG #2993, item 6).
 
-    It reads one unit at a time. A return of the claim that also names the opt-out in the same
-    unit still passes."""
+    It reads one unit at a time. A reworded return of the claim that also names the opt-out in
+    the same unit still passes. The first guard's own phrase does not."""
     return [
         u
         for u in units
         if _REQUIRE_ENCRYPTION.search(u)
-        and _KEYLESS_REFUSAL.search(u)
-        and not _KEYLESS_OPT_OUT.search(u)
+        and (
+            _RETIRED_REQUIRE_PHRASE in u
+            or (_KEYLESS_REFUSAL.search(u) and not _KEYLESS_OPT_OUT.search(u))
+        )
     ]
 
 
@@ -3146,7 +3152,9 @@ _AUTH_DISABLED = re.compile(r"\bauth(?:entication)? (?:is )?disabled\b", re.IGNO
 #: the corporate network" is not the claim.
 _SIGN_IN = r"(?:auth|authentication|sign-?in|log-?in)"
 
-#: One sign-in leg can be off, so a leg's name ahead of the subject is not the claim.
+#: One sign-in leg can be off, and so can a second factor or another system's auth. So one of
+#: these names ahead of the subject is not the claim. "factor" stands for "two-factor" and
+#: "multi-factor".
 _SIGN_IN_LEGS = (
     "Kerberos",
     "Windows",
@@ -3160,6 +3168,8 @@ _SIGN_IN_LEGS = (
     "password",
     "passkey",
     "intake",
+    "factor",
+    "SMTP",
 )
 
 #: Sign-in described as something that can be off: "auth disabled", "sign-in is optional",
@@ -3191,15 +3201,16 @@ def _says_sign_in_can_be_off(clauses: list[str]) -> list[str]:
     #2993, item 6). That pattern still reds by itself.
 
     A denial clears a rewording only from inside the same stretch of the clause, back to the last
-    comma, colon or bracket. So a return of the claim behind a "no" or "not" in that stretch still
-    passes. A true sentence can trip it, at least "that account's sign-in is disabled" and "a
-    request without authentication is answered 401": that is loud, and rewording clears it."""
+    comma, colon, dash or bracket. So a return of the claim behind a "no" or "not" in that stretch
+    still passes, and so does one joined on by "and". A true sentence can trip it, at least "that
+    account's sign-in is disabled" and "a request without authentication is answered 401": that is
+    loud, and rewording clears it."""
     return [
         c
         for c in clauses
         if _AUTH_DISABLED.search(c)
         or any(
-            not _DENIED_BEFORE.search(re.split(r"[,:(]", c[: m.start()])[-1])
+            not _DENIED_BEFORE.search(re.split(r"[,:(—–]", c[: m.start()])[-1])
             for m in _SIGN_IN_OFF.finditer(c)
         )
     ]
@@ -3219,6 +3230,9 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "Set `[store].require_encryption = true` to make encryption mandatory.",
         "Set `require_encryption` so the engine will not start with an empty key.",
         "Set `require_encryption` so a PHI instance cannot start in cleartext.",
+        "Set `MEFOR_STORE_REQUIRE_ENCRYPTION=true` so the engine refuses to start without a key.",
+        # The first guard's own phrase reds whatever else the unit says.
+        "Set `require_encryption` so the engine refuses to start unencrypted (there is no opt-out).",
     ]
     assert _credits_require_encryption_with_the_refusal(credited) == credited
     corrected = [
@@ -3252,6 +3266,7 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         # A denial in an earlier stretch of the clause is about something else.
         "`--allow-insecure-bind` does not relax this: with sign-in off, the bind is refused.",
         "TLS is not needed on loopback, where sign-in is optional.",
+        "TLS is not needed on loopback — sign-in is optional there.",
         # The first guard's own phrase reds whatever stands ahead of it.
         "TLS is not needed where auth is disabled.",
     ]
@@ -3268,6 +3283,7 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "Sign-in is always required, and the engine creates no account on its own.",
         "`intake_auth` defaults to `none`, so the listener checks no credential.",
         "Off-box log forwarding needs a collector on another host.",
+        "Two-factor authentication is on by default.",
         *(f"{leg} sign-in is off unless configured." for leg in _SIGN_IN_LEGS),
     ]
     assert _says_sign_in_can_be_off(denied) == []
@@ -3344,7 +3360,8 @@ def test_the_guide_points_at_section_2_for_the_deidentification_framework_only_i
     assert about, (
         "the guide no longer names the de-identification framework, so this check reads nothing"
     )
-    pointed = [c for c in about if "§2" in c]
+    # "§2" alone, or at a sentence end: not "§20" and not a subsection such as "§2.1".
+    pointed = [c for c in about if re.search(r"§2(?!\.?\d)", c)]
     assert listed or not pointed, (
         f"the guide points at §2 for the de-identification framework: {pointed}. Section 2's built "
         "table does not list it; docs/PHI.md section 9 documents it."
@@ -4036,8 +4053,8 @@ def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
             assert token in p, f"docs/PHI.md's built-controls paragraph must name {token}"
         # The paragraph's own "documented per deployment" pointer names no `forward_*`, so the
         # clause scan below does not read it (vault BACKLOG #2993, item 3).
-        # "§11" alone, so a citation such as "ASVS §11.7" in this paragraph is not the pointer.
-        assert not re.search(r"§11(?![.\d])|#11-hardening", p), (
+        # "§11" alone, or at a sentence end. A citation such as "ASVS §11.7" is not the pointer.
+        assert not re.search(r"§11(?!\.?\d)|#11-hardening", p), (
             "docs/PHI.md's built-controls paragraph sends the reader to section 11, the roadmap, "
             "again. DEPLOYMENT.md documents each control, and section 7 documents forwarding."
         )
