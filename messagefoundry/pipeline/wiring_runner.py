@@ -2291,29 +2291,86 @@ class RegistryRunner:
         except FutureCancelledError as exc:  # an Exception, unlike asyncio's CancelledError
             raise DbLookupError(f"db_lookup on {connection!r}: the query was cancelled") from exc
 
-    def _build_fhir_lookup_executor(self) -> FhirLookupExecutor | None:
+    def _build_fhir_lookup_executor(self, *, isolate: bool = False) -> FhirLookupExecutor | None:
         """Build the live FHIR-read executor from the current graph's ``FhirLookup`` specs, or ``None`` if
         the graph declares none (so ``fhir_lookup`` is unavailable and its runner is not activated). Mirrors
         :meth:`_build_lookup_executor`: resolves ``env()`` in each spec and fail-closed egress-checks the
-        FHIR host against ``[egress].allowed_http`` (ADR 0043), exactly as the FHIR outbound is gated."""
-        if not self.registry.fhir_lookups:
+        FHIR host against ``[egress].allowed_http`` (ADR 0043), exactly as the FHIR outbound is gated.
+
+        ``isolate`` is :meth:`start`'s form (vault BACKLOG #3008). A lookup that fails to build, such
+        as one whose hop is refused, is then isolated as :meth:`_start_outbound` isolates a lane: it is
+        recorded failed and alerted, the executor refuses every read on it, and the rest of the graph
+        starts. Without it, a failure raises, as a reload's build does once its build check passed. A
+        failure that no single lookup's build reproduces is graph-wide, and raises either way."""
+        specs = self.registry.fhir_lookups
+        if not specs:
             return None
-        resolved: dict[str, dict[str, Any]] = {}
-        for name, spec in self.registry.fhir_lookups.items():
+
+        def build(
+            names: Iterable[str], failed: Mapping[str, str] | None = None
+        ) -> FhirLookupExecutor:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
-            resolved[name] = _fhir_lookup_settings(spec, self._env_values, self._egress)
-        # #200 (ADR 0092): stamp the derived posture around the live executor build so each connection's
-        # cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off) captures THIS
-        # instance's posture rather than the unstamped fail-closed default. engine.start()/reload build
-        # the executor here outside build_check_registry's active_hop_posture scope, so an unstamped build
-        # would either fail-closed a legit dev read or (via the send-time re-assertion) mis-key the hop.
-        with active_hop_posture(self._hop_posture):
-            # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
-            # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
-            # against an internal FHIR server could otherwise never name an internal CA.
-            return FhirLookupExecutor(
-                resolved, egress=self._egress, trust_anchor_policy=self._trust_anchor_policy
-            )
+            resolved = {
+                name: _fhir_lookup_settings(specs[name], self._env_values, self._egress)
+                for name in names
+            }
+            # #200 (ADR 0092): stamp the derived posture around the live executor build so each
+            # connection's cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off)
+            # captures THIS instance's posture rather than the unstamped fail-closed default.
+            # engine.start()/reload build the executor here outside build_check_registry's
+            # active_hop_posture scope, so an unstamped build would either fail-closed a legit dev read
+            # or (via the send-time re-assertion) mis-key the hop.
+            with active_hop_posture(self._hop_posture):
+                # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
+                # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
+                # against an internal FHIR server could otherwise never name an internal CA.
+                return FhirLookupExecutor(
+                    resolved,
+                    egress=self._egress,
+                    trust_anchor_policy=self._trust_anchor_policy,
+                    failed=failed,
+                )
+
+        try:
+            return build(specs)  # a healthy graph builds once, as it always did
+        except Exception:
+            if not isolate:
+                raise
+        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
+        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
+        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its warning
+        # and attestation lines, so on this path each surviving lookup logs them again per build.
+        # That cost falls only on a start that already failed, and keeps the healthy start to one build.
+        failed: dict[str, str] = {}
+        for name in specs:
+            try:
+                build([name])
+            except Exception as exc:
+                failed[name] = self._record_fhir_lookup_failed(name, exc)
+        return build([name for name in specs if name not in failed], failed)
+
+    def _record_fhir_lookup_failed(self, name: str, exc: BaseException) -> str:
+        """Isolate a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed` isolates
+        a connection (ADR 0031, vault BACKLOG #3008), and return the reason for the executor to
+        keep. The alert names the lookup by its record name, so it cannot be read as an outbound
+        of the same name."""
+        return self._log_and_alert_start_failure(
+            f"fhir lookup {name!r}",
+            fhir_lookup_record_name(name),
+            "reload or restart; every Handler call to it fails closed meanwhile",
+            exc,
+        )
+
+    def fhir_lookup_failed(self, name: str) -> str | None:
+        """The failure reason if the ``FhirLookup`` of this name failed to build at start, else
+        ``None`` (vault BACKLOG #3008). The lookup twin of :meth:`outbound_failed`."""
+        return self.degraded_fhir_lookups().get(name)
+
+    def degraded_fhir_lookups(self) -> dict[str, str]:
+        """Snapshot of ``{lookup: reason}`` for each ``FhirLookup`` that failed to build at start
+        (vault BACKLOG #3008). Empty when every lookup built, or when none is declared."""
+        executor = self._fhir_lookup_executor
+        return executor.failed if executor is not None else {}
 
     def _run_fhir_lookup(
         self,
@@ -4317,21 +4374,32 @@ class RegistryRunner:
         ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
         bare name: an alert row is addressed to the operator's connection, and the detail says which
         direction failed to start."""
-        reason = safe_exc(exc)
-        self._failed[(kind, name)] = reason
-        log.error(
-            "%s connection %r failed to start — ISOLATED, engine continues (fix the cause, then "
-            "reload%s): %s",
-            kind,
+        self._failed[(kind, name)] = self._log_and_alert_start_failure(
+            f"{kind} connection {name!r}",
             name,
-            " or restart it" if kind == "inbound" else "",
+            "reload or restart it" if kind == "inbound" else "reload",
+            exc,
+        )
+
+    def _log_and_alert_start_failure(
+        self, subject: str, alert_name: str, recovery: str, exc: BaseException
+    ) -> str:
+        """The ADR 0031 signal for one thing that failed to start and was isolated: an ERROR line
+        and a ``connection_stopped`` alert. Returns the scrubbed reason. Shared by a connection
+        (:meth:`_record_failed`) and a ``FhirLookup`` (:meth:`_record_fhir_lookup_failed`)."""
+        reason = safe_exc(exc)
+        log.error(
+            "%s failed to start — ISOLATED, engine continues (fix the cause, then %s): %s",
+            subject,
+            recovery,
             reason,
             exc_info=exc,
         )
         try:
-            self._alert_sink.connection_stopped(name, detail=f"failed to start: {reason}")
+            self._alert_sink.connection_stopped(alert_name, detail=f"failed to start: {reason}")
         except Exception:
-            log.exception("alert sink raised on connection_stopped for %r", name)
+            log.exception("alert sink raised on connection_stopped for %r", alert_name)
+        return reason
 
     # --- #122 / ADR 0162: fail-closed application-log write guard ------------
 
@@ -4928,7 +4996,8 @@ class RegistryRunner:
                 # failure no longer aborts startup — it is recorded + alerted and the rest of the graph
                 # still comes up (a failed connection must not crash the engine). The outer except below
                 # stays a backstop for genuinely fatal, graph-wide startup errors (the store, the
-                # lookup executor), which still unwind + raise.
+                # DB-lookup executor), which still unwind + raise. A FhirLookup is isolated per
+                # lookup below (vault BACKLOG #3008).
                 # #122 (ADR 0162): this runner came up into an unwritable application log, so the
                 # delivery tier is paused BEFORE its lanes are built — see
                 # :meth:`_park_delivery_for_log_failure` for why "before" is load-bearing. The intake
@@ -4941,7 +5010,12 @@ class RegistryRunner:
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
                 self._lookup_executor = self._build_lookup_executor()
-                self._fhir_lookup_executor = self._build_fhir_lookup_executor()
+                # Vault BACKLOG #3008, owner ruling R3 of 2026-10-05: a FhirLookup that fails to build
+                # is isolated like a lane. It is recorded failed, the Handlers that call it fail closed,
+                # and the other feeds start. On every start, matching how a lane is isolated: a Manager
+                # decision under the owner's standing driver rules, 2026-10-11, not an owner ruling.
+                # A restart and a clustered node's start on promotion both come through here.
+                self._fhir_lookup_executor = self._build_fhir_lookup_executor(isolate=True)
                 # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
                 self._recompute_inline_ok()
@@ -5050,16 +5124,20 @@ class RegistryRunner:
                     len(self.filtered_outbound()),
                     self._dr_standby.value,
                 )
-            if self._failed:
+            failed_lookups = self.degraded_fhir_lookups()
+            if self._failed or failed_lookups:
                 log.warning(
                     "wiring started DEGRADED: %d inbound, %d outbound connection(s); "
                     "%d failed to start (isolated, engine running): %s",
                     len(self.registry.inbound),
                     len(self.registry.outbound),
-                    len(self._failed),
+                    len(self._failed) + len(failed_lookups),
                     # Named WITH the direction — an operator reading this has to know which half
                     # of a dual-role name to go and fix.
-                    ", ".join(f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())),
+                    ", ".join(
+                        [f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())]
+                        + [f"fhir lookup {n} ({r})" for n, r in sorted(failed_lookups.items())]
+                    ),
                 )
             else:
                 log.info(

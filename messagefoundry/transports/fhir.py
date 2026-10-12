@@ -1261,10 +1261,16 @@ class FhirLookupExecutor:
         *,
         egress: EgressSettings,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
+        failed: Mapping[str, str] | None = None,
     ) -> None:
         # `egress` is required and every connection is checked against it before anything is built,
         # so no caller can construct an executor that reads from an unchecked host (vault BACKLOG #2605).
         from messagefoundry.transports.egress import check_fhir_lookup_allowed
+
+        # Vault BACKLOG #3008: the lookups the runner could not build at start, name -> reason. Each
+        # is isolated like a lane: no opener exists for it, and every read or probe on it is refused
+        # before anything is sent.
+        self._failed: dict[str, str] = dict(failed or {})
 
         for cname, s in connections.items():
             check_fhir_lookup_allowed(cname, s, egress)
@@ -1444,6 +1450,24 @@ class FhirLookupExecutor:
         """The declared lookup connection names."""
         return frozenset(self._base)
 
+    @property
+    def failed(self) -> dict[str, str]:
+        """``{lookup: reason}`` for each lookup that failed to build at start (vault BACKLOG #3008).
+        Empty when every lookup built. A copy, so a caller cannot change the executor's record."""
+        return dict(self._failed)
+
+    def _refuse_failed(self, connection: str, prefix: str) -> None:
+        """Refuse a read or a probe on a lookup that failed to build, before anything is sent. The
+        Handler sees a :class:`FhirLookupError`, so the message takes the error path. The reason
+        stays in the server log, because this text reaches the message's error record."""
+        from messagefoundry.config.fhir_lookup import FhirLookupError
+
+        if connection in self._failed:
+            raise FhirLookupError(
+                f"{prefix}: this lookup failed to start and is isolated, so nothing was sent. "
+                "Fix the cause, then reload or restart; the server log says why"
+            )
+
     def abandon(self, connection: str, pending: concurrent.futures.Future[Any]) -> None:
         """Record that the Handler bridge stopped waiting for ``pending``, a read on ``connection``.
 
@@ -1521,6 +1545,7 @@ class FhirLookupExecutor:
         # Lazy import keeps transports/ from importing config at module load (config imports transports).
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
+        self._refuse_failed(connection, f"fhir_lookup on {connection!r}")
         if connection not in self._base:
             known = ", ".join(sorted(self._base)) or "(none declared)"
             raise FhirLookupError(
@@ -1653,8 +1678,9 @@ class FhirLookupExecutor:
     def _probe(self, connection: str) -> None:
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
-        base = self._base[connection]
         prefix = f"FhirLookup {connection!r}"
+        self._refuse_failed(connection, prefix)
+        base = self._base[connection]
         # The probe sends the same credential the read does, over the same hop, so it gets the same
         # send-time re-check (BACKLOG #2059). Before the mint, as in _get.
         self._assert_hop(connection, prefix)

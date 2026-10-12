@@ -291,10 +291,15 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > the connector, not to pass the posture. So are `DICOM(..., tls=True)`, an `Ftp(..., tls=True)`
 > upload, a `Direct()` relay with a `username`, and an `https://` `FhirLookup()`.
 >
-> **A first `serve` start does not treat every refusal alike** (measured for BACKLOG #2193). It
-> builds each outbound on its own, so a refused outbound is recorded failed and the rest of the
-> graph starts. It builds the lookups once for the whole graph, so a refused `FhirLookup` stops
-> the start. `messagefoundry check`, dry-run and reload fail as a whole in both cases.
+> **At start, a refused hop costs only its own connection or lookup** (vault BACKLOG #3008). A
+> refused outbound is recorded failed and the rest of the graph starts. A refused `FhirLookup` is
+> isolated the same way. It is recorded failed and alerted under `fhir_lookup:<name>`, every
+> Handler call to it raises `FhirLookupError` before anything is sent, so its messages take the
+> error path, and the other feeds start. That holds on every start, a restart and a clustered
+> node's start included. `messagefoundry check`, dry-run and reload still fail as a whole in both
+> cases. A reload with the cause fixed brings the lookup back, and so does a restart. A refused
+> `tls_ca_file` on a `FhirLookup()` is a separate check, and it still refuses the start (see
+> *The engine checks the file at every start and reload*, below).
 >
 > **At the shipped default the ways across are:** keep the hop on **loopback**; load a CRL with
 > `[tls].crl_file` where it reaches the hop; or attest this one connection with

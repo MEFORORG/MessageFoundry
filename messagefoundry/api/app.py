@@ -7920,6 +7920,7 @@ def create_app(
                 # BACKLOG #1609: a pooled stage whose claimer died reads healthy everywhere
                 # else, so it is named here for the console's nav heart.
                 stages_degraded=rr.degraded_stages() if rr is not None else {},
+                fhir_lookups_failed=sorted(rr.degraded_fhir_lookups()) if rr is not None else [],
             ),
             kpis=kpis,
             db=DbInfo(

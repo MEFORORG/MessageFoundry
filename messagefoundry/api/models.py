@@ -911,7 +911,12 @@ class EngineInfo(BaseModel):
     repeated deaths it stays until the claimer has run cleanly for a while. No connection names, and
     the reason names only the task and the exception TYPE, so it needs no channel scoping.
 
-    All three are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
+    ``fhir_lookups_failed`` names each ``FhirLookup`` that failed to start and is isolated (vault
+    BACKLOG #3008): every Handler call to it fails closed until a reload or a restart builds it.
+    Names only, never the reason, for the reason ``channels_failed_names`` gives. A lookup belongs
+    to no channel, so the list is not channel-scoped.
+
+    All four are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
 
     version: str
     uptime_seconds: float
@@ -923,6 +928,7 @@ class EngineInfo(BaseModel):
     channels_failed: int = 0  # deployed inbounds that failed to start (ADR 0031), estate-wide
     channels_failed_names: list[str] = Field(default_factory=list)  # the caller-visible subset
     stages_degraded: dict[str, str] = Field(default_factory=dict)  # BACKLOG #1609
+    fhir_lookups_failed: list[str] = Field(default_factory=list)  # vault BACKLOG #3008
 
 
 class EngineKpis(BaseModel):
