@@ -289,7 +289,7 @@ class RetentionPass:
     # a WARNING was logged. NOT part of `did_work`, and that matters more here than for the disk
     # floor: the audit row a did-work pass writes would land in the very table this warns about, so
     # the warning would grow the table by one row every pass. False when the warning is off, when
-    # the read failed, or on a pass the duration cap cut short before the check.
+    # the read failed, or on a follower, which never reads the table.
     audit_log_over_warn: bool = False
 
     @property
@@ -519,6 +519,13 @@ class RetentionRunner:
                 below_disk_floor=below_disk_floor,
             )
 
+        # The audit-log growth check (BACKLOG #1421) runs after the leader gate, unlike the disk
+        # floor: audit_log is the shared store's table, not this host's volume, so in a cluster only
+        # the leader warns. (Each engine shard runs its own retention, so each one warns.) It runs
+        # before the duration cap, like the floor: it is one index seek, and a pass that ran out of
+        # time must still say the table is large.
+        audit_log_over_warn = await self._check_audit_growth()
+
         # Between-phase duration cap (#121, ADR 0137): bound the wall time one maintenance pass may spend
         # so a long pass can't run unbounded into the next window. `cap <= 0` (the default) disables it —
         # byte-identical to the pre-#121 pass. `_deadline_hit()` reads a MONOTONIC clock (not `now`, the
@@ -732,9 +739,6 @@ class RetentionRunner:
             vacuumed = True
 
         size_bytes, over_limit = (0, False) if _deadline_hit() else await self._check_size()
-        # After the leader gate, unlike the disk floor: audit_log is the one shared store's table,
-        # not this host's volume, so only the node that runs retention should count and warn.
-        audit_log_over_warn = False if _deadline_hit() else await self._check_audit_growth()
 
         result = RetentionPass(
             messages_purged=messages_purged,
@@ -909,8 +913,11 @@ class RetentionRunner:
         ``audit_anchor``: one awaited seek on the UNIQUE ``seq`` index on every backend, so it costs
         the same at any table size and never blocks the event loop. A full ``COUNT(*)`` would scan
         a table that only grows, every pass. On an intact chain the newest ``seq`` IS the row count.
-        On a damaged one it can only be higher, because ``seq`` values are distinct and at least 1,
-        so the warning may come early and never late.
+        On Postgres and SQL Server a CHECK keeps every ``seq`` at least 1, and values are distinct,
+        so on a damaged chain the number can only be higher and the warning comes early, never
+        late. SQLite carries no such CHECK, so a writer with file access can number rows 0 or
+        below and make it read low. The warning is a size signal, not a tamper control; the audit
+        verify is the one that reports a renumbered row.
 
         A read that fails logs a WARNING with its reason and returns False, so a backend that
         cannot answer degrades visibly rather than silently. It never stops the pass."""
@@ -933,8 +940,7 @@ class RetentionRunner:
             "[retention].audit_log_warn_rows threshold of %d. "
             "Nothing prunes audit_log: [retention].audit_days is not enforced, and no engine "
             "feature deletes audit rows. Plan storage for its growth, then raise the threshold to "
-            "acknowledge this size. Setting [security].audit_all_authorization_decisions = false "
-            "slows the growth and is reported as a loosening.",
+            "acknowledge this size.",
             rows,
             threshold,
         )

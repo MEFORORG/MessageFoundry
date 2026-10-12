@@ -1085,7 +1085,7 @@ def test_enabled_property(store: MessageStore) -> None:
     off = {"min_free_disk_mb": 0, "wal_checkpoint_seconds": 0, "audit_log_warn_rows": 0}
     assert RetentionRunner(store, RetentionSettings.model_validate(off)).enabled is False
 
-    # Every knob below is checked with both default-ON knobs OFF, so each one is seen enabling the
+    # Every knob below is checked with every default-ON knob in `off` OFF, so each one is seen enabling the
     # runner alone.
     def enabled(log_dir: str | None = None, **knobs: object) -> bool:
         settings = RetentionSettings.model_validate({**off, **knobs})
@@ -1221,8 +1221,9 @@ async def test_a_failed_audit_read_is_logged_and_the_pass_goes_on(
 async def test_the_audit_warning_applies_to_a_server_backend(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Unlike the disk floor, the read goes through the Store protocol, so a store reporting a
-    server backend starts the runner on this knob alone and is checked."""
+    """Unlike the disk floor, the runner does not gate this check on the SQLite backend: a store
+    reporting a server backend is still checked. The store under it is SQLite, so this pins the
+    runner's gating only; each backend's own ``audit_anchor`` is that backend's suite's to test."""
     rows = await _fill_audit(store, 2)
     monkeypatch.setattr(store, "backend", StoreBackend.SQLSERVER)
     runner = RetentionRunner(store, _growth_only(rows - 1), clock=lambda: 1000.0)
@@ -1231,6 +1232,24 @@ async def test_the_audit_warning_applies_to_a_server_backend(
         result = await runner.run_once()
     assert result.audit_log_over_warn is True
     assert len(_growth_warnings(caplog)) == 1
+
+
+async def test_a_capped_pass_still_warns_about_audit_growth(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check runs before the #121 duration cap, so a pass that ran out of time still warns."""
+    calls = _spy_anchor(monkeypatch, store)
+    ticks = iter([0.0] + [1e9] * 100)  # the cap is hit at the first between-phase check
+    runner = RetentionRunner(
+        store,
+        _growth_only(1, max_pass_seconds=1, messages_days=1),
+        clock=lambda: 10 * DAY,
+        monotonic=lambda: next(ticks),
+    )
+    result = await runner.run_once()
+    assert result.capped is True
+    assert result.audit_log_over_warn is True
+    assert len(calls) == 1
 
 
 async def test_a_follower_does_not_read_the_audit_log(
