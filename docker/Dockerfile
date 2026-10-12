@@ -33,7 +33,7 @@
 # tag; its `docker` entry in .github/dependabot.yml moves the digest when the tag gets a security
 # rebuild. The pin also freezes the base's Debian packages: a fix reaches the image only when that
 # digest moves, and a build from an older checkout keeps that checkout's digest.
-FROM python:3.14-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56 AS python-base
+FROM python:3.14-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
 FROM python-base AS builder-base
