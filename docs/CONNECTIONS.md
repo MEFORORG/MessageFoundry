@@ -1251,15 +1251,17 @@ route does not do.
 labelled `text/csv` downloads as `text/plain` with a `.txt` name. A sender can start a cell with `=`, and
 a spreadsheet evaluates that cell when it opens the file. The route serves a CSV's stored bytes as they
 are, so the `.txt` name is what keeps a double-click away from a spreadsheet. The comment beside the
-table holds the reasoning and the limits. Three of the limits matter to an operator:
+table holds the reasoning and the limits. At least these limits matter to an operator:
 
-- The message page's attachment list still shows the sender's `text/csv` label, so the `.txt` name is
-  expected. **Do not rename the file to `.csv` to open it.** Renaming it, or importing it into a
+- **Do not give a downloaded attachment a `.csv` name to open it.** Renaming it, or importing it into a
   spreadsheet, still evaluates its cells.
+- The message page's attachment list still shows the sender's `text/csv` label, so the `.txt` name is
+  expected. The page carries no note that says so.
 - Which program opens a `.txt` file is set by your own host. Nobody has tested this route against a
   browser or a spreadsheet.
-- Only the exact label `text/csv` is covered. Another spelling, such as `application/csv`, downloads as
-  `application/octet-stream` with a `.bin` name, like any unlisted type.
+- Only the exact label `text/csv` is covered. Another spelling, such as `application/csv` or
+  `text/csv; charset=utf-8`, downloads as `application/octet-stream` with a `.bin` name, like any
+  unlisted type. The first limit applies to that file too.
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 

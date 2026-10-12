@@ -2162,7 +2162,9 @@ _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 #: bytes of a CSV as they are, so the cell arrives intact.
 #:
 #: Like the PDF case, this is a local-open risk and the application origin is not reached. CSV still
-#: gets the other answer, because PDF reason 2 points the other way for it.
+#: gets the other answer, because PDF reason 2 points the other way for it. The two decisions do not
+#: conflict. The PDF text is about the ``Content-Type`` header, and the origin is all that header
+#: controls. This decision is about the download name, which the same route also writes.
 #:
 #: 1. PDF reason 2 says the file extension decides what opens a saved file, and this route writes
 #:    that extension. A host with a spreadsheet installed usually opens ``.csv`` in it. So the

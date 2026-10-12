@@ -116,6 +116,7 @@ _BROWSER_ACTIVE_LABELS = (
 _MALFORMED_LABELS = (
     "image/svg+xml; charset=utf-8",
     "text/plain; charset=utf-8",
+    "text/csv; charset=utf-8",  # the text/csv alias does not reach a parameterized label either
     "text/html\r\nX-Evil: 1",
 )
 
@@ -585,6 +586,10 @@ def test_csv_is_off_the_allowlist_by_recorded_decision() -> None:
     The alias reuses the case-folded key, so a mixed-case label lands on the same type."""
     assert "text/csv" not in _INERT_ATTACHMENT_TYPES
     assert _ATTACHMENT_SERVED_AS == {"text/csv": "text/plain"}
+    # The table's two rules, in general form, so a later entry that only updates the literal above
+    # still has to keep them. A target off the allow-list would silently serve as the generic type.
+    assert set(_ATTACHMENT_SERVED_AS.values()) <= set(_INERT_ATTACHMENT_TYPES)
+    assert not set(_ATTACHMENT_SERVED_AS) & set(_INERT_ATTACHMENT_TYPES)
     for label in ("text/csv", "Text/CSV", "TEXT/CSV"):
         assert _safe_attachment_content_type(label) == "text/plain"
 
