@@ -96,7 +96,17 @@ MALFORMED_SEGMENT = "(malformed segment)"
 #: The address a malformed line's first field always gets. :func:`structural_phi_hits` refuses on it.
 _MALFORMED_LINE = f"{MALFORMED_SEGMENT}-0"
 #: The hit a malformed line raises. Named so :func:`refusal_advice` can tell it from a PHI shape.
-MALFORMED_LINE_HIT = "line with a malformed segment id, which no rule can reach"
+#: It names both kinds of line :func:`_line_is_malformed` refuses, in the words
+#: ``normalized_message`` uses, so an operator reading it knows a short header line is one cause.
+MALFORMED_LINE_HIT = (
+    "line no rule can reach (a malformed segment id, or a header line with no separator after "
+    "its encoding characters)"
+)
+#: The advice that goes with :data:`MALFORMED_LINE_HIT`.
+MALFORMED_LINE_ADVICE = (
+    "Repair the line no rule can reach: give it a well-formed segment id, or give a header line "
+    "the separator after its encoding characters."
+)
 #: The stand-in segment id for a well-formed id that the message's HL7 version does not define and
 #: that is not a Z-segment. A segment id is untrusted text too -- a wrapped ``KIM|F`` looks like a
 #: segment -- so only a defined id, a Z-segment or an id a rule names is ever printed in an address.
@@ -308,8 +318,9 @@ def unmapped_field_values(
 
     The MSH control header is skipped whole: it carries routing/site data the field-anchored
     site-code pass already covers, not patient PHI. The header is the ONE line
-    ``read_message_seps`` takes the separators from, and no other. A bare or short ``MSH`` line
-    ahead of it is not the header: it is walked, and refused, like one after it. Every line,
+    ``read_message_seps`` takes the separators from, and no other. An ``MSH`` line ahead of it is
+    not the header: it is walked, and refused whatever it holds, where one after the header is
+    refused only when it is bare or short. Every line,
     whichever side of the header it sits on, is judged against the header's own MSH-12 version
     (BACKLOG #3001). A later MSH line is checked. It, and every ``BHS`` and ``FHS`` line, is
     numbered the header way: field N sits at split index N-1, because field 1 is the separator
@@ -408,9 +419,9 @@ def structural_phi_hits(
     result is safe to raise/log. Empty when the message has no parseable MSH. ``version`` is
     handed to :func:`unmapped_field_values`.
 
-    A line with a malformed segment id is a hit by itself, whatever it holds: no rule can reach it,
-    so the anonymizer passed it through untouched, and a wrapped name or note is exactly what such a
-    line tends to carry."""
+    A line no rule can reach (a malformed segment id, or a short header line; see
+    :func:`_line_is_malformed`) is a hit by itself, whatever it holds: the anonymizer passed it
+    through untouched, and a wrapped name or note is exactly what such a line tends to carry."""
     parsed = read_message_seps(text)
     if parsed is None:
         return []
@@ -596,7 +607,7 @@ def refusal_advice(
                 "For a line with no fields, add a rule or a keep for any field of that segment."
             )
     if MALFORMED_LINE_HIT in report.structural_hits:
-        steps.append("Repair the line with a malformed segment id.")
+        steps.append(MALFORMED_LINE_ADVICE)
     if denylist_refused:
         steps.append("Load the denylist token source.")
     return " ".join(steps)
@@ -615,10 +626,15 @@ UNMAPPED_SCOPE_NOTE = (
 class CoverageTally:
     """The unmapped-field coverage across many messages, kept as counts rather than as reports so a
     long run holds one entry per distinct address. PHI-safe: addresses and counts, never a value.
-    Pass :meth:`add` as ``anonymize_checked``'s ``on_report``."""
+    Pass :meth:`add` as ``anonymize_checked``'s ``on_report``.
+
+    ``anonymize_checked`` calls ``on_report`` only for a message that reached the leak-check. One
+    it refuses first, with :class:`AnonError`, builds no report, so a caller that wants the
+    summary to show it calls :meth:`refuse` when it catches that error (BACKLOG #3004)."""
 
     def __init__(self, *, full_coverage: bool = False) -> None:
         self.messages = 0
+        self.refused = 0
         self.counts: Counter[str] = Counter()
         self.undecided: Counter[str] = Counter()
         self.blanked: Counter[str] = Counter()
@@ -631,6 +647,10 @@ class CoverageTally:
         self.undecided.update(report.undecided_fields)
         self.blanked.update(report.blanked_fields)
         self.denylist_live = self.denylist_live and denylist_is_live(report)
+
+    def refuse(self) -> None:
+        """Count one message ``anonymize`` refused with :class:`AnonError`, before any report."""
+        self.refused += 1
 
     def summary(self) -> str:
         live = "yes" if self.messages and self.denylist_live else "no"
@@ -647,5 +667,20 @@ class CoverageTally:
             gone = ", ".join(f"{a} x{n}" for a, n in sorted(self.blanked.items()))
             text += (
                 f" Date fields emptied because the value was not a timestamp it could keep: {gone}."
+            )
+        if any(address.endswith(BARE_LINE) for address in self.counts):
+            # The entry reads like a field address and is not one, and the advice a LeakError
+            # carries never reaches an operator whose caller prints its own text (BACKLOG #3004).
+            text += (
+                f" An entry that ends in '{BARE_LINE.strip()}' is a line holding only that "
+                "segment id. It is not an overlay key. A rule or a keep on any field of that "
+                "segment decides it."
+            )
+        if self.refused:
+            text += (
+                f" Not counted above: {self.refused} message(s) refused before the leak-check "
+                "built a report. The cause is at least one of these: no parseable MSH; a line "
+                f"no rule can reach, which a report lists as {_MALFORMED_LINE}; an HL7 version "
+                "in MSH-12 with a run of digits too long to read."
             )
         return text

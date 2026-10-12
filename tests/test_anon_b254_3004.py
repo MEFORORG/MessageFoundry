@@ -9,13 +9,19 @@ Part 2: ``anonymize_checked`` judges a bare line by the HL7 version the message 
 read the version from its own output, so a rule that rewrote MSH-12 could change which bare
 segment ids counted as defined, and a message that passed plain ``anonymize`` was refused.
 
+Part 1: the ``python -m tee anonymize-captures`` summary counts a message ``anonymize`` refused
+before the leak-check built a report. Two carry-overs from the reviews of vault BACKLOG #2998 and
+#3001 sit with it: the summary says what a bare-line entry is, and the refusal texts name a
+short header line.
+
 Every value here is synthetic.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,8 +32,10 @@ import messagefoundry.anon as engine_anon
 import tee.anon as tee_anon
 from messagefoundry.anon import leak as engine_leak
 from messagefoundry.anon import rules as engine_rules
+from tee.__main__ import main as tee_main
 from tee.anon import leak as tee_leak
 from tee.anon import rules as tee_rules
+from tee.store import RelayStore
 
 _LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
 _NO_SCANNER = pytest.mark.skipif(
@@ -257,6 +265,12 @@ def test_a_direct_leak_report_takes_the_version(side: Any) -> None:
     assert "PRT (line with no fields)" in report.unmapped_fields
 
 
+def test_the_two_packages_agree_on_the_version_of_every_case() -> None:
+    """Parity, for the helper the leak-check now depends on."""
+    for text in (_message(version="2.7"), "\x0bLEE\rMSH\r" + _msh("2.4^X"), "PID|1", ""):
+        assert engine_leak.message_version(text) == tee_leak.message_version(text)
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     (
@@ -276,3 +290,167 @@ def test_message_version_reads_the_header_the_walk_reads(
     side: Any, text: str, expected: str | None
 ) -> None:
     assert side.leak.message_version(text) == expected
+
+
+# --- part 1: the tee summary shows a message refused before the leak-check ------------------------
+
+_NOT_COUNTED = "Not counted above: {n} message(s) refused before the leak-check built a report."
+_OF_THEM = "{n} of them were refused before the leak-check, as the coverage line says."
+#: Bare text that is not a segment id of any HL7 version, standing in for a wrapped line.
+_WRAPPED = "QQX"
+_SHORT_HEADER = "a header line with no separator after its encoding characters"
+_BARE_NOTE = (
+    "An entry that ends in '(line with no fields)' is a line holding only that segment id. "
+    "It is not an overlay key. A rule or a keep on any field of that segment decides it."
+)
+
+
+def _seed(db: str, raws: tuple[str, ...]) -> None:
+    async def go() -> None:
+        store = await RelayStore.open(db)
+        try:
+            for n, raw in enumerate(raws):
+                await store.record_capture(
+                    direction="corepoint_copy", control_id=f"C{n}", raw=raw.encode("latin-1")
+                )
+        finally:
+            await store.close()
+
+    asyncio.run(go())
+
+
+@pytest.fixture
+def run_tee(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> Callable[..., tuple[int, str, Path]]:
+    """Run ``anonymize-captures`` in process over ``raws``. Returns the exit code, everything the
+    operator would read (stderr plus the coverage line, which is logged at INFO) and the dataset
+    path."""
+    # The in-process run must not reconfigure logging for the whole pytest session.
+    monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    caplog.set_level("INFO", logger="tee.anonymize")
+
+    def run(*raws: str) -> tuple[int, str, Path]:
+        db = str(tmp_path / "tee.db")
+        out = tmp_path / "ds.jsonl"
+        _seed(db, raws)
+        code = tee_main(["anonymize-captures", "--db", db, "--out", str(out)])
+        logged = "\n".join(r.getMessage() for r in caplog.records if r.name == "tee.anonymize")
+        return code, capsys.readouterr().err + logged, out
+
+    return run
+
+
+def test_the_tee_summary_counts_a_message_refused_before_the_leak_check(
+    run_tee: Callable[..., tuple[int, str, Path]],
+) -> None:
+    """The reproduction. One clean message, one with a wrapped line and one with no MSH. Before
+    the fix the summary said one message reached the leak-check and nothing about the other two."""
+    code, text, out = run_tee(_message(), _message(_WRAPPED), "PID|1||7^^^H^MR")
+    assert code == 1 and not out.exists()
+    assert "coverage: 1 message(s) reached the leak-check" in text
+    assert _NOT_COUNTED.format(n=2) in text
+    assert "a line no rule can reach, which a report lists as (malformed segment)-0" in text
+    assert "error: 2 of 3 message(s) failed anonymization" in text
+    assert _OF_THEM.format(n=2) in text
+    assert _WRAPPED not in text  # addresses and counts only, never the line's text
+
+
+def test_a_leak_check_refusal_is_not_counted_as_refused_before_it(
+    run_tee: Callable[..., tuple[int, str, Path]],
+) -> None:
+    """The control. A dashed SSN in an unmapped field is refused BY the leak-check, so it is in
+    the coverage count and the new sentence stays out."""
+    code, text, _ = run_tee(_message("ZPD|123-45-6789"))
+    assert code == 1
+    assert "coverage: 1 message(s) reached the leak-check" in text
+    assert "error: 1 of 1 message(s) failed anonymization" in text
+    assert "Not counted above" not in text and "of them were refused" not in text
+
+
+def test_a_clean_tee_run_says_nothing_about_refusals(
+    run_tee: Callable[..., tuple[int, str, Path]],
+) -> None:
+    code, text, out = run_tee(_message())
+    assert code == 0 and out.exists()
+    assert "Not counted above" not in text and _BARE_NOTE not in text
+
+
+@_SIDES
+def test_the_tally_names_refusals_only_when_there_are_some(side: Any) -> None:
+    tally = side.leak.CoverageTally()
+    assert "Not counted above" not in tally.summary()
+    tally.refuse()
+    tally.refuse()
+    assert tally.refused == 2 and tally.messages == 0
+    assert _NOT_COUNTED.format(n=2) in tally.summary()
+
+
+# --- carry-over: the tee operator is told what a bare-line entry is -------------------------------
+
+
+def test_the_tee_says_what_a_bare_line_entry_is(
+    run_tee: Callable[..., tuple[int, str, Path]],
+) -> None:
+    """The advice a ``LeakError`` carries never reaches a tee operator, because the command
+    prints its own text. The summary lists the entry, so the summary explains it."""
+    code, text, _ = run_tee(_message("PV2"))
+    assert code == 0
+    assert "PV2 (line with no fields) x1" in text
+    assert _BARE_NOTE in text
+
+
+@_SIDES
+def test_the_tally_explains_a_bare_line_entry_only_when_it_lists_one(side: Any) -> None:
+    def report(*unmapped: str) -> Any:
+        return side.leak.LeakReport(
+            hits=[],
+            unmapped_fields=unmapped,
+            structural_hits=[],
+            token_tables_live=True,
+            token_floor_reason=None,
+        )
+
+    plain = side.leak.CoverageTally()
+    plain.add(report("ZPD-1"))
+    assert _BARE_NOTE not in plain.summary()
+    bare = side.leak.CoverageTally()
+    bare.add(report("ZPD-1", "PV2 (line with no fields)"))
+    assert _BARE_NOTE in bare.summary()
+
+
+# --- carry-over: the refusal texts name a short header line ---------------------------------------
+
+
+@_SIDES
+def test_the_hit_and_the_advice_name_a_short_header_line(side: Any) -> None:
+    """A header line with fewer than three fields is refused under the same hit as a malformed
+    segment id (vault BACKLOG #2998), and the texts said only the second."""
+    assert _SHORT_HEADER in side.leak.MALFORMED_LINE_HIT
+    assert "malformed segment id" in side.leak.MALFORMED_LINE_HIT
+    report = side.leak.LeakReport(
+        hits=[side.leak.MALFORMED_LINE_HIT],
+        unmapped_fields=(),
+        structural_hits=[side.leak.MALFORMED_LINE_HIT],
+        token_tables_live=True,
+        token_floor_reason=None,
+    )
+    advice = side.leak.refusal_advice(report)
+    assert advice == side.leak.MALFORMED_LINE_ADVICE
+    assert "a well-formed segment id" in advice
+    assert "a header line the separator after its encoding characters" in advice
+
+
+def test_the_tee_error_line_names_a_short_header_line(
+    run_tee: Callable[..., tuple[int, str, Path]],
+) -> None:
+    code, text, _ = run_tee(_message("BHS|TEXT"))
+    assert code == 1
+    assert (
+        f"repair each line no rule can reach (a malformed segment id, or {_SHORT_HEADER})" in text
+    )
+    assert _NOT_COUNTED.format(n=1) in text

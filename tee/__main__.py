@@ -49,7 +49,7 @@ from tee import __version__, mefor_api
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
 from tee.anon.leak import CoverageTally
-from tee.anon.rules import RuleError, kept_defaults, load_rules, retargeted_defaults
+from tee.anon.rules import AnonError, RuleError, kept_defaults, load_rules, retargeted_defaults
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -660,8 +660,15 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 require_full_coverage=args.require_full_coverage,
                 on_report=coverage.add,
             )
+        except AnonError:
+            # Counted apart from the rest: anonymize refused the message before the leak-check
+            # built a report, so the coverage line would not show it at all (BACKLOG #3004).
+            # The error's text is not printed; the summary names the count and fixed causes.
+            coverage.refuse()
+            failed += 1
+            continue
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
-            failed += 1  # it is a count, not a leak (LeakError, AnonError, or anything else)
+            failed += 1  # it is a count, not a leak (LeakError, or anything else)
             continue
         lines.append(
             json.dumps(
@@ -677,11 +684,18 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     else:
         print(coverage.summary(), file=sys.stderr)
     if failed:
+        before_check = (
+            f"{coverage.refused} of them were refused before the leak-check, as the coverage "
+            "line says. "
+            if coverage.refused
+            else ""
+        )
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
             "forbidden token or had a field nobody decided — refusing to write a dataset (fail "
-            "closed). Extend the rule map or add a keep in an anon.toml overlay, or repair lines "
-            "with a malformed segment id (no rule can reach one), then retry.",
+            f"closed). {before_check}Extend the rule map or add a keep in an anon.toml overlay, "
+            "or repair each line no rule can reach (a malformed segment id, or a header line "
+            "with no separator after its encoding characters), then retry.",
             file=sys.stderr,
         )
         return 1
