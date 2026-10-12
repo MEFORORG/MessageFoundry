@@ -498,6 +498,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # under a per-process AES-256-GCM key built through store.crypto._install_key (lock + wipe of the
     # key buffer). Memory hygiene for decoded cache values, not at-rest protection.
     "messagefoundry/store/sealed_cache.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #2592: row integrity seals. hmac = HMAC-SHA256 over a typed row encoding under a key
+    # derived (HKDF, through the store.crypto seam) from the store key's authorization root; hashlib =
+    # the SHA-256 the HMAC runs over; compare_digest for the constant-time verify.
+    "messagefoundry/store/row_seal.py": frozenset(
+        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+    ),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -1071,6 +1077,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:via messagefoundry.auth.totp",
             "sign_verify:via messagefoundry.auth.oidc.claims",
             "sign_verify:via messagefoundry.auth.webauthn",
+            # BACKLOG #2592: the session loader checks each session row's integrity seal.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:via messagefoundry.auth.oidc_http",
         }
     ),
@@ -1314,6 +1322,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
+    # BACKLOG #2592: HMAC-SHA256 row seals and their constant-time verify, under a key the
+    # store.crypto seam derives (HKDF) and names by a SHA-256 digest.
+    "messagefoundry/store/row_seal.py": frozenset(
+        {
+            "compare:hmac.compare_digest",
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:hmac.new[sha256]",
+        }
+    ),
     # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
     # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
     # sha256) by store.crypto._install_key.
@@ -1345,6 +1363,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "kdf:via messagefoundry.store.crypto",
             "key_cert:via messagefoundry.config.tls_policy",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:.check_hostname = False",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
@@ -1361,6 +1381,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.store",
             "kdf:via messagefoundry.store.crypto",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/store/store.py": frozenset(
@@ -1373,6 +1395,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
+            "sign_verify:.verify()",
         }
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)

@@ -1076,6 +1076,27 @@ UPLOADED_FILE_TABLE = "uploaded_file"
 UPLOAD_CIPHER_SUBJECT = "upload-cipher"
 
 
+#: The ``integrity_drift`` subject for an authority row whose integrity seal did not verify (BACKLOG
+#: #2592). Its own subject, so it throttles and routes apart from the cipher and the audit chain.
+AUTHORITY_SEAL_SUBJECT = "authority-seal"
+
+
+def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call raises
+    ``integrity_drift`` under :data:`AUTHORITY_SEAL_SUBJECT` with the given reason.
+
+    The reason names a row kind and a short id prefix, never a row value, so it carries no PHI.
+    Never raises: an alert failure must not change what a sign-in or a request resolves to."""
+
+    def _raise(reason: str) -> None:
+        try:
+            sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning("authority-seal integrity alert could not be delivered")
+
+    return _raise
+
+
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:
     """Raise the refusal alert for an unmarked value in ``table.column``: ``upload-cipher`` for the
     uploaded-file store, ``store-cipher`` for everything else.

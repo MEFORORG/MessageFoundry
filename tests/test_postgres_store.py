@@ -5086,6 +5086,38 @@ async def test_session_rotation_contract(store) -> None:
     await assert_session_rotation_contract(store)
 
 
+async def test_session_seal_contract(store) -> None:
+    """BACKLOG #2592: session-row integrity seals, the same contract the SQLite suite runs, on a
+    keyed handle. ``raw`` runs each statement on a pooled connection, outside the store's helpers.
+    The fixture truncates the session and user tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._session_seal_contract import (
+        assert_session_columns,
+        assert_session_seal_contract,
+        dollar_placeholders,
+    )
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'sessions'"
+            )
+        await assert_session_seal_contract(keyed, raw)
+        assert_session_columns({str(r["column_name"]) for r in rows})
+    finally:
+        await keyed.close()
+
+
 async def test_session_supersession_contract(store) -> None:
     """BACKLOG #2146: supersede_session revokes and returns in one statement, so a rotation after it
     fails closed. Extra-free shared contract, run here as on SQLite."""

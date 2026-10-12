@@ -390,6 +390,7 @@ from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_se
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    authority_seal_alert,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
@@ -10074,6 +10075,9 @@ def create_managed_app(
                     # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
                     # connector-construction gate, so the clamp is inert unless the posture arrives here).
                     hop_posture=_hop_posture,
+                    # BACKLOG #2592: an authority row that fails its integrity seal is denied and
+                    # raises integrity_drift on the same sink the cipher refusal uses.
+                    integrity_alert=authority_seal_alert(notifier or LoggingAlertSink()),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:

@@ -301,21 +301,52 @@ async def test_postgres_convenience_reads_are_bounded_too(method: str) -> None:
         await getattr(store, method)("SELECT 1")
 
 
+class _SessionConn(_Conn):
+    """The connection the busy pool hands over once freed: records each statement, answers a
+    session-row read with one live unsealed row, and reports two rows changed (BACKLOG #2592 made
+    both writes read and rewrite inside a transaction)."""
+
+    def __init__(self, statements: list[str]) -> None:
+        super().__init__("busy")
+        self._statements = statements
+
+    def transaction(self) -> Any:
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _txn() -> Any:
+            yield
+
+        return _txn()
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self._statements.append(sql)
+        return "UPDATE 2"
+
+    async def fetchrow(self, sql: str, *args: Any) -> Any:
+        self._statements.append(sql)
+        if not sql.startswith("SELECT * FROM sessions"):
+            return None
+        return {
+            "token_hash": "a" * 64,
+            "user_id": "u",
+            "created_at": 1.0,
+            "expires_at": 9e9,
+            "last_used_at": 1.0,
+            "revoked_at": None,
+            "client": None,
+            "user_epoch": 0,
+            "seal": "",
+        }
+
+
 class _BusyPool(_GatedPool):
-    """A saturated pool: every borrow waits until the test frees a connection. ``execute`` stands
-    in for asyncpg's own ``Pool.execute``, which borrows inside with no timeout."""
+    """A saturated pool: every borrow waits until the test frees a connection."""
 
     def __init__(self) -> None:
         super().__init__()
         self.statements: list[str] = []
-
-    async def execute(self, sql: str, *args: Any) -> str:
-        conn = await self.acquire()
-        try:
-            self.statements.append(sql)
-            return "UPDATE 2"
-        finally:
-            await self.release(conn)
+        self.conn = _SessionConn(self.statements)
 
 
 @pytest.mark.parametrize(
@@ -332,6 +363,7 @@ async def test_postgres_post_commit_session_writes_wait_out_a_busy_pool(
     frees. The control proves the stand-in does time a bounded borrow out."""
     pool = _BusyPool()
     store = _postgres_store(pool)
+    store._row_sealer = None  # keyless: the re-key rewrites the row with an empty seal
     with pytest.raises(StoreAcquireTimeout):
         await store._execute("UPDATE sessions SET revoked_at=$1", 1.0)
 
@@ -470,6 +502,8 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # (a reset password, a disable, a completed factor ceremony), and nothing retries it, so on the
     # bounded borrow a busy pool left that account's sessions live or its old token unrotated.
     # The helper keeps the count; its docstring gives the reasoning.
+    # Still 35 on 2026-10-11: BACKLOG #2592 turned that helper into `_after_commit_txn`, one
+    # unbounded `self._pool.acquire()` in place of its one `self._pool.execute`.
     assert (len(store_sites), len(cluster_sites)) == (35, 0), (
         "the measured population of pool borrows OUTSIDE the bounded helper moved from 35 (store)"
         " + 0 (cluster), measured 2026-10-05. Re-read the CONNECTIONS.md scope note before changing"
@@ -478,9 +512,10 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
 
 
 def test_postgres_unbounded_post_commit_helper_has_exactly_its_two_callers() -> None:
-    """``_execute_after_commit`` is ONE pinned site in the census above, however many methods call
-    it, and the offline placeholder tests stub it out. So a third session write moved onto it would
-    pass both. This pins its callers by name (BACKLOG #2283)."""
+    """``_after_commit_txn`` is ONE pinned site in the census above, however many methods use it,
+    and the offline placeholder tests stub it out. So a third session write moved onto it would
+    pass both. This pins its callers by name (BACKLOG #2283). It was ``_execute_after_commit``, one
+    statement, until BACKLOG #2592 made each of the two writes a transaction."""
     import ast
 
     tree = ast.parse((_REPO / "messagefoundry/store/postgres.py").read_text(encoding="utf-8"))
@@ -489,7 +524,7 @@ def test_postgres_unbounded_post_commit_helper_has_exactly_its_two_callers() -> 
         for fn in ast.walk(tree)
         if isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef)
         for node in ast.walk(fn)
-        if isinstance(node, ast.Attribute) and node.attr == "_execute_after_commit"
+        if isinstance(node, ast.Attribute) and node.attr == "_after_commit_txn"
     )
     assert callers == ["revoke_user_sessions", "rotate_session"], (
         "a new caller reached the unbounded post-commit borrow; give it the bounded `_execute`"

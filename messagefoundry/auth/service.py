@@ -25,6 +25,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import (
+    AsyncIterator,
     Awaitable,
     Callable,
     Coroutine,
@@ -32,7 +33,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -127,6 +128,7 @@ from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -141,6 +143,8 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     require_notify_email,
     seed_notify_email,
+    session_seal_ok,
+    session_sealed_by_retired_key,
 )
 from messagefoundry.transports.bounded_read import EgressReplyError
 from messagefoundry.transports.email import envelope_address_problem
@@ -2240,6 +2244,25 @@ def oidc_client_auth_from_settings(
     )
 
 
+#: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
+AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
+#: How often one failing row is reported again while it keeps being presented, in seconds.
+_SEAL_FAILURE_REPORT_INTERVAL_SECONDS: Final = 300.0
+#: How many failing rows the report throttle remembers; the oldest is forgotten first.
+_SEAL_FAILURE_TRACK_MAX: Final = 1024
+#: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
+#: the ``auth.session_revoked`` rows already record.
+_SESSION_REF_LEN: Final = 12
+
+
+@dataclass
+class _StampOutcome:
+    """What :meth:`AuthService._sealed_stamp` saw: ``refused`` when the store would not re-seal the
+    row because its seal did not verify, so the stamp was not made (BACKLOG #2592)."""
+
+    refused: bool = False
+
+
 class AuthService:
     """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory.
 
@@ -2258,9 +2281,16 @@ class AuthService:
         secret_provider: SecretProvider | None = None,
         enforcing: bool = True,
         hop_posture: HopPosture | None = None,
+        integrity_alert: Callable[[str], None] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
+        # BACKLOG #2592: raises the integrity alert when an authority row fails its seal. Injected by
+        # the API lifespan (the service never imports the alert sinks). None logs only.
+        self._integrity_alert = integrity_alert
+        # Session token-hash prefix -> monotonic time its seal failure was last reported, so one
+        # bad row presented on every request writes one audit row and one alert per interval.
+        self._seal_failures_reported: dict[str, float] = {}
         # #285 (ASVS 6.7.1): the ADR 0148 [security].enforcement dial, threaded in by the caller
         # (the lifespan passes trust_anchors_enforcing). It gates the OIDC anchor's construction-site
         # ACL preflight in build_idp_opener below so a group/world-writable anchor WARNS (not refuses)
@@ -3240,7 +3270,7 @@ class AuthService:
         """Whether :meth:`_elevated_hash` must end this session because its temporary credential
         lapsed, ending it and auditing the refusal when so (BACKLOG #2298). A session already gone
         answers False: the rotation then fails closed on its own."""
-        session = await self._store.get_session(token_hash)
+        session = await self._load_session(token_hash)
         if session is None:
             return False
         user = await self._store.get_user(session.user_id)
@@ -4488,7 +4518,7 @@ class AuthService:
         """
         if not token:
             return False
-        session = await self._store.get_session(hash_token(token))
+        session = await self._load_session(hash_token(token))
         return session is not None and session.auth_mechanism == SessionMechanism.OIDC.value
 
     async def begin_oidc_step_up(
@@ -4514,7 +4544,7 @@ class AuthService:
         if not self.oidc_enabled or self._oidc_flows is None:
             raise oidc.FlowError("federated sign-in is not configured")
         token_hash = hash_token(token)
-        session = await self._store.get_session(token_hash)
+        session = await self._load_session(token_hash)
         if (
             session is None
             or session.revoked_at is not None
@@ -4724,7 +4754,7 @@ class AuthService:
                 TOO_EARLY, actor=actor, client=client, return_to=return_to
             )
         now = time.time()
-        session = await self._store.get_session(token_hash)
+        session = await self._load_session(token_hash)
         if (
             session is None
             or session.revoked_at is not None
@@ -4830,9 +4860,10 @@ class AuthService:
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
         # The accepted auth_time is written in the same statement (BACKLOG #2143), so the next
         # step-up must show a later one: this answer replayed by the IdP is then refused.
-        await self._store.mark_session_reauthed(
-            token_hash, client=client, idp_auth_time=principal_claims.auth_time
-        )
+        async with self._sealed_stamp(token_hash):
+            await self._store.mark_session_reauthed(
+                token_hash, client=client, idp_auth_time=principal_claims.auth_time
+            )
         self._restart_new_ip_dedupe(token_hash)
         grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
             token_hash, purpose
@@ -4882,7 +4913,7 @@ class AuthService:
         events. A sign-in flow, or a session already gone, has no account to name."""
         if flow.step_up_session_hash is None:
             return "<oidc>"
-        session = await self._store.get_session(flow.step_up_session_hash)
+        session = await self._load_session(flow.step_up_session_hash)
         user = await self._store.get_user(session.user_id) if session is not None else None
         return user.username if user is not None else "<oidc>"
 
@@ -7177,7 +7208,8 @@ class AuthService:
             # asserted one): mark the session's 2nd factor satisfied at issuance so the step-up gate
             # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
             # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
-            await self._store.mark_session_mfa_verified(token_hash)
+            async with self._sealed_stamp(token_hash):
+                await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
         await self._enforce_session_cap(user_id, client=client)
@@ -7299,7 +7331,7 @@ class AuthService:
         """:meth:`_rotate_session_token` keyed on the session's HASH, for the one ceremony that holds
         no token: the federated step-up callback, which the SameSite=Strict cookie never reaches
         (BACKLOG #296). Same contract, same lock, same re-key."""
-        session = await self._store.get_session(old_hash)
+        session = await self._load_session(old_hash)
         if session is None:
             return None
         # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
@@ -7307,7 +7339,14 @@ class AuthService:
         # the hash the rotation just retired, and the live session would never count it.
         async with self._account_reproof_lock(session.user_id):
             new_token = mint_token()
-            if not await self._store.rotate_session(old_hash, new_token_hash=hash_token(new_token)):
+            try:
+                rotated = await self._store.rotate_session(
+                    old_hash, new_token_hash=hash_token(new_token)
+                )
+            except RowSealError:  # BACKLOG #2592: the row failed its seal; nothing was written
+                await self._session_seal_failed(old_hash)
+                return None
+            if not rotated:
                 return None
             self._rekey_token_state(old_hash, hash_token(new_token))
             return new_token
@@ -7419,7 +7458,7 @@ class AuthService:
         propagates.
         """
         try:
-            session = await self._store.get_session(hash_token(token))
+            session = await self._load_session(hash_token(token))
             if session is not None:
                 await self._enforce_session_cap(session.user_id, client=client)
         except Exception:  # noqa: BLE001 -- driver errors vary by backend; see the docstring
@@ -7449,8 +7488,8 @@ class AuthService:
         """
         if not token:
             return None
-        session = await self._store.get_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
+        session = await self._load_session(hash_token(token))
+        if session is None:
             return None
         now = time.time()
         # Revoke on any of: a backward wall-clock step (NTP step-back, VM snapshot revert), where a
@@ -7469,11 +7508,111 @@ class AuthService:
                 session.token_hash, user.username, at="session", client=None
             )
             return None
+        # BACKLOG #2592: a whole-account revoke raised the account's epoch after this session was
+        # sealed, so the session belongs to sessions that were ended. That revoke blanked every
+        # seal under the account's lock, so no write of the store's own leaves such a row live:
+        # it is ended and reported like a row that fails its seal. Refused before the touch.
+        if user is not None and session.user_epoch != user.session_epoch:
+            await self._session_seal_failed(session.token_hash)
+            return None
         if activity:
             await self._store.touch_session(session.token_hash, now=now)
         if user is None or user.disabled:
             return None
         return await self._build_identity(user)
+
+    async def _load_session(self, token_hash: str) -> SessionRecord | None:
+        """The session ``token_hash`` names, or ``None`` (BACKLOG #2592). The ONLY reader of
+        ``AuthStore.get_session`` in this service; ``tests/test_session_seal.py`` holds that.
+
+        ``None`` for no row, for a revoked row, and for an unrevoked row whose integrity seal does not
+        verify. A revoked row grants nothing and its seal is blank by design, so it is refused
+        quietly. An unrevoked row that fails is treated as no session and handed to
+        :meth:`_session_seal_failed`, which ends it. On a keyless store there is no seal to check.
+
+        The account's session epoch is checked where the account is read, in
+        :meth:`identity_for_token` and :meth:`list_sessions`, so this costs no extra statement."""
+        session = await self._store.get_session(token_hash)
+        if session is None or session.revoked_at is not None:
+            return None
+        if not await self._session_row_holds(session, self._store.row_sealer()):
+            return None
+        return session
+
+    async def _session_row_holds(self, session: SessionRecord, sealer: RowSealer | None) -> bool:
+        """Whether an unrevoked session row's seal verifies; a row that fails is handed to
+        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592)."""
+        if session_seal_ok(sealer, session):
+            return True
+        await self._session_seal_failed(
+            session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
+        )
+        return False
+
+    async def _session_seal_failed(self, token_hash: str, *, key_changed: bool = False) -> None:
+        """End a session row that failed its integrity seal, and report it (BACKLOG #2592).
+
+        The row is revoked, which blanks its seal and needs no key, so the next presentation is
+        refused quietly as a revoked row. With ``key_changed`` the row carries a genuine seal made
+        under a retired store key: the store key changed without ``rotate-key`` ending the sessions,
+        so it is logged at INFO and nothing more. Otherwise it is an integrity failure: a WARNING,
+        an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. The
+        caller denies; the engine keeps running.
+
+        Reports are rate-limited per row, once per :data:`_SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
+        for a row the revoke could not end. Each names the row by a short prefix of its token hash,
+        never a row value. A store refusal of the revoke or the audit write is logged, not raised,
+        so it does not turn a denial into an error."""
+        ref = token_hash[:_SESSION_REF_LEN]
+        try:
+            await self._store.revoke_session(token_hash)
+        except _audit_write_errors():
+            _log.exception("a session row that failed its integrity seal could not be revoked")
+        if key_changed:
+            _log.info(
+                "session %s was sealed under a retired store key and has been ended; run"
+                " 'messagefoundry rotate-key' after a key change to end every session at once",
+                ref,
+            )
+            return
+        now = time.monotonic()
+        last = self._seal_failures_reported.get(ref)
+        if last is not None and now - last < _SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
+            return
+        self._seal_failures_reported.pop(ref, None)
+        if len(self._seal_failures_reported) >= _SEAL_FAILURE_TRACK_MAX:
+            self._seal_failures_reported.pop(next(iter(self._seal_failures_reported)))
+        self._seal_failures_reported[ref] = now
+        reason = f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})"
+        _log.warning("%s", reason)
+        await write_audit_soft(
+            lambda: self._audit(
+                AUTHORITY_SEAL_FAILED_ACTION,
+                detail=_json({"kind": SESSION_KIND, "session": ref}),
+            ),
+            log=_log,
+            message="the %s audit row for a refused session could not be written",
+            args=(AUTHORITY_SEAL_FAILED_ACTION,),
+            errors=_audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
+        if self._integrity_alert is not None:
+            self._integrity_alert(reason)
+
+    @asynccontextmanager
+    async def _sealed_stamp(self, token_hash: str) -> AsyncIterator[_StampOutcome]:
+        """Wrap one session stamp the store writes through its sealing helper (BACKLOG #2592).
+
+        The store refuses the write, writing nothing, when the row it read does not verify. That is
+        handled here like a refused read, and the yielded outcome's ``refused`` is set. A caller
+        whose next steps record a success must check it and end closed; the others reach a rotation
+        that fails closed on the same row."""
+        outcome = _StampOutcome()
+        try:
+            yield outcome
+        except RowSealError:
+            outcome.refused = True
+            await self._session_seal_failed(token_hash)
 
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
@@ -7752,14 +7891,31 @@ class AuthService:
 
     async def list_sessions(self, user_id: str) -> list[SessionRecord]:
         """A user's active sessions — the self-service session inventory. Idle-expired rows are
-        hidden too, since the validator refuses them on presentation (BACKLOG #2096)."""
-        return await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
+        hidden too, since the validator refuses them on presentation (BACKLOG #2096). So is a row
+        that fails its integrity seal (BACKLOG #2592): it resolves to nothing, so it is not one of
+        the user's sessions, and it is handled as :meth:`_load_session` handles one. So is a row
+        minted under an older session epoch than the account's, which the validator refuses."""
+        rows = await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
+        if not rows:
+            return []
+        user = await self._store.get_user(user_id)
+        epoch = None if user is None else user.session_epoch
+        sealer = self._store.row_sealer()
+        kept: list[SessionRecord] = []
+        for row in rows:
+            if not await self._session_row_holds(row, sealer):
+                continue
+            if row.user_epoch == epoch:
+                kept.append(row)
+            elif epoch is not None:
+                await self._session_seal_failed(row.token_hash)  # see identity_for_token
+        return kept
 
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
         if the session doesn't exist or isn't the caller's — so the API answers 404 without revealing
         or letting a user touch another's session. Audited."""
-        session = await self._store.get_session(session_id)
+        session = await self._load_session(session_id)
         if session is None or session.user_id != identity.user_id:
             return False
         await self._store.revoke_session(session_id)
@@ -7775,14 +7931,23 @@ class AuthService:
     ) -> int:
         """Revoke all of ``identity``'s sessions **except** the caller's current one ("sign out
         everywhere else"). Returns the count revoked. Audited when any were revoked."""
-        revoked = await self._store.revoke_user_sessions(
-            identity.user_id, except_token_hash=current_token_hash
-        )
+        scope = "self_others"
+        try:
+            revoked = await self._store.revoke_user_sessions(
+                identity.user_id, except_token_hash=current_token_hash
+            )
+        except RowSealError:
+            # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
+            # The caller asked to end every other session and its own is suspect: end them all,
+            # and audit that scope, since the caller's own session is ended too.
+            await self._session_seal_failed(current_token_hash)
+            revoked = await self._store.revoke_user_sessions(identity.user_id)
+            scope = "self_all"
         if revoked:
             await self._audit(
                 "auth.session_revoked",
                 actor=actor,
-                detail=_json({"scope": "self_others", "count": revoked}),
+                detail=_json({"scope": scope, "count": revoked}),
             )
         return revoked
 
@@ -8144,7 +8309,7 @@ class AuthService:
         if user is None:
             return _Reproof(ok=False)
         token_hash = hash_token(token)
-        session = await self._store.get_session(token_hash)
+        session = await self._load_session(token_hash)
         if session is None or session.revoked_at is not None or session.user_id != user.id:
             # Revoked or rotated away while this attempt waited behind the lock -- by the budget,
             # or by anything else. It is not verified, so a queued burst cannot outrun the budget.
@@ -8319,7 +8484,8 @@ class AuthService:
             # columns forward; a stamp issued after it would silently write nothing.
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
-            await self._store.mark_session_reauthed(hash_token(token), client=client)
+            async with self._sealed_stamp(hash_token(token)):
+                await self._store.mark_session_reauthed(hash_token(token), client=client)
             self._restart_new_ip_dedupe(hash_token(token))
             # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
             # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
@@ -8466,7 +8632,7 @@ class AuthService:
         """:meth:`_owes_enrolled_factor` keyed on the session's hash (see :meth:`_elevated_hash`)."""
         if await self._mfa_satisfied_hash(token_hash):
             return False
-        session = await self._store.get_session(token_hash)
+        session = await self._load_session(token_hash)
         if session is None:
             return True  # no session to act on, so fail closed
         user = await self._store.get_user(session.user_id)
@@ -8661,7 +8827,7 @@ class AuthService:
         (BACKLOG #2142)."""
         if not token:
             return False
-        session = await self._store.get_session(hash_token(token))
+        session = await self._load_session(hash_token(token))
         if session is None or session.reauth_at is None:
             return False
         return (time.time() - session.reauth_at) <= self._settings.step_up_max_age_seconds
@@ -8955,7 +9121,7 @@ class AuthService:
         if not self._settings.admin_new_ip_step_up or not token:
             return False
         token_hash = hash_token(token)
-        session = await self._store.get_session(token_hash)
+        session = await self._load_session(token_hash)
         if session is None or session.revoked_at is not None:
             return False
         # No baseline address (older session / unknown login source) or the same host → not new. A
@@ -9254,7 +9420,7 @@ class AuthService:
 
     async def _mfa_satisfied_hash(self, token_hash: str) -> bool:
         """:meth:`mfa_satisfied` keyed on the session's hash (see :meth:`_elevated_hash` for why)."""
-        session = await self._store.get_session(token_hash)
+        session = await self._load_session(token_hash)
         if session is None or session.revoked_at is not None:
             return False
         if session.mfa_verified_at is not None:
@@ -9382,7 +9548,8 @@ class AuthService:
         # The cost: if enable_totp itself fails after a good rotation, the new token is never handed
         # back, so the user is signed out with MFA still off. That fails closed, and a retry works.
         # Stamp against the OLD hash, then rotate — never the other way round.
-        await self._store.mark_session_mfa_verified(hash_token(token))
+        async with self._sealed_stamp(hash_token(token)):
+            await self._store.mark_session_mfa_verified(hash_token(token))
         elevation = await self._elevated(
             token,
             ceremony="mfa_enroll_confirm",
@@ -9493,7 +9660,7 @@ class AuthService:
         arrived_at = time.time()  # the service's clock, for the floor; `arrived` is the TOTP clock
         if not token:
             return Elevation()
-        session = await self._store.get_session(hash_token(token))
+        session = await self._load_session(hash_token(token))
         if session is None or session.revoked_at is not None:
             return Elevation()
         user = await self._store.get_user(session.user_id)
@@ -9534,7 +9701,7 @@ class AuthService:
             # above was a network round trip, and for any account the queue may have been a wait, so
             # what was read before either may be stale: a session revoked meanwhile would still spend
             # its code, and a lock set by the attempt ahead in the queue would go unseen.
-            session = await self._store.get_session(hash_token(token))
+            session = await self._load_session(hash_token(token))
             if session is None or session.revoked_at is not None:
                 return Elevation()
             user = await self._store.get_user(session.user_id)
@@ -9564,7 +9731,12 @@ class AuthService:
                 # an OIDC one also seed the step-up window (the session has completed password +
                 # MFA). (Initial enrollment has no factor to verify, so this never fires there —
                 # keeping the enrollment step-up gate honest, WP-14.)
-                await self._store.mark_session_mfa_verified(hash_token(token))
+                async with self._sealed_stamp(hash_token(token)) as factor_stamp:
+                    await self._store.mark_session_mfa_verified(hash_token(token))
+                if factor_stamp.refused:
+                    # BACKLOG #2592: the session failed its seal and has been ended. Nothing below
+                    # may record a success for it.
+                    return Elevation(session_lost=True)
                 # BACKLOG #2142 (see the docstring): an OIDC session's window and anchor move only
                 # at the IdP. Seat decision under owner delegation 2026-10-08, not an owner ruling.
                 # Do NOT move the stamp out of this branch: tests/test_oidc_step_up.py pins the
@@ -9574,7 +9746,11 @@ class AuthService:
                     # with reauth), so an MFA-required admin who roamed clears the WP-L3-13
                     # new-client-IP signal with one credential proof rather than being forced into a
                     # separate password step-up.
-                    await self._store.mark_session_reauthed(hash_token(token), client=client)
+                    async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
+                        await self._store.mark_session_reauthed(hash_token(token), client=client)
+                    if reauth_stamp.refused:
+                        # BACKLOG #2592: as above, the session has been ended.
+                        return Elevation(session_lost=True)
                     self._restart_new_ip_dedupe(hash_token(token))
                 await self._store.record_login_success(user.id, now=now)
                 await self._audit("auth.mfa_verified", actor=user.username, client=client)
@@ -9690,7 +9866,7 @@ class AuthService:
         floor = self._settings.mfa_verify_min_elapsed_seconds
         if floor <= 0:
             return False
-        session = await self._store.get_session(hash_token(token))
+        session = await self._load_session(hash_token(token))
         if session is None or session.revoked_at is not None or session.mfa_verified_at is not None:
             return False
         if now - session.created_at >= floor:
@@ -10239,7 +10415,8 @@ class AuthService:
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
         # rotated — the reverse order writes nothing and still reports success.
-        await self._store.mark_session_mfa_verified(hash_token(token))
+        async with self._sealed_stamp(hash_token(token)):
+            await self._store.mark_session_mfa_verified(hash_token(token))
         elevation = await self._elevated(
             token, ceremony="webauthn_enroll", actor=identity.username, client=client
         )
@@ -10264,7 +10441,7 @@ class AuthService:
         MFA-pending sessions: the assertion is exactly what proves the second factor."""
         if not token:
             return None
-        session = await self._store.get_session(hash_token(token))
+        session = await self._load_session(hash_token(token))
         if session is None or session.revoked_at is not None:
             return None
         creds = [
@@ -10312,7 +10489,7 @@ class AuthService:
         ``directory_unconfirmed`` and spends neither the challenge nor the sign count."""
         if not token:
             return Elevation()
-        session = await self._store.get_session(hash_token(token))
+        session = await self._load_session(hash_token(token))
         if session is None or session.revoked_at is not None:
             return Elevation()
         user = await self._store.get_user(session.user_id)
@@ -10357,7 +10534,7 @@ class AuthService:
             # meanwhile must stop this assertion before it marks the factor or clears the counters.
             # A session or account gone meanwhile is ``session_lost``: the token no longer
             # authenticates, so the caller must not report a wrong passkey.
-            session = await self._store.get_session(hash_token(token))
+            session = await self._load_session(hash_token(token))
             if session is None or session.revoked_at is not None:
                 return Elevation(session_lost=True)
             user = await self._store.get_user(session.user_id)
@@ -10457,7 +10634,10 @@ class AuthService:
             token, user, client=client, factor_checked=True, at="webauthn_assert"
         ):
             return Elevation(session_lost=True)
-        await self._store.mark_session_mfa_verified(hash_token(token))
+        async with self._sealed_stamp(hash_token(token)) as stamp:
+            await self._store.mark_session_mfa_verified(hash_token(token))
+        if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
+            return Elevation(session_lost=True)
         # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
         # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
         # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,
