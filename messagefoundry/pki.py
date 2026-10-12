@@ -278,7 +278,7 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(
             "it has a '-----BEGIN X509 CRL-----' marker that does not start a line. If that is a "
-            "CRL, OpenSSL does not load it as written. If it is text in a comment, the engine "
+            "CRL, OpenSSL can skip it as written. If it is text in a comment, the engine "
             "cannot tell it from a CRL the file is meant to hold. Either one refuses the file. "
             "Put each CRL's marker first on its line, after a line feed: no space, tab or other "
             "text before it, and no line that ends in a carriage return alone. Take the marker "
