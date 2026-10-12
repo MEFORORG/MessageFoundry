@@ -553,10 +553,11 @@ and the table prints the date in its own column either way.
 - No ruling says what the stamps hold for a cell that never had a full read.
 
 **Tools written before these rulings may read the stamps differently.** This section governs what an
-assessor writes, and the tools follow it. At least two do not yet. The writer,
-`scripts/asvs/apply.py`, dates an anchor repair from the payload's `last_verified`. The rendered
-page's `Verdict bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing
-the tools into line is unfiled work.
+assessor writes, and the tools follow it. At least one does not yet. The rendered page's `Verdict
+bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing it into line is
+unfiled work. The writer, `scripts/asvs/apply.py`, dated an anchor repair from the payload's
+`last_verified` until BACKLOG #2865. A repair payload now states its own `anchor_repaired_at`, and
+the writer refuses one that does not, or one dated before the repair the record already holds.
 
 The first ruling was given in session on 2026-10-08, after adversarial review, and the other two on
 2026-10-09. All are recorded on pull requests in the `MessageFoundry-vault` repository, and a
