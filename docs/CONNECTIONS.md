@@ -2251,7 +2251,12 @@ these messages, and the SMTP relay accepts them before anyone tries.
 is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
 key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
 is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
-to a certificate from an untrusted issuer). The connector then signs and encrypts one fixed synthetic body.
+to a certificate from an untrusted issuer). All three of `signing_key`, `recipient_cert` and every
+`trust_anchor` in the file must also hold an allowed key type: RSA of at least 2048 bits, EC on P-256, P-384
+or P-521, Ed25519 or Ed448. A DSA key is refused at any size, and so is any other type (BACKLOG #3384). These
+are the same types the XML signature check allows. Today an Ed25519 or Ed448 key works only as a
+`trust_anchor`: the signing library takes RSA and EC signers only, and the envelope takes RSA recipients only.
+The connector then signs and encrypts one fixed synthetic body.
 So a fault that would fail every S/MIME build also fails here. That covers at least a crypto library or
 OpenSSL build that refuses the algorithms, and a line break inside `subject`. It does not cover the SMTP hop:
 the relay can still refuse a `sender` or recipient at send time.
