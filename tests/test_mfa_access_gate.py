@@ -1178,6 +1178,49 @@ def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
         ), f"provider {provider!r} must not change the answer"
 
 
+async def test_an_unrecognized_provider_row_is_covered_by_the_gates_and_the_census(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_requirement_covers`` or the census allow-lists ``LOCAL`` again (BACKLOG #3117).
+
+    A local account with a chosen password and no factor is covered. Planting an unknown provider
+    on its row must leave it covered: AC-A3a's helper says so, the enrol-first gate still sends it
+    to enrolment, and the census still names it. ``ad`` is the one value that leaves it out, which
+    is the control that the plant reaches all three."""
+    import dataclasses
+
+    from messagefoundry.auth.service import _requirement_covers
+    from messagefoundry.store.store import UserRecord
+
+    service = await _service(engine)
+    await _add(service, "rogue", Role.VIEWER)
+    real = await service.store.get_user_by_username("rogue")
+    assert real is not None and not real.totp_enabled and real.password_hash is not None
+    identity = await service.identity_for_user_id(real.id)
+    assert identity is not None
+    real_get_user = engine.store.get_user
+    real_list_users = engine.store.list_users
+
+    for provider, covered in (("local", True), ("saml-from-the-future", True), ("ad", False)):
+
+        async def get_user(user_id: str, provider: str = provider) -> UserRecord | None:
+            user = await real_get_user(user_id)
+            return None if user is None else dataclasses.replace(user, auth_provider=provider)
+
+        async def list_users(provider: str = provider) -> list[UserRecord]:
+            return [dataclasses.replace(u, auth_provider=provider) for u in await real_list_users()]
+
+        monkeypatch.setattr(engine.store, "get_user", get_user)
+        monkeypatch.setattr(engine.store, "list_users", list_users)
+        row = await engine.store.get_user(real.id)
+        assert row is not None
+        roles = frozenset({Role.VIEWER})
+        assert _requirement_covers(service._settings, row, roles) is covered, provider
+        assert await service.must_enrol_before_rotating(identity) is covered, provider
+        census = await service.lockable_account_census()
+        assert ("rogue" in census.no_way_past) is covered, provider
+
+
 # --- 6.8.4: the directory legs assert nothing, so the engine assumes nothing --
 
 

@@ -1827,8 +1827,13 @@ def _scope_covers(settings: AuthSettings, roles: frozenset[Role]) -> bool:
 
 def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozenset[Role]) -> bool:
     """Whether the requirement covers ``user`` as a LOCAL account, enrolled or not (ADR 0197
-    Amendment A): :func:`_scope_covers`, restricted to local accounts."""
-    return user.auth_provider == AuthProvider.LOCAL.value and _scope_covers(settings, roles)
+    Amendment A): :func:`_scope_covers`, restricted to local accounts.
+
+    **Only a directory account is left out, by a deny-list (BACKLOG #3117).** An allow-list of
+    ``LOCAL`` let a row with an unrecognised provider escape AC-A3a, the enrol-first gates and
+    :func:`lockable_account_census`, although :meth:`AuthService._build_identity` maps such a row
+    back to ``LOCAL`` and every other path treats it as local. So an unknown provider is covered."""
+    return user.auth_provider != AuthProvider.AD.value and _scope_covers(settings, roles)
 
 
 class CensusNeedsTheStoreKey(RuntimeError):
@@ -1901,7 +1906,8 @@ async def lockable_account_census(
         if (
             user.password_generated
             or user.password_hash is None
-            or user.auth_provider != AuthProvider.LOCAL.value
+            # A deny-list, as in _requirement_covers: an unrecognised provider is read (#3117).
+            or user.auth_provider == AuthProvider.AD.value
             or not settings.require_mfa
         ):
             continue
