@@ -828,8 +828,9 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     included; on a request that goes direct, past every proxy, where the destination would read it;
     and over TLS whose context does not require the proxy's certificate, match its host name, or
     check its dates. A destination's relaxed TLS settings relax nothing here, because the leg to
-    the proxy uses the same context. One way across exists, for a caller-set header on a cleartext
-    leg only: the connection's posture-keyed guard admitted it when the connection was built, and
+    the proxy uses the same context. A credential that rides a ``CONNECT`` is judged as cleartext,
+    whatever TLS follows it. One way across exists, for a caller-set header on a cleartext leg
+    only: the connection's posture-keyed guard admitted it when the connection was built, and
     its proxy handler carries ``caller_header_admitted``. A credential from a proxy URL has none.
 
     urllib keeps the header when it hands a request on to the next proxy (vault BACKLOG #3410),

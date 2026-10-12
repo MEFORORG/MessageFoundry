@@ -111,7 +111,7 @@ ACK-on-receipt, and the no-"channel"-element rule are untouched.
   → `tests/test_outbound_forward_proxy.py::test_basic_proxy_auth_preemptive_header`
 - **AC-5** — IF a proxy credential would ride a cleartext `http` proxy hop on a production-PHI instance,
   THEN THE SYSTEM SHALL refuse at construction **regardless of the destination scheme** (a loopback proxy
-  is allowed).
+  is allowed). Widened by Amendment D to a proxy written `https://`.
   → `tests/test_outbound_forward_proxy.py::test_cleartext_proxy_hop_credential_refused`
 - **AC-6** — IF `proxy_auth_type="digest"` targets an https destination, THEN THE SYSTEM SHALL refuse at
   construction (digest-over-`CONNECT` unsupported); IF `proxy_auth_type` ∈ {ntlm, windows}, THEN THE
@@ -277,6 +277,16 @@ silently, or must be disclosed. This ADR's proxy is of the last two kinds.
   the hops that may read one (`transports/ambient_proxy.py`, `tests/test_ambient_proxy_disclosure.py`).
   It makes no per-hop claim. What it says, and the per-hop facts, are in
   [CONFIGURATION.md](../CONFIGURATION.md#serve-names-an-environment-proxy-at-start).
+
+### Amendment D (2026-10-12) — a proxy written `https://` gets no pass
+
+The guard above and AC-5 named only a cleartext `http` proxy hop. A `proxy_url` maps both schemes
+to one proxy. So urllib sends a `proxy_user` credential to it in a `CONNECT` before any TLS, for an
+`https` target and an `http` target alike, even when the proxy is written `https://`. The guard now
+judges that credential as cleartext for a proxy written either way (vault BACKLOG #3416). The send-time
+rule, which also covers a direct request and a TLS leg that does not verify the proxy (vault
+BACKLOG #3417, #3418), is stated once on `ProxyCredentialsRefusedError` in
+[`transports/bounded_read.py`](../../messagefoundry/transports/bounded_read.py).
 
 ## Deviations from the phase doc
 

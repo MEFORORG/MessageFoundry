@@ -219,8 +219,9 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
     key is the header name. **Header-injection-safe:** a name that is not a valid RFC 7230 token is
     dropped (it can never be emitted), and CR/LF/NUL/other control chars are stripped from the value via
     :func:`_strip_header_control_chars`, so a message-derived value cannot split the request or inject an
-    extra header. **``Authorization`` is never settable per-message** — auth is connection config only, so
-    a message-derived value can neither weaken nor replace the connection's credential. **Pure:** the
+    extra header. **``Authorization`` and ``Proxy-Authorization`` are never settable per-message** —
+    auth is connection config only, so a message-derived value can neither weaken nor replace the
+    connection's credential, nor ride a proxy handler's admission (vault BACKLOG #3416). **Pure:** the
     result is a deterministic function of ``metadata`` (itself pure from the transform), so an
     at-least-once re-run yields byte-identical headers. ``None``/empty → ``{}`` (the default,
     byte-identical) — no per-message headers.
@@ -256,8 +257,11 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        if name.lower() == "authorization":
-            continue  # auth is connection-configured only — a message never sets/overrides it
+        if name.lower() in ("authorization", "proxy-authorization"):
+            # Auth is connection-configured only: a message never sets or overrides it. A proxy
+            # handler's admission covers the connection's own proxy_user header, so a message must
+            # not be able to supply one (vault BACKLOG #3416).
+            continue
         if not isinstance(value, str):
             continue  # SetMeta enforces str, but stay defensive against a hand-built bag
         safe = _strip_header_control_chars(value)

@@ -541,3 +541,38 @@ def test_verifies_peer_fully_reads_each_relaxation() -> None:
     assert not verifies_peer_fully(no_name)
     no_name.verify_mode = ssl.CERT_NONE
     assert not verifies_peer_fully(no_name)
+
+
+@pytest.mark.parametrize("family", list(_UNVERIFIED))
+def test_a_proxy_url_shaped_map_rides_a_connect_whatever_tls_follows(family: str) -> None:
+    """A connection's ``proxy_url`` maps both schemes to one proxy, so an ``http`` target reaches it
+    through a ``CONNECT`` to the proxy itself, sent before any TLS. The cleartext rule governs that
+    leg, not the TLS check: an unadmitted header is refused, and an admitted one rides only the
+    ``CONNECT``. What urllib sends inside the tunnel is not read here: the fake proxy serves no
+    TLS."""
+    with _WireProxy() as proxy:
+        value = f"https://{proxy.address}"
+        plain = urllib.request.ProxyHandler({"http": value, "https": value})
+        _refused(_UNVERIFIED[family](plain), _with_header(_HTTP_TARGET), "#3416")
+    assert proxy.connections == 0
+
+    with _WireProxy() as proxy:
+        value = f"https://{proxy.address}"
+        admitted = LoopbackDirectProxyHandler(
+            {"http": value, "https": value}, caller_header_admitted=True
+        )
+        _open_and_discard(_UNVERIFIED[family](admitted), _with_header(_HTTP_TARGET))
+    assert len(proxy.cleartext) == 1
+    assert proxy.cleartext[0].startswith(b"CONNECT 127.0.0.1:")
+    assert f"Proxy-Authorization: {_HEADER}\r\n".encode() in proxy.cleartext[0]
+
+
+@pytest.mark.parametrize("name", ["Proxy-Authorization", "proxy-authorization", "Authorization"])
+def test_a_message_cannot_set_an_auth_header(name: str) -> None:
+    """A proxy handler's admission covers the connection's own ``proxy_user`` header, so a Handler
+    must not be able to supply a ``Proxy-Authorization`` through message metadata."""
+    headers = rest.outbound_headers_from_metadata(
+        {rest.DYNAMIC_HEADER_PREFIX + name: _HEADER, rest.DYNAMIC_HEADER_PREFIX + "X-Trace": "t1"}
+    )
+    # Control in the same bag: an ordinary header still survives.
+    assert headers == {"X-Trace": "t1"}

@@ -1529,12 +1529,13 @@ that would go direct with it, and one whose TLS to the proxy does not verify. Wr
 any TLS.
 The error names no part of the proxy URL, and `[security].enforcement` does not relax it.
 
-A credential in a connection's own `proxy_url` is not checked when the connection is built, so
-each of its sends is refused. With `[security].require_nonstatic_credentials` on, `serve` refuses
+A credential in a connection's own `proxy_url` is not checked when the connection is built. Its
+sends are refused under the rule above, on at least every leg that would carry it to the proxy in
+cleartext. A send that goes direct carries no credential from the URL, so it is not refused. With `[security].require_nonstatic_credentials` on, `serve` refuses
 a credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
-the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is refused when
-the connection is built, for a proxy written either way, unless the proxy is on the box or the
-connection declares `cleartext_accepted` or `tls_hop_attested`. That build-time check follows the
+the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is checked when
+the connection is built, for a proxy written either way. It is refused there unless the proxy is on
+the box or the connection declares `cleartext_accepted` or `tls_hop_attested`. That build-time check follows the
 posture, so under `[security].enforcement = warn` it logs a WARNING and the connection builds. A
 credential it lets through may cross in cleartext at send; it still never goes direct or over TLS
 that does not verify. A credential from a proxy URL has no such way across. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names
