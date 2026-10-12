@@ -221,6 +221,7 @@ from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
+    ExportStopped,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -2068,17 +2069,6 @@ def _summary(row: Row) -> MessageSummary:
     )
 
 
-class ExportStopped(RuntimeError):
-    """A running bulk export lost its caller's standing, so the stream aborts (BACKLOG #1154).
-
-    The response has already started, so no status code can say so. Raising aborts the transfer,
-    and the client sees an incomplete download rather than a short file that looks complete. The
-    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
-    and uvicorn writes a traceback. Returning without the final body message would avoid
-    that, but the ``@app.middleware("http")`` layers above would then finish the response cleanly,
-    which is the short file this exists to prevent."""
-
-
 def _export_ndjson_line(row: Row) -> bytes:
     """One NDJSON line for the bulk body export (#124, ADR 0131): the message metadata + the **decrypted
     raw body** (the PHI egress). ``json.dumps`` escapes the CR-delimited HL7 / binary ``mfb64:`` markers
@@ -2150,6 +2140,43 @@ _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 #:
 #: Anyone reversing this decision should reverse it on evidence about the **origin**, because the origin
 #: is the only thing this header controls.
+#:
+#: **``text/csv`` is NOT on this list, and that is the second recorded decision (vault BACKLOG #2802).**
+#: A ``text/csv`` label is declared ``text/plain`` and named ``.txt``, through
+#: :data:`_ATTACHMENT_SERVED_AS` below. Before that row it was on the list with a ``.csv`` name, and
+#: no written decision covered it.
+#:
+#: The risk is a formula cell. A sender can label an OBX-5 document ``text/csv`` and start a cell with
+#: ``=``. A spreadsheet evaluates that cell when it opens the file. The engine's own exports escape
+#: such cells (:func:`messagefoundry.spreadsheet.spreadsheet_safe`). This route serves the stored
+#: bytes of a CSV as they are, so the cell arrives intact.
+#:
+#: Like the PDF case, this is a local-open risk and the application origin is not reached. CSV still
+#: gets the other answer, because PDF reason 2 points the other way for it. The two decisions do not
+#: conflict. The PDF text is about the ``Content-Type`` header, and the origin is all that header
+#: controls. This decision is about the download name, which the same route also writes.
+#:
+#: 1. PDF reason 2 says the file extension decides what opens a saved file, and this route writes
+#:    that extension. A host with a spreadsheet installed usually opens ``.csv`` in it. So the
+#:    ``.csv`` name would send the document to the one program that runs its content.
+#: 2. A PDF cannot be read without a PDF viewer, so the operator supplies ``.pdf`` whatever the route
+#:    served. A CSV is plain text, so under ``.txt`` it stays readable with no rename. A text editor
+#:    evaluates nothing. The decision rests on the name. The declared type moves with it so the
+#:    two agree.
+#: 3. The cost is small. The stored bytes and the stored label are untouched, and the console's
+#:    attachment list still shows ``text/csv``.
+#:
+#: What this does NOT do, so that nobody reads more into it:
+#:
+#: - It narrows the default open only. An operator who renames the file to ``.csv``, or imports it
+#:   into a spreadsheet, still evaluates its cells.
+#: - It rests on host defaults nobody measured. Which program opens ``.csv`` or ``.txt`` is a
+#:   property of the operator's host, and no browser or spreadsheet was exercised against this route.
+#: - It covers the exact label ``text/csv``. Other spellings, such as ``application/csv``, were never
+#:   on the list and still download under the generic type with a ``.bin`` name.
+#: - It is not the only possible control. The route could serve an escaped copy and keep the stored
+#:   value verbatim, as it does for an SVG. That was not weighed here and is not built. It would
+#:   have to parse a sender's CSV, whose delimiter and quoting the label does not carry.
 _INERT_ATTACHMENT_TYPES: dict[str, str] = {
     "application/dicom": ".dcm",
     "application/json": ".json",
@@ -2159,8 +2186,14 @@ _INERT_ATTACHMENT_TYPES: dict[str, str] = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/tiff": ".tif",
-    "text/csv": ".csv",
     "text/plain": ".txt",
+}
+#: Labels the route recognizes but DECLARES as another type on the allow-list above, so the served
+#: type and the download name are both the target's. The reasoning for each entry is in the comment
+#: above the allow-list. Matched exactly on the case-folded label, like the allow-list. A key here must
+#: never also be an allow-list key, and every value must be one.
+_ATTACHMENT_SERVED_AS: dict[str, str] = {
+    "text/csv": "text/plain",
 }
 #: The download-name extension for every type the allow-list does not name — the partner of
 #: :data:`_DEFAULT_ATTACHMENT_MIME`. Both the served type and the served extension now come from this
@@ -2192,7 +2225,8 @@ _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
 def _safe_attachment_content_type(content_type: str | None) -> str:
     """The download ``Content-Type``: the canonical spelling from :data:`_INERT_ATTACHMENT_TYPES` when the
     stored ``content_type`` is a clean, bounded ``type/subtype`` naming one of them, else
-    ``application/octet-stream``.
+    ``application/octet-stream``. A label on :data:`_ATTACHMENT_SERVED_AS` is declared as its target
+    type instead, so ``text/csv`` is declared ``text/plain``.
 
     The stored value is a verbatim, attacker-influenced OBX-5.2 label, so it is never trusted into the
     response header (header-splitting shapes) and never trusted into the *browser* either. An
@@ -2215,6 +2249,7 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     # The shape screen has already excluded parameters (``; charset=…``) and inner whitespace, so the
     # case-fold is the only normalization an exact lookup still needs.
     key = ct.casefold()
+    key = _ATTACHMENT_SERVED_AS.get(key, key)
     return key if key in _INERT_ATTACHMENT_TYPES else _DEFAULT_ATTACHMENT_MIME
 
 
@@ -9767,7 +9802,8 @@ def create_managed_app(
                 await store.close()
                 raise
         # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
-        # api-mTLS client CA) BEFORE any listener binds — a group/world-writable anchor refuses (at
+        # api-mTLS client CA), and the settings CAs a hop dials with (vault BACKLOG #3188;
+        # trust_anchors module item 10), BEFORE any listener binds — a group/world-writable anchor refuses (at
         # enforce) or warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
         # change since the last load is audited (auth.trust_anchor). Dormant (no store call, no audit)
         # when no anchor is configured. On a fatal violation it raises, so we tear down like attestation.
@@ -9919,7 +9955,8 @@ def create_managed_app(
             # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031), and before a
             # reload for each lane that reload builds or keeps running.
             lane_anchor_check=make_lane_anchor_check(store, enforcing=trust_anchors_enforcing),
-            # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA), re-verified by
+            # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA, and since vault
+            # BACKLOG #3188 the dialling settings CAs), re-verified by
             # the engine on EVERY real reload, not only the direct /config/reload route. None when
             # no settings anchor is configured.
             settings_preflight=make_settings_anchor_preflight(

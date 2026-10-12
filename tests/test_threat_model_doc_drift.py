@@ -714,6 +714,11 @@ _REMOVED_SETTINGS: dict[tuple[str, str], str] = {
         "BACKLOG #1243 limb A removed it together with the verbatim flat '?'-query FHIR search "
         "path it gated; the 15.1.5 fhir_lookup row names it to record that removal"
     ),
+    ("sandbox", "cpu_seconds"): (
+        "engine PR 2133 (squash commit eb9a1fd776, vault BACKLOG #3133 part 1) removed it together "
+        "with the worker's POSIX RLIMIT_CPU; the document names it only in correction notes that "
+        "record that removal (vault BACKLOG #3225)"
+    ),
 }
 
 
@@ -903,10 +908,10 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 sandbox default = off (no Router/Handler wall cap)", s.sandbox.mode, "off"),
         ("15.1.3 sandbox wall cap = 5.0 s", s.sandbox.wall_seconds, 5.0),
         # The "sandbox cpu cap = 2.0 s (POSIX)" row left with [sandbox].cpu_seconds (ADR 0087,
-        # amendment of 2026-10-07; vault BACKLOG #3133 part 1). COUPLED edit, like the retry row
-        # below: the vault security record still claims the cap in at least THREAT-MODEL.md (the
-        # 15.1.3 row and the ADR 0087 quote), ASVS-L3-REMEDIATION-PLAN.md WP-L3-17, and an
-        # asvs-scorecard.toml residual. Nothing here fails on that stale text.
+        # amendment of 2026-10-07; vault BACKLOG #3133 part 1). Vault BACKLOG #3225 added correction
+        # notes recording the removal to THREAT-MODEL.md, ASVS-L3-REMEDIATION-PLAN.md WP-L3-17 and
+        # an asvs-scorecard.toml residual (read at vault 1d79e522f1). THREAT-MODEL.md names it as a
+        # [section].key inside those notes, so _REMOVED_SETTINGS exempts it from the resolution check.
         ("15.1.3 sandbox mem cap = 512 MiB (POSIX)", s.sandbox.mem_mb, 512),
         ("15.1.3 live-lookup bridge = 30.0 s", wiring_runner._LOOKUP_RESULT_TIMEOUT_SECONDS, 30.0),
         # BACKLOG #1051 flipped this from None (retry forever) to a finite 100. This is a COUPLED

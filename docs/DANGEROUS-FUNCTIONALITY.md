@@ -652,6 +652,7 @@ or compression library:
   in memory. A trial pass that keeps no output checks the byte ceiling, and for gzip the member
   cap, before the real decompression starts (BACKLOG #1129). The File
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
+  A connection with `decompress=` set and that ceiling off logs one warning when it is built.
   Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
   A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
   after the archive. Each member's name must be a safe relative path, and its bytes must match the
@@ -718,7 +719,9 @@ Other switches on `install-service.ps1` change more than the service:
 
 - `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
-  directory and of everything in it. Without the switch, the script only adds a read grant.
+  directory and of everything in it. It does the same to the value file's folder, and to the
+  settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
+  Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
   keyed by program name. So they affect every process with that name on the machine, not only the
   engine.

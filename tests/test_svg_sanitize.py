@@ -15,6 +15,7 @@ import gzip
 import re
 import time
 import zlib
+from typing import Any
 from xml.etree.ElementTree import Element
 
 import pytest
@@ -28,6 +29,7 @@ from messagefoundry.api.svg_sanitize import (
     sanitize_if_svg,
     sanitize_svg,
 )
+from messagefoundry.parsing._bounded_inflate import bounded_inflate
 from tests.test_xml_parser_consistency import HOSTILE
 
 _DRAWING = (
@@ -313,6 +315,64 @@ def test_a_gzip_bomb_is_bounded() -> None:
         sanitize_if_svg("image/svg+xml", svg_bomb)
     assert sanitize_if_svg("image/svg+xml", text_bomb) is text_bomb
     assert time.perf_counter() - started < 10
+
+
+def _spy_on_inflate(monkeypatch: pytest.MonkeyPatch) -> list[tuple[bool, int | None]]:
+    """Record ``(keep_output, max_output_bytes)`` for each call the sanitizer makes to the shared
+    inflate loop, in order, and let the call through."""
+    calls: list[tuple[bool, int | None]] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append((kwargs["keep_output"], kwargs["max_output_bytes"]))
+        return bounded_inflate(*args, **kwargs)
+
+    monkeypatch.setattr(svg_sanitize, "bounded_inflate", spy)
+    return calls
+
+
+def test_svgz_over_the_bound_is_refused_before_any_output_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1129. A trial pass that keeps nothing refuses markup over the bound, so the pass
+    that keeps the document never runs for it. The ceiling it ran under is the bound."""
+    calls = _spy_on_inflate(monkeypatch)
+    with pytest.raises(SvgRejected, match="larger than the bound"):
+        sanitize_if_svg("image/svg+xml", _gz(b"<svg>" + b" " * (40 * 1024 * 1024)))
+    assert calls, "the sanitizer no longer inflates through the shared loop"
+    assert not any(keep for keep, _ in calls)
+    assert calls[-1] == (False, svg_sanitize._MAX_SVG_BYTES)
+
+
+def test_svgz_at_the_bound_renders_and_one_over_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control for the refusal above: an SVGZ that inflates to exactly the bound is still
+    sanitized and served, after a trial pass at the bound. The bounds are shrunk so the document is
+    cheap to sanitize; the head stays smaller than the bound, as it is in production."""
+    monkeypatch.setattr(svg_sanitize, "_GZIP_SNIFF_BYTES", 1024)
+    monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
+    head, tail = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1"/>', b"</svg>"
+    at_bound = head + b" " * (4096 - len(head) - len(tail)) + tail
+    assert len(at_bound) == 4096
+    calls = _spy_on_inflate(monkeypatch)
+    out = sanitize_if_svg(None, _gz(at_bound))
+    assert b"<rect" in gzip.decompress(out)
+    assert calls == [(False, 1024), (False, 4096), (True, 4096)]
+
+    calls.clear()
+    with pytest.raises(SvgRejected, match="larger than the bound"):
+        sanitize_if_svg(None, _gz(at_bound + b" "))
+    assert calls == [(False, 1024), (False, 4096)]
+
+
+def test_a_large_body_whose_head_is_only_noise_is_cleared_by_its_first_content_byte(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trial pass keeps no output, yet still sees the first byte past leading noise. A body that
+    passes the bound but starts, past that noise, with a byte other than ``<`` is not markup and is
+    served as stored, as it was before the trial pass."""
+    monkeypatch.setattr(svg_sanitize, "_GZIP_SNIFF_BYTES", 1024)
+    monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
+    body = _gz(b" " * 2048 + b"%PDF-1.4 synthetic" + b"A" * 8192)
+    assert sanitize_if_svg("application/gzip", body) is body
 
 
 # --- BACKLOG #2391: SVG below a root that is not svg -----------------------------------------------
