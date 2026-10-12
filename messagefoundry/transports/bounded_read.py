@@ -867,7 +867,7 @@ def _refuse_cleartext_proxy_credentials(
     proxy: str,
     proxies: Mapping[str, str],
     *,
-    caller_header_admitted: bool = False,
+    caller_header_admitted: bool,
 ) -> None:
     """Raise :class:`ProxyCredentialsRefusedError` if ``req`` would carry a web-proxy credential to
     ``proxy`` in cleartext. ``proxies`` is the handler's own map. Called after the loopback rule,
@@ -884,7 +884,7 @@ def _sends_cleartext_proxy_credentials(
     proxy: str,
     proxies: Mapping[str, str],
     *,
-    caller_header_admitted: bool = False,
+    caller_header_admitted: bool,
 ) -> bool:
     """The reading behind the cleartext refusal. ``proxy`` is read exactly as
     ``ProxyHandler.proxy_open`` reads it, and the request's own ``Proxy-authorization`` header is

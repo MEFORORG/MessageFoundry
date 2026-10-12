@@ -1562,16 +1562,15 @@ class ProxyConfig:
     digest: _ProxyDigestRecipe | None
     # The declaring connection's name, for a log record. A name, never a setting value.
     connection: str | None = None
-    # True when this connection's proxy credential passed its posture-keyed guard at build. Handed to
-    # the proxy handler, the only thing that lets a caller-set header across a cleartext proxy leg
-    # (vault BACKLOG #3416; bounded_read.ProxyCredentialsRefusedError states the rule).
-    credential_admitted: bool = False
 
     def _build_proxy_handler(self) -> urllib.request.ProxyHandler:
         if self.use_default:
             return LoopbackDirectProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
+        # A credential is here only because it passed the posture-keyed guard in
+        # proxy_auth_handler_from_settings, so the handler may let that caller-set header across a
+        # cleartext proxy leg (vault BACKLOG #3416; bounded_read.ProxyCredentialsRefusedError).
         return LoopbackDirectProxyHandler(
-            dict(self.proxies), caller_header_admitted=self.credential_admitted
+            dict(self.proxies), caller_header_admitted=bool(self.auth_header or self.digest)
         )
 
     def for_host(self, host: str) -> _HostProxy | None:
@@ -1808,8 +1807,6 @@ def proxy_config_from_settings(
         auth_header=auth_header,
         digest=digest,
         connection=connection,
-        # A credential reached here only by passing the posture-keyed guard above.
-        credential_admitted=bool(auth_header or digest),
     )
 
 

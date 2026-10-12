@@ -67,9 +67,9 @@ DEFAULT_IDP_TIMEOUT_SECONDS = 10.0
 
 
 class _NoRedirectHandler(NoRedirectHandler):
-    """Never follow a redirect. Duplicated from ``transports/rest.py`` rather than imported: the house
-    pattern (``pipeline/alert_sinks.py`` does the same) is to keep each subsystem's opener policy local
-    rather than couple the auth path to a message-transport module."""
+    """Never follow a redirect. The auth path's own name for the shared
+    :class:`~messagefoundry.transports.bounded_read.NoRedirectHandler`, which
+    ``build_strict_opener`` would add anyway (vault BACKLOG #3417)."""
 
 
 def build_idp_opener(
