@@ -335,7 +335,9 @@ class AlertSink(Protocol):
         ``name`` is ``crl_reload:<path>``, with ``@node:<id>`` or ``@shard:<id>`` appended where
         several engine processes share the store, because each process holds its own contexts.
         ``<path>`` is the CRL file's absolute path, case-folded on Windows, and shortened to a
-        checksum plus its tail when long. ``path`` is the file as configured. ``remedy_class`` is
+        checksum plus its tail when long. ``path`` is the file's absolute path, case kept, as the
+        reload reads it; a relative path in a setting appears here in its absolute form.
+        ``remedy_class`` is
         a short token for what the operator does next (``restart``, ``fix_file``, ``wait`` and so
         on; ``pipeline/crl_reload.py`` holds the set). ``stale_contexts`` counts the contexts
         still on the old copy when the alert was raised. ``remedy`` is the engine's own fixed

@@ -1887,7 +1887,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | Event field | What it holds |
 |---|---|
 | `connection` | `crl_reload:` and the CRL file's absolute path, case-folded on Windows. `@node:<node_id>` or `@shard:<id>` follows when several engine processes share the store, because each process holds its own TLS contexts. A long path is shortened to a checksum and its tail; `path` holds it whole. |
-| `path` | the file as configured |
+| `path` | the file's absolute path, case kept. A relative path in a setting appears here in its absolute form |
 | `remedy_class` | a short token for what to do next; see the next table |
 | `stale_contexts` | how many running TLS contexts still held the old copy when the alert was raised |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
@@ -1905,7 +1905,7 @@ reason, once the held copy nears its `nextUpdate`.
 | `bad_signature` | A CRL in the file fails its signature check under rule 2. The signature paragraphs above say when to fix the file and when a restart loads it. |
 | `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
 | `restart` | Restart the engine to apply the file. |
-| `no_issuer` | Restart the engine, or add the issuing intermediate CA to the hop's own CA file. |
+| `no_issuer` | Restart the engine to apply the file. Adding the issuing intermediate CA to the hop's own CA file does not apply this file; it lets later reloads verify the CRL without a restart. |
 | `retry` | The engine tries again every pass. A restart applies the file now. |
 | `wait` | Wait. The engine applies the file once its CRL takes effect. Do not restart before then. |
 
@@ -1915,8 +1915,9 @@ no remedy sentence.
 **One alert per file version.** The engine raises the alert when it first refuses a version of the
 file. It raises it again only when the file's bytes change or the reason does, which is the rule the
 ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
-applies: a second refused version inside `[alerts].realert_seconds` of the first updates the open
-alert and does not page again.
+applies while the alert is open: a second refused version inside `[alerts].realert_seconds` of the
+first updates the open alert and does not page again. Resolving the alert ends that cooldown, so it
+does not hold back a refusal that follows a fix.
 
 **The alert resolves itself.** Its inverse, `crl_reload_applied`, pages nobody and cannot be a
 rule's `event_type`. The engine raises it once the refusal no longer stands on that process:

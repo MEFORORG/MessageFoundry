@@ -231,6 +231,12 @@ _REMEDY_CLASS = {
 #: never reaches a notifier.
 _OTHER_REMEDY_CLASS = "other"
 
+
+def _remedy_class(remedy: str) -> str:
+    """The alert's short token for ``remedy``. One rule, for the outcome and for the alert."""
+    return _REMEDY_CLASS.get(remedy, _OTHER_REMEDY_CLASS)
+
+
 #: The longest CRL path a ``crl_reload_refused`` alert subject carries whole. With the
 #: ``crl_reload:`` prefix, that leaves
 #: :func:`~messagefoundry.pipeline.intake_bound.process_alert_subject` room to add the process
@@ -286,9 +292,7 @@ class ReloadOutcome:
     def remedy_class(self) -> str | None:
         """The short token for what the operator does next (:data:`_REMEDY_CLASS`), or ``None``
         when nothing was refused."""
-        if self.refusal is None:
-            return None
-        return _REMEDY_CLASS.get(self.refusal.remedy, _OTHER_REMEDY_CLASS)
+        return None if self.refusal is None else _remedy_class(self.refusal.remedy)
 
 
 def _first_lapse(held: Sequence[CrlBlock]) -> CrlBlock | None:
@@ -956,8 +960,9 @@ class CrlReloadRunner:
         # minute, so this is what keeps the alert to one per file version. It is also the set of
         # alerts this runner has open. Touched only on the event loop.
         self._alerted: dict[str, _Alerted] = {}
-        # True while the sink is refusing calls: one WARNING per failing streak, not one a pass.
-        self._sink_failing = False
+        # The sink calls now failing, as (what, path key): one WARNING per failing streak of each,
+        # not one a pass.
+        self._sink_failing: set[tuple[str, str]] = set()
 
     def start(self) -> None:
         """Spawn the loop (idempotent)."""
@@ -1016,9 +1021,18 @@ class CrlReloadRunner:
                 outcomes = await asyncio.to_thread(self._reload)
             except Exception:
                 log.exception("crl_reload pass failed; will retry next interval")
+            if self._stop.is_set():
+                # stop() resolves what is open. A refusal raised now would page, and the stop
+                # would resolve it a moment later, for a condition the restart itself ends.
+                return
             # After the await, so on the event loop: a notifier schedules its alert-state write
             # with the running loop, and off the loop that write is dropped without an error.
-            self._report(outcomes)
+            try:
+                self._report(outcomes)
+            except Exception:
+                # Broad on purpose, as for the pass: reporting must never end the loop that
+                # applies revocations. An injected ``reload`` can return an outcome of any shape.
+                log.exception("crl_reload: reporting a pass failed; will retry next interval")
 
     def _report(self, outcomes: object) -> None:
         """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet, then
@@ -1039,9 +1053,14 @@ class CrlReloadRunner:
         context holds the file's bytes, and drops it when no hop holds the file. Forgetting the
         alert here is also what makes the same bytes, refused again later, alert again, as they
         log again."""
-        if not self._alerted:
+        if not self._alerted and not self._sink_failing:
             return
         standing = reload_refusals()
+        # A raise that kept failing for a refusal since cleared is moot. End its streak, so the
+        # next failure for that file is logged again.
+        self._sink_failing = {
+            (what, key) for what, key in self._sink_failing if what != "raised" or key in standing
+        }
         self._resolve(
             [key for key in self._alerted if key not in standing], "the refusal no longer stands"
         )
@@ -1057,16 +1076,18 @@ class CrlReloadRunner:
             except Exception:
                 # Broad on purpose, as in _raise_refused. Kept as open, so the next pass or the
                 # stop retries the clear.
-                self._sink_failed("resolved")
+                self._sink_failed("resolved", key)
                 continue
-            self._sink_failing = False
+            self._sink_failing.discard(("resolved", key))
             del self._alerted[key]
             log.info("crl_reload: the refused-reload alert for %s is resolved: %s", path, why)
 
-    def _sink_failed(self, what: str) -> None:
-        """One WARNING per failing streak, from inside the ``except`` that caught the failure."""
-        if not self._sink_failing:
-            self._sink_failing = True
+    def _sink_failed(self, what: str, key: str) -> None:
+        """One WARNING per failing streak of one call for one file, from inside the ``except``
+        that caught the failure. Per call and per file, so one file's success does not restart
+        another's streak, and one standing failure does not hide a new one."""
+        if (what, key) not in self._sink_failing:
+            self._sink_failing.add((what, key))
             log.warning(
                 "crl_reload: the refused-reload alert could not be %s; the next pass, or the "
                 "stop, tries again",
@@ -1080,21 +1101,21 @@ class CrlReloadRunner:
         known = self._alerted.get(key)
         if known is not None and (known.fingerprint, known.reason) == version:
             return  # this version of the file is alerted already
-        token = _REMEDY_CLASS.get(refusal.remedy)
+        token = _remedy_class(refusal.remedy)
         try:
             self._alert_sink.crl_reload_refused(
                 reload_alert_subject(key, self._node),
                 path=outcome.path,
-                remedy_class=token or _OTHER_REMEDY_CLASS,
+                remedy_class=token,
                 stale_contexts=outcome.stale,
                 # Only a sentence the class map vouches for. Never ``refusal.reason``.
-                remedy=refusal.remedy if token else "",
+                remedy=refusal.remedy if token != _OTHER_REMEDY_CLASS else "",
                 start_refuses=outcome.start_refuses,
             )
         except Exception:
             # Broad on purpose: a sink must never raise, and a broken one must not end the loop
             # that applies revocations. Not recorded as alerted, so the next pass retries it.
-            self._sink_failed("raised")
+            self._sink_failed("raised", key)
             return
-        self._sink_failing = False
+        self._sink_failing.discard(("raised", key))
         self._alerted[key] = _Alerted(outcome.path, *version)

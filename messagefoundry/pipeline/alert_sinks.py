@@ -1014,7 +1014,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # refusal's reason quotes CRL issuer names and dates, so it is never passed in. `detail` is
         # what the instance's reason column shows, built by the helper the logging sink uses. The
         # runner raises this once per file version, so a second version refused inside the
-        # cooldown updates the open instance and does not page again.
+        # cooldown while the alert is still open updates the instance and does not page again.
+        # crl_reload_applied ends that cooldown, so it never throttles a refusal after a clear.
         event: dict[str, Any] = {
             "type": "crl_reload_refused",
             "connection": name,
@@ -1035,6 +1036,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def crl_reload_applied(self, name: str, *, path: str) -> None:
         # #2904: the INVERSE -- no page; auto-resolves the open crl_reload_refused via _AUTO_RESOLVE.
+        # It also ends the cooldown for that file. The runner raises a refusal once per file
+        # version and sends no reminders, so a refusal that follows this clear inside the cooldown
+        # would otherwise be throttled and never paged at all.
+        self._last_sent.pop(f"crl_reload_refused:{name}", None)
         self._record_state({"type": "crl_reload_applied", "connection": name}, "info")
 
     def secret_rotation_due(

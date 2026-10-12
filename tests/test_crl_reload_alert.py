@@ -427,6 +427,116 @@ async def test_a_sink_that_raises_does_not_stop_the_runner_and_is_retried(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_each_failing_sink_call_has_its_own_streak(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One file's success must not restart another file's streak, and one standing failure must
+    not hide a new one."""
+
+    class _Selective(_Sink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failing: set[tuple[str, str]] = set()
+
+        def _record(self, kind: str, name: str, payload: dict[str, Any]) -> None:
+            if (kind, name) in self.failing:
+                raise RuntimeError("sink down for this call")
+            super()._record(kind, name, payload)
+
+    a, b = str(tmp_path / "a.pem"), str(tmp_path / "b.pem")
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    outcomes = [ReloadOutcome(path, 0, refusal, 1) for path in (a, b)]
+    for path in (a, b):
+        loaded_crls.record_reload_refusal(path, refusal)
+    sink = _Selective()
+    sink.failing = {("refused", reload_alert_subject(a)), ("applied", reload_alert_subject(b))}
+    runner = _runner(sink)
+
+    def warned(what: str) -> int:
+        return sum(f"could not be {what}" in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        for _ in range(3):
+            runner._report(outcomes)  # A's raise fails every time; B's raise lands once
+        assert (warned("raised"), warned("resolved")) == (1, 0)
+        assert sink.kinds() == ["refused"]
+
+        loaded_crls.clear_reload_refusal(b)  # B is cleared, and its clear now fails too
+        for _ in range(3):
+            runner._report(outcomes[:1])
+        assert (warned("raised"), warned("resolved")) == (1, 1)
+
+
+async def test_a_pass_in_flight_at_stop_raises_nothing(pki: _Pki) -> None:
+    """A refusal raised after the stop was asked for would page, and the stop would resolve it a
+    moment later, for a condition the restart itself ends."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    returned: list[list[ReloadOutcome]] = []
+    runner = _runner(sink, interval_seconds=0.01)
+
+    def reload() -> list[ReloadOutcome]:
+        runner._stop.set()  # the stop arrives while the pass runs
+        returned.append(reload_replaced_crls())
+        return returned[-1]
+
+    runner._reload = reload
+    pki.crl.write_bytes(_expired(pki))
+    runner.start()
+    await until(lambda: bool(returned), "the pass in flight")
+    await runner.stop()
+
+    assert returned[0][0].refusal is not None, "the control: the pass did refuse the file"
+    assert sink.events == []
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_report_that_fails_does_not_end_the_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The pass is guarded, and so is its report: an outcome of an odd shape from an injected
+    ``reload`` must not end the loop that applies revocations."""
+    passes: list[int] = []
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+
+    def reload() -> list[ReloadOutcome]:
+        passes.append(1)
+        return [ReloadOutcome(cast(Any, 123), 0, refusal, 1)]  # not a path
+
+    runner = CrlReloadRunner(interval_seconds=0.01, reload=reload, skip_when_idle=False)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        runner.start()
+        try:
+            await until(lambda: len(passes) >= 3, "a third pass after two failed reports")
+        finally:
+            await runner.stop()
+    assert any("reporting a pass failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_refusal_after_a_clear_is_not_held_back_by_the_cooldown() -> None:
+    """The runner raises once per file version and sends no reminders. So a refusal the
+    notifier throttled would never be paged at all, and the clear must end the cooldown."""
+    transport = _RecordingTransport("webhook")
+    sink = NotifierAlertSink([transport])  # the default cooldown, far longer than this test
+
+    def refuse(name: str) -> None:
+        sink.crl_reload_refused(
+            name, path="a.pem", remedy_class="fix_file", stale_contexts=1, remedy=FIX
+        )
+
+    refuse("crl_reload:fixed-between")
+    sink.crl_reload_applied("crl_reload:fixed-between", path="a.pem")
+    refuse("crl_reload:fixed-between")
+    # The control: with no clear between them, the second raise is throttled.
+    refuse("crl_reload:still-open")
+    refuse("crl_reload:still-open")
+    await _drain_transports(sink)
+
+    paged = [e["connection"] for e in transport.events]
+    assert paged.count("crl_reload:fixed-between") == 2
+    assert paged.count("crl_reload:still-open") == 1
+
+
 async def test_the_same_bytes_refused_again_after_a_fix_alert_again(pki: _Pki) -> None:
     """Matching the log: a refusal that was cleared and then recurs is a new refusal."""
     hop = pki.outbound_hop()
