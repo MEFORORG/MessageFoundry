@@ -8334,14 +8334,13 @@ def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]
     fields = ApprovalsSettings.model_fields
     held = set(approvals.operations)
     if not held:
-        out.append(
+        return [
             (
                 "approvals.operations",
                 "dual control is on and holds no operation. One caller's authority completes "
                 "every action with no second approver, as it does with dual control off",
             )
-        )
-        return out
+        ]
     # The default is read off the field, so a default that moves is followed and never restated.
     left_out = sorted(set(fields["operations"].get_default(call_default_factory=True)) - held)
     if left_out:

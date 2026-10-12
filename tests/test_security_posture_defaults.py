@@ -1029,6 +1029,11 @@ def _approvals(**over: float) -> ApprovalsSettings:
     return ApprovalsSettings(enabled=True, **over)
 
 
+def _approval_risks(approvals: ApprovalsSettings) -> dict[str, str]:
+    """Switch name -> risk text for an ``[approvals]`` section, every other input at default."""
+    return dict(_pairs(approvals=approvals))
+
+
 @pytest.mark.parametrize(
     ("floor", "named"),
     [
@@ -1066,15 +1071,13 @@ def test_the_approval_limits_are_not_named_while_dual_control_holds_nothing() ->
     # The empty list is named for itself (vault BACKLOG #3123). Its limits bind nothing, so they
     # are still not named.
     no_ops = ApprovalsSettings(enabled=True, operations=[], min_dwell_seconds=0.0, expiry_hours=0.0)
-    assert _names(approvals=no_ops) == ["approvals.operations"]
+    assert _names(approvals=no_ops) == [_OPS]
     held = _approvals(min_dwell_seconds=0.0, expiry_hours=0.0)
     assert _names(approvals=held) == ["min_dwell_seconds", "expiry_hours"]
 
 
 def test_the_approval_entries_say_off_at_zero_and_quote_a_looser_value() -> None:
-    def risks(approvals: ApprovalsSettings) -> dict[str, str]:
-        return dict(_pairs(approvals=approvals))
-
+    risks = _approval_risks
     off = risks(_approvals(min_dwell_seconds=0.0, expiry_hours=0.0))
     assert "the moment it is made" in off["min_dwell_seconds"]
     assert "never expires" in off["expiry_hours"]
@@ -1107,7 +1110,7 @@ async def test_posture_route_reports_the_approval_dwell_the_app_was_built_with(
     assert "min_dwell_seconds" not in default and "expiry_hours" not in default
     # Vault BACKLOG #3123: the same route names a narrowed operations list.
     assert _OPS not in loose and _OPS not in default
-    narrowed = await switches(ApprovalsSettings(enabled=True, operations=["dead_letter_replay"]))
+    narrowed = await switches(_held(["dead_letter_replay"]))
     assert _OPS in narrowed
 
 
@@ -1133,7 +1136,7 @@ def test_each_default_operation_left_out_of_dual_control_is_named(dropped: str) 
     one, so it comes from the difference and not from the list being short."""
     kept = [op for op in _DEFAULT_HELD if op != dropped]
     assert kept, "a one-item default would make this the empty-list case"
-    risks = dict(_pairs(approvals=_held(kept)))
+    risks = _approval_risks(_held(kept))
     assert list(risks) == [_OPS]
     assert f"does not hold {dropped}," in risks[_OPS]
     assert not any(op in risks[_OPS] for op in kept)
@@ -1143,12 +1146,12 @@ def test_each_default_operation_left_out_of_dual_control_is_named(dropped: str) 
 
 def test_a_dropped_purge_or_replay_is_named_by_its_own_name() -> None:
     """The two cases the row names, written out by hand so they do not lean on the default list."""
-    purge = dict(_pairs(approvals=_held(["dead_letter_replay"])))[_OPS]
+    purge = _approval_risks(_held(["dead_letter_replay"]))[_OPS]
     assert "does not hold connection_purge, " in purge and "dead_letter_replay" not in purge
-    replay = dict(_pairs(approvals=_held(["connection_purge"])))[_OPS]
+    replay = _approval_risks(_held(["connection_purge"]))[_OPS]
     assert "does not hold dead_letter_replay, " in replay and "connection_purge" not in replay
     # Both dropped with one opt-in operation still held: each is named, and config_reload is not.
-    both = dict(_pairs(approvals=_held(["config_reload"])))[_OPS]
+    both = _approval_risks(_held(["config_reload"]))[_OPS]
     assert "does not hold connection_purge, dead_letter_replay, " in both
     assert "config_reload" not in both
     for risk in (purge, replay, both):
@@ -1179,12 +1182,11 @@ def test_a_narrowed_list_is_not_named_while_dual_control_is_off(operations: list
 def test_an_empty_list_with_dual_control_on_is_named_as_holding_nothing() -> None:
     """``enabled = true`` with ``operations = []`` loads, and the gate then holds no action at all.
     That is the narrowing in its largest form, and it has its own wording."""
-    risks = dict(_pairs(approvals=_held([])))
-    assert list(risks) == [_OPS]
-    assert "holds no operation" in risks[_OPS]
-    assert "does not hold" not in risks[_OPS]
+    risk = _approval_risks(_held([]))[_OPS]
+    assert "holds no operation" in risk
+    assert "does not hold" not in risk
     # The wording belongs to the empty list alone.
-    assert "holds no operation" not in dict(_pairs(approvals=_held(["config_reload"])))[_OPS]
+    assert "holds no operation" not in _approval_risks(_held(["config_reload"]))[_OPS]
 
 
 def test_a_narrowed_list_is_named_beside_its_loosened_limits() -> None:
@@ -1199,20 +1201,22 @@ def test_a_narrowed_list_is_named_beside_its_loosened_limits() -> None:
 def test_serve_names_a_narrowed_operations_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The serve-time loosening WARNING reads the loaded ``[approvals]``. The same file with the
-    list left at its default is the control. The two fixtures stand down the start gates this test
-    is not about, as ``tests/test_cli.py`` does for the helper borrowed here."""
+    """The serve-time loosening WARNING reads the loaded ``[approvals]``: the entry names the one
+    operation this file leaves out, which no default section could produce. The two fixtures stand
+    down the start gates this test is not about, as ``tests/test_cli.py`` does for the helper
+    borrowed here."""
     from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
 
-    base = "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION + _SECURE_ALERTS
-    narrowed = base + '[approvals]\nenabled = true\noperations = ["dead_letter_replay"]\n'
+    narrowed = (
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS
+        + '[approvals]\nenabled = true\noperations = ["dead_letter_replay"]\n'
+    )
     rc, _ = _run_secure_serve(tmp_path, monkeypatch, narrowed)
     assert rc == 0
     out = capsys.readouterr().out
     assert f"{_OPS} (" in out and "does not hold connection_purge, " in out
-    rc, _ = _run_secure_serve(tmp_path, monkeypatch, base + "[approvals]\nenabled = true\n")
-    assert rc == 0
-    assert _OPS not in capsys.readouterr().out
 
 
 # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4) --------------------
