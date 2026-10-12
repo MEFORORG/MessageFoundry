@@ -167,6 +167,7 @@ _EVIDENCE_ARTIFACT_MARKERS = (
 #: Settings names the rewritten §2/§3/§8 text depends on; a rename must red the doc, not rot it.
 _CITED_SETTINGS = (
     ("store", "aad_bind"),
+    ("store", "secure_delete"),
     ("store", "cipher_provider"),
     ("store", "key_provider"),
     ("store", "uploads_dir"),
@@ -505,6 +506,10 @@ def test_documented_defaults_match_the_shipped_defaults() -> None:
         "§8 says the raw [retention] windows still default to 0"
     )
     assert settings.retention.max_pass_seconds == 0.0, "§8 says the pass cap defaults to off"
+    assert settings.store.secure_delete is True, "§8 says secure_delete is on by default"
+    assert settings.retention.wal_checkpoint_seconds == 3600.0, (
+        "§2 and §8 say the WAL truncate is tried hourly by default"
+    )
     assert settings.store.uploads_retention_days == 30, (
         "§8 says [store].uploads_dir blobs auto-prune after uploads_retention_days (default 30)"
     )

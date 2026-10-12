@@ -12,18 +12,19 @@ import gzip
 import json
 import logging
 import os
+import sqlite3
 import time
 from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import EgressSettings, RetentionSettings
+from messagefoundry.config.settings import EgressSettings, RetentionSettings, StoreSettings
 from messagefoundry.pipeline import retention as retention_mod
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.retention import RetentionRunner
-from messagefoundry.store import MessageStore, OutboxStatus
+from messagefoundry.store import MessageStore, OutboxStatus, open_store
 from messagefoundry.store.store import DbStatus
 
 DAY = 86_400.0
@@ -630,6 +631,139 @@ async def test_wal_checkpoint_and_vacuum_run_clean(store: MessageStore) -> None:
     assert ok
 
 
+# --- purge residue (vault BACKLOG #2619) ----------------------------------------
+
+
+def test_purge_residue_knobs_ship_on() -> None:
+    assert StoreSettings().secure_delete is True
+    assert RetentionSettings().wal_checkpoint_seconds == 3600.0
+
+
+async def _secure_delete_reads(store: MessageStore) -> int:
+    cur = await store._db.execute("PRAGMA secure_delete")
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    return int(row[0])
+
+
+@pytest.mark.parametrize("secure_delete", [True, False])
+async def test_a_purged_body_leaves_no_bytes_in_the_file(tmp_path, secure_delete: bool) -> None:
+    """With ``secure_delete`` on, the bytes of a purged body are gone from the SQLite file. The
+    ``False`` case is the control: the same purge leaves the body readable in free space, which
+    proves the byte search below can see it."""
+    db = tmp_path / f"residue_{secure_delete}.db"
+    store = await MessageStore.open(db, secure_delete=secure_delete)
+    try:
+        assert await _secure_delete_reads(store) == int(secure_delete)
+        marker = "RESIDUE-MARKER-2619"
+        # Big enough to spill onto overflow pages, which a purge frees to the freelist.
+        raw = "MSH|^~\\&|" + marker + "|" + "X" * 6000
+        await _delivered(store, now=0.0, raw=raw, summary="S")
+        await store.wal_checkpoint()  # the body is in the main file, as auto-checkpoint leaves it
+        assert marker.encode() in db.read_bytes()
+        assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+        await store.wal_checkpoint()
+    finally:
+        await store.close()
+    assert (marker.encode() in db.read_bytes()) is (not secure_delete)
+
+
+async def test_open_store_threads_the_secure_delete_setting(tmp_path) -> None:
+    for flag in (True, False):
+        settings = StoreSettings(path=str(tmp_path / f"o_{flag}.db"), secure_delete=flag)
+        store = await open_store(settings, create=True, keyless_chain_refusal=None)
+        try:
+            assert isinstance(store, MessageStore)
+            assert await _secure_delete_reads(store) == int(flag)
+        finally:
+            await store.close()
+
+
+async def test_the_default_pass_truncates_the_wal_after_its_purge(store: MessageStore) -> None:
+    """Stock ``[retention]`` truncates the ``-wal`` file after its purge, so frames that held a
+    purged body do not stay on disk past the write point. The pass's own audit row is written after
+    the truncate, so the file is not empty; what is checked is that the body is gone from it."""
+    marker = b"WAL-MARKER-2619"
+    await _delivered(store, now=0.0, raw="MSH|^~\\&|" + marker.decode() + "|" + "Y" * 6000)
+    wal = f"{store.path}-wal"
+    with open(wal, "rb") as fh:
+        assert marker in fh.read()  # the control: the search can see the body in the WAL
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 30 * DAY)
+    result = await runner.run_once()
+    assert result.messages_purged == 1
+    assert result.wal_checkpointed is True
+    with open(wal, "rb") as fh:
+        assert marker not in fh.read()
+    with open(str(store.path), "rb") as fh:
+        assert marker not in fh.read()
+
+
+async def test_wal_checkpoint_says_so_when_a_reader_pins_the_wal(store: MessageStore) -> None:
+    """A read transaction that started on WAL frames makes TRUNCATE give up after the busy timeout,
+    and the store now says so (vault BACKLOG #2619). The control is the same call once the reader
+    is gone, which finishes. The busy timeout is cut to keep the test fast; the outcome is SQLite's
+    busy flag either way."""
+    await _delivered(store, now=0.0)
+    cur = await store._db.execute("PRAGMA busy_timeout=50")
+    await cur.close()
+    reader = sqlite3.connect(str(store.path))
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM messages").fetchone()
+        assert await store.wal_checkpoint() is False
+    finally:
+        reader.close()
+    assert await store.wal_checkpoint() is True
+    assert os.path.getsize(f"{store.path}-wal") == 0
+
+
+async def test_a_pass_whose_truncate_did_not_finish_warns_and_records_it(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The pass used to say nothing when its truncate gave up. Now it logs a WARNING that names the
+    file and not the content, and the pass result records it. The control is the same pass with a
+    truncate that finishes: no warning, nothing recorded."""
+    marker = "UNTRUNCATED-MARKER-2619"
+    await _delivered(store, now=0.0, raw="MSH|^~\\&|" + marker, summary=marker)
+
+    async def busy() -> bool:
+        return False
+
+    settings = RetentionSettings(messages_days=1, wal_checkpoint_seconds=1)
+    caplog.set_level(logging.WARNING, logger=retention_mod.__name__)
+    clean = await RetentionRunner(store, settings, clock=lambda: 30 * DAY).run_once()
+    assert clean.wal_checkpointed is True
+    assert clean.wal_left_untruncated is False
+    assert not [r for r in caplog.records if "WAL truncate" in r.getMessage()]
+
+    monkeypatch.setattr(store, "wal_checkpoint", busy)
+    # A second purgeable message, so the second pass is audited too.
+    await _delivered(store, now=DAY, raw="MSH|^~\\&|" + marker, summary=marker, control="CID-2")
+    result = await RetentionRunner(store, settings, clock=lambda: 31 * DAY).run_once()
+    assert result.wal_checkpointed is True
+    assert result.wal_left_untruncated is True
+    warned = [r for r in caplog.records if "WAL truncate did not finish" in r.getMessage()]
+    assert len(warned) == 1
+    assert warned[0].levelno == logging.WARNING
+    assert f"{os.path.abspath(store.path)}-wal" in warned[0].getMessage()
+    assert marker not in caplog.text
+    # Each pass purged, so each wrote an audit row, and the row says whether the WAL kept the frames.
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    left = sorted(json.loads(r["detail"])["wal_left_untruncated"] for r in audit)
+    assert left == [False, True]
+
+
+async def test_a_purge_pass_with_no_truncate_records_null_not_false(store: MessageStore) -> None:
+    """A pass that ran no truncate must not record ``false``, which would read as "truncated"."""
+    await _delivered(store, now=0.0)
+    settings = RetentionSettings(messages_days=1, wal_checkpoint_seconds=0)
+    result = await RetentionRunner(store, settings, clock=lambda: 30 * DAY).run_once()
+    assert result.messages_purged == 1 and result.wal_checkpointed is False
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert [json.loads(r["detail"])["wal_left_untruncated"] for r in audit] == [None]
+
+
 # --- RetentionRunner ----------------------------------------------------------
 
 
@@ -847,9 +981,10 @@ async def test_run_once_cap_skips_phase_after_deadline(store: MessageStore, monk
     }  # a controllable monotonic clock for the deadline (separate from the window clock)
     orig_wal = store.wal_checkpoint
 
-    async def slow_wal() -> None:
-        await orig_wal()
+    async def slow_wal() -> bool:
+        finished = await orig_wal()
         mono["t"] = 100.0  # the WAL phase overruns the 5s cap
+        return finished
 
     monkeypatch.setattr(store, "wal_checkpoint", slow_wal)
 
@@ -939,14 +1074,18 @@ async def test_run_once_cap_off_is_byte_identical(store: MessageStore) -> None:
 def test_enabled_property(store: MessageStore) -> None:
     # BACKLOG #290: the low-disk floor ships ON (1024 MiB), and on a SQLite store it needs the runner,
     # so stock settings now enable it. "Everything off" has to turn the floor off explicitly.
+    # Vault BACKLOG #2619: the WAL truncate ships ON too, so "everything off" turns both off.
     assert RetentionRunner(store, RetentionSettings()).enabled is True
-    assert RetentionRunner(store, RetentionSettings(min_free_disk_mb=0)).enabled is False
+    off = {"min_free_disk_mb": 0, "wal_checkpoint_seconds": 0}
+    assert RetentionRunner(store, RetentionSettings.model_validate(off)).enabled is False
 
-    # Every knob below is checked with the floor OFF, so each one is seen enabling the runner alone.
+    # Every knob below is checked with both default-ON knobs OFF, so each one is seen enabling the
+    # runner alone.
     def enabled(log_dir: str | None = None, **knobs: object) -> bool:
-        settings = RetentionSettings.model_validate({"min_free_disk_mb": 0, **knobs})
+        settings = RetentionSettings.model_validate({**off, **knobs})
         return RetentionRunner(store, settings, log_dir=log_dir).enabled
 
+    assert enabled(wal_checkpoint_seconds=3600) is True
     assert enabled(messages_days=1) is True
     assert enabled(max_db_mb=10) is True
     assert enabled(vacuum_at="03:30") is True

@@ -506,10 +506,12 @@ async def test_mark_failed_at_attempt_1025_under_retry_forever_keeps_the_cap_pac
     await store._db.commit()
     retry = RetryPolicy(max_attempts=None)
 
-    assert await store.mark_failed(item.id, "partner down", retry, now=1000.0) == 1300.0
+    assert (await store.mark_failed(item.id, "partner down", retry, now=1000.0)).retry_at == 1300.0
     claimed = await store.claim_next_fifo(DEST, now=1300.0)
     assert claimed is not None and claimed.attempts == 1026
-    assert await store.mark_batch_failed([claimed.id], "partner down", retry, now=2000.0) == 2300.0
+    assert (
+        await store.mark_batch_failed([claimed.id], "partner down", retry, now=2000.0)
+    ).retry_at == 2300.0
 
 
 async def test_a_failed_send_at_attempt_1025_parks_the_lane_for_the_cap(

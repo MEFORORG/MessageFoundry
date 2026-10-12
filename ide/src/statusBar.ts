@@ -36,6 +36,7 @@ import {
   runDirHasEngine,
   runStartPlan,
   storeLessStartPrompt,
+  validateProvisionEmail,
   validateProvisionUsername,
   type AdminDetails,
   type AdminProbeResult,
@@ -660,11 +661,8 @@ export class EngineStatusBar implements vscode.Disposable {
     const exited = awaitExit(term);
     term.show();
     // The argv carries nothing secret, since the password never leaves the terminal. The log names the
-    // account and whether an address was given, and leaves the address itself out.
-    logAction(
-      "provision administrator",
-      `${admin.username}${admin.email?.trim() ? " (with a notification address)" : ""}`,
-    );
+    // account and leaves the address out.
+    logAction("provision administrator", admin.username);
     try {
       const code = await exited;
       // ADR 0197 Amendment A: provision-admin may have printed the authenticator key (it does so
@@ -856,10 +854,10 @@ async function askAdminDetails(): Promise<AdminDetails | undefined> {
   const email = await vscode.window.showInputBox({
     title,
     prompt:
-      "Notification address for security notices. The shipped settings refuse to start the engine " +
-      "until some enabled administrator has one. Leave it blank to set it later with " +
-      "`messagefoundry admin-set-notify-email`.",
+      "Notification address for this administrator's security notices, such as name@example.org. " +
+      "It is required.",
     ignoreFocusOut: true,
+    validateInput: validateProvisionEmail,
   });
   if (email === undefined) {
     return undefined;

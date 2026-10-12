@@ -78,6 +78,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    FailOutcome,
     FederatedUnbind,
     LatencyHistogram,
     LockoutCounter,
@@ -826,12 +827,15 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
-    ) -> float | None:
+    ) -> FailOutcome:
         """Reschedule one outbox row with exponential backoff, or dead-letter it once a finite
-        ``max_attempts`` is exhausted. Returns the row's new ``next_attempt_at`` (epoch seconds) when
-        it was RESCHEDULED — the runner arms a per-lane retry wake at that time (WS-C: with the long
-        idle backstop, the retry re-claim no longer rides a short poll) — and ``None`` when the row
-        dead-lettered or no longer exists (nothing to re-claim).
+        ``max_attempts`` is exhausted. Returns a :class:`FailOutcome` read inside the write (vault
+        BACKLOG #3211). Its ``retry_at`` is the row's new ``next_attempt_at`` (epoch seconds) on the
+        retry branch: the runner arms a per-lane retry wake at that time (WS-C: with the long idle
+        backstop, the retry re-claim no longer rides a short poll). Its ``dead`` is 1 when this call
+        dead-lettered the row, and it names the row with the attempts the store read there. A row
+        that no longer exists returns an empty outcome, and so does a final write the H1 fence
+        rolled back.
 
         The retry branch re-pends a row only while it is ``inflight`` or ``pending`` (ADR 0157
         Amendment A, BACKLOG #2078, #2348, widened by owner ruling 2026-09-29). So a row a lease sweep
@@ -856,12 +860,15 @@ class QueueStore(StoreLifecycle, Protocol):
         error: str,
         retry: RetryPolicy,
         now: float | None = None,
-    ) -> float | None:
+    ) -> FailOutcome:
         """Re-pend (or dead-letter) N outbound rows that FAILED **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to every member, so all N re-pend to the same ``next_attempt_at`` (re-claimed
-        as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. Returns
-        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered. On the
+        as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. The
+        head is the first member still present, and the returned :class:`FailOutcome` names it, with
+        the shared ``next_attempt_at`` as ``retry_at`` when rescheduled and the members written DEAD
+        as ``dead``. An empty or wholly vanished batch returns an empty outcome, and so does a final
+        write the H1 fence rolled back. On the
         retry branch a terminal member (neither ``inflight`` nor ``pending``) is skipped, event and
         all, as in
         :meth:`mark_failed`, and the shared retry time is returned even when every member was
@@ -1627,7 +1634,11 @@ class QueueStore(StoreLifecycle, Protocol):
         row and makes the set read as present-but-empty; that trade is deliberate and recorded."""
         ...
 
-    async def wal_checkpoint(self) -> None: ...
+    async def wal_checkpoint(self) -> bool | None:
+        """Truncate the SQLite ``-wal`` file. ``True`` when no ``-wal`` frames remain (an in-memory
+        or non-WAL SQLite store has none), ``False`` when the checkpoint could not finish (vault
+        BACKLOG #2619), and ``None`` on a server backend, whose method is a no-op."""
+        ...
 
     async def vacuum(self) -> None: ...
 
@@ -3385,6 +3396,7 @@ async def _open_backend(
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             read_only=read_only,
+            secure_delete=settings.secure_delete,
         )
     if settings.backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep

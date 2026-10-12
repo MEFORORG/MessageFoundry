@@ -1016,6 +1016,37 @@ class OutboxItem:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class FailOutcome:
+    """What one ``mark_failed`` or ``mark_batch_failed`` call did, read inside its own write
+    (vault BACKLOG #3211). The runner logs a dead-letter at the retry cap from this, with no read
+    back of the row.
+
+    ``retry_at`` is the new ``next_attempt_at`` (the batch's shared one) on the retry branch. It
+    comes back even when the status term skipped every row (ADR 0157 Amendment A), so it does not
+    prove a row is PENDING. It is ``None`` on every other path.
+
+    ``dead`` is how many rows this call's DEAD write covered: on SQLite, the rows it wrote under the
+    single writer; on Postgres and SQL Server, the rows the transaction read present before an
+    unfenced write, whose row count those backends do not read. It is 0 on the retry branch, for a
+    vanished row or an empty batch, and for a final write the H1 epoch fence rolled back.
+
+    ``head_id`` and ``attempts`` name the row the store decided from, with the attempts it read
+    there: the one row, or a batch's first member still present. Both are ``None`` when no row was
+    present, and on Postgres and SQL Server also when the H1 fence rolled back a DEAD write on a row
+    that was present. They can differ from what the claim returned: a lease sweep can re-pend a row under a
+    slow send, and a second claim then spends another attempt.
+
+    ``dead_messages`` holds the message ids of the rows that ``dead`` counts, each once, in the order
+    the call was handed the rows. It is empty whenever ``dead`` is 0."""
+
+    retry_at: float | None = None
+    dead: int = 0
+    head_id: str | None = None
+    attempts: int | None = None
+    dead_messages: tuple[str, ...] = ()
+
+
 class ClaimAbortPhase(StrEnum):
     """WHICH statement of a claim transaction hit the lock timeout (BACKLOG #1270).
 
@@ -5844,8 +5875,14 @@ class MessageStore:
         audit_mac_fn: Callable[[bytes], str] | None = None,
         message_events: str = "all",
         read_only: bool = False,
+        secure_delete: bool = True,
     ) -> MessageStore:
         """Open (and, unless ``read_only``, create, schema-ensure and migrate) the store at ``path``.
+
+        ``secure_delete`` (vault BACKLOG #2619) sets ``PRAGMA secure_delete`` on the writer
+        connection. On, SQLite overwrites the bytes of a deleted row or a NULLed body with zeros, so a
+        retention purge and a consumed queue row leave no copy in the file's free space. The knob,
+        its default and its cost are ``[store].secure_delete`` in ``docs/CONFIGURATION.md``.
 
         ``read_only`` (BACKLOG #1780) is for a caller that means *inspect this store*. The file is
         opened through a ``mode=ro`` URI, so SQLite itself refuses to create it or write to it. No
@@ -5888,6 +5925,8 @@ class MessageStore:
                 # win vs FULL. `sync` is validated above, so this f-string can't inject. FULL is
                 # available for the paranoid (every commit fsynced) via [store] synchronous = "full".
                 await db.execute(f"PRAGMA synchronous={sync}")
+                # Per connection, and only the writer deletes: the read pool is query_only.
+                await db.execute(f"PRAGMA secure_delete={'ON' if secure_delete else 'OFF'}")
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=5000")
             if read_only:
@@ -9685,17 +9724,18 @@ class MessageStore:
 
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
-    ) -> float | None:
-        """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns the
-        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT or
-        PENDING to re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry
-        wake on a float — WS-C; see the base contract)."""
+    ) -> FailOutcome:
+        """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns a
+        :class:`FailOutcome`: its ``retry_at`` is the new ``next_attempt_at`` on the retry branch,
+        whether or not the row was still INFLIGHT or PENDING to re-pend (the runner arms the
+        per-lane retry wake on it — WS-C), and ``dead`` is 1 when this call dead-lettered the row.
+        A missing row returns an empty outcome. See the base contract."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        rescheduled_at: float | None = None
+        outcome = FailOutcome()
 
         async def _body() -> None:
-            nonlocal rescheduled_at
+            nonlocal outcome
             row = await self._row(outbox_id)
             if row is None:
                 raise _AbortMember(None)
@@ -9735,10 +9775,15 @@ class MessageStore:
                     ),
                 ),
             )
-            if retrying:
-                rescheduled_at = next_at
-                if cur.rowcount == 0:
-                    raise _AbortMember(None)  # zero-mutation exit, as the other no-op paths
+            outcome = FailOutcome(
+                retry_at=next_at if retrying else None,
+                dead=0 if retrying else 1,
+                head_id=outbox_id,
+                attempts=attempts,
+                dead_messages=() if retrying else (row["message_id"],),
+            )
+            if retrying and cur.rowcount == 0:
+                raise _AbortMember(None)  # zero-mutation exit, as the other no-op paths
             await self._event(
                 row["message_id"],
                 event,
@@ -9750,7 +9795,7 @@ class MessageStore:
                 await self._maybe_finalize_message(row["message_id"], now)
 
         await self._run_grouped(_body)
-        return rescheduled_at
+        return outcome
 
     async def mark_batch_failed(
         self,
@@ -9758,23 +9803,24 @@ class MessageStore:
         error: str,
         retry: RetryPolicy,
         now: float | None = None,
-    ) -> float | None:
+    ) -> FailOutcome:
         """Re-pend (or dead-letter) N outbound rows that FAILED **as a unit** — one ``BHS``…``BTS``
         envelope send the partner rejected transiently or that hit a transport error (ADR 0082). The
         atomic-batch guarantee: the disposition (reschedule-with-backoff vs dead-letter) is decided from
         the **head** member's attempts and applied **identically** to every member, so all N re-pend to
         the SAME ``next_attempt_at`` and are re-claimed as the identical contiguous prefix (strict FIFO
         preserved), or all dead-letter together — never a split batch that fractures the prefix. Returns
-        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered (the
-        runner arms the lane retry wake on a float). A vanished member is skipped, and on the retry
+        a :class:`FailOutcome`: the shared ``next_attempt_at`` as ``retry_at`` when rescheduled (the
+        runner arms the lane retry wake on it), and the members it dead-lettered as ``dead``, decided
+        from the first member still present (``head_id``). A vanished member is skipped, and on the retry
         branch so is a member that is neither INFLIGHT nor PENDING (ADR 0157 Amendment A, widened
         2026-09-29), which is a terminal member; it keeps its own state."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        rescheduled_at: float | None = None
+        outcome = FailOutcome()
 
         async def _body() -> None:
-            nonlocal rescheduled_at
+            nonlocal outcome
             rows = [(oid, await self._row(oid)) for oid in outbox_ids]
             present = [(oid, r) for oid, r in rows if r is not None]
             if not present:
@@ -9787,7 +9833,6 @@ class MessageStore:
                 # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
                 backoff = retry.backoff_for(head_attempts)
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                rescheduled_at = next_at
             # ADR 0157 Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a
             # terminal member is skipped, event and all. The INFLIGHT and PENDING members re-pend
             # together to the one shared deadline.
@@ -9823,13 +9868,20 @@ class MessageStore:
                 )
                 if status == OutboxStatus.DEAD.value:
                     finalize[row["message_id"]] = None
+            outcome = FailOutcome(
+                retry_at=next_at if retrying else None,
+                dead=0 if retrying else changed,
+                head_id=present[0][0],
+                attempts=head_attempts,
+                dead_messages=tuple(finalize),  # filled on the DEAD branch only, in handed order
+            )
             if not changed:
                 raise _AbortMember(None)  # every member was skipped: a zero-mutation exit
             for message_id in sorted(finalize):  # H-8 canonical order (see below)
                 await self._maybe_finalize_message(message_id, now)
 
         await self._run_grouped(_body)
-        return rescheduled_at
+        return outcome
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
@@ -14171,34 +14223,45 @@ class MessageStore:
                 del self._state_cache[ck]
         return len(purged_keys)
 
-    async def wal_checkpoint(self) -> None:
+    async def wal_checkpoint(self) -> bool:
         """Force a full WAL checkpoint + truncate (``PRAGMA wal_checkpoint(TRUNCATE)``) so the ``-wal``
         sidecar — which holds recently-written PHI outside any app-level cipher — doesn't grow
         unbounded between SQLite's own ~1000-page auto-checkpoints. Runs outside a transaction.
 
-        The guard's entry rollback is what ensures that, so the ``_commit()`` below has no
-        transaction to commit. Taken bare, that commit made any transaction another block had
-        abandoned durable (BACKLOG #1803). It stays for its other effect: it is one more call on the
-        connection's worker, and aiosqlite keeps the previous call's result alive until the next
-        call runs, so an undrained cursor from the last writer is released before the checkpoint.
-        The PRAGMA's own cursor is drained and closed for the same reason, so it cannot leave a
+        The guard's entry rollback is what ensures that, so the ``_commit()`` in
+        :meth:`_checkpoint_wal_locked` has no transaction to commit. Taken bare, that commit made
+        any transaction another block had abandoned durable (BACKLOG #1803). It stays for its other
+        effect: it is one more call on the connection's worker, and aiosqlite keeps the previous
+        call's result alive until the next call runs, so an undrained cursor from the last writer is
+        released before the checkpoint.
+        The PRAGMA's own cursor is read and closed for the same reason, so it cannot leave a
         statement in progress for the next caller, such as :meth:`vacuum`.
 
         While a :meth:`snapshot_to` copy runs, this checkpoints PASSIVE instead (BACKLOG #1937). The
         copy's read transaction pins the WAL, so TRUNCATE would wait out the writer's busy timeout
         (measured 5.5 s) under the store lock, stalling every write, and then still fail to truncate.
         PASSIVE folds what it can without waiting. The WAL is truncated by the next checkpoint that
-        finds no copy running, which may be the next retention pass or the next snapshot. This method
-        reports neither mode's outcome, so a caller cannot tell a truncated WAL from a busy one; that
-        was already true of a TRUNCATE that found a reader."""
+        finds no copy running, which may be the next retention pass or the next snapshot.
+
+        Returns ``True`` only when a TRUNCATE ran and SQLite reported it not busy, so the ``-wal``
+        file is empty (vault BACKLOG #2619). ``False`` means it was left as it was: a TRUNCATE gave
+        up after the busy timeout because a reader still held the WAL, or the PASSIVE above ran. The
+        PRAGMA's first column is that busy flag; the caller decides what to say about it."""
         async with _writer_guard(self._db, self._lock):
-            await self._commit()
-            if self._snapshot_copies:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            else:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            await cur.fetchall()
-            await cur.close()
+            return await self._checkpoint_wal_locked()
+
+    async def _checkpoint_wal_locked(self) -> bool:
+        """The checkpoint :meth:`wal_checkpoint` and :meth:`snapshot_to` share, run under the writer
+        guard they hold. PASSIVE while a snapshot copy runs, else TRUNCATE; the return is
+        :meth:`wal_checkpoint`'s."""
+        await self._commit()
+        passive = bool(self._snapshot_copies)
+        mode = "PASSIVE" if passive else "TRUNCATE"
+        cur = await self._db.execute(f"PRAGMA wal_checkpoint({mode})")
+        # One row of (busy, log frames, checkpointed frames). No row is not a clean result.
+        row = await cur.fetchone()
+        await cur.close()
+        return not passive and row is not None and row[0] == 0
 
     async def vacuum(self) -> None:
         """Rebuild the database file to reclaim space freed by purges (SQLite ``VACUUM``). VACUUM holds
@@ -14273,22 +14336,15 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             # Fold the committed WAL frames into the main DB and truncate the -wal file. The copy's
             # consistency does not depend on this, since its read transaction sees the WAL either way.
-            # It stays for the WAL's sake: on a default config (no retention checkpoint cadence) this is
-            # the one regular TRUNCATE that shrinks the PHI-bearing -wal. It waits only for readers
-            # already in a transaction, as retention's does (BACKLOG #1937). During another snapshot's
-            # copy it would wait out the busy timeout, so it defers to the same PASSIVE rule.
-            # The guard's entry rollback leaves no open transaction to block the checkpoint, so this
-            # commit commits nothing; taken bare, it made another block's abandoned work durable
-            # (BACKLOG #1803). It stays because it is one more call on the connection's worker, which
-            # releases the result aiosqlite kept from the previous call. The PRAGMA's cursor is drained
-            # and closed so it leaves no statement in progress for the next writer.
-            await self._commit()
-            if self._snapshot_copies:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            else:
-                cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            await cur.fetchall()
-            await cur.close()
+            # It stays for the WAL's sake: with the retention cadence off, this is the one regular
+            # TRUNCATE that shrinks the PHI-bearing -wal. It waits only for readers already in a
+            # transaction, as retention's does (BACKLOG #1937). During another snapshot's copy it
+            # would wait out the busy timeout, so it defers to the same PASSIVE rule. It is the same
+            # checkpoint as `wal_checkpoint`, including the bare commit (BACKLOG #1803) and the
+            # closed cursor. Its result is not reported here, because the copy is correct either way.
+            # With the retention cadence on, a pass that cannot truncate logs it (vault BACKLOG
+            # #2619). With the cadence off, nothing reports an untruncated -wal file.
+            await self._checkpoint_wal_locked()
         # The copy, OFF the writer lock (BACKLOG #1937). Counted before the read transaction can open,
         # so a retention checkpoint that lands during the copy runs PASSIVE (see `wal_checkpoint`).
         self._snapshot_copies += 1

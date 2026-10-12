@@ -1993,7 +1993,16 @@ _REMINDER_MARK_PAGE: Final = 50
 #: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
 SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
 SelfTargetOp = Literal[
-    "password_reset", "mfa_reset", "federated_bind", "federated_unbind", "disable", "delete"
+    "password_reset",
+    "mfa_reset",
+    "federated_bind",
+    "federated_unbind",
+    "disable",
+    "delete",
+    # BACKLOG #1149 (ASVS 7.5.2): each of these revokes the target's sessions on the login window.
+    "revoke_sessions",
+    "set_roles",
+    "channel_scope",
 ]
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
@@ -2882,12 +2891,18 @@ class AuthService:
         Raises :class:`FirstAdministratorRefused` on every declined case, with operator-facing text.
         """
         username = username.strip()
-        # Normalized ONCE, so the three later readers cannot disagree about what "an address was
-        # supplied" means: a whitespace-only --email must not reach `users.email` untrimmed on the
-        # create, and must not audit as `"notified": true`.
-        notify_email = (notify_email or "").strip() or None
         if not username:
             raise FirstAdministratorRefused("a username is required and must not be blank")
+        # BACKLOG #1138: a given address is checked as `create_local_user` checks one, so a blank or
+        # malformed address is refused rather than read as none. Checked ONCE, so the three later
+        # readers (`users.email`, `notify_email` and the audit's `notified`) cannot disagree.
+        if notify_email is not None:
+            try:
+                notify_email = _require_single_mailbox(notify_email)
+            except InvalidNotifyEmail as exc:
+                raise FirstAdministratorRefused(
+                    f"the notification address was refused: {exc}"
+                ) from exc
         if await self.has_enabled_administrator():
             raise FirstAdministratorRefused(
                 "this store already has an enabled Administrator, so there is nothing to provision "
@@ -3094,8 +3109,9 @@ class AuthService:
         BACKLOG #2288: a row that already holds a notification address is completed only when
         ``notify_email`` (``--email``) is given. Kept silently, that address would receive every
         security notice for the sole Administrator, and it may be an earlier holder's. Giving the
-        same address again is allowed: it is then the operator's stated choice. A blank
-        ``notify_email`` counts as none, and so does a blank stored address. The text never prints
+        same address again is allowed: it is then the operator's stated choice. Both callers refuse
+        a blank ``notify_email`` before this runs (BACKLOG #1138); a blank stored address counts as
+        none. The text never prints
         the stored address, which may be somebody else's."""
         if existing.auth_provider != AuthProvider.LOCAL.value:
             return (
@@ -3126,8 +3142,14 @@ class AuthService:
         command will not complete. ``provision-admin`` asks it first, so an operator is never shown
         an authenticator key for an account the store then refuses. The service still refuses on its
         own; this is the courtesy, that is the control. ``notify_email`` is the ``--email`` value,
-        required here so the pre-check cannot disagree with the write about BACKLOG #2288."""
+        required here so the pre-check cannot disagree with the write about BACKLOG #2288, and
+        checked here as the write checks it (BACKLOG #1138)."""
         name = username.strip()
+        if notify_email is not None:
+            try:
+                notify_email = _require_single_mailbox(notify_email)
+            except InvalidNotifyEmail as exc:
+                return f"the notification address was refused: {exc}"
         if await self.has_enabled_administrator():
             return (
                 "this store already has an enabled Administrator, so there is nothing to provision "
@@ -7818,9 +7840,10 @@ class AuthService:
 
         BACKLOG #1139 (ASVS 6.3.7). An account with no ``notify_email`` is told nothing out of band
         about a change to its authentication details, because the notifier drops a notice with no
-        address. At least three paths give birth to such an account: ``create_local_user`` with no
-        email, ``provision-admin`` with no ``--email``, and a directory sign-in whose directory returns
-        no ``mail``. (A fourth, the first-run bootstrap administrator, was retired by ADR 0183.) So the
+        address. At least two paths give birth to such an account: ``create_local_user`` with no
+        email, and a directory sign-in whose directory returns no ``mail``. (``provision-admin`` with
+        no ``--email`` was a third until BACKLOG #1138 made the flag required, and the first-run
+        bootstrap administrator a fourth until ADR 0183 retired it.) So the
         first sign-in sets one, in the shape of the ``must_change_password`` confinement.
 
         **ONLY WHEN A SECURITY-NOTICE CHANNEL IS WIRED**, which is ``[auth].notify_security_events``
@@ -10808,7 +10831,11 @@ class AuthService:
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
         """Replace an account's roles. Raises :class:`LastAdministratorRefused`, having written
         nothing, when that would take Administrator from the last enabled administrator; the check
-        and the write are one store transaction (vault BACKLOG #2779). Self-target is allowed."""
+        and the write are one store transaction (vault BACKLOG #2779).
+
+        This method does not refuse a self-target; ``PUT /users/{id}/roles`` does (BACKLOG #1149),
+        so behind that route the last-administrator check is a second line, as on disable and
+        delete."""
         user = await self._store.get_user(user_id)  # for the notification address
         if not await self._store.remove_unless_last_admin(
             user_id,
@@ -11682,8 +11709,9 @@ class AuthService:
         BACKLOG #1020. The PHI startup gate computes notification readiness from the SMTP transport
         alone (``notify_security_events`` + ``email_smtp_host`` + ``email_from``), which answers
         *"is a transport configured"* and never *"can the account that matters actually receive"*.
-        Those come apart whenever an Administrator has no address -- ``provision-admin`` without
-        ``--email``, or an account made in the web console without one -- and
+        Those come apart whenever an Administrator has no address -- a directory account granted the
+        role with none, or a store written before ``provision-admin`` required ``--email`` (BACKLOG
+        #1138) -- and
         ``SecurityEventNotifier.notify`` starts ``if not event.email: return``, so every notice about
         the most privileged account on the instance no-ops while the gate reports a healthy channel.
 

@@ -87,7 +87,15 @@ _ARMS: list[tuple[str, Callable[[Path, Path], list[str]]]] = [
     ),
     (
         "provision-admin",
-        lambda cfg, tmp: ["provision-admin", "--username", "a", "--service-config", str(cfg)],
+        lambda cfg, tmp: [
+            "provision-admin",
+            "--username",
+            "a",
+            "--email",
+            "ops@example.invalid",
+            "--service-config",
+            str(cfg),
+        ],
     ),
     ("rotate-key", lambda cfg, tmp: ["rotate-key", "--service-config", str(cfg)]),
     ("audit-verify", lambda cfg, tmp: ["audit-verify", "--service-config", str(cfg)]),

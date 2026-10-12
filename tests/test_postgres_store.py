@@ -35,7 +35,7 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
-from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
@@ -3392,13 +3392,20 @@ async def test_schema_fastpath_skips_and_reruns(store) -> None:
 
 
 async def test_mark_failed_returns_reschedule_time(store) -> None:
-    """WS-C: the runner arms the per-lane retry wake on mark_failed's returned next_attempt_at —
-    rescheduled → the epoch time; dead-lettered/missing → None (parity with the SQLite backend)."""
+    """WS-C: the runner arms the per-lane retry wake on the ``retry_at`` mark_failed returns:
+    the epoch time when rescheduled, and a missing row writes nothing (parity with SQLite)."""
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     item = (await store.claim_ready(now=200.0))[0]
-    next_at = await store.mark_failed(item.id, "transient", RetryPolicy(), now=1000.0)
+    next_at = (await store.mark_failed(item.id, "transient", RetryPolicy(), now=1000.0)).retry_at
     assert next_at == 1005.0  # attempts=1 → backoff 5.0 * 2**0
-    assert await store.mark_failed("no-such-row", "x", RetryPolicy(), now=1000.0) is None
+    assert (await store.mark_failed("no-such-row", "x", RetryPolicy(), now=1000.0)) == FailOutcome()
+
+
+async def test_mark_failed_and_mark_batch_failed_say_what_they_did(store) -> None:
+    """Vault BACKLOG #3211 on this backend: each call returns a FailOutcome read inside its write."""
+    from tests._fail_outcome_contract import assert_fail_outcomes
+
+    await assert_fail_outcomes(store)
 
 
 # --- #149 Phase 4: streaming attachment substrate parity (ADR 0105) ------------------------------

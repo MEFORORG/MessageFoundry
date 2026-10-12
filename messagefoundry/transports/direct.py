@@ -172,6 +172,8 @@ _MIN_RSA_BITS = 2048
 #: EC curves admitted for Direct S/MIME material. All three are at or above 128-bit security, so
 #: unlike the RSA floor this list needs no "does not meet the verb" caveat. Named positively so a
 #: curve nobody considered is excluded by construction rather than admitted by an absent deny-rule.
+#: ``parsing/xml/signature.py`` holds a copy for its XML-DSig key floor (BACKLOG #1166), and a test
+#: pins the two equal. A change here changes that floor too, so it needs the same ruling.
 _APPROVED_EC_CURVES = frozenset({"secp256r1", "secp384r1", "secp521r1"})
 
 
