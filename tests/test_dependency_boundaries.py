@@ -1517,12 +1517,16 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 #
 # The second parses each file and reads its imports. It sees at least the shapes the pattern does
 # not spell: a relative import such as `from ..anon import Keyer`, `import os, messagefoundry.anon`,
-# a `from messagefoundry import (` wrapped over several lines, two spaces after `from`, and an
-# `importlib.import_module` or `__import__` call given the name as a literal. It cannot see a
-# docstring or a comment, which is why the text search stays.
+# a `from messagefoundry import (` wrapped over several lines, two spaces after `from`, an
+# `importlib.import_module` call given the name as a literal, and an absolute `__import__` call
+# given a literal name or `fromlist`. It cannot see a docstring or a comment, which is why the
+# text search stays.
 #
 # WHAT NEITHER SEES. At least an import whose name is built at run time, an `exec` of source text,
-# and any file outside the walked trees.
+# a relative `__import__`, any file outside the walked trees, and a file outside the package that
+# never spells `anon` as a whole word. The parse reads only files that do, for speed, so a name
+# split across two adjacent literals, written with an escape, or in letters the parser folds to
+# `anon` passes. These searches hold the tree against an accident, not against an evasion.
 #
 # A REAL import is a different matter from a line that only looks like one. ADR 0030 section 1
 # allows the harness to import the package directly, and nothing does yet. A real import would end
@@ -1552,8 +1556,9 @@ _ANON_IMPORT = re.compile(
 _ANON_MODULE = "messagefoundry.anon"
 _ANON_PACKAGE_DIR = PurePosixPath(*_ANON_MODULE.split("."))
 
-#: A file outside the package can import it only by naming ``anon`` as a whole word, whether as
-#: ``messagefoundry.anon``, ``..anon`` or ``import anon``. So a file without it is not parsed.
+#: Every import shape the parse is named to see spells ``anon`` as a whole word, whether as
+#: ``messagefoundry.anon``, ``..anon`` or ``import anon``. So a file outside the package without
+#: it is not parsed. The section comment above says what that lets through.
 _ANON_WORD = re.compile(r"\banon\b")
 
 #: One line per shape the pattern exists to catch. The test searches these first, so a pattern
@@ -1642,31 +1647,62 @@ def _parsed_anon_imports(rel: PurePosixPath, source: str) -> list[str]:
     resolved against the file's own package. A call to ``import_module`` or ``__import__`` counts
     when its name is a literal, resolved against a literal ``package`` if it is relative.
     """
-    tree = ast.parse(source)
+    try:
+        tree = ast.parse(source.removeprefix("\ufeff"))
+    except SyntaxError as exc:
+        # Named here, or every anon test fails on one traceback that names no file.
+        raise AssertionError(f"{rel} does not parse, so the anon search cannot read it") from exc
     named = _modules_imported_by(tree, ".".join(rel.parent.parts))
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and node.args):
+        if not isinstance(node, ast.Call):
             continue
         match node.func:
             case ast.Attribute(attr=callee) | ast.Name(id=callee):
                 pass
             case _:
                 continue
-        first = node.args[0]
-        if callee not in ("import_module", "__import__") or not (
-            isinstance(first, ast.Constant) and isinstance(first.value, str)
-        ):
+        if callee not in ("import_module", "__import__"):
             continue
-        name: str = first.value
+        name = _literal_argument(node, 0, "name")
+        if not isinstance(name, str):
+            continue
+        if callee == "__import__":
+            # Only an absolute one: a relative `__import__` resolves against its caller's
+            # globals, which a parse cannot read.
+            if _literal_argument(node, 4, "level") in (None, 0):
+                named.add(name)
+                fromlist = _literal_argument(node, 3, "fromlist")
+                if isinstance(fromlist, (list, tuple)):
+                    named.update(f"{name}.{item}" for item in fromlist if isinstance(item, str))
+            continue
         if name.startswith("."):
-            given = node.args[1:2] or [k.value for k in node.keywords if k.arg == "package"]
-            if not (
-                given and isinstance(given[0], ast.Constant) and isinstance(given[0].value, str)
-            ):
+            package = _literal_argument(node, 1, "package")
+            if not isinstance(package, str):
                 continue
-            name = importlib.util.resolve_name(name, given[0].value)
+            try:
+                name = importlib.util.resolve_name(name, package)
+            except ImportError:
+                # It climbs past its package, so it imports nothing at run time either.
+                continue
         named.add(name)
     return sorted(m for m in named if _is_forbidden(m, (_ANON_MODULE,)))
+
+
+def _literal_argument(call: ast.Call, position: int, keyword: str) -> object:
+    """The literal value ``call`` passes at ``position`` or as ``keyword``, else ``None``.
+
+    A list or tuple of literals comes back as a list. Anything built at run time is ``None``.
+    """
+    given = call.args[position : position + 1] or [
+        k.value for k in call.keywords if k.arg == keyword
+    ]
+    if not given:
+        return None
+    try:
+        value = ast.literal_eval(given[0])
+    except ValueError:
+        return None
+    return list(value) if isinstance(value, tuple) else value
 
 
 def _anon_search(root: Path) -> _AnonSearch:
@@ -1772,7 +1808,8 @@ def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
     # `harness/` and `messagefoundry/`, which the walk reads raw. Under `scripts/` the walk blanks
     # strings, so the docstring there is not a hit, while a real import there still is. Each
     # parse-only plant is a shape the pattern does not spell, so the text search must stay silent
-    # on it. The package's own files are text-searched and not parsed for a violation.
+    # on it. The package's own files are text-searched and not parsed for a violation. The near
+    # names, the name built at run time and the one that climbs past its package must stay silent.
     plants = {
         "harness/reconcile/capture.py": _ANON_DOCSTRING_PLANT,
         "messagefoundry/x.py": _ANON_DOCSTRING_PLANT,
@@ -1780,8 +1817,14 @@ def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
         "scripts/live.py": "from messagefoundry.anon import Keyer\n",
         "harness/clean.py": "import json\n",
         "harness/joined.py": "import os, messagefoundry.anon\n",
+        "harness/bom.py": "﻿import os, messagefoundry.anon\n",
         "harness/spaced.py": "from  messagefoundry.anon import Keyer\n",
         "harness/call_rel.py": 'import_module(".anon", package="messagefoundry")\n',
+        "harness/call_kw.py": 'importlib.import_module(name="messagefoundry.anon")\n',
+        "harness/call_from.py": '__import__("messagefoundry", fromlist=["anon"])\n',
+        "harness/call_far.py": 'import_module("...anon", package="messagefoundry")\n',
+        "harness/near.py": "from messagefoundry import anonymize\nimport messagefoundry.anonymous\n",
+        "harness/built.py": 'import_module("messagefoundry." + "anon")\n',
         "messagefoundry/sub/rel.py": "from ..anon import Keyer\n",
         "messagefoundry/call.py": 'importlib.import_module("messagefoundry.anon.leak")\n',
         "scripts/wrapped.py": "from messagefoundry import (\n    parsing,\n    anon,\n)\n",
@@ -1805,6 +1848,9 @@ def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
         ),
         ("messagefoundry/anon/__init__.py:3",),
         (
+            "harness/bom.py: messagefoundry.anon",
+            "harness/call_from.py: messagefoundry.anon",
+            "harness/call_kw.py: messagefoundry.anon",
             "harness/call_rel.py: messagefoundry.anon",
             "harness/joined.py: messagefoundry.anon",
             "harness/spaced.py: messagefoundry.anon",
@@ -1814,7 +1860,7 @@ def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
             "scripts/wrapped.py: messagefoundry.anon",
         ),
         1,
-        {"harness": 5, "messagefoundry": 4, "scripts": 3},
+        {"harness": 11, "messagefoundry": 4, "scripts": 3},
     )
 
 
