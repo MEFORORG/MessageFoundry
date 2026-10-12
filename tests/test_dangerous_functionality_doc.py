@@ -39,6 +39,15 @@ comes from, and no check here reads that.
 Section 9's claim about which extension file builds markup with ``innerHTML`` is pinned to a file
 that exists and does.
 
+Section 11 holds the test harness, ``harness/**``, to its own lists (BACKLOG #2883). The same
+detectors read it: its process-start table and form column, the modules that import by name or
+call the engine's config loader, and the parse sites the six patterns find. It must import no
+``ctypes`` and no archive library. One detector is the harness's own: an assignment to an attribute
+of something a module imported, which is how its provision path replaces the shipped command's
+terminal read. Each such assignment is registered in ``_REVIEWED_HARNESS_SWAPS`` and named on the
+page. That detector sees a plain assignment and a ``setattr`` on an imported name, at least; it
+cannot see a swap through a second name, ``unittest.mock`` or ``importlib``.
+
 The start detector covers at least the names in ``_SUBPROCESS_FUNCS``, ``_START_FORMS``,
 ``_OS_EXEC_RE`` and ``_ATTRIBUTE_STARTS``. Its known limits: it cannot see a start hidden behind
 ``getattr`` with a computed name, or one made inside a third-party library; it takes a ``subprocess``
@@ -354,8 +363,13 @@ def _ctypes_listed(text: str) -> set[str]:
 
 
 def _start_rows(text: str) -> dict[str, set[str]]:
+    return _start_rows_in(_section(text, 4))
+
+
+def _start_rows_in(region: str) -> dict[str, set[str]]:
+    """Each table row in ``region`` whose first cell is one module, and the forms in its last."""
     rows: dict[str, set[str]] = {}
-    for line in _section(text, 4).splitlines():
+    for line in region.splitlines():
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         module = re.fullmatch(r"`([\w/]+\.py)`", cells[0]) if line.startswith("|") else None
         if module is None:
@@ -388,9 +402,11 @@ def _ctypes_drift(text: str, live: set[str]) -> list[str]:
     return problems
 
 
-def _start_drift(text: str, live: Mapping[str, frozenset[str]]) -> list[str]:
+def _start_row_drift(
+    text: str, rows: Mapping[str, set[str]], live: Mapping[str, frozenset[str]]
+) -> list[str]:
+    """Rows against the code, module by module and form by form. Section 4 defines every form."""
     problems: list[str] = []
-    rows = _start_rows(text)
     for module in sorted(set(rows) | set(live)):
         page, code = rows.get(module), live.get(module)
         if page is None:
@@ -401,7 +417,14 @@ def _start_drift(text: str, live: Mapping[str, frozenset[str]]) -> list[str]:
             problems.append(f"{module}: the row says {sorted(page)}, the code uses {sorted(code)}")
     undefined = {form for forms in rows.values() for form in forms} - _defined_forms(text)
     if undefined:
-        problems.append(f"form(s) used in the table but not defined below it: {sorted(undefined)}")
+        problems.append(
+            f"form(s) used in a table but not defined in section 4: {sorted(undefined)}"
+        )
+    return problems
+
+
+def _start_drift(text: str, live: Mapping[str, frozenset[str]]) -> list[str]:
+    problems = _start_row_drift(text, _start_rows(text), live)
     for where, count in (
         ("section 4", _section_count(_section(text, 4), "start a process")),
         ("the short-version row 4", _short_table_count(text, 4)),
@@ -1166,7 +1189,7 @@ def _parser_scan_sources() -> dict[str, str]:
 def _table_units(section: str, header: str) -> set[str]:
     """Every module, package or file the table under ``header`` names in its last cell."""
     lines = section.splitlines()
-    assert header in lines, f"section 7 has no table headed {header!r}"
+    assert header in lines, f"the section has no table headed {header!r}"
     units: set[str] = set()
     for line in lines[lines.index(header) + 2 :]:
         if not line.startswith("|"):
@@ -1593,3 +1616,285 @@ def test_extension_parser_table_drift_is_reported() -> None:
     # A pattern the page states that the detector does not use, or one it drops.
     for old, new in (("`tls` or `dgram`", "`tls`"), ("`charAt`, ", "`charAt`, `at`, ")):
         assert _ts_page_patterns(_replace_once(text, old, new)) != _TS_DETECTOR_PATTERNS, new
+
+
+# --- section 11: the test harness (BACKLOG #2883) --------------------------------------------------
+
+_HARNESS = _ROOT / "harness"
+
+#: The bold leads that open each harness list in section 11. A list runs to the next bold lead.
+_HARNESS_STARTS_LEAD = "**Process starts.**"
+_HARNESS_IMPORTS_LEAD = "**Import by name.**"
+_HARNESS_LOADS_LEAD = "**Config modules.**"
+_HARNESS_SWAP_LEAD = "**A run-time function swap.**"
+_HARNESS_PARSE_HEADER = "| What it reads | Where it comes from | Harness modules |"
+
+#: The engine's config loader, which executes every module in the folder it is given (section 2).
+_CONFIG_LOADERS = frozenset({"load_config"})
+
+#: Reviewed assignments to an attribute of something a harness module imported, by module, each as
+#: the dotted name assigned. Section 11's swap paragraph names each module and each attribute.
+_REVIEWED_HARNESS_SWAPS: dict[str, tuple[str, ...]] = {
+    # ``_provision_here`` replaces the terminal read of the shipped ``provision-admin`` command with
+    # a password the rig holds, in a process started for that one job.
+    "load/rigadmin.py": ("messagefoundry.__main__._read_new_password",),
+}
+
+
+@functools.cache
+def _harness_sources() -> dict[str, str]:
+    """The harness's modules, keyed under ``harness/`` as section 11 names them."""
+    return _python_under(_HARNESS)
+
+
+@functools.cache
+def _attribute_swaps(source: str) -> tuple[str, ...]:
+    """Each dotted name one module assigns to, where the name starts at something it imported:
+    ``cli.read = fake`` after ``import pkg.cli as cli``, or ``setattr(cli, "read", fake)``.
+
+    It sees at least those two forms. It cannot see a swap made through a second name for the
+    module, through ``unittest.mock``, or on a module fetched by ``importlib``. A subscript write
+    such as ``os.environ["X"] = v`` is not an attribute assignment and does not count."""
+    tree = _parse(source)
+    aliases = _aliases(tree)
+    swaps: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if _called_name(node) == "setattr" and isinstance(node.func, ast.Name) and node.args:
+                owner = _dotted(node.args[0], aliases)
+                name = node.args[1] if len(node.args) > 1 else None
+                literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
+                if owner is not None and literal:
+                    swaps.append(f"{owner}.{ast.literal_eval(node.args[1])}")
+                elif owner is not None:
+                    swaps.append(f"{owner}.<computed>")
+            continue
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            for part in ast.walk(target):
+                # ``a.b.c = x`` stores to ``a.b.c`` only; the inner ``a.b`` is a load.
+                if isinstance(part, ast.Attribute) and isinstance(part.ctx, ast.Store):
+                    dotted = _dotted(part, aliases)
+                    if dotted is not None:
+                        swaps.append(dotted)
+    return tuple(swaps)
+
+
+def _harness_swaps(sources: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
+    return {rel: swaps for rel, source in sources.items() if (swaps := _attribute_swaps(source))}
+
+
+def _modules_calling(sources: Mapping[str, str], names: frozenset[str]) -> set[str]:
+    """Modules that call a function with one of ``names``, bare or as an attribute."""
+    return {
+        rel
+        for rel, source in sources.items()
+        if any(name in source for name in names)
+        and any(
+            isinstance(node, ast.Call) and _called_name(node) in names
+            for node in ast.walk(_parse(source))
+        )
+    }
+
+
+def _harness_parse_sites(sources: Mapping[str, str]) -> set[str]:
+    return {rel for rel, source in sources.items() if _is_parse_site(source)}
+
+
+def _harness_region(text: str, lead: str) -> str:
+    """Section 11 from ``lead`` to the next paragraph that opens with a bold lead."""
+    region = _section(text, 11).partition(lead)[2]
+    assert region, f"section 11 has no {lead!r} paragraph"
+    return re.split(r"^\*\*", region, maxsplit=1, flags=re.M)[0]
+
+
+def _harness_count(region: str, lead: str) -> int:
+    match = re.match(r"\s*(\d+) harness modules?\b", region)
+    assert match is not None, f"section 11's {lead!r} paragraph does not open with '<N> harness'"
+    return int(match.group(1))
+
+
+def _harness_bullets(region: str) -> set[str]:
+    """The module each bullet in ``region`` opens with."""
+    return {
+        first.group(1)
+        for line in region.splitlines()
+        if line.startswith("- ") and (first := _TICKED_PY_RE.match(line, 2))
+    }
+
+
+def _harness_list_drift(text: str, lead: str, live: set[str]) -> list[str]:
+    region = _harness_region(text, lead)
+    problems = _set_drift(f"section 11's {lead} list", _harness_bullets(region), live)
+    if (count := _harness_count(region, lead)) != len(live):
+        problems.append(f"section 11's {lead} paragraph says {count}; the code has {len(live)}")
+    return problems
+
+
+def _harness_start_drift(text: str, live: Mapping[str, frozenset[str]]) -> list[str]:
+    region = _harness_region(text, _HARNESS_STARTS_LEAD)
+    problems = _start_row_drift(text, _start_rows_in(region), live)
+    if (count := _harness_count(region, _HARNESS_STARTS_LEAD)) != len(live):
+        problems.append(
+            f"section 11 says {count} modules start a process; the code has {len(live)}"
+        )
+    return problems
+
+
+def _harness_swap_drift(text: str, live: Mapping[str, tuple[str, ...]]) -> list[str]:
+    problems: list[str] = []
+    if live != _REVIEWED_HARNESS_SWAPS:
+        problems.append(
+            f"harness assignments to an imported module's attribute changed: {dict(live)}. Review "
+            "each new one, register it in _REVIEWED_HARNESS_SWAPS and name it in section 11"
+        )
+    region = _harness_region(text, _HARNESS_SWAP_LEAD)
+    for rel, swaps in _REVIEWED_HARNESS_SWAPS.items():
+        names = [rel, *(swap.rpartition(".")[2] for swap in swaps)]
+        problems += [
+            f"section 11's swap paragraph does not name `{name}`"
+            for name in names
+            if f"`{name}`" not in region
+        ]
+    return problems
+
+
+def _harness_parse_drift(text: str, live: set[str]) -> list[str]:
+    return _set_drift(
+        "section 11's parser table", _table_units(_section(text, 11), _HARNESS_PARSE_HEADER), live
+    )
+
+
+def _harness_absent_problems(sources: Mapping[str, str]) -> list[str]:
+    """Section 11 says the harness imports no ``ctypes`` and no archive library."""
+    problems = [f"harness/{rel} imports ctypes" for rel in sorted(_ctypes_modules(sources))]
+    return problems + [
+        f"harness/{rel} imports an archive library" for rel in sorted(_archive_modules(sources))
+    ]
+
+
+def _harness_drift(text: str, sources: Mapping[str, str]) -> list[str]:
+    """Every way section 11 can disagree with ``harness/``."""
+    return [
+        *_harness_start_drift(text, _start_sites(sources)),
+        *_harness_list_drift(
+            text, _HARNESS_IMPORTS_LEAD, _modules_calling(sources, _DYNAMIC_IMPORTS)
+        ),
+        *_harness_list_drift(text, _HARNESS_LOADS_LEAD, _modules_calling(sources, _CONFIG_LOADERS)),
+        *_harness_swap_drift(text, _harness_swaps(sources)),
+        *_harness_parse_drift(text, _harness_parse_sites(sources)),
+        *_harness_absent_problems(sources),
+    ]
+
+
+def test_the_harness_section_matches_the_code() -> None:
+    _assert_no_drift(11, _harness_drift(_doc_text(), _harness_sources()))
+
+
+_SWAP_CONTROLS: list[tuple[str, tuple[str, ...]]] = [
+    ("import pkg.cli as cli\ncli.read = fake\n", ("pkg.cli.read",)),
+    ("def f():\n    import pkg.cli as cli\n    cli.read = fake\n", ("pkg.cli.read",)),
+    ("from pkg import cli\ncli.read = fake\n", ("pkg.cli.read",)),
+    ("import sys\nsys.stdout = sys.stderr\n", ("sys.stdout",)),
+    ("from pkg.m import Thing\nThing.write = fake\n", ("pkg.m.Thing.write",)),
+    ("import a\na.b.c = x\n", ("a.b.c",)),
+    ("import a\nold, a.read = a.read, fake\n", ("a.read",)),
+    ("import a\na.count += 1\n", ("a.count",)),
+    ("import a\nsetattr(a, 'read', fake)\n", ("a.read",)),
+    ("import a\nsetattr(a, name, fake)\n", ("a.<computed>",)),
+]
+
+
+@pytest.mark.parametrize(("source", "expected"), _SWAP_CONTROLS)
+def test_the_swap_detector_fires_on_each_form(source: str, expected: tuple[str, ...]) -> None:
+    assert _attribute_swaps(source) == expected
+
+
+def test_the_harness_scans_fire() -> None:
+    """Each harness scan must find something on the real tree, and must stay quiet on a mention."""
+    sources = _harness_sources()
+    assert "load/rigadmin.py" in sources, "the harness is not scanned"
+    assert _start_sites(sources), "no harness process start found: the scan is dead"
+    assert _modules_calling(sources, _DYNAMIC_IMPORTS), "no harness import by name found"
+    assert _modules_calling(sources, _CONFIG_LOADERS), "no harness config load found"
+    assert _harness_swaps(sources), "no harness attribute swap found: the scan is dead"
+    assert _harness_parse_sites(sources), "no harness parse site found: the scan is dead"
+    quiet = (
+        '"""cli.read = fake, importlib.import_module(name) and load_config(path)."""\n'
+        "import os\n"
+        "import pkg.cli as cli\n"
+        "# cli.read = fake\n"
+        "os.environ['X'] = 'y'\n"
+        "value = cli.read\n"
+        "self.read = fake\n"
+        "local = object()\n"
+        "local.read = fake\n"
+        "setattr(self, 'read', fake)\n"
+    )
+    assert _attribute_swaps(quiet) == ()
+    assert not _modules_calling({"a.py": quiet}, _DYNAMIC_IMPORTS | _CONFIG_LOADERS)
+    assert _modules_calling({"a.py": "reg = load_config(folder)\n"}, _CONFIG_LOADERS) == {"a.py"}
+
+
+def test_harness_drift_is_reported() -> None:
+    """Break the tree and the page in memory, one way at a time, and each break must be reported."""
+    text = _doc_text()
+    sources = _harness_sources()
+    assert not _harness_drift(text, sources)
+
+    # A new dangerous site in a harness module the section does not list for that class.
+    for planted in (
+        "import subprocess\nsubprocess.run(['x'])\n",
+        "import ctypes\n",
+        "import zipfile\n",
+        "import importlib\nimportlib.import_module(name)\n",
+        "from messagefoundry.config.wiring import load_config\nload_config(folder)\n",
+        "import messagefoundry.__main__ as cli\ncli.main = fake\n",
+        "import json\njson.loads(raw)\n",
+    ):
+        assert _harness_drift(text, {**sources, "new_tool.py": planted}), planted
+    # A listed start that changes form, and a second swap in the module that already has one.
+    grown = {**sources}
+    grown["load/failover.py"] += "\nimport subprocess\nsubprocess.run('x', shell=True)\n"
+    assert _harness_drift(text, grown)
+    grown = {**sources}
+    grown["load/rigadmin.py"] += "\nimport getpass\ngetpass.getpass = fake\n"
+    assert _harness_drift(text, grown)
+    # The reviewed swap removed from the code leaves the page naming a swap that is gone.
+    swap = "cli._read_new_password = _held_password"
+    assert sources["load/rigadmin.py"].count(swap) == 1, "fixture drifted from load/rigadmin.py"
+    gone = {**sources, "load/rigadmin.py": sources["load/rigadmin.py"].replace(swap, "pass")}
+    assert _harness_drift(text, gone)
+
+    # The page, one break at a time: a dropped row or bullet, a wrong count, a wrong form, a name
+    # the swap paragraph loses, and a module dropped from or added to the parser table.
+    n_starts = len(_start_sites(sources))
+    for broken in (
+        _drop_line(text, "| `load/connscale/probe.py` |"),
+        _drop_line(text, "- `acceptance/probes.py` imports"),
+        _drop_line(text, "- `load/shardcert.py` loads"),
+        _replace_once(
+            text, f"{n_starts} harness modules start", f"{n_starts + 1} harness modules start"
+        ),
+        _replace_once(text, "2 harness modules import", "3 harness modules import"),
+        _replace_once(
+            text,
+            "| Stamping a load report with the commit it ran at | argument list |",
+            "| Stamping a load report with the commit it ran at | shell string |",
+        ),
+        _replace_once(text, "replaces its `_read_new_password`", "replaces its password read"),
+        _replace_once(text, "`load/failover.py`, `load/rigadmin.py` |", "`load/failover.py` |"),
+        _replace_once(
+            text,
+            "`load/failover.py`, `load/rigadmin.py` |",
+            "`load/failover.py`, `load/rigadmin.py`, `monitor.py` |",
+        ),
+    ):
+        assert _harness_drift(broken, sources)
+    with pytest.raises(AssertionError):
+        _harness_drift(_replace_once(text, _HARNESS_PARSE_HEADER, "| Reads | Modules |"), sources)
