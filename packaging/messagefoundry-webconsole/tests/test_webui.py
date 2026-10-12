@@ -8238,6 +8238,32 @@ async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) 
     assert row["client"] == "192.0.2.46"
 
 
+async def test_a_forged_state_callback_keeps_the_flow_and_its_cookie(engine: Engine) -> None:
+    """BACKLOG #3198: a callback with a wrong ``state`` consumes nothing. Any page can send the
+    browser here with the SameSite=Lax flow cookie, so clearing that cookie, or popping the flow,
+    would let a forged callback cancel the sign-in in flight. The flow and the cookie both wait for
+    the real IdP return."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        flow_id = c.cookies.get("mf_oidc_flow")
+        assert flow_id
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "authcode", "state": "forged-" + state},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/login?e=flow_binding_missing"
+        assert "mf_oidc_flow" not in r.headers.get("set-cookie", "")
+        assert c.cookies.get("mf_oidc_flow") == flow_id
+        assert service._oidc_flows is not None
+        assert service._oidc_flows.peek(flow_id) is not None
+        assert any("state_mismatch" in d for d in await _oidc_audits(engine))
+
+
 async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) -> None:
     """The IdP redirect back is LEGITIMATELY Sec-Fetch-Site: cross-site. If a same-origin assertion
     were added here every real login would 403 while every hermetic test still passed."""

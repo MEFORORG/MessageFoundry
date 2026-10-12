@@ -89,6 +89,10 @@ this line.**
 
 ### Security
 
+- **A forged federated sign-in callback no longer cancels the real one.** A callback to
+  `/ui/oidc/callback` whose `state` does not match now keeps the flow cookie, so the real IdP
+  return can still finish the sign-in. Any page can send a browser to that URL with the cookie,
+  and clearing it ended the sign-in in flight. No seam change. (vault BACKLOG #3198)
 - **Changing a second factor now offers to sign out your other sessions.** Confirming a TOTP
   enrolment, turning TOTP off, adding a passkey and removing one each end with an offer to end
   every other session and keep this one (ASVS 7.4.3). The enrolment confirm shows it below the

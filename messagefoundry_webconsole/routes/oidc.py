@@ -200,10 +200,12 @@ _REASON_TO_CODE = {
 }
 
 
-def _fail(request: Request, code: str) -> Response:
-    """A terminal callback failure: 303 to the login page AND clear the single-use flow cookie."""
+def _fail(request: Request, code: str, *, keep_flow: bool = False) -> Response:
+    """A callback failure: 303 to the login page AND, unless ``keep_flow``, clear the single-use
+    flow cookie. ``keep_flow`` is for a refusal that consumed nothing (BACKLOG #3198)."""
     resp = RedirectResponse(f"/ui/login?e={code}", status_code=303)
-    clear_oidc_flow_cookie(resp, request)
+    if not keep_flow:
+        clear_oidc_flow_cookie(resp, request)
     return resp
 
 
@@ -507,7 +509,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not outcome.ok or outcome.token is None:
             # complete_oidc_login already audited the closed-set reason; map it to an allow-listed
             # short code, defaulting to the generic one so an unrecognised slug is never reflected.
-            return _fail(request, _REASON_TO_CODE.get(outcome.reason or "", "oidc_failed"))
+            # A state mismatch consumed nothing (BACKLOG #3198): the flow waits for the real IdP
+            # return, which needs this browser's flow cookie, as in _step_up_landing.
+            return _fail(
+                request,
+                _REASON_TO_CODE.get(outcome.reason or "", "oidc_failed"),
+                keep_flow=outcome.reason == "state_mismatch",
+            )
         resp = HTMLResponse(pages.oidc_landing(), status_code=200)
         set_session_cookie(resp, outcome.token, request=request)
         clear_oidc_flow_cookie(resp, request)

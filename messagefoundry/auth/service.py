@@ -4086,8 +4086,8 @@ class AuthService:
         client: str | None,
         public_origin: str,
     ) -> LoginOutcome:
-        """Redeem a staged flow: pop it (single-use), constant-time-compare ``state``, then run the
-        full exchange + verification through :meth:`_authenticate_oidc`.
+        """Redeem a staged flow: constant-time-compare ``state``, pop the flow (single-use) only once
+        it matches, then run the full exchange + verification through :meth:`_authenticate_oidc`.
 
         The flow cache stays private to the service, so route code never holds the PKCE verifier or
         the nonce. A missing/expired flow and a ``state`` mismatch are both audited with closed-set
@@ -4134,15 +4134,19 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
-        flow = self._oidc_flows.pop(flow_id)
-        if flow is None:
+        # PEEKED, then popped only once `state` matches (BACKLOG #3198), as complete_oidc_step_up
+        # does. The flow cookie is SameSite=Lax, so any page can send the browser to the callback
+        # with it; popping first let such a forged callback use up the sign-in in flight. No await
+        # sits between the peek and the pop, so a matching callback still consumes it exactly once.
+        flow = self._oidc_flows.peek(flow_id)
+        if flow is not None and not oidc.state_matches(flow.state, state):
+            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch", client=client)
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
+        if flow is None or self._oidc_flows.pop(flow_id) is None:
             await self._directory_reject_audit("<oidc>", "oidc", "state_unknown", client=client)
             return LoginOutcome(
                 ok=False, error="federated sign-in expired; start again", reason="state_unknown"
             )
-        if not oidc.state_matches(flow.state, state):
-            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch", client=client)
-            return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
         # The INNER leg: the public wrapper would pad a second time inside this challenge's pad.
         return await self._authenticate_oidc(
             code,

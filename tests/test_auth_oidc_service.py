@@ -1903,6 +1903,44 @@ async def test_a_successful_callback_is_not_padded(
         await store.close()
 
 
+async def test_a_forged_state_leaves_the_sign_in_in_flight_and_a_replay_is_refused(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3198: ``state`` is compared BEFORE the flow is consumed.
+
+    The flow cookie is SameSite=Lax, so any page can send the browser to the callback with it. A
+    forged callback with a wrong ``state`` must leave the real sign-in completable, and the real
+    callback, once it succeeds, must still spend the flow: its replay is refused. The control is
+    the old order, pop then compare, under which the real callback below answers ``state_unknown``.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        monkeypatch.setattr(service, "_exchange_and_validate", lambda *_a, **_k: _verified())
+        flow_id, url = await service.begin_oidc_login(
+            client="192.0.2.10", public_origin="https://ops.example"
+        )
+        real_state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
+
+        async def callback(state: str) -> LoginOutcome:
+            return await service.complete_oidc_login(
+                flow_id=flow_id,
+                state=state,
+                code=AUTH_CODE,
+                client="192.0.2.10",
+                public_origin="https://ops.example",
+            )
+
+        forged = await callback("forged-" + real_state)
+        assert not forged.ok and forged.reason == "state_mismatch"
+        real = await callback(real_state)
+        assert real.ok, real
+        replay = await callback(real_state)
+        assert not replay.ok and replay.reason == "state_unknown"
+    finally:
+        await store.close()
+
+
 async def test_authenticate_oidc_pads_its_own_refusals(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
