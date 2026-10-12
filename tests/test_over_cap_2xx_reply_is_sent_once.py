@@ -67,6 +67,9 @@ from messagefoundry.transports.bounded_read import (
     TruncatedResponseError,
     read_2xx_reply_text,
 )
+from messagefoundry.transports.bounded_read import (
+    logger as _reader_logger,
+)
 from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp, _wire
 from tests.test_digest_refusal_classification import _FACTORY, _LABEL, _build, _Stops
 
@@ -703,13 +706,21 @@ async def test_send_follows_the_ruling_for_an_unreadable_2xx_body(
             identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
             assert str(ei.value).startswith(f"{identity}: {code}, not sent again")
             assert _URL_MARKER not in str(ei.value)
+            # The positive control: a WARNING on the reader's own logger, which is the one that
+            # logs "recorded as delivered", reaches caplog here.
+            _reader_logger.warning("positive control")
     assert len(opener.requests) == 1
+    # Each side logs at least one WARNING: the delivered one, or the refused side's control.
+    assert caplog.records
     warned = [r.getMessage() for r in caplog.records if "recorded as delivered" in r.getMessage()]
     if side == _DELIVERED:
         (warning,) = warned
         assert said in warning
         assert _URL_MARKER not in warning
     else:
+        # Capture of the reader's logger is live, and it logged nothing but the control.
+        reader = [r.getMessage() for r in caplog.records if r.name == _reader_logger.name]
+        assert reader == ["positive control"]
         assert warned == []
 
 
