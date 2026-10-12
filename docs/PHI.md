@@ -35,7 +35,7 @@ levels:
   subnet); always **authenticated** (RBAC + audit). Smallest surface.
 - **Data plane** (inbound MLLP / TCP / X12 / DB-poll feeds) — **network-bound in any real install**
   (feeds arrive from other systems on the LAN, not `127.0.0.1`), protected by **TLS on the wire**
-  (MLLP-over-TLS, built), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
+  (MLLP-over-TLS), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
   not cross the LAN in cleartext — and can't accidentally: the bind-guards **refuse a non-loopback
   *plaintext* listener**, at least MLLP, raw TCP and X12 (ADR 0002 §0). An off-loopback API bind needs
   an operator certificate or a declared TLS-terminating proxy (§4).
@@ -48,20 +48,15 @@ levels:
   said the listener was not built.
 
 The security controls that only become material off-loopback (mTLS, certificate revocation,
-off-box logs) are **built into the engine**, and each leans on the org's environment.
+off-box logs) each lean on the org's environment.
 Its PKI issues the certificates and the CRL files the engine checks, its SIEM receives the forwarded
-logs, and its network controls stay its own. Built is not the same as on. API mTLS acts only once
-`[api].tls_client_ca_file` names a CA. Revocation checking reads a CRL file the org's PKI publishes,
-named per hop, for example `[logging].forward_tls_crl_file`. Log forwarding starts once `[logging].forward_host` names a
-collector, and under the default `[security].enforcement = enforce`, `serve` refuses to start without
-forwarding over verified TLS. Each is documented per deployment — see
+logs, and its network controls stay its own. Whether each control is in the engine, and what turns
+it on, is in the
+[security controls table](EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
+of the early-adopter guide. Each is documented per deployment — see
 [DEPLOYMENT.md](DEPLOYMENT.md), and [§7](#7-logging--phi-redaction) for log forwarding.
-MFA is not among them. The engine's own second factor (`[security].require_mfa`, on by default)
-applies on any bind, with one way to meet it outside the engine. While `[auth].oidc_require_mfa_claim`
-is on, the default, the engine checks the identity provider's token for an accepted MFA claim. An OIDC
-session whose token carries one has met the factor. Any other session the requirement covers proves an
-engine factor.
-Which accounts the requirement covers is stated in
+The engine's second factor is not among them, because it does not depend on the bind. The same
+table covers it. Which accounts that factor covers is stated in
 [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14).
 
 | Actor / vector | In scope? | Mitigation |
@@ -71,7 +66,7 @@ Which accounts the requirement covers is stated in
 | Stolen DB file / backup | Yes | At-rest body + `summary`/`metadata` encryption (built — §3) + required volume encryption for WAL/temp |
 | PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
 | Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS is always on, except behind a declared proxy with no operator certificate; MLLP-over-TLS is built** (Gate #4, §4) — *enable MLLP TLS per connection*; the bind-guards refuse a non-loopback plaintext listener, and an off-loopback API bind needs an operator certificate or a declared TLS-terminating proxy; + your network segmentation |
-| Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log forwarding to your SIEM (built; set `[logging].forward_*` — [§7](#7-logging--phi-redaction)) for evidence beyond the host |
+| Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log forwarding to your SIEM (set `[logging].forward_*` — [§7](#7-logging--phi-redaction)) for evidence beyond the host |
 | **Public-internet attacker** | **Out of scope by design** | MEFOR is **not** internet-facing (trust boundary above); off-loopback exposure is internal-only and TLS-required |
 | Misconfigured outbound destination | Yes | Destination allowlist (`[egress].allowed_*`, §4) |
 
@@ -2359,14 +2354,17 @@ prerequisite (encrypted, access-controlled backups) is the checklist item in
 ## 12. Known limitations (current, honest)
 
 Retention is enforced (`[retention]`, §8) but `audit_days` audit-log pruning is **reserved/keep-forever
-by design** (archive-first pruning is a follow-up) · the exception path is redacted (`safe_exc`, §7,
-WP-6c); structured (JSON) logging + off-box (syslog/SIEM) forwarding + the cross-backend audit-tee are now **built** (sec-offbox-log #357/#361/#363), with **native RFC 5425 TLS-syslog** (ADR 0080) and a posture-gated forwarding hop (#1163) · the
+by design** (archive-first pruning is a follow-up) · the
 searchable `summary` column stays outside the encryption seam by design (volume encryption covers it;
-`error`/`last_error`/`detail` are now ciphered — WP-5) · a fail-closed outbound/egress allowlist is
-enforced (`[egress]`, WP-11c) and **MLLP-over-TLS is built** (WP-13b, opt-in per connection; a non-loopback plaintext listener is refused) · no
-strict-parse time budget · de-identification is **built** for HL7 v2 (the anonymizer, §9, ADR 0030)
+`error`/`last_error`/`detail` are now ciphered — WP-5) · no
+strict-parse time budget · de-identification covers HL7 v2 only (the anonymizer, §9, ADR 0030),
 with X12/FHIR seams still to come. Each is tracked in
 [§11](#11-hardening-roadmap).
+
+For at least the main security controls, the
+[security controls table](EARLY-ADOPTER-GUIDE.md#security-controls-built-on-by-default-and-not-built)
+of the early-adopter guide says which are in the engine and which are on by default. §4 documents
+transport TLS, and §7 documents logging and redaction.
 
 **The test harness's at-rest data falls short of its protection levels.** The harness is in the
 ASVS assessed scope (owner ruling 2026-10-02); its stores, and how far each falls short, are in the
