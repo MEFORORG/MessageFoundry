@@ -3451,11 +3451,21 @@ class RegistryRunner:
                     exc,
                     exc_info=not refused,
                 )
+                if isinstance(exc, ValueError):
+                    what, advice = _ANCHOR_SETTING_REFUSED, _ANCHOR_SETTING_ADVICE
+                elif refused:
+                    what = "tls_ca_file was refused"
+                    advice = (
+                        "Fix the file, then reload; the server log and the auth.trust_anchor "
+                        "audit rows say why"
+                    )
+                else:
+                    # The check did not run, so nothing says the file is at fault.
+                    what = "tls_ca_file could not be checked"
+                    advice = "The server log says why; reload once the cause is fixed"
                 fixed = TrustAnchorError(
-                    f"{direction} connection '{name}': its tls_ca_file "
-                    f"{'was refused' if refused else 'could not be checked'} on this passive DR "
-                    "standby, and POST /dr/activate needs it. Fix the file, then reload; the "
-                    "server log and the auth.trust_anchor audit rows say why"
+                    f"{direction} connection '{name}': its {what} on this passive DR standby, "
+                    f"and POST /dr/activate needs it. {advice}"
                 )
                 self._record_failed(name, fixed, kind=direction)
 
@@ -3539,7 +3549,8 @@ class RegistryRunner:
         A refusal that fails a lane is raised as a fixed line naming the connection. The refusal
         text names the CA's path, the folders above it and its SHA-256, so it goes to the server
         log only, as the connection-test route keeps it from API callers (BACKLOG #1142). The lane
-        status and the ``connection_stopped`` alert carry the fixed line."""
+        status and the ``connection_stopped`` alert carry the fixed line. A ``ValueError`` is a
+        refused setting, not a refused file, and its line says so (vault BACKLOG #3224)."""
         if self._lane_anchor_check is None:
             return
         try:
@@ -3549,6 +3560,11 @@ class RegistryRunner:
                 raise
             self._anchor_refused[(direction, name)] = _anchor_key(settings)
             log.warning("%s connection %r: trust anchor refused: %s", direction, name, exc)
+            if isinstance(exc, ValueError):
+                raise TrustAnchorError(
+                    f"{direction} connection '{name}': its {_ANCHOR_SETTING_REFUSED}. "
+                    f"{_ANCHOR_SETTING_ADVICE}"
+                ) from exc
             raise TrustAnchorError(
                 f"{direction} connection '{name}': its tls_ca_file was refused. Fix the file, then "
                 "start the connection; the server log and the auth.trust_anchor audit rows say why"
@@ -3625,7 +3641,16 @@ class RegistryRunner:
             return False
         try:
             settings = self._anchor_lane_settings(new)
-        except Exception:  # noqa: BLE001 - an unresolvable value is a change; the build reports it
+        except Exception as exc:  # noqa: BLE001 - an unresolvable value is a change
+            # The build reports the fault itself. This line says why the reload reads a CA it
+            # had been leaving alone (vault BACKLOG #3224).
+            log.info(
+                "%s connection %r: its settings no longer resolve, so its trust-anchor failure "
+                "is not kept and this reload builds it again: %s",
+                direction,
+                name,
+                safe_exc(exc),
+            )
             return False
         return _anchor_key(settings) == key
 
@@ -10979,6 +11004,14 @@ def _insecure_bind_cause(source: Source) -> str:
         return f"tls_hop_attested; reason: {source.tls_hop_attested_reason or '(none provided)'}"
     # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
     return "--allow-insecure-bind / require_encryption_for_remote = false"
+
+
+#: A lane's fixed refusal line for a ``ValueError`` from its CA check (vault BACKLOG #3224). That is
+#: a setting the check refused, such as a blank or unread ``tls_ca_pin`` or a ``tls_ca_file`` value
+#: that is no path. Mending the file does nothing for it, and a start reads the same setting again.
+#: A reload reads the changed one, since a changed setting ends a kept failure.
+_ANCHOR_SETTING_REFUSED = "tls_ca_pin or tls_ca_file setting was refused"
+_ANCHOR_SETTING_ADVICE = "Fix the setting, then reload; the server log says why"
 
 
 def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:

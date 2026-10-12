@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from messagefoundry import proctree
+from messagefoundry.auth.trust_anchors import TrustAnchorError
 from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -95,6 +96,31 @@ def _vip_note(cause: str) -> str:
         f". {cause}, so the VIP may have moved to this box with no priority listener bound -- "
         "check the load balancer before retrying"
     )
+
+
+#: What a step-4 abort says in place of a trust-anchor refusal's own text (vault BACKLOG #3224).
+#: That text names the CA's path, the folders above it and its SHA-256.
+_ANCHOR_REFUSED = (
+    "a trust anchor was refused; the server log and the auth.trust_anchor audit rows say which "
+    "one and why"
+)
+
+
+def _caused_by_trust_anchor(exc: BaseException) -> bool:
+    """Whether ``exc`` is a :class:`TrustAnchorError` or wraps one through its explicit
+    ``__cause__`` chain, the way the settings, registry and lane checks raise a refusal.
+
+    An implicit ``__context__`` is not followed: an unrelated error raised while a refusal was
+    being handled would then lose its own text. The API's connection-test route walks the chain
+    the same way; ``pipeline/`` cannot import it from there."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, TrustAnchorError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return False
 
 
 #: The one answer for every refused request archive, whichever check refused it. It names the
@@ -436,6 +462,14 @@ class DrCoordinator:
             await self._activate_profile()
         except Exception as exc:
             self._active = False
+            if _caused_by_trust_anchor(exc):
+                # The refusal's own text goes to the server log only. The reason below reaches
+                # the API caller and the dr_activation_aborted row, which is teed off the box
+                # (vault BACKLOG #3224; BACKLOG #1142 for the connection-test route's same rule).
+                log.warning("DR activation refused by a trust anchor: %s", exc)
+                cause = _ANCHOR_REFUSED
+            else:
+                cause = safe_exc(exc)
             # A preflight that refused or timed out bound nothing, so its reason must not say a
             # bind failed (vault BACKLOG #3094).
             reason = (
@@ -443,7 +477,7 @@ class DrCoordinator:
                 if progress.in_preflight
                 else "DR run-profile activation failed (the engine could not bind the priority "
                 "feeds)"
-            ) + f": {safe_exc(exc)}"
+            ) + f": {cause}"
             if progress.hook_ran:
                 reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this
