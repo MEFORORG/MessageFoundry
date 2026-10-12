@@ -41,9 +41,9 @@ def _resolve_token_text() -> str | None:
     """The active token content, or ``None`` if no source is configured — the SAME source
     ``scripts/security/scan_forbidden.py`` reads, so the site-code authority is externalized in one
     place (never committed). ``MEFOR_FORBIDDEN_TOKENS`` wins: an existing file path is read; any other
-    non-empty value is inline content; an explicitly-empty value means "no source". Otherwise the
-    git-ignored ``scripts/security/scan-tokens.local.txt`` is located by walking up from this file
-    (a dev checkout); an installed wheel without it degrades to no-op.
+    non-empty value is inline content; an explicitly-empty value means "no source". Otherwise ONE
+    path is built, never searched for (BACKLOG #2995): the git-ignored ``scan-tokens.local.txt`` in
+    ``scripts/security/`` under the folder that holds this package. No file there means no source.
     """
     env = os.environ.get("MEFOR_FORBIDDEN_TOKENS")
     if env is not None:
@@ -57,13 +57,13 @@ def _resolve_token_text() -> str | None:
         except OSError:
             pass
         return env
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / "scripts" / "security" / "scan-tokens.local.txt"
-        try:
-            if candidate.is_file():
-                return candidate.read_text(encoding="utf-8")
-        except OSError:
-            pass
+    try:  # parents[2]: the repository root in a checkout. A shorter path has none (IndexError).
+        root = Path(__file__).resolve().parents[2]
+        candidate = root / "scripts" / "security" / "scan-tokens.local.txt"
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    except (OSError, IndexError):
+        pass
     return None
 
 
