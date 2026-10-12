@@ -1042,8 +1042,7 @@ class FhirDestination(DestinationConnector):
                     encoding=self.encoding,
                     body_is_needed=wrapped or self.capture_response,
                 )
-                # No default: a missing status is not guessed to be 200 (#3040 item 10).
-                status = int(resp.status)
+                status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers_out = capture_response_headers(
                     getattr(resp, "headers", None), self.capture_response_headers

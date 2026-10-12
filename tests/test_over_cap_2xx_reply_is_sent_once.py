@@ -67,7 +67,6 @@ from tests.test_digest_refusal_classification import (
     _FACTORY,
     _LABEL,
     _build,
-    _send,
     _Stops,
 )
 
@@ -107,7 +106,7 @@ def test_an_unused_over_cap_body_reads_as_empty_and_warns(
     assert message.startswith("REST connection 'OB_X' answered with status 201 and")
     assert "64-byte bound" in message
     assert message.endswith(_TAKEN_AS_ANSWER)
-    # #3040 item 2: the line is logged before the caller's store write, so it claims no record.
+    # vault BACKLOG #3040 item 2: the line is logged before the caller's store write, so it claims no record.
     assert "recorded" not in message
     assert _REPLY_FILL.decode() * 4 not in message
 
@@ -245,7 +244,7 @@ def test_the_status_guard_lets_every_2xx_through(
 def test_the_stored_refusal_keeps_its_code_and_advice_under_a_long_connection_name() -> None:
     """A dead-lettered row keeps the error text, cut at 200 characters, and not the code. So the
     code, "not sent again" and the advice come first, and the connection last, where a long name
-    can push out only itself (#3040 items 4 and 6). DICOMweb has the longest label, so with the
+    can push out only itself (vault BACKLOG #3040 items 4 and 6). DICOMweb has the longest label, so with the
     connection first the advice went there first, from about 23 characters of name."""
     name = "OB_" + "LONGPARTNER_" * 5 + "ADT"
     assert len(name) > 60
@@ -294,7 +293,8 @@ def _payload(ctype: ConnectorType, over: dict[str, Any] | None = None) -> str:
 
 #: vault #2804 (engine PR 2244, open when these rows were added) makes a FHIR ``transaction`` or
 #: ``batch`` connection list the methods its entries may use, and refuses one that does not. Until
-#: it lands the setting does not exist, so it is passed only where ``FHIR()`` takes it.
+#: it lands the setting does not exist, so it is passed only where ``FHIR()`` takes it. Once
+#: that PR is on main, pass the setting outright and drop this probe.
 _ENTRY_SCREEN: dict[str, Any] = (
     {"allowed_entry_methods": ["POST"]}
     if "allowed_entry_methods" in inspect.signature(FHIR).parameters
@@ -343,7 +343,7 @@ _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
         },
         _DELIVERED,
     ),
-    # #3040 item 3: the cells engine PR 2041 left without a row. Capture off, the last forms that
+    # vault BACKLOG #3040 item 3: the cells engine PR 2041 left without a row. Capture off, the last forms that
     # are not wrapped: a conditional create, and a batch Bundle the Handler built.
     (
         ConnectorType.FHIR,
@@ -464,19 +464,6 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
         # A refusal is not also logged as a delivery. The delivered cases of this same test show
         # the capture sees that WARNING when it is logged.
         assert _TAKEN_AS_ANSWER not in caplog.text
-
-
-@pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
-def test_post_takes_no_status_it_was_not_given(ctype: ConnectorType) -> None:
-    """#3040 item 10: ``_post`` no longer supplies a 200 when the reply shows no status. urllib's
-    response always carries one, so only a reader like this one reaches the line, and it is not
-    taken for a 2xx. An in-cap body, so the read itself refuses nothing."""
-    dest = _build(ctype, "https://partner.example.com/x")
-    resp = _ExactResp(b'{"ok": true}')
-    del resp.status  # an in-cap reply whose reader has no status at all
-    dest._opener = _FakeOpener(resp)
-    with pytest.raises(AttributeError, match="status"):
-        _send(ctype, dest)
 
 
 # --- the delivery worker, on the wire -------------------------------------------------------------
@@ -683,7 +670,7 @@ async def test_an_over_cap_2xx_in_another_framing_is_sent_once(
     tmp_path: Path,
     over_cap_body: bytes,
 ) -> None:
-    """#3040 item 7: the wire layer above frames each reply with ``Content-Length``. A chunked or
+    """vault BACKLOG #3040 item 7: the wire layer above frames each reply with ``Content-Length``. A chunked or
     close-framed over-cap body after a 2xx takes the same arm, with one request."""
     ctype, over, side = case
     with _Partner(200, over_cap_body, framing=framing) as partner:

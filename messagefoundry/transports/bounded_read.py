@@ -22,8 +22,8 @@ refuse is a *reply* to a request the engine made.
 Where it surfaces inside a delivery, the worker retries the delivery and then dead-letters it,
 as it does for any reply the engine could not read (a timeout mid-read, a reset socket). A token
 endpoint's over-cap reply is one such case, when a delivery mints its bearer before it sends. At
-least a probe, the alert webhook and a ``fhir_lookup`` raise the error to their own caller
-instead, and nothing retries those.
+least a probe and a ``fhir_lookup`` raise the error to their own caller instead, and nothing
+retries those. So does the alert webhook, unless the reply is a 2xx: see :func:`drain_2xx_reply`.
 
 A delivery that already holds a 2xx status is different, because a retry would send again a
 request the partner answered 2xx (vault BACKLOG #2180).
@@ -1251,16 +1251,29 @@ def read_bounded_text(
 REPLY_TOO_LARGE_CODE = "reply-too-large"
 
 
-def shown_2xx_status(reader: object) -> int | None:
+def _shown_2xx_status(reader: object) -> int | None:
     """``reader.status`` when it is an integer from 200 to 299, else ``None``.
 
-    The guard an over-cap body after a 2xx takes before it is dropped rather than raised. It fails
-    closed: a reader with no status, or one it cannot show as an integer, is not taken for a 2xx.
-    Shared by :func:`read_2xx_reply_text` and the alert webhook (#3040 item 1), so the rule has
-    one copy.
+    The guard an over-cap body after a 2xx passes before it is dropped rather than raised. It
+    fails closed: a reader with no status, or one it cannot show as an integer, is not taken for a
+    2xx. Shared by :func:`read_2xx_reply_text` and :func:`drain_2xx_reply`.
     """
     status = getattr(reader, "status", None)
     return status if isinstance(status, int) and 200 <= status < 300 else None
+
+
+def _warn_dropped_2xx_body(connector: str, status: int, limit: int) -> None:
+    """The WARNING for an over-cap body dropped after a 2xx. It carries ``connector``, the status
+    and the bound, and no byte of the reply. It says nothing of a store record, because a delivery
+    logs it before the caller writes one, and that write can still fail (vault BACKLOG #3040
+    item 2)."""
+    logger.warning(
+        "%s answered with status %s and a response body over the %d-byte bound; "
+        "the body is dropped and the 2xx is taken as the partner's answer",
+        connector,
+        status,
+        limit,
+    )
 
 
 def read_2xx_reply_text(
@@ -1285,10 +1298,8 @@ def read_2xx_reply_text(
     one place in code that states the rule:
 
     * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
-      without it. Returns ``""`` and logs a WARNING. The WARNING carries ``connector``, the
-      status and the bound, and no byte of the reply. It says nothing of the store record,
-      because it is logged before the caller writes one, and that write can still fail (#3040
-      item 2).
+      without it. Returns ``""`` and logs a WARNING, which carries ``connector``, the status
+      and the bound, and no byte of the reply.
     * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
       permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
       :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
@@ -1302,7 +1313,7 @@ def read_2xx_reply_text(
     try:
         return read_bounded_text(reader, limit=limit, connector=connector, encoding=encoding)
     except ResponseTooLargeError:
-        status = shown_2xx_status(reader)
+        status = _shown_2xx_status(reader)
         if status is None:
             raise
         # A 2xx is handled below, outside the handler. The traceback reaches the frame that holds
@@ -1310,7 +1321,8 @@ def read_2xx_reply_text(
         # that frame alive on its __context__ until the worker let go of it.
     if body_is_needed:
         # The row keeps only 200 characters of this, so the code and the advice come first and
-        # the connection name, which has no length cap, comes last (#3040 items 4 and 6). It
+        # the connection name, which has no length cap, comes last (vault BACKLOG #3040 items
+        # 4 and 6). It
         # does not say the partner accepted the request: the body that could not be read is
         # where a Fault, a failed-instance list or a failed entry status would be.
         raise NegativeAckError(
@@ -1319,11 +1331,34 @@ def read_2xx_reply_text(
             code=REPLY_TOO_LARGE_CODE,
             permanent=True,
         )
-    logger.warning(
-        "%s answered with status %s and a response body over the %d-byte bound; "
-        "the body is dropped and the 2xx is taken as the partner's answer",
-        connector,
-        status,
-        limit,
-    )
+    _warn_dropped_2xx_body(connector, status, limit)
     return ""
+
+
+def drain_2xx_reply(
+    reader: _SupportsRead,
+    *,
+    limit: int = DEFAULT_MAX_RESPONSE_BYTES,
+    connector: str,
+) -> None:
+    """:func:`drain_bounded` for a reply whose 2xx status is the whole answer.
+
+    The alert webhook's drain. Nothing reads its body, so an over-cap body after a 2xx is dropped
+    with the same WARNING :func:`read_2xx_reply_text` logs, and the call returns. Owner ruling
+    2026-10-12 (#3040 item 1) extends the 2026-10-05 principle, "decide by who reads the body",
+    to the alert webhook. Any other status, or none the reader can show, still raises
+    :class:`ResponseTooLargeError`.
+
+    A function of its own rather than a change to :func:`drain_bounded`, because the connection
+    probes share that drain and keep the raise.
+    """
+    try:
+        drain_bounded(reader, limit=limit, connector=connector)
+        return
+    except ResponseTooLargeError:
+        status = _shown_2xx_status(reader)
+        if status is None:
+            raise
+        # Logged below, outside the handler, so the traceback that reaches the bytes read so far
+        # is let go first.
+    _warn_dropped_2xx_body(connector, status, limit)

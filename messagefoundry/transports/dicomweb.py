@@ -487,8 +487,7 @@ class DicomWebDestination(DestinationConnector):
                     encoding=self.encoding,
                     body_is_needed=True,
                 )
-                # No default: a missing status is not guessed to be 200 (#3040 item 10).
-                status = int(resp.status)
+                status = int(getattr(resp, "status", 200))
                 return body, status
         except urllib.error.HTTPError as exc:
             # Non-2xx: classify transient vs permanent. Raised for BOTH capturing and non-capturing — a

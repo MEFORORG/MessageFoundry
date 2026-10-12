@@ -529,15 +529,15 @@ def test_alert_webhook_drain_is_bounded(
     import messagefoundry.pipeline.alert_sinks as sinks
 
     monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", opener.open)
-    with caplog.at_level(logging.WARNING, logger=sinks.__name__):
+    with caplog.at_level(logging.WARNING, logger=bounded_read.logger.name):
         transport._post({"type": "queue_buildup", "connection": "OB_X"})  # no raise
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
-    (record,) = [r for r in caplog.records if r.name == sinks.__name__]
+    (record,) = [r for r in caplog.records if r.name == bounded_read.logger.name]
     assert record.levelno == logging.WARNING
     assert record.getMessage() == (
-        "alert webhook hooks.example answered with status 200 and a response body over the "
-        f"{DEFAULT_MAX_RESPONSE_BYTES}-byte bound; the body is dropped and the alert counts as "
-        "delivered"
+        "alert webhook answered with status 200 and a response body over the "
+        f"{DEFAULT_MAX_RESPONSE_BYTES}-byte bound; the body is dropped and the 2xx is taken as "
+        "the partner's answer"
     )
 
 
@@ -558,12 +558,12 @@ def test_alert_webhook_over_cap_reply_with_no_2xx_to_show_still_raises(
 
     monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", _FakeOpener(resp).open)
     with (
-        caplog.at_level(logging.WARNING, logger=sinks.__name__),
+        caplog.at_level(logging.WARNING, logger=bounded_read.logger.name),
         pytest.raises(ResponseTooLargeError),
     ):
         transport._post({"type": "queue_buildup", "connection": "OB_X"})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
-    assert "counts as delivered" not in caplog.text
+    assert "the 2xx is taken as" not in caplog.text
 
 
 # --- the signing key file (a LOCAL read, not an egress reply) -------------------------------------
@@ -938,6 +938,7 @@ _READERS = frozenset(
         "read_bounded",
         "read_bounded_text",
         "drain_bounded",
+        "drain_2xx_reply",
         "read_reply_body",
         "request_token",
         "_read_token_reply",

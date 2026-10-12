@@ -447,12 +447,7 @@ class WebhookTransport:
         # Bounded so the drain cannot be turned into a memory exhaustion by a webhook host that
         # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily for the
         # same reason as the length gate above.
-        from messagefoundry.transports.bounded_read import (
-            DEFAULT_MAX_RESPONSE_BYTES,
-            ResponseTooLargeError,
-            drain_bounded,
-            shown_2xx_status,
-        )
+        from messagefoundry.transports.bounded_read import drain_2xx_reply
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
         with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
@@ -462,29 +457,11 @@ class WebhookTransport:
             # took it. The byte bound still applies -- an unbounded drain is a memory exhaustion
             # whether or not anyone reads the bytes.
             #
-            # An over-cap body after a 2xx counts as delivered: owner ruling 2026-10-12 (#3040
-            # item 1), which extends ruling R5's "decide by who reads the body" to this sink.
-            # Nothing reads this body, so the host's 2xx is the answer. Handled here and not in
-            # drain_bounded, because the connection probes share that drain and keep the raise.
-            try:
-                drain_bounded(resp, connector=f"alert webhook {host}")
-            except ResponseTooLargeError:
-                # Fails closed. urllib raises every non-2xx as HTTPError before this point, so
-                # only a reader that cannot show an integer 2xx still raises here.
-                status = shown_2xx_status(resp)
-                if status is None:
-                    raise
-            else:
-                return
-            # Logged outside the handler, so the traceback that reaches the bytes read so far is
-            # let go first. No byte of the reply is in the line: the host, the status, the bound.
-            log.warning(
-                "alert webhook %s answered with status %d and a response body over the %d-byte "
-                "bound; the body is dropped and the alert counts as delivered",
-                host,
-                status,
-                DEFAULT_MAX_RESPONSE_BYTES,
-            )
+            # An over-cap body after a 2xx counts as delivered, with a WARNING: owner ruling
+            # 2026-10-12 (#3040 item 1), which extends the owner ruling of 2026-10-05, "decide by
+            # who reads the body", to this sink. Nothing reads this body. The label is fixed, so
+            # the WARNING does not carry the configured host.
+            drain_2xx_reply(resp, connector="alert webhook")
 
 
 #: The name the alerts SMTP hop logs under. The security notifier registers its verification-off
