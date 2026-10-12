@@ -4481,9 +4481,16 @@ def _serve(args: argparse.Namespace) -> int:
         # GET /logging/level next to the (possibly runtime-overridden) effective level.
         configured_log_level=settings.logging.level,
         # #285 (ASVS 6.7.1): the operator-supplied auth-path trust anchors (OIDC / AD / api-mTLS client
-        # CA) the lifespan + /config/reload preflight for ACL + optional SHA-256 pin. Empty when none is
+        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188), that the
+        # lifespan + /config/reload preflight for ACL + optional SHA-256 pin. Empty when none is
         # configured → dormant, byte-identical. `enforcing` is the [security].enforcement refuse/warn dial.
-        trust_anchor_specs=collect_anchor_specs(settings.auth, settings.api),
+        trust_anchor_specs=collect_anchor_specs(
+            settings.auth,
+            settings.api,
+            tls=settings.tls,
+            alerts=settings.alerts,
+            log_settings=settings.logging,
+        ),
         trust_anchors_enforcing=enforcing,
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,

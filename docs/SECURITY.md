@@ -5351,7 +5351,29 @@ amended 2026-10-06). One gap remains. The hop reads the file again by path when 
 context, so a file swapped after the check would be trusted until that connection is built again.
 A matching pin is no escape for a file whose permissions the engine cannot read.
 [CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin)
-states the checks once. `[tls].internal_ca_file` takes none of these checks yet.
+states the checks once.
+
+At least three settings name a CA that an engine hop dials with, and each takes the permission and
+change checks too (vault BACKLOG #3188): `[tls].internal_ca_file`, `[alerts].email_tls_ca_file` and
+`[logging].forward_tls_ca_file`. The engine checks each one at start and at every reload, but only
+while its hop reads it. That means the internal CA under `augment` or `pinned`, the email CA while
+an alert or security-notice sender verifies over TLS, and the syslog CA while logs are forwarded over
+verified TLS. Under `enforce`, a file another account could replace, or one whose permissions the
+engine cannot read, refuses the start or the reload. These settings take no pin.
+
+**The engine finds a swapped file at the next start or reload, not when a hop reads it.** Each hop
+reads the file again by path, on its own schedule. The SMTP hop reads it at every send, so a file
+swapped between reloads would be trusted by the next send. A connection that falls back to the
+internal CA reads it when the connection is built, and the syslog forwarder reads it once, at start.
+Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
+`restart_required` row for them. A changed syslog CA takes effect only at a restart.
+
+At least four readers sit before or outside the check. At start, the syslog forwarder and the alert
+notifier are built before the check runs, so an alert sent during startup, or the first forwarded
+records, would use a CA not yet checked. The `supervise` process builds its own forwarder and runs
+no check. The offline recovery commands send security notices over an SMTP hop with no check. The
+internal CA is checked under `augment` or `pinned` even when no hop reads it, because every hop is
+loopback or names its own `tls_ca_file`.
 
 ### PHI data-plane integrity residuals — scope-outs (#190, ADR 0093)
 
