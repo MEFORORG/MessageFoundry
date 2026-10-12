@@ -62,15 +62,37 @@ class RuleError(ValueError):
     a :class:`FieldRule` built in code with an unknown kind or a path that is not a whole field."""
 
 
+#: The most characters of rule or overlay text a :class:`RuleError` quotes for ONE thing it names:
+#: a path, a value that is not a kind, or the whole sorted list of unknown keys. No message quotes
+#: more than two, and the words around them are fixed, so every schema refusal is bounded however
+#: long the overlay is (BACKLOG #3000). A real path or kind is far shorter than this.
+_QUOTE_LIMIT = 80
+
+
+def _quoted(value: object) -> str:
+    """``repr(value)`` for a :class:`RuleError`, cut to :data:`_QUOTE_LIMIT` characters.
+
+    A cut is marked with the number of characters left out, so a reader can tell a long key from
+    a short one that happens to end there. The bound is on the WHOLE repr, so a list of many
+    short keys and a value that is not a string are cut the way one long string is."""
+    text = repr(value)
+    if len(text) <= _QUOTE_LIMIT:
+        return text
+    return f"{text[:_QUOTE_LIMIT]}... ({len(text) - _QUOTE_LIMIT} more characters not shown)"
+
+
 def _coerce_kind(path: str, raw: object) -> SurrogateKind:
     if not isinstance(raw, str):
-        raise RuleError(f"rule for {path!r} must name a surrogate kind as a string, got {raw!r}")
+        raise RuleError(
+            f"rule for {_quoted(path)} must name a surrogate kind as a string, got {_quoted(raw)}"
+        )
     try:
         return SurrogateKind(raw)
     except ValueError:
         allowed = ", ".join(k.value for k in SurrogateKind)
         raise RuleError(
-            f"rule for {path!r} names unknown surrogate kind {raw!r}; allowed: {allowed}. "
+            f"rule for {_quoted(path)} names unknown surrogate kind {_quoted(raw)}; "
+            f"allowed: {allowed}. "
             "A new kind is a code change in surrogates.py, never an overlay value."
         ) from None
 
@@ -81,7 +103,7 @@ def _check_field_path(path: object) -> None:
     overlay key alike."""
     if not isinstance(path, str) or _FIELD_PATH_RE.fullmatch(path) is None:
         raise RuleError(
-            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
+            f"rule path {_quoted(path)} is not a whole-field HL7 address like 'PID-5' "
             "(component paths and free text are rejected — selection is field-level only)"
         )
 
@@ -217,6 +239,37 @@ class AnonError(ValueError):
 
 _LOG = logging.getLogger(__name__)
 
+#: The overlay warnings this process has already logged. One entry is every line ONE load
+#: produced. :func:`load_rules` runs again for every message when a caller hands the anonymizer a
+#: path, and without this each message repeated every line (BACKLOG #3000). The key is the
+#: warnings' own text and not the file alone, so an overlay edited to keep or retarget a
+#: different field warns again in a process that stays up.
+_warned: set[tuple[str, ...]] = set()
+
+#: ``_warned`` is emptied when it holds this many entries. A caller that writes a new overlay
+#: file per message would otherwise grow it without limit. Emptying it costs a repeated warning.
+_WARNED_LIMIT = 256
+
+
+def _warn_once(lines: tuple[str, ...]) -> None:
+    """Log ``lines`` at WARNING unless this process already logged exactly these lines.
+
+    Nothing is remembered while WARNING is switched off, so a caller that turns it on later still
+    gets the lines once."""
+    if not lines or lines in _warned or not _LOG.isEnabledFor(logging.WARNING):
+        return
+    if len(_warned) >= _WARNED_LIMIT:
+        _warned.clear()
+    _warned.add(lines)
+    for line in lines:
+        _LOG.warning("%s", line)
+
+
+def _forget_warnings() -> None:
+    """Empty the record of warnings already logged, so the next load warns again. For tests."""
+    _warned.clear()
+
+
 #: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
 #: id, and 3 in MSH, because MSH-1 and MSH-2 hold the message's own delimiters. With either of
 #: those rewritten the output has no readable header, and the leak-check has no separators to
@@ -300,6 +353,18 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     A keep on a :data:`DEFAULT_RULES` path turns that default scrub off. Each one is logged at
     WARNING, by field address and kind only; :func:`kept_defaults` lists them (BACKLOG #2268).
+
+    An overlay that points a :data:`DEFAULT_RULES` path at a DIFFERENT kind is logged at WARNING
+    too, by field address, default kind and new kind; :func:`retargeted_defaults` lists them. A
+    different kind can leave part of the field as captured: ``id``, ``mrn`` and ``ssn`` rewrite
+    the first component only, so on ``PID-5`` they leave the given name. A retarget to the same
+    kind changes nothing and a ``drop`` blanks the field, so neither warns (BACKLOG #3000).
+
+    Both warnings are logged once per process for one set of lines, not once per call, so a
+    caller that passes ``overlay=`` for every message does not repeat them.
+
+    A schema refusal quotes at most :data:`_QUOTE_LIMIT` characters of any one overlay key or
+    value, and of the whole list of unknown keys.
     """
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     if overlay is None:
@@ -335,7 +400,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     unknown_top = set(data) - {"hl7"}
     if unknown_top:
         raise RuleError(
-            f"anon overlay has unexpected top-level key(s) {sorted(unknown_top)}; "
+            f"anon overlay has unexpected top-level key(s) {_quoted(sorted(unknown_top))}; "
             "only an [hl7] section (fields/keep/drop) is allowed"
         )
     hl7 = data.get("hl7", {})
@@ -344,7 +409,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     unknown_hl7 = set(hl7) - {"fields", "keep", "drop"}
     if unknown_hl7:
         raise RuleError(
-            f"anon overlay [hl7] has unexpected key(s) {sorted(unknown_hl7)}; "
+            f"anon overlay [hl7] has unexpected key(s) {_quoted(sorted(unknown_hl7))}; "
             "only 'fields', 'keep', 'drop' are allowed"
         )
 
@@ -369,14 +434,22 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
             f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, which no rule can "
             "rewrite: MSH-1 and MSH-2 hold the message's delimiters. Remove the rule"
         )
-    for cancelled in kept_defaults(rules):
-        _LOG.warning(
-            "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
-            "as captured",
-            overlay,
-            cancelled.path,
-            cancelled.kind.value,
+    # Field addresses and kinds only, never a value.
+    _warn_once(
+        (
+            *(
+                f"anon overlay {overlay} keeps {cancelled.path}, which turns off its default "
+                f"{cancelled.kind.value} scrub: the field is left as captured"
+                for cancelled in kept_defaults(rules)
+            ),
+            *(
+                f"anon overlay {overlay} retargets {default.path} from its default "
+                f"{default.kind.value} scrub to {now.kind.value}: a different kind can leave "
+                "part of the field as captured"
+                for default, now in retargeted_defaults(rules)
+            ),
         )
+    )
     return rules
 
 
@@ -403,6 +476,32 @@ def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
     """
     kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP}
     return tuple(r for r in DEFAULT_RULES if r.path in kept)
+
+
+def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, FieldRule], ...]:
+    """The :data:`DEFAULT_RULES` entries that ``rules`` scrubs with a DIFFERENT kind, each as
+    ``(default rule, rule now in force)``, in :data:`DEFAULT_RULES` order.
+
+    The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
+    value behind while the leak-check still counts the field as scrubbed. ``id``, ``mrn`` and
+    ``ssn`` rewrite the first component only: on ``PID-5`` that leaves the given name, on
+    ``PID-11`` the city and postal code, on ``PV1-7`` the clinician's name. ``date`` keeps the
+    year, so on ``PID-7`` it keeps the birth year. No ordering of the kinds says which retarget is
+    safe, because what ``date`` leaves depends on the value. So every change of kind is listed,
+    with two exceptions: a ``drop``, which blanks the field, and a ``keep``, which
+    :func:`kept_defaults` lists. A rule that names the default's own kind changed nothing and is
+    not listed. :func:`load_rules` logs each entry, and a caller with a console of its own can
+    repeat them there.
+    """
+    now = {r.path: r for r in rules}
+    quiet = (SurrogateKind.KEEP, SurrogateKind.DROP)
+    return tuple(
+        (default, now[default.path])
+        for default in DEFAULT_RULES
+        if default.path in now
+        and now[default.path].kind != default.kind
+        and now[default.path].kind not in quiet
+    )
 
 
 def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:

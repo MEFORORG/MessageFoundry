@@ -49,7 +49,7 @@ from tee import __version__, mefor_api
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
 from tee.anon.leak import CoverageTally
-from tee.anon.rules import RuleError, kept_defaults, load_rules
+from tee.anon.rules import RuleError, kept_defaults, load_rules, retargeted_defaults
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -630,6 +630,20 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             "warning: the overlay keeps "
             + ", ".join(f"{rule.path} ({rule.kind.value})" for rule in kept)
             + ", which turns off the default scrub of each: those fields are not rewritten",
+            file=sys.stderr,
+        )
+    # Printed for the same reason. A different kind can leave part of a field in the dataset
+    # while the leak-check counts the field as scrubbed (BACKLOG #3000).
+    retargeted = retargeted_defaults(rules)
+    if retargeted:
+        print(
+            "warning: the overlay retargets "
+            + ", ".join(
+                f"{default.path} ({default.kind.value} to {now.kind.value})"
+                for default, now in retargeted
+            )
+            + ", which replaces the default scrub of each: a different kind can leave part of "
+            "the field as captured",
             file=sys.stderr,
         )
 

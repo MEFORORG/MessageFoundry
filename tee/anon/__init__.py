@@ -37,6 +37,7 @@ from .rules import (
     SurrogateKind,
     kept_defaults,
     load_rules,
+    retargeted_defaults,
 )
 
 __all__ = [
@@ -54,6 +55,7 @@ __all__ = [
     "leak_check",
     "leak_report",
     "load_rules",
+    "retargeted_defaults",
 ]
 
 
