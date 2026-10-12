@@ -2158,8 +2158,12 @@ What the `date` kind does to a value:
   Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
   whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
   because a rule maps it, so nothing refuses these. A message that declares a digit or one of
-  `+ - . : / < > =` as a separator keeps no numeric value at all. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word under one of them, such as
-  a surname, would still leave whole.
+  `+ - . : / < > =` as its component, repetition or subcomponent separator keeps no numeric
+  `OBX-5` value. The guard does not read the field separator. Under a field separator of `-`, at
+  least a value such as `000-12-3456` would still leave whole. The message itself splits it
+  across `OBX-5`, `OBX-6` and `OBX-7`. The first part is a valid number, and no rule maps the
+  other two fields. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word
+  under one of them, such as a surname, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
   kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
@@ -2201,8 +2205,10 @@ refuses.
 
 **A keep on a field the default rules scrub turns that scrub off.** A keep on `PID-5` leaves the
 patient name in the output as captured, whatever the keep was added for. A default-scrubbed field
-already counts as decided, so a keep on one never clears a refusal. `load_rules` logs a WARNING for each
-such field. The line names the field and the kind of scrub it lost, never a value. A keep on a
+already counts as decided, so a keep on one never clears a refusal. `load_rules` logs one WARNING
+line for each such field, but not on every load. It remembers each set of lines it has logged in
+this process, and skips a set it remembers. The line names the field and the kind of scrub it
+lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.
 
