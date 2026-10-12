@@ -49,9 +49,21 @@ class _NoTlsLoad:
         raise AssertionError("the TLS library was handed an encrypted block")
 
 
+def _contexts(kind: type) -> tuple[list[Any], Any]:
+    """A context factory that builds ``kind``, and the list of every context it built."""
+    made: list[Any] = []
+
+    def factory() -> Any:
+        made.append(kind())
+        return made[-1]
+
+    return made, factory
+
+
 def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
     """A narrowed connection that opens no socket, to Vault directly or through an https proxy."""
     cls = _narrowed_pool_classes(factory, connector="Vault test hop")["https"].ConnectionCls
+    conn: Any
     if proxied:
         conn = cls(
             "vault.test",
@@ -89,12 +101,7 @@ def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: s
     """Red under: the ``_refuse_encrypted_ca_text`` call removed from ``connect``. Through a proxy
     the stand-in context then raises its ``AssertionError``, and direct the stand-in socket raises
     ``_Stopped``. The refusal is the type a failed CA load raises, with fixed text."""
-    made: list[_NoTlsLoad] = []
-
-    def factory() -> _NoTlsLoad:
-        made.append(_NoTlsLoad())
-        return made[-1]
-
+    made, factory = _contexts(_NoTlsLoad)
     conn = _connection(factory, proxied=proxied, ca_cert_data=text)
     with pytest.raises(urllib3.exceptions.SSLError, match="encryption header") as refusal:
         conn.connect()
@@ -119,12 +126,7 @@ def test_other_ca_data_still_reaches_the_proxy_leg_load(data: str | bytes) -> No
     """The control: the check refuses only flagged text, and everything else is loaded as before.
     A header above the first block passes, as it does in ``anchor_cadata``, because OpenSSL skips
     every line outside a block. ``bytes`` are never checked: the load reads them as DER."""
-    made: list[_RecordingContext] = []
-
-    def factory() -> _RecordingContext:
-        made.append(_RecordingContext())
-        return made[-1]
-
+    made, factory = _contexts(_RecordingContext)
     conn = _connection(factory, proxied=True, ca_cert_data=data)
     with pytest.raises(_Stopped):
         conn.connect()
@@ -139,12 +141,7 @@ def test_a_ca_directory_reaches_the_proxy_leg_and_is_not_refused(tmp_path: Path)
     and ``CURL_CA_BUNDLE`` the same way. This drives requests' own pool builder with a directory as
     ``verify``, so it pins the hand-off and not a copy of it. Red under: a refusal of a set
     ``ca_cert_dir``, which would stop a hop that works today."""
-    made: list[_RecordingContext] = []
-
-    def factory() -> _RecordingContext:
-        made.append(_RecordingContext())
-        return made[-1]
-
+    made, factory = _contexts(_RecordingContext)
     adapter = StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
     request = requests.Request("GET", "https://vault.test:8200/v1/sys/health").prepare()
     pool = adapter.get_connection_with_tls_context(
