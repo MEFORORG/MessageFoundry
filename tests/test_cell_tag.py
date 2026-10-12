@@ -103,7 +103,7 @@ def test_open_message_cell_refuses_a_moved_cell_and_alerts() -> None:
 
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
 #: Backends not yet moved onto the builders in this branch's earlier commits.
-_UNCONVERTED = {"postgres.py", "sqlserver.py"}
+_UNCONVERTED = {"sqlserver.py"}
 
 
 def _literal_cells(path: pathlib.Path, tables: set[str]) -> int:

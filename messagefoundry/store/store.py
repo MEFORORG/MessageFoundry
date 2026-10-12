@@ -103,6 +103,7 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.cell_tag import (
     CellTagError,
     audits_cell_tag,
+    dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
     open_message_cell,
@@ -8491,6 +8492,7 @@ class MessageStore:
             ),
         )
 
+    @dead_letters_on_cell_tag
     async def transform_handoff(
         self,
         *,
@@ -8663,15 +8665,7 @@ class MessageStore:
             for ck, cv in applied:
                 self._state_cache[ck] = cv
 
-        try:
-            result = bool(await self._run_grouped(_body, on_commit=_publish))
-        except CellTagError as err:
-            # BACKLOG #2593: the message's metadata cell does not belong to its row. The handoff
-            # rolled back; the routed row is dead-lettered so the lane moves on and the message is
-            # ERROR, and the failure is audited (the alert was raised at the read).
-            await self.dead_letter_now(routed_id, str(err))
-            await report_cell_tag_failure(self, err)
-            return False
+        result = bool(await self._run_grouped(_body, on_commit=_publish))
         return result
 
     async def _insert_message(

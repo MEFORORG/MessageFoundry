@@ -33,7 +33,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any, Concatenate, Final, Protocol
 
 from messagefoundry.store.crypto import NO_STORE_ID, CipherError, cell_aad
@@ -51,6 +51,7 @@ __all__ = [
     "PRESET_TAG_FAILED_ACTION",
     "CellTagError",
     "audits_cell_tag",
+    "dead_letters_on_cell_tag",
     "is_row_tagged",
     "message_cell_aad",
     "open_message_cell",
@@ -302,8 +303,8 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
 
 
 def audits_cell_tag[S: _AuditSink, **P, R](
-    fn: Callable[Concatenate[S, P], Awaitable[R]],
-) -> Callable[Concatenate[S, P], Awaitable[R]]:
+    fn: Callable[Concatenate[S, P], Coroutine[Any, Any, R]],
+) -> Callable[Concatenate[S, P], Coroutine[Any, Any, R]]:
     """Wrap a store read entry point so a :class:`CellTagError` it raises is audited before it
     propagates. Apply it only to a method no store method calls while holding the writer lock: the
     audit write takes that lock."""
@@ -314,6 +315,33 @@ def audits_cell_tag[S: _AuditSink, **P, R](
         except CellTagError as err:
             await report_cell_tag_failure(self, err)
             raise
+
+    functools.update_wrapper(wrapper, fn)
+    return wrapper
+
+
+class _DeadLetterSink(_AuditSink, Protocol):
+    async def dead_letter_now(
+        self, outbox_id: str, error: str, now: float | None = None
+    ) -> None: ...
+
+
+def dead_letters_on_cell_tag[S: _DeadLetterSink, **P](
+    fn: Callable[Concatenate[S, P], Coroutine[Any, Any, bool]],
+) -> Callable[Concatenate[S, P], Coroutine[Any, Any, bool]]:
+    """Wrap a stage handoff whose keyword ``routed_id`` names the in-flight row it consumes. When the
+    handoff raises :class:`CellTagError`, its transaction has rolled back: the row is dead-lettered so
+    the lane moves on and the message is ``ERROR`` (count-and-log), the failure is audited (the alert
+    was raised at the read), and the handoff reports ``False``. Without this the runner would read the
+    raise as an infrastructure fault and re-pend the row until the inbound stopped."""
+
+    async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
+        try:
+            return await fn(self, *args, **kwargs)
+        except CellTagError as err:
+            await self.dead_letter_now(str(kwargs["routed_id"]), str(err))
+            await report_cell_tag_failure(self, err)
+            return False
 
     functools.update_wrapper(wrapper, fn)
     return wrapper

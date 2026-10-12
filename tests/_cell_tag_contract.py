@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
+from uuid import uuid4
 
 from messagefoundry.store.cell_tag import MESSAGE_TAG_FAILED_ACTION, PRESET_TAG_FAILED_ACTION
 from messagefoundry.store.content_search import make_spec
@@ -31,6 +32,9 @@ RawSql = Callable[[str, tuple[Any, ...]], Awaitable[None]]
 RawFetch = Callable[[str, tuple[Any, ...]], Awaitable[list[dict[str, Any]]]]
 
 _RAW = "MSH|^~\\&|SYNTH|F|R|RF|20260101||ADT^A01|CT1|P|2.5.1\rPID|1||SYNTH-200||DOE^JOHN\r"
+#: Keys and owners the contract mints carry this, so a rerun on a database that kept the last
+#: run's rows does not collide with them.
+_RUN = uuid4().hex[:8]
 _META = json.dumps({"user": {"k": "SYNTH-META"}})
 
 
@@ -93,13 +97,13 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
     cipher.set_tag_failure_hook(hook)
 
     # --- control: an untouched message reads in full ------------------------------------------
-    ctl = await _message(store, "IB_CT_A")
+    ctl = await _message(store, f"IB_CT_A_{_RUN}")
     _assert_reads(await store.get_message(ctl))
     assert await store.message_metadata_json(ctl) == _META
 
     # --- a message moved to another channel is refused, alerted and audited ---------------------
-    moved = await _message(store, "IB_CT_B")
-    await raw("UPDATE messages SET channel_id=? WHERE id=?", ("IB_CT_A", moved))
+    moved = await _message(store, f"IB_CT_B_{_RUN}")
+    await raw("UPDATE messages SET channel_id=? WHERE id=?", (f"IB_CT_A_{_RUN}", moved))
     await _refused(lambda: store.get_message(moved), "get_message")
     assert hook.saw("messages", moved)
     assert await _audited(fetch, MESSAGE_TAG_FAILED_ACTION, moved) == 1
@@ -109,23 +113,25 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
     # The list still shows the moved row by its plaintext columns, its cells withheld; the
     # untouched row beside it lists in full.
     listed = {
-        r["id"]: r for r in await store.list_messages(channel_id="IB_CT_A", allowed_channels=None)
+        r["id"]: r
+        for r in await store.list_messages(channel_id=f"IB_CT_A_{_RUN}", allowed_channels=None)
     }
     assert listed[ctl]["summary"] == "SYNTH-SUMMARY" and listed[ctl]["metadata"] == _META
     assert listed[moved]["summary"] is None and listed[moved]["error"] is None
-    assert listed[moved]["metadata"] is None and listed[moved]["channel_id"] == "IB_CT_A"
+    assert listed[moved]["metadata"] is None and listed[moved]["channel_id"] == f"IB_CT_A_{_RUN}"
 
     # Content search cannot match a moved row; the untouched row still matches.
     found = await store.search_messages(
         make_spec(content="SYNTH-200", field_path=None, field_value=None),
-        channel_id="IB_CT_A",
+        channel_id=f"IB_CT_A_{_RUN}",
         allowed_channels=None,
     )
-    assert [r["id"] for r in found.rows] == [ctl], found.rows
+    found_ids = {r["id"] for r in found.rows}
+    assert ctl in found_ids and moved not in found_ids, found_ids
 
     # --- a cell copied onto another row of the same channel is refused --------------------------
-    m1 = await _message(store, "IB_CT_C")
-    m2 = await _message(store, "IB_CT_C")
+    m1 = await _message(store, f"IB_CT_C_{_RUN}")
+    m2 = await _message(store, f"IB_CT_C_{_RUN}")
     cells = {
         r["id"]: r for r in await fetch("SELECT id, raw FROM messages WHERE id IN (?, ?)", (m1, m2))
     }
@@ -135,21 +141,27 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
 
     # --- a dead-letter list keeps a moved message's row and withholds its summary ---------------
     dmid = await store.enqueue_message(
-        channel_id="IB_CT_D", raw=_RAW, summary="SYNTH-SUMMARY", deliveries=[("OB_CT_D", "B")]
+        channel_id=f"IB_CT_D_{_RUN}",
+        raw=_RAW,
+        summary="SYNTH-SUMMARY",
+        deliveries=[(f"OB_CT_D_{_RUN}", "B")],
     )
-    item = await store.claim_next_fifo("OB_CT_D")
+    item = await store.claim_next_fifo(f"OB_CT_D_{_RUN}")
     assert item is not None
     await store.dead_letter_now(item.id, "synthetic permanent reject")
     dctl = await store.enqueue_message(
-        channel_id="IB_CT_D", raw=_RAW, summary="SYNTH-SUMMARY", deliveries=[("OB_CT_D", "B")]
+        channel_id=f"IB_CT_D_{_RUN}",
+        raw=_RAW,
+        summary="SYNTH-SUMMARY",
+        deliveries=[(f"OB_CT_D_{_RUN}", "B")],
     )
-    item = await store.claim_next_fifo("OB_CT_D")
+    item = await store.claim_next_fifo(f"OB_CT_D_{_RUN}")
     assert item is not None
     await store.dead_letter_now(item.id, "synthetic permanent reject")
-    await raw("UPDATE messages SET channel_id=? WHERE id=?", ("IB_CT_E", dmid))
+    await raw("UPDATE messages SET channel_id=? WHERE id=?", (f"IB_CT_E_{_RUN}", dmid))
     dead = {
         r["message_id"]: r
-        for r in await store.list_dead(destination_name="OB_CT_D", allowed_channels=None)
+        for r in await store.list_dead(destination_name=f"OB_CT_D_{_RUN}", allowed_channels=None)
     }
     assert dead[dctl]["summary"] == "SYNTH-SUMMARY"  # control
     assert dead[dmid]["summary"] is None
@@ -157,12 +169,12 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
 
     # --- an edit-and-resubmit from a moved origin is refused -----------------------------------
     outcome = await store.reingress(
-        origin_message_id=ctl, raw=_RAW, idempotency_key="ct-reingress-ctl"
+        origin_message_id=ctl, raw=_RAW, idempotency_key=f"ct-reingress-ctl-{_RUN}"
     )
     assert outcome.status != "duplicate"  # control: an untouched origin resubmits
     await _refused(
         lambda: store.reingress(
-            origin_message_id=moved, raw=_RAW, idempotency_key="ct-reingress-moved"
+            origin_message_id=moved, raw=_RAW, idempotency_key=f"ct-reingress-moved-{_RUN}"
         ),
         "reingress",
     )
@@ -198,20 +210,20 @@ async def _assert_transform_handoff(store: Any, raw: RawSql, fetch: RawFetch, ho
                 routed_id=routed_id,
                 message_id=mid,
                 channel_id=channel_id,
-                deliveries=[("OB_CT_T", "SYNTH-OUT")],
+                deliveries=[(f"OB_CT_T_{_RUN}", "SYNTH-OUT")],
                 meta_ops=[("added", "SYNTH-ADDED")],
             )
         )
 
     # Control: an untouched message hands off, and its merged metadata reads back.
-    mid, rid = await _routed(store, fetch, "IB_CT_T")
-    assert await handoff(mid, rid, "IB_CT_T") is True
+    mid, rid = await _routed(store, fetch, f"IB_CT_T_{_RUN}")
+    assert await handoff(mid, rid, f"IB_CT_T_{_RUN}") is True
     merged = json.loads(await store.message_metadata_json(mid) or "{}")
     assert merged["user"]["added"] == "SYNTH-ADDED"
 
-    mid, rid = await _routed(store, fetch, "IB_CT_U")
-    await raw("UPDATE messages SET channel_id=? WHERE id=?", ("IB_CT_T", mid))
-    assert await handoff(mid, rid, "IB_CT_U") is False
+    mid, rid = await _routed(store, fetch, f"IB_CT_U_{_RUN}")
+    await raw("UPDATE messages SET channel_id=? WHERE id=?", (f"IB_CT_T_{_RUN}", mid))
+    assert await handoff(mid, rid, f"IB_CT_U_{_RUN}") is False
     rows = await fetch("SELECT status, stage FROM queue WHERE message_id=?", (mid,))
     assert rows == [{"status": OutboxStatus.DEAD.value, "stage": Stage.ROUTED.value}], rows
     status = await fetch("SELECT status FROM messages WHERE id=?", (mid,))
@@ -222,17 +234,18 @@ async def _assert_transform_handoff(store: Any, raw: RawSql, fetch: RawFetch, ho
 
 async def _assert_presets(store: Any, raw: RawSql, fetch: RawFetch, hook: _Hook) -> None:
     criteria = json.dumps({"content": "SYNTH-200"})
+    owner1, owner2 = f"u-ct-1-{_RUN}", f"u-ct-2-{_RUN}"
     ctl, _ = await store.upsert_search_preset(
-        preset_id="ct-preset-ctl", owner_user_id="u-ct-2", name="ctl", criteria=criteria
+        preset_id=uuid4().hex, owner_user_id=owner2, name="ctl", criteria=criteria
     )
     pid, _ = await store.upsert_search_preset(
-        preset_id="ct-preset-moved", owner_user_id="u-ct-1", name="moved", criteria=criteria
+        preset_id=uuid4().hex, owner_user_id=owner1, name="moved", criteria=criteria
     )
-    got = await store.get_search_preset(preset_id=pid, owner_user_id="u-ct-1")
+    got = await store.get_search_preset(preset_id=pid, owner_user_id=owner1)
     assert got is not None and got["criteria"] == criteria  # control, before the move
-    await raw("UPDATE search_presets SET owner_user_id=? WHERE id=?", ("u-ct-2", pid))
-    await _refused(lambda: store.get_search_preset(preset_id=pid, owner_user_id="u-ct-2"), "preset")
+    await raw("UPDATE search_presets SET owner_user_id=? WHERE id=?", (owner2, pid))
+    await _refused(lambda: store.get_search_preset(preset_id=pid, owner_user_id=owner2), "preset")
     assert hook.saw("search_presets", pid)
     assert await _audited(fetch, PRESET_TAG_FAILED_ACTION, pid) == 1
-    got = await store.get_search_preset(preset_id=ctl, owner_user_id="u-ct-2")
+    got = await store.get_search_preset(preset_id=ctl, owner_user_id=owner2)
     assert got is not None and got["criteria"] == criteria  # control: the owner's own preset

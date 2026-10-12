@@ -1389,6 +1389,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.crypto",
             # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
             "cipher:via messagefoundry.store.queue_tag",
+            # BACKLOG #2593: message cells and preset criteria open under their row tag.
+            "cipher:via messagefoundry.store.cell_tag",
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
