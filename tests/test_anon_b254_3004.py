@@ -265,6 +265,24 @@ def test_a_direct_leak_report_takes_the_version(side: Any) -> None:
     assert "PRT (line with no fields)" in report.unmapped_fields
 
 
+@pytest.mark.parametrize("index", _REFUSING_SALTS)
+@_LEAK_SIDES
+def test_a_caller_that_runs_the_two_steps_itself_can_pass_the_version(
+    side: Any, index: int
+) -> None:
+    """``anonymize`` then ``leak_check``, as a caller outside ``anonymize_checked`` runs them.
+    Without the input's version the check still reads the surrogate in its own text; with it,
+    the answer matches ``anonymize_checked``. Both names are exported."""
+    rules = _with_version_rule(side)
+    message = _message(_BARE_PRT, version="2.7")
+    out = side.anon.anonymize(message, salt=_salt(index), rules=rules)
+    assert side.anon.leak_check(out, rules=rules) == [side.leak.MALFORMED_LINE_HIT]
+    version = side.anon.message_version(message)
+    assert version == "2.7"
+    assert side.anon.leak_check(out, rules=rules, version=version) == []
+    assert "message_version" in side.anon.__all__
+
+
 def test_the_two_packages_agree_on_the_version_of_every_case() -> None:
     """Parity, for the helper the leak-check now depends on."""
     for text in (_message(version="2.7"), "\x0bLEE\rMSH\r" + _msh("2.4^X"), "PID|1", ""):
@@ -354,7 +372,8 @@ def test_the_tee_summary_counts_a_message_refused_before_the_leak_check(
     assert code == 1 and not out.exists()
     assert "coverage: 1 message(s) reached the leak-check" in text
     assert _NOT_COUNTED.format(n=2) in text
-    assert "a line no rule can reach, which a report lists as (malformed segment)-0" in text
+    assert "a line no rule can reach, which a report would list as (malformed segment)-0" in text
+    assert "This line cannot say which cause applies. Among the causes, at least:" in text
     assert "error: 2 of 3 message(s) failed anonymization" in text
     assert _OF_THEM.format(n=2) in text
     assert _WRAPPED not in text  # addresses and counts only, never the line's text

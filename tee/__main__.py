@@ -327,7 +327,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--require-full-coverage",
         action="store_true",
         help="refuse any field no rule scrubs and no anon.toml keep names (set ids, PID-8 and "
-        "PV1-2 excepted); off by default",
+        "PV1-2 excepted), and any line holding only a segment id unless a rule or a keep names "
+        "a field of that segment; off by default",
     )
     anon.add_argument(
         "--log-level",

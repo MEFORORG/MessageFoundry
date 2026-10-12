@@ -62,6 +62,7 @@ __all__ = [
     "leak_check",
     "leak_report",
     "load_rules",
+    "message_version",
     "retargeted_defaults",
 ]
 

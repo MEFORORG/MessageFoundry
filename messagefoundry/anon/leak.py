@@ -261,8 +261,8 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
     id, or the line has no field separator and its text is not an id in ``defined``.
 
     A segment with no fields is legal HL7, so a bare ``PV2`` is an empty segment and passes;
-    :func:`unmapped_field_values` gives it a coverage record. A bare ``LEE`` or ``ZOE`` is three letters of untrusted text that no rule can address,
-    so it is malformed. ``defined`` is the ids the message's HL7 version defines plus the ids a
+    :func:`unmapped_field_values` gives it a coverage record. A bare ``LEE`` or ``ZOE`` is three
+    letters of untrusted text that no rule can address, so it is malformed. ``defined`` is the ids the message's HL7 version defines plus the ids a
     rule names, so a bare ``ZPD`` is an empty segment only when a rule names ``ZPD``. A Z-prefix
     alone does not count (BACKLOG #2247).
 
@@ -310,11 +310,13 @@ def unmapped_field_values(
     ``mapped_paths`` and whose value is non-empty — the fields the rule map never touched. One
     kind of record has an empty value: the one a bare line gets, described below.
 
-    ``version`` is the HL7 version to judge a bare line by. Left out, it is read from the header
-    of ``text``. A caller that checks OUTPUT passes the version of the INPUT
-    (:func:`message_version`): a rule on MSH-12 writes a surrogate there, and a surrogate version
-    can leave out an id the real version defines, so a line that passed on the way in would be
-    refused on the way out (BACKLOG #3004).
+    ``version`` is the HL7 version whose segment ids count as defined. It decides which bare line
+    passes, and which segment ids are printed in an address rather than as
+    :data:`UNKNOWN_SEGMENT`, so pass only the version the message really came with. Left out, it
+    is read from the header of ``text``. A caller that checks OUTPUT passes the version of the
+    INPUT (:func:`message_version`): a rule on MSH-12 writes a surrogate there, and a surrogate
+    version can leave out an id the real version defines, so a line that passed on the way in
+    would be refused on the way out (BACKLOG #3004).
 
     The MSH control header is skipped whole: it carries routing/site data the field-anchored
     site-code pass already covers, not patient PHI. The header is the ONE line
@@ -563,12 +565,15 @@ def leak_report(
     )
 
 
-def leak_check(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> list[str]:
+def leak_check(
+    text: str, *, rules: tuple[FieldRule, ...] | None = None, version: str | None = None
+) -> list[str]:
     """Forbidden-token + structural PHI hits in ``text`` (empty list = clean) — a thin wrapper over
     :func:`leak_report`. ``rules`` scopes the structural PHI-shape detectors to the fields no rule
-    matched; omitting it (a bare-string call) runs the legacy token-only check.
+    matched; omitting it (a bare-string call) runs the legacy token-only check. A caller that
+    ran ``anonymize`` itself passes ``version=message_version(raw)``, as :func:`leak_report` says.
     """
-    return leak_report(text, rules=rules).hits
+    return leak_report(text, rules=rules, version=version).hits
 
 
 def coverage_clause(report: LeakReport) -> str:
@@ -679,8 +684,9 @@ class CoverageTally:
         if self.refused:
             text += (
                 f" Not counted above: {self.refused} message(s) refused before the leak-check "
-                "built a report. The cause is at least one of these: no parseable MSH; a line "
-                f"no rule can reach, which a report lists as {_MALFORMED_LINE}; an HL7 version "
-                "in MSH-12 with a run of digits too long to read."
+                "built a report. This line cannot say which cause applies. Among the causes, at "
+                "least: no parseable MSH; a line no rule can reach, which a report would list "
+                f"as {_MALFORMED_LINE}; an HL7 version in MSH-12 with a run of digits too long "
+                "to read."
             )
         return text
