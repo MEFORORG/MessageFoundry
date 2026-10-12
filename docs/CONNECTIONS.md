@@ -1518,18 +1518,17 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 `bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
 by this rule. It has its own, below.
 
-**A proxy URL with credentials is refused unless it is written `https://` (vault BACKLOG #2572).**
-`urllib` sends a `user:password@` from a proxy URL to the proxy as a `Proxy-Authorization: Basic`
-header. Such a proxy is refused before each request, whether it comes from `proxy_url`, from
+**A credential in a proxy URL is refused on any leg where it would reach a proxy in cleartext,
+a second proxy included (vault BACKLOG #2572, #3410).** The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. A connection with such a `proxy_url` still builds, and each send then fails with this
-error. The error names no part of the proxy URL, and `[security].enforcement` does not relax it. A
-request that goes direct is not refused: one to a loopback host, or to a host that `NO_PROXY` or the
-system bypass list names. A connection's own `proxy_no_proxy` is not that list. A host it names
-skips the connection's `proxy_url` and still follows a proxy from the environment.
-**Writing the proxy `https://` is not refused, and it does not keep the credentials off the wire
-either.** When the leg to the proxy has no TLS is stated once, in
+broker. A connection with such a `proxy_url` still builds. The error names no part of the proxy
+URL, and `[security].enforcement` does not relax it. A request that goes direct, such as one to a
+loopback host, is not refused. A connection's own `proxy_no_proxy` is not urllib's bypass list. A
+host it names skips the connection's `proxy_url` and still follows a proxy from the environment.
+The rule, an example of a leg it lets through, and what it does not check are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). Which legs reach
+the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
 out of the proxy URL.
 
