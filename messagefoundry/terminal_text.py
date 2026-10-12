@@ -46,6 +46,13 @@ into ``\\u2014``. Its output is not pure ASCII, so it is for a stream already ha
 unencodable character (``messagefoundry.console_streams`` does that for the engine's command
 line).
 
+A MARKDOWN TABLE CELL. :func:`escape_for_markdown_cell` is the console rule above with
+``single_line`` and ``keep_printable_unicode``, then the escapes a GFM table cell needs. It is
+the rule the ``messagefoundry verify`` Markdown report and the harness acceptance Markdown report
+both write every cell by (BACKLOG #2897), so the two cannot drift apart again. What it covers,
+and at least what it leaves, is stated at :data:`_MD_CELL`. ``scripts/asvs/scorecard.py`` keeps
+a cell helper of its own, by design: its docstring says why.
+
 WHY THIS IS NOT IN :mod:`messagefoundry.controlchars`. That module's refusals screen C0 plus DEL,
 because their sinks are byte-oriented (a request line, a header, a file name). This rule is a
 different alphabet -- an allowlist of printable ASCII, not a denylist of C0 -- with a
@@ -66,7 +73,12 @@ import unicodedata
 
 from messagefoundry.controlchars import CONTROL_CATEGORIES, json_unicode_escape
 
-__all__ = ["CONTROL_CATEGORIES", "escape_for_terminal", "escape_json_for_terminal"]
+__all__ = [
+    "CONTROL_CATEGORIES",
+    "escape_for_markdown_cell",
+    "escape_for_terminal",
+    "escape_json_for_terminal",
+]
 
 #: THE STRICT ALPHABET: every character that is not printable ASCII, newline or tab. The JSON path
 #: uses it as is; the text path decides per character in :func:`_is_escaped`, which spells the same
@@ -192,3 +204,67 @@ def escape_json_for_terminal(text: str) -> str:
     byte for byte, and nothing is decoded and encoded again, which could alter a number or drop a
     duplicate key."""
     return _NOT_SHOWN_RE.sub(_json_escaped, text)
+
+
+#: What a GFM table cell would act on, each replaced by a character reference. References are
+#: decoded only after the row is split into cells and never take a structural role. ``&`` is in
+#: the set, or a peer's ``&#x202e;`` would render as the bidi control the terminal rule escaped.
+#: ``<`` opens raw HTML, which GitHub and most viewers render; ``>`` cannot act once ``<`` is
+#: escaped, and is escaped so the cell carries no raw angle bracket at all. The ``(`` after ``]``
+#: is what makes ``[text](url)`` a link whose text is not its target and ``![x](url)`` a remote
+#: image fetched on view; ``[`` alone stays, so the engine's own ``[store].path`` reads as typed. A
+#: backtick would open a code span, inside which no reference decodes, so it goes too, and the
+#: engine's own code spans render as plain backticks. ``$`` opens GitHub math, which could draw a
+#: large coloured PASS in a FAIL row.
+#: ``@`` and ``#`` become references, so the source carries no raw ``@name`` mention or ``#N``
+#: issue reference, and the ``:`` of ``://`` does too, so no raw ``scheme://`` URL is left to
+#: autolink (BACKLOG #2897). Each keeps the raw character out of the Markdown SOURCE. Whether a
+#: renderer that looks for mentions, references or links AFTER it decodes references is stopped
+#: was NOT measured; GitHub's mention handling may work that way.
+#: NOT covered, at least: a ``www.`` autolink; emphasis, strikethrough and emoji shortcodes, which
+#: still restyle the rendered text within its cell; a viewer that runs a MathJax-style
+#: auto-render over the rendered page, which can still find ``\(...\)``; and every invisible
+#: printable character but the four Hangul fillers at :data:`_MD_INVISIBLE`.
+_MD_CELL = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "|": "&#124;",
+    "](": "]&#40;",
+    "`": "&#96;",
+    "$": "&#36;",
+    "@": "&#64;",
+    "#": "&#35;",
+    "://": "&#58;//",
+}
+#: Spelled as a literal, not joined from the keys, so the ReDoS scan in
+#: ``tests/test_security_static.py`` can read it; ``tests/test_terminal_text_console_sinks.py``
+#: holds it to the keys above.
+_MD_CELL_RE = re.compile(r"[&<>|`$@#]|\]\(|://")
+#: Printable characters that render as blank space (Unicode category ``Lo``, so
+#: ``keep_printable_unicode`` keeps them): U+115F, U+1160, U+3164 and U+FFA0, the Hangul fillers.
+#: One can pad a cell so it reads as empty, or stand in for a space in a name. The cell shows
+#: each as a visible ``\uNNNN`` escape. The console keeps them; this is the cell's rule only.
+_MD_INVISIBLE = re.compile(r"[\u115f\u1160\u3164\uffa0]")
+#: A backslash run Markdown would eat: two or more (each pair reads as one), or one before ASCII
+#: punctuation, the references above included. Doubled, it renders as written, so the terminal
+#: rule's odd/even backslash convention and a UNC path survive the renderer.
+_MD_BACKSLASHES = re.compile(r"\\{2,}|\\(?=[!-/:-@\[-`{-~])")
+
+
+def escape_for_markdown_cell(text: str) -> str:
+    """``text`` made safe to write inside one cell of a GFM Markdown table (ASVS 1.1.2).
+
+    The console rule first, with ``single_line`` and ``keep_printable_unicode``: ESC, C1 and bidi
+    controls become visible escapes, and so do newline and CR, so a peer cannot start a forged
+    row and the file is safe to ``cat``. Then the blank fillers at :data:`_MD_INVISIBLE` as
+    visible escapes, then the Markdown escapes at :data:`_MD_CELL`, then the backslash runs at
+    :data:`_MD_BACKSLASHES`. Other printable Unicode, such as an em dash, is kept, so the caller
+    writes the file as UTF-8.
+
+    A filler's escape needs no backslash handling of its own: in that mode the console rule has
+    already doubled any backslash run standing before a non-ASCII character."""
+    shown = escape_for_terminal(text, single_line=True, keep_printable_unicode=True)
+    shown = _MD_INVISIBLE.sub(lambda m: _visible(m.group()), shown)
+    cell = _MD_CELL_RE.sub(lambda m: _MD_CELL[m.group()], shown)
+    return _MD_BACKSLASHES.sub(lambda m: m.group() * 2, cell)

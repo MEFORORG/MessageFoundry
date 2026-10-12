@@ -45,7 +45,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    Before this, a file swapped between the check and the load was trusted unchecked. The AD anchor
    joined in BACKLOG #2034: ``ldap3`` used to read it by path on every bind, and now gets the checked
    bytes as ``ca_certs_data``. **Not covered:** the audit row of the central preflight, which records
-   its own read rather than the consumer's, and the dialling CAs of item 9, which still load by path.
+   its own read rather than the consumer's, and the dialling CAs of items 9 and 10, which still
+   load by path.
 6. **An indeterminate read refuses at ``enforce``, and a matching pin is the escape** (BACKLOG #1142,
    slice 3). When the ACL or the path could not be settled, the engine cannot say who else can
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
@@ -94,6 +95,31 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    ``cafile=`` loads what ``cadata=`` refuses. Item 5 closed the same gap for the inbound CAs.
    A CA the hop never reads, such as one behind ``use_tls=False`` or an ``http://`` url, is not
    checked, and a pin beside it is refused (:func:`unread_ca_reason`).
+10. **The dialling settings CAs** (vault BACKLOG #3188). At least three settings name a CA that an
+    engine hop verifies its server with: ``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``
+    and ``[logging].forward_tls_ca_file``. :func:`collect_anchor_specs` adds each to the settings
+    preflight when its hop reads it, so it takes the checks of items 1 to 4 at start and at every
+    reload. An exposed or unjudged CA refuses the start or the reload at ``enforce``. A CA its hop
+    does not read is not checked: the internal CA under ``trust_anchor_mode = "system"``, and the
+    other two when their sender is off, sends in cleartext or verifies nothing.
+
+    **Not covered**, as in item 9: these hops load the file by path with ``cafile=``, so the
+    checked bytes are not the loaded bytes. The specs carry ``loads_verified_bytes=False`` and no
+    pin, so no pin can stand in for an unjudged read, and the PEM shape checks are skipped. The
+    hops read the file on their own schedule, not at the check. The SMTP hop reads it at every
+    send, so a file swapped between reloads is trusted by the next send, and this check finds the
+    swap at the next reload. A connection that falls back to the internal CA reads it when it is
+    built, and the log forwarder reads it once, when ``serve`` builds it. Those keep the bytes they
+    read until they are built again, but item 8's restart report skips these anchors, since no
+    consumer records a fingerprint for them: a reload writes ``changed`` and no
+    ``restart_required``. The internal CA is checked under ``augment`` or ``pinned`` even when every
+    hop is loopback or names its own ``tls_ca_file``, and so never reads it.
+
+    At least four readers come before or outside this check. At start, ``serve`` builds the log
+    forwarder, and the API lifespan starts the alert notifier, before the lifespan runs this
+    preflight, so an alert sent during startup, or the forwarder's first records, use a CA not yet
+    checked. ``supervise`` builds its own forwarder and runs no preflight. The offline security
+    notifier of the recovery commands builds an SMTP hop with no check.
 """
 
 from __future__ import annotations
@@ -124,7 +150,13 @@ from messagefoundry.redaction import codec_safe_str
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
-    from messagefoundry.config.settings import ApiSettings, AuthSettings
+    from messagefoundry.config.settings import (
+        AlertsSettings,
+        ApiSettings,
+        AuthSettings,
+        LoggingSettings,
+        TlsSettings,
+    )
     from messagefoundry.config.wiring import Registry, WiringError
     from messagefoundry.store.base import Store
 
@@ -155,6 +187,7 @@ class AnchorSpec:
     """One operator-supplied trust anchor to preflight.
 
     ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"`` /
+    ``"tls_internal_ca"`` / ``"alerts_email_ca"`` / ``"logging_forward_ca"`` /
     ``"inbound:<connection>"`` / ``"outbound:<connection>"`` / ``"fhir_lookup:<name>"``);
     ``setting`` is the human-facing config key for messages; ``path`` is the configured PEM; ``pin``
     is the optional configured SHA-256 pin (any case, optional ``:`` separators); ``pin_setting``
@@ -165,8 +198,8 @@ class AnchorSpec:
     for an unreadable ACL or path, and why the anchor takes the PEM shape checks of
     :func:`anchor_cadata`. **A consumer that reads the file again by path must not reuse a spec
     with this True**: the pin would vouch for bytes it never loaded. The AD anchor did exactly that
-    until BACKLOG #2034. The dialling CAs of module item 9 still read by path, so their specs
-    carry ``False``."""
+    until BACKLOG #2034. The dialling CAs of module items 9 and 10 still read by path, so their
+    specs carry ``False``."""
 
     label: str
     setting: str
@@ -1331,24 +1364,100 @@ def registry_anchor_specs(
     return specs
 
 
-def collect_anchor_specs(auth: AuthSettings, api: ApiSettings) -> list[AnchorSpec]:
-    """Every configured operator-supplied trust anchor, in a stable order. An anchor with no path set
-    is omitted, so an install with no OIDC/AD/mTLS anchor yields an empty list: the dormant,
-    byte-identical path.
+def internal_ca_anchor_spec(tls: TlsSettings) -> AnchorSpec | None:
+    """The ``[tls].internal_ca_file`` anchor spec, or ``None`` when no hop reads it (vault BACKLOG
+    #3188). Under ``trust_anchor_mode = "system"``, the default, every hop ignores the file
+    (:func:`~messagefoundry.config.tls_policy.resolve_trust_anchor`), so it is not checked. Each
+    hop loads it with ``cafile=``, so the spec carries ``loads_verified_bytes=False`` and no pin."""
+    if not tls.internal_ca_file or tls.trust_anchor_mode == "system":
+        return None
+    return AnchorSpec(
+        "tls_internal_ca",
+        "[tls].internal_ca_file",
+        tls.internal_ca_file,
+        loads_verified_bytes=False,
+    )
+
+
+def alerts_email_anchor_spec(alerts: AlertsSettings, auth: AuthSettings) -> AnchorSpec | None:
+    """The ``[alerts].email_tls_ca_file`` anchor spec, or ``None`` when no SMTP hop trusts it (vault
+    BACKLOG #3188).
+
+    Two senders read it: the alert email transport, built with ``email_smtp_host``, ``email_from``
+    and an ``email_to``; and the security notifier, built with ``[auth].notify_security_events``,
+    ``email_smtp_host`` and ``email_from``. Either hop trusts the file only with ``email_use_tls``
+    and ``email_tls_verify`` on: ``email_tls_verify=false`` loads it into a context that verifies
+    nothing. The hop loads it with ``cafile=``, so the spec carries ``loads_verified_bytes=False``
+    and no pin."""
+    if not (alerts.email_tls_ca_file and alerts.email_use_tls and alerts.email_tls_verify):
+        return None
+    if not (alerts.email_smtp_host and alerts.email_from):
+        return None
+    if not (alerts.email_to or auth.notify_security_events):
+        return None
+    return AnchorSpec(
+        "alerts_email_ca",
+        "[alerts].email_tls_ca_file",
+        alerts.email_tls_ca_file,
+        loads_verified_bytes=False,
+    )
+
+
+def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:
+    """The ``[logging].forward_tls_ca_file`` anchor spec, or ``None`` when the forwarder does not
+    trust it (vault BACKLOG #3188). ``serve`` builds the forwarder with ``forward_enabled`` and a
+    ``forward_host``, and it reads the file only with ``forward_protocol = "tls"``. With
+    ``forward_tls_verify=false`` it loads the file into a context that verifies nothing, so that
+    case is not checked either. The forwarder loads it with ``cafile=``, so the spec carries
+    ``loads_verified_bytes=False`` and no pin."""
+    from messagefoundry.config.settings import SyslogProtocol
+
+    if not log_settings.forward_tls_ca_file:
+        return None
+    if not (log_settings.forward_enabled and log_settings.forward_host):
+        return None
+    if (
+        log_settings.forward_protocol is not SyslogProtocol.TLS
+        or not log_settings.forward_tls_verify
+    ):
+        return None
+    return AnchorSpec(
+        "logging_forward_ca",
+        "[logging].forward_tls_ca_file",
+        log_settings.forward_tls_ca_file,
+        loads_verified_bytes=False,
+    )
+
+
+def collect_anchor_specs(
+    auth: AuthSettings,
+    api: ApiSettings,
+    *,
+    tls: TlsSettings,
+    alerts: AlertsSettings,
+    log_settings: LoggingSettings,
+) -> list[AnchorSpec]:
+    """Every configured operator-supplied trust anchor in the settings, in a stable order: the OIDC,
+    AD and API client CAs, then since vault BACKLOG #3188 the settings CAs an engine hop dials with
+    (module item 10). An anchor with no path set is omitted, and so is a dialling CA its hop does
+    not read, so an install with none yields an empty list: the dormant, byte-identical path.
+
+    The three dialling sections are keyword arguments with no default on purpose. A caller that
+    left one out would leave its CA unchecked with nothing to say so.
 
     The per-connection inbound CAs are not here: ``serve`` calls this before any graph is loaded.
     :func:`registry_anchor_specs` collects them each time a graph is loaded, at start and at
     reload (BACKLOG #1142, slice 3)."""
-    specs: list[AnchorSpec] = []
-    if auth.oidc_tls_ca_cert_file:
-        specs.append(oidc_anchor_spec(auth.oidc_tls_ca_cert_file, auth.oidc_tls_ca_cert_pin))
-    ad_spec = ad_anchor_spec(auth)
-    if ad_spec is not None:
-        specs.append(ad_spec)
-    api_spec = api_client_anchor_spec(api)
-    if api_spec is not None:
-        specs.append(api_spec)
-    return specs
+    oidc = auth.oidc_tls_ca_cert_file
+    candidates = (
+        oidc_anchor_spec(oidc, auth.oidc_tls_ca_cert_pin) if oidc else None,
+        ad_anchor_spec(auth),
+        api_client_anchor_spec(api),
+        internal_ca_anchor_spec(tls),
+        alerts_email_anchor_spec(alerts, auth),
+        log_forward_anchor_spec(log_settings),
+    )
+    return [spec for spec in candidates if spec is not None]
 
 
 # --- central preflight (store-backed: audit the load, detect changes, then enforce) -------------
@@ -1493,7 +1602,8 @@ async def _report_restart_required(
 ) -> None:
     """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
     loaded (:func:`loaded_fingerprint`). An anchor no consumer loaded is skipped: a restart would
-    apply nothing there.
+    apply nothing there. The dialling settings CAs of module item 10 are always skipped, since
+    their hops load by path and record no fingerprint.
 
     The compare is never against the audit chain. The last audited fingerprint moves to the new
     bytes at the first reload that sees them, while the consumers still trust the old bytes. A
@@ -1535,7 +1645,7 @@ def make_settings_anchor_preflight(
     preflight passes, it warns and audits ``restart_required`` for each anchor whose bytes on disk
     differ from its consumer's (:func:`loaded_fingerprint`). That repeats on every reload until a
     restart. The specs are frozen here, pins included, so a reload re-reads the paths and pins the
-    engine started with."""
+    engine started with. The report skips the dialling settings CAs of module item 10."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError
