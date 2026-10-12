@@ -5,7 +5,8 @@
 The behavioural contract is ``tests/_session_seal_contract.py``; the Postgres and SQL Server suites
 run the same one on their own legs. This file runs it on SQLite, and adds what only one place needs
 to hold: the list of columns a seal leaves out, the single reader in the service, the list of every
-statement that writes a session row, and the denial's audit row and alert.
+statement that writes a session row, and the denial's audit row and alert. It also drives the MFA
+verify leg with the store refusing a session stamp for its seal, which must end the session.
 """
 
 from __future__ import annotations
@@ -20,17 +21,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _totp_clock import pin_totp_clock
 
+from messagefoundry.auth import totp
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealError
 from messagefoundry.store.store import (
     SESSION_SEAL_EXCLUDED,
     MessageStore,
     SessionRecord,
     session_seal_ok,
 )
+from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._session_seal_contract import (
     assert_session_columns,
     assert_session_seal_contract,
@@ -291,6 +296,113 @@ async def test_signing_out_elsewhere_keeps_the_callers_own_session(
     assert await service.revoke_other_sessions(identity, hash_token(tokens[0]), actor="u") == 2
     assert await service.identity_for_token(tokens[0]) is not None
     assert all([await service.identity_for_token(t) is None for t in tokens[1:]])
+
+
+# --- a refused stamp in the MFA verify leg ----------------------------------------------------
+
+
+async def _pending_factor(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str, str, str]:
+    """Enrol TOTP for a local administrator, sign in again so the new session owes its factor, and
+    return ``(user id, that session's token, a code the verify will accept)``.
+
+    The clock is pinned so the enrolment and the verify sit in different steps: enrolment spends
+    the step it activates on (BACKLOG #1021)."""
+    identity, token, password = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enroll.secret, now=t0), token=token
+    )
+    assert confirmed.ok
+    out = await service.login(ADMIN_USERNAME, password)
+    assert out.ok and out.mfa_required and out.token is not None
+    t1 = t0 + totp.DEFAULT_PERIOD
+    pin_totp_clock(monkeypatch, t1)
+    return identity.user_id, out.token, totp.totp(enroll.secret, now=t1)
+
+
+def _refuse(kind: str) -> Any:
+    async def refuse(*args: Any, **kwargs: Any) -> None:
+        raise RowSealError(kind)
+
+    return refuse
+
+
+def _spy(calls: list[str], name: str, method: Any) -> Any:
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(name)
+        return await method(*args, **kwargs)
+
+    return spy
+
+
+async def _assert_verify_ends_the_session(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, *, refused: str
+) -> list[str]:
+    """Drive ``verify_mfa`` with the store refusing the ``refused`` session stamp for its seal, and
+    assert the leg ends the session and records no success (BACKLOG #2592). Returns the stamps and
+    success writes the store was asked for."""
+    service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+    user_id, token, code = await _pending_factor(service, monkeypatch)
+    verified_before = len(await store.list_audit(action="auth.mfa_verified"))
+    calls: list[str] = []
+    for name in ("mark_session_mfa_verified", "mark_session_reauthed", "record_login_success"):
+        monkeypatch.setattr(store, name, _spy(calls, name, getattr(store, name)))
+    monkeypatch.setattr(store, refused, _spy(calls, refused, _refuse(SESSION_KIND)))
+
+    out = await service.verify_mfa(token, code, client="192.0.2.9")
+
+    assert out.session_lost and not out.ok and out.token is None
+    row = await store.get_session(hash_token(token))
+    assert row is not None and row.revoked_at is not None
+    assert await service.identity_for_token(token) is None
+    assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+    assert len(await store.list_audit(action="auth.mfa_verified")) == verified_before
+    assert "record_login_success" not in calls
+    user = await store.get_user(user_id)
+    assert user is not None and user.second_step_failed_attempts == 0  # nothing charged either
+    return calls
+
+
+async def test_verify_mfa_ends_the_session_when_the_factor_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = keyed
+    calls = await _assert_verify_ends_the_session(
+        store, monkeypatch, refused="mark_session_mfa_verified"
+    )
+    # The leg stops at the first refusal: the reauth stamp is never asked for.
+    assert calls == ["mark_session_mfa_verified"]
+
+
+async def test_verify_mfa_ends_the_session_when_the_reauth_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = keyed
+    calls = await _assert_verify_ends_the_session(
+        store, monkeypatch, refused="mark_session_reauthed"
+    )
+    assert calls == ["mark_session_mfa_verified", "mark_session_reauthed"]
+
+
+async def test_verify_mfa_succeeds_when_no_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control for the two tests above: the same flow on the same keyed store, with no refusal.
+    store, _ = keyed
+    service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+    _, token, code = await _pending_factor(service, monkeypatch)
+    verified_before = len(await store.list_audit(action="auth.mfa_verified"))
+
+    out = await service.verify_mfa(token, code, client="192.0.2.9")
+
+    assert out.ok and not out.session_lost and out.token is not None
+    assert await service.mfa_satisfied(out.token) is True
+    assert len(await store.list_audit(action="auth.mfa_verified")) == verified_before + 1
+    assert await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION) == []
 
 
 # --- static guards --------------------------------------------------------------------------

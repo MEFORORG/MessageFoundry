@@ -9918,7 +9918,9 @@ class AuthService:
                         return Elevation(session_lost=True)
                 # ORDER-CRITICAL: this whole write group lands against the OLD hash, and only then
                 # does the session rotate. Moving any of them after the rotation writes NOTHING and
-                # reports success — every session stamp UPDATE is rowcount-blind.
+                # reports success — every session stamp UPDATE is rowcount-blind. The group is not
+                # all-or-nothing: a stamp whose seal is refused ends the session (BACKLOG #2592), so
+                # each refusal check below must stay ahead of every write that records a success.
                 # The 2nd factor is now satisfied; clear the failure counter, and on any session but
                 # an OIDC one also seed the step-up window (the session has completed password +
                 # MFA). (Initial enrollment has no factor to verify, so this never fires there —
