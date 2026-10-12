@@ -373,12 +373,26 @@ class JsonFormatter(_SafeExcFormatter):
     PHI redaction + control-char scrubbing run upstream as **handler filters** (see
     :func:`configure_logging`), so by the time ``format`` runs ``record.getMessage()`` and
     ``record.exc_text`` are already redacted; ``json.dumps`` additionally escapes any residual C0
-    control, so a record can never break the one-object-per-line framing (ASVS 16.4.1). It leaves the
-    C1 controls and U+2028/U+2029 raw under ``ensure_ascii=False``, so a filter-less handler gets no
-    escape for those (vault BACKLOG #2815); the configured handlers' scrub filter covers them. UTC ``Z``
-    timestamps match the text formatter (16.2.2). The exception/stack fields are populated **and
-    already redacted** by :class:`RedactionFilter` (which clears ``exc_info`` after rendering), so they
-    are emitted from ``exc_text``/``stack_info`` without re-rendering the raw exception."""
+    control, so a record cannot put a raw newline into the one-object-per-line framing (ASVS 16.4.1).
+    UTC ``Z`` timestamps match the text formatter (16.2.2). The exception/stack fields are populated
+    **and already redacted** by :class:`RedactionFilter` (which clears ``exc_info`` after rendering),
+    so they are emitted from ``exc_text``/``stack_info`` without re-rendering the raw exception.
+
+    **A handler with this formatter and no filters is not safe** (BACKLOG #2976 item 3). Under
+    ``ensure_ascii=False``, ``json.dumps`` escapes the C0 controls and nothing else in the log
+    alphabet. It writes the rest raw: at least DEL, the C1 controls, the format characters such as a
+    bidirectional override, U+2028 and U+2029, a lone surrogate, and the private-use and unassigned
+    code points (vault BACKLOG #2815). Such a handler also leaves the message, its arguments and
+    ``stack_info`` unredacted, and scrubs no credential anywhere. The ``exc_info`` branch below is
+    the only PHI redaction on it, and it runs only when no earlier formatter on the same record has
+    already cached a raw traceback in ``exc_text``. Every handler :func:`configure_logging` builds
+    carries the filters, so none of this reaches a configured sink. Use this formatter only on a
+    handler that carries the same filters.
+
+    The limit is kept on purpose, by a Manager ruling on BACKLOG #2976 item 3. Escaping alone would
+    still leave the message unredacted, so it would not make such a handler safe. Any escape added
+    here must also keep the JSON-valid spelling the audit tee's document relies on (vault BACKLOG
+    #3012, #3032). ``tests/test_logging.py`` pins this paragraph and the raw characters together."""
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -392,8 +406,10 @@ class JsonFormatter(_SafeExcFormatter):
             payload["exception"] = record.exc_text
         elif record.exc_info:
             # Defensive: RedactionFilter normally pre-renders + redacts exc_text and clears exc_info,
-            # so this branch is dead on the configured handlers. If JsonFormatter is ever attached to a
-            # filter-less handler, redact here too so PHI safety doesn't depend on call-site discipline.
+            # so this branch is dead on the configured handlers. On a filter-less handler it redacts
+            # the rendered traceback, the likeliest PHI carrier, unless an earlier formatter already
+            # cached it raw in exc_text. It does not make that handler safe; the class docstring
+            # lists what still passes.
             # Bounded for the same reason and on the same terms as the filter's own call (#1576): a
             # filter-less handler is exactly the one with nothing upstream to have clamped it already.
             payload["exception"] = redact_untrusted(self.formatException(record.exc_info))

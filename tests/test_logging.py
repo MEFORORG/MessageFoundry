@@ -1831,7 +1831,37 @@ _LOG_ESCAPED_CLASSES = {
     "c0_and_del": (0x01, 0x08, 0x1B, 0x7F),
     "soft_hyphen": (0xAD,),
     "astral": (0xE0001, 0xF0000),
+    # Categories Co and Cn in the Basic Multilingual Plane. U+FFFF is a noncharacter, unassigned in
+    # every Unicode version, so no table update can move it out of Cn (BACKLOG #2976).
+    "private_use_and_unassigned": (0xE000, 0xFFFF),
 }
+
+#: Every class above, named a second time. The tests below are parametrised over the keys of
+#: ``_LOG_ESCAPED_CLASSES``, so a class removed there would silently lose its cases. Adding a class
+#: means adding it here too.
+_LOG_ESCAPED_CLASS_NAMES = frozenset(
+    {
+        "c1",
+        "bidi",
+        "separator",
+        "surrogate",
+        "c0_and_del",
+        "soft_hyphen",
+        "astral",
+        "private_use_and_unassigned",
+    }
+)
+
+
+def test_the_log_alphabet_classes_are_all_present() -> None:
+    """Not parametrised, on purpose (engine PR 2012, review comment 5987939300). The tests below
+    take one case per key of ``_LOG_ESCAPED_CLASSES``. If the dict lost a key, or every key, pytest
+    would run fewer cases or report the tests as skipped, and the run would stay green. Each
+    class's own ``len(codes) >= 1`` check cannot see that, because it never runs."""
+    missing = _LOG_ESCAPED_CLASS_NAMES - _LOG_ESCAPED_CLASSES.keys()
+    assert not missing, f"_LOG_ESCAPED_CLASSES lost the classes {sorted(missing)}"
+    unlisted = _LOG_ESCAPED_CLASSES.keys() - _LOG_ESCAPED_CLASS_NAMES
+    assert not unlisted, f"add {sorted(unlisted)} to _LOG_ESCAPED_CLASS_NAMES"
 
 
 def _expected_log_escape(code: int) -> str:
@@ -1923,6 +1953,45 @@ def test_ordinary_non_ascii_text_reaches_every_sink_unchanged(
     """The control for the test above: the wider alphabet is control characters, not non-ASCII."""
     for out in _write_one_record_through_every_sink(fmt, _PLAIN_NON_ASCII, tmp_path, capsys):
         _assert_logged(fmt, out, _PLAIN_NON_ASCII)
+
+
+def test_a_filter_less_json_formatter_limit_is_real_and_stated() -> None:
+    """BACKLOG #2976 item 3, kept as a documented limit by a Manager ruling: ``JsonFormatter`` does
+    not escape or redact on its own, and its docstring says so. Two halves, tied together.
+
+    The behaviour: on a handler with no filters, ``json.dumps`` escapes the C0 controls, and every
+    other character of the log alphabet comes out raw. A credential and the message's PHI pass too.
+    The wording: the docstring states that limit, names each kind of character that passes, and
+    names the missing redaction. If someone adds escaping inside the formatter, the first half goes
+    red and the docstring must change with it. If someone softens the docstring, the second half
+    goes red. ``test_every_configured_sink_escapes_the_wider_log_alphabet`` is the other side: every
+    configured sink escapes the same characters."""
+    # CR and LF are not in the classes; they are added so the framing assertion has input to fail on.
+    codes = sorted(
+        {0x0A, 0x0D, *(code for codes in _LOG_ESCAPED_CLASSES.values() for code in codes)}
+    )
+    message = "a" + "".join(chr(code) for code in codes) + f"z password=pw-Jf_A-91 {SYNTHETIC_PHI}"
+    record = logging.LogRecord("t", logging.INFO, __file__, 1, "%s", (message,), None)
+    line = JsonFormatter().format(record)
+    assert "\n" not in line and "\r" not in line, "a C0 control broke the one-line framing"
+    c0_left_raw = [hex(code) for code in codes if code < 0x20 and chr(code) in line]
+    others_escaped = [hex(code) for code in codes if code >= 0x20 and chr(code) not in line]
+    assert not c0_left_raw, f"json.dumps no longer escapes the C0 controls {c0_left_raw}"
+    assert not others_escaped, (
+        f"JsonFormatter now escapes {others_escaped} on its own. Update its docstring's limit "
+        "paragraph, and keep the JSON-valid spelling the audit tee relies on (vault BACKLOG #3012)."
+    )
+    assert "pw-Jf_A-91" in line and SYNTHETIC_PHI in line, "the formatter now redacts by itself"
+
+    doc = " ".join((JsonFormatter.__doc__ or "").split())
+    for phrase in (
+        "A handler with this formatter and no filters is not safe",
+        "DEL, the C1 controls, the format characters",
+        "U+2028 and U+2029, a lone surrogate, and the private-use and unassigned code points",
+        "leaves the message, its arguments and ``stack_info`` unredacted",
+        "scrubs no credential",
+    ):
+        assert phrase in doc, f"JsonFormatter's docstring no longer says: {phrase!r}"
 
 
 def test_the_c0_escape_is_spelled_as_json() -> None:
