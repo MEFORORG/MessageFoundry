@@ -2353,8 +2353,7 @@ def phi_read_hop_disposition(
 # 5280 via harden_verify_flags) but a REVOKED-but-unexpired peer cert is still accepted — Python's ssl
 # has no OCSP/CRL fetch and the engine deliberately attempts none (offline-by-default, CLAUDE.md §2).
 # So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction /
-# `messagefoundry check` / dry-run unless revocation is proven in front (a revocation-checking egress
-# terminator) or the operator attests a revocation-checking PKI — per-connection `tls_revocation_attested`
+# `messagefoundry check` / dry-run unless the hop's own context checks a CRL or the operator attests a revocation-checking PKI — per-connection `tls_revocation_attested`
 # or the blanket `MEFOR_TLS_REVOCATION_ATTESTED` env (the same opt-out ADR 0078 gave the listener).
 #
 # COMPOSES with #200 (ADR 0092): #200 refuses the CLEARTEXT / verify-off hop, so revocation only matters
@@ -2469,8 +2468,7 @@ class RevocationHopGuard:
     the runner's live builds when ``serve`` starts the graph, which stamp the same posture. So a first
     ``serve`` start refuses a hop at its own build (measured for BACKLOG #2193; ``docs/CONNECTIONS.md``
     says what each refusal stops). It **no-ops when the posture is unstamped** (``None``, such as a
-    direct test build or an embedding that stamps none), with the same semantics as the cleartext
-    :class:`InsecureHopGuard`."""
+    direct test build or an embedding that stamps none)."""
 
     host: str
     cell: str

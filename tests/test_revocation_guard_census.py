@@ -10,7 +10,8 @@ is that list. A new site that obtains a verifying client context fails here unti
 in review, whether it is guarded or exempt and why.
 
 **What counts as a site.** A function in ``messagefoundry/`` that calls a name in :data:`_BUILDERS`,
-or reads ``_NO_REDIRECT_OPENER``. Those names are at least the ways the engine hands out a verifying
+passes one of the engine's own builders as a value (to ``run_in_executor``, say), or reads
+``_NO_REDIRECT_OPENER``. Those names are at least the ways the engine hands out a verifying
 client context today, not all of them (SDS-3.6): a context reached by another name is outside this
 census, which is why :func:`test_every_builder_name_is_still_defined` keeps the list from rotting
 under a rename. A function whose own name is in :data:`_BUILDERS` is not a site. It hands its context
@@ -55,7 +56,9 @@ _BUILDERS = frozenset(
         "build_asserted_https_handler",
         "build_smtp_tls_context",
         "assert_ldap3_tls_suites",
+        "assert_hvac_tls_suites",
         # transports/
+        "build_strict_opener",  # with no HTTPS handler, urllib supplies a verifying one
         "_no_redirect_opener",
         "_expiry_relaxed_opener",
         "_client_cert_opener",
@@ -75,8 +78,11 @@ _BUILDERS = frozenset(
 _SHARED_OPENER = "_NO_REDIRECT_OPENER"
 _SHARED_OPENER_MODULES = ("transports/rest.py", "pipeline/alert_sinks.py")
 
-#: Names whose call runs a revocation guard. Each one other than ``capture`` must itself call another
-#: (:func:`test_every_guard_name_reaches_the_guard`).
+#: The stdlib and truststore names. Matched only as a call: a bare ``SSLContext`` also names a type.
+_STDLIB_BUILDERS = frozenset({"create_default_context", "SSLContext"})
+
+#: Names whose call runs a revocation guard. Each one other than ``capture`` must reach ``capture``
+#: through the others (:func:`test_every_guard_name_reaches_the_guard`).
 _GUARDS = frozenset(
     {
         "capture",  # RevocationHopGuard.capture, matched only on that receiver
@@ -130,6 +136,11 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the builder runs _refuse_forward_revocation on the context it returns",
     ),
     "messagefoundry/store/postgres.py::_build_ssl": Guarded(note="the PostgreSQL store hop"),
+    "messagefoundry/store/postgres.py::_per_connection_ssl_connect.connect": Guarded(
+        by="messagefoundry/store/postgres.py::_build_ssl",
+        note="each pool connection rebuilds, from the same settings, the context _build_ssl "
+        "guarded at store open",
+    ),
     "messagefoundry/transports/dicom.py::DicomScuDestination.__init__": Guarded(),
     "messagefoundry/transports/dicomweb.py::DicomWebDestination.__init__": Guarded(),
     "messagefoundry/transports/direct.py::DirectDestination.__init__": Guarded(
@@ -162,6 +173,15 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
     "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Exempt(
         f"the AI-broker endpoint: {_UNGATED}"
+    ),
+    "messagefoundry/config/secretprovider_vault.py::_build_client": Exempt(
+        "the Vault KV secret provider hop. Ungated, and NOT in docs/DEPLOYMENT.md's ungated table: "
+        "its requests-based client takes one CA bundle and no revocation flag, so no CRL can reach "
+        "it (tls_policy refuses [tls].crl_file there). Found by this census; unfiled"
+    ),
+    "messagefoundry/store/keyprovider_vault.py::_build_client": Exempt(
+        "the Vault Transit key provider hop. Ungated, and NOT in docs/DEPLOYMENT.md's ungated "
+        "table, for the same reason as the KV provider above. Found by this census; unfiled"
     ),
     # --- exempt: not a partner hop -----------------------------------------------------------------
     "messagefoundry/apiclient/client.py::_build_verify_context": Exempt(
@@ -208,6 +228,8 @@ _CENSUS: dict[str, Guarded | Exempt] = {
 class _Scan:
     sites: frozenset[str]
     guard_calls: frozenset[str]
+    #: modules that assign the shared opener at module level.
+    opener_modules: frozenset[str]
     #: bare function or class name -> the guard names its body calls, for every def in the package.
     defs: dict[str, frozenset[str]]
 
@@ -228,8 +250,16 @@ def _is_guard(call: ast.Call) -> bool:
 
 
 class _Visitor(ast.NodeVisitor):
-    def __init__(self, rel: str, sites: set[str], guards: set[str], defs: dict[str, set[str]]):
+    def __init__(
+        self,
+        rel: str,
+        sites: set[str],
+        guards: set[str],
+        defs: dict[str, set[str]],
+        opener_modules: set[str],
+    ):
         self._rel = rel
+        self._opener_modules = opener_modules
         self._scope: list[str] = []
         self._sites = sites
         self._guards = guards
@@ -252,9 +282,18 @@ class _Visitor(ast.NodeVisitor):
     visit_ClassDef = _enter
 
     def visit_Name(self, node: ast.Name) -> None:
-        is_read = node.id == _SHARED_OPENER and isinstance(node.ctx, ast.Load)
-        if is_read and not self._in_builder():
+        if not isinstance(node.ctx, ast.Load) or self._in_builder():
+            return
+        # A bare-name call to an engine builder lands here too, which is harmless: same site key.
+        if node.id == _SHARED_OPENER or node.id in _BUILDERS - _STDLIB_BUILDERS:
             self._sites.add(self._key())
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if not self._scope and any(
+            isinstance(t, ast.Name) and t.id == _SHARED_OPENER for t in node.targets
+        ):
+            self._opener_modules.add(self._rel)
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         if _is_builder(node) and not self._in_builder():
@@ -275,13 +314,19 @@ def _scan() -> _Scan:
     sites: set[str] = set()
     guards: set[str] = set()
     defs: dict[str, set[str]] = {}
+    opener_modules: set[str] = set()
     for path in sorted(_PACKAGE.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
         if not any(name in source for name in _ANY_NAME):
             continue
         rel = path.relative_to(_ROOT).as_posix()
-        _Visitor(rel, sites, guards, defs).visit(ast.parse(source))
-    return _Scan(frozenset(sites), frozenset(guards), {k: frozenset(v) for k, v in defs.items()})
+        _Visitor(rel, sites, guards, defs, opener_modules).visit(ast.parse(source))
+    return _Scan(
+        frozenset(sites),
+        frozenset(guards),
+        frozenset(opener_modules),
+        {k: frozenset(v) for k, v in defs.items()},
+    )
 
 
 def test_every_site_is_in_the_census() -> None:
@@ -312,25 +357,33 @@ def test_every_guarded_site_calls_a_guard() -> None:
 
 
 def test_every_guard_name_reaches_the_guard() -> None:
-    """A wrapper that stopped calling the guard would leave every site it covers green above."""
+    """A wrapper that stopped calling the guard would leave every site it covers green above.
+
+    Followed through the wrappers to ``capture``, so two wrappers that only call each other are
+    hollow too. Keyed by bare function name, so a same-named def elsewhere in the package could
+    stand in for a wrapper; the guard names here are unique today."""
     defs = _scan().defs
     assert callable(getattr(RevocationHopGuard, "capture", None))
-    hollow = sorted(
-        name for name in _GUARDS - {"capture"} if not (defs.get(name, frozenset()) - {name})
-    )
-    assert not hollow, f"guard name(s) whose body calls no guard: {hollow}"
+    reaches = {"capture"}
+    grew = True
+    while grew:
+        grew = False
+        for name in _GUARDS - reaches:
+            if defs.get(name, frozenset()) & reaches:
+                reaches.add(name)
+                grew = True
+    hollow = sorted(_GUARDS - reaches)
+    assert not hollow, f"guard name(s) that never reach RevocationHopGuard.capture: {hollow}"
 
 
 def test_every_builder_name_is_still_defined() -> None:
     """A renamed builder would drop all its callers from the census without a red."""
-    defs = _scan().defs
-    stdlib = {"create_default_context", "SSLContext"}
-    missing = sorted(name for name in _BUILDERS - stdlib if name not in defs)
+    scan = _scan()
+    missing = sorted(name for name in _BUILDERS - _STDLIB_BUILDERS if name not in scan.defs)
     assert not missing, f"builder name(s) no longer defined in messagefoundry/: {missing}"
-    # The shared opener is a module assignment, not a def.
-    gone = [
-        rel
-        for rel in _SHARED_OPENER_MODULES
-        if f"{_SHARED_OPENER} = " not in (_PACKAGE / rel).read_text(encoding="utf-8")
-    ]
-    assert not gone, f"{_SHARED_OPENER} is no longer assigned in: {gone}"
+    # The shared opener is a module-level assignment, not a def.
+    expected = {f"messagefoundry/{rel}" for rel in _SHARED_OPENER_MODULES}
+    assert scan.opener_modules == expected, (
+        f"{_SHARED_OPENER} is assigned at module level in {sorted(scan.opener_modules)}, "
+        f"expected {sorted(expected)}"
+    )

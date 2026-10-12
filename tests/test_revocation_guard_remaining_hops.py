@@ -305,7 +305,7 @@ def test_a_fhir_lookup_read_hop_is_refused_when_it_checks_no_revocation() -> Non
     # The refusal names the lookup, in the lookup namespace, so an operator can find the declaration.
     assert "connection 'fhir_lookup:epic';" in str(exc.value)
     # A lookup only reads, so its refusal says so (BACKLOG #2987). The destinations keep "delivers".
-    assert "reads over verified https" in str(exc.value)
+    assert "sends read requests over verified https" in str(exc.value)
     assert "delivers" not in str(exc.value)
 
 
@@ -629,8 +629,8 @@ def test_an_ftps_upload_that_verifies_nothing_takes_no_revocation_guard(
     revocation = [m for m in log.messages if "revocation" in m]
     # The control: the guard's own logger was captured in this block.
     assert any(control_host in m for m in revocation), log.state()
-    # The subject: no revocation line names its host.
-    assert not any(REMOTE in m for m in revocation), log.state()
+    # The subject: every revocation line is the control's, so none is the subject's.
+    assert all(control_host in m and REMOTE not in m for m in revocation), log.state()
 
 
 def test_an_anonymous_plain_ftp_upload_is_the_cleartext_refusal_not_this_one() -> None:
