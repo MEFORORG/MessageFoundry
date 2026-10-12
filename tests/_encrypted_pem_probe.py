@@ -48,7 +48,6 @@ from pathlib import Path
 __all__ = [
     "CAFILE_MODES",
     "CONDITIONS",
-    "CONTROL_MODES",
     "ENCRYPTED_SHAPES",
     "PLAIN_SHAPE",
     "Trial",
@@ -131,12 +130,14 @@ if pid == 0:
 seen = b""
 deadline = time.monotonic() + start_deadline
 ready = False
+expired = False
 while True:
     if not ready and b"READY" in seen:
         ready = True
         deadline = time.monotonic() + wait
     left = deadline - time.monotonic()
     if left <= 0:
+        expired = True
         break
     if not select.select([fd], [], [], min(left, 0.05))[0]:
         if os.waitpid(pid, os.WNOHANG)[0] == pid:
@@ -152,8 +153,9 @@ while True:
     seen += chunk
 waited = False
 if pid:
-    # A child that has already ended is reaped here, without being counted as waiting.
-    for _ in range(40):
+    # A child that closed its end is on its way out: reap it, and do not count it as waiting.
+    # One look is enough for a child that ran into the deadline.
+    for _ in range(1 if expired else 40):
         if os.waitpid(pid, os.WNOHANG)[0] == pid:
             pid = 0
             break

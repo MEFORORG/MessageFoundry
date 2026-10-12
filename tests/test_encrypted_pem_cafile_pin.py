@@ -54,7 +54,6 @@ from tests._encrypted_pem_probe import (
     CONDITIONS,
     ENCRYPTED_SHAPES,
     PLAIN_SHAPE,
-    Trial,
     run_trial,
     write_shapes,
 )
@@ -97,7 +96,7 @@ def _assert_path_loads_never_wait(shapes: Path, condition: str) -> None:
     )
 
     for shape, mode in _path_loads():
-        trial: Trial = run_trial(mode, shapes / shape, condition, wait=_REFUSE_WITHIN)
+        trial = run_trial(mode, shapes / shape, condition, wait=_REFUSE_WITHIN)
         where = f"{mode} load of {shape} under {condition!r}"
         assert trial.outcome != "WAITING", (
             f"a {where} was still running after {_REFUSE_WITHIN:g} s. A path load can wait for a "

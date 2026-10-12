@@ -60,6 +60,15 @@ def _contexts(kind: type) -> tuple[list[Any], Any]:
     return made, factory
 
 
+def _stop_at_the_socket(conn: Any) -> None:
+    """Replace the one call that opens a socket, so ``connect`` raises ``_Stopped`` there."""
+
+    def no_socket() -> None:
+        raise _Stopped
+
+    conn._new_conn = no_socket
+
+
 def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
     """A narrowed connection that opens no socket, to Vault directly or through an https proxy."""
     cls = _narrowed_pool_classes(factory, connector="Vault test hop")["https"].ConnectionCls
@@ -75,11 +84,7 @@ def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
         conn.set_tunnel("vault.test", 8200, scheme="https")
     else:
         conn = cls("vault.test", 8200, **ca)
-
-    def no_socket() -> None:
-        raise _Stopped
-
-    conn._new_conn = no_socket
+    _stop_at_the_socket(conn)
     return conn
 
 
@@ -150,11 +155,7 @@ def test_a_ca_directory_reaches_the_proxy_leg_and_is_not_refused(tmp_path: Path)
     conn: Any = pool._new_conn()
     assert conn.ca_cert_dir == str(tmp_path) and conn.ca_certs is None
     conn.set_tunnel("vault.test", 8200, scheme="https")
-
-    def no_socket() -> None:
-        raise _Stopped
-
-    conn._new_conn = no_socket
+    _stop_at_the_socket(conn)
     with pytest.raises(_Stopped):
         conn.connect()
     assert made[0].loads == [(None, str(tmp_path), None)]
