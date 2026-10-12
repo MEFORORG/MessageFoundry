@@ -23,9 +23,10 @@ Direct destination import it (vault BACKLOG #2870).
 **STARTTLS by default** (``use_tls=True``): the connector issues ``STARTTLS`` before ``AUTH``/data on
 the ``587`` submission port; port ``465`` (implicit TLS) maps to ``smtplib.SMTP_SSL``. Disabling TLS
 (``use_tls=False``) is **refused unless** the project-wide dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is
-set — read through the CLAMPED ``weakened_tls_escape_permitted_here()`` (#200, ADR 0092), so the blunt
-global escape can no longer silence a cleartext hop on an enforcing production-PHI instance — or the
-connection attests the hop (``tls_hop_attested``). Credentials are **never** sent over a cleartext
+set on an instance at ``[security].enforcement = warn`` — read through the CLAMPED
+``weakened_tls_escape_permitted_here()`` (#200, ADR 0092), so the blunt global escape cannot silence
+a cleartext hop while enforcing — or the connection attests the hop (``tls_hop_attested``) or
+accepts it (``cleartext_accepted``, ADR 0153). Credentials are **never** sent over a cleartext
 channel (a ``username``/``password`` with ``use_tls=False`` raises at construction, even with the
 escape) — the same ``refuse_cleartext_credentials`` posture the REST destination takes. The message
 **body** is PHI on that same cleartext hop, so it is additionally governed by the shared

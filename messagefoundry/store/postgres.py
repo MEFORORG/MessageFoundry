@@ -1081,15 +1081,16 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     refuse-weakened-TLS logic (ASVS 12.3.2).
 
     A weakened posture (``trust_server_certificate=true`` or ``encrypt=false``) is MITM-able, so it
-    **refuses** unless the explicit ``MEFOR_ALLOW_INSECURE_TLS`` dev escape is set — it can't be
-    silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
+    **refuses** unless the explicit ``MEFOR_ALLOW_INSECURE_TLS`` dev escape is set on an instance at
+    ``[security].enforcement = warn`` — it can't be silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
     ``False`` (no TLS) only under the escape with ``encrypt=false``; an SSLContext that skips cert
     verification under the escape with ``trust_server_certificate=true``; otherwise a verifying
     SSLContext the engine builds, against the pinned CA or the system trust store.
 
     #200 (ADR 0092 decision 2): the engine<->store hop routes the escape through the ONE clamp
     (:func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`) so ``MEFOR_ALLOW_INSECURE_TLS``
-    can NEVER relax a **production-PHI** store hop (the SQL Server twin above is keyed identically). It
+    works only at ``[security].enforcement = warn`` and can NEVER relax an **enforcing** store hop
+    (the SQL Server twin above is keyed identically). It
     stays a STRICT verify-off cell (no gradient) and keeps NO second escape. ``posture`` (threaded from
     ``open_store``) ``None`` reads the ambient posture, and with none the escape is NOT permitted
     (vault BACKLOG #2354). CORRECTED: this read *"``None`` leaves the escape unclamped"*."""
