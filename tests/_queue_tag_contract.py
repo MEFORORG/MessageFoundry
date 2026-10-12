@@ -234,6 +234,17 @@ async def assert_queue_tag_contract(
         assert "integrity" in str(exc), exc
     else:
         raise AssertionError("a resend from a source with a changed body_ref was not refused")
+    # A blank payload that still names a shared body is not what retention leaves (it nulls
+    # body_ref in the same write), so a resend refuses it rather than reporting a purged body.
+    await raw("UPDATE queue SET payload='' WHERE id=?", (rid,))
+    try:
+        await store.resend_to(
+            message_id=mid, to="OB_QT_N4", from_="OB_QT_N", idempotency_key="qt-resend-blank"
+        )
+    except Exception as exc:  # noqa: BLE001 -- the refusal type is the cipher's, asserted below
+        assert "integrity" in str(exc), exc
+    else:
+        raise AssertionError("a resend from a blank source that names a shared body went ahead")
 
     # --- control: a dead-lettered row whose tag is intact replays and delivers ----------------
     mid, rid = await _outbound(store, fetch, "OB_QT_O", "SYNTH-BODY-O")

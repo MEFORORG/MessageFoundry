@@ -149,6 +149,7 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
+    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
@@ -2779,16 +2780,17 @@ class PostgresStore:
     ) -> int:
         """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
         (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
-        selected so the decrypt and the encrypt share one tag. A cell whose tag no longer matches its row raises, so the rotation stops rather than re-seal
-        it. The one exception is a DEAD row: the claim already refused and reported it, it is
-        never delivered, and retention blanks it, so it is left as it is and counted in a WARNING
-        instead of blocking every rotation until then. Pages by ``id``, since a skipped row still
-        matches the marker filter."""
+        selected so the decrypt and the encrypt share one tag.
+        A cell that does not open under its own tag with a key this process holds
+        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
+        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
+        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
+        ``id``, since a skipped row still matches the marker filter."""
         total = skipped = 0
         after = ""
         while True:
             rows = await self._fetchall(
-                f"SELECT {QUEUE_TAG_SELECT}, status, payload FROM queue"
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
                 " WHERE payload NOT LIKE $1 AND payload <> '' AND id > $2 ORDER BY id LIMIT $3",
                 active_like,
                 after,
@@ -2804,7 +2806,7 @@ class PostgresStore:
                         (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
                     )
                 except CipherError:
-                    if r["status"] != OutboxStatus.DEAD.value:
+                    if not is_tag_failure(cipher, r["payload"]):
                         raise
                     skipped += 1
             if updates:
@@ -2817,8 +2819,8 @@ class PostgresStore:
                 total += len(updates)
         if skipped:
             log.warning(
-                "rotation left %d dead queue row(s) whose payload does not open under its own"
-                " tag; they are never delivered and retention blanks them (BACKLOG #2593)",
+                "rotation left %d queue row(s) whose payload does not open under its own tag"
+                " under a held key; no claim or read opens them (BACKLOG #2593)",
                 skipped,
             )
         return total
@@ -6777,7 +6779,11 @@ class PostgresStore:
                     # A '' payload is what retention leaves. Otherwise the body is opened under the
                     # source row's own tag (BACKLOG #2593); the body_ref column picks the kind
                     # and the tag binds it, so a changed column fails the tag.
-                    decoded = "" if src["payload"] == "" else await self._open_queue_body(conn, src)
+                    decoded = (
+                        ""
+                        if src["payload"] == "" and src["body_ref"] is None
+                        else await self._open_queue_body(conn, src)
+                    )
                     if not decoded:
                         raise ResendSourceEmpty(
                             f"message {message_id} source body was purged by retention -- cannot resend"
@@ -7383,7 +7389,7 @@ class PostgresStore:
             try:
                 d["payload"] = (
                     ""
-                    if r["payload"] == ""
+                    if r["payload"] == "" and r["body_ref"] is None
                     else await self._open_queue_body(None, r, alert=not dead)
                 )
             except QueueTagError:

@@ -213,12 +213,12 @@ async def test_queue_tag_contract_sqlite(tmp_path: pathlib.Path) -> None:
         await store.close()
 
 
-async def test_rotation_reseals_the_tag_and_steps_over_a_refused_dead_row(
+async def test_rotation_reseals_the_tag_and_steps_over_a_cell_that_fails_it(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """``rotate-key``'s queue pass re-seals each payload under its own tag. A DEAD row that the
-    claim refused for its tag is left as it is and counted, so it cannot block every rotation. A
-    live row whose tag fails still stops the rotation (control)."""
+    """``rotate-key``'s queue pass re-seals each payload under its own tag. A cell that fails its tag
+    under a key the process holds, dead or still pending, is left as it is and counted, so it cannot
+    block every rotation. A cell under a key that is not supplied still stops it (control)."""
     db = tmp_path / "rotate.db"
     old_key, new_key = generate_key(), generate_key()
     store = await MessageStore.open(db, cipher=make_cipher(old_key, write_v2=True))
@@ -226,11 +226,20 @@ async def test_rotation_reseals_the_tag_and_steps_over_a_refused_dead_row(
     try:
         await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[("OB_KEEP", "B1")])
         await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[("OB_BENT", "B2")])
+        await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[("OB_LIVE", "B3")])
         side.execute("UPDATE queue SET destination_name='OB_ELSE' WHERE destination_name='OB_BENT'")
+        side.execute("UPDATE queue SET destination_name='OB_X' WHERE destination_name='OB_LIVE'")
         side.commit()
         assert await store.claim_next_fifo("OB_ELSE") is None  # refused and dead-lettered
     finally:
         await store.close()
+
+    unsupplied = await MessageStore.open(db, cipher=make_cipher(new_key, write_v2=True))
+    try:
+        with pytest.raises(CipherError, match="no configured key"):  # the old key is missing
+            await unsupplied.reencrypt_to_active()
+    finally:
+        await unsupplied.close()
 
     rotated = await MessageStore.open(
         db, cipher=make_cipher(new_key, retired_b64=[old_key], write_v2=True)
@@ -238,21 +247,28 @@ async def test_rotation_reseals_the_tag_and_steps_over_a_refused_dead_row(
     try:
         with caplog.at_level("WARNING"):
             assert await rotated.reencrypt_to_active() >= 1
-        assert "rotation left 1 dead queue row" in caplog.text
+        assert "rotation left 2 queue row(s)" in caplog.text
         item = await rotated.claim_next_fifo("OB_KEEP")
         assert item is not None and item.payload == "B1"  # re-sealed under the new key and tag
-        await rotated.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[("OB_LIVE", "B3")])
-        side.execute("UPDATE queue SET destination_name='OB_X' WHERE destination_name='OB_LIVE'")
-        side.commit()
-    finally:
-        await rotated.close()
-
-    again = await MessageStore.open(
-        db, cipher=make_cipher(generate_key(), retired_b64=[new_key, old_key], write_v2=True)
-    )
-    try:
-        with pytest.raises(CipherError):  # a live row whose tag fails stops the rotation
-            await again.reencrypt_to_active()
+        assert await rotated.claim_next_fifo("OB_X") is None  # still refused after the rotation
     finally:
         side.close()
-        await again.close()
+        await rotated.close()
+
+
+def test_a_key_or_format_problem_is_not_a_tag_failure() -> None:
+    """Only a marked cell under a held key that fails its tag is a tag failure. An unmarked value
+    and a cell under a key that is not configured raise the cipher's own error."""
+    old_key = generate_key()
+    sealer = make_cipher(old_key, write_v2=True)
+    row = _row()
+    sealed = sealer.encrypt("SYNTH-BODY", aad=queue_row_aad(row))
+    other = make_cipher(generate_key(), write_v2=True)
+    with pytest.raises(CipherError) as missing:
+        open_queue_cell(other, {**row, "payload": sealed})
+    assert not isinstance(missing.value, QueueTagError)
+    with pytest.raises(CipherError) as unmarked:
+        open_queue_cell(sealer, {**row, "payload": "SYNTH-PLAINTEXT"})
+    assert not isinstance(unmarked.value, QueueTagError)
+    with pytest.raises(QueueTagError):  # control: the held key, the wrong row
+        open_queue_cell(sealer, {**row, "channel_id": "IB_B", "payload": sealed})

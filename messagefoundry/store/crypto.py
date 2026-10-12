@@ -1187,6 +1187,20 @@ class AesGcmCipher(_UnmarkedPolicy):
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
 
+    def holds_key_for(self, stored: str) -> bool:
+        """Whether this keyring holds the key the marker of ``stored`` names (BACKLOG #2593).
+
+        Lets a caller tell a cell whose AEAD tag fails under a key it holds (the cell does not
+        belong where it is) from one sealed under a key that is not configured. False for an
+        unmarked or malformed value. Reads only the marker, never the ciphertext."""
+        if not stored.startswith(MARKER_PREFIX):
+            return False
+        try:
+            key_id, _salt, _blob = self._parse(stored)
+        except CipherError:
+            return False
+        return key_id in self._keyring
+
     def audit_mac_key(self) -> bytes:
         """The HKDF-derived HMAC key for the tamper-evident audit chain (#190-B). Keys the
         ``audit_row_hash`` chain so it cannot be forged without the DEK. Non-secret to *hold* here (it

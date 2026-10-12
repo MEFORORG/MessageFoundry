@@ -139,6 +139,7 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
+    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
@@ -6887,16 +6888,17 @@ class MessageStore:
     ) -> int:
         """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
         (:func:`queue_row_aad`, BACKLOG #2593); caller holds ``self._lock``. The id-keyed loop's
-        shape, with the tag columns selected so the decrypt and the encrypt share one tag. A cell whose tag no longer matches its row raises, so the rotation stops rather than re-seal
-        it. The one exception is a DEAD row: the claim already refused and reported it, it is
-        never delivered, and retention blanks it, so it is left as it is and counted in a WARNING
-        instead of blocking every rotation until then. Pages by ``id``, since a skipped row still
-        matches the marker filter."""
+        shape, with the tag columns selected so the decrypt and the encrypt share one tag.
+        A cell that does not open under its own tag with a key this process holds
+        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
+        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
+        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
+        ``id``, since a skipped row still matches the marker filter."""
         total = skipped = 0
         after = ""
         while True:
             cur = await self._db.execute(
-                f"SELECT {QUEUE_TAG_SELECT}, status, payload FROM queue"
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
                 " WHERE payload NOT LIKE ? AND payload <> '' AND id > ? ORDER BY id LIMIT ?",
                 (active_like, after, batch),
             )
@@ -6911,7 +6913,7 @@ class MessageStore:
                         (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
                     )
                 except CipherError:
-                    if r["status"] != OutboxStatus.DEAD.value:
+                    if not is_tag_failure(cipher, r["payload"]):
                         raise
                     skipped += 1
             if updates:
@@ -6921,8 +6923,8 @@ class MessageStore:
                 total += len(updates)
         if skipped:
             log.warning(
-                "rotation left %d dead queue row(s) whose payload does not open under its own"
-                " tag; they are never delivered and retention blanks them (BACKLOG #2593)",
+                "rotation left %d queue row(s) whose payload does not open under its own tag"
+                " under a held key; no claim or read opens them (BACKLOG #2593)",
                 skipped,
             )
         return total
@@ -8770,10 +8772,10 @@ class MessageStore:
         if row["body_ref"] is None:
             return OutboxItem.from_row(row, open_queue_cell(self._cipher, row))
         async with self._read() as db:
-            return OutboxItem.from_row(row, await self._open_queue_body(db, row))
+            return OutboxItem.from_row(row, await self._open_queue_body(db, row, alert=False))
 
     async def _open_queue_body(
-        self, db: aiosqlite.Connection, row: aiosqlite.Row, *, alert: bool = False
+        self, db: aiosqlite.Connection, row: aiosqlite.Row, *, alert: bool = True
     ) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593).
 
@@ -10902,8 +10904,8 @@ class MessageStore:
                 # store-once row's sealed reference decides which shared body is read.
                 decoded = (
                     ""
-                    if src["payload"] == ""
-                    else await self._open_queue_body(self._db, src, alert=True)
+                    if src["payload"] == "" and src["body_ref"] is None
+                    else await self._open_queue_body(self._db, src)
                 )
                 if not decoded:
                     raise ResendSourceEmpty(
@@ -11570,7 +11572,7 @@ class MessageStore:
                 try:
                     d["payload"] = (
                         ""
-                        if r["payload"] == ""
+                        if r["payload"] == "" and r["body_ref"] is None
                         else await self._open_queue_body(db, r, alert=not dead)
                     )
                 except QueueTagError:

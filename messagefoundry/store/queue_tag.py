@@ -49,6 +49,7 @@ __all__ = [
     "QUEUE_TAG_FAILED_ACTION",
     "QueueTagError",
     "alert_queue_tag_failure",
+    "is_tag_failure",
     "open_queue_cell",
     "queue_payload_aad",
     "queue_row_aad",
@@ -142,11 +143,25 @@ def queue_row_aad(row: Any) -> bytes:
     )
 
 
+def is_tag_failure(cipher: Cipher, stored: str) -> bool:
+    """Whether a failed open of ``stored`` means the cell does not belong to its row, rather than a
+    key or format problem: the value is marked and the cipher holds the key its marker names.
+
+    An unmarked value is the cipher's own refusal, which raises its own alert, and a value under a
+    key that is not configured is a key-configuration fault. Neither is a tag failure. A cipher that
+    cannot say which keys it holds (Vault Transit) counts every marked value as held."""
+    if not cipher.is_encrypted(stored):
+        return False
+    holds = getattr(cipher, "holds_key_for", None)
+    return bool(holds(stored)) if callable(holds) else True
+
+
 def open_queue_cell(cipher: Cipher, row: Any) -> str:
     """Open ``row``'s ``payload`` under its own tag: the body for an inline row, the sealed
     ``shared_body`` key for a ``ref`` row.
 
-    Raises :class:`QueueTagError` when the cell does not open under the row's tag, when a keyed
+    Raises :class:`QueueTagError` when the cell does not open under the row's tag (see
+    :func:`is_tag_failure`; a key or format problem raises the cipher's own error), when a keyed
     store's row (or any ``ref`` row) holds a blank ``payload``, or when a ``ref`` row's sealed key
     differs from its ``body_ref`` column. A keyless store writes plaintext and has no tag to check,
     so there only the reference comparison binds anything."""
@@ -159,6 +174,8 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))
     except CipherError as exc:
+        if not is_tag_failure(cipher, payload):
+            raise  # a key or format problem, which the cipher's own error names
         raise QueueTagError(
             f"integrity: the queue row's payload does not open under its own tag ({exc})"
         ) from exc
