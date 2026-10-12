@@ -413,8 +413,24 @@ def harden_crl_check(
     if before.get("crl", 0) == 0:
         _refuse_crl_count(loaded, blocks, label=label)
     else:
-        with staged_crl(pem) as copy:
-            crl_scratch_context(str(copy), blocks, label=label)
+        try:
+            with staged_crl(pem) as copy:
+                crl_scratch_context(str(copy), blocks, label=label)
+        except ssl.SSLError:
+            # An OSError too, but about the bytes OpenSSL read, so it is not reworded below.
+            raise
+        except OSError as exc:
+            # Vault BACKLOG #2866: the private copy could not be made, written or read. Refuse as
+            # every other check here does, naming the file. Caught here and not in ``staged_crl``:
+            # the running-hop reload tells this OSError, which it retries, from a ValueError, which
+            # it does not. The random temp path stays out of the text, as it does there.
+            raise ValueError(
+                f"{label} could not be checked: the engine could not make or read its private "
+                f"copy of the file in its temporary directory "
+                f"({exc.strerror or type(exc).__name__}). That is not a verdict on the file. "
+                "Give the engine's account a temporary directory it can write to, with room for "
+                "the file"
+            ) from exc
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)

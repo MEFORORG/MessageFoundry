@@ -1247,6 +1247,76 @@ def test_a_file_to_fix_is_reported_for_a_context_at_the_cap(
     assert _accepts(hop, pki.server())
 
 
+# --- vault BACKLOG #2866 item 1: a start that cannot stage its private copy -----------------------
+
+
+def _fail_mkdtemp(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(prefix: str) -> str:
+        raise PermissionError(13, "Permission denied", f"C:/tmp/{prefix}random")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", fail)
+
+
+def _fail_the_private_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = Path.write_bytes
+
+    def fail(self: Path, data: bytes) -> int:
+        if self.parent.name.startswith("mefor-crl-"):
+            raise OSError(28, "No space left on device", str(self))
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail)
+
+
+def _fail_the_private_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(crl_file: str, blocks: object, *, label: str) -> ssl.SSLContext:
+        raise FileNotFoundError(2, "No such file or directory", crl_file)
+
+    monkeypatch.setattr(tls_policy_module, "crl_scratch_context", fail)
+
+
+@pytest.mark.parametrize(
+    ("fail", "why"),
+    [
+        (_fail_mkdtemp, "Permission denied"),
+        (_fail_the_private_write, "No space left on device"),
+        (_fail_the_private_read, "No such file or directory"),
+    ],
+    ids=["mkdtemp", "write", "read"],
+)
+def test_a_start_that_cannot_stage_its_private_copy_is_a_refusal_that_names_the_file(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, fail: object, why: str
+) -> None:
+    # The private copy is staged only on a context that already holds a CRL, so load one first.
+    hop = pki.outbound_hop()
+    harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")  # control: a second load passes
+    assert callable(fail)
+    fail(monkeypatch)
+
+    with pytest.raises(ValueError, match="private copy") as refused:
+        harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+
+    said = str(refused.value)
+    assert said.startswith(f"[tls].crl_file ({str(pki.crl)!r})")  # the setting and the file
+    assert why in said
+    assert "mefor-crl-" not in said  # never the random path, as the reload's reason leaves it out
+    assert isinstance(refused.value.__cause__, OSError)
+
+
+def test_an_openssl_error_on_the_private_copy_is_not_reworded_as_a_staging_failure(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ``ssl.SSLError`` is an ``OSError``. It is about the bytes, so it must not read as a full disk.
+    hop = pki.outbound_hop()
+
+    def fail(crl_file: str, blocks: object, *, label: str) -> ssl.SSLContext:
+        raise ssl.SSLError(ssl.SSL_ERROR_SSL, "[X509] no certificate or crl found")
+
+    monkeypatch.setattr(tls_policy_module, "crl_scratch_context", fail)
+    with pytest.raises(ssl.SSLError, match="no certificate or crl found"):
+        harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+
+
 # --- vault BACKLOG #2866 items 3 and 4: a refusal that holds still across passes -------------------
 
 
