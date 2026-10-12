@@ -348,7 +348,21 @@ class AlertSink(Protocol):
 
         Raised once per file version, as the reload's ERROR line is logged: again only when the
         file's bytes change or the reason does. Emitted on the event loop by
-        :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`."""
+        :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`;
+        :meth:`crl_reload_applied` is its auto-resolving inverse."""
+        ...
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        """The INVERSE of :meth:`crl_reload_refused`: the refusal for the CRL file at ``path`` no
+        longer stands on this process. The file was applied to every context that held an older
+        copy, or it was put back to the bytes they hold, or no context holds it any more. Also
+        raised when the runner stops, because a restart rebuilds every context from the file.
+
+        Emits **no** notification (a recovery needs no page); it exists so durable alert-state
+        (ADR 0044) **auto-resolves** the open ``crl_reload_refused`` instance for the same
+        ``name``. Raised only for an alert this runner raised, and only once the refusal is gone
+        from the record: a pass that could not read the file, or that failed, clears nothing. A
+        process that dies without stopping leaves its alert open, for an operator to resolve."""
         ...
 
     def secret_rotation_due(
@@ -900,6 +914,10 @@ class LoggingAlertSink:
                 start_refuses=start_refuses,
             ),
         )
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the runner already logged at INFO.
+        log.debug("ALERT crl_reload_applied: %r CRL file %s is no longer refused", name, path)
 
     def secret_rotation_due(
         self,

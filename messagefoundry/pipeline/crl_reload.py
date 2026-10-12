@@ -908,7 +908,16 @@ class CrlReloadRunner:
     the refusal's reason does. The pass runs in a worker thread, so the alert is raised here,
     on the event loop, from the outcomes the pass returns. ``alert_sink`` defaults to a
     :class:`~messagefoundry.pipeline.alerts.LoggingAlertSink`, as the expiry monitor's does.
-    ``node`` names this process in the alert subject (:func:`reload_alert_subject`)."""
+    ``node`` names this process in the alert subject (:func:`reload_alert_subject`).
+
+    **It resolves that alert with ``crl_reload_applied``, and only on evidence.** A pass returns
+    no outcome for a file it could not read, and none when it failed, while the refusal still
+    stands. So a missing outcome clears nothing: the alert is resolved only once the refusal is
+    gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`). That is
+    when the file was applied, when it was put back to the bytes the hops hold, and when no hop
+    holds it any more. :meth:`stop` resolves what is still open, because a restart rebuilds
+    every context from the file and nothing later would clear it. A process that dies without
+    stopping leaves its alerts open, for an operator to resolve in the alert list."""
 
     def __init__(
         self,
@@ -930,10 +939,11 @@ class CrlReloadRunner:
         self._task: asyncio.Task[None] | None = None
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._node = node
-        # Per path key, the refusal already alerted: the fingerprint of the refused bytes and the
-        # reason. A pass returns a refused outcome every minute, so this is what keeps the alert
-        # to one per file version. Touched only on the event loop.
-        self._alerted: dict[str, tuple[tuple[int, int], str]] = {}
+        # Per path key, the refusal already alerted: the file's path, the fingerprint of the
+        # refused bytes and the reason. A pass returns a refused outcome every minute, so this is
+        # what keeps the alert to one per file version. It is also the set of alerts this runner
+        # has open. Touched only on the event loop.
+        self._alerted: dict[str, tuple[str, tuple[int, int], str]] = {}
         # True while the sink is refusing calls: one WARNING per failing streak, not one a pass.
         self._sink_failing = False
 
@@ -950,25 +960,31 @@ class CrlReloadRunner:
         A pass in flight gets that long to finish, so it does not go on loading CRLs after the engine
         stopped. A pass that takes longer, such as a read hung on a network share, is abandoned: the
         task is cancelled, and its worker thread, which cannot be cancelled, finishes on its own. A
-        pass lock keeps it from overlapping a runner started next."""
+        pass lock keeps it from overlapping a runner started next.
+
+        Every ``crl_reload_refused`` alert this runner still has open is resolved on the way out.
+        A stopped runner can no longer see a refusal clear, and the next start builds every
+        context from the file as it is then, so an alert left open would say hops hold an old
+        copy when none does. A runner started again raises it afresh if a refusal still stands."""
         self._stop.set()
         task = self._task
         self._task = None
-        if task is None:
-            return
-        try:
-            done, _ = await asyncio.wait({task}, timeout=self._stop_timeout)
-        except asyncio.CancelledError:
-            task.cancel()
-            raise
-        if not done:
-            log.warning(
-                "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
-                self._stop_timeout,
-            )
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        if task is not None:
+            try:
+                done, _ = await asyncio.wait({task}, timeout=self._stop_timeout)
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            if not done:
+                log.warning(
+                    "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
+                    self._stop_timeout,
+                )
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        # Also with no task: a clear the sink refused at an earlier stop is retried by this one.
+        self._resolve(list(self._alerted), "the reload has stopped")
 
     async def _run(self) -> None:
         # Sleep first: every context was just built from the file as it is now.
@@ -979,6 +995,9 @@ class CrlReloadRunner:
                 return
             if self._skip_when_idle and not has_held_copies():
                 _forget_all()
+                # No pass runs, so nothing else would resolve an alert for a file no hop holds
+                # now. Read from the record all the same: _forget_all skips a held pass lock.
+                self._resolve_cleared()
                 continue
             outcomes: object = None
             try:
@@ -990,26 +1009,64 @@ class CrlReloadRunner:
             self._report(outcomes)
 
     def _report(self, outcomes: object) -> None:
-        """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet.
+        """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet, then
+        resolve the alerts whose refusal no longer stands.
 
         ``outcomes`` is whatever the pass returned. An injected ``reload`` may return anything,
         and a pass that raised returns nothing, so only a list of :class:`ReloadOutcome` is read."""
         for outcome in outcomes if isinstance(outcomes, list) else ():
             if isinstance(outcome, ReloadOutcome) and outcome.refusal is not None:
                 self._raise_refused(outcome, outcome.refusal)
-        if self._alerted:
-            # A refusal the registry no longer holds was cleared: the file was applied or put
-            # back, or no hop holds it now. Forget it, so the same bytes refused again later
-            # alert again, as they log again.
-            standing = reload_refusals()
-            for key in [key for key in self._alerted if key not in standing]:
-                del self._alerted[key]
+        self._resolve_cleared()
+
+    def _resolve_cleared(self) -> None:
+        """Resolve every open alert whose refusal the record no longer holds.
+
+        The record, never the outcomes: a file the pass could not read and a pass that failed
+        both return no outcome while the refusal stands. The pass clears the record when every
+        context holds the file's bytes, and drops it when no hop holds the file. Forgetting the
+        alert here is also what makes the same bytes, refused again later, alert again, as they
+        log again."""
+        if not self._alerted:
+            return
+        standing = reload_refusals()
+        self._resolve(
+            [key for key in self._alerted if key not in standing], "the refusal no longer stands"
+        )
+
+    def _resolve(self, keys: Sequence[str], why: str) -> None:
+        """Raise ``crl_reload_applied`` for each alert in ``keys``, and forget the ones raised."""
+        for key in keys:
+            path = self._alerted[key][0]
+            try:
+                self._alert_sink.crl_reload_applied(
+                    reload_alert_subject(key, self._node), path=path
+                )
+            except Exception:
+                # Broad on purpose, as in _raise_refused. Kept as open, so the next pass or the
+                # stop retries the clear.
+                self._sink_failed("resolved")
+                continue
+            self._sink_failing = False
+            del self._alerted[key]
+            log.info("crl_reload: the refused-reload alert for %s is resolved: %s", path, why)
+
+    def _sink_failed(self, what: str) -> None:
+        """One WARNING per failing streak, from inside the ``except`` that caught the failure."""
+        if not self._sink_failing:
+            self._sink_failing = True
+            log.warning(
+                "crl_reload: the refused-reload alert could not be %s; the next pass, or the "
+                "stop, tries again",
+                what,
+                exc_info=True,
+            )
 
     def _raise_refused(self, outcome: ReloadOutcome, refusal: ReloadRefusal) -> None:
         key = crl_path_key(outcome.path)
-        version = (refusal.fingerprint, refusal.reason)
-        if self._alerted.get(key) == version:
-            return
+        known = self._alerted.get(key)
+        if known is not None and known[1:] == (refusal.fingerprint, refusal.reason):
+            return  # this version of the file is alerted already
         try:
             self._alert_sink.crl_reload_refused(
                 reload_alert_subject(key, self._node),
@@ -1023,13 +1080,7 @@ class CrlReloadRunner:
         except Exception:
             # Broad on purpose: a sink must never raise, and a broken one must not end the loop
             # that applies revocations. Not recorded as alerted, so the next pass retries it.
-            if not self._sink_failing:
-                self._sink_failing = True
-                log.warning(
-                    "crl_reload: the refused-reload alert could not be raised; the next pass "
-                    "retries it",
-                    exc_info=True,
-                )
+            self._sink_failed("raised")
             return
         self._sink_failing = False
-        self._alerted[key] = version
+        self._alerted[key] = (outcome.path, refusal.fingerprint, refusal.reason)

@@ -11,6 +11,10 @@ What this file proves, and the instrument for each:
   refused version raises one more.
 * **It is raised on the event loop.** A real ``NotifierAlertSink`` writes its alert-state row only
   with a running loop. The control makes the same call from a worker thread, and no row lands.
+* **Its inverse, ``crl_reload_applied``, resolves it only on evidence.** Applying the file, putting
+  the old bytes back, and losing every holder each resolve it once. A file that cannot be read and
+  a pass that fails resolve nothing: the control is the refusal still on record. A stop resolves
+  what is open.
 
 All material is synthetic and minted by ``tests/test_crl_reload.py``. No PHI.
 """
@@ -18,6 +22,7 @@ All material is synthetic and minted by ``tests/test_crl_reload.py``. No PHI.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 import ssl
@@ -39,7 +44,7 @@ from messagefoundry.config.loaded_crls import (
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AlertRule, EgressSettings
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.pipeline import crl_reload
-from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_reload_refused_detail
 from messagefoundry.pipeline.crl_reload import (
     ALERT_PATH_MAX_LENGTH,
@@ -96,6 +101,9 @@ class _Sink(LoggingAlertSink):
             "start_refuses": start_refuses,
         }
         self.events.append(("refused", name, payload))
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        self.events.append(("applied", name, {"path": path}))
 
     def kinds(self) -> list[str]:
         return [kind for kind, _name, _payload in self.events]
@@ -450,7 +458,254 @@ async def test_the_same_bytes_refused_again_after_a_fix_alert_again(pki: _Pki) -
     _pass(runner)
 
     assert [p["remedy_class"] for p in sink.refused()] == ["fix_file", "fix_file"]
+    assert sink.kinds() == ["refused", "applied", "refused"]
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+# --- the inverse: resolved when the file is applied or the refusal is cleared -------------------
+
+
+@pytest.mark.parametrize("node", [None, "shard:a"])
+async def test_applying_the_file_resolves_the_alert_once(pki: _Pki, node: str | None) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, node=node)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    _pass(runner)
+    assert sink.kinds() == ["refused"]
+
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    (applied,) = _pass(runner)
+    for _ in range(3):
+        _pass(runner)
+
+    assert (applied.reloaded, applied.refusal) == (1, None)
+    assert sink.kinds() == ["refused", "applied"], "resolved once, and not again"
+    (_, raised_as, _), (_, cleared_as, cleared) = sink.events
+    # The clear names the instance the raise opened, and this process's alone.
+    assert raised_as == cleared_as == reload_alert_subject(pki.crl, node)
+    assert cleared_as != reload_alert_subject(pki.crl, "shard:b")
+    assert Path(cleared["path"]) == pki.crl.resolve()
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_putting_the_old_bytes_back_resolves_the_alert(pki: _Pki) -> None:
+    """The refusal is cleared without any reload: every hop holds the file's bytes again."""
+    hop = pki.outbound_hop()
+    original = pki.crl.read_bytes()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+
+    pki.crl.write_bytes(original)
+
+    assert _pass(runner) == [], "the pass has nothing to do, so it returns no outcome"
+    assert sink.kinds() == ["refused", "applied"]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_alert_stays_while_any_context_is_on_the_old_copy(pki: _Pki) -> None:
+    current = pki.outbound_hop()
+    unproven = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    pem = pki.crl.read_bytes()
+    record_crl_load(unproven, str(pki.crl), pem, read_soonest_crl_facts(pem, now=time.time()))
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+
+    for _ in range(3):
+        _pass(runner)
+    assert sink.kinds() == ["refused"], "one hop took the file, and the other still has not"
+
+    del unproven
+    gc.collect()
+    _pass(runner)
+
+    assert sink.kinds() == ["refused", "applied"]
+    assert current.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_alert_resolves_once_no_hop_holds_the_file(pki: _Pki) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    assert sink.kinds() == ["refused"]
+
+    del hop
+    gc.collect()
+    _pass(runner)
+
+    assert sink.kinds() == ["refused", "applied"]
+
+
+async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(pki: _Pki) -> None:
+    """With no CRL load recorded the runner starts no pass, so the idle branch must resolve."""
+    sink = _Sink()
+    passes: list[int] = []
+    # A stand-in pass that touches no record, so only the idle branch can clear the refusal.
+    runner = CrlReloadRunner(
+        interval_seconds=0.01, reload=lambda: passes.append(1), alert_sink=sink
+    )
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    loaded_crls.record_reload_refusal(pki.crl, refusal)
+    runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 1)])
+    assert sink.kinds() == ["refused"] and not loaded_crls.has_held_copies()
+
+    runner.start()
+    try:
+        # Before the stop, which resolves too.
+        for _ in range(2000):
+            if "applied" in sink.kinds():
+                break
+            await asyncio.sleep(0.005)
+        assert sink.kinds() == ["refused", "applied"]
+        assert passes == [], "no pass ran: the idle branch resolved it"
+        assert reload_refusals() == {}
+    finally:
+        await runner.stop()
+    assert sink.kinds() == ["refused", "applied"]
+
+
+@pytest.mark.parametrize("final", [True, False], ids=["a-final-verdict", "a-retried-verdict"])
+async def test_a_file_the_pass_cannot_read_resolves_nothing(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, final: bool
+) -> None:
+    """A pass returns no outcome for a file it cannot stat or read. The refusal still stands, so
+    the missing outcome must not read as a clear."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
+    pki.crl.write_bytes(_expired(pki) if final else future)
+    (refused,) = _pass(runner)
+    assert refused.refusal is not None and refused.refusal.sticky is final
+
+    def unreadable(_path: str) -> tuple[int, int, int]:
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(crl_reload, "_stamp", unreadable)
+        for _ in range(3):
+            assert _pass(runner) == [], "no outcome at all for the unreadable file"
+        # The control: the refusal is still on record, which is what the runner reads.
+        assert crl_path_key(pki.crl) in reload_refusals()
+        assert sink.kinds() == ["refused"]
+
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    _pass(runner)
+    assert sink.kinds() == ["refused", "applied"], "and a real clear still resolves it"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_pass_that_fails_resolves_nothing(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+
+    def boom(*_args: object) -> None:
+        raise RuntimeError("the triage failed")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(crl_reload, "_triage", boom)
+        assert _pass(runner) == [], "a failure on the file is logged and returns no outcome"
+        runner._report(None)  # what _run reports when the whole pass raised
+        assert crl_path_key(pki.crl) in reload_refusals()
+        assert sink.kinds() == ["refused"]
+
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_stop_resolves_what_is_still_open_and_pages_nobody(pki: _Pki) -> None:
+    """A restart rebuilds every context from the file, so nothing later would clear the alert."""
+    hop = pki.outbound_hop()
+    transport, store = _RecordingTransport("webhook"), _RecordingStore()
+    sink = NotifierAlertSink([transport], store=cast(Any, store))
+    passes = _CountedPasses()
+    runner = CrlReloadRunner(interval_seconds=0.01, reload=passes, alert_sink=sink)
+    pki.crl.write_bytes(_not_newer(pki))
+    runner.start()
+    try:
+        await passes.more(2)
+        await _drain_state(sink)
+        assert len(store.upserts) == 1 and store.resolves == [], "open while the runner runs"
+    finally:
+        await runner.stop()
+    await runner.stop()  # idempotent: nothing is left to resolve
+    await _drain_state(sink)
+    await _drain_transports(sink)
+
+    subject = reload_alert_subject(pki.crl)
+    assert store.resolves == [{"event_type": "crl_reload_refused", "connection": subject}]
+    assert [e["type"] for e in transport.events] == ["crl_reload_refused"], "a clear needs no page"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_runner_started_again_raises_a_refusal_that_still_stands(pki: _Pki) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    await runner.stop()
+    assert sink.kinds() == ["refused", "applied"]
+
+    _pass(runner)
+
+    assert sink.kinds() == ["refused", "applied", "refused"]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_clear_the_sink_refuses_is_retried(
+    pki: _Pki, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _Broken(_Sink):
+        down = True
+
+        def crl_reload_applied(self, name: str, *, path: str) -> None:
+            if self.down:
+                raise RuntimeError("sink down")
+            super().crl_reload_applied(name, path=path)
+
+    hop = pki.outbound_hop()
+    sink = _Broken()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        for _ in range(3):
+            _pass(runner)
+        failures = [r for r in caplog.records if "could not be resolved" in r.getMessage()]
+        assert len(failures) == 1 and sink.kinds() == ["refused"]
+        sink.down = False
+        _pass(runner)
+        _pass(runner)
+
+    assert sink.kinds() == ["refused", "applied"]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_the_inverse_resolves_the_alert_and_no_rule_can_name_it() -> None:
+    assert _AUTO_RESOLVE["crl_reload_applied"] == "crl_reload_refused"
+    assert "crl_reload_applied" not in _ALERT_EVENT_TYPES
+    with pytest.raises(ValidationError, match="event_type"):
+        AlertRule(event_type="crl_reload_applied")
+
+
+def test_the_logging_sink_logs_the_inverse_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.alerts"):
+        LoggingAlertSink().crl_reload_applied("crl_reload:a", path="a.pem")
+    (record,) = caplog.records
+    assert record.levelno == logging.DEBUG and "crl_reload_applied" in record.getMessage()
 
 
 # --- the alert key -------------------------------------------------------------------------------
@@ -550,9 +805,10 @@ def test_the_alert_is_rule_targetable_and_takes_no_control_action() -> None:
         AlertRule(event_type="crl_reload_refused", control_action="restart_inbound")
 
 
-def test_every_shipped_sink_implements_the_alert() -> None:
+def test_every_shipped_sink_implements_the_alert_and_its_inverse() -> None:
     for cls in (LoggingAlertSink, NotifierAlertSink):
-        assert callable(getattr(cls, "crl_reload_refused", None)), cls.__name__
+        for method in ("crl_reload_refused", "crl_reload_applied"):
+            assert callable(getattr(cls, method, None)), f"{cls.__name__}.{method}"
 
 
 # --- the engine wiring ---------------------------------------------------------------------------

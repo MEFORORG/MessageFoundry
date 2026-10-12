@@ -145,6 +145,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     # raised under the "directory-reconciler-referral" label once no referral stands.
     "ad_reconcile_breaker_cleared": "ad_reconcile_aborted",
     "ad_reconcile_hold_released": "ad_reconcile_held",
+    # #2904: a CRL file the reload no longer refuses resolves the open refusal for the same file
+    # on the same process.
+    "crl_reload_applied": "crl_reload_refused",
 }
 
 _T = TypeVar("_T")
@@ -1029,6 +1032,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # Only when there is something to say, as crl_expiry adds its held-copy keys.
             event["start_refuses"] = True
         self._emit(event)
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        # #2904: the INVERSE -- no page; auto-resolves the open crl_reload_refused via _AUTO_RESOLVE.
+        self._record_state({"type": "crl_reload_applied", "connection": name}, "info")
 
     def secret_rotation_due(
         self,
