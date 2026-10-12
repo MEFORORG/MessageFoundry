@@ -2012,8 +2012,8 @@ least these paths. The alert is keyed `approval:<id>` and carries the row's acti
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;
-- the `approval.approver_provenance` row a release writes after it has gone ahead. The log line
-  carries the row's detail;
+- the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
+  The log line carries the row's detail;
 - the request or repeat write. The log line names the actor and the operation;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
@@ -2095,7 +2095,15 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
 - writes `approval.resolved` against the resolver in the same write as the move, naming the
   requester, the releasing approver, the outcome, the new status and the cut-off time. If that write
   fails, the resolve answers **503** and the row stays `interrupted`. A resolver who loses a race
-  moves nothing and writes no row. The row keeps the releasing approver.
+  moves nothing and writes no row. The row keeps the releasing approver;
+- flags a resolver whose account changed after the request, and still resolves (BACKLOG #2125). It
+  runs the approver check below on the resolver, against the request time. Once the row has moved,
+  it writes `approval.approver_provenance` with `act` `resolve` and raises the same alert, keyed
+  `approval:<id>:resolve`. A resolve that answers 409 or 503 is not flagged, even where its COMMIT
+  landed despite the error. The check compares against the request time, not the cut-off time,
+  so a row left `interrupted` for a long time also flags a routine password change or TOTP
+  enrolment made while it waited. This is a seat decision under owner delegation
+  2026-10-08, not an owner ruling.
 
 `GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
 have waited longest are never the ones cut off.
@@ -2208,7 +2216,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 
 | Signal | When | Where it goes |
 |---|---|---|
-| `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
+| `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made. A resolution of an `interrupted` release does the same for the resolver's account (BACKLOG #2125) | Audit row against the approver or resolver, with their `client` address (ADR 0150). Its `act` field is `release` or `resolve`. Alert keyed `approval:<id>` for a release and `approval:<id>:resolve` for a resolution, carrying the changed facts only |
 | `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync newly gives an account the role (vault BACKLOG #2610) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in |
 | `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
 | `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
