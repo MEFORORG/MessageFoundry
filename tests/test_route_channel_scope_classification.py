@@ -158,7 +158,7 @@ ROUTES: dict[str, tuple[str, str]] = {
     "GET /connections/{name}/metadata": (SCOPED, "403 outside the caller's scope"),
     "POST /connections/{name}/test": (SCOPED, "403 outside the caller's scope"),
     "POST /connections/{name}/test-credential": (SCOPED, "403 outside the caller's scope"),
-    "POST /connections/{name}/purge": (SCOPED, "a scoped caller cannot purge a shared outbound"),
+    "POST /connections/{name}/purge": (SCOPED, "a scoped caller cannot purge any outbound"),
     "POST /statistics/reset": (SCOPED, "each target is checked against the caller's scope"),
     "GET /events": (SCOPED, "narrowed; outbound events dropped"),
     "GET /connections/{name}/events": (SCOPED, "403 outside the caller's scope"),
