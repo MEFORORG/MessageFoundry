@@ -300,11 +300,20 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
     version = header[11].split(seps.component)[0] if len(header) > 11 else ""
     nameable = known_segments(version) | {path.split("-", 1)[0] for path in mapped_paths}
     for n, seg in enumerate(lines):
-        if n == header_at or all(c.isspace() or not c.isprintable() for c in seg):
+        if all(c.isspace() or not c.isprintable() for c in seg):
             continue
         fields = seg.split(field_sep)
         seg_id = fields[0]
-        if _line_is_malformed(fields, nameable):
+        is_msh = seg_id.upper() == "MSH"
+        # A header whose separator is a letter of its own id does not split to an MSH id. It is
+        # not skipped, and the check below refuses it, as it did before the header was found
+        # by line.
+        if n == header_at and is_msh:
+            continue
+        # An MSH line ahead of the header is refused whatever it holds. The tee adapter takes
+        # the FIRST line whose id reads MSH as its header, so with one here an MSH rule would
+        # miss the real header, which this walk never checks.
+        if _line_is_malformed(fields, nameable) or (n < header_at and is_msh):
             out.append((_MALFORMED_LINE, seg_id))  # always present, even when empty
             out.extend((f"{MALFORMED_SEGMENT}-{i}", v) for i, v in enumerate(fields) if i and v)
             continue

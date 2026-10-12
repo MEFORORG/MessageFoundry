@@ -270,16 +270,35 @@ def test_the_walk_passes_a_leading_bare_id_of_the_messages_own_version(side: Any
     assert side.leak.unmapped_field_values(message, set())[0] == (f"PV2{_NO_FIELDS}", "")
 
 
+@pytest.mark.parametrize("leading", ("MSH|a|b", "MSH|^~|x", "msh|a|b"))
 @_SIDES
-def test_the_real_header_is_skipped_and_a_short_msh_line_ahead_of_it_is_walked(side: Any) -> None:
+def test_an_msh_line_ahead_of_the_header_is_refused_and_the_header_skipped(
+    side: Any, leading: str
+) -> None:
     """``MSH|a|b`` has three fields and no encoding characters, so it is not the header. Before
-    the fix it was skipped whole and the real header was walked as a later MSH line."""
-    addresses = {
-        address
-        for address, _ in side.leak.unmapped_field_values(_leading("MSH|a|b", version="2.3"), set())
-    }
-    assert {"MSH-2", "MSH-3"} <= addresses  # the short line's own two fields
-    assert "MSH-12" not in addresses and "MSH-9" not in addresses  # the real header's
+    the fix it was skipped whole and the real header was walked as a later MSH line. It is
+    refused: the tee adapter would take it as ITS header, and an MSH rule would miss the real one."""
+    message = _leading(leading, version="2.3")
+    addresses = [address for address, _ in side.leak.unmapped_field_values(message, set())]
+    assert addresses[0] == "(malformed segment)-0"
+    assert not any(address.startswith("MSH-") for address in addresses)  # the real header's
+
+
+def test_the_tee_refuses_a_short_msh_line_ahead_of_a_header_not_in_capitals() -> None:
+    """The case the refusal above is for. The tee adapter binds its header to the first line
+    whose id reads ``MSH``. With the short line emitted, an ``MSH-4`` rule would rewrite that
+    line and leave the real header, which the leak-check never walks, as it came."""
+    message = "\r".join(("MSH|^~|x", _msh("2.3", seg="msh"), _PID))
+    with pytest.raises(tee_anon.AnonError, match="no rule can reach"):
+        tee_anon.anonymize(message, salt=_SALT, rules=_rules(_TEE, ("MSH-4", "drop")))
+
+
+@_SIDES
+def test_a_header_whose_separator_is_a_letter_of_its_id_is_refused(side: Any) -> None:
+    """``MSHH^~\\&H...`` splits on ``H`` to the id ``MS``. Both sides refused it before the header
+    was found by line, and they still do."""
+    message = "\r".join((r"MSHH^~\&HAPPHFAC", "PIDH1HHX"))
+    assert side.leak.has_unreachable_line(message) is True
 
 
 @_SIDES
