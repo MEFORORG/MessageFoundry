@@ -216,6 +216,41 @@ def test_a_kept_label_does_not_switch_the_encoded_run_off() -> None:
     assert not _paths_keeping(text, _VALUE, "ZQDOE", "ZQJANE", "4455667")
 
 
+def test_a_kept_label_on_a_later_call_does_not_switch_the_encoded_run_off() -> None:
+    """Two handlers filter one record. The line break keeps the encoded run off on the first pass,
+    where the credential filter writes ``password=<redacted>`` over it. Before #2968 the second
+    pass found no credential shape and applied the run; the kept label must not stop it now."""
+    phi = "ZQDOE%5EZQJANE%5E4455667"
+    text = f"x|y|z;password=\n {_VALUE} q={phi}"
+    out = _through_the_chain(_through_the_chain(text))
+    assert not [value for value in (_VALUE, "ZQDOE", "ZQJANE", "4455667") if value in out], out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"x|y|z;session: PWD:\t{_VALUE}",
+        f"x|y|z;token= )api-key: {_VALUE}",
+        f"x|y|z;secret: 'a password: {_VALUE}'",
+    ],
+    ids=["label-as-value", "glued-label-as-value", "label-in-a-quoted-value"],
+)
+def test_a_label_whose_value_holds_a_label_is_not_kept(text: str) -> None:
+    """The credential filters take a value whole and do not stop at a label inside it. A kept label
+    would take the next label as its value, and that label's value would print, where the run used
+    to take the first label and the filters read the second. So such a label goes with the run."""
+    assert redact(text).startswith("[redacted] "), redact(text)
+    assert not _paths_keeping(text, _VALUE)
+
+
+def test_every_tail_word_holds_a_hint() -> None:
+    """The check on a kept label's value looks for these substrings, so every label word must hold
+    one or a label inside a value would go unseen."""
+    words = _label_words(redaction._TRAILING_CREDENTIAL_LABEL.pattern).split("|")
+    for word in [*words, "MEFOR_X"]:
+        assert any(hint in word.casefold() for hint in redaction._LABEL_HINTS), word
+
+
 def test_a_credential_label_glued_to_an_encoded_run_still_loses_its_value() -> None:
     """Closing step 3 of the row, one glue here. The encoded run still takes a glued label with its
     token; the value goes because ``redact`` leaves that run off a text holding a credential

@@ -183,6 +183,92 @@ _TRAILING_CREDENTIAL_LABEL = re.compile(
 _TRAILING_LABEL_SPAN = 64
 #: What must follow a kept label that holds no separator of its own: whitespace, then one.
 _SEPARATOR_AFTER = re.compile(r"\s++[:=]")
+_LEADING_SPACE = re.compile(r"\s*+")
+_VALUE_TOKEN = re.compile(r"\S*+")
+#: The most of a kept label's value :func:`_value_may_hold_a_label` reads. A longer value is not
+#: read, and its label is not kept.
+_VALUE_SPAN = 4096
+#: Substrings at least one of which every credential label holds, folded: each word of
+#: :data:`_TRAILING_CREDENTIAL_LABEL` contains one, and ``tests/test_redaction_glued_credential_label.py``
+#: holds that.
+_LABEL_HINTS = (
+    "pass",
+    "pwd",
+    "secret",
+    "credential",
+    "authorization",
+    "bearer",
+    "token",
+    "session",
+    "api_key",
+    "api-key",
+    "apikey",
+    "encryption_key",
+    "private_key",
+    "mefor_",
+)
+
+
+#: The two characters ``casefold`` does not turn into a plain "i", though the credential filters'
+#: case-insensitive match reads each as one (``secretscrub._GATE_FOLDS``). Built with ``chr()`` so no
+#: encoding layer can change them.
+_DOTTED_I = (chr(0x0130), chr(0x0131))
+
+
+def _value_span(text: str, pos: int) -> tuple[int, int, bool] | None:
+    """Where the value a label takes from ``pos`` starts and stops, read as the credential filters
+    take it, and whether it is quoted. ``None`` where it cannot be read here.
+
+    From the first character after whitespace: a plain value to the next whitespace, and a quoted one
+    to its closing quote on the same line, or the line's end. A braced value can cross lines, so it is
+    not read, and nor is anything longer than :data:`_VALUE_SPAN`. Each call reads at most that many
+    characters past the whitespace."""
+    found = _LEADING_SPACE.match(text, pos)
+    start = pos if found is None else found.end()
+    if start >= len(text):
+        return start, start, False
+    first, limit = text[start], min(len(text), start + _VALUE_SPAN)
+    if first == "{":
+        return None
+    if first in "'\"":
+        ends = [
+            i for i in (text.find("\n", start, limit), text.find("\r", start, limit)) if i != -1
+        ]
+        if not ends and limit < len(text):
+            return None
+        line_end = min(ends, default=limit)
+        closer = text.find(first, start + 1, line_end)
+        return start, line_end if closer == -1 else closer + 1, True
+    token = _VALUE_TOKEN.match(text, start, limit)
+    stop = limit if token is None else token.end()
+    if stop == limit < len(text) and not text[limit].isspace():
+        return None
+    return start, stop, False
+
+
+def _value_may_hold_a_label(text: str, pos: int) -> bool:
+    """Whether the value a kept label would take, starting at ``pos``, may hold another label.
+
+    **A kept label's value can swallow a later label, and that later label's value then prints.**
+    The credential filters take a plain value up to whitespace and a quoted one to its closing
+    quote, and they do not stop at a label inside it. In ``x|y|z;session: PWD:<tab><value>`` the
+    run used to take ``session:``, so the filters read ``PWD:`` and scrubbed its value. Kept,
+    ``session:`` takes ``PWD:`` as its value and the next value prints. A differential found that
+    shape on the installed chain. So a label is kept only where its value (:func:`_value_span`)
+    holds no label word, and where that value can be read at all.
+
+    The test is a folded substring test, wider than any label: a value that merely contains
+    ``pass`` loses its label, which is what the run did before. Linear: a plain value is the next
+    token, which no other kept label reads, and a quoted one is read for a bounded span."""
+    span = _value_span(text, pos)
+    if span is None:
+        return True
+    value = text[span[0] : span[1]]
+    if not value.isascii():
+        for dotted in _DOTTED_I:
+            value = value.replace(dotted, "i")
+    value = value.casefold()
+    return any(hint in value for hint in _LABEL_HINTS)
 
 
 def _field_run_replacement(match: re.Match[str], delimiters: frozenset[str]) -> str:
@@ -196,18 +282,23 @@ def _field_run_replacement(match: re.Match[str], delimiters: frozenset[str]) -> 
     tail = _TRAILING_CREDENTIAL_LABEL.search(text, max(start, end - _TRAILING_LABEL_SPAN), end)
     if tail is None or tail.start() == start:
         return _REDACTED
-    kept = tail.group()
+    kept, value_at = tail.group(), end
     if tail.group("bare") is not None:
         if text[tail.start() - 1] in delimiters:
             return _REDACTED  # a whole component, so data
         if kept.lower() == "bearer":
-            return _REDACTED + "bearer"
-        if _SEPARATOR_AFTER.match(text, end) is None:
-            return _REDACTED
-        return _REDACTED + kept
-    scheme = tail.start("scheme")
-    if scheme != -1:
-        kept = kept[: scheme - tail.start()] + kept[scheme - tail.start() :].lower()
+            kept = "bearer"
+        else:
+            separator = _SEPARATOR_AFTER.match(text, end)
+            if separator is None:
+                return _REDACTED
+            value_at = separator.end()
+    else:
+        scheme = tail.start("scheme")
+        if scheme != -1:
+            kept = kept[: scheme - tail.start()] + kept[scheme - tail.start() :].lower()
+    if _value_may_hold_a_label(text, value_at):
+        return _REDACTED
     return _REDACTED + kept
 
 
@@ -216,14 +307,50 @@ def _default_field_run_replacement(match: re.Match[str]) -> str:
     return _field_run_replacement(match, _DEFAULT_DELIMITERS)
 
 
-#: A label :func:`_field_run_replacement` kept, as it stands in that function's output: right after
-#: the placeholder. :func:`redact` looks for one before it pays for a second look at its switch.
+#: A label :func:`_field_run_replacement` kept, as it stands in that function's output: the
+#: placeholder at the start of a token, then the tail. :func:`redact` looks for one before it pays
+#: for a second look at its switch, and :func:`_without_kept_labels` reads it.
 _KEPT_LABEL = re.compile(
-    r"""\[redacted\](?:MEFOR_|(?i:"""
+    r"""(?<!\S)\[redacted\](?:MEFOR_[A-Z0-9_]+|(?i:"""
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
-    r"""|token|pass|pwd))"""
+    r"""|token|pass|pwd))['"]?(?P<separator>[:=](?i:bearer|basic|digest)?+)?"""
 )
+
+
+def _without_kept_labels(text: str) -> str:
+    """``text`` with each kept label the percent-encoded run cannot break taken out, for the
+    credential test of :func:`redact`'s switch only. Never returned to a caller.
+
+    **The switch would otherwise read a kept label on a later call.** The engine's error log redacts
+    twice, and a record two handlers filter is redacted once per handler. Before BACKLOG #2968 the
+    first call took the label, so a later call found no credential shape and applied the encoded
+    run. Since #2968 the label stays, the credential filters write ``label=<redacted>`` after it,
+    and a later call read that as a reason to leave the run off. Measured: an encoded run's PHI that
+    the second handler scrubbed before #2968 printed after it.
+
+    **Why taking such a label out is safe.** The switch exists so the encoded run cannot take a mark
+    the credential filters read (:data:`_CREDENTIAL_AHEAD`). A kept label starts its token, and the
+    placeholder replaced every separator before it, so the run cannot take the label. The run takes
+    a whole token or nothing, so it cannot cut a plain value in two. A quoted value can be cut,
+    where one of its tokens holds an encoded separator, and so can one this module cannot read
+    (:func:`_value_span`), so a label before either stays in the test. Any other credential shape
+    in the text still switches the run off."""
+
+    def unless_breakable(match: re.Match[str]) -> str:
+        value_at = match.end()
+        if match.group("separator") is None and match.group().lower() != "[redacted]bearer":
+            separator = _SEPARATOR_AFTER.match(text, value_at)
+            if separator is None:
+                return match.group()
+            value_at = separator.end()
+        span = _value_span(text, value_at)
+        if span is None or (span[2] and _ENCODED_SEPARATOR.search(text, span[0], span[1])):
+            return match.group()
+        return _REDACTED
+
+    return _KEPT_LABEL.sub(unless_breakable, text)
+
 
 #: A field run whose separators are PERCENT-ENCODED, in a URL or a form body: ``%7C``, ``%5E``,
 #: ``%7E`` and ``%26`` for ``| ^ ~ &``, either case (BACKLOG #2171). A FHIR search such as
@@ -1811,8 +1938,10 @@ def redact(text: str) -> str:
     the filters after this module can read it. Read by the switch, that label would turn the run
     off on text where it applied before, and the run's PHI would print. So where the output may hold
     a kept label (:data:`_KEPT_LABEL`), the switch reads the stages as they ran before #2968, which
-    costs a second pass of the stages on that text only. A kept label sits in a token with no
-    separator left in it, so the run cannot take it.
+    costs a second pass of the stages on that text only. On a later call the label is already in
+    the input, so the credential test also leaves out each kept label whose value the run cannot
+    break (:func:`_without_kept_labels` says why that is safe). Both were measured by a
+    before-and-after differential; the commit that added them carries the numbers.
 
     **A text the widened stage could read is left alone too** (:func:`_needs_widened_stage`). Those
     rules keep some values by their surroundings: a bare value under a JSON ``name`` stays while more
@@ -1828,10 +1957,14 @@ def redact(text: str) -> str:
         return out
     # BACKLOG #2968: a label the field run kept is a credential shape the switch below would read,
     # and it would switch the run off on text where it applied before, so the run's PHI would
-    # print. So where one may be in ``out``, the switch reads the stages as they ran before #2968.
+    # print. So where one may be in ``out``, the switch reads the stages as they ran before #2968,
+    # and its credential test leaves out a kept label already in the input (a later call).
     gate = out
     if _CREDENTIAL_AHEAD.search(out) is not None and _KEPT_LABEL.search(out) is not None:
         gate = _redact_stages(text, keep_labels=False)
+        credential_gate = _without_kept_labels(gate)
+    else:
+        credential_gate = gate
     # This module's own bound note is joined by a line break (:data:`_TRAILING_NOTES`). It is the one
     # unprintable character that is not a peer's, so it is set aside before the test below.
     note = _TRAILING_NOTES.search(gate) if gate.endswith("unscanned]") else None
@@ -1840,7 +1973,7 @@ def redact(text: str) -> str:
         not body.isprintable()
         or _USERINFO_OPENER in gate
         or _needs_widened_stage(gate)
-        or _CREDENTIAL_AHEAD.search(gate) is not None
+        or _CREDENTIAL_AHEAD.search(credential_gate) is not None
     ):
         return out
     return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
