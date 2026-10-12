@@ -5525,6 +5525,14 @@ def _import(args: argparse.Namespace) -> int:
             "\nReview the `# TODO: Corepoint ...` markers in the generated modules and hand-finish them, "
             "then run: messagefoundry check --config " + str(args.out)
         )
+    # Every generated endpoint is undeployed, whatever mapped (BACKLOG #1130), so say so every time:
+    # a fully mapped import would otherwise read as ready to run while the engine binds nothing.
+    # The wording holds for both layers: an XML endpoint is a placeholder to replace, a JSON one is
+    # export text to review, and the generated module's own TODO says which.
+    print(
+        "\nEvery endpoint is emitted deployed=False and binds nothing. Follow the endpoint TODO in "
+        "each generated module, then drop deployed=False."
+    )
     return 0
 
 
