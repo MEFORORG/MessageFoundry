@@ -27,15 +27,15 @@ on:
   # manufactures a permanent green-that-means-not-applicable on the merge path -- the silent-control
   # decay ADR 0158 names.
   #
-  # THE QUEUE-TIME GREEN IS DECORATIVE FOR SIGNING AND LOAD-BEARING FOR MERGING, ON GITHUB'S WORD.
-  # Load-bearing for the first paragraph's reason. GitHub's merge-queue docs say a pull request joins
-  # the queue only after passing all required branch protection checks. So the PR-time `cla` run has
-  # done the signing work. The owner accepted that entry condition by ruling 2026-09-14, recorded on
-  # vault BACKLOG #340. PR 754 fits it without testing it: on 2026-09-03 its one `cla` check-run went
-  # green at 19:25:55Z on head 1e9f1cb3, before it was queued. The merge-path green that means
-  # not-applicable is a STATED RESIDUAL, accepted by the owner on 2026-10-08. At least one route stays
-  # open: if the entry condition ever failed, an unsigned PR could merge on that green. That route is
-  # NOT MEASURED HERE, because the owner declined the experiment. Nothing here proves signing holds.
+  # THE QUEUE-TIME GREEN IS DECORATIVE FOR SIGNING, ON GITHUB'S WORD, AND LOAD-BEARING FOR MERGING.
+  # Load-bearing for the reason under DO NOT REMOVE IT above. GitHub's merge-queue docs say a PR
+  # joins the queue only after passing all required branch protection checks. So the PR-time `cla`
+  # run has done the signing work. The owner accepted that entry condition by ruling 2026-09-14, on
+  # vault BACKLOG #340. PR 754 fits it without testing it: its PR head 1e9f1cb3 carried one `cla`
+  # check-run, green at 19:26:03Z, before it was queued. The merge-path green that means
+  # not-applicable is a STATED RESIDUAL, accepted by the owner on 2026-10-08. At least one route
+  # stays open: if the entry condition ever failed, an unsigned PR could merge on that green. That
+  # route is NOT MEASURED HERE: the owner declined the experiment. Nothing here proves signing holds.
   #
   # FORMERLY "INERT UNTIL A MERGE QUEUE EXISTS": true on 2026-08-26, false once a queue was set up,
   # corrected 2026-09-03. The owner chose on 2026-10-08 to close BACKLOG #340.
