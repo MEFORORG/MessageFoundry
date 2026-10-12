@@ -146,6 +146,10 @@ def anonymize_checked(
     ``anon.toml`` ``keep`` names, other than :data:`.leak.ALWAYS_DECIDED` (set ids, PID-8, PV1-2).
     It asks whether every field was DECIDED, not whether its value is safe: a kept field passes
     it and is still scanned for PHI shapes. The MSH header is outside its reach (BACKLOG #1710).
+    A line that is a bare segment id and passed, such as an empty ``PV2``, is in the report under
+    its own address. It counts as undecided unless a rule or a ``keep`` names any field of that
+    segment, because a wrapped line of free text that is exactly such an id looks the same
+    (BACKLOG #3001).
 
     The report's ``blanked_fields`` names each field the ``date`` kind scrubbed to empty because the
     value was not a timestamp it could keep. It is a record, not a refusal cause (BACKLOG #2330).

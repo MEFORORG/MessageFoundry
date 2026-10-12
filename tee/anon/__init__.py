@@ -104,7 +104,9 @@ def anonymize_checked(
     structural PHI-shape detectors over the fields no rule matched. ``require_live_denylist`` (default
     off) makes a non-live token source a refusal cause; ``require_full_coverage`` (default off)
     refuses any present field no rule scrubs and no ``keep`` names, other than set ids, PID-8 and
-    PV1-2, and a kept field is still scanned; ``on_report`` receives the :class:`LeakReport`
+    PV1-2, and a kept field is still scanned; a line that is a bare segment id and passed is in
+    the report under its own address, undecided unless a rule or a ``keep`` names any field of
+    that segment (BACKLOG #3001); ``on_report`` receives the :class:`LeakReport`
     on the clean path and on a leak-check refusal, not when :func:`anonymize` raises :class:`AnonError`. The error names token categories and field shapes/addresses only, never a value.
     A clean return is not proof of PHI-free output: a name, an undashed number or a date in an
     unmapped field passes, so surface the ``on_report`` coverage on the clean path (BACKLOG #1710).
