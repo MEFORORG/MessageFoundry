@@ -4849,6 +4849,15 @@ class AuthService:
             return await self._step_up_refused(
                 "not_in_directory", actor=actor, client=client, return_to=return_to
             )
+        # BACKLOG #3174: the answer must name the row's own directory object before its groups are
+        # trusted. The lookup was keyed on that id, but a directory implementation that does not
+        # check the id itself could answer for whoever holds the name now. The same test the AD
+        # step-up re-bind applies (_directory_answer_mismatch), with its closed-set reasons.
+        mismatch = _directory_answer_mismatch(principal, user.directory_object_id)
+        if mismatch is not None:
+            return await self._step_up_refused(
+                mismatch, actor=actor, client=client, return_to=return_to
+            )
         # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
         # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
         # (#2240). Inline rather than through that helper, because its probe would change this
@@ -7167,7 +7176,16 @@ class AuthService:
         row is safely written and BEFORE the per-user cap runs. That order is the point: ending it
         after the cap would let the cap evict another device's oldest session to make room for a
         session that was about to go anyway.
+
+        Raises :class:`ValueError` for an ``oidc`` session with no ``idp_auth_time``, before anything
+        is written (BACKLOG #3174). :meth:`_complete_ad_login` refuses the same mint earlier, but
+        this is the one place every session is minted, so a caller that skips that method is still
+        refused here. ``Store.create_session`` has no other caller in the engine.
         """
+        if mechanism is SessionMechanism.OIDC and idp_auth_time is None:
+            # BACKLOG #2143's rule at the mint itself: an oidc session that stores NULL refuses
+            # every IdP step-up, so it is a programming error, not a session to issue.
+            raise ValueError("an oidc session needs the verified IdP auth_time")
         token = mint_token()
         token_hash = hash_token(token)
         expires_at = time.time() + self._settings.session_absolute_hours * 3600
@@ -11487,6 +11505,7 @@ class AuthService:
                 actor=actor,
                 expected_issuer=expected_issuer,
                 expected_subject=expected_subject,
+                held=(outcome.issuer, outcome.subject),
             )
         # BOTH halves, matching the store's own predicate: either one set means the row had
         # something to clear and the store cleared it, so raising here would report "nothing to
@@ -11504,6 +11523,7 @@ class AuthService:
         actor: str,
         expected_issuer: str | None,
         expected_subject: str | None,
+        held: tuple[str | None, str | None] | None,
     ) -> FederatedBindingChanged:
         """Audit a :class:`FederatedBindingChanged` refusal, and return the exception to raise
         (BACKLOG #2331).
@@ -11511,21 +11531,23 @@ class AuthService:
         Nothing was written, but an attempt to change who may sign in as an account is worth a row
         even when it is refused. The row records what the caller expected, and says nothing about
         why the pair differed: another administrator's change, or a retry of the caller's own call
-        that had already landed, look the same here. It does not carry the pair the row holds,
-        because one refusal arm finds it changed without reading it.
+        that had already landed, look the same here.
+
+        ``held`` is the pair the row held when the refusal read it, and the row carries it as
+        ``held_issuer`` and ``held_subject`` (BACKLOG #3174). Both are ``None`` for a row read
+        unbound. ``held`` is ``None`` only on the bind arm whose conditional write found the row
+        bound without reading it. That row leaves both fields out rather than read them again,
+        because a later read could name a pair that changed after the refusal.
         """
-        await self._audit(
-            action,
-            actor=actor,
-            detail=_json(
-                {
-                    **detail,
-                    "expected_issuer": expected_issuer,
-                    "expected_subject": expected_subject,
-                    "reason": FEDERATED_BINDING_CHANGED,
-                }
-            ),
-        )
+        fields: dict[str, object] = {
+            **detail,
+            "expected_issuer": expected_issuer,
+            "expected_subject": expected_subject,
+        }
+        if held is not None:
+            fields["held_issuer"], fields["held_subject"] = held
+        fields["reason"] = FEDERATED_BINDING_CHANGED
+        await self._audit(action, actor=actor, detail=_json(fields))
         return FederatedBindingChanged()
 
     async def _record_federated_unbind(
@@ -11643,39 +11665,43 @@ class AuthService:
         if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
             raise ValueError("the account already holds that identity")
 
-        async def audit_changed(username: str) -> FederatedBindingChanged:
+        target = {"user_id": user_id, "issuer": issuer, "subject": subject}
+
+        async def audit_changed(
+            username: str, held: tuple[str | None, str | None] | None
+        ) -> FederatedBindingChanged:
             # BACKLOG #2331: each of the three changed-pair refusals below writes this one row.
             return await self._audit_binding_changed(
                 "auth.federated_bind_refused",
-                {"user_id": user_id, "username": username, "issuer": issuer, "subject": subject},
+                {**target, "username": username},
                 actor=actor,
                 expected_issuer=expected_issuer,
                 expected_subject=expected_subject,
+                held=held,
+            )
+
+        async def audit_refused(reason: str, **extra: object) -> None:
+            # BACKLOG #3174: every other refusal past the no-op check writes the same row, so an
+            # attempt to change who may sign in as an account is never refused silently. `reason`
+            # is a closed-set literal and goes last, so nothing can overwrite it.
+            await self._audit(
+                "auth.federated_bind_refused",
+                actor=actor,
+                detail=_json({**target, "username": user.username, **extra, "reason": reason}),
             )
 
         # A caller whose pair is already stale gets the stale answer, not whichever refusal below
         # this read happens to trip. The locked compare in the clear is still the authority.
         if (user.oidc_issuer, user.oidc_subject) != (expected_issuer, expected_subject):
-            raise await audit_changed(user.username)
+            raise await audit_changed(user.username, (user.oidc_issuer, user.oidc_subject))
         if user.auth_provider != AuthProvider.AD.value:
+            await audit_refused("not_a_directory_account")
             raise ValueError("only a directory (AD) account can take a federated binding")
         if not user.directory_object_id:
             # BACKLOG #1143 slice C: see DirectoryObjectIdMissing. After the no-op check, so a
             # legacy binding resubmitted as it stands gets the harmless answer above, while moving
             # it to another pair is still refused. Unbinding it stays open.
-            await self._audit(
-                "auth.federated_bind_refused",
-                actor=actor,
-                detail=_json(
-                    {
-                        "user_id": user_id,
-                        "username": user.username,
-                        "issuer": issuer,
-                        "subject": subject,
-                        "reason": DIRECTORY_OBJECT_ID_MISSING,
-                    }
-                ),
-            )
+            await audit_refused(DIRECTORY_OBJECT_ID_MISSING)
             raise DirectoryObjectIdMissing(
                 f"{DIRECTORY_OBJECT_ID_MISSING}: this account has no immutable directory identifier"
                 " (objectGUID), so it cannot take a federated binding, and it never gains one."
@@ -11687,6 +11713,7 @@ class AuthService:
             )
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
         if holder is not None and holder.id != user_id:
+            await audit_refused("federated_subject_held", previous_binding_removed=False)
             raise FederatedSubjectHeld(
                 "that identity is already bound to another account; unbind it there first"
             )
@@ -11702,7 +11729,7 @@ class AuthService:
         if cleared is None:
             raise ValueError("no such user")
         if cleared.changed:
-            raise await audit_changed(cleared.username)
+            raise await audit_changed(cleared.username, (cleared.issuer, cleared.subject))
         previous_issuer, previous_subject = cleared.issuer, cleared.subject
         revoked = cleared.sessions_revoked
         rebind = previous_issuer is not None or previous_subject is not None
@@ -11723,6 +11750,7 @@ class AuthService:
             # above. Rendered as the same refusal the sequential check gives; anything else re-raises.
             if not _is_integrity_refusal(exc):
                 raise
+            await audit_refused("federated_subject_held", previous_binding_removed=rebind)
             raise FederatedSubjectHeld(
                 "that identity is already bound to another account"
                 + (
@@ -11742,8 +11770,10 @@ class AuthService:
             if not rebind:
                 # Nothing was written: the caller saw the account unbound and another bind landed
                 # first. That is the changed-pair refusal, with its code (BACKLOG #2026).
-                raise await audit_changed(cleared.username)
+                raise await audit_changed(cleared.username, None)
             await self._record_federated_unbind(user_id, cleared, actor=actor)
+            # Another bind of THIS account landed between the clear and the write (BACKLOG #3174).
+            await audit_refused("account_bound_concurrently", previous_binding_removed=True)
             # This request DID write: its clear removed the pair it expected. So not the
             # changed-pair refusal, whose promise is that nothing changed.
             raise FederatedSubjectHeld(

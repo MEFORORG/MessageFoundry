@@ -1637,6 +1637,11 @@ async def test_a_rebind_racing_another_bind_is_refused_and_audits_what_it_remove
         assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
         [unbound] = await _audit_rows(store, "auth.federated_subject_unbound")
         assert json.loads(unbound["detail"])["subject"] == "S-1-first"
+        # BACKLOG #3174: the refusal itself is audited too.
+        [refused] = await _audit_rows(store, "auth.federated_bind_refused")
+        refused_detail = json.loads(refused["detail"])
+        assert refused_detail["reason"] == "account_bound_concurrently"
+        assert refused_detail["previous_binding_removed"] is True
         assert await _audit_rows(store, "auth.federated_subject_rebound") == []
         assert any(e.event_type == FEDERATED_IDENTITY_UNBOUND for e in notifier.events)
     finally:
@@ -1744,6 +1749,157 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
             FEDERATED_BINDING_CHANGED,
             DIRECTORY_OBJECT_ID_MISSING,
         ]
+    finally:
+        await store.close()
+
+
+async def _bind_refusals(store: MessageStore) -> list[dict[str, Any]]:
+    """Each ``auth.federated_bind_refused`` row's detail, oldest first."""
+    rows = await _audit_rows(store, "auth.federated_bind_refused")
+    return [json.loads(r["detail"]) for r in reversed(rows)]
+
+
+async def test_a_subject_held_elsewhere_and_a_local_account_are_audited(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #3174 (engine PR 2110, item 13). RED when: a bind refused because another account
+    holds the pair, or because the account is not a directory account, writes no row. An attempt to
+    change who may sign in as an account is worth a row even when it is refused."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind="S-1-alice")
+        other_id = uuid4().hex
+        await store.create_user(
+            user_id=other_id,
+            username="bsmith",
+            auth_provider="ad",
+            directory_object_id=_oid("bsmith"),
+            password_generated=False,
+        )
+        with pytest.raises(FederatedSubjectHeld):
+            await service.bind_federated_subject(
+                other_id, "S-1-alice", expected_issuer=None, expected_subject=None, actor="admin"
+            )
+        local_id = await create_local_user_chosen(
+            service,
+            username="jlocal",
+            password="Sup3rSecret!!-long-enough",
+            display_name=None,
+            email=None,
+            roles=[],
+            actor="test",
+        )
+        with pytest.raises(ValueError, match="only a directory"):
+            await service.bind_federated_subject(
+                local_id, "S-1-local", expected_issuer=None, expected_subject=None, actor="admin"
+            )
+
+        held, local = await _bind_refusals(store)
+        assert held == {
+            "user_id": other_id,
+            "issuer": "https://idp.example",
+            "subject": "S-1-alice",
+            "username": "bsmith",
+            "previous_binding_removed": False,
+            "reason": "federated_subject_held",
+        }
+        assert local == {
+            "user_id": local_id,
+            "issuer": "https://idp.example",
+            "subject": "S-1-local",
+            "username": "jlocal",
+            "reason": "not_a_directory_account",
+        }
+        rows = await _audit_rows(store, "auth.federated_bind_refused")
+        assert all(r["actor"] == "admin" for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_a_subject_taken_between_the_check_and_the_write_is_audited(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3174. The unique index refuses the write when another account took the pair after
+    the sequential check. That refusal is audited like the sequential one, and says whether this
+    call's clear had already removed a previous binding. The check is blinded so the write is what
+    refuses."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind="S-1-alice")
+        other_id = await _bind(service, store, "S-1-bob", username="bsmith")
+
+        async def nobody(*_a: object) -> None:
+            return None
+
+        monkeypatch.setattr(store, "get_user_by_federated_subject", nobody)
+        with pytest.raises(FederatedSubjectHeld, match="previous binding was removed"):
+            await service.bind_federated_subject(
+                other_id,
+                "S-1-alice",
+                expected_issuer="https://idp.example",
+                expected_subject="S-1-bob",
+                actor="admin",
+            )
+
+        [refused] = await _bind_refusals(store)
+        assert refused["reason"] == "federated_subject_held"
+        assert refused["previous_binding_removed"] is True
+        assert refused["user_id"] == other_id
+    finally:
+        await store.close()
+
+
+async def test_a_changed_pair_refusal_records_the_pair_the_row_held(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #3174 (engine PR 2110, item 7). RED when: the changed-pair row leaves out the pair the
+    row held. Three arms read it: the bind's early read, the bind's clear, and the unbind's clear.
+    The clear arm is reached by a wedge that rebinds the row between the early read and the clear."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind="S-1-held")
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        idp = "https://idp.example"
+
+        # The bind's early read: the caller saw the account unbound.
+        with pytest.raises(FederatedBindingChanged):
+            await service.bind_federated_subject(
+                account.id, "S-1-new", expected_issuer=None, expected_subject=None, actor="admin"
+            )
+        # The unbind's clear: the caller expected another pair.
+        with pytest.raises(FederatedBindingChanged):
+            await service.unbind_federated_subject(
+                account.id, expected_issuer=idp, expected_subject="S-1-stale", actor="admin"
+            )
+        # The bind's clear: the early read matches, then the row moves before the clear.
+        real_clear = store.clear_user_federated_subject
+
+        async def rebind_then_clear(user_id: str, **kw: Any) -> Any:
+            await store.set_user_federated_subject(user_id, idp, "S-1-moved")
+            return await real_clear(user_id, **kw)
+
+        store.clear_user_federated_subject = rebind_then_clear  # type: ignore[method-assign]
+        try:
+            with pytest.raises(FederatedBindingChanged):
+                await service.bind_federated_subject(
+                    account.id,
+                    "S-1-new",
+                    expected_issuer=idp,
+                    expected_subject="S-1-held",
+                    actor="admin",
+                )
+        finally:
+            del store.clear_user_federated_subject
+
+        early, clear = await _bind_refusals(store)
+        assert (early["held_issuer"], early["held_subject"]) == (idp, "S-1-held")
+        assert (clear["held_issuer"], clear["held_subject"]) == (idp, "S-1-moved")
+        [unbind] = await _audit_rows(store, "auth.federated_unbind_refused")
+        detail = json.loads(unbind["detail"])
+        assert (detail["held_issuer"], detail["held_subject"]) == (idp, "S-1-held")
+        assert detail["expected_subject"] == "S-1-stale"
+        assert {early["reason"], clear["reason"], detail["reason"]} == {FEDERATED_BINDING_CHANGED}
     finally:
         await store.close()
 

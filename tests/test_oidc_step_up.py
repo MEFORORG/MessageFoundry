@@ -30,6 +30,8 @@ from messagefoundry.auth import oidc, totp
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.service import (
+    DIRECTORY_IDENTITY_CONFLICT,
+    DIRECTORY_OBJECT_ID_MISSING,
     DIRECTORY_ROLES_DEMOTED,
     FLOW_PURPOSE_MISMATCH,
     IDP_STEP_UP_REQUIRED,
@@ -617,6 +619,151 @@ async def test_an_account_gone_from_the_directory_is_refused(
         await _assert_untouched(service, token)
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize(
+    ("answer_id", "reason"),
+    [
+        ("guid-someone-else", DIRECTORY_IDENTITY_CONFLICT),
+        (None, DIRECTORY_OBJECT_ID_MISSING),
+        ("guid-jdoe", None),
+    ],
+    ids=["another-object", "no-id", "same-object"],
+)
+async def test_a_directory_answer_for_another_object_is_refused_before_its_groups(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    answer_id: str | None,
+    reason: str | None,
+) -> None:
+    """BACKLOG #3174 (engine PR 2110, item 11). RED when: the IdP leg trusts the groups of a
+    directory answer whose object id is not the row's own. The lookup is keyed on that id, but a
+    directory that does not check it could answer for whoever holds the name now. The answer here
+    keeps the account's groups, so only the id test can refuse it. The same-object arm elevates."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _CountingLdap()
+        service = await _service(store, rsa_key, ldap=ldap)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token)
+        ldap._principal = replace(PRINCIPAL, directory_object_id=answer_id)
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+
+        if reason is None:
+            assert out.ok, out
+        else:
+            assert not out.ok and out.reason == reason
+            rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+            assert rows and rows[-1]["reason"] == reason, rows
+            await _assert_untouched(service, token)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("held", [None, "sign-in"], ids=["missing", "not-later"])
+async def test_the_idp_clock_test_refuses_before_the_directory_is_asked(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, held: str | None
+) -> None:
+    """BACKLOG #3174 (engine PR 2110, item 4). RED when: the directory lookup moves ahead of the
+    IdP-clock test. ADR 0142 AC-16 orders the freshness tests before the directory checks, so an
+    answer the IdP clock refuses costs no directory round trip and is never filed as a directory
+    reason. The directory here would refuse too, so the reason also shows which test ran first."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _CountingLdap()
+        service = await _service(store, rsa_key, ldap=ldap)
+        if held is None:
+            user = await store.get_user_by_username("jdoe")
+            assert user is not None
+            token = mint_token()
+            assert await store.create_session(
+                token_hash=hash_token(token),
+                user_id=user.id,
+                expires_at=time.time() + 3600,
+                seed_reauth=False,
+                auth_mechanism=SessionMechanism.OIDC.value,
+            )
+            answered_at = time.time()
+            expected = STEP_UP_IDP_AUTH_TIME_MISSING
+        else:
+            token = await _oidc_session(service, monkeypatch, rsa_key)
+            signed_in_at = await _held_auth_time(store, token)
+            assert signed_in_at is not None
+            answered_at = signed_in_at
+            expected = STEP_UP_IDP_AUTH_TIME_NOT_LATER
+        flow_id, _url = await _begin(service, token)
+        ldap.resolved.clear()
+        ldap._principal = None  # the directory would refuse as not_in_directory
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=answered_at)
+
+        assert not out.ok and out.reason == expected
+        assert ldap.resolved == [], "the directory was asked before the IdP-clock test"
+    finally:
+        await store.close()
+
+
+async def test_an_oidc_session_is_never_minted_without_an_idp_auth_time(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #3174 (engine PR 2110, item 3). RED when: a caller that reaches ``_issue_session``
+    directly, past ``_complete_ad_login``'s guard, can mint an ``oidc`` session holding NULL. Every
+    IdP step-up on such a session is refused, so the mint itself refuses, and writes nothing. The
+    control is the same call with a value, which mints."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        with pytest.raises(ValueError, match="IdP auth_time"):
+            await service._issue_session(
+                user.id,
+                None,
+                mfa_verified=False,
+                seed_reauth=False,
+                mechanism=SessionMechanism.OIDC,
+                idp_auth_time=None,
+            )
+        assert await store.list_sessions(user.id) == []
+        token = await service._issue_session(
+            user.id,
+            None,
+            mfa_verified=False,
+            seed_reauth=False,
+            mechanism=SessionMechanism.OIDC,
+            idp_auth_time=time.time(),
+        )
+        assert await _mechanism(store, token) == SessionMechanism.OIDC.value
+    finally:
+        await store.close()
+
+
+def test_issue_session_is_the_only_engine_caller_of_create_session() -> None:
+    """BACKLOG #3174. The guard above sits in ``_issue_session`` because it is the one place the
+    engine mints a session. A second caller of ``Store.create_session`` would mint past it, so this
+    pins that there is none. Calls are counted in the AST, so a comment or a docstring cannot hide
+    or fake one."""
+    import ast
+    from pathlib import Path
+
+    import messagefoundry
+
+    root = Path(messagefoundry.__file__).parent
+    callers: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(node):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "create_session"
+                ):
+                    callers.append(f"{path.relative_to(root).as_posix()}:{node.name}")
+    assert callers == ["auth/service.py:_issue_session"], callers
 
 
 #: A second mapped group, for the demotion arms below (BACKLOG #2154). Synthetic.

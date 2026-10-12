@@ -533,7 +533,10 @@ B.1 left the verification of what comes back to the build. These are its criteri
   test and a freshness test, is refused as `step_up_subject_mismatch` (BACKLOG #2143). IF the directory no
   longer returns the account by its immutable id, THEN THE SYSTEM SHALL refuse with
   `not_in_directory`, and a row with no immutable id SHALL be refused with
-  `directory_object_id_missing` rather than looked up by name. IF a role stored on the account is
+  `directory_object_id_missing` rather than looked up by name. IF the directory's answer does not
+  carry the row's own immutable id, THEN THE SYSTEM SHALL refuse with `directory_object_id_missing`
+  (no id) or `directory_identity_conflict` (another id), before its groups are read (BACKLOG
+  #3174). IF a role stored on the account is
   not among the roles its current directory groups map to, THEN THE SYSTEM SHALL refuse with
   `directory_roles_demoted`, write no roles, and leave the session as it was (BACKLOG #2154). Only a
   lost role refuses, and channel scope is not compared.
