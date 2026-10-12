@@ -3094,16 +3094,19 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The policy is applied** — `tests/test_field_authz_enforcement_sites.py` hits the redaction
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
-  `monitoring:diagnose` without it for the alert list). That `view_raw` role is one minting now
-  refuses (see [Custom roles](#custom-roles-adr-0045)), so this test lifts the pairing rule alone
-  to reach the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated
-  property comes back `null`. A companion assertion checks that an administrator sees all
-  fifteen, matched **per model, not per property name**, so the negative cannot pass vacuously.
-  That distinction is load-bearing: keyed on names, `last_error` looked covered by
-  `DeadLetterRow.last_error` on
-  `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
-  outbox row carries a non-null `last_error` is the dead-lettered one and its detail route was not in
-  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
+  `monitoring:diagnose` without it for the alert list). Minting now refuses that `view_raw` role
+  (see [Custom roles](#custom-roles-adr-0045)). So this test lifts the pairing rule alone to reach
+  the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated property
+  comes back `null`. It also reads each surface as an administrator, and checks two things there
+  (vault BACKLOG #2727). The administrator sees a gated value on that surface. And the restricted
+  response holds an object of each model that value sits on. So a surface that returns the
+  restricted caller no such object now fails, where before it passed with nothing checked. A
+  companion assertion checks that an administrator sees all fifteen across the surfaces, matched
+  **per model, not per property name**. That distinction is load-bearing: keyed on names,
+  `last_error` looked covered by `DeadLetterRow.last_error` on `/dead-letters` while
+  `OutboxInfo.last_error` had **zero** coverage, because the only message whose outbox row carries
+  a non-null `last_error` is the dead-lettered one and its detail route was not in the surface
+  list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
