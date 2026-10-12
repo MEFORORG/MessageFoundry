@@ -508,10 +508,13 @@ async def _bearer(client: httpx.AsyncClient, username: str) -> dict[str, str]:
 
 
 async def test_crud_requires_users_manage(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings())
+    # require_mfa=False: under the default, the MFA gate answers 403 first, to an administrator
+    # as well, so the refusals below would not show the permission gate (vault BACKLOG #2727).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     # a VIEWER has neither USERS_MANAGE nor USERS_READ
     await _onboarded(service, "viewer", Role.VIEWER)
+    await _onboarded(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         h = await _bearer(c, "viewer")
         # create / update / delete are all denied for a non-USERS_MANAGE caller
@@ -520,17 +523,20 @@ async def test_crud_requires_users_manage(engine: Engine) -> None:
             headers=h,
             json={"display_name": "X", "permissions": ["monitoring:read"]},
         )
-        assert r.status_code == 403
+        assert r.status_code == 403 and r.json()["detail"] == "missing permission: users:manage"
         r = await c.put(
             "/roles/custom/custom:abc",
             headers=h,
             json={"display_name": "X", "permissions": ["monitoring:read"]},
         )
-        assert r.status_code == 403
+        assert r.status_code == 403 and r.json()["detail"] == "missing permission: users:manage"
         r = await c.delete("/roles/custom/custom:abc", headers=h)
-        assert r.status_code == 403
+        assert r.status_code == 403 and r.json()["detail"] == "missing permission: users:manage"
         # listing custom roles needs USERS_READ — also denied for VIEWER
-        assert (await c.get("/roles/custom", headers=h)).status_code == 403
+        r = await c.get("/roles/custom", headers=h)
+        assert r.status_code == 403 and r.json()["detail"] == "missing permission: users:read"
+        # Control: the same listing answers an administrator, so the 403s are the permission.
+        assert (await c.get("/roles/custom", headers=await _bearer(c, "adm"))).status_code == 200
 
 
 async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:

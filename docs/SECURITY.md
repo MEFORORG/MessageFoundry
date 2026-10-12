@@ -1153,11 +1153,14 @@ replacement:
   at once (`/raw`, attachments, `/ui/messages/{id}/body`, a one-id `/messages/export`), and the
   route gates on `/outbound` and the `/responses` body stay as a second line. No deployment exists,
   so no stored role is broken by the change.
-  *Decided 2026-10-12, vault BACKLOG #2727:* the rule is judged **per role**, and it stays that
-  way. A `view_raw` role meant to pair with another role's `view_summary` is refused, even for a
-  user who would hold both roles. That cost is accepted. A role is the unit an administrator
-  grants, so such a role could later be assigned alone. An identity is a union of whole roles, so
-  while no role has the shape, no merged identity has it either. A rule on the merged identity
+  *Decided 2026-10-12, vault BACKLOG #2727, by the maintainers and not by an owner ruling:* the
+  rule is judged **per role**, and it stays that way. A `view_raw` role meant to pair with another
+  role's `view_summary` is refused, even for a user who would hold both roles. That cost is
+  accepted. A role is the unit an administrator grants, so such a role could later be assigned
+  alone. The premise is that `AuthService` builds every identity from whole roles: the built-in
+  ones, plus each custom role's decoded set. While that holds and no role has the shape, no
+  merged identity has it either. `Identity.build` itself does not check this, so a new caller
+  that hands it a narrowed permission set would break the premise. A rule on the merged identity
   would need a check wherever a role reaches a user, at least each role assignment and each
   directory group mapping. `raw_body_without_summary` in
   [`auth/permissions.py`](../messagefoundry/auth/permissions.py) is the one predicate, and
@@ -3098,15 +3101,17 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
   (see [Custom roles](#custom-roles-adr-0045)). So this test lifts the pairing rule alone to reach
   the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated property
   comes back `null`. It also reads each surface as an administrator, and checks two things there
-  (vault BACKLOG #2727). The administrator sees a gated value on that surface. And the restricted
-  response holds an object of each model that value sits on. So a surface that returns the
-  restricted caller no such object now fails, where before it passed with nothing checked. A
-  companion assertion checks that an administrator sees all fifteen across the surfaces, matched
-  **per model, not per property name**. That distinction is load-bearing: keyed on names,
-  `last_error` looked covered by `DeadLetterRow.last_error` on `/dead-letters` while
-  `OutboxInfo.last_error` had **zero** coverage, because the only message whose outbox row carries
-  a non-null `last_error` is the dead-lettered one and its detail route was not in the surface
-  list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
+  (vault BACKLOG #2727). The administrator sees a gated value on that surface. And for each
+  model, the restricted response holds at least as many objects as the administrator saw carrying
+  one. So a surface that returns the restricted caller fewer such objects now fails, where before
+  it passed with nothing checked. That is a count per model. It does not match object to object,
+  so it does not prove the same rows came back. A companion assertion checks that an
+  administrator sees all fifteen across the surfaces, matched **per model, not per property
+  name**. That distinction is load-bearing: keyed on names, `last_error` looked covered by
+  `DeadLetterRow.last_error` on `/dead-letters` while `OutboxInfo.last_error` had **zero**
+  coverage, because the only message whose outbox row carries a non-null `last_error` is the
+  dead-lettered one and its detail route was not in the surface list. It is now, and the coverage
+  assertion is keyed on `(model, property)` pairs.
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`

@@ -46,7 +46,7 @@ def h(msg):
 """
 
 #: The same module, failing after its print. ``validate`` reports it as a diagnostic and ``graph``
-#: as an ``{{"error"}}`` body, so the error documents are covered as well as the success ones.
+#: as an ``{"error"}`` body, so the error documents are covered as well as the success ones.
 RAISING_CONFIG = PRINTING_CONFIG + '\nraise RuntimeError("config module failed on purpose")\n'
 
 ADT_A01 = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\rEVN|A01|20260101\r"
@@ -70,11 +70,12 @@ def anchor(request: pytest.FixtureRequest, tmp_path: Path) -> list[str]:
     return _anchored(tmp_path) if request.param else []
 
 
-def _stdout_json(capsys: pytest.CaptureFixture[str]) -> object:
-    """Stdout parsed as one JSON document, after checking the print ran and went to stderr."""
+def _stdout_json(capsys: pytest.CaptureFixture[str], anchor: list[str]) -> object:
+    """Stdout parsed as one JSON document, after checking each load's print went to stderr."""
     captured = capsys.readouterr()
-    # Control: the print ran, so its absence from stdout below is not vacuous.
-    assert MARKER in captured.err, "the config module's print did not run"
+    # Control: the print ran once per load of the config, so its absence from stdout is not
+    # vacuous. The command loads it once, and the anchor helper once more under its flags.
+    assert captured.err.count(MARKER) == (2 if anchor else 1), captured.err
     assert MARKER not in captured.out
     return json.loads(captured.out)
 
@@ -84,7 +85,7 @@ def test_validate_sends_a_config_modules_print_to_stderr(
 ) -> None:
     cfg = _config(tmp_path, PRINTING_CONFIG)
     assert main(["validate", "--config", cfg, "--json", *anchor]) == 0
-    assert _stdout_json(capsys) == []
+    assert _stdout_json(capsys, anchor) == []
 
 
 def test_validate_reports_a_failing_module_as_json_despite_its_print(
@@ -92,7 +93,7 @@ def test_validate_reports_a_failing_module_as_json_despite_its_print(
 ) -> None:
     cfg = _config(tmp_path, RAISING_CONFIG)
     assert main(["validate", "--config", cfg, "--json", *anchor]) == 1
-    diags = _stdout_json(capsys)
+    diags = _stdout_json(capsys, anchor)
     assert isinstance(diags, list) and diags, diags
     assert any(str(d["file"]).endswith("IB_TEST.py") for d in diags), diags
 
@@ -104,17 +105,17 @@ def test_graph_sends_a_config_modules_print_to_stderr(
     """``graph`` prints JSON with and without ``--json``; the flag only makes it compact."""
     cfg = _config(tmp_path, PRINTING_CONFIG)
     assert main(["graph", "--config", cfg, *compact, *anchor]) == 0
-    graph = _stdout_json(capsys)
+    graph = _stdout_json(capsys, anchor)
     assert isinstance(graph, dict)
     assert [c["name"] for c in graph["inbound"]] == ["IB_TEST"]
 
 
 def test_graph_reports_a_failing_module_as_json_despite_its_print(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], anchor: list[str]
 ) -> None:
     cfg = _config(tmp_path, RAISING_CONFIG)
-    assert main(["graph", "--config", cfg, "--json"]) != 0
-    body = _stdout_json(capsys)
+    assert main(["graph", "--config", cfg, "--json", *anchor]) != 0
+    body = _stdout_json(capsys, anchor)
     assert isinstance(body, dict) and set(body) == {"error"}, body
 
 
@@ -125,9 +126,8 @@ def test_dryrun_under_a_project_root_sends_a_config_modules_print_to_stderr(
     cfg = _config(tmp_path, PRINTING_CONFIG)
     message = tmp_path / "a.hl7"
     message.write_bytes(ADT_A01.encode("utf-8"))
-    rc = main(
-        ["dryrun", "--config", cfg, "--messages", str(message), "--json", *_anchored(tmp_path)]
-    )
+    anchor = _anchored(tmp_path)
+    rc = main(["dryrun", "--config", cfg, "--messages", str(message), "--json", *anchor])
     assert rc == 0
-    results = _stdout_json(capsys)
+    results = _stdout_json(capsys, anchor)
     assert isinstance(results, list) and len(results) == 1

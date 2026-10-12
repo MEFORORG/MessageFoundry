@@ -26,6 +26,7 @@ Synthetic HL7 only — the MRN and name below are invented.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,9 +129,18 @@ def _attributed_pairs(node: object) -> set[tuple[str, str]]:
     }
 
 
-def _models_present(node: object) -> set[str]:
-    """The mapped models with at least one object anywhere in ``node``."""
-    return {model for model, _obj in _attributed(node)}
+def _present(node: object) -> Counter[str]:
+    """Per mapped model, how many of its objects ``node`` holds."""
+    return Counter(model for model, _obj in _attributed(node))
+
+
+def _carrying(node: object) -> Counter[str]:
+    """Per mapped model, how many of its objects in ``node`` hold a non-null gated property."""
+    return Counter(
+        model
+        for model, obj in _attributed(node)
+        if any(obj.get(prop) is not None for cls_name, prop in _GATED_PAIRS if cls_name == model)
+    )
 
 
 @dataclass(frozen=True)
@@ -336,8 +346,10 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
     invisible to every map-level test. This is the assertion that catches it.
 
     An absence proves nothing about a response that holds no object to withhold from. So each
-    surface is also read as the administrator, and the restricted response must hold an object of
-    every model the administrator saw a gated value on (vault BACKLOG #2727).
+    surface is read as the administrator first. For each model, the restricted response must hold
+    at least as many objects as the administrator saw carrying a gated value (vault BACKLOG
+    #2727). That is a count per model, not a match of each object, so it does not prove the same
+    rows came back.
     """
     async with _client(seeded.engine, seeded.service) as client:
         tokens = {
@@ -348,6 +360,14 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
         boss = await _login(client, "boss")
         for template, who in _SURFACES:
             path = _path(template, seeded, who)
+            # The administrator reads first: a row that arrives between the two reads can then
+            # only add to the restricted count.
+            control = await client.get(_path(template, seeded, "boss"), headers=boss)
+            assert control.status_code == 200, f"{path} as boss: {control.text}"
+            carrying = _carrying(control.json())
+            assert carrying, (
+                f"{path} shows the administrator no gated value, so nothing on it tests withholding"
+            )
             response = await client.get(path, headers=tokens[who])
             assert response.status_code == 200, (
                 f"{path} as {who}: {response.status_code} {response.text}"
@@ -364,16 +384,12 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
                 "messages:view_summary — the route is missing its redact_unauthorized call "
                 "(ASVS 8.1.2)."
             )
-            control = await client.get(_path(template, seeded, "boss"), headers=boss)
-            assert control.status_code == 200, f"{path} as boss: {control.text}"
-            exposed_on = {model for model, _prop in _attributed_pairs(control.json())}
-            assert exposed_on, (
-                f"{path} shows the administrator no gated value, so nothing on it tests withholding"
-            )
-            missing = exposed_on - _models_present(body)
-            assert not missing, (
-                f"{path} as {who} returned no {sorted(missing)} object, so the assertion above "
-                "had nothing to withhold from and passed without checking that model."
+            # Counter subtraction keeps only the models the restricted response is short of.
+            short = carrying - _present(body)
+            assert not short, (
+                f"{path} as {who} is short of these objects, by model: {dict(short)}. The "
+                "administrator saw that many more carrying a gated value, so the assertion above "
+                "had nothing to withhold from for them."
             )
 
 
@@ -415,7 +431,13 @@ async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identi
     the top-level properties ``PHI_FIELDS`` gates on ``MessageDetail``, on either row. The
     administrator arm shows which of those properties each row carries, so no withholding assertion
     is vacuous. Nested properties, and the dead-lettered row, are the surfaces test's job."""
-    gated = frozenset(PHI_FIELDS[MessageDetail])
+    # Only the view_summary rows: this caller holds view_raw, so a property gated on that would
+    # rightly be returned to it.
+    gated = frozenset(
+        prop
+        for prop, permission in PHI_FIELDS[MessageDetail].items()
+        if permission is Permission.MESSAGES_VIEW_SUMMARY
+    )
     assert gated, "PHI_FIELDS gates nothing on MessageDetail, so the loop below would check nothing"
     # The exception names only real gated properties and is not the whole set.
     assert gated > _UNSET_ON_THE_PROCESSED_ROW
