@@ -57,7 +57,8 @@ knob to buy a verdict.
 
 **The first administrator is named and credentialled by an operator at the host, offline, before the
 engine first serves — so the "not present" arm is the arm taken, and no account exists until a human
-names one.** `messagefoundry provision-admin --username <name>` creates it.
+names one.** `messagefoundry provision-admin --username <name>` creates it. *(Amended 2026-10-10 by
+Amendment D: the command also requires `--email <address>`.)*
 
 The way in is **filesystem authority over the store**, not an account. Every operator who installs
 the service already holds it; no attacker on the network does. That is the same gate ADR 0171
@@ -687,6 +688,8 @@ after the create leaves its own address on the row. The same command, run again,
 so it completes the row. The operator may also give the address the row already holds; it is then
 a stated choice rather than an inherited one. A blank `--email` counts as none, and so does a
 blank stored address.
+*Amended 2026-10-11: for a blank `--email`, superseded by Amendment D, which refuses one. A blank
+stored address still counts as none.*
 
 The `docs/SECURITY.md` bullet under *Provisioning the first administrator* that said the account
 keeps the earlier holder's address with a warning is replaced there.
