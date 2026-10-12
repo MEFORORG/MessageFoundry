@@ -275,6 +275,7 @@ def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(crl_reload, "_SEEN", {})
     monkeypatch.setattr(crl_reload, "_UNREADABLE", set())
     monkeypatch.setattr(crl_reload, "_FAILED", {})
+    monkeypatch.setattr(crl_reload, "_LABELS", {})
 
 
 @pytest.fixture
@@ -1369,6 +1370,14 @@ def test_only_a_refusal_that_stops_a_context_or_is_reported_keeps_a_pass_open() 
 # --- vault BACKLOG #3099 item 2: a retried refusal keeps its label --------------------------------
 
 
+def _holder(pki: _Pki, ca_file: Path, name: str) -> ssl.SSLContext:
+    """A hop that trusts ``ca_file`` and holds ``pki``'s CRL under a setting that names it."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cafile=str(ca_file))
+    harden_crl_check(ctx, str(pki.crl), setting=f"outbound connection '{name}' tls_crl_file")
+    return ctx
+
+
 @pytest.mark.parametrize("held_back_by", [RETRY, NO_ISSUER], ids=["a-defect", "unlisted-issuer"])
 def test_a_retried_refusal_keeps_its_label_once_another_holder_takes_the_file(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, held_back_by: str
@@ -1378,16 +1387,9 @@ def test_a_retried_refusal_keeps_its_label_once_another_holder_takes_the_file(
     the fix: the second pass read the label from the one hop still stale, so it led with that
     hop's setting, the reason changed, and the refusal was logged again."""
     pki, both = _make_intermediate_pki(tmp_path)
-
-    def holder(ca_file: Path, name: str) -> ssl.SSLContext:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.load_verify_locations(cafile=str(ca_file))
-        harden_crl_check(ctx, str(pki.crl), setting=f"outbound connection '{name}' tls_crl_file")
-        return ctx
-
-    taker = holder(both, "takes-it")
+    taker = _holder(pki, both, "takes-it")
     # The root alone cannot verify the intermediate's CRL, which the reload retries every pass.
-    refused = holder(pki.ca_file if held_back_by == NO_ISSUER else both, "refused")
+    refused = _holder(pki, pki.ca_file if held_back_by == NO_ISSUER else both, "refused")
     if held_back_by == RETRY:
 
         def boom(binary_form: bool = False) -> list[bytes]:
@@ -1407,3 +1409,30 @@ def test_a_retried_refusal_keeps_its_label_once_another_holder_takes_the_file(
     assert second is not None and (second.reloaded, second.refusal) == (0, first.refusal)
     assert _refusals_logged(caplog) == 1
     assert taker.verify_flags & refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_retried_refusal_keeps_its_label_while_a_short_lived_holder_comes_and_goes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One hop is refused and names its setting. A context built later from the file as it is
+    now, under another setting, holds the file for a while and is then collected, as a context
+    built for one send is. Neither changes the label. Red against a label read from every holder
+    on each pass, which turned into the path while that context lived and back when it went."""
+    pki, both = _make_intermediate_pki(tmp_path)
+    refused = _holder(pki, pki.ca_file, "refused")
+    pki.crl.write_bytes(_fresher(pki))
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first = _reload(pki)
+        passing = _holder(pki, both, "passing")  # current from the start: it read the new file
+        beside = _reload(pki)
+        del passing
+        after = _reload(pki)
+
+    assert first is not None and first.refusal is not None
+    assert first.refusal.remedy == NO_ISSUER
+    assert "outbound connection 'refused' tls_crl_file" in first.refusal.reason
+    assert beside is not None and beside.refusal == first.refusal
+    assert after is not None and after.refusal == first.refusal
+    assert _refusals_logged(caplog) == 1
+    assert refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
