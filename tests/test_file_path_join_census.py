@@ -474,7 +474,7 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
     "messagefoundry/anon/surrogates.py::_resolve_token_text": Site(
-        1, INTERNAL, "A fixed name under a parent of the package."
+        1, INTERNAL, "One fixed path under the folder that holds the package."
     ),
     "messagefoundry/api/tls.py::_generated_pair": Site(
         2, INTERNAL, "Fixed names in the engine's state directory."
