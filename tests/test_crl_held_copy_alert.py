@@ -643,7 +643,43 @@ def test_a_crl_the_engine_cannot_judge_in_the_ca_file_is_fixed_before_a_restart(
 
     detail = _bundle_detail(bundle)
 
-    assert detail.startswith("Fix or remove the CRL in the CA file before restarting")
+    assert detail.startswith(
+        "Replace the CRL in the CA file with one the engine can judge before restarting"
+    )
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_file_crl_minutes_from_taking_effect_gets_no_clock_skew(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # A CRL setting's start allows five minutes of skew; a CA file's CRL meets no check at start,
+    # and OpenSSL allows none, so a CRL two minutes out still refuses peers until then.
+    two_minutes_out = (63 + 2) / (24 * 60)  # crl() starts an hour and `number` minutes back
+    hop, bundle = _replaced_bundle(
+        ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=two_minutes_out)
+    )
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Replace the CRL in the CA file with one in effect now, or wait")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_file_the_scan_cannot_stage_keeps_the_held_copy_date(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A disk that refuses the private copy says nothing about the file. The held copy's date and a
+    # check-first remedy must survive it, not fall back to the file's later date.
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
+
+    def _no_room(pem: bytes) -> Any:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.staged_crl", _no_room)
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Check the CRL in the CA file before restarting")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -703,11 +739,9 @@ def test_a_file_held_as_a_crl_and_as_a_ca_file_leads_with_the_restart(
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
-def test_a_refused_reload_of_such_a_file_keeps_its_remedy_alone_and_first(
-    ca: _Ca, tmp_path: Path
-) -> None:
-    # A refusal's remedy leads its reason (review round 2 of #2319, untested until now), and no
-    # restart clause follows it: a "Wait" remedy says not to restart yet.
+def test_a_refused_reload_of_such_a_file_keeps_its_remedy_first(ca: _Ca, tmp_path: Path) -> None:
+    # A refusal's remedy leads its reason (review round 2 of #2319, untested until now). The CA-file
+    # hop's restart comes after both, as a next step: a "Wait" remedy says not to restart yet.
     hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
     remedy = "Wait: the engine applies the file once its CRL takes effect"
     record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), "why", remedy))
@@ -716,8 +750,8 @@ def test_a_refused_reload_of_such_a_file_keeps_its_remedy_alone_and_first(
     finally:
         clear_reload_refusal(both)
 
-    assert detail.startswith(f"{remedy}. Reason: why. Held by: ")
-    assert "restart" not in detail.lower()
+    assert detail.startswith(f"{remedy}. Reason: why. Once the reload applies it, a hop that ")
+    assert "either way" not in detail
     assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
 
 
