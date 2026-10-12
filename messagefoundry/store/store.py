@@ -3500,8 +3500,10 @@ def not_deployed_detail(destination: str) -> str:
 #: "off" would lose exactly the record needed to answer that, on exactly the deployments most likely
 #: to be asked. ``reply_returned`` is the routine happy-path counterpart and is deliberately NOT in
 #: the floor: it is thinnable like ``delivered``.
+#: ``reply_dropped`` joins it for the same reason (vault BACKLOG #3040 item 5): it is the one row
+#: that answers "you ignored our reply", and the delivery worker's WARNING says it was written.
 _AUDIT_FLOOR_EVENTS = frozenset(
-    {VIEWED_EVENT, "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout"}
+    {VIEWED_EVENT, "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout", "reply_dropped"}
 )
 
 #: The COMPLETE ``message_events.event`` vocabulary, shared by all three backends.
@@ -3542,11 +3544,17 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         # out of every log, event and exception).
         "reply_returned",
         "reply_timeout",
+        # vault BACKLOG #3040 item 5: a delivered row whose 2xx reply body was over the byte bound
+        # and dropped. Written by mark_done with the "delivered" row. Status and bound only, never
+        # a byte of the reply.
+        "reply_dropped",
     }
 )
 
 #: Kinds only the store itself writes, refused from the public ``record_message_event``.
-_STORE_ONLY_EVENT_KINDS: Final[frozenset[str]] = frozenset({VIEWED_EVENT})
+#: ``reply_dropped`` too: it is a floor row, and only ``mark_done`` may write it, with the
+#: delivery it describes (vault BACKLOG #3040 item 5).
+_STORE_ONLY_EVENT_KINDS: Final[frozenset[str]] = frozenset({VIEWED_EVENT, "reply_dropped"})
 
 
 def check_caller_event_kind(event: str) -> None:
@@ -3555,7 +3563,8 @@ def check_caller_event_kind(event: str) -> None:
     Shared by all three backends so the rule cannot drift between them. Undeclared: see
     :data:`MESSAGE_EVENT_KINDS`. Store-only: :data:`VIEWED_EVENT`, because a caller-written
     ``viewed`` row would carry a detail the error reveal unmasks while the audit leaves it out
-    (BACKLOG #2440)."""
+    (BACKLOG #2440). And ``reply_dropped``, a floor row only ``mark_done`` may write, with the
+    delivery it describes (vault BACKLOG #3040 item 5)."""
     if event not in MESSAGE_EVENT_KINDS:
         raise ValueError(
             f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
@@ -9378,15 +9387,17 @@ class MessageStore:
             return
         await self._run_grouped(_body)
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
         now = time.time() if now is None else now
 
-        async def _body() -> None:
+        async def _body() -> bool:
             # _row is a read; under group-commit it runs inside the batch's BEGIN. A vanished row is an
             # idempotent no-op (zero mutation) — abort without failing the batch.
             row = await self._row(outbox_id)
             if row is None:
-                raise _AbortMember(None)
+                raise _AbortMember(False)
             await self._db.execute(
                 "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
                 (OutboxStatus.DONE.value, now, outbox_id),
@@ -9408,9 +9419,14 @@ class MessageStore:
                 f"attempt {row['attempts']}",
                 now,
             )
+            if reply_dropped is not None:
+                await self._event(
+                    row["message_id"], "reply_dropped", row["destination_name"], reply_dropped, now
+                )
             await self._maybe_finalize_message(row["message_id"], now)
+            return True
 
-        await self._run_grouped(_body)
+        return bool(await self._run_grouped(_body))
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in ONE transaction — the batch counterpart of

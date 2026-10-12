@@ -28,6 +28,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.base import DeliveryResponse
 from messagefoundry.transports.rest import (
     RestDestination,
     capture_response_headers,
@@ -109,7 +110,7 @@ async def test_rest_captures_only_allowlisted_response_header() -> None:
     hdrs = _reply_headers(Location="/Patient/9", ETag='W/"3"', **{"X-Trace": "abc"})
     dest._opener = _FakeOpener(_FakeResp(b'{"resourceType":"Patient"}', hdrs, 201))  # type: ignore[assignment]
     resp = await dest.send('{"resourceType":"Patient"}')
-    assert resp is not None
+    assert isinstance(resp, DeliveryResponse)
     assert resp.outcome == "accepted"
     assert dict(resp.headers) == {"Location": "/Patient/9", "ETag": 'W/"3"'}
     assert "X-Trace" not in resp.headers  # not allow-listed → never captured (PHI gate)
@@ -120,7 +121,7 @@ async def test_rest_no_allowlist_is_byte_identical_empty_headers() -> None:
     hdrs = _reply_headers(Location="/Patient/9")
     dest._opener = _FakeOpener(_FakeResp(b"OK", hdrs, 200))  # type: ignore[assignment]
     resp = await dest.send("body")
-    assert resp is not None
+    assert isinstance(resp, DeliveryResponse)
     assert dict(resp.headers) == {}  # no allow-list → no capture
 
 
@@ -129,7 +130,7 @@ async def test_rest_empty_2xx_still_carries_headers() -> None:
     hdrs = _reply_headers(Location="/Patient/created")
     dest._opener = _FakeOpener(_FakeResp(b"", hdrs, 201))  # type: ignore[assignment]
     resp = await dest.send("body")
-    assert resp is not None
+    assert isinstance(resp, DeliveryResponse)
     assert resp.outcome == "no_reply"  # empty body
     assert dict(resp.headers) == {"Location": "/Patient/created"}
 

@@ -9504,7 +9504,9 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
         now = time.time() if now is None else now
         output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9516,7 +9518,7 @@ class SqlServerStore:
                 row = await cur.fetchone()
                 if row is None:
                     await self._commit(conn)
-                    return
+                    return False
                 message_id, destination_name, handler_name, attempts = (
                     row[0],
                     row[1],
@@ -9546,11 +9548,18 @@ class SqlServerStore:
                 await self._event(
                     cur, message_id, "delivered", destination_name, f"attempt {attempts}", now
                 )
+                if reply_dropped is not None:
+                    await self._event(
+                        cur, message_id, "reply_dropped", destination_name, reply_dropped, now
+                    )
                 await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
+                return True
             except Exception:
                 await conn.rollback()
                 raise
+        # _fence_scope swallowed a fenced write: rolled back and re-pended, so nothing was recorded.
+        return False
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in ONE transaction — the batch counterpart of

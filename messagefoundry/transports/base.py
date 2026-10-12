@@ -62,6 +62,7 @@ __all__ = [
     "SourceStartupError",
     "TestNotSupportedError",
     "DeliveryResponse",
+    "ReplyBodyDropped",
     "SourceConnector",
     "DestinationConnector",
     "register_source",
@@ -809,6 +810,27 @@ class DeliveryResponse:
     headers: Mapping[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ReplyBodyDropped:
+    """A delivery the partner answered 2xx, whose reply body was over the byte bound and dropped.
+
+    A non-capturing ``send`` returns this instead of ``None`` when nothing reads the body (vault
+    BACKLOG #2180). The message is delivered. The delivery worker marks the row done with a
+    ``reply_dropped`` event in one transaction, and only then logs a WARNING that names the message
+    (vault BACKLOG #3040 items 2 and 5).
+
+    It carries the status and the bound, and no byte of the reply.
+    """
+
+    status: int
+    limit: int
+
+    @property
+    def detail(self) -> str:
+        """The ``reply_dropped`` event's detail: the status and the bound, nothing else."""
+        return f"HTTP {self.status}; reply body over the {self.limit}-byte bound"
+
+
 class SourceConnector(abc.ABC):
     """Inbound connector. ``start`` sets the source up, begins delivering received
     messages to ``handler`` in the background, and **returns once the source is live**
@@ -970,7 +992,9 @@ class DestinationConnector(abc.ABC):
     ``send`` returns ``None`` for a one-way delivery (the default for every non-capturing outbound —
     byte-identical to before ADR 0013). A **response-capturing** outbound returns a
     :class:`DeliveryResponse` carrying the partner's reply; the delivery worker persists it inside the
-    same transaction that marks the row done. ``aclose`` releases any held resources (no-op by default).
+    same transaction that marks the row done. A non-capturing send whose 2xx reply body was over the
+    byte bound returns :class:`ReplyBodyDropped`, which is still a delivery. ``aclose`` releases any
+    held resources (no-op by default).
 
     ``metadata`` (BACKLOG #68) is this message's read-only **user** metadata bag (the ADR 0081 ``SetMeta``
     writes, decrypted), or ``None``. It rides the message as pure DATA — the delivery worker supplies it
@@ -987,7 +1011,7 @@ class DestinationConnector(abc.ABC):
     @abc.abstractmethod
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
-    ) -> DeliveryResponse | None: ...
+    ) -> DeliveryResponse | ReplyBodyDropped | None: ...
 
     async def aclose(self) -> None:
         return None
