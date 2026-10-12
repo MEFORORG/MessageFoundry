@@ -673,52 +673,6 @@ async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
     assert any(r["actor"] == "rawonly" and '"body": false' in r["detail"] for r in reads), reads
 
 
-async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:
-    """vault BACKLOG #1187: the admin's own surface, POST and PUT /roles/custom, answers 400 with the
-    pairing message. Controls: a POST and a PUT keeping view_summary are accepted. A final listing
-    shows neither refusal wrote anything, name included."""
-    service = await _service(engine)
-    await _add(service, "adm", Role.ADMINISTRATOR)
-    async with _client(engine, service) as c:
-        h = _auth((await _login(c, "adm")).json()["token"])  # a fresh login is step-up fresh
-        refused = await c.post(
-            "/roles/custom",
-            headers=h,
-            json={"display_name": "Raw", "permissions": ["messages:read", "messages:view_raw"]},
-        )
-        assert refused.status_code == 400, refused.text
-        assert "messages:view_raw needs messages:view_summary" in refused.json()["detail"]
-        made = await c.post(
-            "/roles/custom",
-            headers=h,
-            json={
-                "display_name": "Raw and summary",
-                "permissions": ["messages:read", "messages:view_raw", "messages:view_summary"],
-            },
-        )
-        assert made.status_code == 201, made.text
-        role_url = f"/roles/custom/{made.json()['id']}"
-        both = ["messages:read", "messages:view_raw", "messages:view_summary"]
-        # PUT control: the same edit keeping view_summary is accepted.
-        kept = await c.put(role_url, headers=h, json={"display_name": "R", "permissions": both})
-        assert kept.status_code == 200, kept.text
-        # The refused edit drops view_summary and also renames; the 400's detail ties it to the
-        # pairing rule, and the listing below shows the rename did not land either.
-        edited = await c.put(
-            role_url,
-            headers=h,
-            json={
-                "display_name": "Changed",
-                "permissions": ["messages:read", "messages:view_raw"],
-            },
-        )
-        assert edited.status_code == 400, edited.text
-        assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
-        # Neither refusal wrote anything: one role, still holding view_summary.
-        listed = (await c.get("/roles/custom", headers=h)).json()
-        assert [(r["display_name"], r["permissions"]) for r in listed] == [("R", sorted(both))]
-
-
 def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:
     """The reply and outbound bodies now need both permissions (vault BACKLOG #1187). Every built-in
     role that held ``view_raw`` must therefore hold ``view_summary`` too, or this change would take

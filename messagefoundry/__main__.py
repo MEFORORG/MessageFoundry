@@ -1420,7 +1420,10 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        reg = load_config(config_dir)
+        # This load imports the author's config modules ahead of the subcommand's own load, so a
+        # print() in one would reach stdout before any command redirects it (vault BACKLOG #2727).
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir)
     except (WiringError, FileNotFoundError, OSError):
         # A config that doesn't load is reported by the subcommand's own validate/load path with a
         # precise message; don't pre-empt it here (and don't claim a missing env file for it). OSError
@@ -4947,7 +4950,8 @@ def _validate(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     config_dir, _ = resolved
-    diags = validate_config(config_dir)
+    with _author_prints_to_stderr():
+        diags = validate_config(config_dir)
     if args.json:
         print(
             json.dumps(
@@ -4974,7 +4978,8 @@ def _graph(args: argparse.Namespace) -> int:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
-        reg = load_config(config_dir, allow_empty=True)
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -5100,7 +5105,11 @@ def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
     ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
     one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
     the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
-    ``_print_json`` still write to the real stdout (vault BACKLOG #1187)."""
+    ``_print_json`` still write to the real stdout (vault BACKLOG #1187).
+
+    ``validate``, ``graph`` and the anchor helper's own load wrap their config load the same way
+    (vault BACKLOG #2727). Nothing enforces the wrap: a command that loads a config without it
+    still lets a print reach stdout."""
     return contextlib.redirect_stdout(sys.stderr)
 
 
