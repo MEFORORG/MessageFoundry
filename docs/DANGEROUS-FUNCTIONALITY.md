@@ -1017,9 +1017,14 @@ than the table names. At least these: the other sinks under `sinks/`, `load/sink
 
 `sinks/__init__.py` states the rule that a sink under `sinks/` which listens binds `127.0.0.1`
 only. That rule does not cover every harness listener. `load/sink.py` and `reconcile/capture.py`
-bind the host the run gives them, and a two-box run gives an address other machines can reach.
-Such a listener reads frames from any host that can connect. This page's test reads neither the
-rule nor the bind addresses.
+bind the host the run gives them. Each defaults to `127.0.0.1`, and so do most `--sink-host`
+options. At least one default is every interface: `harness batch-driver` binds its sinks on
+`0.0.0.0` unless `--sink-host` says otherwise, and `run_batch_driver` in
+`load/connscale/batchbox.py` has the same default. A listener bound that way reads frames from any
+host that can connect. The engine side has the same shape. At least `harness shardcert-engine`,
+`harness shardcert-engine-ladder` and `harness batch-engine` default `--inbound-bind-host` to
+`0.0.0.0`, so the engine they start listens for messages on every interface. This page's test
+reads neither the rule nor the bind addresses.
 
 ---
 
