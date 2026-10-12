@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A web-proxy credential crosses only inside TLS that fully verifies the proxy (vault BACKLOG
-#3416, #3417, #3418).
+"""Engine openers refuse a web-proxy credential on the legs where it could be read on the way
+(vault BACKLOG #3416, #3417, #3418).
 
-The rule is stated once, on ``bounded_read.ProxyCredentialsRefusedError``. Its proxy-URL half has
+The rule, with its one exception, is stated once, on ``bounded_read.ProxyCredentialsRefusedError``.
+Its proxy-URL half has
 its own file, ``tests/test_proxy_url_credentials_refused.py``. This file pins the three cases that
 docstring used to list as outside the check:
 
@@ -462,13 +463,56 @@ def test_an_environment_proxy_credential_is_refused_over_unverified_tls(
 
 @pytest.mark.parametrize("family", list(_UNVERIFIED))
 def test_a_caller_set_header_is_refused_over_unverified_tls(family: str) -> None:
-    """The same leg for a header a caller set, even one its connection's guard admitted."""
+    """The same leg for a header a caller set that no connection admitted."""
+    with _WireProxy() as proxy:
+        handler = LoopbackDirectProxyHandler({"http": f"https://{proxy.address}"})
+        _refused(_UNVERIFIED[family](handler), _with_header(_HTTP_TARGET), "#3418")
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("family", list(_UNVERIFIED))
+def test_an_admitted_caller_set_header_crosses_unverified_tls(family: str) -> None:
+    """The exception covers this leg as it covers a cleartext one. Unverified TLS to the proxy is
+    the safer of the two, so a header the connection admitted for cleartext is sent here too: the
+    proxy sees one connection, TLS first, and no cleartext request head."""
     with _WireProxy() as proxy:
         handler = LoopbackDirectProxyHandler(
             {"http": f"https://{proxy.address}"}, caller_header_admitted=True
         )
+        _open_and_discard(_UNVERIFIED[family](handler), _with_header(_HTTP_TARGET))
+    assert proxy.connections == 1
+    assert proxy.tls_first == 1
+    assert proxy.cleartext == []
+
+
+@pytest.mark.parametrize("family", list(_UNVERIFIED))
+def test_admission_never_covers_a_proxy_url_credential_over_unverified_tls(family: str) -> None:
+    """An admitting handler whose proxy URL carries a credential. urllib replaces the caller's
+    header with the URL's own, and that one is refused on the unverified leg."""
+    with _WireProxy() as proxy:
+        handler = LoopbackDirectProxyHandler(
+            {"http": f"https://{_CRED}@{proxy.address}"}, caller_header_admitted=True
+        )
         _refused(_UNVERIFIED[family](handler), _with_header(_HTTP_TARGET), "#3418")
     assert proxy.connections == 0
+
+
+def test_admission_never_carries_a_proxy_url_credential_to_a_second_proxy() -> None:
+    """An admitting handler sends an ``http`` target to proxy A, written ``https://`` with a
+    credential, and ``https`` to proxy B, written ``http://``. urllib puts A's credential on the
+    request, hands it back for ``https``, and would send it to B in a cleartext ``CONNECT``. Only
+    matching the header to a proxy URL tells it from the caller's own, so the send is refused and
+    neither proxy is dialled (vault BACKLOG #3410). Measured 2026-10-12: with
+    ``bounded_read._proxy_url_credentials`` replaced by ``lambda p: set()``, B received the
+    ``CONNECT`` with A's credential and this test failed."""
+    with _WireProxy() as proxy_a, _WireProxy() as proxy_b:
+        handler = LoopbackDirectProxyHandler(
+            {"http": f"https://{_CRED}@{proxy_a.address}", "https": f"http://{proxy_b.address}"},
+            caller_header_admitted=True,
+        )
+        _refused(build_strict_opener(handler), _HTTP_TARGET, "#3410")
+    assert proxy_b.connections == 0
+    assert proxy_a.connections == 0
 
 
 @pytest.mark.parametrize("build", [build_strict_opener, rest._no_redirect_opener])

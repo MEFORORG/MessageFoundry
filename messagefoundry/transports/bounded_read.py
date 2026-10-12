@@ -115,6 +115,7 @@ ASVS 12.2.1). The same handler makes that check, for the same reason. See
 from __future__ import annotations
 
 import base64
+import contextlib
 import email.message
 import email.parser
 import functools
@@ -762,8 +763,8 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
 
     ``caller_header_admitted`` is set only by a connection whose ``proxy_user`` credential its
     posture-keyed guard admitted when the connection was built
-    (``transports.rest.ProxyConfig``). It lets that caller-set header across a cleartext proxy leg.
-    It never admits a credential from a proxy URL.
+    (``transports.rest.ProxyConfig``). What it lets that caller-set header across is the one
+    exception :class:`ProxyCredentialsRefusedError` states.
     """
 
     def __init__(
@@ -780,9 +781,16 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
             host = None
         if is_never_proxied_host(host):
             return None  # not rewritten, so the scheme's own handler dials the host itself
+        proxies = _proxies_of(self)
         _refuse_cleartext_proxy_credentials(
-            req, proxy, _proxies_of(self), caller_header_admitted=self.caller_header_admitted
+            req, proxy, proxies, caller_header_admitted=self.caller_header_admitted
         )
+        # Cleared first, so a request reused from an opener that admitted its header is judged
+        # afresh by this one.
+        with contextlib.suppress(AttributeError):
+            delattr(req, _ADMITTED_CALLER_HEADER)
+        if self.caller_header_admitted:
+            _note_admitted_caller_header(req, proxy, proxies)
         return super().proxy_open(req, proxy, type)
 
 
@@ -811,27 +819,31 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
 
     A web-proxy credential is a ``Proxy-Authorization`` header on a request. urllib makes one from
     a user and a password in a proxy URL, and a caller may set one, as a connection's
-    ``proxy_user`` does. Refused on every opener :func:`build_strict_opener` makes, under every
-    ``[security].enforcement`` setting. The proxy may come from ``HTTP_PROXY`` or ``HTTPS_PROXY``,
-    from the system proxy settings, or from a connection's ``proxy_url``. The opener holds no
-    posture, and a proxy from the environment has no acceptance field. So a credential from a proxy
-    URL has no acceptance and no exception for a proxy on a loopback address, like the Vault hop's
-    twin, ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). Building a
-    connection does not refuse a credential in its own ``proxy_url``, so its sends are refused
-    under the rule below. With ``[security].require_nonstatic_credentials`` on, ``serve`` refuses
-    a credential written into ``proxy_url`` at start unless ``static_credential_accepted`` names
-    the hop (BACKLOG #1182). A ``proxy_user`` credential is also judged when the connection is
-    built, by the posture-keyed ``transports.rest.refuse_cleartext_credential_hop``.
+    ``proxy_user`` does. Raised on every opener :func:`build_strict_opener` makes. The proxy may
+    come from ``HTTP_PROXY`` or ``HTTPS_PROXY``, from the system proxy settings, or from a
+    connection's ``proxy_url``. The opener holds no posture, and a proxy from the environment has
+    no acceptance field. So a credential from a proxy URL has no acceptance and no exception for a
+    proxy on a loopback address, like the Vault hop's twin,
+    ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). Building a connection
+    does not refuse a credential in its own ``proxy_url``, so its sends meet the rule below. With
+    ``[security].require_nonstatic_credentials`` on, ``serve`` refuses a credential written into
+    ``proxy_url`` at start unless ``static_credential_accepted`` names the hop (BACKLOG #1182).
 
-    **The rule.** A web-proxy credential crosses the network only inside TLS that fully verifies
-    the proxy. Anywhere else it is refused: in cleartext to any proxy, a second, different proxy
-    included; on a request that goes direct, past every proxy, where the destination would read it;
-    and over TLS whose context does not require the proxy's certificate, match its host name, or
-    check its dates. A destination's relaxed TLS settings relax nothing here, because the leg to
-    the proxy uses the same context. A credential that rides a ``CONNECT`` is judged as cleartext,
-    whatever TLS follows it. One way across exists, for a caller-set header on a cleartext leg
-    only: the connection's posture-keyed guard admitted it when the connection was built, and
-    its proxy handler carries ``caller_header_admitted``. A credential from a proxy URL has none.
+    **The rule.** A web-proxy credential is refused on any leg where it could be read on the way:
+    in cleartext to any proxy, a second, different proxy included; on a request that goes direct,
+    past every proxy, where the destination would read it; and over TLS whose context does not
+    require the proxy's certificate, match its host name, or check its dates. A destination's
+    relaxed TLS settings apply to that leg too, because the leg to the proxy uses the same context.
+    A credential that rides a ``CONNECT`` is judged as cleartext, whatever TLS follows it.
+
+    **The one exception.** A caller-set header that its connection admitted when it was built is
+    sent as declared, on a cleartext leg or over TLS that does not verify. The admitting check is
+    the connection's posture-keyed guard, ``transports.rest.refuse_cleartext_credential_hop``. It
+    admits a ``proxy_user`` credential in at least these cases: under
+    ``[security].enforcement = warn``, where it logs a WARNING, and when the connection declares
+    ``cleartext_accepted`` or ``tls_hop_attested``. The connection's proxy handler then carries
+    ``caller_header_admitted``. The exception never covers a request that goes direct, and never a
+    credential from a proxy URL, including one a request carries on to a second proxy.
 
     urllib keeps the header when it hands a request on to the next proxy (vault BACKLOG #3410),
     and its redirect handler copies it onto a new request. So the check reads the header on the
@@ -924,14 +936,45 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
     cleartext ``CONNECT``, which :class:`LoopbackDirectProxyHandler` judged when it set the tunnel.
     So is a plain ``http`` request to a proxy, for the same reason.
     """
-    if _proxy_credential_header(req) is None or getattr(req, "_tunnel_host", None):
+    header = _proxy_credential_header(req)
+    if header is None or getattr(req, "_tunnel_host", None):
         return
     if not req.has_proxy():
         # Direct: no proxy rewrote this request, so the destination would read the header.
         raise ProxyCredentialsRefusedError(_DIRECT_PROXY_CREDENTIALS)
-    if context is not None and not verifies_peer_fully(context):
-        # The TLS leg to an https proxy, on a context that does not authenticate it.
+    if (
+        context is not None
+        and not verifies_peer_fully(context)
+        and getattr(req, _ADMITTED_CALLER_HEADER, None) != header
+    ):
+        # The TLS leg to an https proxy, on a context that does not authenticate it. A caller-set
+        # header the connection admitted crosses here as it crosses a cleartext leg.
         raise ProxyCredentialsRefusedError(_UNVERIFIED_PROXY_TLS)
+
+
+#: The request attribute that records a caller-set header its proxy handler admitted. It holds the
+#: header's value, so a header urllib later replaces with one from a proxy URL no longer matches.
+_ADMITTED_CALLER_HEADER = "_messagefoundry_admitted_proxy_header"
+
+
+def _note_admitted_caller_header(
+    req: urllib.request.Request, proxy: str, proxies: Mapping[str, str]
+) -> None:
+    """Record on ``req`` that its ``Proxy-Authorization`` header is the caller's own, admitted.
+
+    Called only by a handler with ``caller_header_admitted``, after the cleartext check passed. A
+    header from a proxy URL is never recorded: not one this proxy's URL would make, which urllib
+    puts on the request next, and not one an earlier proxy's URL made (vault BACKLOG #3410).
+    """
+    carried = _proxy_credential_header(req)
+    if carried is None or carried in _proxy_url_credentials(proxies):
+        return
+    try:
+        _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+    except ValueError:
+        return
+    if not (user and password):
+        setattr(req, _ADMITTED_CALLER_HEADER, carried)
 
 
 def _proxy_credential_header(req: urllib.request.Request) -> str | None:
