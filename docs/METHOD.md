@@ -1057,7 +1057,7 @@ fleet, so never take them*.
 
   **CORRECTED 2026-10-12, added after the move (owner ruling, in session).** The sentence above
   sends every finding that names a defect the merge would ship to the owner. That was the rule
-  until 2026-10-12. That day, in the Lander's own chat, the Lander proposed this standing rule,
+  until 2026-10-12. That day, in the Lander's own chat, the Lander proposed,
   verbatim: *"Let me merge when the open findings are filed as rows and none changes behaviour or
   weakens a control. I would still bring you anything that does."* The owner replied, verbatim:
   *"approved"*, and then: *"make that persistent for future landers"*. That was at about 17:40
