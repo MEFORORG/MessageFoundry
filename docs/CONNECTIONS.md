@@ -1523,11 +1523,14 @@ a second proxy included (vault BACKLOG #2572, #3410).** The proxy may come from 
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
 broker. A connection with such a `proxy_url` still builds. The error names no part of the proxy
-URL, and `[security].enforcement` does not relax it. A connection's own `proxy_no_proxy` is not
-urllib's bypass list: a host it names skips the connection's `proxy_url` and still follows a proxy
-from the environment. The rule, an example of a leg it lets through, and what it does not check are
-stated once, on [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
-Take the credentials out of the proxy URL.
+URL, and `[security].enforcement` does not relax it. A request that goes direct, such as one to a
+loopback host, is not refused. A connection's own `proxy_no_proxy` is not urllib's bypass list. A
+host it names skips the connection's `proxy_url` and still follows a proxy from the environment.
+The rule, an example of a leg it lets through, and what it does not check are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). Which legs reach
+the proxy with no TLS is in
+[CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
+out of the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a

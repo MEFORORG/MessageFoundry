@@ -1344,7 +1344,7 @@ transport's list is set, an outbound of that transport not on it is **refused at
 | `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry is `host` (any port) or `host:port`. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Counts toward the open-egress startup gate on the same terms as `allowed_smtp`**. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
 | `allowed_recipient_domains` | list | `[]` | allowed **recipient domains** for the `Email(...)` outbound (vault BACKLOG #2616). `allowed_smtp` gates only the relay hop, and a relay forwards to whatever address the connection names, so this list bounds where the mail ends up: **every** address in an `Email()` destination's `recipients` must sit in a listed domain, or the destination is **refused at config load/reload**. Each entry is a bare domain (`hospital.example`), matched exactly and without regard to case; a subdomain needs its own entry. The `Email()` **sender's** domain must be listed too, under the same match, because bounces and replies go to the sender and can carry the message body (vault BACKLOG #2912). An entry that could never match, such as an address, URL, port, wildcard, IP address, or a dot at either end, is refused at load: each entry must pass the same host-name rule as a recipient's domain, described below (vault BACKLOG #2843). Each address the engine parses out of `recipients` must also be a plain `local@domain` that reads back unchanged, within the SMTP length limits, with a local part of letters, digits, dots and the RFC 5322 mailbox symbols other than `%`, `!`, `|`, `/`, `=` and `?`, not starting with `-`. A display name or comment in the setting is dropped, and the `To:` header carries only the checked addresses. Its domain must be ASCII: write an internationalized domain in its `xn--` form, in the recipient and in the list. The domain must also be a host name. Each label holds 1 to 63 letters, digits and hyphens, and does not start or end with a hyphen. No label may be empty, so a dot at either end is refused. The last label must start with a letter, so a bare IP address is refused. A list entry may hold at most 253 characters; an address's domain is held to 252 by the length limit above. The same address rule binds at least the `Email()` sender, the `Direct()` sender and recipients, the `[alerts]` sender, recipients and rule overrides, and per-user notification addresses. **Deny-by-default even under the `block_unlisted_outbound = false` opt-out, unlike the destination lists above:** an empty list refuses every `Email()` destination on every instance, whatever `[security].block_unlisted_outbound` says. It does not gate `Direct()`, which encrypts to one partner certificate, and it does **not** count toward the open-egress startup gate. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS` |
 | `allowed_syslog` | list | `[]` | allowed **syslog collectors** for the off-box log forwarder (`[logging].forward_host` with `forward_port`; BACKLOG #2356); each entry is `host` (any port) or `host:port`. The forwarder is not a connection, so no config load checks it: `serve` and `supervise` check it **at start**, before the forwarder opens a socket, and **exit 2** on a refusal, under `enforcement = warn` as well. Empty or unset means what it means for `allowed_tcp`: with deny-by-default on (the default, or `block_unlisted_outbound = true`) a configured collector is **refused**, and under `block_unlisted_outbound = false` it is unrestricted. A list that is set refuses a collector that is not on it, whichever way that switch is written. With no collector configured the list is not read. It is matched against the host as written in `forward_host`; nothing is resolved. **Never counts toward the open-egress startup gate**: it names no message destination. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SYSLOG` |
-| `proxy_url` | str | _unset_ | site-wide **default forward/egress web proxy** for the HTTP family — REST/SOAP/FHIR/`fhir_lookup`/DICOMweb plus the OAuth2/SMART token endpoints ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md)). A connection that sets no per-connection `proxy` inherits this; a per-connection value overrides it. Unset (default) = no site-wide proxy from this file; only per-connection proxies apply. An off-box hop then still follows `HTTP_PROXY` / `HTTPS_PROXY` and the operating system's own proxy settings, which `urllib` reads on its own. `"default"` selects the OS default web proxy (`getproxies()`); an `http(s)://` address names an explicit one. **A loopback host is never sent through a proxy**, whichever of these named it (see the cleartext note below this table). **Proxy credentials stay per-connection** (secrets via `env()`), never a global TOML value. Via env: `MEFOR_EGRESS_PROXY_URL` |
+| `proxy_url` | str | _unset_ | site-wide **default forward/egress web proxy** for the HTTP family — REST/SOAP/FHIR/`fhir_lookup`/DICOMweb plus the OAuth2/SMART token endpoints ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md)). A connection that sets no per-connection `proxy` inherits this; a per-connection value overrides it. Unset (default) = no site-wide proxy from this file; only per-connection proxies apply. An off-box hop then still follows `HTTP_PROXY` / `HTTPS_PROXY` and the operating system's own proxy settings, which `urllib` reads on its own, and `serve` names that proxy in a startup warning ([below](#serve-names-an-environment-proxy-at-start)). `"default"` selects the OS default web proxy (`getproxies()`); an `http(s)://` address names an explicit one. **A loopback host is never sent through a proxy**, whichever of these named it (see the cleartext note below this table). **Proxy credentials stay per-connection** (secrets via `env()`), never a global TOML value. Via env: `MEFOR_EGRESS_PROXY_URL` |
 | `proxy_no_proxy` | list | `[]` | the site-wide `NO_PROXY`-style **bypass list** inherited by a connection that sets no per-connection `proxy_no_proxy`. Each entry is a host, `.suffix`, `*.suffix` or `*`. Via env: comma-separated `MEFOR_EGRESS_PROXY_NO_PROXY` |
 | `allowed_proxy` | list | `[]` | allowed **forward-proxy** hosts; each entry is `host` (any port) or `host:port`. Gates the proxy an http-family connection dials **through** — per-connection `proxy_url` or the `[egress].proxy_url` default above — on both the outbound and the `fhir_lookup` read arm. **Deny-by-default even under the `block_unlisted_outbound = false` opt-out, unlike the destination lists above:** a configured proxy with an empty `allowed_proxy` is **refused at config load**. Empty refuses nothing until you set a proxy, so the cost is one line for operators who use one; permissive-when-empty would leave the proxy ungated under that opt-out, and the proxy receives a `Proxy-Authorization` credential under `proxy_auth_type = basic`. Same shape as `[ai].allowed_endpoints` ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)). `proxy_url = "default"` is exempt (it names no address at config time and cannot carry engine-minted proxy credentials). **Not a destination list:** it is deliberately separate from `allowed_http`, because [ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md) puts the proxy out of that gate's scope — one corporate proxy fronts many destinations and would otherwise have to be co-listed with every one — and it does **not** count toward the open-egress startup gate. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_PROXY` |
 | `deny_by_default` | | | **→ moved to `[security].block_unlisted_outbound`** (ADR 0118) — set it there; no longer accepted in `[egress]`. |
@@ -1409,6 +1409,101 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > silently, which made a typo in one file indistinguishable from a deliberate declaration, with every
 > transport hop in the product as its blast radius. `MEFOR_ALLOW_INSECURE_TLS` no longer influences this
 > decision either; it survives for the non-connection cells that have nowhere to carry a declaration.
+
+#### A forward proxy must not re-frame what it carries
+
+**This is a deployment requirement on the forward proxy you name with `proxy_url`** (BACKLOG
+#1125). What it means depends on the destination's scheme.
+
+- **An `https://` destination.** The proxy opens a `CONNECT` tunnel and sees only TLS bytes, so
+  request and reply framing stay between the engine and the partner. The proxy has nothing to frame.
+  A TLS-inspecting proxy is different: it ends the engine's TLS and starts its own, so it reads and
+  re-sends every request and reply, like the `http://` case below. The engine accepts that only if
+  the hop trusts the inspection CA.
+- **An `http://` destination.** The proxy reads and re-sends each request and each reply. The engine
+  never proxies a loopback host, and the cleartext note above says when it allows any other
+  `http://` hop. Where such a hop goes through a proxy, the proxy must at least:
+  1. forward the engine's request with its `Content-Length` unchanged, and never re-send its body
+     chunked;
+  2. refuse a partner reply that carries both `Content-Length` and `Transfer-Encoding`, two
+     different `Content-Length` values, a folded header line, or a bare CR or bare LF in its head,
+     rather than clean it up and pass it on;
+  3. drop its connection to the partner after any reply it could not read to its framed end.
+     The engine's own `Connection: close` binds only the engine's hop to the proxy. It says nothing
+     about how the proxy reuses its connections to the partner, so a misframed reply could otherwise
+     be read as the answer to the next engine request through that proxy.
+
+The engine checks its own hop. Its reply reader refuses an ambiguous reply
+(`transports/bounded_read.py`), but it cannot see what the proxy received from the partner. The
+same rules for a proxy in front of the engine's API are in
+[DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses).
+
+#### `serve` names an environment proxy at start
+
+**A web proxy from the environment or the system settings reaches at least these hops with no
+engine setting** (BACKLOG #1125). The sources include at least `http_proxy`, `https_proxy` and
+`all_proxy`, in either case, and the Windows or macOS system proxy settings.
+
+- **The urllib hops.** Each HTTP-family connection, and its OAuth2 or SMART token request, uses the
+  proxy for the target's scheme wherever no explicit `proxy_url` applies to the host. That is no
+  proxy set at all, `proxy_url = "default"`, or a host that `proxy_no_proxy` bypasses. Other urllib
+  hops with no proxy setting of their own use the same proxies. They include at least the alert
+  webhook, the OIDC sign-in and JWKS reads, and the AI broker. No urllib hop reads `all_proxy`.
+- **The Vault and OpenBao clients** (see `[secrets]`). They use the proxy for the Vault address's
+  scheme, or the `all` proxy when that scheme has none. They refuse an `http://` Vault behind any
+  proxy.
+
+So `serve` and `supervise` each log one WARNING at start when any `http`, `https` or `all` proxy
+is set. Under `supervise`, every engine shard logs its own. The WARNING lists each of those proxies,
+by scheme, host and port, never a user or password from its URL. A value it cannot read, including
+one with leading or trailing whitespace, is named "an unreadable value". It then names the hops
+that may read an environment proxy, and says they include at least those. It names the Vault and
+OpenBao clients only when the `[vault]` extra is installed. It does not say which hop uses which
+proxy, or what reaches the proxy. This section says that, and the WARNING points here.
+
+It logs nothing with no proxy set, or with a `NO_PROXY` of exactly `*`, unless building the
+WARNING fails. A failure logs a different WARNING instead, whether or not a proxy is set. urllib's
+own system proxy readers swallow many of their errors and report no proxy, so a broken read can
+also log nothing. It says a proxy may be set and names only the error's
+class, then gives the same hop sentence, pointer and remedy. One odd entry is meant not to cause
+that failure. The WARNING names a value it cannot label as "an unreadable value", treats an empty
+string or `None` as no entry, and skips an entry whose key is not text.
+
+The WARNING does not check whether a hop reads a proxy, so it still logs for a proxy no hop reads,
+such as a lone `all` proxy without the `[vault]` extra. Nor does it read any other `NO_PROXY` entry,
+so it still logs when a bypass list covers every host the engine reaches. Other commands that reach
+these hops, such as `check-privileges` and `verify`, do not log this warning.
+
+**Some hosts go direct.** Both families send a host on `NO_PROXY` or the system bypass list
+direct. The urllib hops also dial a loopback host direct. The Vault clients have no loopback rule,
+so an `https://` Vault on a loopback address is proxied.
+
+**A credential in a proxy URL is refused where it would reach a proxy in cleartext.** The urllib
+hops refuse it on each request, on any leg with no TLS to a proxy. Writing the proxy `https://`
+does not by itself exempt the credential. The rule, an example of a leg it lets through, and what
+it does not check are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). The Vault clients
+refuse a credentialed proxy not written `https://`, when they are built and again on each send.
+
+**The leg to the proxy is not always TLS, even for a proxy written `https://`.** The other
+documents link here rather than restate it.
+
+- The urllib hops reach at least the `https` proxy over plain TCP. For an `https` target they send
+  `CONNECT` before any TLS.
+- With an `https` proxy set, an `http` target whose `http` proxy is written `https://` is re-sent
+  through the `https` proxy the same way, unless urllib's bypass list names the `http` proxy's own
+  host.
+- An `http` target opens TLS to a proxy written `https://` when no `https` proxy is set, and in
+  that bypass case.
+- The Vault clients do open TLS to an `https://` proxy. `[secrets]` says how they verify it.
+
+`tests/test_proxy_url_credentials_refused.py` measures the urllib legs on the wire.
+
+To stop the proxy, clear `http_proxy`, `https_proxy` and `all_proxy`, in either case, and the
+system proxy, for the account the engine runs as. An address in `[egress].proxy_url` or a
+connection's `proxy_url` changes only the HTTP-family connections and their token requests. The
+other hops keep the environment proxy, and the WARNING still logs, because it reads only the
+environment. The operator API client and the tray ignore the environment proxy.
 
 ### `[shadow]`
 Parallel-run / **shadow-instance** egress suppression (#15). A *shadow* MessageFoundry processes real
@@ -1793,7 +1888,9 @@ the CA that issued your Vault server's certificate to verify that hop against yo
 public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin is
 `MEFOR_STORE_VAULT_CA_FILE`) — a path, not a secret, and unset leaves the hop exactly as it was.
 **A web proxy reaches both Vault clients with no engine setting.** They honour `HTTPS_PROXY`,
-`HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, and on Windows the system proxy. Through an `https://` proxy,
+`HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, and the Windows or macOS system proxy. `serve` names
+such a proxy at start; [`[egress]`](#serve-names-an-environment-proxy-at-start) says which proxy
+each Vault address can use. Through an `https://` proxy,
 the TLS leg to the proxy uses the same approved suites as the Vault leg. It is verified against the
 same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
 public bundle otherwise. There is no separate proxy anchor, on purpose (BACKLOG #2318). The proxy
