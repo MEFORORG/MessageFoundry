@@ -45,7 +45,7 @@ _PRINCIPAL = AdPrincipal(
 
 class _FakeLdap:
     def resolve_principal(
-        self, username: str, *, object_id: str | None = None
+        self, username: str, *, object_id: str | None = None, **_: object
     ) -> AdPrincipal | None:
         return _PRINCIPAL if username == "jdoe" else None
 

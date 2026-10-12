@@ -1002,10 +1002,15 @@ class LdapAuthenticator:
         *,
         fallback_username: str,
         expected_object_id: str | None = None,
+        tie_break_object_id: str | None = None,
     ) -> _Lookup:
         """Run one user search and extract the entry. ``info`` is ``None`` for no match, more than
         one match (``AMBIGUOUS``, vault BACKLOG #2778), a disabled account or an undetermined one,
         and ``answer`` says which (ADR 0195 rule item 2).
+
+        ``tie_break_object_id``, a canonical id, picks among several matches (vault BACKLOG #3228):
+        the one entry that reads it back is used, and none or several are still ``AMBIGUOUS``. It
+        never changes a search that matched one entry. See :meth:`_lookup_by_name`.
 
         ``expected_object_id``, the canonical id an id-keyed search asked for, makes an entry that
         does not read it back a no-match, before its account state is read (BACKLOG #2027). See
@@ -1041,23 +1046,44 @@ class LdapAuthenticator:
         )
         if not conn.entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
+        e = conn.entries[0]
         if len(conn.entries) > 1:
             # Vault BACKLOG #2778. The name filter matches sAMAccountName OR userPrincipalName, and
             # a directory may legally give one account a UPN prefix equal to another's
             # sAMAccountName. Taking entries[0] would let the server's result order pick which
-            # account signs in. No entry is provably the one asked about, so none is. Logged with
-            # a label for the name and the count only, once per name: the attempts repeat at
-            # sign-in rate, and the set of names stays bounded by the collisions the directory holds.
+            # account signs in. Logged with a label for the name and the count only, once per name:
+            # the attempts repeat at sign-in rate, and the set of names stays bounded by the
+            # collisions the directory holds.
+            #
+            # Vault BACKLOG #3228. When the caller holds the account's stored objectGUID, the one
+            # entry that reads it back is the account the engine row is bound to, so it is used.
+            # Refusing it too let anyone able to write a colliding entry lock the account out. No
+            # match, or more than one, still proves nothing, so it is refused as before.
             label = safe_name(fallback_username)
+            matching = (
+                [x for x in conn.entries if _object_guid(x) == tie_break_object_id]
+                if tie_break_object_id is not None
+                else []
+            )
+            if len(matching) != 1:
+                _warn_once(
+                    f"ambiguous:{label}",
+                    "AD user search for %s matched %d directory entries; refusing it as ambiguous "
+                    "(logged once per name)",
+                    label,
+                    len(conn.entries),
+                )
+                return _Lookup(DirectoryAnswer.AMBIGUOUS)
+            # Still reported: the collision is in the directory, and an operator should clear it.
             _warn_once(
-                f"ambiguous:{label}",
-                "AD user search for %s matched %d directory entries; refusing it as ambiguous "
-                "(logged once per name)",
+                f"ambiguous-chosen:{label}",
+                "AD user search for %s matched %d directory entries; using the one carrying the "
+                "account's stored %s (logged once per name)",
                 label,
                 len(conn.entries),
+                _OBJECT_GUID_ATTR,
             )
-            return _Lookup(DirectoryAnswer.AMBIGUOUS)
-        e = conn.entries[0]
+            e = matching[0]
         own: str | None = None
         if expected_object_id is not None:
             own = _object_guid(e)
@@ -1095,7 +1121,16 @@ class LdapAuthenticator:
     def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
         return self._lookup_by_name(conn, username).info
 
-    def _lookup_by_name(self, conn: Any, username: str) -> _Lookup:
+    def _lookup_by_name(
+        self, conn: Any, username: str, *, tie_break_object_id: str | None = None
+    ) -> _Lookup:
+        """Find a user by name. ``tie_break_object_id`` only chooses among several matches.
+
+        Vault BACKLOG #3228. The name stays the key: a Kerberos ticket proves a name, so searching
+        by the stored id instead would sign the ticket holder in as whoever holds that id now, even
+        after the name passed to someone else. The id is normalised here, the one place it enters
+        this lookup; one that cannot be read breaks no tie.
+        """
         upn = f"{username}@{self._s.ad_domain}" if self._s.ad_domain else username
         return self._search_user(
             conn,
@@ -1104,6 +1139,11 @@ class LdapAuthenticator:
                 f"(userPrincipalName={_escape_filter(upn)}))"
             ),
             fallback_username=username,
+            tie_break_object_id=(
+                normalise_object_guid(tie_break_object_id)
+                if tie_break_object_id is not None
+                else None
+            ),
         )
 
     def _lookup_by_object_id(self, conn: Any, object_id: str, *, fallback_username: str) -> _Lookup:
@@ -1261,7 +1301,11 @@ class LdapAuthenticator:
         return DirectoryBind(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
 
     def resolve_principal(
-        self, username: str, *, object_id: str | None = None
+        self,
+        username: str,
+        *,
+        object_id: str | None = None,
+        tie_break_object_id: str | None = None,
     ) -> AdPrincipal | None:
         """Look a user up + resolve groups *without* a password. Uses the service-account bind only.
 
@@ -1282,10 +1326,22 @@ class LdapAuthenticator:
         ``username`` is still required, and is what the principal reports when the matched entry
         carries no ``sAMAccountName`` of its own -- an absent attribute is not the directory announcing
         a rename to nothing.
-        """
-        return self.probe_principal(username, object_id=object_id).principal
 
-    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        ``tie_break_object_id`` serves a name-keyed caller that already holds the account's stored
+        ``objectGUID``: when the name matches several entries, the one carrying that id is used
+        (vault BACKLOG #3228, :meth:`_lookup_by_name`). It is ignored when ``object_id`` is given.
+        """
+        return self.probe_principal(
+            username, object_id=object_id, tie_break_object_id=tie_break_object_id
+        ).principal
+
+    def probe_principal(
+        self,
+        username: str,
+        *,
+        object_id: str | None = None,
+        tie_break_object_id: str | None = None,
+    ) -> DirectoryProbe:
         """:meth:`resolve_principal`, also saying WHY an account did not resolve (ADR 0195).
 
         The session reconciler's lookup, and ``verify_mfa``'s before it renews a directory
@@ -1304,7 +1360,9 @@ class LdapAuthenticator:
                 found = (
                     self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
-                    else self._lookup_by_name(svc, username)
+                    else self._lookup_by_name(
+                        svc, username, tie_break_object_id=tie_break_object_id
+                    )
                 )
                 info = found.info
                 if info is None:

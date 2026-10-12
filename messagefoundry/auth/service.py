@@ -3952,7 +3952,11 @@ class AuthService:
                     "<kerberos>", "kerberos", "no_principal", client=client
                 )
                 return LoginOutcome(ok=False, error="SSO authentication failed")
-            principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
+            principal = await asyncio.to_thread(
+                self._ldap.resolve_principal,
+                username,
+                tie_break_object_id=await self._stored_directory_object_id(username),
+            )
         except LdapError as exc:
             await self._audit(
                 "auth.login_error",
@@ -3985,6 +3989,21 @@ class AuthService:
             session_mechanism=SessionMechanism.KERBEROS,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
+
+    async def _stored_directory_object_id(self, username: str) -> str | None:
+        """The ``objectGUID`` the directory row named ``username`` is bound to, or ``None``.
+
+        Vault BACKLOG #3228. The Kerberos sign-in looks its ticket's name up in the directory, and a
+        name that matches several entries is refused (vault BACKLOG #2778). That refusal let anyone
+        able to write a colliding entry lock the account out. This id lets the lookup pick the entry
+        the row is already bound to, and only that one. The directory search stays keyed by the
+        name, so the id never chooses an account the name does not match. A local row holds no
+        directory id, and is refused at the sign-in anyway, so it breaks no tie.
+        """
+        row = await self._store.get_user_by_username(username)
+        if row is None or row.auth_provider != AuthProvider.AD.value:
+            return None
+        return row.directory_object_id
 
     def _oidc_policy(self, nonce: str) -> oidc.OidcClaimPolicy:
         s = self._settings
