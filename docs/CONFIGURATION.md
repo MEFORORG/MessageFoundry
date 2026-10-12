@@ -1385,8 +1385,8 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > **This is a rule of the engine's own `urllib` openers**: at least the HTTP family and its token
 > endpoints, the alert webhook, the OIDC legs and the AI broker. A client built on another HTTP
 > library is outside it. Of those, the Vault clients refuse a loopback `http://` Vault behind a proxy
-> rather than bypass it (see `[secrets]`). A client that uses none of the engine's openers, such as
-> the `tee` tool, follows the environment proxy even for a loopback engine address.
+> rather than bypass it (see `[secrets]`). The `tee` tool uses none of the engine's openers and
+> follows the environment proxy even for a loopback engine address that `NO_PROXY` does not name.
 >
 > **`tls_hop_attested` is a per-connection declaration, set with `tls_hop_attested_reason`** (owner
 > ruling 2026-09-24). It is a keyword on `inbound()` / `outbound()` / `FhirLookup()` /
@@ -1474,10 +1474,12 @@ such as a lone `all` proxy without the `[vault]` extra. Nor does it read any oth
 so it still logs when a bypass list covers every host the engine reaches. Other commands that reach
 these hops, such as `check-privileges` and `verify`, do not log this warning.
 
-**Some hosts go direct.** Both families send a host on `NO_PROXY` direct. On Windows and macOS,
-a value in any `*_proxy` environment variable, even `NO_PROXY`, makes both families ignore the
+**Some hosts go direct.** Both families send a host on `NO_PROXY` direct. With no `*_proxy`
+environment variable holding a value, they also send a host on the Windows or macOS system bypass
+list direct. A value in any `*_proxy` variable, even `NO_PROXY`, makes both families ignore the
 system proxy settings, bypass list included. The urllib hops also dial a loopback host direct. The
-Vault clients have no loopback rule, so an `https://` Vault on a loopback address is proxied.
+Vault clients have no loopback rule, so an `https://` Vault on a loopback address is proxied
+unless a bypass list names it.
 
 **A credential in a proxy URL is refused where it would reach a proxy in cleartext.** The urllib
 hops refuse it on each request, on any leg with no TLS to a proxy. Writing the proxy `https://`
