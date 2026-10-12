@@ -125,7 +125,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any, Protocol, cast
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
@@ -860,11 +860,8 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
 
     **Outside this check**, at least:
 
-    * A proxy credential carried in any header but ``Proxy-Authorization``. The name is read in
-      any letter case and with whitespace around it, by :func:`is_proxy_credential_header_name`.
-    * A header named with trailing whitespace, on a ``CONNECT`` tunnel through a handler that
-      admits caller-set headers. urllib moves only the exact name into the ``CONNECT``, so that
-      header stays on the request sent inside the tunnel.
+    * A proxy credential carried in any header but ``Proxy-Authorization``. Which names count as
+      that header is :func:`is_proxy_credential_header_name`'s to say.
     * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
       trusts, so a context on the system store accepts any publicly trusted certificate for the
       proxy's host.
@@ -915,9 +912,13 @@ def _sends_cleartext_proxy_credentials(
         return "@" in proxy
     # A header an earlier proxy_open put on this request rides along to this proxy (vault BACKLOG
     # #3410), and so does one a redirect copied, and one a caller set (vault BACKLOG #3416).
-    carried = _proxy_credential_header(req)
-    if not _is_from_a_proxy_url(carried, user, password, proxies) and (
-        carried is None or caller_header_admitted
+    carried = _proxy_credential_headers(req)
+    # An admission covers the header its connection made, which is spelled plainly. urllib moves
+    # only that spelling into a CONNECT, so any other would stay on the request sent inside the
+    # tunnel, and the destination would read it. So no other spelling is ever admitted.
+    admitted = caller_header_admitted and all(_is_spelled_plainly(name) for name in carried)
+    if not _is_from_a_proxy_url(carried.values(), user, password, proxies) and (
+        not carried or admitted
     ):
         return False
     # urllib dials a host on its own bypass list direct, and adds no proxy header to that request.
@@ -939,7 +940,7 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
     cleartext ``CONNECT``, which :class:`LoopbackDirectProxyHandler` judged when it set the tunnel.
     So is a plain ``http`` request to a proxy, for the same reason.
     """
-    if _proxy_credential_header(req) is None or getattr(req, "_tunnel_host", None):
+    if not _proxy_credential_headers(req) or getattr(req, "_tunnel_host", None):
         return
     if not req.has_proxy():
         # Direct: no proxy rewrote this request, so the destination would read the header.
@@ -951,42 +952,51 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
 
 
 def _is_from_a_proxy_url(
-    carried: str | None, user: str | None, password: str | None, proxies: Mapping[str, str]
+    carried: Collection[str], user: str | None, password: str | None, proxies: Mapping[str, str]
 ) -> bool:
     """Whether a leg's credential comes from a proxy URL: this proxy's own user and password, or a
-    ``carried`` header that one of ``proxies`` would make (vault BACKLOG #3410)."""
-    return bool(user and password) or (
-        carried is not None and carried in _proxy_url_credentials(proxies)
-    )
+    ``carried`` header value that one of ``proxies`` would make (vault BACKLOG #3410)."""
+    return bool(user and password) or not _proxy_url_credentials(proxies).isdisjoint(carried)
+
+
+_PLAIN_NAME = "proxy-authorization"
 
 
 def is_proxy_credential_header_name(name: str) -> bool:
-    """Whether ``name`` is the ``Proxy-Authorization`` header, in any letter case and with any
-    whitespace around it.
+    """Whether ``name`` is the ``Proxy-Authorization`` header, however it is spelled.
 
-    The one reading of that name, so the rules that ask the question cannot drift apart.
-    ``http.client`` sends a name that ends in a space or a tab as it is written, and a proxy may
-    read it as the plain name. Only whitespace is removed, as ``str.strip`` defines it. A name that
-    differs in any other way is another header, which the rule on
+    The one reading of that name, so the rules that ask the question cannot drift apart. The
+    letter case is ignored. So is every character at either end that cannot be part of a header
+    name: whitespace, a control character, a NUL. ``http.client`` sends at least a name that ends
+    in a space, a tab, a NUL or a DEL as it is written, and a proxy may read each as the plain
+    name. A name that differs in any other way is another header, which the rule on
     :class:`ProxyCredentialsRefusedError` leaves out.
     """
-    return name.strip().lower() == "proxy-authorization"
+    return _NOT_A_NAME_EDGE.sub("", name).lower() == _PLAIN_NAME
 
 
-def _proxy_credential_header(req: urllib.request.Request) -> str | None:
-    """The ``Proxy-Authorization`` value on ``req``, or ``None``. The name is read by
-    :func:`is_proxy_credential_header_name`.
+def _is_spelled_plainly(name: str) -> bool:
+    """Whether ``name`` is ``Proxy-Authorization`` with nothing around it, in any letter case.
+    ``do_open`` title-cases each name, so this is the set of spellings it moves into a ``CONNECT``."""
+    return name.lower() == _PLAIN_NAME
+
+
+def _proxy_credential_headers(req: urllib.request.Request) -> dict[str, str]:
+    """Each ``Proxy-Authorization`` header on ``req``, by the name it is stored under. The name
+    is read by :func:`is_proxy_credential_header_name`.
 
     urllib stores a header under ``str.capitalize()`` of its name, but ``do_open`` sends every
     header it holds, so a key stored in another case would still reach the wire. So would one
-    stored with trailing whitespace. The unredirected headers are read first because ``do_open``
-    lets them win over a header of the same name.
+    stored with whitespace after it, beside a plainly spelled one. Every match is returned for
+    that reason: one value must not hide another. The unredirected headers are read last because
+    ``do_open`` lets them win over a header of the same name.
     """
-    for headers in (req.unredirected_hdrs, req.headers):
-        for name, value in headers.items():
-            if is_proxy_credential_header_name(name):
-                return str(value)
-    return None
+    return {
+        name: str(value)
+        for headers in (req.headers, req.unredirected_hdrs)
+        for name, value in headers.items()
+        if is_proxy_credential_header_name(name)
+    }
 
 
 def _proxy_url_credentials(proxies: Mapping[str, str]) -> set[str]:
@@ -1142,6 +1152,8 @@ def _is_a(handler: object, kinds: type | tuple[type, ...]) -> bool:
 _TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
 _TOKEN = f"[{_TCHARS}]+"
 _FIELD_NAME = re.compile(_TOKEN)
+#: A run of characters at either end of a header name that no field name can hold.
+_NOT_A_NAME_EDGE = re.compile(rf"\A[^{_TCHARS}]+|[^{_TCHARS}]+\Z")
 #: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
 #: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
 _OBS_FOLD = re.compile(r"\r?\n[ \t]")
