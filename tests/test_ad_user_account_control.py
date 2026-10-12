@@ -602,7 +602,9 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
         assert sink.events[0][2]["probed"] == 12
         aborted = json.loads((await _audited(store, "auth.ad_reconcile_aborted"))[0]["detail"])
         assert aborted["probed"] == 12 and "judged" not in aborted  # the held two are in it
-        assert "(2 of them held)" in (service.directory_reconcile_alert or "")
+        assert "of the 12 signed-in directory principals it probed (2 of them held)" in (
+            service.directory_reconcile_alert or ""
+        )
         assert len(await _audited(store, "auth.ad_reconcile_held")) == 2
         assert await _alive(service, tokens) == set(names)
         assert service.directory_reconcile_hold is not None

@@ -455,8 +455,9 @@ def test_held_probes_stay_in_the_breakers_count() -> None:
 
 
 def test_a_mass_revocation_wave_beside_a_held_one_still_trips_the_breaker() -> None:
-    """Counting held probes dilutes the fraction, but a genuine wave still exceeds it: 30 absent
-    accounts beside 40 held ones are more than 0.34 of 70. The hold survives the abort."""
+    """Counting held probes dilutes the fraction, but a broad wave of absences, false ones
+    included, still exceeds it: 30 absent accounts beside 40 held ones are more than 0.34 of 70.
+    The hold survives the abort."""
     held = [reconcile.Probe(f"h{i}", f"h{i}", U) for i in range(40)]
     gone = [reconcile.Probe(f"g{i}", f"g{i}", reconcile.ProbeOutcome.ABSENT) for i in range(30)]
     plan = _plan(held + gone, prior_strikes={p.user_id: 1 for p in gone})
@@ -755,7 +756,7 @@ async def test_mass_revoke_breaker_aborts_the_pass_and_alerts() -> None:
             assert token is not None and await service.identity_for_token(token) is not None
         assert service.directory_reconcile_alert is not None
         assert "circuit breaker TRIPPED" in service.directory_reconcile_alert
-        assert "held" not in service.directory_reconcile_alert  # no hold, so no held clause
+        assert "of them held" not in service.directory_reconcile_alert  # no hold, no held clause
         assert any(a["action"] == "auth.ad_reconcile_aborted" for a in await store.list_audit())
     finally:
         await store.close()
