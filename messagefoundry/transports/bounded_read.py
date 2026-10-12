@@ -115,7 +115,6 @@ ASVS 12.2.1). The same handler makes that check, for the same reason. See
 from __future__ import annotations
 
 import base64
-import contextlib
 import email.message
 import email.parser
 import functools
@@ -686,7 +685,9 @@ class StrictHTTPHandler(urllib.request.HTTPHandler):
     """urllib's ``http`` handler, reading each reply with :class:`StrictHTTPResponse`."""
 
     def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
-        _refuse_proxy_credentials_on_this_leg(req, context=None)
+        _refuse_proxy_credentials_on_this_leg(
+            req, context=None, opener=getattr(self, "parent", None)
+        )
         return self.do_open(_StrictHTTPConnection, req)
 
 
@@ -699,7 +700,9 @@ class StrictHTTPSHandler(urllib.request.HTTPSHandler):
 
     def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
         context = _tls_context_of(self)
-        _refuse_proxy_credentials_on_this_leg(req, context=context)
+        _refuse_proxy_credentials_on_this_leg(
+            req, context=context, opener=getattr(self, "parent", None)
+        )
         return self.do_open(_StrictHTTPSConnection, req, context=context)
 
 
@@ -785,12 +788,8 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
         _refuse_cleartext_proxy_credentials(
             req, proxy, proxies, caller_header_admitted=self.caller_header_admitted
         )
-        # Cleared first, so a request reused from an opener that admitted its header is judged
-        # afresh by this one.
-        with contextlib.suppress(AttributeError):
-            delattr(req, _ADMITTED_CALLER_HEADER)
         if self.caller_header_admitted:
-            _note_admitted_caller_header(req, proxy, proxies)
+            _note_admitted_caller_header(req, proxy, proxies, opener=getattr(self, "parent", None))
         return super().proxy_open(req, proxy, type)
 
 
@@ -912,10 +911,9 @@ def _sends_cleartext_proxy_credentials(
     # A header an earlier proxy_open put on this request rides along to this proxy (vault BACKLOG
     # #3410), and so does one a redirect copied, and one a caller set (vault BACKLOG #3416).
     carried = _proxy_credential_header(req)
-    from_a_proxy_url = bool(user and password) or (
-        carried is not None and carried in _proxy_url_credentials(proxies)
-    )
-    if not from_a_proxy_url and (carried is None or caller_header_admitted):
+    if not _is_from_a_proxy_url(carried, user, password, proxies) and (
+        carried is None or caller_header_admitted
+    ):
         return False
     # urllib dials a host on its own bypass list direct, and adds no proxy header to that request.
     # A header already on it would then reach the destination, which the strict handlers refuse.
@@ -927,12 +925,15 @@ def _sends_cleartext_proxy_credentials(
     return not (req.type == "http" and (scheme or "").lower() == "https")
 
 
-def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, context: object) -> None:
+def _refuse_proxy_credentials_on_this_leg(
+    req: urllib.request.Request, *, context: object, opener: object
+) -> None:
     """Refuse a web-proxy credential on the connection a strict handler is about to open.
 
     Every request an engine opener sends is opened here, so this sees the final shape of each leg,
     whichever proxy handler ran before it, or none. ``context`` is the TLS context the leg would
-    use, or ``None`` for plain ``http``. A ``CONNECT`` tunnel is left alone: the header rides in the
+    use, or ``None`` for plain ``http``. ``opener`` is the handler's own opener, which an admission
+    recorded on the request must name. A ``CONNECT`` tunnel is left alone: the header rides in the
     cleartext ``CONNECT``, which :class:`LoopbackDirectProxyHandler` judged when it set the tunnel.
     So is a plain ``http`` request to a proxy, for the same reason.
     """
@@ -945,20 +946,22 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
     if (
         context is not None
         and not verifies_peer_fully(context)
-        and getattr(req, _ADMITTED_CALLER_HEADER, None) != header
+        and not _admitted_here(req, header, opener)
     ):
         # The TLS leg to an https proxy, on a context that does not authenticate it. A caller-set
         # header the connection admitted crosses here as it crosses a cleartext leg.
         raise ProxyCredentialsRefusedError(_UNVERIFIED_PROXY_TLS)
 
 
-#: The request attribute that records a caller-set header its proxy handler admitted. It holds the
-#: header's value, so a header urllib later replaces with one from a proxy URL no longer matches.
+#: The request attribute that records a caller-set header its proxy handler admitted, as the pair
+#: (that handler's opener, the header's value). The opener ties it to the one opener whose handler
+#: admitted it, so a request reused through another opener is not covered. The value means a header
+#: urllib later replaces with one from a proxy URL no longer matches.
 _ADMITTED_CALLER_HEADER = "_messagefoundry_admitted_proxy_header"
 
 
 def _note_admitted_caller_header(
-    req: urllib.request.Request, proxy: str, proxies: Mapping[str, str]
+    req: urllib.request.Request, proxy: str, proxies: Mapping[str, str], *, opener: object
 ) -> None:
     """Record on ``req`` that its ``Proxy-Authorization`` header is the caller's own, admitted.
 
@@ -967,14 +970,36 @@ def _note_admitted_caller_header(
     puts on the request next, and not one an earlier proxy's URL made (vault BACKLOG #3410).
     """
     carried = _proxy_credential_header(req)
-    if carried is None or carried in _proxy_url_credentials(proxies):
+    if carried is None or opener is None:
         return
     try:
         _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
     except ValueError:
         return
-    if not (user and password):
-        setattr(req, _ADMITTED_CALLER_HEADER, carried)
+    if not _is_from_a_proxy_url(carried, user, password, proxies):
+        setattr(req, _ADMITTED_CALLER_HEADER, (opener, carried))
+
+
+def _admitted_here(req: urllib.request.Request, header: str, opener: object) -> bool:
+    """Whether ``header`` is the one a proxy handler of ``opener`` admitted on ``req``."""
+    mark = getattr(req, _ADMITTED_CALLER_HEADER, None)
+    return (
+        opener is not None
+        and isinstance(mark, tuple)
+        and len(mark) == 2
+        and mark[0] is opener
+        and mark[1] == header
+    )
+
+
+def _is_from_a_proxy_url(
+    carried: str | None, user: str | None, password: str | None, proxies: Mapping[str, str]
+) -> bool:
+    """Whether a leg's credential comes from a proxy URL: this proxy's own user and password, or a
+    ``carried`` header that one of ``proxies`` would make (vault BACKLOG #3410)."""
+    return bool(user and password) or (
+        carried is not None and carried in _proxy_url_credentials(proxies)
+    )
 
 
 def _proxy_credential_header(req: urllib.request.Request) -> str | None:

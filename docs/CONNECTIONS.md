@@ -1518,8 +1518,8 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 `bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
 by this rule. It has its own, below.
 
-**Engine openers refuse a web-proxy credential on the legs where it could be read on the way
-(vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That covers a user and password in a proxy URL
+**Engine openers refuse a web-proxy credential on the legs where it could be read on the way,
+with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That covers a user and password in a proxy URL
 and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI

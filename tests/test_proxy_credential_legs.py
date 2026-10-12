@@ -497,6 +497,40 @@ def test_admission_never_covers_a_proxy_url_credential_over_unverified_tls(famil
     assert proxy.connections == 0
 
 
+@pytest.mark.parametrize("family", list(_UNVERIFIED))
+def test_an_admission_does_not_follow_a_request_into_another_opener(family: str) -> None:
+    """A request sent once through an admitting opener keeps its proxy rewrite. Sent again
+    through an opener whose handler admitted nothing, its header is refused on the unverified leg,
+    and the proxy sees only the first send."""
+    with _WireProxy() as proxy:
+        admitting = LoopbackDirectProxyHandler(
+            {"http": f"https://{proxy.address}"}, caller_header_admitted=True
+        )
+        request = _with_header(_HTTP_TARGET)
+        _open_and_discard(_UNVERIFIED[family](admitting), request)
+        assert request.has_proxy()
+        _refused(_UNVERIFIED[family](urllib.request.ProxyHandler({})), request, "#3418")
+    assert proxy.connections == 1
+
+
+@pytest.mark.parametrize("family", list(_UNVERIFIED))
+def test_admission_never_records_a_proxy_url_header_carried_past_a_bypass(
+    monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    """An admitting handler sends an ``http`` target to a credentialed ``https://`` proxy, and the
+    bypass list names that proxy's own host. urllib hands the request back for ``https`` and then
+    leaves it on the TLS leg to the proxy, carrying the proxy URL's header. That header is not the
+    caller's, so the unverified leg refuses it."""
+    with _WireProxy() as proxy:
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        handler = LoopbackDirectProxyHandler(
+            {"http": f"https://{_CRED}@{proxy.address}", "https": f"http://{_MARKER}"},
+            caller_header_admitted=True,
+        )
+        _refused(_UNVERIFIED[family](handler), _HTTP_TARGET, "#3418")
+    assert proxy.connections == 0
+
+
 def test_admission_never_carries_a_proxy_url_credential_to_a_second_proxy() -> None:
     """An admitting handler sends an ``http`` target to proxy A, written ``https://`` with a
     credential, and ``https`` to proxy B, written ``http://``. urllib puts A's credential on the
