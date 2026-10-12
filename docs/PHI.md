@@ -1780,7 +1780,10 @@ loop. **Every purge in the runner is backend-agnostic** — it is constructed wi
 protocol and started by the Engine when `[retention]` is configured. Its one backend branch purges
 nothing: the low-disk floor `[retention].min_free_disk_mb` (BACKLOG #290, default-on at 1024 MiB)
 measures free space on a **SQLite** store's volume only, and is skipped on SQL Server and Postgres.
-Because that floor ships on, a SQLite store starts the runner on stock settings. Config:
+Because that floor ships on, a SQLite store starts the runner on stock settings. The
+`[retention].audit_log_warn_rows` growth warning (BACKLOG #1421) also ships on and is
+backend-agnostic, so stock settings start the runner on every backend; it reads the size of
+`audit_log` and deletes nothing. Config:
 [CONFIGURATION.md](CONFIGURATION.md#retention).
 
 **"Off by default" is no longer the whole truth on a PHI instance.** The raw `[retention]` fields do
