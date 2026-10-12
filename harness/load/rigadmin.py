@@ -400,6 +400,22 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
+class _LoopbackDirect(urllib.request.ProxyHandler):
+    """urllib's proxy handler, except that a loopback engine is dialled direct (BACKLOG #1127).
+
+    The stock handler sends ``http://127.0.0.1`` to ``HTTP_PROXY``, or the system proxy, unless
+    ``NO_PROXY`` names the host. That proxy would read the sign-in password and the bearer in clear
+    on a hop :func:`_checked_base` allowed only because it stays on the box. The engine's own
+    openers do the same (``LoopbackDirectProxyHandler`` in ``messagefoundry/transports/bounded_read.py``);
+    this copy keeps the module on the standard library. An off-box ``https`` engine still goes
+    through a set proxy, inside a TLS tunnel the proxy cannot read."""
+
+    def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> object:  # noqa: A002
+        if (urlsplit(req.full_url).hostname or "").lower() in _LOOPBACK_HOSTS:
+            return None  # not rewritten, so the scheme's own handler dials the host itself
+        return super().proxy_open(req, proxy, type)
+
+
 def _read_bounded(reply: _Readable) -> bytes:
     """The whole answer ``reply`` holds, refused once it passes :data:`MAX_API_REPLY_BYTES`.
 
@@ -448,7 +464,7 @@ def _call(
         request.add_header("Authorization", f"Bearer {bearer}")
     # The context is passed on every call. A loopback http URL makes no handshake and ignores it.
     opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=_context(cacert)), _RefuseRedirect()
+        urllib.request.HTTPSHandler(context=_context(cacert)), _RefuseRedirect(), _LoopbackDirect()
     )
     try:
         try:

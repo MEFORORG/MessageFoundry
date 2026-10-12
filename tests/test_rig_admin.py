@@ -314,6 +314,10 @@ def test_an_answer_that_ends_before_its_stated_length_is_no_answer(status: int) 
         peer.join(10.0)
 
 
+#: ``struct linger``: two ``u_short`` in Winsock, two ``int`` elsewhere.
+_LINGER = "HH" if sys.platform == "win32" else "ii"
+
+
 @contextlib.contextmanager
 def _peer_that_breaks_off(status: int, *, reset: bool) -> Iterator[str]:
     """A loopback peer that sends ``status``, a ``Content-Length`` of 5000 and 100 bytes of it.
@@ -334,7 +338,7 @@ def _peer_that_breaks_off(status: int, *, reset: bool) -> Iterator[str]:
                 if reset:
                     time.sleep(0.2)  # the client is now blocked reading the rest of the body
                     # Linger on, with a zero timeout: close() sends a reset, not a normal close.
-                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(_LINGER, 1, 0))
                 else:
                     done.wait(10.0)
 
@@ -362,8 +366,10 @@ def test_an_answer_that_stalls_or_resets_mid_body_is_no_answer_on_a_refusal_too(
     ):
         rigadmin._call("GET", f"{base}/stats", cacert=None)
     assert not isinstance(caught.value, rigadmin.RigReplyRefused)
-    if not reset:
-        assert str(caught.value) == "the engine did not answer (TimeoutError)"
+    # The exact reason, so a reset that arrived as a normal close (and read as a short answer)
+    # cannot pass for the refusal path this test is about.
+    reason = "ConnectionResetError" if reset else "TimeoutError"
+    assert str(caught.value) == f"the engine did not answer ({reason})"
 
 
 class _CountingServer:
@@ -417,15 +423,44 @@ def test_a_redirect_is_never_followed_and_the_bearer_never_leaves(code: int) -> 
         assert "stolen" not in str(caught.value)
 
         # CONTROL: the hit count is a working instrument. A normal 200 at the other server is read
-        # and counted, and stock urllib, given the same redirect, follows it with the bearer.
+        # and counted, and urllib's stock redirect handler, given the same redirect, follows it
+        # with the bearer. No proxy, so a machine's own proxy setting cannot move the request.
         assert rigadmin._call("GET", f"{elsewhere.base}/ok", cacert=None) == (200, b'{"ok": true}')
         assert elsewhere.seen == [("/ok", None)]
         stock = urllib.request.Request(
             f"{engine.base}/stats", headers={"Authorization": "Bearer held-session"}
         )
-        with urllib.request.urlopen(stock, timeout=10.0) as followed:
+        no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with no_proxy.open(stock, timeout=10.0) as followed:
             followed.read()
         assert elsewhere.seen[-1] == ("/stolen", "Bearer held-session")
+
+
+def test_a_loopback_engine_is_dialled_direct_when_a_proxy_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1127: with ``HTTP_PROXY`` set and no ``NO_PROXY``, urllib sends a request for
+    ``http://127.0.0.1`` to the proxy, which would read the sign-in password and the bearer in
+    clear. The rig dials a loopback engine direct, as the engine's own openers do."""
+    for name in ("no_proxy", "NO_PROXY", "http_proxy", "HTTP_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    with (
+        _CountingServer(200, {}, b"proxied") as proxy,
+        _CountingServer(200, {}, b"direct") as engine,
+    ):
+        monkeypatch.setenv("http_proxy", proxy.base)
+        status, raw = rigadmin._call("GET", f"{engine.base}/stats", cacert=None, bearer="held")
+        assert (status, raw) == (200, b"direct")
+        assert engine.seen == [("/stats", "Bearer held")]
+        assert proxy.seen == [], "the loopback request went through the proxy"
+
+        # CONTROL: stock urllib, under the same environment, hands the request to the proxy.
+        stock = urllib.request.Request(
+            f"{engine.base}/stats", headers={"Authorization": "Bearer held"}
+        )
+        with urllib.request.build_opener().open(stock, timeout=10.0) as proxied:
+            assert proxied.read() == b"proxied"
+        assert proxy.seen == [(f"{engine.base}/stats", "Bearer held")]
 
 
 # --- the one session per process ---------------------------------------------
