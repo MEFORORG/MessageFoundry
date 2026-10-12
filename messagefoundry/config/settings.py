@@ -2214,9 +2214,9 @@ class DiagnosticsSettings(_Section):
     # adds 9 more. The ceiling is ONE row per request per require() dependency, because
     # _grant_audit_permission returns a single permission. So the growth is bounded by JSON-API client
     # polling cadence (the harness polls /stats), not by console page views. Nothing prunes the chain:
-    # `[retention].audit_days` is reserved and unenforced by design. Two advisory signals warn and
-    # never delete: `[retention].audit_log_warn_rows`, on by default since BACKLOG #1421, measures this
-    # table, and `[retention].max_db_mb`, off by default, measures the whole store.
+    # `[retention].audit_days` is reserved and unenforced by design. The size signals that warn and
+    # never delete include `[retention].audit_log_warn_rows`, on by default since BACKLOG #1421,
+    # which measures this table, and `[retention].max_db_mb`, off by default, the whole store.
     #
     # THE COST IS A COMMIT, NOT JUST A ROW, and that is the half a storage estimate misses. `require()`
     # AWAITS `record_audit` before the route body runs, and `record_audit` takes the store's write lock,
@@ -2578,7 +2578,7 @@ class RetentionSettings(_Section):
     survives; its PHI *columns* do not. Tiers that carry nothing but PHI and back no count (transform
     state, connection events) are DELETEd outright instead.
 
-    Three knobs here are default-ON rather than off. ``min_free_disk_mb``, the low-disk storage floor
+    At least three knobs here are default-ON rather than off. ``min_free_disk_mb``, the low-disk storage floor
     (BACKLOG #290), refuses a ``serve`` start and warns at runtime; it never purges anything.
     ``wal_checkpoint_seconds`` truncates the SQLite ``-wal`` file once an hour, so a purged body
     does not outlive the purge there (vault BACKLOG #2619). ``audit_log_warn_rows`` warns while

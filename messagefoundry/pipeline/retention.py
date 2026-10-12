@@ -910,14 +910,13 @@ class RetentionRunner:
         line carries two numbers and setting names only, never a row's contents.
 
         The measure is the newest row's sequence number, read through the store's own
-        ``audit_anchor``: one awaited seek on the UNIQUE ``seq`` index on every backend, so it costs
-        the same at any table size and never blocks the event loop. A full ``COUNT(*)`` would scan
-        a table that only grows, every pass. On an intact chain the newest ``seq`` IS the row count.
-        On Postgres and SQL Server a CHECK keeps every ``seq`` at least 1, and values are distinct,
-        so on a damaged chain the number can only be higher and the warning comes early, never
-        late. SQLite carries no such CHECK, so a writer with file access can number rows 0 or
-        below and make it read low. The warning is a size signal, not a tamper control; the audit
-        verify is the one that reports a renumbered row.
+        ``audit_anchor``: one awaited seek on the UNIQUE ``seq`` index, so it never blocks the event
+        loop and, on an intact chain, costs the same at any table size. A full ``COUNT(*)`` would
+        scan a table that only grows, every pass. (SQLite's ``audit_anchor`` falls back to a full
+        count when the newest ``seq`` is not a positive integer.) On an intact chain the newest
+        ``seq`` IS the row count. On a chain someone renumbered, it can read high or low on any
+        backend. The warning is a size signal, not a tamper control; the audit verify is what
+        reports a renumbered row.
 
         A read that fails logs a WARNING with its reason and returns False, so a backend that
         cannot answer degrades visibly rather than silently. It never stops the pass."""
