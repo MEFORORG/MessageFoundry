@@ -243,6 +243,15 @@ def test_a_label_whose_value_holds_a_label_is_not_kept(text: str) -> None:
     assert not _paths_keeping(text, _VALUE)
 
 
+def test_a_label_a_later_pass_glues_into_the_value_is_read_again() -> None:
+    """The value is read when the run keeps the label, and the passes after the run can change it.
+    Here the name run replaces the two names, which glues ``,secret:`` to the kept label's value,
+    so the finished output is read again and the label is not kept."""
+    text = f"x|y|z;pwd: Wilhelmina Pemberly,secret: {_VALUE}"
+    assert redact(text).startswith("[redacted] "), redact(text)
+    assert not _paths_keeping(text, _VALUE, "Wilhelmina", "Pemberly")
+
+
 def test_every_tail_word_holds_a_hint() -> None:
     """The check on a kept label's value looks for these substrings, so every label word must hold
     one or a label inside a value would go unseen."""
