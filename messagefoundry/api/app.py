@@ -2158,26 +2158,33 @@ _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 #:
 #: The risk is a formula cell. A sender can label an OBX-5 document ``text/csv`` and start a cell with
 #: ``=``. A spreadsheet evaluates that cell when it opens the file. The engine's own exports escape
-#: such cells (:func:`messagefoundry.spreadsheet.spreadsheet_safe`). This route cannot, because the
-#: stored document must stay verbatim.
+#: such cells (:func:`messagefoundry.spreadsheet.spreadsheet_safe`). This route serves the stored
+#: bytes of a CSV as they are, so the cell arrives intact.
 #:
 #: Like the PDF case, this is a local-open risk and the application origin is not reached. CSV still
-#: gets the other answer, because PDF reasons 2 and 3 do not carry over.
+#: gets the other answer, because PDF reason 2 points the other way for it.
 #:
 #: 1. PDF reason 2 says the file extension decides what opens a saved file, and this route writes
 #:    that extension. A host with a spreadsheet installed usually opens ``.csv`` in it. So the
 #:    ``.csv`` name would send the document to the one program that runs its content.
 #: 2. A PDF cannot be read without a PDF viewer, so the operator supplies ``.pdf`` whatever the route
-#:    served, and that is why PDF reason 3 calls a serve-time choice the wrong instrument. A CSV is
-#:    plain text. Under ``.txt`` it opens in a text editor, which evaluates nothing, and the operator
-#:    can read it there with no rename. The decision rests on the name. The declared type moves
-#:    with it so the two agree.
+#:    served. A CSV is plain text, so under ``.txt`` it stays readable with no rename. A text editor
+#:    evaluates nothing. The decision rests on the name. The declared type moves with it so the
+#:    two agree.
 #: 3. The cost is small. The stored bytes and the stored label are untouched, and the console's
 #:    attachment list still shows ``text/csv``.
 #:
-#: This narrows the default open only. An operator who renames the file to ``.csv``, or imports it
-#: into a spreadsheet, still evaluates its cells. Nobody has exercised a browser or a spreadsheet
-#: against this route: which program opens ``.csv`` and ``.txt`` is a property of the operator's host.
+#: What this does NOT do, so that nobody reads more into it:
+#:
+#: - It narrows the default open only. An operator who renames the file to ``.csv``, or imports it
+#:   into a spreadsheet, still evaluates its cells.
+#: - It rests on host defaults nobody measured. Which program opens ``.csv`` or ``.txt`` is a
+#:   property of the operator's host, and no browser or spreadsheet was exercised against this route.
+#: - It covers the exact label ``text/csv``. Other spellings, such as ``application/csv``, were never
+#:   on the list and still download under the generic type with a ``.bin`` name.
+#: - It is not the only possible control. The route could serve an escaped copy and keep the stored
+#:   value verbatim, as it does for an SVG. That was not weighed here and is not built. It would
+#:   have to parse a sender's CSV, whose delimiter and quoting the label does not carry.
 _INERT_ATTACHMENT_TYPES: dict[str, str] = {
     "application/dicom": ".dcm",
     "application/json": ".json",

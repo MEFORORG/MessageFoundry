@@ -1249,11 +1249,17 @@ route does not do.
 
 `text/csv` gets the other answer, by a decision recorded beside the same table. A document the sender
 labelled `text/csv` downloads as `text/plain` with a `.txt` name. A sender can start a cell with `=`, and
-a spreadsheet evaluates that cell when it opens the file. The route cannot escape the cell, because the
-stored document stays verbatim. Under a `.txt` name the file opens in a text editor, which evaluates
-nothing. This covers the double-click only: an operator who renames the file to `.csv`, or imports it
-into a spreadsheet, still evaluates its cells. The message page's attachment list still shows the
-sender's `text/csv` label.
+a spreadsheet evaluates that cell when it opens the file. The route serves a CSV's stored bytes as they
+are, so the `.txt` name is what keeps a double-click away from a spreadsheet. The comment beside the
+table holds the reasoning and the limits. Three of the limits matter to an operator:
+
+- The message page's attachment list still shows the sender's `text/csv` label, so the `.txt` name is
+  expected. **Do not rename the file to `.csv` to open it.** Renaming it, or importing it into a
+  spreadsheet, still evaluates its cells.
+- Which program opens a `.txt` file is set by your own host. Nobody has tested this route against a
+  browser or a spreadsheet.
+- Only the exact label `text/csv` is covered. Another spelling, such as `application/csv`, downloads as
+  `application/octet-stream` with a `.bin` name, like any unlisted type.
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
