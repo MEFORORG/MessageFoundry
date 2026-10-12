@@ -841,8 +841,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     WARNING, and when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``. The
     connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
     header in its plain spelling only. A header named with any other character at either end is
-    never admitted, and is refused on every proxy leg, a verified TLS leg included: neither urllib
-    nor a proxy is sure to take that spelling as the proxy's own. The exception never covers
+    never admitted. One that could be sent is refused on every proxy leg, a verified TLS leg
+    included: neither urllib nor a proxy is sure to take that spelling as the proxy's own. One
+    that can never be sent is not refused by this rule at all; the list below says what happens
+    to it. The exception never covers
     a request that goes direct, and never a credential from a proxy URL, including one a request
     carries on to a second proxy. **A TLS leg whose context does not fully verify the proxy is
     refused regardless**, admitted or not, because that guard never reads the TLS context.
@@ -869,9 +871,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
 
     * A proxy credential carried in any header but ``Proxy-Authorization``. Which names count as
       that header is :func:`is_proxy_credential_header_name`'s to say.
-    * A spelling of that name which ``http.client`` can never send. Once every refusal above
-      has had its turn, the request fails with a ``ValueError`` and not with this error, as
-      :func:`_refuse_a_proxy_header_that_can_never_be_sent` explains.
+    * A spelling of that name, other than the plain one, which ``http.client`` can never send.
+      Once every refusal above has had its turn, the request fails with a ``ValueError``, or
+      with ``http.client``'s own error where that is not a ``ValueError``, and not with this
+      error. :func:`_refuse_a_proxy_header_that_can_never_be_sent` explains.
     * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
       trusts, so a context on the system store accepts any publicly trusted certificate for the
       proxy's host.
@@ -1017,18 +1020,30 @@ def _proxy_header_items(req: urllib.request.Request) -> dict[str | bytes, Any]:
     }
 
 
+def _put_as_do_open_would(name: str | bytes, value: Any) -> None:
+    """Hand one header to ``http.client`` with the call ``do_open`` makes: the name title-cased,
+    and the value as stored. Raises whatever that library raises for a header it will not send.
+
+    Asked of the library itself, so the answer follows its rule in every Python version. The
+    connection is the class the strict ``http`` handler opens, and it is never opened: nothing
+    is connected and no name is resolved, because ``putrequest`` and ``putheader`` only fill a
+    buffer.
+    """
+    probe = _StrictHTTPConnection("localhost")
+    probe.putrequest("GET", "/")
+    probe.putheader(name.title(), value)
+
+
 def _can_never_be_sent(name: str | bytes, value: Any) -> bool:
     """Whether ``http.client`` would refuse this header, by its name or by its value.
 
-    Asked of ``http.client`` itself, with the call ``do_open`` makes: the name title-cased, and
-    the value as stored. So the answer follows that library's rule in every Python version.
-    Nothing is connected: ``putrequest`` and ``putheader`` only fill a buffer.
+    Any error counts, not only a ``ValueError``. This answer decides which headers the rule
+    judges, so an error that escaped here would come before a credential refusal that applies.
+    A value that is ``None`` raises ``TypeError``, for one.
     """
-    probe = http.client.HTTPConnection("localhost")
-    probe.putrequest("GET", "/")
     try:
-        probe.putheader(name.title(), value)
-    except ValueError:  # a name or a value it will not send; UnicodeEncodeError is one
+        _put_as_do_open_would(name, value)
+    except Exception:  # noqa: BLE001 - whatever http.client raises, it will not send this header
         return True
     return False
 
@@ -1058,23 +1073,31 @@ def _proxy_credential_headers(req: urllib.request.Request) -> dict[str | bytes, 
 
 
 def _refuse_a_proxy_header_that_can_never_be_sent(req: urllib.request.Request) -> None:
-    """Raise :class:`ValueError` if ``req`` holds a spelling of ``Proxy-Authorization``, other
-    than the plain one, that ``http.client`` can never send.
+    """Raise if ``req`` holds a spelling of ``Proxy-Authorization``, other than the plain one,
+    that ``http.client`` can never send.
 
     At least a name that starts with a space, one that holds a line feed or a colon, and one
     that will not encode as ASCII are such names. No request could carry one, so it is a fault
     in what the caller wrote and not a credential on its way out. Before the rule read these
-    spellings, ``http.client`` refused such a request with a ``ValueError`` of its own, after
-    every credential refusal had run. This keeps both the class and the order. At least the REST
-    send maps a ``ValueError`` to a permanent refusal, where the credential refusal is retried,
-    and a retry cannot mend a header name.
+    spellings, ``http.client`` refused such a request itself, after every credential refusal
+    had run. This keeps both the class of that error and the order. At least the REST send maps
+    a ``ValueError`` to a permanent refusal, where the credential refusal is retried, and a
+    retry cannot mend a header name.
 
-    The text is fixed. ``http.client``'s own error would quote the name, or the value.
+    Where ``http.client`` raises a ``ValueError``, this raises one with fixed text, because that
+    library's would quote the name or the value. Any other error it raises is left to stand, as
+    it stood before: a ``TypeError`` for a value that is ``None``, for one.
     """
-    # Raised here, outside any handler, so no http.client error rides on it.
-    if any(
-        not _is_judged_by_the_rule(name, value) for name, value in _proxy_header_items(req).items()
-    ):
+    refused_by_value_error = False
+    for name, value in _proxy_header_items(req).items():
+        if _is_spelled_plainly(name):
+            continue
+        try:
+            _put_as_do_open_would(name, value)
+        except ValueError:
+            refused_by_value_error = True
+    # Raised here, outside the handler, so no http.client error rides on it.
+    if refused_by_value_error:
         raise ValueError(_UNSENDABLE_PROXY_HEADER)
 
 

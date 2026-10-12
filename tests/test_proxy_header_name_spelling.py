@@ -40,8 +40,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
+import ssl
+import subprocess
+import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -263,6 +269,172 @@ def test_a_name_is_judged_as_do_open_would_send_it() -> None:
         request.headers[chr(0xDF) + _NAME] = _VALUE
         _refused(_opener(proxy), request, "#3416")
     assert proxy.connections == 0
+
+
+# --- the order: a credential refusal first, on every leg -------------------------------------------
+
+
+def _unsendable_beside_plain(url: str) -> urllib.request.Request:
+    """A plain header, and beside it a spelling that can never be sent."""
+    request = urllib.request.Request(url, headers={" " + _NAME: _VALUE})
+    request.headers[_NAME.upper()] = _VALUE
+    return request
+
+
+def _hostname_unchecked() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    return context
+
+
+def test_the_direct_refusal_comes_before_the_unsendable_one() -> None:
+    """The direct leg. Before the fix the rule refused the plain header here, and only a request
+    that got past it met ``http.client``. The order is the same now."""
+    with _WireProxy() as destination:
+        opener = build_strict_opener(urllib.request.ProxyHandler({}))
+        _refused(opener, _unsendable_beside_plain(f"http://{destination.address}/x"), "#3417")
+    assert destination.connections == 0
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_the_unverified_tls_refusal_comes_before_the_unsendable_one(admitted: bool) -> None:
+    """The leg that reaches an ``https://`` proxy over TLS, on a context that does not check the
+    host name. The plain header is refused for that, admitted or not, before the unsendable
+    spelling is looked at."""
+    with _WireProxy() as proxy:
+        handler = LoopbackDirectProxyHandler(
+            {"http": f"https://{proxy.address}"}, caller_header_admitted=admitted
+        )
+        opener = build_strict_opener(
+            urllib.request.HTTPSHandler(context=_hostname_unchecked()), handler
+        )
+        _refused(opener, _unsendable_beside_plain(_HTTP_TARGET), "#3418")
+    assert proxy.connections == 0
+
+
+def test_control_the_unsendable_one_alone_is_what_those_legs_raise() -> None:
+    """The other polarity for the two tests above: with no plain header beside it, the same two
+    legs raise the fixed ``ValueError``. So those tests read an order, not an absence."""
+    with _WireProxy() as peer:
+        direct = build_strict_opener(urllib.request.ProxyHandler({}))
+        _never_sent(direct, _request(" " + _NAME, f"http://{peer.address}/x"))
+        handler = LoopbackDirectProxyHandler({"http": f"https://{peer.address}"})
+        over_tls = build_strict_opener(
+            urllib.request.HTTPSHandler(context=_hostname_unchecked()), handler
+        )
+        _never_sent(over_tls, _request(" " + _NAME, _HTTP_TARGET))
+    assert peer.connections == 0
+
+
+# --- a value http.client refuses with another error -----------------------------------------------
+
+#: Values ``http.client`` will not send, and refuses with a ``TypeError`` and not a ``ValueError``.
+_TYPE_ERROR_VALUES: dict[str, Any] = {"none": None, "float": 1.5, "list": ["made", "up"]}
+
+
+def _odd_request(value: Any, url: str = _HTTP_TARGET) -> urllib.request.Request:
+    """A sendable odd spelling, holding a value ``http.client`` cannot send."""
+    request = urllib.request.Request(url)
+    request.headers[_NAME + " "] = value
+    return request
+
+
+@pytest.mark.parametrize("value", list(_TYPE_ERROR_VALUES.values()), ids=list(_TYPE_ERROR_VALUES))
+def test_measured_http_client_raises_type_error_for_the_value(value: Any) -> None:
+    with _WireProxy() as destination, pytest.raises(TypeError):
+        _stock_opener().open(_odd_request(value, f"http://{destination.address}/x"), timeout=5)
+    assert destination.connections == 0
+
+
+@pytest.mark.parametrize("value", list(_TYPE_ERROR_VALUES.values()), ids=list(_TYPE_ERROR_VALUES))
+def test_a_proxy_url_credential_refusal_comes_before_any_error_from_the_value(value: Any) -> None:
+    """The check that decides which headers the rule judges asks ``http.client`` about this
+    value. Its ``TypeError`` must not escape from there: a credential in the proxy URL is refused
+    first, as it was before the rule read this spelling."""
+    with _WireProxy() as proxy:
+        proxy_url = f"http://{_URL_CRED}@{proxy.address}"
+        opener = build_strict_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+        _refused(opener, _odd_request(value), "#2572")
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("value", list(_TYPE_ERROR_VALUES.values()), ids=list(_TYPE_ERROR_VALUES))
+def test_a_plain_header_refusal_comes_before_any_error_from_the_value(value: Any) -> None:
+    with _WireProxy() as proxy:
+        request = _odd_request(value)
+        request.headers[_NAME.upper()] = _VALUE
+        _refused(_opener(proxy), request, "#3416")
+    assert proxy.connections == 0
+
+
+@pytest.mark.parametrize("value", list(_TYPE_ERROR_VALUES.values()), ids=list(_TYPE_ERROR_VALUES))
+def test_control_with_no_credential_refusal_the_type_error_stands(value: Any) -> None:
+    """With nothing for the rule to refuse, the request fails as it did before the fix: with
+    ``http.client``'s own ``TypeError``, and with nothing sent."""
+    with _WireProxy() as proxy, pytest.raises(TypeError):
+        _opener(proxy).open(_odd_request(value), timeout=5)
+    assert proxy.connections == 0
+
+
+# --- asking http.client opens nothing --------------------------------------------------------------
+
+#: Run in a child process, because an audit hook cannot be removed once it is added. It imports
+#: the engine first, then counts the audit events for a socket being made or connected and for a
+#: name being resolved: once around a control that does both, and once around the check.
+_AUDIT_SCRIPT = """
+import json, socket, sys
+from messagefoundry.transports import bounded_read
+
+watched = {"socket.__new__", "socket.connect", "socket.getaddrinfo", "socket.gethostbyname",
+           "socket.gethostbyaddr"}
+seen = []
+sys.addaudithook(lambda event, args: seen.append(event) if event in watched else None)
+
+socket.getaddrinfo("localhost", 80)
+socket.socket().close()
+control = sorted(set(seen))
+seen.clear()
+
+plain = "Proxy-Authorization"
+value = "made up"
+answers = {
+    "leading space": bounded_read._can_never_be_sent(chr(32) + plain, value),
+    "line feed": bounded_read._can_never_be_sent(plain + chr(10), value),
+    "not ascii": bounded_read._can_never_be_sent(plain + chr(160), value),
+    "value is None": bounded_read._can_never_be_sent(plain + chr(32), None),
+    "trailing space": bounded_read._can_never_be_sent(plain + chr(32), value),
+    "bytes name": bounded_read._can_never_be_sent(plain.encode() + bytes([32]), value),
+}
+print(json.dumps({"control": control, "seen": seen, "answers": answers}))
+"""
+
+
+def test_asking_http_client_about_a_header_opens_no_socket_and_resolves_no_name() -> None:
+    """The check runs on every request that holds an odd spelling, so it must cost no network.
+    It names ``localhost`` and never resolves it. The control shows the hook fires for a socket
+    and for a lookup, and the answers show the check really ran."""
+    done = subprocess.run(  # noqa: S603 - this interpreter, a fixed script, no input from a test
+        [sys.executable, "-c", _AUDIT_SCRIPT],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    report = json.loads(done.stdout)
+    assert "socket.getaddrinfo" in report["control"]
+    assert "socket.__new__" in report["control"]
+    assert report["answers"] == {
+        "leading space": True,
+        "line feed": True,
+        "not ascii": True,
+        "value is None": True,
+        "trailing space": False,
+        "bytes name": False,
+    }
+    assert report["seen"] == []
 
 
 # --- the rule, per leg -----------------------------------------------------------------------------
