@@ -223,10 +223,6 @@ _LOG = logging.getLogger(__name__)
 #: walk it with.
 _FIRST_REWRITABLE_FIELD = 1
 _FIRST_REWRITABLE_MSH_FIELD = 3
-_UNWRITABLE_WHY = (
-    "which no rule can rewrite: field 0 is the segment id, and MSH-1 and MSH-2 hold the "
-    "message's delimiters"
-)
 
 
 def _unwritable_fields(rules: tuple[FieldRule, ...]) -> tuple[str, ...]:
@@ -265,8 +261,9 @@ def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
     named = _unwritable_fields(rules)
     if named:
         raise AnonError(
-            f"a rule names {', '.join(named)}, {_UNWRITABLE_WHY}. Repair or remove a later MSH "
-            "line that carries data there. Refusing to emit"
+            f"a rule names {', '.join(named)}, which no rule can rewrite: field 0 is the "
+            "segment id, and MSH-1 and MSH-2 hold the message's delimiters. Repair or remove a "
+            "later MSH line that carries data there. Refusing to emit"
         )
 
 
@@ -291,7 +288,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
     an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
-    and column. TOML that stops early names the last line. A path the system refuses to open is
+    and column. TOML that runs out after a final newline names the last line. A path the system refuses to open is
     reported as the path's fault. It quotes nothing from the file, and it chains no other exception.
 
     An overlay whose final rule set would rewrite ``MSH-1`` or ``MSH-2`` is refused here too, once,
@@ -313,7 +310,6 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     # The read and the parse are two steps, so an error about the PATH is never reported as one
     # about the file's content (BACKLOG #3003).
     refusal: str | None = None
-    text = ""
     try:
         text = overlay.read_text(encoding="utf-8")
     except UnicodeDecodeError:  # a ValueError, not an OSError, so it goes before the plain arm
@@ -366,11 +362,12 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
     # Checked on the final rule set, so a later keep on the same path lifts the refusal. Left to
     # the adapters alone, this rule would fail every message and the tee would report a count.
+    # Field 0 never gets this far: the path check above refuses it, so only MSH-1 and MSH-2 can.
     unwritable = _unwritable_fields(rules)
     if unwritable:
         raise RuleError(
-            f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, {_UNWRITABLE_WHY}. "
-            "Remove the rule, or change it to a keep"
+            f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, which no rule can "
+            "rewrite: MSH-1 and MSH-2 hold the message's delimiters. Remove the rule"
         )
     for cancelled in kept_defaults(rules):
         _LOG.warning(
@@ -386,13 +383,13 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 def _toml_refusal(exc: tomllib.TOMLDecodeError) -> str:
     """Where the TOML went wrong, as a line and column. Nothing from the file is quoted.
 
-    For text that stops early the parser reports the position after the last character. When the
-    text ends in a newline that is the line AFTER the last one, which no editor shows. So that
-    case names the last line and says the file ended (BACKLOG #3003).
+    When the parser runs off the end of text that ends in a newline, it reports column 1 of the
+    line AFTER the last one, which no editor shows. That one case names the last line instead
+    (BACKLOG #3003). With no final newline the parser's own line and column exist, so they stand:
+    it reports the end position for at least a repeated key there too, not only for cut-off text.
     """
-    if exc.pos >= len(exc.doc):
-        last_line = exc.lineno - 1 if exc.doc.endswith("\n") else exc.lineno
-        return f"invalid TOML at the end of the file, line {last_line}"
+    if exc.pos >= len(exc.doc) and exc.doc.endswith("\n"):
+        return f"invalid TOML at the end of the file, line {exc.lineno - 1}"
     return f"invalid TOML at line {exc.lineno}, column {exc.colno}"
 
 

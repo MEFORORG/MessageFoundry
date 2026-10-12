@@ -4,8 +4,8 @@
 
 1. A path the system refuses to open is reported as the path's fault. The read and the parse
    used to share one ``try``, so that error was reported as a value the TOML parser refused.
-2. TOML that stops early names the last line of the file. The parser reports the line after the
-   final newline, which no editor shows.
+2. TOML that runs out after a final newline names the last line of the file. The parser reports
+   the line after that newline, which no editor shows.
 3. ``python -m tee anonymize-captures`` checks the salt and loads the overlay before it reads
    the store, so a bad overlay refuses the run whatever the store holds.
 4. Both packages export ``kept_defaults``.
@@ -87,7 +87,7 @@ def test_a_missing_file_and_bad_bytes_keep_their_own_reasons(
     assert _refusal(rules_module, not_text).endswith("the file is not UTF-8 text")
 
 
-# --- part 2: TOML that stops early names the last line --------------------------------------------
+# --- part 2: TOML that runs out after a final newline names the last line -------------------------
 
 
 @_BOTH
@@ -96,16 +96,25 @@ def test_a_missing_file_and_bad_bytes_keep_their_own_reasons(
     [
         # Two lines, ending in a newline: the parser's own answer is line 3, column 1.
         ('[hl7]\nkeep = ["PID-5"\n', "invalid TOML at the end of the file, line 2"),
-        # No final newline: the parser already named line 2.
-        ('[hl7]\nkeep = ["PID-5"', "invalid TOML at the end of the file, line 2"),
         ("[hl7]\nkeep = [\n\n\n", "invalid TOML at the end of the file, line 4"),
-        ("[hl7", "invalid TOML at the end of the file, line 1"),
+        # No final newline: the parser's own line and column exist, so they stand.
+        ('[hl7]\nkeep = ["PID-5"', "invalid TOML at line 2, column 16"),
+        ("[hl7", "invalid TOML at line 1, column 5"),
+        # Not cut off at all: a repeated key is reported at the end position too.
+        ('[hl7]\nkeep = ["PID-5"]\nkeep = ["PID-6"]', "invalid TOML at line 3, column 17"),
         # The control: an error inside the file keeps the parser's line and column.
         ("[hl7]\nkeep = = 1\ndrop = []\n", "invalid TOML at line 2, column 8"),
     ],
-    ids=["trailing-newline", "no-trailing-newline", "blank-tail", "one-line", "mid-file"],
+    ids=[
+        "trailing-newline",
+        "blank-tail",
+        "no-trailing-newline",
+        "one-line",
+        "repeated-key-at-end",
+        "mid-file",
+    ],
 )
-def test_toml_that_stops_early_names_the_last_line(
+def test_toml_that_runs_out_after_a_final_newline_names_the_last_line(
     rules_module: ModuleType, body: str, expected: str, tmp_path: Path
 ) -> None:
     overlay = _overlay(tmp_path, body)
