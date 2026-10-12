@@ -77,6 +77,11 @@ built or before a send. A refusal of the REPLY is an
 :class:`~messagefoundry.transports.bounded_read.EgressReplyError`. Both carry fixed text only, and
 :func:`vault_failure_text` is how the providers' catch-all handlers keep that text rather than
 shrinking it to a type name.
+
+**This module raises the hop refusal as** :class:`VaultHopRefused` **(vault BACKLOG #3247).** It is
+an ``InsecureHopRefused``, so every handler written for the base type still catches it. The
+subclass marks a refusal built here from fixed text, and :func:`vault_failure_text` keeps the text
+of that subclass only.
 """
 
 from __future__ import annotations
@@ -116,9 +121,26 @@ from messagefoundry.transports.bounded_read import (
 __all__ = [
     "MAX_VAULT_REPLY_BYTES",
     "StrictReplyAdapter",
+    "VaultHopRefused",
     "mount_strict_reply_adapter",
     "vault_failure_text",
 ]
+
+
+class VaultHopRefused(InsecureHopRefused):
+    """A refusal of the Vault hop, built in this module from fixed text (vault BACKLOG #3247).
+
+    Every check this module runs on the hop raises this type, from the hop's fixed connector label
+    and a fixed reason. It names no part of the address, the proxy URL, the token or the reply.
+    The base type promises none of that: elsewhere in the engine an ``InsecureHopRefused`` can
+    echo a host (``transports/rest.py``). So :func:`vault_failure_text` keeps this type's text and
+    no other hop refusal's.
+
+    **Raise it only in this module, and only with fixed text.**
+    ``tests/test_vault_hop_refusal_marker.py`` reads the source for both: no other module under
+    ``messagefoundry/`` builds one, and this module raises no bare ``InsecureHopRefused``.
+    """
+
 
 #: Ceiling on one reply body on the Vault or OpenBao Transit client.
 #:
@@ -220,7 +242,7 @@ def _narrowed_pool_classes(
 
         def connect(self) -> None:
             if resolve_cert_reqs(self.cert_reqs) == ssl.CERT_NONE:
-                raise InsecureHopRefused(
+                raise VaultHopRefused(
                     f"{connector} would open a TLS session that verifies no peer; "
                     "refusing to connect"
                 )
@@ -273,7 +295,7 @@ def _narrowed_pool_classes(
             if isinstance(leg, ssl.SSLSocket):
                 leg.close()
             self.close()
-            raise InsecureHopRefused(
+            raise VaultHopRefused(
                 f"{connector}: the TLS leg to its https:// proxy did not run on the engine's "
                 "narrowed, verifying context; refusing to send"
             )
@@ -397,13 +419,13 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
             issubclass(pool.ConnectionCls, _STRICT_CONNECTIONS)
             and issubclass(pool.ConnectionCls.response_class, StrictHTTPResponse)
         ):
-            raise InsecureHopRefused(
+            raise VaultHopRefused(
                 f"{self._connector} would read its reply head with a connection the engine cannot "
                 "make strict; refusing to send"
             )
         # BACKLOG #300, the same fail-closed shape: an https pool must be the narrowed one.
         if pool.scheme == "https" and not getattr(type(pool), _NARROWED_POOL_MARK, False):
-            raise InsecureHopRefused(
+            raise VaultHopRefused(
                 f"{self._connector} would handshake on a TLS context the engine did not narrow; "
                 "refusing to send"
             )
@@ -413,7 +435,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         url = request.url or ""
         if _scheme_of(url) != "https":
             if pool.scheme == "https":
-                raise InsecureHopRefused(_unverifiable_proxy_leg(self._connector))
+                raise VaultHopRefused(_unverifiable_proxy_leg(self._connector))
             # BACKLOG #2317: a non-https request carries the token in cleartext unless it stays
             # on the box. Checked at construction too; this catches a proxy that appeared since.
             _refuse_a_cleartext_vault_hop(
@@ -493,20 +515,24 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
 def vault_failure_text(exc: BaseException) -> str:
     """What a Vault provider's catch-all handler may say about ``exc`` (BACKLOG #2318).
 
-    A refusal from this hop keeps its own text: an
-    :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` from the hop checks, or an
-    :class:`~messagefoundry.transports.bounded_read.EgressReplyError` from the reply reader. Both
-    are built here and in ``bounded_read`` from the hop's fixed connector label and fixed reason
-    text. They name no part of the address, the proxy URL, the token or the reply. Any other
-    failure gives only its type name, as before, because its text can echo ciphertext, a
+    A refusal from this hop keeps its own text: a :class:`VaultHopRefused` from the hop checks, or
+    an :class:`~messagefoundry.transports.bounded_read.EgressReplyError` from the reply reader.
+    Both are built here and in ``bounded_read`` from the hop's fixed connector label and fixed
+    reason text. They name no part of the address, the proxy URL, the token or the reply. Any
+    other failure gives only its type name, as before, because its text can echo ciphertext, a
     request body or a URL.
 
-    **The test is by type, so it holds only where those are the only sources.** Call it only from
-    a handler around an hvac call on a client :func:`mount_strict_reply_adapter` mounted, which is
-    the six Vault provider handlers today. Elsewhere in the engine an ``InsecureHopRefused`` can
-    echo a host (``transports/rest.py``), so a handler around other code must not use this.
+    **A hop refusal of any other type gives only its type name (vault BACKLOG #3247).** The test
+    used to accept every ``InsecureHopRefused``. Elsewhere in the engine one can echo a host
+    (``transports/rest.py``), so a handler that met one would have printed that host.
+    :class:`VaultHopRefused` is raised only in this module, so its text is this module's.
+
+    **The reply half is still by type.** An ``EgressReplyError`` is built in this module and in
+    ``bounded_read`` only, at least today, and both use fixed text. Call this only from a handler
+    around an hvac call on a client :func:`mount_strict_reply_adapter` mounted, which is the six
+    Vault provider handlers today.
     """
-    if isinstance(exc, (InsecureHopRefused, EgressReplyError)):
+    if isinstance(exc, (VaultHopRefused, EgressReplyError)):
         return str(exc)
     return type(exc).__name__
 
@@ -574,22 +600,27 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     host direct (``bounded_read.LoopbackDirectProxyHandler``, vault BACKLOG #2579). requests
     has no such handler, which is why this hop refuses instead.
 
-    Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a ``ValueError``, with
-    fixed text."""
+    Raises :class:`VaultHopRefused`, an ``InsecureHopRefused`` and so a ``ValueError``, with fixed
+    text."""
     scheme, host = _vault_scheme_and_host(url)
     if scheme == "https":
         return
     on_box = scheme == "http" and not proxy and bool(host) and is_loopback_hop_host(host)
-    enforce_insecure_hop(
-        insecure_hop_disposition(
-            enforcing=True,  # no posture in scope (docstring); fail closed
-            is_loopback_hop=on_box,
-            hop_attested=False,
-            cleartext_accepted=False,
-        ),
-        message=_CLEARTEXT_VAULT_HOP,
-        cell=connector,
-    )
+    try:
+        enforce_insecure_hop(
+            insecure_hop_disposition(
+                enforcing=True,  # no posture in scope (docstring); fail closed
+                is_loopback_hop=on_box,
+                hop_attested=False,
+                cleartext_accepted=False,
+            ),
+            message=_CLEARTEXT_VAULT_HOP,
+            cell=connector,
+        )
+    except InsecureHopRefused as exc:
+        # The shared authority raises the base type. Its text here is the two fixed arguments
+        # above and nothing else, so it is raised again as this module's marked type.
+        raise VaultHopRefused(str(exc)) from exc
 
 
 #: The fixed text of the proxy-credential refusal. Like the cleartext one, it names no part of the
@@ -647,7 +678,7 @@ def _refuse_cleartext_proxy_credentials(proxy: str | None, *, connector: str) ->
     exception. Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` with fixed
     text."""
     if proxy and _proxy_carries_cleartext_credentials(proxy):
-        raise InsecureHopRefused(f"{connector}: {_CLEARTEXT_PROXY_CREDENTIALS}")
+        raise VaultHopRefused(f"{connector}: {_CLEARTEXT_PROXY_CREDENTIALS}")
 
 
 def _prepared_vault_hop(
@@ -724,7 +755,7 @@ def _refuse_an_insecure_vault_hop(
     sent, proxy = hop if hop is not None else ("", None)
     _refuse_cleartext_proxy_credentials(proxy, connector=connector)
     if _scheme_of(sent) == "http" and proxy and _scheme_of(proxy) == "https":
-        raise InsecureHopRefused(_unverifiable_proxy_leg(connector))
+        raise VaultHopRefused(_unverifiable_proxy_leg(connector))
     _refuse_a_cleartext_vault_hop(sent, proxy, connector=connector)
 
 
