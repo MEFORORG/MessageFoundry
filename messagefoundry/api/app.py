@@ -2150,6 +2150,37 @@ _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 #:
 #: Anyone reversing this decision should reverse it on evidence about the **origin**, because the origin
 #: is the only thing this header controls.
+#:
+#: **``text/csv`` is NOT on this list, and that is the second recorded decision (vault BACKLOG #2802).**
+#: A ``text/csv`` label is declared ``text/plain`` and named ``.txt``, through
+#: :data:`_ATTACHMENT_SERVED_AS` below. Before that row it was on the list with a ``.csv`` name, and
+#: no written decision covered it.
+#:
+#: The risk is a formula cell. A sender can label an OBX-5 document ``text/csv`` and start a cell with
+#: ``=``. A spreadsheet evaluates that cell when it opens the file. The engine's own exports escape
+#: such cells (:func:`messagefoundry.spreadsheet.spreadsheet_safe`). This route cannot, because the
+#: stored document must stay verbatim.
+#:
+#: Like the PDF case, this is a local-open risk and the application origin is not reached. CSV still
+#: gets the other answer, because the PDF reasons do not carry over.
+#:
+#: 1. PDF reason 2 says the file extension decides what opens a saved file. This route writes that
+#:    extension. A PDF cannot be read without a PDF viewer, so the operator supplies ``.pdf`` whatever
+#:    the route served. A CSV is plain text. Under ``.txt`` it opens in a text editor, which evaluates
+#:    nothing, and the operator can read it there with no rename.
+#: 2. A host with a spreadsheet installed usually opens ``.csv`` in it, and evaluating cells is what
+#:    a spreadsheet does with the file. So the ``.csv`` name would send the document to the one
+#:    program that runs its content.
+#: 3. PDF reason 3 calls a serve-time MIME choice the wrong instrument. That holds for a type the
+#:    operator must open in its own viewer. Here the served name decides the default handler, so it
+#:    is the right instrument for the double-click. The decision rests on the name. The declared
+#:    type moves with it so the two agree.
+#: 4. The cost is small. The stored bytes and the stored label are untouched, and the console's
+#:    attachment list still shows ``text/csv``.
+#:
+#: This narrows the default open only. An operator who renames the file to ``.csv``, or imports it
+#: into a spreadsheet, still evaluates its cells. Nobody has exercised a browser or a spreadsheet
+#: against this route: which program opens ``.csv`` and ``.txt`` is a property of the operator's host.
 _INERT_ATTACHMENT_TYPES: dict[str, str] = {
     "application/dicom": ".dcm",
     "application/json": ".json",
@@ -2159,8 +2190,14 @@ _INERT_ATTACHMENT_TYPES: dict[str, str] = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/tiff": ".tif",
-    "text/csv": ".csv",
     "text/plain": ".txt",
+}
+#: Labels the route recognizes but DECLARES as another type on the allow-list above, so the served
+#: type and the download name are both the target's. The reasoning for each entry is in the comment
+#: above the allow-list. Matched exactly on the case-folded label, like the allow-list. A key here must
+#: never also be an allow-list key, and every value must be one.
+_ATTACHMENT_SERVED_AS: dict[str, str] = {
+    "text/csv": "text/plain",
 }
 #: The download-name extension for every type the allow-list does not name — the partner of
 #: :data:`_DEFAULT_ATTACHMENT_MIME`. Both the served type and the served extension now come from this
@@ -2192,7 +2229,8 @@ _ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
 def _safe_attachment_content_type(content_type: str | None) -> str:
     """The download ``Content-Type``: the canonical spelling from :data:`_INERT_ATTACHMENT_TYPES` when the
     stored ``content_type`` is a clean, bounded ``type/subtype`` naming one of them, else
-    ``application/octet-stream``.
+    ``application/octet-stream``. A label on :data:`_ATTACHMENT_SERVED_AS` is declared as its target
+    type instead, so ``text/csv`` is declared ``text/plain``.
 
     The stored value is a verbatim, attacker-influenced OBX-5.2 label, so it is never trusted into the
     response header (header-splitting shapes) and never trusted into the *browser* either. An
@@ -2215,6 +2253,7 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     # The shape screen has already excluded parameters (``; charset=…``) and inner whitespace, so the
     # case-fold is the only normalization an exact lookup still needs.
     key = ct.casefold()
+    key = _ATTACHMENT_SERVED_AS.get(key, key)
     return key if key in _INERT_ATTACHMENT_TYPES else _DEFAULT_ATTACHMENT_MIME
 
 
