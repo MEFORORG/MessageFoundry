@@ -292,10 +292,11 @@ have their own rows in the inventory table above.) The engine mints at least the
 - A self-signed EC P-256 certificate and key, on request (`messagefoundry cert
   self-signed`, `make_self_signed` in [`pki.py`](../messagefoundry/pki.py)). The key PEM is
   unencrypted PKCS#8, written `O_EXCL` with mode `0o600` and a tightened Windows DACL. The command
-  refuses to overwrite an existing `key.pem` or `cert.pem`, and writes both files or neither: if
-  `cert.pem` cannot be written, it removes the key it just wrote. A self-signed certificate has no chain of trust. It is
-  better than cleartext and worse than an operator-supplied chain, so it is a placeholder to
-  replace, not an endorsed production terminator.
+  refuses to overwrite an existing `key.pem` or `cert.pem`. If `cert.pem` cannot be written, it
+  removes the key it just wrote, and its failure line names any file it could not remove. A
+  self-signed certificate has no chain of trust. It is better than cleartext and worse than an
+  operator-supplied chain, so it is a placeholder to replace, not an endorsed production
+  terminator.
 - The **API TLS placeholder key**, unasked, on the first `serve` that has no `[api].tls_cert_file`
   and no declared upstream TLS terminator
   ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).

@@ -803,7 +803,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
         "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
         "it); key.pem is written owner-only (mode 0600 on POSIX, a restrictive access list on "
-        "Windows). It refuses to overwrite an existing cert.pem or key.pem, and writes both or neither",
+        "Windows). It refuses to overwrite an existing cert.pem or key.pem, and removes the key it "
+        "wrote if cert.pem cannot be written",
     )
     cert_self_signed.add_argument(
         "--cn",
@@ -5900,11 +5901,15 @@ def _san_labels(names: list[str]) -> str:
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
-    Writes cert.pem + key.pem to ``--out-dir``, both or neither. It refuses an existing cert.pem or
-    key.pem before it mints, and both writes are exclusive, so a file that appears meanwhile is
-    still never replaced. If cert.pem cannot be written, the key.pem this run wrote is removed.
-    Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
+    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem or key.pem before
+    it mints, and both writes are exclusive, so a file that appears meanwhile is still never
+    replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
+    line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
+
+    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
+    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
+    from messagefoundry.api.tls import _unlink_generated
 
     if args.days <= 0:
         return _cert_fail("--days must be a positive integer", as_json=args.json)
@@ -5953,24 +5958,29 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
         with cert_path.open("xb") as fh:
             cert_created = True
             fh.write(cert_pem)
-    except OSError as exc:
-        # Both files or neither: remove what THIS run wrote, never a file that was already there.
-        # The engine's own unlink rides out a brief Windows hold, such as a scanner on the new key.
-        from messagefoundry.api.tls import _unlink_generated
-
-        reason = (
-            refuse_cert if isinstance(exc, FileExistsError) else f"cannot write {cert_path}: {exc}"
-        )
-        left = []
+    except BaseException as exc:
+        # BaseException, so an interrupt between the two writes still cleans up; it is re-raised.
+        # Remove only what THIS run wrote, never a file that was already there.
+        removed: list[str] = []
+        left: list[str] = []
         for path in (key_path, cert_path) if cert_created else (key_path,):
             try:
                 _unlink_generated(path)
+            except FileNotFoundError:
+                continue  # already gone, so nothing is left to remove
             except OSError:
                 left.append(str(path))
+            else:
+                removed.append(str(path))
+        if not isinstance(exc, OSError):
+            raise
+        reason = (
+            refuse_cert if isinstance(exc, FileExistsError) else f"cannot write {cert_path}: {exc}"
+        )
+        if removed:
+            reason += f"; removed {', '.join(removed)}, which this run wrote"
         if left:
             reason += f"; could not remove {', '.join(left)}, so remove it before running again"
-        else:
-            reason += f"; removed the {key_path} this run wrote, so nothing was left behind"
         return _cert_fail(reason, as_json=args.json)
 
     names = list(dict.fromkeys([args.cn, *sans]))
@@ -7863,7 +7873,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 return ("audit-refused", user.username, str(exc))
             try:
                 await store.set_user_notify_email(user.id, email=address)
-            except BaseException as exc:
+            except OSError as exc:
                 # The row above now records a change that did not happen, so say so in the log too.
                 # Whatever the failure was (BACKLOG #1983), Ctrl-C included: the compensating row
                 # must not depend on this command recognising the error, since a missed class
@@ -8221,7 +8231,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                     expected_enrolled_at=target.enrolled_at,
                     audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
                 )
-            except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised
+            except OSError as exc:  # noqa: BLE001 - read back, then refused or re-raised
                 # Any error may follow the commit, Ctrl-C included, so every one is read back.
                 # Only a store refusal that the re-read confirms becomes a refusal; anything else
                 # is re-raised, after the re-read has said whether the swap landed.
@@ -8258,7 +8268,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     failure: BaseException | None = None
     try:
         refused = run_guarded(run())
-    except BaseException as exc:  # noqa: BLE001 - re-raised below unless the swap may have landed
+    except OSError as exc:  # noqa: BLE001 - re-raised below unless the swap may have landed
         if not (swapped or unknown):
             # Before the swap, but after the key was shown: nothing written, and the new entry
             # in the app has no seed behind it, so the hint goes with every store failure here.
@@ -8332,7 +8342,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     try:
         report["holder_notice"] = run_guarded(notice())
-    except BaseException as exc:  # noqa: BLE001 - best effort, after the commit; the swap stands
+    except OSError as exc:  # noqa: BLE001 - best effort, after the commit; the swap stands
         # Ctrl-C on a slow relay included: the report below must still say the seed was replaced.
         # The class only, as AuthService._notify_security logs it: the text could name the address.
         print(

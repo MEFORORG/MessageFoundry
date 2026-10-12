@@ -10,6 +10,7 @@ the env-only passphrase, and that a bad/missing password never leaks into the er
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import errno
 import json
@@ -845,7 +846,34 @@ def test_a_failed_cert_write_leaves_neither_file(
     assert rc == 2
     error = json.loads(capsys.readouterr().out)["error"]
     assert "No space left on device" in error
-    assert "nothing was left behind" in error
+    assert f"removed {out / 'key.pem'}, {out / 'cert.pem'}, which this run wrote" in error
+    assert "could not remove" not in error
+    assert list(out.iterdir()) == []
+
+
+def test_an_interrupted_cert_write_still_removes_the_new_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt is not an OSError. Between the two writes it must still remove the key this run
+    wrote, then propagate, or the orphan key makes every later run refuse.
+
+    Mutation: narrow the cleanup back to `except OSError`. Red: key.pem is still there."""
+
+    class _HandleInterruptedMidWrite(_HandleThatDiesMidWrite):
+        def write(self, _data: bytes) -> int:
+            raise KeyboardInterrupt
+
+    real_open = Path.open
+
+    def _open(self: Path, *a: Any, **k: Any) -> Any:
+        handle = real_open(self, *a, **k)
+        return _HandleInterruptedMidWrite(handle) if self.name == "cert.pem" else handle
+
+    monkeypatch.setattr(Path, "open", _open)
+    out = tmp_path / "o"
+
+    with contextlib.suppress(KeyboardInterrupt):  # run_cli may turn it into an exit code instead
+        main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
     assert list(out.iterdir()) == []
 
 
@@ -870,7 +898,9 @@ def test_a_cert_that_appears_after_the_check_is_kept_and_the_new_key_removed(
 
     rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
     assert rc == 2
-    assert "refusing to overwrite" in json.loads(capsys.readouterr().out)["error"]
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "refusing to overwrite" in error
+    assert f"removed {out / 'key.pem'}, which this run wrote" in error
     assert (out / "cert.pem").read_bytes() == b"ANOTHER-WRITERS-CERT\n"
     assert not (out / "key.pem").exists()
 
