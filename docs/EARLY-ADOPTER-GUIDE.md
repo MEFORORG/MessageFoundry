@@ -712,7 +712,7 @@ incumbent's outcomes for the same messages.
 partner / one low-volume interface).
 
 **Prereqs:** switch to **Postgres (single-node)** if you need a server DB; **encryption on**
-(`require_encryption=true`); **alerts wired** and **monitoring in place** (§12); **backups automated**;
+(a store key set, and `require_encryption=true` so the audited opt-out cannot lift the refusal); **alerts wired** and **monitoring in place** (§12); **backups automated**;
 **upgrade + rollback runbook validated on staging** (§13).
 
 **Exit criteria (→ Stage 3):**

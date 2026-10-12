@@ -289,7 +289,7 @@ So: **server TLS required** (the gate enforces it), **mTLS opt-in per partner**,
 |---|---|---|---|
 | `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (bind mount, Docker config/secret-as-file, or k8s Secret mounted as a volume) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, restrict perms, never bake into an image layer. |
 | `tls_key_password` (API + MLLP) | secret | API: env `MEFOR_API_TLS_KEY_PASSWORD`. MLLP: per-connection `tls_key_password=env(...)` | Decrypts an encrypted private key. The API key uses the env var; an encrypted **MLLP** key uses the per-connection `tls_key_password` (env-sourced) — see §7. |
-| Store cipher key | secret | container env / secret → `MEFOR_STORE_ENCRYPTION_KEY` (base64 32-byte) | The engine **fails closed** by default if the key is absent. Set `[store].require_encryption = true` so the audited opt-out (`[security].allow_unencrypted_phi`) cannot start it keyless either. Mint with `messagefoundry gen-key`. |
+| Store cipher key | secret | container env / secret → `MEFOR_STORE_ENCRYPTION_KEY` (base64 32-byte) | The engine **fails closed** by default if the key is absent. Set `[store].require_encryption = true` so the audited opt-out (`[security].allow_unencrypted_phi`) cannot start it keyless either ([PHI.md](PHI.md) §3). Mint with `messagefoundry gen-key`. |
 | DB password / `tls_client_ca_file` etc. | secret / file | env (`MEFOR_STORE_PASSWORD`) / mounted file | Prefer the orchestrator's secret store over plain `-e` where possible. |
 
 **Prefer secret stores over plain env** for the passwords/keys (Docker/K8s secrets surface as files
@@ -345,7 +345,8 @@ The console stays a **host-side process**; only its target URL changes.
   WAL/SHM files. Enable the at-rest cipher: set `MEFOR_STORE_ENCRYPTION_KEY`. An instance already
   **refuses to start** without a key by default (fail-closed). Also set
   `[store].require_encryption = true`, so the audited opt-out (`[security].allow_unencrypted_phi`)
-  cannot start it keyless either. Back up and restrict the volume like any PHI-at-rest store.
+  cannot start it keyless either ([PHI.md](PHI.md) §3 has the full rule). Back up and restrict the
+  volume like any PHI-at-rest store.
 - **External SQL Server / Postgres store.** The store connection is TLS by default
   (`[store].encrypt = true`, `[store].trust_server_certificate = false`). **`MEFOR_ALLOW_INSECURE_TLS`
   must NOT be set in a real deployment** — it is the single switch that downgrades store TLS (and

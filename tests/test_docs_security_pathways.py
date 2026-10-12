@@ -3038,6 +3038,10 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
     acknowledged = settings_module.SecuritySettings(
         allow_unencrypted_phi_under_strict_enforcement=True
     )
+    assert (
+        settings_module.keyless_opt_out_refusal(opted_out, settings_module.SecuritySettings())
+        == settings_module.KEYLESS_REFUSED_BY_NO_STRICT_ACK
+    ), "the opt-out alone lifts the keyless refusal under `enforce` now; restate docs/PHI.md §3."
     assert settings_module.keyless_opt_out_refusal(opted_out, acknowledged) is None, (
         "the audited opt-out no longer lifts the keyless refusal; restate the guide's and "
         "docs/CONTAINER-EXPOSURE-EVALUATION.md's `require_encryption` sentences."
@@ -3086,15 +3090,20 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
 #: `[store].require_encryption`, and not `[security].require_encryption_for_remote`.
 _REQUIRE_ENCRYPTION = re.compile(r"require_encryption(?!_for_remote)")
 
-#: A keyless start being refused, in the words a doc gives it.
+#: A keyless start being refused, or encryption being made to happen, in the words a doc gives
+#: it. "without a restart" is not among them: only a key can be the thing that is missing.
 _KEYLESS_REFUSAL = re.compile(
-    r"\brefus|\bfail\w*[ -]closed\b|\bkeyless\b|\bunencrypted\b|\bwithout\b|\bno key\b"
-    r"|\babsent\b|\bmissing\b",
+    r"\brefus|\bfail\w*[ -]closed\b|\bkeyless\b|\bunencrypted\b|\bcleartext\b|\bplaintext\b"
+    r"|\bwithout (?:it|one|(?:a |an |the |its )?(?:\w+ )?key)\b|\b(?:no|empty) key\b"
+    r"|\babsent\b|\bmissing\b|\bmandatory\b|(?:\b(?:not|cannot)|n't) start\b"
+    r"|\bencryption (?:is )?on\b",
     re.IGNORECASE,
 )
 
-#: The audited opt-out, by its key or by that word.
-_KEYLESS_OPT_OUT = re.compile(r"allow_unencrypted_phi|\bopt-out\b", re.IGNORECASE)
+#: The audited opt-out, by either key that sets it or by that word.
+_KEYLESS_OPT_OUT = re.compile(
+    r"allow_unencrypted_phi|encrypt_stored_data|\bopt-out\b", re.IGNORECASE
+)
 
 
 def _clauses_and_rows(text: str) -> list[str]:
@@ -3129,28 +3138,47 @@ def _credits_require_encryption_with_the_refusal(units: list[str]) -> list[str]:
     ]
 
 
-_SIGN_IN = r"(?:auth|authentication|sign-?in)"
+#: The first guard's whole pattern, kept as it was. It clears no clause for a denial, so nothing
+#: that guard caught passes now.
+_AUTH_DISABLED = re.compile(r"\bauth(?:entication)? (?:is )?disabled\b", re.IGNORECASE)
+
+#: The noun spellings. "sign in" with a space is left out: it is also the verb, and "sign in off
+#: the corporate network" is not the claim.
+_SIGN_IN = r"(?:auth|authentication|sign-?in|log-?in)"
 
 #: One sign-in leg can be off, so a leg's name ahead of the subject is not the claim.
-_SIGN_IN_LEGS = ("Kerberos", "Windows", "OIDC", "SSO", "directory", "password", "passkey")
+_SIGN_IN_LEGS = (
+    "Kerberos",
+    "Windows",
+    "OIDC",
+    "SSO",
+    "AD",
+    "LDAP",
+    "directory",
+    "federated",
+    "local",
+    "password",
+    "passkey",
+    "intake",
+)
 
 #: Sign-in described as something that can be off: "auth disabled", "sign-in is optional",
-#: "authentication can be switched off", "auth is enabled by default", "disable auth", "turn off
-#: auth", "without auth", "with no auth", "no-auth". Only "is", "can", "be", "turned" and
-#: "switched" may stand between the subject and its state, so a denial there ("sign-in cannot be
+#: "authentication may be switched off", "auth is not required", "auth is enabled by default",
+#: "disable auth", "turn off auth", "without auth", "with no auth", "no-auth". Only the words
+#: listed may stand between the subject and its state, so a denial there ("sign-in cannot be
 #: turned off") does not match at all. "off-loopback" and "off-box" are not the state.
-_NOT_ONE_LEG = "".join(rf"(?<!{leg} )" for leg in _SIGN_IN_LEGS)
+_NOT_ONE_LEG = "".join(rf"(?<!\b{leg} )" for leg in _SIGN_IN_LEGS)
 _SIGN_IN_OFF = re.compile(
     rf"\b{_NOT_ONE_LEG}{_SIGN_IN}\b"
-    r"(?: (?:is|can|be|turned|switched)){0,3} "
-    r"(?:disabled|optional|off(?![-\w])|(?:enabled|on) by default)"
+    r"(?: (?:is|can|may|be|currently|turned|switched)){0,3} "
+    r"(?:disabled|optional|opt-in|off(?![-\w])|not (?:required|needed)|(?:enabled|on) by default)"
     rf"|\b(?:disabl\w+|turn\w* off|switch\w* off) (?:the |any )?{_SIGN_IN}\b"
     rf"|\b(?:without|with no) {_SIGN_IN}\b"
     r"|\bno-auth\b",
     re.IGNORECASE,
 )
 
-#: A denial ahead of the phrase: "no flag turns sign-in off", "no bind runs without sign-in".
+#: A denial just ahead of the phrase: "no flag turns sign-in off", "no bind runs without sign-in".
 _DENIED_BEFORE = re.compile(r"\b(?:no|not|never|cannot|nothing)\b|n't\b", re.IGNORECASE)
 
 
@@ -3160,15 +3188,20 @@ def _says_sign_in_can_be_off(clauses: list[str]) -> list[str]:
     The retired claim is that auth can be disabled. `serve` always requires sign-in, and the load
     refuses both keys that once turned it off (the second-round probe). The first guard went red
     on "auth disabled" and "auth is disabled" only, and a reworded return passed it (vault BACKLOG
-    #2993, item 6).
+    #2993, item 6). That pattern still reds by itself.
 
-    A denial word anywhere ahead of the phrase clears the clause, so a return of the claim behind
-    an unrelated "no" or "not" still passes. A true sentence about one account, such as "that
-    account's sign-in is disabled", trips it: that is loud, and rewording the sentence clears it."""
+    A denial clears a rewording only from inside the same stretch of the clause, back to the last
+    comma, colon or bracket. So a return of the claim behind a "no" or "not" in that stretch still
+    passes. A true sentence can trip it, at least "that account's sign-in is disabled" and "a
+    request without authentication is answered 401": that is loud, and rewording clears it."""
     return [
         c
         for c in clauses
-        if any(not _DENIED_BEFORE.search(c[: m.start()]) for m in _SIGN_IN_OFF.finditer(c))
+        if _AUTH_DISABLED.search(c)
+        or any(
+            not _DENIED_BEFORE.search(re.split(r"[,:(]", c[: m.start()])[-1])
+            for m in _SIGN_IN_OFF.finditer(c)
+        )
     ]
 
 
@@ -3182,12 +3215,19 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "Set `[store].require_encryption = true` so the engine fails closed if the key is absent.",
         "Turn on `require_encryption` to make a keyless start fail-closed.",
         "| `MEFOR_STORE_REQUIRE_ENCRYPTION` | `[store].require_encryption` | refuse to start keyless |",
+        "encryption on (`require_encryption=true`);",
+        "Set `[store].require_encryption = true` to make encryption mandatory.",
+        "Set `require_encryption` so the engine will not start with an empty key.",
+        "Set `require_encryption` so a PHI instance cannot start in cleartext.",
     ]
     assert _credits_require_encryption_with_the_refusal(credited) == credited
     corrected = [
         "Also set `[store].require_encryption = true`, so the audited opt-out "
         "(`[security].allow_unencrypted_phi`) cannot start it unencrypted either.",
-        "encryption on (`require_encryption=true`);",
+        "encryption on (a store key set, and `require_encryption=true` so the audited opt-out "
+        "cannot lift the refusal);",
+        "`require_encryption` keeps the refusal even past `[security].encrypt_stored_data = false`.",
+        "`require_encryption` can be changed without a restart.",
         "`[security].require_encryption_for_remote = false` is refused under `enforce`.",
         "The engine already refuses to start without one by default.",
     ]
@@ -3199,12 +3239,21 @@ def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() ->
         "If you disable auth, the bind is refused.",
         "If you turn off authentication, the bind is refused.",
         "Sign-in is optional on a loopback bind.",
+        "Login is optional on a loopback bind.",
         "A dev box can run without auth.",
         "Use the no-auth mode for a first look.",
         "Run with no auth on a dev box.",
-        "Authentication can be switched off for a loopback bind.",
+        "Authentication may be switched off for a loopback bind.",
+        "Auth is currently disabled.",
+        "Auth is not required on loopback.",
+        "Authentication is opt-in.",
         "Auth is enabled by default, and the engine creates no account on its own.",
         "The console prompts for sign-in (authentication is on by default).",
+        # A denial in an earlier stretch of the clause is about something else.
+        "`--allow-insecure-bind` does not relax this: with sign-in off, the bind is refused.",
+        "TLS is not needed on loopback, where sign-in is optional.",
+        # The first guard's own phrase reds whatever stands ahead of it.
+        "TLS is not needed where auth is disabled.",
     ]
     assert _says_sign_in_can_be_off(off) == off
     denied = [
@@ -3285,7 +3334,7 @@ def test_the_guide_points_at_section_2_for_the_deidentification_framework_only_i
     built = guide[built_start : guide.index("\n### ", built_start + 1)]
     # An empty table reads as "not listed", which is the strict side, so it needs no floor.
     listed = any(
-        re.search(r"de-identification", row[0], re.IGNORECASE)
+        re.search(r"de-identification|anonymi[sz]", row[0], re.IGNORECASE)
         for table in _tables(built)
         for row in table
     )
@@ -3987,7 +4036,8 @@ def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
             assert token in p, f"docs/PHI.md's built-controls paragraph must name {token}"
         # The paragraph's own "documented per deployment" pointer names no `forward_*`, so the
         # clause scan below does not read it (vault BACKLOG #2993, item 3).
-        assert not re.search(r"§11|#11-hardening", p), (
+        # "§11" alone, so a citation such as "ASVS §11.7" in this paragraph is not the pointer.
+        assert not re.search(r"§11(?![.\d])|#11-hardening", p), (
             "docs/PHI.md's built-controls paragraph sends the reader to section 11, the roadmap, "
             "again. DEPLOYMENT.md documents each control, and section 7 documents forwarding."
         )
