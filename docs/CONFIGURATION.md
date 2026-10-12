@@ -1439,27 +1439,40 @@ same rules for a proxy in front of the engine's API are in
 
 #### `serve` names an environment proxy at start
 
-**A web proxy from `http_proxy` or `https_proxy`, in either case, or the Windows system proxy
-settings reaches at least these hops with no engine setting** (BACKLOG #1125):
+**A web proxy from the environment or the system settings reaches at least these hops with no
+engine setting** (BACKLOG #1125). The sources include at least `http_proxy`, `https_proxy` and
+`all_proxy`, in either case, and the Windows or macOS system proxy settings.
 
-- each HTTP-family connection, and its OAuth2 or SMART token request, wherever no explicit
-  `proxy_url` applies to the host. That is no proxy set at all, `proxy_url = "default"`, or a host
-  that `proxy_no_proxy` bypasses;
-- the alert webhook, the OIDC sign-in requests and the AI broker, which have no proxy setting;
-- the Vault and OpenBao clients (see `[secrets]`), which also honour `all_proxy`. They have no
-  loopback rule, so an `https://` Vault on a loopback address goes through the proxy too.
+- Each HTTP-family connection, and its OAuth2 or SMART token request, follows an `http` or `https`
+  proxy wherever no explicit `proxy_url` applies to the host. That is no proxy set at all,
+  `proxy_url = "default"`, or a host that `proxy_no_proxy` bypasses.
+- The alert webhook, the OIDC sign-in requests and the AI broker follow the same proxies. They
+  have no proxy setting of their own.
+- The Vault and OpenBao clients (see `[secrets]`) follow an `https` or `all` proxy to an `https://`
+  Vault. An `http` proxy alone carries no Vault hop, and an `http://` Vault behind any proxy is
+  refused. They have no loopback rule, so an `https://` Vault on a loopback address is proxied too.
 
-So `serve` and `supervise` each log one WARNING at start when such a proxy is set, or `all_proxy`
-alone, or a system proxy on macOS; under `supervise`, every engine shard logs its own. The WARNING
-names each proxy's scheme, host and port, never a user or password from its URL, and lists those
-hops. With no proxy set, or a `NO_PROXY` of exactly `*`, it logs nothing. The urllib hops dial a
-loopback host direct, and a host on `NO_PROXY` or the system bypass list goes direct. A proxy URL
-that carries credentials and is not `https://` is refused on each request instead
-([CONNECTIONS.md](CONNECTIONS.md)). Other commands that reach these hops, such as
-`check-privileges` and `verify`, do not log this warning. To stop the proxy, clear `http_proxy`, `https_proxy` and `all_proxy`, in
-either case, and the system proxy, for the account the engine runs as. The HTTP family can name its
-proxy instead, through an address in `[egress].proxy_url` or a connection's `proxy_url`; the other
-hops have no such setting. The operator API client and the tray ignore the environment proxy.
+So `serve` and `supervise` each log one WARNING at start when such a proxy is set. Under
+`supervise`, every engine shard logs its own. The WARNING names each proxy's scheme, host and port,
+never a user or password from its URL. It lists only the hops above that can use that proxy. With
+no proxy set, or a `NO_PROXY` of exactly `*`, it logs nothing. Other commands that reach these
+hops, such as `check-privileges` and `verify`, do not log this warning.
+
+The urllib hops, which are every hop above except Vault, dial a loopback host direct. A host on
+`NO_PROXY` or the system bypass list goes direct too. A proxy URL that carries credentials and is
+not `https://` is refused on each request ([CONNECTIONS.md](CONNECTIONS.md)).
+
+**The scheme the WARNING names is not a TLS leg to the proxy for the urllib hops.** For an `https`
+target, they reach any proxy over plain TCP, even one written `https://`. They send `CONNECT`, and
+any credential from the proxy URL, in cleartext. Only an `http` target, with no `https` proxy set,
+gets a TLS leg to an `https://` proxy. The Vault clients do open TLS to an `https://` proxy (see
+`[secrets]`).
+
+To stop the proxy, clear `http_proxy`, `https_proxy` and `all_proxy`, in either case, and the
+system proxy, for the account the engine runs as. An address in `[egress].proxy_url` or a
+connection's `proxy_url` names a proxy for the HTTP family only. The other hops keep the
+environment proxy, and the WARNING still logs, because it reads only the environment. The operator
+API client and the tray ignore the environment proxy.
 
 ### `[shadow]`
 Parallel-run / **shadow-instance** egress suppression (#15). A *shadow* MessageFoundry processes real

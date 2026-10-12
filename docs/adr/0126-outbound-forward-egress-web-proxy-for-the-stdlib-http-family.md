@@ -275,7 +275,10 @@ silently, or must be disclosed. This ADR's proxy is of the last two kinds.
   openers reading the environment, for the reason it gives. So the ruling's other branch applies:
   `serve` and `supervise` each log one WARNING at start naming the proxy's host and port and at
   least the hops that use it (`transports/ambient_proxy.py`, `tests/test_ambient_proxy_disclosure.py`).
-  The Vault clients read the same environment through `requests`, so the warning lists them too.
+  The Vault clients read the same environment through `requests`, so the warning lists them too
+  when an `https` or `all` proxy can carry an `https://` Vault. The warning does not let the
+  proxy's scheme read as a TLS leg. For an `https` target, the urllib hops send `CONNECT` to any
+  proxy in cleartext, even one written `https://`.
 
 ## Deviations from the phase doc
 
