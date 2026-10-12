@@ -123,8 +123,7 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
     - a number that is not whole is refused, of any numeric type, so ``0.5``, ``1.9``,
       ``Decimal("1.9")`` and ``Fraction(19, 10)`` all fail rather than truncate;
     - an infinity or a NaN is refused;
-    - text is read by ``int()``, so ``" 7 "`` and ``"+5"`` pass and ``"1e3"`` and ``"2048.0"`` fail.
-      A zero written as ``"0.0"`` reads as 0, so it can still mean "off" to a caller;
+    - text is read by ``int()``, so ``" 7 "`` and ``"+5"`` pass and ``"1e3"`` and ``"2048.0"`` fail;
     - anything else is refused, whatever ``int()`` would have made of it.
 
     Zero and negatives come back as they are. What a zero means, and whether a negative is a typo, is
@@ -139,10 +138,6 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
             return int(value)
         except ValueError:
             reason = "text must be a whole number in digits"
-        # An uncast env() reference hands over text, and "0.0" is a way of writing zero.
-        with contextlib.suppress(ValueError):
-            if float(value) == 0:
-                return 0
     elif isinstance(value, numbers.Integral):
         return operator.index(value)
     elif isinstance(value, numbers.Number):
@@ -183,9 +178,8 @@ def cap_setting[NumT: (int, float)](
 
     **An ``int`` cap is read by :func:`count_setting`, and only its exact zero is "off".** That
     refuses a bool and every fraction, so nothing truncates to zero: a ``max_connections_per_host`` of
-    ``-0.5`` cannot silently disable a security cap the caller's guard is supposed to refuse. A
-    ``float`` cap is any other ``kind``; its zero test reads a ``float`` view, so ``"0.0"`` and ``-0.0``
-    are off too.
+    ``-0.5`` cannot silently disable a security cap the caller's guard is supposed to refuse. Text
+    that spells zero, such as ``"0.0"``, is off on either kind of cap, and so is a float ``-0.0``.
 
     A negative value is returned as-is, for the callers that refuse one at build with a message naming
     their own key; :func:`positive_cap` is that caller for most sites. It is a different mistake with a
@@ -194,7 +188,11 @@ def cap_setting[NumT: (int, float)](
     """
     if value is None or value == "":
         return None
-    if kind is not float:
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            if float(value) == 0:  # at least "0", " 0 ", "0.0" and "-0.0"
+                return None
+    if kind is int:
         count = count_setting(value, knob=knob, transport=transport)
         return None if count == 0 else count
     try:

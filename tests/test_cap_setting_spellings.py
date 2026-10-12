@@ -151,6 +151,7 @@ def test_a_string_zero_disables_the_cap_exactly_as_a_number_zero_does(
     cap of zero and only that site's case reds, which is why this is parametrized per setting."""
     assert getattr(build({key: 0}), attr) is None
     assert getattr(build({key: "0"}), attr) is None, f"{key}='0' became a live cap of zero"
+    assert getattr(build({key: "0.0"}), attr) is None, f"{key}='0.0' is zero written as text"
     assert getattr(build({key: None}), attr) is None
     assert getattr(build({key: ""}), attr) is None
     # The control: the same key really is read into that attribute when it is a live value.
