@@ -283,7 +283,8 @@ def _build_raw(
 ) -> DestinationConnector:
     """Build ``cell`` from its factory's settings plus raw ``extra`` keys, so a credential the factory
     does not take (a static header, a digest pair) reaches the connector as a hand-built spec would."""
-    ctype, factory, https_url = _HTTPS[cell]
+    spec: tuple[Any, Any, str] = _HTTPS[cell]
+    ctype, factory, https_url = spec
     settings = {**factory(url=url or https_url).settings, **extra}
     return build_destination(
         Destination(
@@ -444,7 +445,8 @@ def test_an_explicit_none_verify_tls_verifies(cell: str, monkeypatch: pytest.Mon
     from messagefoundry.transports.rest import opener_tls_context
 
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    ctype, factory, url = _HTTPS[cell]
+    spec: tuple[Any, Any, str] = _HTTPS[cell]
+    ctype, factory, url = spec
     settings = {**factory(url=url).settings, "verify_tls": None}
     with active_hop_posture(_PROD):
         conn = build_destination(
