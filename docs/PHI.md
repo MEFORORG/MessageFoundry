@@ -55,7 +55,7 @@ logs, and its network controls stay its own. Built is not the same as on. API mT
 named per hop, for example `[logging].forward_tls_crl_file`. Log forwarding starts once `[logging].forward_host` names a
 collector, and under the default `[security].enforcement = enforce`, `serve` refuses to start without
 forwarding over verified TLS. Each is documented per deployment — see
-[DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
+[DEPLOYMENT.md](DEPLOYMENT.md), and [§7](#7-logging--phi-redaction) for log forwarding.
 MFA is not among them. The engine's own second factor (`[security].require_mfa`, on by default)
 applies on any bind, with one way to meet it outside the engine. While `[auth].oidc_require_mfa_claim`
 is on, the default, the engine checks the identity provider's token for an accepted MFA claim. An OIDC

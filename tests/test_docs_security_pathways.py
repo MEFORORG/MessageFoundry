@@ -2872,9 +2872,14 @@ def test_the_twelfth_sweep_user_guide_offers_no_provider_choice() -> None:
     start = guide.index("### Opening and signing in to the console")
     signing_in = guide[start : guide.index("\n### ", start + 1)]
     # The section must still hold steps to read, or the scan below clears a heading and no more.
+    # The floor was 8 against 18 clauses, read on 2026-10-12, and a fair shortening of the section
+    # could cross it for a reason unrelated to provider choice (vault BACKLOG #2993, item 7). It
+    # is 4 now. The scan reads every clause whatever the count, so the floor only has to tell
+    # steps from a bare heading or a stub that points elsewhere. The link check at the end of this
+    # test is what holds the content: it reds when the section stops naming the form's links.
     steps = _clauses(signing_in)
-    assert len(steps) >= 8, (
-        f"docs/USER-GUIDE.md's sign-in section cut into {len(steps)} clause(s), floor 8: the "
+    assert len(steps) >= 4, (
+        f"docs/USER-GUIDE.md's sign-in section cut into {len(steps)} clause(s), floor 4: the "
         "provider-choice scan reads too little to clear it."
     )
     # A choice on the form, worded with or without the word "provider": a choosing word, or the
@@ -3029,13 +3034,43 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
         )
         == settings_module.KEYLESS_REFUSED_BY_NO_OPT_OUT
     ), "a keyless store opens by default now; the guide says encryption is required by default."
+    #    `[store].require_encryption` does not create that refusal. It keeps it when the audited
+    #    opt-out, with its second acknowledgment under `enforce`, would otherwise lift it.
+    opted_out = settings_module.StoreSettings(allow_unencrypted_phi=True)
+    acknowledged = settings_module.SecuritySettings(
+        allow_unencrypted_phi_under_strict_enforcement=True
+    )
+    assert settings_module.keyless_opt_out_refusal(opted_out, acknowledged) is None, (
+        "the audited opt-out no longer lifts the keyless refusal; restate the guide's and "
+        "docs/CONTAINER-EXPOSURE-EVALUATION.md's `require_encryption` sentences."
+    )
+    assert (
+        settings_module.keyless_opt_out_refusal(
+            opted_out.model_copy(update={"require_encryption": True}), acknowledged
+        )
+        == settings_module.KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION
+    ), (
+        "`[store].require_encryption` no longer wins over the opt-out; the same sentences say it does."
+    )
     # 4. Raw TCP and X12 take no TLS setting, so they are the remaining transport gap. Both
     #    signatures are read into one list, floored above what either holds alone today, so a
     #    factory cut down to ``**settings`` cannot pass by showing no names to scan.
+    signatures = {factory.__name__: inspect.signature(factory) for factory in (Tcp, X12)}
+    # The joint floor of 30 alone would pass a factory cut down to ``**settings`` once the other
+    # held 30 names by itself (vault BACKLOG #2993, item 8). So each factory has a floor of its
+    # own. It is 10 because Tcp() showed 22 names and X12() 19 on 2026-10-12, and a factory
+    # reduced to ``**settings`` shows one: 10 tells the two apart and leaves room for a trim.
+    for factory_name, signature in signatures.items():
+        assert len(signature.parameters) >= 10, (
+            f"{factory_name}() shows {len(signature.parameters)} parameter(s), floor 10: the TLS "
+            "scan reads too little of it to clear it."
+        )
+    # The joint floor stays. The absence lint (tests/test_vacuous_absence_assert_lint.py) counts
+    # only a guard at the test's top level on the list the scan walks, and the loop above is not one.
     parameters = [
-        (factory.__name__, name)
-        for factory in (Tcp, X12)
-        for name in inspect.signature(factory).parameters
+        (factory_name, name)
+        for factory_name, signature in signatures.items()
+        for name in signature.parameters
     ]
     assert len(parameters) >= 30, (
         f"Tcp() and X12() show {len(parameters)} parameter(s) between them, floor 30: the TLS scan "
@@ -3054,12 +3089,156 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
         )
 
 
+#: `[store].require_encryption`, and not `[security].require_encryption_for_remote`.
+_REQUIRE_ENCRYPTION = re.compile(r"require_encryption(?!_for_remote)")
+
+#: A keyless start being refused, in the words a doc gives it.
+_KEYLESS_REFUSAL = re.compile(
+    r"\brefus|\bfail\w*[ -]closed\b|\bkeyless\b|\bunencrypted\b|\bwithout\b|\bno key\b"
+    r"|\babsent\b|\bmissing\b",
+    re.IGNORECASE,
+)
+
+#: The audited opt-out, by its key or by that word.
+_KEYLESS_OPT_OUT = re.compile(r"allow_unencrypted_phi|\bopt-out\b", re.IGNORECASE)
+
+
+def _clauses_and_rows(text: str) -> list[str]:
+    """``_clauses(text)``, then each table row whole.
+
+    A clause is cut at the cell bars. So a row that names its subject in one cell and says what it
+    does in another shows the pair only as a row."""
+    rows = [
+        _flat(line).replace("*", "") for line in text.splitlines() if line.lstrip().startswith("|")
+    ]
+    return _clauses(text) + rows
+
+
+def _credits_require_encryption_with_the_refusal(units: list[str]) -> list[str]:
+    """The clauses or rows that put `[store].require_encryption` beside the keyless refusal and
+    leave the audited opt-out out.
+
+    The retired claim is that setting the key is what makes a keyless start refuse. A keyless start
+    is refused by default, and the key only keeps that refusal when the opt-out would lift it (the
+    second-round probe pins both). So a unit that names the key beside the refusal must name the
+    opt-out too. The first guard went red on one phrase, "so the engine refuses to start
+    unencrypted", and a reworded return passed it (vault BACKLOG #2993, item 6).
+
+    It reads one unit at a time. A return of the claim that also names the opt-out in the same
+    unit still passes."""
+    return [
+        u
+        for u in units
+        if _REQUIRE_ENCRYPTION.search(u)
+        and _KEYLESS_REFUSAL.search(u)
+        and not _KEYLESS_OPT_OUT.search(u)
+    ]
+
+
+_SIGN_IN = r"(?:auth|authentication|sign-?in|log-?in)"
+
+#: One sign-in leg can be off, so a leg's name ahead of the subject is not the claim.
+_NOT_ONE_LEG = "".join(
+    rf"(?<!{leg} )"
+    for leg in ("Kerberos", "Windows", "OIDC", "SSO", "directory", "password", "passkey")
+)
+
+#: The words that may stand between the subject and its state. A denial is not among them, so
+#: "sign-in cannot be turned off" and "auth is never optional" do not match at all.
+_STATE_VERBS = r"(?: (?:is|are|was|be|been|can|may|stays?|left|kept|set|turned|switched)){0,3}"
+
+#: Sign-in described as something that can be off: "auth disabled", "sign-in is optional",
+#: "authentication can be turned off", "auth is enabled by default", "disable auth", "without
+#: auth", "with no auth", "no-auth". Not "arms no sign-in lock" or "without auth-surface pacing":
+#: there the subject is the first half of another noun.
+_SIGN_IN_OFF = re.compile(
+    rf"{_NOT_ONE_LEG}\b{_SIGN_IN}\b{_STATE_VERBS} "
+    r"(?:disabled|optional|off(?![-\w])|(?:enabled|on) by default)"
+    r"|\b(?:disabl\w+|turn\w*(?: \w+)? off|switch\w*(?: \w+)? off)[ -](?:the |any )?"
+    rf"{_SIGN_IN}\b"
+    rf"|\b(?:without|with no) {_SIGN_IN}\b(?!-\w)"
+    r"|\bno-(?:auth|authentication)\b",
+    re.IGNORECASE,
+)
+
+#: A denial ahead of the phrase: "no flag turns sign-in off", "no bind runs without sign-in".
+_DENIED_BEFORE = re.compile(r"\b(?:no|not|never|cannot|nothing)\b|n't\b", re.IGNORECASE)
+
+
+def _says_sign_in_can_be_off(clauses: list[str]) -> list[str]:
+    """The clauses that describe sign-in as off, or as a default, without denying it.
+
+    The retired claim is that auth can be disabled. `serve` always requires sign-in, and the load
+    refuses both keys that once turned it off (the second-round probe). The first guard went red
+    on "auth disabled" and "auth is disabled" only, and a reworded return passed it (vault BACKLOG
+    #2993, item 6).
+
+    A denial word anywhere ahead of the phrase clears the clause, so a return of the claim behind
+    an unrelated "no" or "not" still passes. A true sentence about one account, such as "that
+    account's sign-in is disabled", trips it: that is loud, and rewording the sentence clears it."""
+    return [
+        c
+        for c in clauses
+        if any(not _DENIED_BEFORE.search(c[: m.start()]) for m in _SIGN_IN_OFF.finditer(c))
+    ]
+
+
+def test_the_widened_twelfth_sweep_guards_read_the_claim_and_not_one_phrase() -> None:
+    """Both helpers above go red on the retired sentence and on rewordings of it, and stay green
+    on the corrected sentences. A guard that only its own retired phrase can trip is what vault
+    BACKLOG #2993 item 6 reported."""
+    credited = [
+        "set `[store].require_encryption = true` so the engine refuses to start unencrypted.",
+        "`require_encryption=true` refuses start without a key;",
+        "Set `[store].require_encryption = true` so the engine fails closed if the key is absent.",
+        "Turn on `require_encryption` to make a keyless start fail-closed.",
+        "| `MEFOR_STORE_REQUIRE_ENCRYPTION` | `[store].require_encryption` | refuse to start keyless |",
+    ]
+    assert _credits_require_encryption_with_the_refusal(credited) == credited
+    corrected = [
+        "Also set `[store].require_encryption = true`, so the audited opt-out "
+        "(`[security].allow_unencrypted_phi`) cannot start it unencrypted either.",
+        "encryption on (`require_encryption=true`);",
+        "`[security].require_encryption_for_remote = false` is refused under `enforce`.",
+        "The engine already refuses to start without one by default.",
+    ]
+    assert _credits_require_encryption_with_the_refusal(corrected) == []
+
+    off = [
+        "(With auth disabled, a non-loopback bind is refused unconditionally.)",
+        "With authentication turned off, a non-loopback bind is refused.",
+        "If you disable auth, the bind is refused.",
+        "Sign-in is optional on a loopback bind.",
+        "A dev box can run without auth.",
+        "Use the no-auth mode for a first look.",
+        "Run with no auth on a dev box.",
+        "Authentication can be turned off for a loopback bind.",
+        "Auth is enabled by default, and the engine creates no account on its own.",
+    ]
+    assert _says_sign_in_can_be_off(off) == off
+    denied = [
+        "(`serve` always requires sign-in;",
+        "there is no switch that turns it off.)",
+        "No bind runs without sign-in, whatever `--allow-insecure-bind` says.",
+        "It stays fail-closed, and no flag turns sign-in off.",
+        "Sign-in cannot be turned off.",
+        "Auth is never optional.",
+        "Kerberos sign-in is off unless configured.",
+        "Wrong passwords arm no sign-in lock.",
+        "Sign-in is always required, and the engine creates no account on its own.",
+        "`intake_auth` defaults to `none`, so the listener checks no credential.",
+        "Off-box log forwarding needs a collector on another host.",
+    ]
+    assert _says_sign_in_can_be_off(denied) == []
+
+
 def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_default() -> None:
     """The guide named off-box log shipping as the remaining transport gap (raw TCP and X12 are at
     least two), called at-rest encryption opt-in twice and told the reader to set
     `require_encryption` to get the keyless refusal (a keyless store is refused by default), and
     said auth can be disabled (`serve` always requires sign-in)."""
-    clauses = _clauses(_doc("docs/EARLY-ADOPTER-GUIDE.md"))
+    guide = _doc("docs/EARLY-ADOPTER-GUIDE.md")
+    clauses = _clauses(guide)
     assert len(clauses) >= 300, (
         f"docs/EARLY-ADOPTER-GUIDE.md cut into {len(clauses)} clause(s), floor 300: the opt-in and "
         "auth-disabled scans read too little to clear it."
@@ -3076,14 +3255,77 @@ def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_def
     ]
     assert not opt_in, f"the guide calls at-rest encryption opt-in again: {opt_in}"
     # The require_encryption step must not be the thing that creates the keyless refusal.
-    require = [c for c in clauses if "require_encryption" in c]
-    assert require and not any(
-        "so the engine refuses to start unencrypted" in c for c in require
-    ), f"the guide says require_encryption creates the keyless refusal again: {require}"
-    disabled = [
-        c for c in clauses if re.search(r"\bauth(?:entication)? (?:is )?disabled\b", c, re.I)
+    require = [u for u in _clauses_and_rows(guide) if _REQUIRE_ENCRYPTION.search(u)]
+    assert require, "the guide no longer names `require_encryption`, so this check reads nothing"
+    credited = _credits_require_encryption_with_the_refusal(require)
+    assert not credited, (
+        f"the guide says require_encryption creates the keyless refusal again: {credited}. A "
+        "keyless start is refused by default; the key keeps that refusal past the audited opt-out."
+    )
+    disabled = _says_sign_in_can_be_off(clauses)
+    assert not disabled, (
+        f"the guide says auth can be turned off again: {disabled}. `serve` always requires sign-in."
+    )
+
+
+def test_the_container_evaluation_does_not_credit_require_encryption_with_the_refusal() -> None:
+    """docs/CONTAINER-EXPOSURE-EVALUATION.md said three times that setting
+    `[store].require_encryption` is what makes a keyless start refuse. Engine PR 2015 retired that
+    claim from the early-adopter guide and no guard read this file for it (vault BACKLOG #2993,
+    item 5)."""
+    units = _clauses_and_rows(_doc("docs/CONTAINER-EXPOSURE-EVALUATION.md"))
+    assert len(units) >= 150, (
+        f"docs/CONTAINER-EXPOSURE-EVALUATION.md cut into {len(units)} clause(s) and row(s), floor "
+        "150: the require_encryption scan reads too little to clear it."
+    )
+    require = [u for u in units if _REQUIRE_ENCRYPTION.search(u)]
+    assert require, (
+        "docs/CONTAINER-EXPOSURE-EVALUATION.md no longer names `require_encryption`, so this check "
+        "reads nothing"
+    )
+    credited = _credits_require_encryption_with_the_refusal(require)
+    assert not credited, (
+        "docs/CONTAINER-EXPOSURE-EVALUATION.md says require_encryption creates the keyless refusal "
+        f"again: {credited}. A keyless start is refused by default; the key keeps that refusal past "
+        "the audited opt-out."
+    )
+
+
+def test_the_guide_points_at_section_2_for_the_deidentification_framework_only_if_listed() -> None:
+    """Section 1 of docs/EARLY-ADOPTER-GUIDE.md said the HL7 v2 de-identification framework is
+    "built too (§2)". Section 2 names the framework only inside a not-built row,
+    "De-identification on the AI-assist path", so the pointer sent a reader to a not-built row for
+    a built feature (vault BACKLOG #2993, item 4). A pointer to section 2 is right only while that
+    section's built table lists the framework."""
+    guide = _doc("docs/EARLY-ADOPTER-GUIDE.md")
+    start = guide.index("\n## 2. ")
+    end = guide.index("\n## 3. ", start)
+    built_start = guide.index("### Built and production-ready", start, end)
+    built = guide[built_start : guide.index("\n### ", built_start + 1, end)]
+    labels = [
+        line.strip().strip("|").split("|")[0]
+        for line in built.splitlines()
+        if line.lstrip().startswith("|")
     ]
-    assert not disabled, f"the guide says auth can be disabled again: {disabled}"
+    assert len(labels) >= 5, (
+        f"the guide's built table shows {len(labels)} row(s), floor 5: this reads too little of it "
+        "to say what it lists."
+    )
+    listed = any(re.search(r"de-identification", label, re.IGNORECASE) for label in labels)
+    about = [
+        c
+        for c in _clauses(guide[:start] + guide[end:])
+        if re.search(r"de-identification framework", c, re.IGNORECASE)
+    ]
+    assert about, (
+        "the guide no longer names the de-identification framework outside section 2, so this "
+        "check reads nothing"
+    )
+    pointed = [c for c in about if "§2" in c]
+    assert listed or not pointed, (
+        f"the guide points at §2 for the de-identification framework: {pointed}. Section 2's built "
+        "table does not list it; docs/PHI.md section 9 documents it."
+    )
 
 
 def test_the_twelfth_sweep_phi_does_not_delegate_built_controls() -> None:
@@ -3769,6 +4011,13 @@ def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
             "`[logging].forward_tls_crl_file`",
         ):
             assert token in p, f"docs/PHI.md's built-controls paragraph must name {token}"
+        # The paragraph's own "documented per deployment" pointer went to section 11 too, after
+        # the threat-table row was corrected (vault BACKLOG #2993, item 3). Its clause does not
+        # name `forward_*`, so the clause scan below never read it.
+        assert not re.search(r"§11|#11-hardening", p), (
+            "docs/PHI.md's built-controls paragraph sends the reader to section 11, the roadmap, "
+            "again. DEPLOYMENT.md documents each control, and section 7 documents forwarding."
+        )
     clauses = _clauses(doc)
     assert len(clauses) >= 1000, f"docs/PHI.md cut into {len(clauses)} clause(s), floor 1000"
     # _clauses strips emphasis asterisks, so `forward_*` reads as `forward_` here.

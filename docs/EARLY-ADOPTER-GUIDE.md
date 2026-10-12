@@ -58,8 +58,9 @@ operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 and who are comfortable validating a pre-1.0 tool against their own traffic before trusting it. A single
 engine node on a trusted network is the simplest pilot; **native TLS** (API + MLLP) and an opt-in
 **active-passive failover** cluster on a shared server-DB store (PostgreSQL or SQL Server) are both built when you need them (see
-§2/§6/§14). Native MFA (TOTP and passkeys), off-box log forwarding and the HL7 v2 de-identification
-framework are built too (§2). What is genuinely *not* there yet is listed in §2 — track those items
+§2/§6/§14). Native MFA (TOTP and passkeys) and off-box log forwarding are built too (§2). So is the
+HL7 v2 de-identification framework ([PHI.md §9](PHI.md#9-de-identification)).
+What is genuinely *not* there yet is listed in §2 — track those items
 and pilot the parts that are ready. (Horizontal *active-active*
 scale-out was dropped and is not a planned milestone; active-passive HA is the supported HA model.)
 
@@ -330,7 +331,7 @@ engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by na
 
 ### 4.5 Provision the first administrator
 
-Auth is **enabled by default**, and **the engine creates no account on its own**. Until you create the
+Sign-in is **always required**, and **the engine creates no account on its own**. Until you create the
 first Administrator, nobody can manage the engine. At the shipped posture a start with no Administrator
 is refused. If a start goes ahead without one, a Windows sign-in (Kerberos), where configured, can
 still create a directory account, but that account holds no role. Create the
