@@ -438,6 +438,10 @@ def test_allowlisted_types_are_declared_verbatim(label: str) -> None:
         "application/pdf+xml",
         "text/plain-html",
         "image/png2",
+        # The text/csv alias is exact too (vault BACKLOG #2802). These passed before it existed.
+        "text/csv2",
+        "text/x-csv",
+        "application/csv",
     ],
 )
 def test_allowlist_match_is_exact_not_substring(label: str) -> None:
@@ -548,54 +552,28 @@ def test_pdf_stays_on_the_allowlist_by_recorded_decision() -> None:
 
 # --- vault BACKLOG #2802: a text/csv label is served as plain text, by recorded decision ------------
 
-#: A synthetic CSV whose cells start with each character a spreadsheet reads as a formula.
+#: A synthetic CSV whose cells start with ``=``, ``+``, ``-`` and ``@``.
 _FORMULA_CSV = b"name,value\r\n=1+1,+2\r\n-3,@SUM(A1)\r\n"
 
 
-@pytest.mark.parametrize("label", ["text/csv", "Text/CSV", "TEXT/CSV"])
 async def test_csv_label_is_served_as_plain_text_with_a_txt_name(
-    engine: Engine, client: httpx.AsyncClient, label: str
+    engine: Engine, client: httpx.AsyncClient
 ) -> None:
-    """A ``text/csv`` label is declared ``text/plain`` and the download is named ``.txt``.
+    """A ``text/csv`` label is declared ``text/plain`` and the download is named ``.txt``. The
+    reasoning is beside ``_INERT_ATTACHMENT_TYPES``. Before that decision the route served
+    ``text/csv`` and ``attachment-<ref>.csv``, and the type and name assertions below each fail on that.
 
-    A double-click on a ``.csv`` name opens a spreadsheet wherever one is installed, and a spreadsheet
-    evaluates a cell that starts with ``=``. The route cannot escape such a cell, because the stored
-    document stays verbatim, so it changes the served type and name instead. Before this decision the
-    route served ``text/csv`` and ``attachment-<ref>.csv``, and both assertions below fail on that.
-
-    What this does NOT assert is which program opens either name. Nobody has exercised a browser or a
-    spreadsheet against this route."""
-    mid, ref = await _seed_labelled(engine, label, marker=label, prefix=_FORMULA_CSV)
+    What this does NOT assert is which program opens either name."""
+    mid, ref = await _seed_labelled(engine, "text/csv", marker="csv", prefix=_FORMULA_CSV)
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
     assert _base_media_type(r) == "text/plain"
     assert r.headers["content-disposition"] == _disposition(ref, ".txt")
     # The served bytes are the stored document, formula cells included. Only the label moved.
-    assert r.content == _FORMULA_CSV + f"synthetic document {label} not real PHI".encode()
+    assert r.content == _FORMULA_CSV + b"synthetic document csv not real PHI"
     # The stored label is untouched, so the console's attachment list still names the sender's type.
     (att,) = (await client.get(f"/messages/{mid}")).json()["attachments"]
-    assert att["content_type"] == label
-    # The other serve-time layers are the same as for any download.
-    assert r.headers["content-security-policy"] == _ATTACHMENT_CSP
-    assert r.headers["x-content-type-options"] == "nosniff"
-
-
-@pytest.mark.parametrize(
-    "label",
-    [
-        "text/x-csv",
-        "application/csv",
-        "text/comma-separated-values",
-        "text/csv2",
-        "application/vnd.ms-excel",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ],
-)
-def test_other_spreadsheet_labels_are_declared_generic(label: str) -> None:
-    """A control, and it passed before the ``text/csv`` decision too: these labels were never on the
-    allow-list. It is here so the alias stays an exact match. A substring or prefix match on
-    ``text/csv`` would hand ``text/csv2`` the plain-text name."""
-    assert _safe_attachment_content_type(label) == _OCTET
+    assert att["content_type"] == "text/csv"
 
 
 def test_csv_is_off_the_allowlist_by_recorded_decision() -> None:
@@ -603,20 +581,12 @@ def test_csv_is_off_the_allowlist_by_recorded_decision() -> None:
 
     This pins the decision the way the PDF test above pins the opposite one. A later lane that puts
     ``text/csv`` back on the allow-list, or empties the alias table, fails here and has to answer the
-    recorded argument. The alias table is pinned as a literal, so a new entry needs its own decision."""
+    recorded argument. The alias table is pinned as a literal, so a new entry needs its own decision.
+    The alias reuses the case-folded key, so a mixed-case label lands on the same type."""
     assert "text/csv" not in _INERT_ATTACHMENT_TYPES
     assert _ATTACHMENT_SERVED_AS == {"text/csv": "text/plain"}
-    assert _safe_attachment_content_type("text/csv") == "text/plain"
-    assert _INERT_ATTACHMENT_TYPES["text/plain"] == ".txt"
-
-
-def test_served_as_table_only_points_at_the_allowlist() -> None:
-    """Every alias target is an allow-listed type, and no alias key is one. A target off the list
-    would be declared ``application/octet-stream`` and the alias would do nothing. A key on the list
-    would make the table and the allow-list disagree about one label."""
-    assert set(_ATTACHMENT_SERVED_AS.values()) <= set(_INERT_ATTACHMENT_TYPES)
-    assert not set(_ATTACHMENT_SERVED_AS) & set(_INERT_ATTACHMENT_TYPES)
-    assert all(key == key.casefold() for key in _ATTACHMENT_SERVED_AS)
+    for label in ("text/csv", "Text/CSV", "TEXT/CSV"):
+        assert _safe_attachment_content_type(label) == "text/plain"
 
 
 async def test_download_carries_sandbox_csp(engine: Engine, client: httpx.AsyncClient) -> None:

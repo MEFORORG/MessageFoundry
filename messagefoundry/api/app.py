@@ -2162,20 +2162,17 @@ _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 #: stored document must stay verbatim.
 #:
 #: Like the PDF case, this is a local-open risk and the application origin is not reached. CSV still
-#: gets the other answer, because the PDF reasons do not carry over.
+#: gets the other answer, because PDF reasons 2 and 3 do not carry over.
 #:
-#: 1. PDF reason 2 says the file extension decides what opens a saved file. This route writes that
-#:    extension. A PDF cannot be read without a PDF viewer, so the operator supplies ``.pdf`` whatever
-#:    the route served. A CSV is plain text. Under ``.txt`` it opens in a text editor, which evaluates
-#:    nothing, and the operator can read it there with no rename.
-#: 2. A host with a spreadsheet installed usually opens ``.csv`` in it, and evaluating cells is what
-#:    a spreadsheet does with the file. So the ``.csv`` name would send the document to the one
-#:    program that runs its content.
-#: 3. PDF reason 3 calls a serve-time MIME choice the wrong instrument. That holds for a type the
-#:    operator must open in its own viewer. Here the served name decides the default handler, so it
-#:    is the right instrument for the double-click. The decision rests on the name. The declared
-#:    type moves with it so the two agree.
-#: 4. The cost is small. The stored bytes and the stored label are untouched, and the console's
+#: 1. PDF reason 2 says the file extension decides what opens a saved file, and this route writes
+#:    that extension. A host with a spreadsheet installed usually opens ``.csv`` in it. So the
+#:    ``.csv`` name would send the document to the one program that runs its content.
+#: 2. A PDF cannot be read without a PDF viewer, so the operator supplies ``.pdf`` whatever the route
+#:    served, and that is why PDF reason 3 calls a serve-time choice the wrong instrument. A CSV is
+#:    plain text. Under ``.txt`` it opens in a text editor, which evaluates nothing, and the operator
+#:    can read it there with no rename. The decision rests on the name. The declared type moves
+#:    with it so the two agree.
+#: 3. The cost is small. The stored bytes and the stored label are untouched, and the console's
 #:    attachment list still shows ``text/csv``.
 #:
 #: This narrows the default open only. An operator who renames the file to ``.csv``, or imports it
