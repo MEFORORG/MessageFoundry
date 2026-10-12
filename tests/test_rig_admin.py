@@ -243,6 +243,37 @@ def test_an_answer_past_the_reply_cap_is_refused_and_one_at_it_is_read_whole(
         rigadmin._call("GET", f"{base}/stats", cacert=None)
 
 
+@pytest.mark.parametrize("status", [200, 401])
+def test_a_stated_length_past_the_cap_is_refused_before_any_of_the_answer_is_read(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """An engine that states an over-cap length and then sends nothing is refused for size at once,
+    on the success path and the HTTP-error path. Counting alone would wait out the read timeout
+    and report an engine that did not answer, not the limit."""
+    monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 1_000)
+    monkeypatch.setattr(rigadmin, "_HTTP_TIMEOUT_S", 2.0)
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        server.settimeout(10.0)
+        done = threading.Event()
+
+        def headers_only() -> None:
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(f"HTTP/1.1 {status} X\r\nContent-Length: 5000\r\n\r\n".encode())
+                done.wait(10.0)
+
+        peer = threading.Thread(target=headers_only, daemon=True)
+        peer.start()
+        base = f"http://127.0.0.1:{server.getsockname()[1]}"
+        try:
+            with pytest.raises(rigadmin.RigReplyRefused, match="states a length"):
+                rigadmin._call("GET", f"{base}/stats", cacert=None)
+        finally:
+            done.set()
+            peer.join(10.0)
+
+
 @pytest.mark.parametrize("states_length", [True, False], ids=["stated", "unstated"])
 def test_a_sign_in_answer_past_the_reply_cap_reads_as_no_answer(
     monkeypatch: pytest.MonkeyPatch, states_length: bool
