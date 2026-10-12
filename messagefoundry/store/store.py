@@ -136,6 +136,7 @@ from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.row_seal import (
     PASSKEYS_LABEL,
+    SEAL_PREFIX,
     SESSION_KIND,
     USER_KIND,
     RowSealer,
@@ -1681,19 +1682,40 @@ class AdminRemoval(StrEnum):
         return self is not AdminRemoval.SET_ROLES or admin_role_id not in role_ids
 
 
-#: The last-administrator guard's read (vault BACKLOG #2779): among enabled accounts holding the
-#: role, how many are the target and how many are not. Binds: user id, user id, role id. The ids
-#: are compared in SQL rather than in Python so the guard matches ids exactly as the write's
+#: The last-administrator guard's read (vault BACKLOG #2779): every enabled account holding the
+#: role, each with a flag for whether it is the target. Binds: user id, role id. The ids are
+#: compared in SQL rather than in Python so the guard matches ids exactly as the write's
 #: ``WHERE id=?`` does, under the database's own collation. SQL Server runs it as is; Postgres
 #: carries a ``$n``/boolean twin. One more copy of "enabled administrator" beside the service's
 #: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
-#: in all.
-_SQL_ADMIN_GUARD_COUNTS = (
-    "SELECT COALESCE(SUM(CASE WHEN u.id = ? THEN 1 ELSE 0 END), 0),"
-    " COALESCE(SUM(CASE WHEN u.id <> ? THEN 1 ELSE 0 END), 0)"
+#: in all. Since BACKLOG #2592 the other holders are counted only when their record passes its
+#: integrity seal (:func:`admin_guard_counts`), as the service's enumerations count them.
+_SQL_ADMIN_GUARD_HOLDERS = (
+    "SELECT u.id, CASE WHEN u.id = ? THEN 1 ELSE 0 END"
     " FROM users u JOIN user_roles r ON r.user_id = u.id"
     " WHERE r.role_id = ? AND u.disabled = 0"
 )
+
+
+async def admin_guard_counts(
+    holders: Iterable[tuple[str, bool]],
+    sealer: RowSealer | None,
+    read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
+) -> tuple[int, int]:
+    """``(target, others)`` for the last-administrator guard from :data:`_SQL_ADMIN_GUARD_HOLDERS`'
+    rows (BACKLOG #2592). Another holder counts only when its record passes its seal, read with
+    ``read_record`` inside the guard's transaction: a refused administrator can sign nobody in, so
+    counting it would let the last usable administrator be removed."""
+    target = others = 0
+    for holder_id, is_target in holders:
+        if is_target:
+            target += 1
+            continue
+        record = await read_record(holder_id)
+        if record is not None and user_seal_ok(sealer, record):
+            others += 1
+    return target, others
+
 
 #: The session sweep a bind and an unbind each run inside their own transaction. A revoke blanks
 #: the seal (BACKLOG #2592): that needs no key, and a revoked row then fails its seal even with
@@ -2074,11 +2096,6 @@ class WebAuthnCredential:
 USER_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
     {
         "authz_seal": "the seal itself",
-        "totp_secret": (  # nosec B105 -- a column name and the reason it is left out, no secret
-            "re-encrypted in place by the key-rotation and legacy-encryption passes, which hold no"
-            " user seal; its own AES-GCM tag binds it to this row's id under a key the database does"
-            " not hold, and the seal covers whether it is set (totp_secret_set)"
-        ),
     }
 )
 
@@ -2244,13 +2261,12 @@ class UserAuthzRecord:
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
         """The ``(name, value)`` pairs a user seal covers: every :class:`UserRow` field not in
-        :data:`USER_SEAL_EXCLUDED`, whether a TOTP secret is set, then the role rows, counted."""
+        :data:`USER_SEAL_EXCLUDED`, then the role rows, counted."""
         out: list[tuple[str, object]] = [
             (f.name, getattr(self.row, f.name))
             for f in _dc_fields(self.row)
             if f.name not in USER_SEAL_EXCLUDED
         ]
-        out.append(("totp_secret_set", self.row.totp_secret is not None))
         out.append(("roles", len(self.roles)))
         for grant in self.roles:
             out.extend(
@@ -2743,6 +2759,39 @@ def report_unsealed_users(count: int) -> None:
             " provision-admin' under a new username, then recreate or remove these accounts",
             count,
         )
+
+
+def rotation_reseal(
+    sealer: RowSealer, active_prefix: str, reencrypt: Callable[[str, bytes], str]
+) -> UserChange:
+    """``rotate-key``'s change to one user record (BACKLOG #2592): the TOTP secret re-encrypted under
+    the active key when it is not already, and the record re-sealed under the active key. The seal
+    covers the secret's bytes, so the generic re-encrypt loops leave ``users.totp_secret`` to this
+    pass, which re-encrypts it and re-seals in one write after the old seal has been checked.
+    ``None`` (nothing written) for a record already sealed under the active key over an active-key
+    secret."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        secret = r.row.totp_secret
+        stale = bool(secret) and not str(secret).startswith(active_prefix)
+        if not stale and sealer.is_active(r.row.authz_seal):
+            return None
+        if not stale:
+            return r
+        aad = cell_aad("users", "totp_secret", r.row.id)
+        return r.changed(totp_secret=reencrypt(str(secret), aad))
+
+    return apply
+
+
+def report_refused_role_holder() -> None:
+    """Log a holder of a custom role being deleted whose record fails its integrity seal (BACKLOG
+    #2592). Its role row is deleted with the role, which needs no key, and nothing is re-sealed; the
+    account was already refused on every read, and reported there."""
+    log.warning(
+        "a holder of a deleted custom role failed its integrity seal; its role row was removed"
+        " and nothing was re-sealed (BACKLOG #2592)"
+    )
 
 
 def report_user_reseal(resealed: int, refused: int) -> None:
@@ -7406,6 +7455,10 @@ class MessageStore:
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
+                if table == "users":
+                    # BACKLOG #2592: the user seal covers the secret's bytes, so it is re-encrypted
+                    # with its seal by reseal_user_records, after this pass.
+                    continue
                 while True:
                     # Anything not already under the active key (plaintext or a retired-key blob),
                     # excluding NULL/blank. Rewritten rows match active_like next round, so this ends.
@@ -13401,21 +13454,34 @@ class MessageStore:
         """Re-seal every user record under the active key (BACKLOG #2592), for ``rotate-key``.
 
         A record sealed under a retired key verifies until that key is dropped; this moves it to the
-        active key first, so dropping the retired key locks nobody out. A record that fails its seal
-        is left exactly as it is and counted. Returns ``(re-sealed, refused)``."""
+        active key first, so dropping the retired key locks nobody out. The account's TOTP secret is
+        re-encrypted here too, in the same write (:func:`rotation_reseal` says why). A record that
+        fails its seal is left exactly as it is and counted. Returns ``(re-sealed, refused)``."""
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
+        # A sealer exists only for a cipher that holds its keys in-process, which is AesGcmCipher.
+        cipher = cast("AesGcmCipher", self._cipher)
+        change = rotation_reseal(
+            sealer,
+            cipher.active_marker_prefix,
+            lambda stored, aad: self._reencrypt_value(cipher, stored, aad),
+        )
         async with self._read() as db:
-            cur = await db.execute("SELECT id FROM users WHERE authz_seal <> '' ORDER BY id")
+            # Only records the pass has work on: sealed under another key, or over a TOTP secret not
+            # yet under the active key. The change re-checks both, so this filter only saves work.
+            cur = await db.execute(
+                "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE ?"
+                " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE ?))"
+                " ORDER BY id",
+                (f"{SEAL_PREFIX}{sealer.key_id}:%", f"{cipher.active_marker_prefix}%"),
+            )
             ids = [str(r["id"]) for r in await cur.fetchall()]
         resealed = refused = 0
         for user_id in ids:
             try:
                 async with _writer_guard(self._db, self._lock):
-                    written = await self._write_user(
-                        user_id, lambda r: None if sealer.is_active(r.row.authz_seal) else r
-                    )
+                    written = await self._write_user(user_id, change)
                     await self._commit()
             except RowSealError:
                 refused += 1
@@ -13868,10 +13934,11 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             if change.takes_role(admin_role_id, role_ids):
-                cur = await self._db.execute(
-                    _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                target, others = await admin_guard_counts(
+                    holders, self._row_sealer, self._read_user_record
                 )
-                target, others = await cur.fetchone() or (0, 0)
                 if target and not others:
                     await self._db.rollback()
                     return False
@@ -14026,8 +14093,10 @@ class MessageStore:
                 "SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)
             )
             for holder in [str(r["user_id"]) for r in await cur.fetchall()]:
-                with suppress(RowSealError):
+                try:
                     await self._write_user(holder, without_role(role_id))
+                except RowSealError:
+                    report_refused_role_holder()
             await self._db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))

@@ -104,7 +104,7 @@ async def test_the_record_round_trips_unchanged_on_sqlite(
 
 def test_the_columns_a_user_seal_leaves_out_are_pinned() -> None:
     # A change here is a decision about what a writer may alter unseen; it needs a reason beside it.
-    assert dict(USER_SEAL_EXCLUDED).keys() == {"authz_seal", "totp_secret"}
+    assert dict(USER_SEAL_EXCLUDED).keys() == {"authz_seal"}
     assert dict(PASSKEY_DIGEST_EXCLUDED).keys() == {"sign_count", "last_used_at"}
     assert all(USER_SEAL_EXCLUDED.values()) and all(PASSKEY_DIGEST_EXCLUDED.values())
 
@@ -114,8 +114,9 @@ def test_a_user_seal_covers_every_other_field_by_default() -> None:
     covered = [name for name, _ in UserAuthzRecord(row=row).seal_fields()]
     expected = [f.name for f in fields(UserRow) if f.name not in USER_SEAL_EXCLUDED]
     assert covered[: len(expected)] == expected
-    # Then whether a TOTP secret is set, and the role rows, counted.
-    assert covered[len(expected) :] == ["totp_secret_set", "roles"]
+    # Then the role rows, counted.
+    assert "totp_secret" in covered
+    assert covered[len(expected) :] == ["roles"]
 
 
 def _sample(annotation: object) -> Any:
@@ -180,6 +181,7 @@ async def test_a_key_rotation_reseals_every_account_under_the_active_key(tmp_pat
         await AuthService(store, AuthSettings()).initialize()  # the built-in roles
         await _user(store, "u")
         await store.set_user_roles("u", [Role.VIEWER.value])
+        await store.set_totp_secret("u", secret="JBSWY3DPEHPK3PXP")
     finally:
         await store.close()
 
@@ -208,8 +210,39 @@ async def test_a_key_rotation_reseals_every_account_under_the_active_key(tmp_pat
     try:
         loaded = await AuthService(dropped, AuthSettings())._load_user("u")
         assert loaded is not None and loaded.role_ids == (Role.VIEWER.value,)
+        # The secret was re-encrypted with the seal, so it still opens without the old key.
+        assert await dropped.get_totp_secret("u") == "JBSWY3DPEHPK3PXP"
     finally:
         await dropped.close()
+
+
+async def test_the_last_administrator_guard_counts_only_sealed_administrators(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """The store's last-administrator backstop counts another administrator only when its record
+    passes its seal, as the service's own enumerations do; the control is the same removal with
+    the other administrator intact."""
+    from messagefoundry.store.store import AdminRemoval
+
+    store, path = keyed
+    await AuthService(store, AuthSettings()).initialize()
+    for name in ("a", "b"):
+        await _user(store, name)
+        await store.set_user_roles(name, [Role.ADMINISTRATOR.value])
+
+    async def removable(target: str) -> bool:
+        return await store.remove_unless_last_admin(
+            target,
+            AdminRemoval.SET_ROLES,
+            admin_role_id=Role.ADMINISTRATOR.value,
+            role_ids=[Role.VIEWER.value],
+        )
+
+    await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", "b"))
+    assert not await removable("a")  # b is refused, so a is the last usable administrator
+    await _user(store, "c")
+    await store.set_user_roles("c", [Role.ADMINISTRATOR.value])
+    assert await removable("a")  # control: c is a sealed administrator
 
 
 async def test_a_row_written_before_the_seal_is_refused_and_named_at_open(

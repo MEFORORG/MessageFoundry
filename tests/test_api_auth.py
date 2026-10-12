@@ -181,6 +181,29 @@ async def test_unauthenticated_is_rejected_but_health_is_open(engine: Engine) ->
         assert (await c.get("/connections")).status_code == 401
 
 
+async def test_a_write_the_store_refuses_for_a_failing_seal_answers_409(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2592: a store refusal over a record that fails its integrity seal reaches the
+    caller as a 409 with a fixed text, never a 500 and never the row. The control is the same
+    request answering 200 before the refusal is planted."""
+    from messagefoundry.store.row_seal import RowSealError
+
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "viewer")).json()["token"]
+        assert (await c.get("/me/sessions", headers=_auth(token))).status_code == 200
+
+        async def refused(_user_id: str) -> list[Any]:
+            raise RowSealError("user")
+
+        monkeypatch.setattr(service, "list_sessions", refused)
+        r = await c.get("/me/sessions", headers=_auth(token))
+        assert r.status_code == 409
+        assert "integrity check" in r.json()["detail"]
+
+
 async def test_security_events_feed_lists_callers_auth_events(engine: Engine) -> None:
     # WP-L3-05 (ASVS 6.3.5/6.3.7): /me/security-events surfaces the caller's own audited auth.* events.
     service = await _service(engine)

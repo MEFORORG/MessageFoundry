@@ -209,12 +209,18 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     assert rotated_identity is not None
     assert (await h.service.reauth(rotated_identity, chosen, token=rotated_token)).ok
 
-    # --- the TOTP secret: whether one is set is sealed; its own cipher binds its bytes ---------
+    # --- the TOTP secret's stored bytes are sealed: an earlier value put back is refused ------
     enrolled = await h.account("enrolled")
     await store.set_totp_secret(enrolled, secret="JBSWY3DPEHPK3PXP")
-    assert await h.service._load_user(enrolled) is not None  # control
-    await raw("UPDATE users SET totp_secret=NULL WHERE id=?", (enrolled,))
+    earlier = (await _record(store, enrolled)).row.totp_secret
+    await store.set_totp_secret(enrolled, secret="AAAAAAAAAAAAAAAA")
+    assert await h.service._load_user(enrolled) is not None  # control: the store's own write
+    await raw("UPDATE users SET totp_secret=? WHERE id=?", (earlier, enrolled))
     assert await h.service._load_user(enrolled) is None
+    cleared = await h.account("cleared")
+    await store.set_totp_secret(cleared, secret="JBSWY3DPEHPK3PXP")
+    await raw("UPDATE users SET totp_secret=NULL WHERE id=?", (cleared,))
+    assert await h.service._load_user(cleared) is None
 
     # --- a passkey row inserted outside the store fails the account's passkeys ----------------
     keyed = await h.account("keyed")
@@ -265,9 +271,9 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     assert await h.service._verified_passkeys(counted_user) is not None
     # Clearing every passkey needs no check, so an administrator's reset still clears a bad set.
     assert await store.delete_all_webauthn_credentials(keyed) == 2
-    cleared = await h.service._load_user(keyed)
-    assert cleared is not None and not cleared.has_passkeys
-    assert await h.service._verified_passkeys(cleared) == []
+    reset = await h.service._load_user(keyed)
+    assert reset is not None and not reset.has_passkeys
+    assert await h.service._verified_passkeys(reset) == []
 
     # --- the write helper refuses a record whose seal fails, and does not re-seal it ----------
     bent = await h.account("bent")

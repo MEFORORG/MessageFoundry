@@ -123,7 +123,13 @@ from messagefoundry.store.privilege import (
     classify_audit_writes,
     sqlserver_excess,
 )
-from messagefoundry.store.row_seal import SESSION_KIND, USER_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import (
+    SEAL_PREFIX,
+    SESSION_KIND,
+    USER_KIND,
+    RowSealer,
+    RowSealError,
+)
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -137,7 +143,7 @@ from messagefoundry.store.store import (
     _SESSION_INSERT,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
-    _SQL_ADMIN_GUARD_COUNTS,
+    _SQL_ADMIN_GUARD_HOLDERS,
     _USER_ROLE_INSERT,
     _USER_ROLES_CLEAR,
     _WEBAUTHN_INSERT,
@@ -207,6 +213,7 @@ from messagefoundry.store.store import (
     _session_cap_groups,
     _session_live_params,
     _transit_attestation_row,
+    admin_guard_counts,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -232,10 +239,12 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    report_refused_role_holder,
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
     roll_audit_key_range,
+    rotation_reseal,
     scope_if_source,
     scope_withdrawal,
     seal_session,
@@ -7519,7 +7528,7 @@ class SqlServerStore:
         for table, column in (
             ("messages", "raw"),
             ("queue", "payload"),
-            ("users", "totp_secret"),
+            # users.totp_secret is re-encrypted with its seal by reseal_user_records (BACKLOG #2592).
             ("messages", "summary"),
             ("messages", "metadata"),
             ("messages", "error"),
@@ -11927,11 +11936,17 @@ class SqlServerStore:
         columns = [c[0] for c in cur.description]
         return [dict(zip(columns, row, strict=True)) for row in await cur.fetchall()]
 
-    async def _read_user_record(self, cur: Any, user_id: str) -> UserAuthzRecord | None:
+    async def _read_user_record(
+        self, cur: Any, user_id: str, *, lock: bool = True
+    ) -> UserAuthzRecord | None:
         """The account's whole authorization record, read on ``cur`` inside an open transaction with
         the account row held under ``UPDLOCK, ROWLOCK``, so the compare on the seal is a second
-        guard and not the only one (BACKLOG #2592)."""
-        await cur.execute("SELECT * FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
+        guard and not the only one (BACKLOG #2592). ``lock=False`` reads it unlocked, for a check
+        that writes nothing."""
+        if lock:
+            await cur.execute("SELECT * FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
+        else:
+            await cur.execute("SELECT * FROM users WHERE id=?", (user_id,))
         rows = await self._fetch_dicts(cur)
         if not rows:
             return None
@@ -11964,7 +11979,6 @@ class SqlServerStore:
             for grant in updated.roles:
                 await cur.execute(
                     _USER_ROLE_INSERT,
-                    _USER_ROLES_CLEAR,
                     (current.row.id, grant.role_id, grant.assigned_at, grant.assigned_by),
                 )
         return updated
@@ -12053,13 +12067,21 @@ class SqlServerStore:
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
-        rows = await self._fetchall("SELECT id FROM users WHERE authz_seal <> '' ORDER BY id")
+        cipher = self._cipher
+        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+            return 0, 0
+        change = rotation_reseal(sealer, cipher.active_marker_prefix, self._reencrypt_value)
+        # Only records the pass has work on; store.py's reseal_user_records says why.
+        rows = await self._fetchall(
+            "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE ?"
+            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE ?))"
+            " ORDER BY id",
+            (f"{SEAL_PREFIX}{sealer.key_id}:%", f"{cipher.active_marker_prefix}%"),
+        )
         resealed = refused = 0
         for row in rows:
             try:
-                written = await self._write_user_txn(
-                    str(row["id"]), lambda r: None if sealer.is_active(r.row.authz_seal) else r
-                )
+                written = await self._write_user_txn(str(row["id"]), change)
             except RowSealError:
                 refused += 1
                 continue
@@ -12450,10 +12472,13 @@ class SqlServerStore:
                         await cur.execute("SELECT TOP (1) id FROM users WHERE id=?", (user_id,))
                         await cur.fetchall()
                         await self._applock(cur, _ADMIN_GUARD_LOCK)
-                        await cur.execute(
-                            _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                        await cur.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                        holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                        target, others = await admin_guard_counts(
+                            holders,
+                            self._row_sealer,
+                            lambda holder: self._read_user_record(cur, holder, lock=False),
                         )
-                        target, others = await cur.fetchone() or (0, 0)
                         if target and not others:
                             await conn.rollback()  # nothing written; releases the applock
                             return False
@@ -12591,7 +12616,12 @@ class SqlServerStore:
         (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
+                # XLOCK (BACKLOG #2592): a concurrent grant of this role reads the row under a shared
+                # lock for its foreign key, so it waits here and then fails the key; no grant can land
+                # between the holder read below and the bulk delete, which would desync its seal.
+                await cur.execute(
+                    "SELECT builtin FROM roles WITH (XLOCK, ROWLOCK) WHERE id=?", (role_id,)
+                )
                 row = await cur.fetchone()
                 if row is None or int(row[0]) != 0:
                     await conn.rollback()
@@ -12604,7 +12634,7 @@ class SqlServerStore:
                     try:
                         await self._write_user(cur, holder, without_role(role_id))
                     except RowSealError:
-                        continue
+                        report_refused_role_holder()
                 await cur.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
                 await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
                 await cur.execute("DELETE FROM roles WHERE id=?", (role_id,))

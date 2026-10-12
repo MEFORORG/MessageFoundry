@@ -144,7 +144,13 @@ from messagefoundry.store.privilege import (
     classify_audit_writes,
     postgres_excess,
 )
-from messagefoundry.store.row_seal import SESSION_KIND, USER_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import (
+    SEAL_PREFIX,
+    SESSION_KIND,
+    USER_KIND,
+    RowSealer,
+    RowSealError,
+)
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -214,6 +220,7 @@ from messagefoundry.store.store import (
     _opt_float,
     _session_cap_groups,
     _transit_attestation_row,
+    admin_guard_counts,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -239,10 +246,12 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    report_refused_role_holder,
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
     roll_audit_key_range,
+    rotation_reseal,
     scope_if_source,
     scope_withdrawal,
     seal_session,
@@ -2841,6 +2850,10 @@ class PostgresStore:
         active_like = f"{cipher.active_marker_prefix}%"
         total = 0
         for table, column in self._CIPHER_COLUMNS:
+            if table == "users":
+                # BACKLOG #2592: re-encrypted with its seal by reseal_user_records; store.py's
+                # rotation_reseal says why.
+                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT id, {column} AS v FROM {table}"
@@ -8067,11 +8080,16 @@ class PostgresStore:
         )
         return [RoleGrant.from_mapping(dict(r)) for r in rows]
 
-    async def _read_user_record(self, conn: Any, user_id: str) -> UserAuthzRecord | None:
+    async def _read_user_record(
+        self, conn: Any, user_id: str, *, lock: bool = True
+    ) -> UserAuthzRecord | None:
         """The account's whole authorization record, read inside ``conn``'s transaction with the
         account row locked, so the compare on the seal is a second guard and not the only one
-        (BACKLOG #2592)."""
-        row = await conn.fetchrow("SELECT * FROM users WHERE id=$1 FOR UPDATE", user_id)
+        (BACKLOG #2592). ``lock=False`` reads it unlocked, for a check that writes nothing."""
+        if lock:
+            row = await conn.fetchrow("SELECT * FROM users WHERE id=$1 FOR UPDATE", user_id)
+        else:
+            row = await conn.fetchrow("SELECT * FROM users WHERE id=$1", user_id)
         if row is None:
             return None
         grants = await conn.fetch(
@@ -8157,13 +8175,26 @@ class PostgresStore:
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
-        rows = await self._fetchall("SELECT id FROM users WHERE authz_seal <> '' ORDER BY id")
+        cipher = self._cipher
+        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+            return 0, 0
+        change = rotation_reseal(
+            sealer,
+            cipher.active_marker_prefix,
+            lambda stored, aad: self._reencrypt_value(cipher, stored, aad),
+        )
+        # Only records the pass has work on; store.py's reseal_user_records says why.
+        rows = await self._fetchall(
+            "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE $1"
+            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE $2))"
+            " ORDER BY id",
+            f"{SEAL_PREFIX}{sealer.key_id}:%",
+            f"{cipher.active_marker_prefix}%",
+        )
         resealed = refused = 0
         for row in rows:
             try:
-                written = await self._write_user_txn(
-                    str(row["id"]), lambda r: None if sealer.is_active(r.row.authz_seal) else r
-                )
+                written = await self._write_user_txn(str(row["id"]), change)
             except RowSealError:
                 refused += 1
                 continue
@@ -8568,14 +8599,18 @@ class PostgresStore:
             if change.takes_role(admin_role_id, role_ids):
                 # Only a change that can empty the set queues on the lock.
                 await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
-                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_COUNTS.
-                target, others = await conn.fetchrow(
-                    "SELECT COALESCE(SUM(CASE WHEN u.id = $1 THEN 1 ELSE 0 END), 0),"
-                    " COALESCE(SUM(CASE WHEN u.id <> $1 THEN 1 ELSE 0 END), 0)"
+                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_HOLDERS (BACKLOG #2592).
+                rows = await conn.fetch(
+                    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
                     " FROM users u JOIN user_roles r ON r.user_id = u.id"
                     " WHERE r.role_id = $2 AND NOT u.disabled",
                     user_id,
                     admin_role_id,
+                )
+                target, others = await admin_guard_counts(
+                    [(str(r["id"]), bool(r["is_target"])) for r in rows],
+                    self._row_sealer,
+                    lambda holder: self._read_user_record(conn, holder, lock=False),
                 )
                 if target and not others:
                     return False  # nothing written; the commit releases the lock
@@ -8706,7 +8741,10 @@ class PostgresStore:
         """Delete a custom (``builtin=FALSE``) role and its user/AD-group assignments in one
         transaction (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
         async with self._timed_acquire() as conn, conn.transaction():
-            row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1", role_id)
+            # FOR UPDATE (BACKLOG #2592): a concurrent grant of this role takes FOR KEY SHARE on the
+            # row for its foreign key, so it waits here and then fails the key; no grant can land
+            # between the holder read below and the bulk delete, which would desync its seal.
+            row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1 FOR UPDATE", role_id)
             if row is None or bool(row["builtin"]):
                 return False
             # BACKLOG #2592: each holder re-sealed without the role; store.py says why a holder
@@ -8716,7 +8754,7 @@ class PostgresStore:
                 try:
                     await self._write_user(conn, holder, without_role(role_id))
                 except RowSealError:
-                    continue
+                    report_refused_role_holder()
             await conn.execute("DELETE FROM user_roles WHERE role_id=$1", role_id)
             await conn.execute("DELETE FROM ad_group_role_map WHERE role_id=$1", role_id)
             await conn.execute("DELETE FROM roles WHERE id=$1", role_id)
