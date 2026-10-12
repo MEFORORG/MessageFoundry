@@ -2005,7 +2005,8 @@ X12/FHIR seams come later.
 
 **A clean result from `anonymize_checked` does not prove the output is PHI-free.** The rule map
 rewrites the fields it names. The leak-check then looks at the output, and it refuses in only
-these cases:
+these cases. A refused rule set and the `require_full_coverage` switch are apart from these, and
+both are described below:
 
 | The leak-check refuses when | Where it looks |
 | --- | --- |
@@ -2015,7 +2016,7 @@ these cases:
 | A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from: the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
+| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
@@ -2026,7 +2027,7 @@ way. The detectors stay narrow on purpose: a broad digit search flags almost eve
 **A shape split across fields by the message's own field separator passes.** The detectors read
 one field at a time, after the message is split on the separator its header declares. Under a
 field separator of `-`, at least the lines `ZZZ-1-123-45-6789` and `ZZZ-1-555-555-0100` would
-pass `anonymize_checked` on both anonymizers: the message itself cuts each value into three
+pass `anonymize_checked` on both anonymizers. The message itself cuts each value into three
 fields. Under `|`, the same two values are refused. With `require_full_coverage` on, such a
 message is refused only because nobody decided the `ZZZ` fields. A `keep` on each of them would
 let it through.
@@ -2261,7 +2262,7 @@ field with no default rule logs nothing. `python -m tee anonymize-captures` also
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
 rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
 the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check counts such a field
-as scrubbed and does not scan what is left, so a clean return does not clear it. `load_rules`
+as scrubbed, and its shape detectors do not scan what is left. So a clean return does not clear it. `load_rules`
 logs one WARNING line for each such field, under the same once-per-set rule as a keep. The line
 names the field, the default kind and the new kind. `python -m tee anonymize-captures` prints
 one `warning:` line that lists them. A retarget to the same kind does not warn, and neither does
@@ -2270,7 +2271,8 @@ a `drop`. Nothing refuses the retarget (vault BACKLOG #3000).
 **The tee checks the salt and reads the overlay once, before it reads the store.** A salt the
 keyer refuses, an overlay it cannot read or parse, or one that breaks the schema, refuses the
 whole run with one `error:` line and writes no dataset. That holds even when the store has no
-captured bodies (vault BACKLOG #3003).
+captured bodies (vault BACKLOG #3003). The keep and retarget `warning:` lines are printed only
+after the store read, so a run on an empty store prints neither.
 
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With

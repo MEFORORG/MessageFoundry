@@ -57,10 +57,11 @@
   `tests/fixtures/anon/batch_18.anon.toml`, which says why neither is a default.
 - **AMENDED 2026-10-12 (vault BACKLOG #3000): what the §2 overlay loader does with a retarget.** A
   retarget of a default path to a different kind loads and is warned about, not refused;
-  `retargeted_defaults` lists them. A different kind can leave part of the field as captured. A
-  schema error from the overlay quotes at most 80 characters of any one key or value, and of the
-  list of unknown keys. **This changes none of the §2 ratified choices:** the overlay still only
-  maps a field to an existing kind. [PHI.md](../PHI.md) §9 is the long form.
+  `retargeted_defaults` lists them. A `drop` blanks the field and does not warn. A different kind
+  can leave part of the field as captured. A schema error from the overlay quotes at most 80
+  characters of any one key or value, and of the list of unknown keys. **This changes none of the
+  §2 ratified choices:** the overlay still only maps a field to an existing kind.
+  [PHI.md](../PHI.md) §9 is the long form for the retarget.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
