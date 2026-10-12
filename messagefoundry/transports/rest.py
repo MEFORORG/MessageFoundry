@@ -75,6 +75,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    ReplyBodyDropped,
     encode_wire_body,
     float_setting,
     register_destination,
@@ -2257,11 +2258,15 @@ class RestDestination(DestinationConnector):
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
-    ) -> DeliveryResponse | None:
+    ) -> DeliveryResponse | ReplyBodyDropped | None:
         # #68: build this message's dynamic headers from its user-metadata bag (pure; None → {} → byte-
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
         body, status, headers = await asyncio.to_thread(self._post, payload, dynamic_headers)
+        if isinstance(body, ReplyBodyDropped):
+            # Capture is off. Delivered; the worker records the drop on the message (vault
+            # BACKLOG #3040 item 5).
+            return body
         if not self.capture_response:
             return None
         if body == "":
@@ -2355,7 +2360,7 @@ class RestDestination(DestinationConnector):
 
     def _post(
         self, payload: str, dynamic_headers: dict[str, str] | None = None
-    ) -> tuple[str, int, dict[str, str]]:
+    ) -> tuple[str | ReplyBodyDropped, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop, before
         # a single byte crosses — defense against a reload / per-message target sneaking PHI past the
         # construction-only gate. A None guard (secure/loopback hop) is byte-identical.
@@ -2418,7 +2423,7 @@ class RestDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # Read the body (drains the connection for clean close; returned for capture). 2xx ⇒
                 # delivered. Decoding a drained body is cheap, so this stays byte-identical when capture
-                # is off (the worker just ignores the return).
+                # is off (send() returns None), except for an over-cap body: see below.
                 # ASVS 15.2.2: bounded on the socket read, so the drain cannot be turned into an
                 # unbounded buffer by a partner that answers a POST with an arbitrarily large body.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not re-send.

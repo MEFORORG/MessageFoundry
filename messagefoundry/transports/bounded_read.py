@@ -28,10 +28,10 @@ retries those. So does the alert webhook, unless the reply is a 2xx: see :func:`
 A delivery that already holds a 2xx status is different, because a retry would send again a
 request the partner answered 2xx (vault BACKLOG #2180).
 :func:`read_2xx_reply_text` reads that body and states the rule. In short, an over-cap body
-there is either dropped with a WARNING or refused for good with code :data:`REPLY_TOO_LARGE_CODE`,
-which is a dead-letter cause the bound did not have before. Each destination's ``_post`` says
-which, and ``docs/CONNECTIONS.md`` has the table. The four HTTP destinations all read their 2xx
-reply through it.
+there is either dropped, which the delivery worker records on the message and then logs, or
+refused for good with code :data:`REPLY_TOO_LARGE_CODE`, which is a dead-letter cause the bound
+did not have before. Each destination's ``_post`` says which, and ``docs/CONNECTIONS.md`` has
+the table. The four HTTP destinations all read their 2xx reply through it.
 
 **Only the byte bound is covered.** At least a reply that is truncated or misframed after a 2xx
 still retries, and so sends the request again.
@@ -126,11 +126,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Collection, Mapping
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast, overload
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
@@ -1530,18 +1530,26 @@ def _shown_2xx_status(reader: object) -> int | None:
     return status if isinstance(status, int) and 200 <= status < 300 else None
 
 
-def _warn_dropped_2xx_body(connector: str, status: int, limit: int) -> None:
-    """The WARNING for an over-cap body dropped after a 2xx. It carries ``connector``, the status
-    and the bound, and no byte of the reply. It says nothing of a store record, because a delivery
-    logs it before the caller writes one, and that write can still fail (vault BACKLOG #3040
-    item 2)."""
-    logger.warning(
-        "%s answered with status %s and a response body over the %d-byte bound; "
-        "the body is dropped and the 2xx is taken as the partner's answer",
-        connector,
-        status,
-        limit,
-    )
+@overload
+def read_2xx_reply_text(
+    reader: _SupportsRead,
+    *,
+    limit: int = ...,
+    connector: str,
+    encoding: str,
+    body_is_needed: Literal[True],
+) -> str: ...
+
+
+@overload
+def read_2xx_reply_text(
+    reader: _SupportsRead,
+    *,
+    limit: int = ...,
+    connector: str,
+    encoding: str,
+    body_is_needed: bool,
+) -> str | ReplyBodyDropped: ...
 
 
 def read_2xx_reply_text(
@@ -1551,7 +1559,7 @@ def read_2xx_reply_text(
     connector: str,
     encoding: str,
     body_is_needed: bool,
-) -> str:
+) -> str | ReplyBodyDropped:
     """:func:`read_bounded_text` for the body of a delivery's reply, once its 2xx status is in.
 
     Call it where the status is already known to be 2xx. In a destination's ``_post`` that is
@@ -1566,8 +1574,10 @@ def read_2xx_reply_text(
     one place in code that states the rule:
 
     * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
-      without it. Returns ``""`` and logs a WARNING, which carries ``connector``, the status
-      and the bound, and no byte of the reply.
+      without it. Returns a :class:`~messagefoundry.transports.base.ReplyBodyDropped` with the
+      status and the bound, and no byte of the reply. Nothing is logged here: the destination
+      hands it back from ``send``, and the delivery worker logs the WARNING after the store write
+      that records the delivery and the drop (vault BACKLOG #3040 items 2 and 5).
     * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
       permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
       :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
@@ -1599,8 +1609,7 @@ def read_2xx_reply_text(
             code=REPLY_TOO_LARGE_CODE,
             permanent=True,
         )
-    _warn_dropped_2xx_body(connector, status, limit)
-    return ""
+    return ReplyBodyDropped(status=status, limit=limit)
 
 
 def drain_2xx_reply(
@@ -1612,9 +1621,11 @@ def drain_2xx_reply(
     """:func:`drain_bounded` for a reply whose 2xx status is the whole answer.
 
     The alert webhook's drain. Nothing reads its body, so an over-cap body after a 2xx is dropped
-    with the same WARNING :func:`read_2xx_reply_text` logs, and the call returns. Owner ruling
-    2026-10-12 (#3040 item 1) extends the 2026-10-05 principle, "decide by who reads the body",
-    to the alert webhook. Any other status, or none the reader can show, still raises
+    with a WARNING, which carries ``connector``, the status and the bound, and no byte of the
+    reply, and the call returns. The WARNING is logged here, because an alert has no message row
+    for a store write to come first. Vault BACKLOG #3040 items 2 and 5 cover deliveries only.
+    Owner ruling 2026-10-12 (#3040 item 1) extends the 2026-10-05 principle, "decide by who reads
+    the body", to the alert webhook. Any other status, or none the reader can show, still raises
     :class:`ResponseTooLargeError`.
 
     A function of its own rather than a change to :func:`drain_bounded`, because the connection
@@ -1629,4 +1640,10 @@ def drain_2xx_reply(
             raise
         # Logged below, outside the handler, so the traceback that reaches the bytes read so far
         # is let go first.
-    _warn_dropped_2xx_body(connector, status, limit)
+    logger.warning(
+        "%s answered with status %s and a response body over the %d-byte bound; "
+        "the body is dropped and the 2xx is taken as the partner's answer",
+        connector,
+        status,
+        limit,
+    )

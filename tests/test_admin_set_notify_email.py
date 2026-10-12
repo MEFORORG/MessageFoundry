@@ -608,8 +608,16 @@ def test_a_row_the_open_cannot_decrypt_is_could_not_start(
     monkeypatch.chdir(tmp_path)
     sealing_key = generate_key()
     db = tmp_path / "unreadable.db"
-    _seed(db, key=sealing_key)
-    # A plaintext state row, sealed by the keyed open below, as in the test above.
+
+    # A plaintext state row, as in the test above, planted in a store no key has opened yet. The
+    # keyed seed below is the first keyed open, so it seals the row. A keyed open records every
+    # cipher surface as keyed (BACKLOG #3383), so a row planted after it would be refused as a
+    # plant instead of sealed, and this test would never reach a row sealed under another key.
+    async def create_keyless() -> None:
+        store = await MessageStore.open(db)
+        await store.close()
+
+    asyncio.run(create_keyless())
     con = sqlite3.connect(db)
     con.execute(
         "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
@@ -617,13 +625,7 @@ def test_a_row_the_open_cannot_decrypt_is_could_not_start(
     )
     con.commit()
     con.close()
-
-    async def seal() -> None:
-        cipher = make_cipher(sealing_key)
-        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
-        await store.close()
-
-    asyncio.run(seal())
+    _seed(db, key=sealing_key)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # not the sealing key
     assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
     error = _error(capsys)

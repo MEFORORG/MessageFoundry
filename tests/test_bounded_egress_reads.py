@@ -56,7 +56,7 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
 from messagefoundry.transports import bounded_read, build_destination
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     MAX_TOKEN_RESPONSE_BYTES,
@@ -297,11 +297,13 @@ def _dicomweb() -> DicomWebDestination:
 
 def test_rest_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
     """The read still stops one byte past the bound. What an over-cap body then means after a 2xx
-    is vault BACKLOG #2180: with capture off nothing looks inside it, so it comes back empty."""
+    is vault BACKLOG #2180: with capture off nothing looks inside it, so it comes back dropped
+    (vault BACKLOG #3040 item 5)."""
     dest = _rest()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
-    assert dest._post("<payload/>") == ("", 200, {})
+    dropped = ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
+    assert dest._post("<payload/>") == (dropped, 200, {})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
@@ -371,12 +373,13 @@ def test_soap_fault_body_is_bounded_and_the_status_still_classifies(
 
 
 def test_fhir_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
-    """As for REST with capture off: the body comes back empty (vault BACKLOG #2180)."""
+    """As for REST with capture off: the body comes back dropped (vault BACKLOG #2180, #3040)."""
     dest = _fhir()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
     body = json.dumps({"resourceType": "Patient"})
-    assert dest._post(body, "POST", f"{FHIR_BASE}/Patient", {}) == ("", 200, {})
+    dropped = ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
+    assert dest._post(body, "POST", f"{FHIR_BASE}/Patient", {}) == (dropped, 200, {})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 

@@ -2769,6 +2769,86 @@ def test_the_store_pass_over_a_bounded_exception_keeps_the_most_it_can() -> None
     assert split > 0, "the control does not hold"
 
 
+# --- vault BACKLOG #3034: the token on the bound, and what a second cut does to an earlier note ----
+
+
+def _count_note(count: int) -> str:
+    """The count note in the one spelling ``safe_text`` writes it."""
+    return f"{redaction._COUNT_OPENER}{count}{redaction._COUNT_CLOSER}"
+
+
+def test_a_token_that_ends_exactly_on_the_bound_is_kept() -> None:
+    """A bound that falls ON whitespace splits nothing, so the token ending just before it stays.
+
+    ``_whole_token_prefix`` searches back through index ``limit`` itself for that reason. Searching
+    from ``limit - 1`` instead drops a whole token the bound never touched, and every other test in
+    this file passed on that change: they check the head is short enough and ends on a token, never
+    that it is the longest such head. Measured on that change, this text keeps 189 characters."""
+    limit = redaction._DEFAULT_LIMIT
+    text = f"{_plain_words(limit)} {_plain_words(60)}"
+    assert text[limit - 1] != " " and text[limit] == " ", "no token ends on the bound"
+    assert redact(text) == text
+    assert safe_text(text, limit=limit) == text[:limit] + _count_note(len(text) - limit)
+
+
+def test_a_note_that_closes_before_the_cut_is_kept_so_a_value_can_hold_two_counts() -> None:
+    """PINS WHAT THE CODE DOES, which ``docs/PHI.md`` once stated the other way round.
+
+    An emit site bounds an exception short, the caller wraps it in more prose, and the store cuts
+    the result again. The first note closed before the new cut and has text after it, so nothing
+    moves the cut back and the stored value holds both counts. THE CONTROL: the stored head is the
+    plain whole-token cut, so ``_clear_of_own_notes`` changed nothing here."""
+    first = safe_exc(ValueError(_plain_words(300)), limit=60)
+    assert first.endswith(redaction._COUNT_CLOSER) and len(first) < 150, "no room after the note"
+    text = f"delivery failed: {first} while closing {_plain_words(300)}"
+    assert redact(text) == text
+    plain = redaction._whole_token_prefix(text, 200)
+    assert plain > text.index(first) + len(first), "the cut does not fall after the first note"
+    stored = safe_text(text, limit=200)
+    assert stored == text[:plain] + _count_note(len(text) - plain)
+    assert stored.count(redaction._COUNT_OPENER) == 2
+
+
+def test_a_second_cut_counts_the_text_it_was_handed_and_can_drop_the_unscanned_marker() -> None:
+    """PINS A LIMIT OF THE NOTE, not a property to defend. The store's count is of the value the store
+    was handed, the emit site's notes included as plain characters. It is not how much of the
+    original text the stored value lacks, and the first call's unscanned marker goes with the cut.
+    Carrying either number forward would parse a number out of text a peer can write.
+
+    The first result is a ``redact`` fixed point under the scan window, so kept plus count is its
+    whole length here. That sum is not a general rule: a scrub changes lengths, and text past the
+    window is in the marker's figure instead.
+
+    THE CONTROL: the first result does carry both notes, with the figures ``safe_text`` quotes."""
+    first = safe_exc(ValueError("ab " * (redaction._REDACT_WINDOW // 3 + 2_000)))
+    assert first.endswith(f"{_count_note(65_334)} {redaction._clamp_marker(6_001)}"), "no control"
+    assert redact(first) == first and len(first) > 200
+    stored = safe_text(first, limit=200)
+    assert stored.endswith(_count_note(81)) and len(stored) - len(_count_note(81)) + 81 == len(
+        first
+    )
+    assert redaction._BOUND_OPENER not in stored
+
+
+@pytest.mark.parametrize(
+    "opener", [redaction._COUNT_OPENER, redaction._BOUND_OPENER], ids=["count", "bound"]
+)
+def test_an_unclosed_opener_a_peer_wrote_ends_the_kept_text_at_itself(opener: str) -> None:
+    """PINS AN ACCEPTED RESIDUAL. A peer writes the text of a diagnostic, so it can write the opening
+    of one of this module's notes. With no closer before the cut, that reads as a split note and the
+    kept text ends there. It drops more and never keeps more, and the count still covers all of it.
+
+    THE CONTROLS: the plain whole-token cut keeps far more of this text, and the same opener in a
+    value under the bound changes nothing."""
+    lead = "upstream said:"
+    text = f"{lead} {opener} {_plain_words(400)}"
+    assert redact(text) == text
+    assert redaction._whole_token_prefix(text, 200) > len(lead) + len(opener) + 1, "no control"
+    assert safe_text(text, limit=200) == lead + _count_note(len(text) - len(lead))
+    short = f"{lead} {opener} {_plain_words(100)}"  # ends on a token: safe_text strips whitespace
+    assert safe_text(short, limit=200) == short
+
+
 # --- BACKLOG #1848: a whole-text dependency the clamp cannot hold ------------------------------------
 
 #: A headerless fragment in the fully-custom delimiters, then filler past the window, then the MSH

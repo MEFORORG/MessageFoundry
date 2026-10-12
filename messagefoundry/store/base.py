@@ -722,7 +722,18 @@ class QueueStore(StoreLifecycle, Protocol):
         needed, and a raise always fails that start closed."""
         return None
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
+        """Mark one delivered outbound row ``DONE``, with its ``delivered`` event, in one
+        transaction. ``reply_dropped``, when given, is the detail of a ``reply_dropped`` event
+        written in the same transaction: the partner answered 2xx and its reply body was over the
+        byte bound and dropped (vault BACKLOG #3040 item 5). It carries the status and the bound,
+        never a byte of the reply. Returns ``True`` when this call wrote the ``DONE`` flip and its
+        events, and ``False`` when it wrote nothing: a vanished row, or a write the H1 fence rolled
+        back (vault BACKLOG #3040 item 2). It does not check the row's status first, so a row some
+        other writer already made ``DONE`` is written again and returns ``True``."""
+        ...
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in **one transaction** — the batch counterpart of
