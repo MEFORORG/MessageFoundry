@@ -306,9 +306,38 @@ async def test_a_probe_that_raises_after_its_caller_left_reports_nothing_to_the_
         loop.set_exception_handler(previous)
 
     assert reported == []
-    gate.clear()
-    gate.set()  # the same fault with the caller still waiting is a refusal, not a raise
+    # The same fault with the caller still waiting is a refusal, not a raise. The gate stays set.
     assert await service.identity_for_cert_user_id(user_id) is None
+
+
+async def test_an_engine_fault_in_the_probe_has_its_own_reason_not_unavailable(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3115. A raise past the directory layer's own catches is an engine fault. Reported
+    as ``unavailable`` it would send an operator after a directory outage that is not there.
+
+    RED when: the certificate probe maps the fault to ``unavailable`` again."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    # The control: an unreachable directory is still "unavailable".
+    directory.unreachable = True
+    assert await service._cert_directory_presence(user) == "unavailable"
+    directory.unreachable = False
+
+    async def _raises(user: UserRecord) -> reconcile.Probe | str:
+        raise RuntimeError("synthetic engine fault")
+
+    monkeypatch.setattr(service, "_directory_presence", _raises)
+    assert await service._cert_directory_presence(user) == service_module.CERT_PROBE_FAULT
+    for _ in range(3):
+        assert await service.identity_for_cert_user_id(user_id) is None
+
+    warnings = _outage_records(caplog, logging.WARNING)
+    assert len(warnings) == 1  # by the outage rules: once, not once per request
+    assert "returned probe_fault" in warnings[0].getMessage()
+    assert "jdoe" not in warnings[0].getMessage()
 
 
 @pytest.mark.parametrize(

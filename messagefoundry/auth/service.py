@@ -262,13 +262,19 @@ _CERT_PROBE_MAX_CONCURRENCY = 8
 _CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
 #: The refusal reason when no probe slot freed in time. Not a directory answer.
 CERT_PROBE_SATURATED = "probe_capacity_saturated"
+#: The refusal reason when the certificate path's probe raised past every catch below it: an engine
+#: fault, not a directory answer, so it must not read as ``unavailable`` (BACKLOG #3115). A fault
+#: the directory layer raised is still read as ``unavailable`` by ``_probe_principal``'s own catch.
+CERT_PROBE_FAULT = "probe_fault"
 #: Refusals that say the directory could not be asked, not what it said about the account. The
-#: certificate path logs these once per outage rather than once per request.
+#: certificate path logs these once per outage rather than once per request. A probe fault repeats
+#: per request the same way, so it is logged by the same rules under its own reason.
 _CERT_DIRECTORY_OUTAGES = frozenset(
     {
         reconcile.ProbeOutcome.UNAVAILABLE.value,
         reconcile.ProbeOutcome.REFERRED.value,
         CERT_PROBE_SATURATED,
+        CERT_PROBE_FAULT,
     }
 )
 #: The least time between two certificate-path outage WARNINGs, so a flapping outage cannot log
@@ -2055,9 +2061,11 @@ def _cert_narrowed_scope(
 
     The rule is :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope`, the one login
     and the reconciler share. Only a narrowing applies, and only as far as the stored scope reaches:
-    the result is the stored channels intersected with what the groups now map to. A scope the groups
-    would widen stays as stored, because this path must not grant, so a widening still waits for a
-    sign-in to write it."""
+    then the result is the stored channels intersected with what the narrowing leaves. Every other
+    decision returns ``user`` unchanged (BACKLOG #3115). That covers a scope the groups would widen,
+    because this path must not grant, so a widening still waits for a sign-in to write it. It also
+    covers a scope an administrator set when none of the account's groups is in the scope map,
+    which the rule keeps as stored."""
     decision = channel_scope.decide_ad_channel_scope(
         channel_scope.ScopeInput(
             stored_scope=user.channel_scope,
@@ -7729,10 +7737,11 @@ class AuthService:
         except Exception:
             # Returned, never raised: a raise from a probe whose caller was cancelled would reach
             # the loop's exception handler through the shield, one ERROR per orphaned request.
-            # Read as an outage, which fails closed and logs by the outage rules. The traceback can
-            # quote a directory value, so it goes to DEBUG and names no account.
+            # Its own reason, not "unavailable", so an engine fault does not read as a directory
+            # outage (BACKLOG #3115). It fails closed and logs by the outage rules. The traceback
+            # can quote a directory value, so it goes to DEBUG and names no account.
             _log.debug("certificate-path directory probe raised", exc_info=True)
-            return reconcile.ProbeOutcome.UNAVAILABLE.value
+            return CERT_PROBE_FAULT
         finally:
             _PROBE_FAULT_LOG_LEVEL.reset(token)
 
@@ -7748,7 +7757,8 @@ class AuthService:
         """Log the certificate path's directory refusals without logging one line per request.
 
         An outage is a refusal that says the directory could not be asked: unreachable, referring,
-        a fault reading the entry, or the probe cap full. It logs one WARNING per outage and, if that
+        a fault reading the entry, the probe cap full, or a fault in the engine's own probe
+        (:data:`CERT_PROBE_FAULT`). It logs one WARNING per outage and, if that
         WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
         said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
         apart, so an outage that flaps (a full cap turning over, or one referring account beside a
