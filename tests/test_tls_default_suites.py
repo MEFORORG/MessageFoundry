@@ -797,12 +797,13 @@ def test_a_refused_engine_tls13_list_is_a_config_refusal_naming_the_list_and_ope
     """Both wrappers turn the narrower's RuntimeError into a ValueError, so every seam reports a
     named configuration refusal rather than an unhandled error at start (BACKLOG #2484)."""
     ctx = _RefusesTls13(ssl.PROTOCOL_TLS_SERVER)
-    with pytest.raises(tls_policy.EngineTlsListRefused) as caught:
+    # Caught as the base a seam catches, then checked for the class, so each half can fail.
+    with pytest.raises(ValueError) as caught:
         if wrapper == "default":
             narrow_to_approved_suites(ctx)
         else:
             tls_policy.apply_operator_tls_ciphers(ctx, _OPERATOR_STRING)
-    assert isinstance(caught.value, ValueError)
+    assert isinstance(caught.value, tls_policy.EngineTlsListRefused)
     message = str(caught.value)
     assert ssl.OPENSSL_VERSION in message
     assert all(name in message for name in APPROVED_TLS13_SUITES), message
@@ -881,16 +882,64 @@ def test_a_refused_engine_tls12_list_is_a_config_refusal_too(settings: dict[str,
         assert all(name in message for name in APPROVED_TLS12_SUITES), message
 
 
+def test_an_unset_ciphers_narrow_never_blames_the_operator_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3096 item 1. With ``tls_ciphers`` unset there is no operator string, so a fault in
+    the engine's own narrow must not read as "tls_ciphers rejected". It is latent: the narrow
+    raises only EngineTlsListRefused today. The stub raises a plain ValueError to prove the arm."""
+
+    def broken(ctx: ssl.SSLContext) -> None:
+        raise ValueError("a fault inside the engine's narrow")
+
+    monkeypatch.setattr(tls_policy, "narrow_to_approved_suites", broken)
+    with pytest.raises(ValueError) as caught:
+        tls_policy.apply_connection_tls_ciphers(
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), {}, connector="MLLP destination"
+        )
+    assert str(caught.value) == "a fault inside the engine's narrow"
+    assert "tls_ciphers rejected" not in str(caught.value)
+
+
 def test_the_library_seam_still_names_its_connector_on_a_refused_engine_list() -> None:
     """The ldap3 and hvac seam caught RuntimeError before #2484; it now catches the new class."""
-    with pytest.raises(
-        tls_policy.EngineTlsListRefused, match="^LDAP: the LDAPS hop cannot be narrowed"
-    ) as caught:
+    with pytest.raises(ValueError, match="^LDAP: the LDAPS hop cannot be narrowed") as caught:
         tls_policy._narrow_library_context(
             _RefusesTls13(ssl.PROTOCOL_TLS_CLIENT), connector="LDAP", hop="the LDAPS hop"
         )
-    assert isinstance(caught.value, ValueError)
+    assert isinstance(caught.value, tls_policy.EngineTlsListRefused)
     assert isinstance(caught.value.__cause__, tls_policy.EngineTlsListRefused)
+
+
+@pytest.mark.parametrize(
+    ("seam", "build"),
+    [
+        (
+            "LDAPS",
+            lambda: tls_policy.assert_ldap3_tls_suites(
+                validate=ssl.CERT_REQUIRED, ca_certs_data=None, connector="LDAPS"
+            ),
+        ),
+        ("Vault", lambda: tls_policy.assert_hvac_tls_suites({}, connector="Vault")),
+    ],
+)
+def test_a_refused_tls12_list_through_a_library_seam_names_its_hop(
+    seam: str, build: Callable[[], object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3096 item 2. The test above drives a TLS 1.3 refusal into the shared helper. This
+    one refuses the TLS 1.2 list on the CLASS, so the seam's own factory meets it on a real build."""
+
+    def refuse(self: ssl.SSLContext, cipherlist: str, /) -> None:
+        raise ssl.SSLError("No cipher can be selected.")
+
+    monkeypatch.setattr(ssl.SSLContext, "set_ciphers", refuse)
+    with pytest.raises(ValueError) as caught:
+        build()
+    assert isinstance(caught.value, tls_policy.EngineTlsListRefused)
+    message = str(caught.value)
+    assert message.startswith(f"{seam}: the {seam} TLS context cannot be narrowed."), message
+    assert "approved TLS 1.2 suites" in message
+    assert ssl.OPENSSL_VERSION in message
 
 
 # --- the call-site count: every engine module that asserts a suite list narrows one -----------------

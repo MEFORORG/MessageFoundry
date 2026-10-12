@@ -37,7 +37,9 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
 )
 from messagefoundry.config.wiring import (
+    DICOM,
     FHIR,
+    MLLP,
     ConnectionSpec,
     DICOMweb,
     EnvRef,
@@ -58,7 +60,7 @@ from messagefoundry.pipeline.wiring_runner import (
     _fhir_lookup_settings,
     _source_config,
 )
-from messagefoundry.transports import rest
+from messagefoundry.transports import dicom, rest
 from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import bearer_provider_from_settings
@@ -308,10 +310,11 @@ def test_a_missing_destination_ca_file_names_the_setting_and_connection(tmp_path
     """It was a bare FileNotFoundError that named nothing. Both bases stay catchable. The path is
     left out, because a connection test returns this text to its caller and audits it."""
     gone = str(tmp_path / "gone.pem")
-    with pytest.raises(CaFileUnreadable) as caught:
+    # Caught as OSError, then each further base checked in turn, so every assert below can fail.
+    with pytest.raises(OSError) as caught:
         _destination_opener(Rest(url="https://partner.example.org/api", tls_ca_file=gone))
     assert isinstance(caught.value, ValueError)
-    assert isinstance(caught.value, OSError)
+    assert isinstance(caught.value, CaFileUnreadable)
     assert isinstance(caught.value.__cause__, FileNotFoundError)
     message = str(caught.value)
     assert "tls_ca_file of connection 'OB' names a CA file that cannot be read" in message
@@ -361,16 +364,70 @@ def test_a_missing_instance_ca_file_names_the_tls_block(mode: str, tmp_path: Pat
         build_anchored_https_handler(anchor=anchor, connector="test")
 
 
-def test_a_ca_file_that_is_not_pem_still_raises_ssl_error(tmp_path: Path) -> None:
-    """Only an unreadable file is renamed. A file that reads but holds no CA keeps its SSLError."""
+def test_a_ca_file_that_is_not_pem_names_the_setting_too(tmp_path: Path) -> None:
+    """Vault BACKLOG #2977 item 10. A file that reads but holds no CA was re-raised as a raw
+    SSLError naming nothing. It now gets the same worded error, naming the setting and not the
+    path, on both builders. The cause keeps the SSLError for a reader who needs OpenSSL's reason."""
     junk = tmp_path / "junk.pem"
     junk.write_text("not a certificate", encoding="utf-8")
     anchor = resolve_trust_anchor(
         connection_ca_file=str(junk), host="10.1.2.3", policy=TrustAnchorPolicy(), connection="OB"
     )
-    with pytest.raises(ssl.SSLError) as caught:
-        build_verifying_client_context(anchor)
-    assert not isinstance(caught.value, CaFileUnreadable)
+    for build in (
+        lambda: build_verifying_client_context(anchor),
+        lambda: build_anchored_https_handler(anchor=anchor, connector="test"),
+    ):
+        with pytest.raises(CaFileUnreadable) as caught:
+            build()
+        message = str(caught.value)
+        assert message.startswith(
+            "tls_ca_file of connection 'OB' names a CA file that holds no usable CA certificate"
+        ), message
+        assert "junk.pem" not in message
+        assert isinstance(caught.value.__cause__, ssl.SSLError)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda ca: DICOM(
+            ae_title="MEFOR", host="pacs.internal.example.org", port=11112, tls=True, tls_ca_file=ca
+        ),
+        lambda ca: MLLP(host="lis.internal.example.org", port=2575, tls=True, tls_ca_file=ca),
+    ],
+    ids=["DICOM", "MLLP"],
+)
+def test_a_missing_dicom_or_mllp_ca_file_names_the_connection(
+    factory: Callable[[str], ConnectionSpec], tmp_path: Path
+) -> None:
+    """BACKLOG #3096 item 6. Both pass the connection's name through the runner's policy branch, so
+    the refusal names it, as the HTTP family's does. Nothing pinned that before."""
+    config = _dest_config(
+        build_outbound_connection("OB_TLS", factory(str(tmp_path / "gone.pem"))),
+        {},
+        trust_anchor_policy=TrustAnchorPolicy(),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(CaFileUnreadable) as caught:
+        build_destination(config, egress=EgressSettings(deny_by_default=False))
+    message = str(caught.value)
+    assert message.startswith("tls_ca_file of connection 'OB_TLS' names a CA file"), message
+    assert "gone.pem" not in message
+
+
+@pytest.mark.parametrize(
+    ("name", "label"),
+    [("OB_PACS", "DICOM destination 'OB_PACS'"), ("", "DICOM destination")],
+    ids=["named", "unnamed-control"],
+)
+def test_a_dicom_suite_refusal_names_the_connection(name: str, label: str) -> None:
+    """BACKLOG #3096 item 3. The runner passes the name, so a refused ``tls_ciphers`` says which
+    DICOM destination to fix. The control is a direct build with no name, which keeps the bare
+    label the refusal always had."""
+    settings = {"tls": True, "host": "pacs.internal.example.org", "tls_ciphers": "NULL-SHA256"}
+    with pytest.raises(ValueError) as caught:
+        dicom._client_ssl_context(settings, trust_anchor_policy=TrustAnchorPolicy(), name=name)
+    assert str(caught.value).startswith(f"{label}: tls_ciphers rejected"), str(caught.value)
 
 
 def test_the_token_hop_reads_the_factory_ca_even_with_verify_tls_off(tmp_path: Path) -> None:
