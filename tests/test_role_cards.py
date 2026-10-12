@@ -798,6 +798,17 @@ class TheHookReadsTheSessionsOwnWorktree(unittest.TestCase):
     def test_an_input_that_is_not_json_falls_back(self):
         self.assertIn("SEAT: builder", self._as_the_desktop_app_runs_it("not json {"))
 
+    def test_a_non_ascii_cwd_survives_the_read(self):
+        """The input is read as UTF-8 bytes. A console-code-page read mangles this name and falls back."""
+        wt = self.primary / ".claude" / "worktrees" / "caf\u00e9"
+        (wt / ".claude").mkdir(parents=True)
+        (wt / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        (wt / MARKER_RELPATH).write_text("lander", encoding="utf-8")
+        self.assertIn(
+            "SEAT: lander",
+            self._as_the_desktop_app_runs_it(json.dumps({"cwd": str(wt)}, ensure_ascii=False)),
+        )
+
     def test_the_worktrees_own_roster_is_read_when_it_has_one(self):
         """A worktree ahead of the primary gets its own card, not the primary's older copy."""
         roles = self.worktree / "docs" / "roles"
@@ -1429,9 +1440,10 @@ if __name__ == "__main__":
 #
 # THE WRAPPER AND THE PROJECT ROW BOTH FIRED HERE, so every card was injected twice. Measured
 # 2026-10-12 over session 07991bb9: each of its five compactions carries two `[role-card] SEAT:` rows,
-# one per status message. The wrapper now stands down when `$env:CLAUDE_PROJECT_DIR`'s settings
+# one per status message. The wrapper MUST stand down when `$env:CLAUDE_PROJECT_DIR`'s settings
 # already name role-card-inject.ps1. That is the directory the harness loads project settings from,
-# so a stale worktree with no project row still gets the wrapper's card.
+# so a stale worktree with no project row still gets the wrapper's card. The installed copies did
+# not carry the stand-down when this was written, so the arm below is red on a box until they do.
 #
 # "The project wiring names a path inside the worktree", above, is true for a CLI session only. A
 # desktop session's project directory is the PRIMARY checkout: see TheHookReadsTheSessionsOwnWorktree.

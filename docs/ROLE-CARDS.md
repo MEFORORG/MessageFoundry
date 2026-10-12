@@ -485,7 +485,7 @@ asserted by reading the source rather than by driving it, and the table says whi
 | The hook is wired **exactly once** at SessionStart | **Tested**, across every hook group and across both the `args` and `command` fields of this file. |
 | The wiring passes `-WorktreeRoot` spelled in full, and nothing else | **Tested positively**: the tokens after the script path must be exactly `-WorktreeRoot ${CLAUDE_PROJECT_DIR}`. |
 | The hook input's `cwd` wins over `-WorktreeRoot` | **Tested by a run**, in a planted primary and worktree with different markers, with a no-input control that reads the primary. Added 2026-10-12. |
-| The user-scope wrapper stands down where the project row runs the hook | **Tested on the installed copies**, which this suite reads but cannot install. Added 2026-10-12. |
+| The user-scope wrapper stands down where the project row runs the hook | **Tested on the installed copies**, which this suite reads but cannot install. Added 2026-10-12, when none of the eight copies carried it, so the arm is red on a box until they do. CI has no copies and skips it. |
 
 The card budget is enforced twice, in the suite and again in the hook, so a card edited in a
 worktree that never runs the tests still cannot cost every session. The resolution order has the

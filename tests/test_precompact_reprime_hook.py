@@ -511,3 +511,55 @@ def test_the_reported_timestamp_carries_its_offset(repo: Worktree) -> None:
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})", stamp), (
         f"the timestamp carries no zone and cannot be read unambiguously: {stamp!r}"
     )
+
+
+def _record(common: Path, box: str, *, worktree: str, branch: str, goal: str) -> None:
+    seat_dir = common / "mefor-coord" / "seats" / box
+    seat_dir.mkdir(parents=True, exist_ok=True)
+    (seat_dir / "declared.json").write_text(
+        json.dumps(
+            {
+                "seat": "builder",
+                "goal": goal,
+                "branch": branch,
+                "declaredAt": (datetime.now(UTC) - timedelta(hours=1)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "worktree": worktree,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def primary_and_worktree(repo: Worktree, tmp_path: Path) -> tuple[Worktree, str]:
+    """`repo` as a primary checkout, plus a linked worktree with its own declaration."""
+    wt = tmp_path / "linked"
+    _git(repo.path, "worktree", "add", "-q", "-b", "linked", str(wt))
+    wt_top = _git(wt, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    _record(repo.common, "primary", worktree=repo.top, branch=_BRANCH, goal="PRIMARY-GOAL")
+    _record(repo.common, "linked", worktree=wt_top, branch="linked", goal="WORKTREE-GOAL")
+    return repo, wt_top
+
+
+def test_the_payload_cwd_names_the_worktree_it_restores(primary_and_worktree) -> None:
+    """THE DESKTOP APP STARTS A WORKTREE SESSION'S HOOKS IN THE PRIMARY CHECKOUT.
+
+    Measured 2026-10-12: it passes `--project-config-root <primary>`, and a hook's working directory
+    followed it. Only the payload `cwd` named the worktree. So at each compaction of session 07991bb9
+    this hook restored the PRIMARY's batch-189 declaration into a Lander's context, beside the
+    worktree's own role card. The hook now moves to the payload `cwd` before any git read.
+    """
+    repo, wt_top = primary_and_worktree
+    out = run_hook(repo, {**_COMPACT_RESTART, "cwd": wt_top})
+    assert "GOAL: WORKTREE-GOAL" in out, out
+    assert "PRIMARY-GOAL" not in out, out
+
+
+def test_without_a_payload_cwd_it_reads_where_it_runs(primary_and_worktree) -> None:
+    """The control: with no `cwd` the same call reads the primary, so the arm above can fail."""
+    repo, _ = primary_and_worktree
+    out = run_hook(repo, _COMPACT_RESTART)
+    assert "GOAL: PRIMARY-GOAL" in out, out
+    assert "WORKTREE-GOAL" not in out, out

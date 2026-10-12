@@ -88,6 +88,7 @@ function Format-Age {
 # Read before any other work, so the common case (a cold start) costs one JSON parse and exits.
 $hookSource = ''
 $hookEvent = ''
+$hookCwd = ''
 try {
     if ([Console]::IsInputRedirected) {
         $raw = [Console]::In.ReadToEnd()
@@ -100,6 +101,7 @@ try {
             if ($names -contains 'hook_event_name' -and $payload.hook_event_name) {
                 $hookEvent = [string]$payload.hook_event_name
             }
+            if ($names -contains 'cwd' -and $payload.cwd) { $hookCwd = [string]$payload.cwd }
         }
     }
 } catch {
@@ -116,6 +118,15 @@ try {
 # it must stay quiet: its stdout does not reach context, so the work is wasted either way.
 if ($hookSource -and $hookSource -ne 'compact') { exit 0 }
 if ($hookEvent -and $hookEvent -ne 'SessionStart') { exit 0 }
+
+# EVERY GIT READ BELOW RESOLVES FROM THE SESSION'S OWN DIRECTORY, which is the payload `cwd`. Under
+# the desktop app this process starts in the PRIMARY checkout: measured 2026-10-12, the app passes
+# `--project-config-root <primary>`, and a hook's working directory followed it. This hook then
+# restored the primary's seat and goal into a worktree session's context, beside that worktree's
+# own role card.
+if ($hookCwd -and (Test-Path -LiteralPath $hookCwd -PathType Container)) {
+    try { Set-Location -LiteralPath $hookCwd } catch { }
+}
 
 # Dot-sourced AFTER the guard, so a cold start never pays for it. config-roots.ps1 is a
 # definitions-only library with no load-time I/O, which is what makes that safe inside a hook.

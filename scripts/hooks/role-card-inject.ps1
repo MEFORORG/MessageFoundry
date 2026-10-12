@@ -46,7 +46,8 @@
     Measured 2026-10-12: the desktop app starts a worktree session's CLI with
     `--project-config-root <primary checkout>`. Reproduced in a fixture repository, a SessionStart
     hook then ran with its working directory, `$env:CLAUDE_PROJECT_DIR` and git's own top-level
-    answer all naming the PRIMARY; only the payload `cwd` named the worktree. The wiring passed `-WorktreeRoot ${CLAUDE_PROJECT_DIR}`, so every desktop worktree
+    answer all naming the PRIMARY; only the payload `cwd` named the worktree. The wiring passed
+    `-WorktreeRoot ${CLAUDE_PROJECT_DIR}`, so every desktop worktree
     session read the primary's marker. MessageFoundry session 07991bb9 declared Lander and got the
     Builder card at five compactions running, and every one rewrote the primary's ROLE.local.md.
     `TheHookReadsTheSessionsOwnWorktree` pins it.
@@ -130,12 +131,21 @@ function Get-InputWorktree {
 # session's worktree. See WHICH WORKTREE above. Reading it also keeps the caller from blocking on
 # the write.
 $hookInput = ''
-try { $hookInput = [Console]::In.ReadToEnd() } catch { }
+try {
+    # As UTF-8 bytes, not through [Console]::In: that decodes with the console code page, which
+    # would mangle a non-ASCII cwd and send the hook quietly back to -WorktreeRoot.
+    $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
+    $hookInput = $reader.ReadToEnd()
+}
+catch { }
 try {
     $fromInput = Get-InputWorktree $hookInput
     if ($fromInput) { $WorktreeRoot = $fromInput }
 }
-catch { }
+catch {
+    # Said aloud, because falling back in silence is the fault this read exists to fix.
+    Write-Output "[role-card] Could not read the hook input's cwd ($($_.Exception.Message)), so the seat below comes from $WorktreeRoot."
+}
 
 $MarkerRelPath = '.claude/seat.local.txt'
 $RoleCopyRelPath = '.claude/ROLE.local.md'
