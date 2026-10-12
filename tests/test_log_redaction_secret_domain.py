@@ -995,7 +995,15 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
     and every ``label=VALUE`` value class come back clean and need no excusing.
 
     The head is read TWICE, once for each route :func:`_repeat_cannot_restart` documents: as a
-    ``\\b``/``^`` anchor, and as a ``(?<![C])`` delimiter class."""
+    ``\\b``/``^`` anchor, and as a ``(?<![C])`` delimiter class.
+
+    THE LABEL START COUNTS AS A ``\\b`` ANCHOR, and only spelled exactly as the shipped constant
+    (BACKLOG #2999). ``secretscrub._LABEL_START`` is ``\\b`` or a position right after a ``%XX``
+    escape. The second half needs a "%" three characters back, so it offers one start per "%" in the
+    text. A class that cannot span a word boundary holds no "%", so a run of it reaches past at most
+    the two hex digits of the escape before it: each run is entered from a constant number of start
+    positions, which is the word-boundary route's own argument with one more start per run. Any other
+    lookbehind in that place is not read as an anchor, so it is flagged."""
     parsed = sre_parser.parse(source)
     head = parsed[0] if len(parsed) else (None, None)
     anchored = head[0] == sre_constants.AT and head[1] in (
@@ -1003,6 +1011,7 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
         sre_constants.AT_BEGINNING,
         sre_constants.AT_BEGINNING_STRING,
     )
+    anchored = anchored or source.removeprefix("(?i)").startswith(scrub_mod._LABEL_START)
     found: list[str] = []
     _walk_scan_prefix(
         parsed,
@@ -1065,6 +1074,13 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
     assert not _unbounded_scan_repeats(_LETTER_HEAD_DSN)
     assert not _unbounded_scan_repeats(
         r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@"
+    )
+    # THE LABEL START (BACKLOG #2999), both ways. Shipped, a word-only run after it is contained, as
+    # after ``\b``. A lookbehind that can fire INSIDE a word run is not the same head, and is flagged.
+    assert scrub_mod._LABEL_START == redact_mod._LABEL_START
+    assert not _unbounded_scan_repeats(r"(?i)" + scrub_mod._LABEL_START + r"[A-Za-z0-9]+[:=]")
+    assert _unbounded_scan_repeats(r"(?i)(?:\b|(?<=[0-9A-Fa-f]{2}))[A-Za-z0-9]+[:=]"), (
+        "a lookbehind that fires inside a word run is not the label start, and is not containment"
     )
 
     checked: list[str] = []
@@ -3251,3 +3267,167 @@ def test_a_line_that_arrives_holding_the_placeholder_is_not_split_at_it() -> Non
     line = f"connect failed {chr(0x212A)}_password=[REDACTED]zq-Lit_Val-52 for svc"
     out = redact_log_line(line)
     assert "zq-Lit_Val-52" not in out, out
+
+
+# --- BACKLOG #2999: a label right after a percent-encoded character -------------------------------
+
+#: A synthetic credential: shorter than ``_LONG_B64``'s 24 and holding "-" and "_", so the bundle's
+#: long-base64 sweep cannot be what hides it.
+_PCT_VALUE = "zq-Pct_Val-29"
+
+#: Every encoded glue character the verifier measured, and the lower-case spelling of each escape
+#: that has a letter in it.
+_PCT_GLUE = tuple(
+    sorted(
+        {
+            f"%{spelling}"
+            for code in ("2C", "22", "3B", "20", "3D", "3A", "7C", "26")
+            + ("7B", "7D", "27", "2F", "3F", "23", "2B", "40")
+            for spelling in (code, code.lower())
+        }
+    )
+)
+
+#: One label of each family, with the separator each pattern reads, plus the bare auth scheme.
+_PCT_CREDENTIALS = (
+    f"password={_PCT_VALUE}",
+    f"pwd: {_PCT_VALUE}",
+    f"secret={_PCT_VALUE}",
+    f"token={_PCT_VALUE}",
+    f"session: {_PCT_VALUE}",
+    f"api_key={_PCT_VALUE}",
+    f"private_key={_PCT_VALUE}",
+    f"encryption_key: {_PCT_VALUE}",
+    f"MEFOR_VALUE_PW={_PCT_VALUE}",
+    f"bearer {_PCT_VALUE}",
+)
+
+#: The five patterns whose start #2999 widened, named the same in both copies.
+_PCT_STARTED = ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL")
+
+
+def _through_the_installed_chain(line: str) -> str:
+    """``line`` through every filter ``_install_phi_filters`` puts on a handler, in its order."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    record = logging.LogRecord("mefor.test", logging.ERROR, __file__, 1, "%s", (line,), None)
+    assert handler.filter(record)
+    return record.getMessage()
+
+
+_PCT_SURFACES: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("scrub_credentials", scrub_credentials),
+    ("CredentialScrubFilter", _write_time_filtered),
+    ("installed chain", _through_the_installed_chain),
+    ("redact_log_line", redact_log_line),
+)
+
+
+def _pct_lines(glue: str) -> list[str]:
+    """Each credential glued by ``glue``, in a URL query and in free text."""
+    return [
+        line
+        for credential in _PCT_CREDENTIALS
+        for line in (
+            f"GET /fhir/Patient?identifier=a1{glue}{credential} HTTP/1.1",
+            f"lookup failed x{glue}{credential}",
+        )
+    ]
+
+
+@pytest.mark.parametrize("glue", _PCT_GLUE)
+def test_a_label_right_after_a_percent_escape_is_read_on_every_surface(glue: str) -> None:
+    """The escape's last hex digit is a word character, so ``\\b`` did not fire before a glued
+    label, and its value printed on every surface. The label must survive too, so a reader still
+    sees which credential it was."""
+    for line in _pct_lines(glue):
+        for surface, apply in _PCT_SURFACES:
+            out = apply(line)
+            assert _PCT_VALUE not in out, f"{surface}: {out!r}"
+        label = re.split(r"[:= ]", line.split(glue, 1)[1], maxsplit=1)[0]
+        assert label in scrub_credentials(line), line
+
+
+def test_the_percent_escape_arm_fails_with_the_old_label_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE CONTROL for the arm above: with ``\\b`` back as the start of the five patterns, in both
+    copies, every credential it plants prints on every surface but the installed chain, where the
+    URL query filter catches the ``token=`` lines. So the start is what does the work."""
+    for module in (scrub_mod, redact_mod):
+        for name in _PCT_STARTED:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert pattern.pattern.count(module._LABEL_START) == 1, f"{module.__name__}.{name}"
+            old = pattern.pattern.replace(module._LABEL_START, r"\b")
+            monkeypatch.setattr(module, name, re.compile(old, pattern.flags))
+    for line in _pct_lines("%2C"):
+        printed = [name for name, apply in _PCT_SURFACES if _PCT_VALUE in apply(line)]
+        assert {"scrub_credentials", "CredentialScrubFilter", "redact_log_line"} <= set(printed), (
+            line,
+            printed,
+        )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "ab12cdpassword reset for svc",
+        "%41BCtoken expired",
+        "x%2Ctokens: 3 left",
+        "page%3Dtoken_count=4",
+        "x%2Cpasswords=3",
+        "x%2Ckey=abc",
+    ],
+)
+def test_a_word_that_only_holds_a_label_word_after_an_escape_is_left_alone(line: str) -> None:
+    """THE OVER-REDACTION CONTROL (closing step 3): a hex-looking word that ends in a label word, a
+    plural or longer word, and the bare ``key`` this vocabulary leaves out are not labels."""
+    for surface, apply in _PCT_SURFACES[:2]:
+        assert apply(line) == line, surface
+
+
+#: Inputs for the growth arm below. Each is about ``length`` long: an escape before every run, one
+#: segment after each escape, and one long segment right after an escape, which a start that could
+#: fire inside a word would re-walk from every character.
+_PCT_GROWTH_SHAPES: tuple[Callable[[int], str], ...] = (
+    lambda length: "%2C" * (length // 3),
+    lambda length: "%2Ca_" * (length // 5),
+    lambda length: "%2C" + "a" * length + "_b",
+)
+
+
+def test_the_percent_escape_start_grows_linearly_in_line_length() -> None:
+    """The start runs on every record, on text an attacker can influence, so it must stay linear.
+    THE POSITIVE CONTROL is ``_BEARER`` with a start that fires inside a word run: every character
+    of the long segment then starts a walk to its end, which is the quadratic."""
+    for module in (scrub_mod, redact_mod):
+        shipped: re.Pattern[str] = module._BEARER
+        control = re.compile(
+            shipped.pattern.replace(module._LABEL_START, r"(?:\b|(?<=[%0-9A-Za-z]))"),
+            shipped.flags,
+        )
+        long_segment = _PCT_GROWTH_SHAPES[-1]
+
+        def sub(text: str, pattern: re.Pattern[str] = control) -> str:
+            return pattern.sub("x", text)
+
+        control_growth = _growth_between(
+            sub, long_segment(_GROWTH_LENGTHS[0]), long_segment(_GROWTH_LENGTHS[1]), rounds=5
+        )
+        assert control_growth > _MAX_GROWTH, (
+            f"{module.__name__}: the quadratic control grew only {control_growth:.1f}x, so this box "
+            "or this input cannot show the hazard and the shipped reading proves nothing"
+        )
+        for name in _PCT_STARTED:
+            pattern: re.Pattern[str] = getattr(module, name)
+            for shape in _PCT_GROWTH_SHAPES:
+                growth = _growth_between(
+                    partial(pattern.sub, "x"),
+                    shape(_GROWTH_LENGTHS[0]),
+                    shape(_GROWTH_LENGTHS[1]),
+                    rounds=5,
+                )
+                assert growth <= _MAX_GROWTH, (
+                    f"{module.__name__}.{name} grew {growth:.1f}x for 8x the length on "
+                    f"{shape(16)!r}, against {control_growth:.1f}x for the quadratic control"
+                )

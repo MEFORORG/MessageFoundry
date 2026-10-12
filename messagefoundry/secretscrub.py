@@ -219,6 +219,18 @@ def _alternation(words: tuple[str, ...]) -> str:
 # ``tls_key_password`` -- two prefix segments each) and nothing in this tree comes close.
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
+# Where a label may start: at a word boundary, or right after a percent-encoded character (BACKLOG
+# #2999). A ``%XX`` escape ends in a hex digit, and a hex digit is a word character, so ``\b`` does
+# not fire between it and a label. A label glued to an encoded separator, as in ``a=1%2Cpassword=x``
+# or ``x%3Bbearer <tok>``, was therefore never read, and its value printed. The lookbehind is fixed
+# width, so it adds a start position only right after a ``%XX`` triplet and keeps the scan linear.
+# The cost is over-redaction where the escape decodes to a letter or digit, as in ``%41token=x``,
+# which is the direction this module may fail in. ``_LABEL_PREFIX`` is not changed: a prefixed label
+# such as ``%2Cclient_secret`` was already read, because "2Cclient_" is one prefix segment.
+# ``messagefoundry.redaction._CREDENTIAL_AHEAD`` deliberately does NOT take this start, because
+# taking it printed PHI; its comment gives the measurement and the credential shape that costs.
+_LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
+
 # A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
 # #1685). Both exist for one reason: a value is quoted PRECISELY so it may carry the characters that
 # would otherwise end it -- ";", "=" and spaces -- and those are exactly what a plain value class
@@ -632,7 +644,7 @@ _PLAIN_SCHEME_VALUE = (
 # A QUOTED value is taken whole when :data:`_GUARDED_QUOTED_VALUE` allows it, and a BRACED one never;
 # the reason is on ``_CREDENTIAL_KV``. Otherwise the plain class takes the value up to its first quote.
 _BEARER = re.compile(
-    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
+    r"(?i)" + _LABEL_START + r"(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
     r"\s*[:=]\s*(?:(?:bearer|basic|digest)\s+)?"
     r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
 )
@@ -657,7 +669,9 @@ _BEARER = re.compile(
 # quoted label, as in ``Bearer password="v w"``, this pattern does not match, and the label's own
 # pattern takes its value. The pattern before the stop redacted the word "password" there, so no
 # later pass saw the label, and "v w" printed.
-_AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE)
+_AUTH_SCHEME = re.compile(
+    r"(?i)" + _LABEL_START + r"(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE
+)
 
 # A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
 # optional quotes match the shape ``resolve_env_settings`` produces -- "(env 'MEFOR_VALUE_PW'='<value>')"
@@ -674,7 +688,7 @@ _AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_S
 # there made ``password="hunter;two MEFOR_DB={x y}" mode`` print ";two", found by the second review
 # round of 2026-10-05.
 _MEFOR_SECRET = re.compile(
-    r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
+    _LABEL_START + r"(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_NO_SPACE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
@@ -731,7 +745,13 @@ _MEFOR_SECRET = re.compile(
 # Each of the four residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new.
 _CREDENTIAL_KV = re.compile(
-    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_CREDENTIAL_WORDS) + r"))\b"
+    r"(?i)"
+    + _LABEL_START
+    + r"("
+    + _LABEL_PREFIX
+    + r"(?:"
+    + _alternation(_CREDENTIAL_WORDS)
+    + r"))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _ODBC_BRACED
@@ -761,7 +781,13 @@ _CREDENTIAL_KV = re.compile(
 # A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
 # on ``_CREDENTIAL_KV``'s residuals.
 _KEY_MATERIAL = re.compile(
-    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_KEY_MATERIAL_WORDS) + r"))\b"
+    r"(?i)"
+    + _LABEL_START
+    + r"("
+    + _LABEL_PREFIX
+    + r"(?:"
+    + _alternation(_KEY_MATERIAL_WORDS)
+    + r"))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_VALUE
