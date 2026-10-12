@@ -674,6 +674,9 @@ after the create leaves its own address on the row. The same command, run again,
 so it completes the row. The operator may also give the address the row already holds; it is then
 a stated choice rather than an inherited one. A blank `--email` counts as none, and so does a
 blank stored address.
+*Amended 2026-10-11, recording a consequence of Amendment D: a blank `--email` no longer counts as
+none. The command and the service both refuse it, and nothing is written. A blank stored address
+still counts as none.*
 
 The `docs/SECURITY.md` bullet under *Provisioning the first administrator* that said the account
 keeps the earlier holder's address with a warning is replaced there.
