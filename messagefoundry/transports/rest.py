@@ -1763,11 +1763,12 @@ def _refuse_a_static_proxy_header(headers: object) -> None:
     own header from a static one. Under Digest the connection sets no header of its own, so the
     static one would cross a cleartext proxy leg on the connection's admission. Under Basic it
     would be silently replaced. Refused rather than dropped, so the operator sees the conflict.
-    Names the key, never its value."""
+    Names the key, never its value. The key is read by the function the send-time rule uses, so
+    the two cannot differ on which spellings are this header."""
     if not isinstance(headers, Mapping):
         return
     for key in headers:
-        if str(key).strip().lower() == "proxy-authorization":
+        if is_proxy_credential_header_name(str(key)):
             raise ValueError(
                 f"headers sets {str(key)[:64]!r} and the connection also sets proxy_user and "
                 "proxy_password. Remove the static header: the proxy credential comes from "

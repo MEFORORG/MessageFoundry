@@ -267,12 +267,12 @@ def test_control_a_direct_request_with_another_header_is_sent() -> None:
 # --- the report's shape: a connection with no proxy_user -----------------------------------------
 
 
-def _rest_with_static_header(name: str, proxy: _WireProxy) -> RestDestination:
-    """A REST connection with no ``proxy_user``, so its proxy handler admits no caller-set header.
-    It sets one static header and names a cleartext proxy. ``cleartext_accepted`` covers the
-    ``http://`` destination hop only."""
+def _rest_with_static_header(name: str, proxy: _WireProxy, **extra: str) -> RestDestination:
+    """A REST connection that sets one static header and names a cleartext proxy on the box. With
+    no ``proxy_user`` in ``extra``, its proxy handler admits no caller-set header.
+    ``cleartext_accepted`` covers the ``http://`` destination hop."""
     settings = Rest(url=_HTTP_TARGET).settings
-    settings.update({"proxy_url": f"http://{proxy.address}", "headers": {name: _VALUE}})
+    settings.update({"proxy_url": f"http://{proxy.address}", "headers": {name: _VALUE}, **extra})
     with active_hop_posture(HopPosture(enforcing=True)):
         dest = build_destination(
             Destination(
@@ -305,6 +305,35 @@ def test_a_rest_send_with_a_static_proxy_header_is_refused_in_any_spelling(name:
     for part in ("u5er", "pa55w0rd", _VALUE):
         assert part not in str(raised.value), part
     assert proxy.connections == 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    [_NAME, *_SENDABLE.values(), *(n for n, _ in _UNSENDABLE.values())],
+    ids=["plain", *_SENDABLE, *_UNSENDABLE],
+)
+def test_a_static_proxy_header_beside_proxy_user_is_refused_at_build_in_any_spelling(
+    name: str,
+) -> None:
+    """The build-time twin of the send-time rule, for a connection that sets ``proxy_user``. It
+    reads the key through the same function, so a spelling one rule refuses the other refuses.
+    It used ``str.strip`` of its own, which no test pinned. The error names the key in ``repr``
+    form and never the value."""
+    with _WireProxy() as proxy, pytest.raises(ValueError, match="#3443") as raised:
+        _rest_with_static_header(name, proxy, proxy_user="u5er", proxy_password="pa55w0rd")
+    text = str(raised.value)
+    assert repr(name) in text
+    for part in ("u5er", "pa55w0rd", _VALUE):
+        assert part not in text, part
+    assert proxy.connections == 0
+
+
+def test_control_another_static_header_beside_proxy_user_builds() -> None:
+    with _WireProxy() as proxy:
+        dest = _rest_with_static_header(
+            "X-Proxy-Authorization", proxy, proxy_user="u5er", proxy_password="pa55w0rd"
+        )
+    assert dest._headers["X-Proxy-Authorization"] == _VALUE
 
 
 def test_control_a_rest_send_with_another_static_header_reaches_the_proxy() -> None:

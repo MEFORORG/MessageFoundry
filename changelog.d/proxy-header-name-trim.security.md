@@ -5,6 +5,7 @@
   plus trailing whitespace would have reached a cleartext proxy, or the destination on a direct
   send, without a refusal. One function now reads the name: it ignores the letter case and every
   character at either end that a header name cannot hold. The message-metadata rule calls it
-  too. A connection's admission of its own `proxy_user` header covers the plain spelling only,
+  too, and so does the build-time refusal of a static `Proxy-Authorization` beside
+  `proxy_user`. A connection's admission of its own `proxy_user` header covers the plain spelling only,
   and the opener reads every matching header on a request, so one cannot hide another. The rule
   is stated on [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
