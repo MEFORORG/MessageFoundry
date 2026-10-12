@@ -333,7 +333,9 @@ The probe now tells an unreadable attribute (*undetermined*) apart from a set di
 "not found". ADR 0195 states when an undetermined account is struck and revoked and when it is held.
 A held account gets no revocation, is audited as `auth.ad_reconcile_held` and is alerted as
 `ad_reconcile_held`. The rest of the estate is reconciled as
-before. The breaker's settings, its AND and its floor are unchanged. What it counts changed in one
-way: held accounts are left out of the population it judges, so it weighs only what the pass could
-still revoke. A pass the breaker aborts still writes the `auth.ad_reconcile_held` row when it also
-holds.
+before. The breaker's settings, its AND and its floor are unchanged. *The next sentence was
+superseded on 2026-10-11 by ADR 0195's amendment of that date (BACKLOG #2138), and is kept as the
+record. Held accounts now stay in the population the breaker judges, so its count is every probe
+again.* What it counts changed in one way: held accounts are left out of the population it judges,
+so it weighs only what the pass could still revoke. A pass the breaker aborts still writes the
+`auth.ad_reconcile_held` row when it also holds.

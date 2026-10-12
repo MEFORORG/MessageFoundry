@@ -481,6 +481,14 @@ class _ScriptedFtp:
         self.files[toname] = self.files.pop(self._rnfr)
         return "250 Rename successful"
 
+    def pwd(self) -> str:
+        self.calls.append("PWD")
+        return "/"
+
+    def cwd(self, path: str) -> str:
+        self.calls.append(f"CWD {path}")
+        return "250 OK"
+
     def quit(self) -> str:
         return "221 Goodbye"
 
@@ -594,7 +602,7 @@ def test_ftp_refusal_stays_permanent_when_the_confirming_listing_fails(
     confirms nothing, so the ``553`` keeps its permanent class rather than becoming a retry."""
     ftp = _ScriptedFtp({"/in/.t.part": b"new"})
     ftp.rnto_reply = "553 Requested action not taken"
-    ftp.list_reply = "550 No files found"
+    ftp.list_reply = "550 Permission denied"
     ftp.listings_before_failure = 1
     with pytest.raises(_RemoteError) as caught:
         _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7"])
@@ -619,12 +627,48 @@ def test_ftp_publish_listing_failure_is_transient(monkeypatch: pytest.MonkeyPatc
     """A listing refused on the publish connection retries, as every send-path listing does (the
     #1936 rule), rather than dead-lettering a message whose temp is already written."""
     ftp = _ScriptedFtp({"/in/.t.part": b"new"})
-    ftp.list_reply = "550 No files found"
+    ftp.list_reply = "550 Permission denied"
     with pytest.raises(_RemoteError) as caught:
         _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7"])
     assert caught.value.permanent is False
     assert caught.value.connection_fault is False
     assert ftp.files == {"/in/.t.part": b"new"}
+
+
+def test_ftp_publish_reads_an_nlst_empty_reply_as_no_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    """An NLST-only server that answers ``550 No files found`` lists no names, once ``CWD``
+    confirms the directory, and the session is put back before ``RNFR``, so the publish goes on."""
+    ftp = _ScriptedFtp({"/in/.t.part": b"new"})
+    ftp.list_reply = "550 No files found"
+    assert _ftp_client(ftp, monkeypatch).publish("/in/.t.part", ["/in/msg.hl7"]) == "/in/msg.hl7"
+    assert ftp.files == {"/in/msg.hl7": b"new"}
+    assert ftp.calls == ["MLSD /in", "PWD", "CWD /in", "CWD /", "RNTO /in/msg.hl7"]
+
+
+class _UnquotedPwdFtp(_ScriptedFtp):
+    """A server whose ``PWD`` reply quotes no path, which ``ftplib`` reads as no home at all."""
+
+    def pwd(self) -> str:
+        self.calls.append("PWD")
+        return ftplib.parse257("257 /home is cwd")
+
+
+def test_ftp_publish_never_confirms_an_empty_dir_from_an_unquoted_pwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    """With no home to return to, ``CWD in`` would leave the session inside ``in``, and the
+    relative ``RNFR`` that follows would name ``in/in/.t.part``. So the ``NLST`` reply stands, the
+    listing fails transient as any refused publish listing does, and no ``CWD`` or ``RNTO`` runs."""
+    ftp = _UnquotedPwdFtp({"in/.t.part": b"new"})
+    ftp.list_reply = "550 No files found"
+    with pytest.raises(_RemoteError) as caught:
+        _ftp_client(ftp, monkeypatch).publish("in/.t.part", ["in/msg.hl7"])
+    assert caught.value.permanent is False
+    assert "No files found" in str(caught.value)
+    assert ftp.calls == ["MLSD in", "PWD"]
+    assert ftp.files == {"in/.t.part": b"new"}
 
 
 # === an SFTP rename whose outcome is unknown is never a collision ==============

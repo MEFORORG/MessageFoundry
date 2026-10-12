@@ -310,13 +310,15 @@ async def _oidc_login(
     service: AuthService,
     monkeypatch: pytest.MonkeyPatch,
     rsa_key: rsa.RSAPrivateKey,
+    *,
+    client: str | None = None,
     **claim_over: Any,
 ) -> LoginOutcome:
     """Run one federated login, stubbing the token exchange to return a freshly-minted id_token whose
     claims are ``_claims(**claim_over)`` (so a test can vary ``sub`` / ``preferred_username``)."""
     _stub_exchange(monkeypatch, _mint(rsa_key, _claims(**claim_over)))
     return await service.authenticate_oidc(
-        AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+        AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback", client=client
     )
 
 

@@ -41,6 +41,7 @@ from messagefoundry.transports.base import (
     SourceStartupError,
 )
 from messagefoundry.transports.file import (
+    DEFAULT_MAX_DECOMPRESSED_MEMBERS,
     DEFAULT_MAX_FILE_BYTES,
     FileDestination,
     FileSource,
@@ -1679,6 +1680,75 @@ async def test_file_source_quarantines_a_stream_over_the_gzip_member_cap(tmp_pat
     assert received == []
 
 
+async def test_file_source_member_cap_is_a_per_connection_setting(tmp_path: Path) -> None:
+    # BACKLOG #1129: a BGZF feed is one gzip member per 64 KiB block, so a drop well under the byte
+    # ceiling can hold more members than the default cap. `max_decompressed_members` raises it.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    members = DEFAULT_MAX_DECOMPRESSED_MEMBERS + 5
+    drop = gzip_compress(ADT.encode("utf-8")) + gzip_compress(b"") * (members - 1)
+    (inbox / "bgzf.hl7.gz").write_bytes(drop)
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.gz",
+                "poll_seconds": 0.01,
+                "decompress": "gzip",
+                "max_decompressed_members": members,
+            },
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: bool(received))
+    finally:
+        await src.stop()
+        await task
+    assert received == [ADT.encode("utf-8")]
+    assert not (inbox / ".error" / "bgzf.hl7.gz").exists()
+
+
+def test_file_source_member_cap_default_matches_the_codec() -> None:  # #1129
+    codec = inspect.signature(gzip_decompress).parameters["max_members"].default
+    # The File factory's default is pinned to the same constant in test_asvs_file_surface_inventory.
+    assert codec == DEFAULT_MAX_DECOMPRESSED_MEMBERS
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": "x"}))
+    assert src.max_decompressed_members == codec
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, DEFAULT_MAX_DECOMPRESSED_MEMBERS),
+        ("", DEFAULT_MAX_DECOMPRESSED_MEMBERS),
+        ("4096", 4096),
+    ],
+)
+def test_file_source_member_cap_reads_unset_and_string_values(
+    value: object, expected: int
+) -> None:  # #1129
+    # Unset takes the default; an uncast env() reference hands the connector text.
+    settings = {"directory": "x", "max_decompressed_members": value}
+    src = FileSource(Source(type=ConnectorType.FILE, settings=settings))
+    assert src.max_decompressed_members == expected
+
+
+@pytest.mark.parametrize("bad", [0, "0", 0.0, -1, "-1", 0.5, 1.9, "1.5", "many", True, False])
+def test_file_source_member_cap_refuses_zero_and_bad_values(bad: object) -> None:  # #1129
+    # The codec's member cap has no off switch, so zero is refused rather than read as "off".
+    settings = {"directory": "x", "max_decompressed_members": bad}
+    with pytest.raises(ValueError, match="max_decompressed_members"):
+        FileSource(Source(type=ConnectorType.FILE, settings=settings))
+
+
 async def test_file_source_quarantines_corrupt_archive(tmp_path: Path) -> None:
     # A file that isn't a valid gzip stream is quarantined to .error, never crashes the poller.
     inbox = tmp_path / "in"
@@ -1767,6 +1837,8 @@ def test_file_factory_carries_compression_knobs() -> None:
     assert spec.settings["compress"] == "gzip"
     assert spec.settings["decompress"] == "gzip"
     assert spec.settings["max_decompressed_bytes"] == 999
+    spec = File(directory="/tmp/x", decompress="gzip", max_decompressed_members=4096)
+    assert spec.settings["max_decompressed_members"] == 4096
 
 
 # --- file source: content_type-gated ingress (ADR 0004 / 0028) ---------------

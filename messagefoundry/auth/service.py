@@ -822,10 +822,12 @@ class Elevation:
     session_lost: bool = False
     recovery_codes: tuple[str, ...] = ()
     locked: bool = False
-    #: Set only by :meth:`AuthService.reauth`, on a session the federated login minted (BACKLOG #296,
+    #: Set by :meth:`AuthService.reauth`, on a session the federated login minted (BACKLOG #296,
     #: ADR 0142 Amendment B). Such a session steps up at the IdP, never by a password, so nothing was
     #: checked and nothing was charged. It qualifies the wrong-proof state: the token still
     #: authenticates, and the caller must send the operator to the IdP leg rather than re-prompt.
+    #: Set by :meth:`AuthService.verify_mfa` for the same reason, on such a session that has already
+    #: met its factor, before the code is read (BACKLOG #2142, ADR 0142 Amendment F).
     idp_step_up_required: bool = False
     #: Set by :meth:`AuthService.verify_mfa`, on a directory account the directory did not confirm
     #: as present and enabled, including when it could not be reached (BACKLOG #2023), or a row with
@@ -4230,7 +4232,8 @@ class AuthService:
 
         The session is born with NO step-up window, as every directory login's is: a federated proof
         is ambient. Its first window-gated action steps up at the IdP (``POST /ui/reauth/oidc``,
-        BACKLOG #296) unless a TOTP or recovery code at the MFA gate already stamped the window.
+        BACKLOG #296). A TOTP or recovery code at the MFA gate does not stamp its window (BACKLOG
+        #2142).
         :meth:`_complete_ad_login` decides that for every directory leg, and no caller overrides it.
 
         Roles come from ``resolve_principal`` — the same password-free LDAP lookup Kerberos uses —
@@ -5296,9 +5299,10 @@ class AuthService:
                 # ticket or a federated redirect is an AMBIENT proof, and seeding would let the
                 # engine's own login stamp satisfy `has_recent_step_up` for the whole
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
-                # window-gated action demands a real step-up: a directory re-bind for a `kerberos`
-                # session, the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG #296), or an engine
-                # TOTP or recovery code at the MFA gate, since `verify_mfa` stamps the window.
+                # window-gated action demands a real step-up: a directory re-bind or an engine TOTP
+                # or recovery code at the MFA gate for a `kerberos` session, since `verify_mfa`
+                # stamps the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
+                # #296, #2142).
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
                 # two Kerberos routes disagreed: `GET /ui/sso` passed False while `POST
@@ -6991,18 +6995,19 @@ class AuthService:
                 detail=_json({"reason": plan.aborted, "asked": plan.asked}),
             )
             return
-        # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
-        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row. A
-        # pass of referrals only never reaches here: it is not a trip (BACKLOG #2538).
+        # The ceiling is taken over the breaker's own denominator, which counts held probes (ADR
+        # 0195 amendment 2026-10-11, BACKLOG #2138). A pass of referrals only never reaches here: it
+        # is not a trip (BACKLOG #2538).
         ceiling = reconcile.breaker_ceiling(
             probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
             max_fraction=self._settings.ad_session_revoke_max_fraction,
         )
+        held_note = f" ({len(plan.held)} of them held)" if plan.held else ""
         self._reconcile_alert = (
             f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
             f"revoked more than {ceiling} of the {plan.judged} signed-in directory principals it "
-            f"judged ({len(plan.held)} held account(s) left out). No "
+            f"probed{held_note}. No "
             f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
             f"ad_bind_dn service account's read rights."
         )
@@ -7015,7 +7020,6 @@ class AuthService:
                 {
                     "reason": plan.aborted,
                     "probed": plan.probed,
-                    "judged": plan.judged,
                     "ceiling": ceiling,
                 }
             ),
@@ -9004,8 +9008,9 @@ class AuthService:
         ``[auth].step_up_max_age_seconds`` -- the gate for sensitive operations (ASVS 7.5.3).
 
         A LOCAL login that owes no second factor is the first verification. No directory login is:
-        Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5), and open one only
-        by a step-up or a code at the MFA gate."""
+        Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
+        opens one by a step-up or a code at the MFA gate, an OIDC session only by the IdP step-up
+        (BACKLOG #2142)."""
         if not token:
             return False
         session = await self._load_session(hash_token(token))
@@ -9132,7 +9137,8 @@ class AuthService:
           here, and the factor leg below writes for it;
         * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
           once the session has rotated, whether it finishes a sign-in or a step-up. Only
-          ``verify_mfa`` also moves the session's anchor (see :meth:`_same_host`);
+          ``verify_mfa`` also moves the session's anchor (see :meth:`_same_host`), and not on an
+          OIDC session, whose anchor moves only at the IdP (BACKLOG #2142);
         * a factor enrolment confirmed, first or later (``confirm_mfa_enrollment``,
           ``finish_webauthn_registration``); a first one is how a first sign-in under
           ``require_mfa`` finishes. Those callers pass the account as ``enrolment``, and an address
@@ -9827,6 +9833,14 @@ class AuthService:
         **A code that completes an MFA-pending session too soon after sign-in is refused** (BACKLOG
         #2301): see :meth:`_second_factor_too_early`.
 
+        **A good code opens no step-up window on a session the federated login minted** (BACKLOG
+        #2142, ADR 0142 Amendment F). It still marks a pending factor met and rotates the session,
+        but it neither stamps ``reauth_at`` nor re-anchors the session's address: that session steps
+        up, and moves its anchor, only at the IdP (:meth:`complete_oidc_step_up`). On such a session
+        that has already met its factor the code would do nothing, so it is refused unread with
+        ``idp_step_up_required`` (:meth:`_code_owes_nothing_to_oidc_session`). Every other
+        session's code opens the window as before.
+
         **A session whose temporary credential has lapsed is ended, not elevated** (BACKLOG #2298,
         ASVS 6.4.1). The route's gate already ends it through :meth:`identity_for_token`, but a
         request can pass that gate before the deadline and wait in the account's queue past it.
@@ -9844,6 +9858,12 @@ class AuthService:
         user = await self._load_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
             return Elevation()
+        # Asked before the lock, the floor and the directory check, and not again inside the queue.
+        # The IdP leg is refused by neither account lock, so it is the right answer for a locked
+        # account too. And no attempt ahead in the queue can make the session satisfied without
+        # rotating it, after which the re-read below finds no session.
+        if await self._code_owes_nothing_to_oidc_session(session, user, client=client):
+            return Elevation(idp_step_up_required=True)
         if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
             return Elevation(session_lost=True)
         if await self._mfa_lock_refused(user, client=client):
@@ -9853,7 +9873,8 @@ class AuthService:
         ):
             return Elevation()
         if user.auth_provider == AuthProvider.AD.value:
-            # BACKLOG #2023: a good code below renews the step-up window, so a DIRECTORY account must
+            # BACKLOG #2023: a good code below can renew the step-up window (on any session but an
+            # OIDC one, BACKLOG #2142) or meet a pending factor, so a DIRECTORY account must
             # still be in the directory before the code is even checked. Asked first, so a refusal
             # spends no TOTP step or recovery code and charges nothing to the lockout: the caller
             # did not guess wrong, the directory could not vouch for the account. This branch only
@@ -9895,26 +9916,34 @@ class AuthService:
                         token, fresh, client=client, factor_checked=True
                     ):
                         return Elevation(session_lost=True)
-                # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only
-                # then does the session rotate. Moving any of them after the rotation writes NOTHING
-                # and reports success — every session stamp UPDATE is rowcount-blind.
-                # The 2nd factor is now satisfied; also seed the step-up window (the session has
-                # completed password + MFA) and clear the failure counter. (Initial enrollment has no
-                # factor to verify, so this never fires there — keeping the enrollment step-up gate
-                # honest, WP-14.)
+                # ORDER-CRITICAL: this whole write group lands against the OLD hash, and only then
+                # does the session rotate. Moving any of them after the rotation writes NOTHING and
+                # reports success — every session stamp UPDATE is rowcount-blind.
+                # The 2nd factor is now satisfied; clear the failure counter, and on any session but
+                # an OIDC one also seed the step-up window (the session has completed password +
+                # MFA). (Initial enrollment has no factor to verify, so this never fires there —
+                # keeping the enrollment step-up gate honest, WP-14.)
                 async with self._sealed_stamp(hash_token(token)) as factor_stamp:
                     await self._store.mark_session_mfa_verified(hash_token(token))
-                # Re-anchor the session to the address that completed the second factor (parity with
-                # reauth), so an MFA-required admin who roamed clears the WP-L3-13 new-client-IP
-                # signal with one credential proof rather than being forced into a separate password
-                # step-up.
-                async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
-                    await self._store.mark_session_reauthed(hash_token(token), client=client)
-                if factor_stamp.refused or reauth_stamp.refused:
+                if factor_stamp.refused:
                     # BACKLOG #2592: the session failed its seal and has been ended. Nothing below
                     # may record a success for it.
                     return Elevation(session_lost=True)
-                self._restart_new_ip_dedupe(hash_token(token))
+                # BACKLOG #2142 (see the docstring): an OIDC session's window and anchor move only
+                # at the IdP. Seat decision under owner delegation 2026-10-08, not an owner ruling.
+                # Do NOT move the stamp out of this branch: tests/test_oidc_step_up.py pins the
+                # behaviour, and tests/test_docs_security_pathways.py pins the branch itself.
+                if session.auth_mechanism != SessionMechanism.OIDC.value:
+                    # Re-anchor the session to the address that completed the second factor (parity
+                    # with reauth), so an MFA-required admin who roamed clears the WP-L3-13
+                    # new-client-IP signal with one credential proof rather than being forced into a
+                    # separate password step-up.
+                    async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
+                        await self._store.mark_session_reauthed(hash_token(token), client=client)
+                    if reauth_stamp.refused:
+                        # BACKLOG #2592: as above, the session has been ended.
+                        return Elevation(session_lost=True)
+                    self._restart_new_ip_dedupe(hash_token(token))
                 await self._store.record_login_success(user.id, now=now)
                 await self._audit("auth.mfa_verified", actor=user.username, client=client)
                 elevation = await self._elevated(
@@ -9937,6 +9966,29 @@ class AuthService:
                 user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
             )
             return Elevation()
+
+    async def _code_owes_nothing_to_oidc_session(
+        self, session: SessionRecord, user: UserRecord, *, client: str | None
+    ) -> bool:
+        """Whether :meth:`verify_mfa` must refuse a code for an OIDC session that has already met
+        its factor, auditing the refusal if so (BACKLOG #2142, ADR 0142 Amendment F).
+
+        Such a code would complete nothing and, since #2142, open no window, so verifying it would
+        spend a TOTP step or a single-use recovery code for no effect. It is refused before the
+        code is read, as :meth:`reauth` refuses a password for the same session: no code is spent
+        and nothing is charged to the lockout, because the caller asked the wrong leg. The route's
+        own rate-limit budget has already been drawn. A pending
+        OIDC session is not refused here; its code still meets the factor. Seat decision under
+        owner delegation 2026-10-08, not an owner ruling."""
+        if session.auth_mechanism != SessionMechanism.OIDC.value or session.mfa_verified_at is None:
+            return False
+        await self._audit(
+            "auth.mfa_failed",
+            actor=user.username,
+            detail=_json({"reason": IDP_STEP_UP_REQUIRED}),
+            client=client,
+        )
+        return True
 
     async def _second_factor_too_early(
         self,

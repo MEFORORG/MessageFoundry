@@ -373,8 +373,10 @@ class AlertSink(Protocol):
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         """A held dual-control request was RELEASED by an approver whose account changed after the
-        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
-        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. It is
+        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``), or an
+        interrupted release was RESOLVED by such an account (BACKLOG #2125). The act went ahead:
+        this flags it and refuses nothing. ``name`` is ``approval:<approval id>`` for a release and
+        ``approval:<approval id>:resolve`` for a resolution, so each is its own instance. It is
         not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898),
         and the colon keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``.
@@ -885,8 +887,9 @@ class LoggingAlertSink:
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         log.warning(
-            "ALERT approval_approver_provenance: %s request %r was released by an approver whose "
-            "account changed after the request (%s)",
+            "ALERT approval_approver_provenance: %s request %r was released (key approval:<id>) "
+            "or resolved (key approval:<id>:resolve) by an account that changed after the "
+            "request (%s)",
             operation,
             name,
             ", ".join(changed),

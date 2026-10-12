@@ -1066,6 +1066,46 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     assert "`verify_mfa` calls `mark_session_reauthed`" in text, (
         "the step-up paragraph must say why a TOTP proved at the MFA gate opens a window."
     )
+    # BACKLOG #2142: verify_mfa stamps only under a branch on the session's mechanism, refuses a
+    # satisfied oidc session's code through one helper (so the "asks nothing" pin above still holds
+    # for every other session), and the paragraph says both.
+    guarded = [
+        n
+        for n in ast.walk(verify)
+        if isinstance(n, ast.If)
+        and any(
+            isinstance(a, ast.Attribute) and a.attr == "auth_mechanism" for a in ast.walk(n.test)
+        )
+        and any(_called(stmt, "mark_session_reauthed") for stmt in n.body)
+    ]
+    unguarded = [
+        stmt
+        for stmt in ast.walk(verify)
+        if isinstance(stmt, ast.Expr)
+        and _called(stmt, "mark_session_reauthed")
+        and not any(stmt in ast.walk(g) for g in guarded)
+    ]
+    assert guarded and not unguarded, (
+        "verify_mfa stamps reauth_at outside its auth_mechanism branch; the doc says an oidc code "
+        "opens no window."
+    )
+    assert _called(verify, "_code_owes_nothing_to_oidc_session"), (
+        "verify_mfa no longer refuses a satisfied oidc session's code; the doc says it does."
+    )
+    # The helper is where the factor-met read went, so pin that it is guarded by the mechanism too:
+    # widened to every session, it would make the "asks nothing" sentence false with no red.
+    helper = _service_func("_code_owes_nothing_to_oidc_session")
+    helper_attrs = {n.attr for n in ast.walk(helper) if isinstance(n, ast.Attribute)}
+    assert {"auth_mechanism", "OIDC", "mfa_verified_at"} <= helper_attrs, (
+        "the satisfied-session refusal no longer keys on the oidc mechanism; the doc says only an "
+        "oidc session's code is refused for an already-met factor."
+    )
+    assert "An `oidc` session's code opens no window" in text, (
+        "the step-up paragraph must say a TOTP opens no window on an oidc session (BACKLOG #2142)."
+    )
+    assert "`verify_mfa` does ask" in text, (
+        "the step-up paragraph must say verify_mfa refuses a satisfied oidc session's code."
+    )
 
 
 def _heading_block(heading: str) -> str:

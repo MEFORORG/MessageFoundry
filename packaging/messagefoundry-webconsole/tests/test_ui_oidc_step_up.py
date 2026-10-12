@@ -223,6 +223,26 @@ async def test_the_json_reauth_names_the_idp_leg_for_an_oidc_session(
         assert ldap.binds == []
 
 
+async def test_a_code_at_the_mfa_gate_for_a_satisfied_oidc_session_opens_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2142, ADR 0142 Amendment F: an OIDC session that already met its factor owes no
+    code, and a code opens no window for it. POST /ui/mfa sends it to /ui, as the GET does for any
+    satisfied session, with nothing rotated and no window opened."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        token = await _federated_sign_in(service, c, monkeypatch)
+        identity = await service.identity_for_token(token, activity=False)
+        assert identity is not None and await service.mfa_satisfied(token)
+        await service.store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
+        assert await service.store.enable_totp(identity.user_id, recovery_code_hashes=[])
+        r = await c.post("/ui/mfa", data={"code": "000000"}, headers=_SAME, follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/ui", r.headers
+        assert c.cookies.get("mf_session") == token, "nothing rotated, so the cookie must not move"
+        assert await service.identity_for_token(token, activity=False) is not None
+        assert not await service.has_recent_step_up(token)
+
+
 async def test_a_fresh_idp_sign_in_steps_the_session_up(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

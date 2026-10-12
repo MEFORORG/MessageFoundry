@@ -259,6 +259,25 @@ needs those settings first, each gated by `allowed_proxy`, and is left as a late
 
 Vault BACKLOG #2579.
 
+### Amendment C (2026-10-11) — the proxy gets a framing requirement, and an environment proxy is named
+
+An owner ruling of 2026-10-11 on BACKLOG #1125 grades each hop in the request chain by who owns it.
+A hop the engine wrote or contracted decides the verdict. A hop the operator deploys gets a framing
+requirement in the deployment documents. A proxy the environment supplies must not attach
+silently, or must be disclosed. This ADR's proxy is of the last two kinds.
+
+- **A `proxy_url` proxy is operator-deployed.** It now carries a framing requirement. For an
+  `https://` destination it only tunnels, so it has nothing to frame. For an `http://` destination,
+  or behind a TLS-inspecting proxy, it must not re-frame the engine's request, must refuse an
+  ambiguous partner reply, and must not reuse its partner connection after a reply it could not
+  frame. The rules are in [CONFIGURATION.md, `[egress]`](../CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries).
+- **An environment proxy is ambient, and `serve` now names it.** Amendment B kept the urllib
+  openers reading the environment, for the reason it gives. So the ruling's other branch applies:
+  `serve` and `supervise` each log one static WARNING at start, naming each proxy that is set and
+  the hops that may read one (`transports/ambient_proxy.py`, `tests/test_ambient_proxy_disclosure.py`).
+  It makes no per-hop claim. What it says, and the per-hop facts, are in
+  [CONFIGURATION.md](../CONFIGURATION.md#serve-names-an-environment-proxy-at-start).
+
 ## Deviations from the phase doc
 
 - **Proxy-auth dispatch lives in `transports/rest.py`, not `transports/http_auth.py`.** `smart.py`'s token

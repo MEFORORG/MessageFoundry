@@ -181,6 +181,12 @@ carries the recommended hardening for an exposed console (client-certificate dev
 `web_console_public_address`, the full startup ladder). It is maintainer-internal —
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
+**Your proxy must also refuse ambiguous request framing**, such as a request carrying both
+`Content-Length` and `Transfer-Encoding`, and send each body to the engine with one
+`Content-Length`. The engine cannot check this, because it sees only the proxy's hop. The full list
+of shapes and rules is in
+[DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses).
+
 ### Authentication at exposure
 
 Auth is always on. Remote users sign in with a local account, or a directory account through

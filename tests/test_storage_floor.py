@@ -265,11 +265,12 @@ async def test_the_runtime_check_skips_a_server_backend(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A store reporting a server backend is never probed, and the floor alone does not start the
-    runner there."""
+    runner there. The audit-log growth warning (BACKLOG #1421) is turned off: it ships on and
+    applies to every backend, so it would start the runner by itself."""
     calls: list[str] = []
     monkeypatch.setattr(shutil, "disk_usage", _fake_disk(1, calls))
     monkeypatch.setattr(store, "backend", StoreBackend.SQLSERVER)
-    runner = RetentionRunner(store, RetentionSettings(), clock=lambda: 1000.0)
+    runner = RetentionRunner(store, RetentionSettings(audit_log_warn_rows=0), clock=lambda: 1000.0)
     assert runner.enabled is False
     result = await runner.run_once()
     assert result.below_disk_floor is False
@@ -302,7 +303,9 @@ async def test_a_probe_that_raises_never_stops_the_purges(
 async def test_an_in_memory_store_has_no_disk_to_floor() -> None:
     mem = await MessageStore.open(":memory:")
     try:
-        assert RetentionRunner(mem, RetentionSettings()).enabled is False
+        # The audit-log growth warning (BACKLOG #1421) is off here for the reason given above.
+        off = RetentionSettings(audit_log_warn_rows=0)
+        assert RetentionRunner(mem, off).enabled is False
     finally:
         await mem.close()
 
