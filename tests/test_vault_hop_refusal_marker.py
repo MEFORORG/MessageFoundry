@@ -56,9 +56,12 @@ def _lines_building(path: Path, name: str) -> list[int]:
 
 
 def test_only_the_strict_reader_module_builds_the_marked_refusal() -> None:
+    modules = sorted(_PACKAGE.rglob("*.py"))
+    # 337 modules when this floor was set. A moved package or a changed glob leaves none to scan.
+    assert len(modules) >= 300, f"the walk found only {len(modules)} module(s) under {_PACKAGE}"
     elsewhere = {
         str(path.relative_to(_PACKAGE)): lines
-        for path in sorted(_PACKAGE.rglob("*.py"))
+        for path in modules
         if path != _HOME and (lines := _lines_building(path, _MARKER))
     }
     assert elsewhere == {}, f"{_MARKER} is built outside strict_requests.py: {elsewhere}"
@@ -139,9 +142,10 @@ def test_every_marked_refusal_is_built_from_fixed_text() -> None:
     tree = parse_source(_HOME.read_text(encoding="utf-8"))
     constants = _string_constants(tree)
     sites = call_sites(tree, _MARKER)
+    # 8 marked refusals when this floor was set. A scan that finds none has checked nothing.
+    assert len(sites) >= 6, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
     loose = [site.lineno for site in sites if not _is_fixed_text(site, constants)]
     assert loose == [], f"a marked refusal interpolates something at lines {loose}"
-    assert sites, "the scan saw no marked refusal at all"
     # The constants the sites use today are found, so the lookup is not passing on an empty set.
     assert {"_CLEARTEXT_VAULT_HOP", "_CLEARTEXT_PROXY_CREDENTIALS"} <= constants
 
