@@ -56,6 +56,7 @@ from messagefoundry.transports.base import (
     ReplyOutcome,
     SourceConnector,
     positive_cap,
+    refuse_non_count,
     register_source,
     wait_for_intake,
 )
@@ -615,6 +616,8 @@ def _header_cap(value: Any) -> int:
     ``not ... >= 1`` so NaN and a sub-1 value that would truncate to zero are refused as well."""
     if value is None or value == "":
         return DEFAULT_MAX_HEADER_BYTES
+    # True and 1.9 both pass the test below and would build a cap of 1 byte (BACKLOG #3431).
+    refuse_non_count(value, knob="max_header_bytes", transport="HTTP source")
     if not float(value) >= 1:
         raise ValueError(
             f"HTTP source max_header_bytes={value!r} must be a positive number of bytes; this cap "

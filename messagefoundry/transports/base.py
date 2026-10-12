@@ -132,12 +132,39 @@ def cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) 
     A negative value is therefore returned as-is, for the callers that refuse one at build with a
     message naming their own key; :func:`positive_cap` is that caller for most sites. It is a different
     mistake with a different answer, and folding it into "off" here would swallow the typo.
+
+    With ``convert=int`` this truncates: ``True`` and ``1.9`` both come back as 1. A caller reading an
+    ``int`` cap calls :func:`refuse_non_count` first, as :func:`positive_cap` and
+    :func:`resolve_poll_ceiling` do (BACKLOG #3431).
     """
     if value is None or value == "":
         return None
     if float(value) == 0:  # at least 0, 0.0, -0.0, False, "0", "0.0" and " 0 " reach this as off
         return None
     return convert(value)
+
+
+def refuse_non_count(value: Any, *, knob: str, transport: str) -> None:
+    """Refuse at build a value that ``int()`` would silently turn into a different count (BACKLOG #3431).
+
+    ``int(True)`` is 1 and ``int(1.9)`` is 1, so either one used to build a live cap of one byte or
+    one connection: a listener that refuses nearly everything, from a value nobody meant as a number.
+    Every reader of an ``int`` cap calls this before it converts, so a bool (either one: ``False`` is
+    not a spelling of "off" either), an infinity or a NaN is refused naming the key. A whole float such
+    as a ``2048.0`` is a count and passes.
+
+    **A fraction is refused here only from one up.** Below one it truncates to zero or less, and every
+    caller already refuses that with a range message of its own, which its tests pin. Refusing it here
+    first would change those messages and fix nothing."""
+    if isinstance(value, bool):
+        reason = "a count is not a bool"
+    elif isinstance(value, float) and not math.isfinite(value):
+        reason = "a count is a finite number"
+    elif isinstance(value, float) and not value.is_integer() and value >= 1:
+        reason = "a count is a whole number, and int() would truncate this one"
+    else:
+        return
+    raise ValueError(f"{transport} {knob}={value!r} is not a valid int value: {reason}")
 
 
 def positive_cap[NumT: (int, float)](
@@ -161,7 +188,12 @@ def positive_cap[NumT: (int, float)](
 
     ``off_hint`` ends the not-above-zero refusal. The default tells the operator how to turn the cap
     off. A caller where ``None``/``0`` does NOT turn it off passes its own text, so the refusal does not
-    point at an off switch that does not exist (the DICOM SCP's ``max_object_bytes``, BACKLOG #2103)."""
+    point at an off switch that does not exist (the DICOM SCP's ``max_object_bytes``, BACKLOG #2103).
+
+    An ``int`` cap first goes through :func:`refuse_non_count`, so a bool or a fraction above one is
+    refused rather than truncated into a cap of one (BACKLOG #3431)."""
+    if convert is int:
+        refuse_non_count(value, knob=knob, transport=transport)
     try:
         cap = cap_setting(value, convert)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -189,6 +221,7 @@ def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None
     # ``value`` is typed Any rather than object because every call site reads it out of an untyped
     # settings mapping; object would need a `type: ignore` on this line, and a suppression a reader
     # has to decide whether to trust is worse than the honest Any.
+    refuse_non_count(value, knob=knob, transport=transport)
     try:
         ceiling = cap_setting(value, int)
     except (TypeError, ValueError, OverflowError) as exc:

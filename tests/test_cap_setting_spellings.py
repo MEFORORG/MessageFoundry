@@ -25,7 +25,16 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Sftp
+from messagefoundry.config.wiring import (
+    _NAMED_CASTS,
+    MLLP,
+    ConnectionSpec,
+    DatabasePoll,
+    Http,
+    Sftp,
+    env,
+    resolve_env_settings,
+)
 from messagefoundry.transports import build_source, mllp
 from messagefoundry.transports.base import cap_setting, positive_cap, resolve_poll_ceiling
 from messagefoundry.transports.dicom import DicomScpSource, DicomScuDestination
@@ -310,3 +319,128 @@ def test_positive_cap_refuses_what_is_left_after_zero_reads_as_off() -> None:
     for bad_seconds in (-0.5, "-0.5", math.nan):
         with pytest.raises(ValueError, match="t k="):
             positive_cap(bad_seconds, float, knob="k", transport="t")
+
+
+# === an integer cap is a whole count (BACKLOG #3431) ==============================================
+
+
+def _database(over: dict[str, Any]) -> Any:
+    settings = DatabasePoll(server="db.example", database="d", poll_statement="SELECT 1").settings
+    return build_source(
+        Source(type=ConnectorType.DATABASE, settings={**settings, **over}),
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+#: (builder, settings key, attribute) for every cap read as an ``int`` count, whichever helper reads
+#: it: ``positive_cap``, ``resolve_poll_ceiling``, the MLLP listener's own ``cap_setting`` calls, and
+#: the two caps with no off switch (``max_header_bytes``, ``max_decompressed_members``).
+_INT_CAPS = [
+    pytest.param(_MLLP_IN, "max_connections", "max_connections", id="mllp-in-max_connections"),
+    pytest.param(
+        _MLLP_IN, "max_connections_per_host", "max_connections_per_host", id="mllp-in-per_host"
+    ),
+    pytest.param(_MLLP_IN, "max_frame_bytes", "max_frame_bytes", id="mllp-in-max_frame_bytes"),
+    pytest.param(_MLLP_IN, "max_inflight_frames", "max_inflight_frames", id="mllp-in-inflight"),
+    pytest.param(_MLLP_OUT, "max_frame_bytes", "max_frame_bytes", id="mllp-out-max_frame_bytes"),
+    pytest.param(_TCP_IN, "max_connections", "max_connections", id="tcp-in-max_connections"),
+    pytest.param(
+        _TCP_IN, "max_connections_per_host", "max_connections_per_host", id="tcp-in-per_host"
+    ),
+    pytest.param(_TCP_IN, "max_frame_bytes", "max_frame_bytes", id="tcp-in-max_frame_bytes"),
+    pytest.param(_TCP_OUT, "max_frame_bytes", "max_frame_bytes", id="tcp-out-max_frame_bytes"),
+    pytest.param(_X12_IN, "max_connections", "max_connections", id="x12-in-max_connections"),
+    pytest.param(
+        _X12_IN, "max_connections_per_host", "max_connections_per_host", id="x12-in-per_host"
+    ),
+    pytest.param(
+        _X12_IN, "max_interchange_bytes", "max_interchange_bytes", id="x12-in-max_interchange"
+    ),
+    pytest.param(
+        _X12_OUT, "max_interchange_bytes", "max_interchange_bytes", id="x12-out-max_interchange"
+    ),
+    pytest.param(_HTTP_IN, "max_connections", "max_connections", id="http-in-max_connections"),
+    pytest.param(
+        _HTTP_IN, "max_connections_per_host", "max_connections_per_host", id="http-in-per_host"
+    ),
+    pytest.param(_HTTP_IN, "max_body_bytes", "max_body_bytes", id="http-in-max_body_bytes"),
+    pytest.param(_HTTP_IN, "max_header_bytes", "max_header_bytes", id="http-in-max_header_bytes"),
+    pytest.param(_file, "max_file_bytes", "max_file_bytes", id="file-max_file_bytes"),
+    pytest.param(
+        _file, "max_decompressed_bytes", "max_decompressed_bytes", id="file-max_decompressed"
+    ),
+    pytest.param(
+        _file, "max_decompressed_members", "max_decompressed_members", id="file-max_members"
+    ),
+    pytest.param(_file, "poll_max_files", "poll_max_files", id="file-poll_max_files"),
+    pytest.param(_remote, "max_file_bytes", "_max_file_bytes", id="remote-max_file_bytes"),
+    pytest.param(_remote, "poll_max_files", "_poll_max_files", id="remote-poll_max_files"),
+    pytest.param(_database, "poll_max_rows", "_poll_max_rows", id="database-poll_max_rows"),
+    pytest.param(_SCP, "max_object_bytes", "_max_object_bytes", id="scp-max_object_bytes"),
+    pytest.param(_SCU, "max_object_bytes", "_max_object_bytes", id="scu-max_object_bytes"),
+]
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS)
+@pytest.mark.parametrize("bad", [True, False, 1.9, 2048.5, 0.5, -1, math.inf, math.nan])
+def test_an_integer_cap_refuses_a_bool_or_a_fraction(
+    build: Build, key: str, attr: str, bad: object
+) -> None:
+    """``int()`` turns ``True`` into 1 and ``1.9`` into 1, so before #3431 either one built a live
+    cap of one byte or one connection, a cap that refuses nearly everything. Each is a typo, so each
+    is a build error that names the key.
+
+    Red mutation: drop the ``refuse_non_count`` call from ``positive_cap``. Every ``True`` and
+    ``1.9`` case on a ``positive_cap`` site builds cleanly. ``0.5``, ``-1``, ``inf`` and ``nan`` were
+    already refused and stay as controls."""
+    del attr
+    with pytest.raises(ValueError, match=key):
+        build({key: bad})
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS)
+def test_an_integer_cap_accepts_a_whole_float_and_padded_text(
+    build: Build, key: str, attr: str
+) -> None:
+    """The control for the refusal above: a TOML ``2048.0`` is a whole count, and an uncast
+    ``env()`` reference hands over text such as ``" 7 "`` or ``"+5"``, which ``int()`` reads."""
+    assert getattr(build({key: 2048.0}), attr) == 2048
+    assert getattr(build({key: " 7 "}), attr) == 7
+    assert getattr(build({key: "+5"}), attr) == 5
+
+
+def _from_spec(spec: ConnectionSpec) -> Any:
+    return build_source(
+        Source(type=spec.type, settings=spec.settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+def test_the_reachable_spellings_are_refused_end_to_end() -> None:
+    """A ``connections.toml`` literal ``1.9`` or ``true`` on an integer key never reaches a connector:
+    ``_check_setting_types`` refuses it at load. Two routes do reach one, and both are pinned here.
+
+    A code-first factory call passes its keyword straight into the settings, and an ``env()``
+    reference cast to ``float`` or ``bool`` hands the connector exactly that type. A config module
+    is not type-checked, so the fraction is passed untyped, as one would arrive there."""
+    fraction: Any = 1.9
+    with pytest.raises(ValueError, match="max_frame_bytes"):
+        _from_spec(MLLP(port=0, max_frame_bytes=fraction))
+    with pytest.raises(ValueError, match="max_header_bytes"):
+        _from_spec(Http(port=0, max_header_bytes=True))
+    for cast, raw in ((float, "1.9"), (_NAMED_CASTS["bool"], "true"), (_NAMED_CASTS["bool"], "0")):
+        settings = resolve_env_settings(
+            {"port": 0, "max_connections": env("cap", cast=cast)}, {"cap": raw}
+        )
+        with pytest.raises(ValueError, match="max_connections"):
+            _TCP_IN({**settings, "framing": "stx_etx"})
+
+
+def test_the_bool_refusal_says_why() -> None:
+    """The message tells the operator what is wrong, not only which key."""
+    with pytest.raises(ValueError, match="a count is not a bool"):
+        positive_cap(True, int, knob="k", transport="t")
+    with pytest.raises(ValueError, match="whole number"):
+        positive_cap(1.9, int, knob="k", transport="t")
+    # A float cap is not a count, so a fraction is the whole point of it.
+    assert positive_cap(1.9, float, knob="k", transport="t") == 1.9

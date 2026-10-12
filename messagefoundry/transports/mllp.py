@@ -90,6 +90,7 @@ from messagefoundry.transports.base import (
     intake_open,
     positive_cap,
     probe_tcp_reachable,
+    refuse_non_count,
     register_destination,
     register_source,
     wait_for_intake,
@@ -1775,6 +1776,10 @@ class MLLPSource(SourceConnector):
         # through it, so there is one rule here rather than a per-key convention to look up. It lives
         # in transports/base.py now (BACKLOG #1872), where the raw-TCP, X12 and HTTP listeners read
         # their caps through `positive_cap` on top of it.
+        # `_cap_setting` truncates an int cap, so True and 1.9 would each build a cap of 1. The
+        # three int caps below refuse them first, naming the key (BACKLOG #3431).
+        for knob in ("max_connections", "max_connections_per_host", "max_frame_bytes"):
+            refuse_non_count(s.get(knob), knob=knob, transport="MLLP")
         self.max_connections: int | None = _cap_setting(
             s.get("max_connections", DEFAULT_MAX_CONNECTIONS), int
         )
