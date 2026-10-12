@@ -64,7 +64,7 @@ async def test_an_inflight_row_still_re_pends_with_its_event(store: MessageStore
     """The positive control for every test below: the status term must not stop a genuine retry."""
     mid, (oid,) = await _claimed(store, "OB1")
 
-    next_at = await store.mark_failed(oid, "boom", _RETRY, now=100.0)
+    next_at = (await store.mark_failed(oid, "boom", _RETRY, now=100.0)).retry_at
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value
@@ -76,7 +76,7 @@ async def test_a_late_worker_cannot_re_pend_a_done_row(store: MessageStore) -> N
     mid, (oid,) = await _claimed(store, "OB1")
     await store.mark_done(oid, now=101.0)  # the row finished while the late send was failing
 
-    next_at = await store.mark_failed(oid, "late failure", _RETRY, now=102.0)
+    next_at = (await store.mark_failed(oid, "late failure", _RETRY, now=102.0)).retry_at
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.DONE.value
@@ -135,7 +135,7 @@ async def test_a_swept_pending_row_takes_the_backoff_the_event_and_the_error(
     mid, (oid,) = await _claimed(store, "OB1")
     await _sweep(store, oid, now=101.0)
 
-    next_at = await store.mark_failed(oid, "late failure", _RETRY, now=102.0)
+    next_at = (await store.mark_failed(oid, "late failure", _RETRY, now=102.0)).retry_at
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value
@@ -181,7 +181,7 @@ async def test_a_successor_failure_after_the_late_re_pend_keeps_its_own_record(
     await store.claim_ready(now=101.0)  # the successor, attempts 2
     await store.mark_failed(oid, "late failure", _RETRY, now=102.0)
 
-    next_at = await store.mark_failed(oid, "successor failure", _RETRY, now=103.0)
+    next_at = (await store.mark_failed(oid, "successor failure", _RETRY, now=103.0)).retry_at
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value
@@ -199,9 +199,9 @@ async def test_a_second_retry_on_a_pending_row_moves_its_deadline_by_the_gap_onl
     the two calls, never earlier. A wake armed for the earlier deadline fires early, claims nothing,
     and the dispatcher's sweep backstop picks the row up at the new one: latency, not loss."""
     mid, (oid,) = await _claimed(store, "OB1")
-    first = await store.mark_failed(oid, "first", _RETRY, now=102.0)
+    first = (await store.mark_failed(oid, "first", _RETRY, now=102.0)).retry_at
 
-    second = await store.mark_failed(oid, "second", _RETRY, now=104.0)
+    second = (await store.mark_failed(oid, "second", _RETRY, now=104.0)).retry_at
 
     assert first == 107.0 and second == 109.0
     assert (await store.outbox_for(mid))[0]["next_attempt_at"] == 109.0
@@ -222,7 +222,7 @@ async def test_a_late_retry_lands_on_a_row_the_operator_replayed(store: MessageS
     assert await store.replay_dead(now=101.5) == 1
     policy = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=2)
 
-    next_at = await store.mark_failed(oid, "late failure", policy, now=102.0)
+    next_at = (await store.mark_failed(oid, "late failure", policy, now=102.0)).retry_at
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value
@@ -247,8 +247,10 @@ async def test_a_zero_multiplier_on_a_reset_row_does_not_raise(store: MessageSto
         max_attempts=None, backoff_seconds=5.0, backoff_multiplier=0.0, max_backoff_seconds=300.0
     )
 
-    assert await store.mark_failed(oid, "late failure", policy, now=102.0) == 107.0
-    assert await store.mark_batch_failed([oid], "late failure", policy, now=103.0) == 108.0
+    assert (await store.mark_failed(oid, "late failure", policy, now=102.0)).retry_at == 107.0
+    assert (
+        await store.mark_batch_failed([oid], "late failure", policy, now=103.0)
+    ).retry_at == 108.0
 
 
 async def test_the_dead_branch_is_unchanged(store: MessageStore) -> None:
@@ -257,7 +259,7 @@ async def test_the_dead_branch_is_unchanged(store: MessageStore) -> None:
     mid, (oid,) = await _claimed(store, "OB1")
     await store.mark_failed(oid, "boom", _RETRY, now=100.0)  # PENDING, not INFLIGHT, attempts 1
 
-    assert await store.mark_failed(oid, "boom", RetryPolicy(max_attempts=1), now=102.0) is None
+    assert (await store.mark_failed(oid, "boom", RetryPolicy(max_attempts=1), now=102.0)).dead == 1
 
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DEAD.value
 
@@ -268,7 +270,7 @@ async def test_a_batch_retry_skips_only_a_terminal_member(store: MessageStore) -
     mid, (a, b) = await _claimed(store, "OB1", "OB2")
     await store.mark_done(a, now=101.0)
 
-    next_at = await store.mark_batch_failed([a, b], "envelope failed", _RETRY, now=102.0)
+    next_at = (await store.mark_batch_failed([a, b], "envelope failed", _RETRY, now=102.0)).retry_at
 
     rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
     assert rows["OB1"]["status"] == OutboxStatus.DONE.value
@@ -285,7 +287,7 @@ async def test_a_batch_retry_re_pends_a_swept_member_with_the_rest(store: Messag
     mid, (a, b) = await _claimed(store, "OB1", "OB2")
     await _sweep(store, a, now=101.0)
 
-    next_at = await store.mark_batch_failed([a, b], "envelope failed", _RETRY, now=102.0)
+    next_at = (await store.mark_batch_failed([a, b], "envelope failed", _RETRY, now=102.0)).retry_at
 
     rows = await store.outbox_for(mid)
     assert {r["status"] for r in rows} == {OutboxStatus.PENDING.value}
@@ -299,7 +301,7 @@ async def test_a_batch_retry_with_every_member_terminal_writes_nothing(store: Me
     await store.mark_done(a, now=101.0)
     await store.mark_done(b, now=101.0)
 
-    next_at = await store.mark_batch_failed([a, b], "envelope failed", _RETRY, now=102.0)
+    next_at = (await store.mark_batch_failed([a, b], "envelope failed", _RETRY, now=102.0)).retry_at
 
     assert {r["status"] for r in await store.outbox_for(mid)} == {OutboxStatus.DONE.value}
     assert await _failed_events(store, mid) == 0
