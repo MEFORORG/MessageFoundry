@@ -1686,7 +1686,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
@@ -1805,7 +1805,7 @@ issuer. The engine applies a replaced file only when all three of these hold:
    same scope, signing key and critical extensions.
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
-what to do. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
+what to do. It also raises the `crl_reload_refused` alert described further down. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
 CRL fails its signature check under rule 2 is held back too. A start refuses it when the CRL names
 the CA's key and that key did not sign it, so fix that file. Otherwise a start loads it with a
 warning, and each handshake then decides. The next paragraphs say which is which.
@@ -1876,6 +1876,58 @@ A reload changes what the next full TLS handshake checks. An established connect
 again, nor is a session resumed from an earlier handshake. So a newly revoked partner that stays
 connected stays connected until it reconnects or you restart. Every reload stays in the hop's trust
 store. After `crl_max_reloads` reloads of one file, a hop refuses the next and asks for a restart.
+
+**A refused reload raises its own alert, `crl_reload_refused` (vault BACKLOG #2904).** The
+`cert_expiry` alert above speaks only once the copy a hop holds nears its `nextUpdate`. So the
+engine also alerts when it refuses a replaced file. Until the file is applied, a revocation added to
+it is not enforced on the hops that hold the old copy. Match the alert in a `[[alerts.rules]]` rule
+with `event_type = "crl_reload_refused"`. It does not depend on `warn_days`. With no `[alerts]`
+transport it is a WARNING in the log, beside the reload's ERROR.
+
+| Event field | What it holds |
+|---|---|
+| `connection` | `crl_reload:` and the CRL file's absolute path, case-folded on Windows. `@node:<node_id>` or `@shard:<id>` follows when several engine processes share the store, because each process holds its own TLS contexts. A path over 120 characters is cut to `~`, an 8-digit checksum, `~` and its last 110 characters. |
+| `path` | the file as configured |
+| `remedy_class` | a short token for what to do next; see the next table |
+| `stale_contexts` | how many running TLS contexts still held the old copy when the alert was raised |
+| `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
+| `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
+
+The event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
+it stays in the engine log, in the `crl_reload` ERROR line. Read that line before you act.
+
+| `remedy_class` | What to do |
+|---|---|
+| `fix_file` | Fix the file. A start would refuse it too. |
+| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. |
+| `bad_signature` | A CRL in the file fails its signature check under rule 2. The signature paragraphs above say when to fix the file and when a restart loads it. |
+| `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
+| `restart` | Restart the engine to apply the file. |
+| `no_issuer` | Restart the engine, or add the issuing intermediate CA to the hop's own CA file. |
+| `retry` | The engine tries again every pass. A restart applies the file now. |
+| `wait` | Wait. The engine applies the file once its CRL takes effect. Do not restart before then. |
+
+The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
+no remedy sentence.
+
+**One alert per file version.** The engine raises the alert when it first refuses a version of the
+file. It raises it again only when the file's bytes change or the reason does, which is the rule the
+ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
+applies: a second refused version inside `[alerts].realert_seconds` of the first updates the open
+alert and does not page again.
+
+**The alert resolves itself.** Its inverse, `crl_reload_applied`, pages nobody and cannot be a
+rule's `event_type`. The engine raises it once the refusal no longer stands on that process:
+
+- the file was applied to every hop that held an older copy;
+- the file was put back to the bytes those hops hold;
+- no hop holds the file any more.
+
+A file the engine cannot read resolves nothing, and neither does a reload pass that fails. The
+engine also resolves its open alerts when it stops, because a restart builds every hop from the
+file. An engine that dies without stopping leaves its alert open; resolve it in the alert list. A
+rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped
+event.
 
 Until a hop is current, the scan judges the copy it holds as well as the new file. So the alert does
 not clear on the file alone, and the alert's date can be the held copy's rather than the new file's.
