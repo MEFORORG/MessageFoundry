@@ -423,7 +423,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # OpenSSL-textual `notAfter` — the stdlib parser rather than a hand-rolled one. Read-only date
     # arithmetic on an ALREADY-VERIFIED cert: it builds no SSLContext, reads no key material, and makes
     # no trust decision (the chain was verified by the listener long before this runs).
-    "messagefoundry/pipeline/cert_expiry.py": frozenset({"ssl"}),
+    # BACKLOG #3176: before it advises a restart into a changed CA file, the scan judges the CRLs in
+    # it as a start judges a CRL setting. It loads those bytes into a scratch context
+    # (tls_policy.crl_scratch_context) to read the CA certificates OpenSSL takes from them, and checks
+    # each CRL's signature against those through pki.crl_signature_refusal. The scratch context is
+    # discarded: it serves no handshake and changes no hop's trust.
+    "messagefoundry/pipeline/cert_expiry.py": frozenset(
+        {"messagefoundry.config.tls_policy", "ssl"}
+    ),
     # BACKLOG #299: applies a replaced CRL file to the live TLS contexts that hold an older copy. It
     # loads CRL bytes into a scratch ssl.SSLContext (tls_policy.crl_scratch_context, which also proves
     # OpenSSL loads exactly the CRLs judged) to find any certificate before the live load, then
@@ -1211,7 +1218,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
-        {"key_cert:ssl.cert_time_to_seconds", "key_cert:via messagefoundry.pki"}
+        {
+            "key_cert:ssl.cert_time_to_seconds",
+            "key_cert:via messagefoundry.pki",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
     ),
     # BACKLOG #299: the running-hop CRL reload; the INVENTORY row above says what each token does.
     "messagefoundry/pipeline/crl_reload.py": frozenset(
