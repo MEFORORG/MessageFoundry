@@ -13,8 +13,8 @@ THE CONTRACT, both directions:
   ``==X.*`` wildcard) has a uv-ecosystem ``ignore`` entry whose range is exactly ``>=`` the version
   ``_cap_of`` derives from the package's tightest cap. Or the package is named in ``_EXEMPT``
   below, in the table it names, with its reason.
-* A package named in ``_EXEMPT`` must NOT have an entry. That is the must-not list: hvac's cap is
-  deliberately not mirrored, and pyproject.toml says why.
+* A package named in ``_EXEMPT`` must NOT have an entry. That is the must-not list, and each
+  package in it carries a pointer to where its reason is written.
 * Every uv ``ignore`` entry names a package that pyproject.toml caps. dependabot.yml says to lift a
   cap and delete its entry in the same PR; this is what makes that rule fail when skipped. It is
   also this test's positive control: a parser that found no caps would red on every real entry, so
@@ -65,10 +65,6 @@ _GROUP_PIN_REASON = (
 #: exact ``==`` pin. Read each reason where it points.
 _EXEMPT: dict[str, tuple[str, str]] = {
     **dict.fromkeys(_GROUP_PINS, (_GROUPS, _GROUP_PIN_REASON)),
-    "hvac": (
-        "[project.optional-dependencies].vault",
-        "pyproject.toml's comment above the [vault] extra says hvac is deliberately not mirrored",
-    ),
     "hatchling": (
         "[build-system].requires",
         "pyproject.toml's [build-system] comment expects Dependabot to bump this pin",
@@ -428,9 +424,9 @@ def test_the_checker_reds_on_a_broken_exemption(
     assert any(expect in p for p in problems), f"no violation mentioning {expect!r}: {problems}"
 
 
-@pytest.mark.parametrize("name", ["hvac", "hatchling"])  # explicit, so dropping one reds here
+@pytest.mark.parametrize("name", ["hatchling"])  # explicit, so dropping one reds here
 def test_a_named_exemption_must_not_have_an_entry(name: str) -> None:
-    """Mutation arm for the must-not list, over the real named exemptions (hvac, hatchling)."""
+    """Mutation arm for the must-not list, over the real named exemption (hatchling)."""
     pyproject, dependabot = _fixture()
     _uv_entry(dependabot)["ignore"].append({"dependency-name": name, "versions": [">=999"]})
     problems = _violations(pyproject, dependabot)
