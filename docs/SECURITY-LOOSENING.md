@@ -1557,7 +1557,13 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   connection secrets and the messages in flight. An application that builds the API without
   `serve` reports this, until something in it imports the command-line module, which installs
   the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  only if another audit hook refused the engine's.
+  in at least two cases. Both need an audit hook that something else added to the process first.
+  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
+  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
+  is there. The engine's hook is then in place and refuses a script, but the entry still reads
+  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
+  refusals. The interpreter reports each one on standard error, with the script's full path. The entry cannot tell the two cases apart, so read
+  it as the first, and look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's
