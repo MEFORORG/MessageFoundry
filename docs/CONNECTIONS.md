@@ -2904,6 +2904,12 @@ Every other MAC is refused, unencrypted bags or not, because it runs the passphr
 PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's default
 included. It also holds when the passphrase is empty, as in `cryptography`'s `NoEncryption` output.
 
+A key inside an encrypted part of the bundle is checked too (BACKLOG #1352). `cert import` opens
+each encrypted part with the passphrase and holds every key in it to the same floor before anything
+decrypts the key. To be opened, a part must use PBKDF2 and AES-CBC. OpenSSL 3's default export
+and the re-export command below write that. A part under scrypt, or under any other cipher, is
+refused. Other `-certpbe` choices, such as ARIA, Camellia or 3DES, are among those.
+
 The passphrase comes from `MEFOR_PFX_PASSWORD`. A bundle whose passphrase is empty needs that
 variable set to the empty string; unset means no passphrase. PowerShell and cmd cannot set an empty
 variable, so from those, re-export the bundle with a passphrase.

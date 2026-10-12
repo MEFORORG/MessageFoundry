@@ -142,6 +142,11 @@ EXACT_RULES: dict[str, str] = {
     # The same parse for a PKCS#12 bundle's MAC and bags, and for an SSH key's encryption header.
     "messagefoundry.keywrap.pkcs12_wrap_refusal": "key_cert",
     "messagefoundry.keywrap.ssh_key_encrypted": "key_cert",
+    # BACKLOG #1352: the second PKCS#12 step, for the key bags inside an encrypted part. pki hands
+    # each part's decrypted contents back to be judged; a loader that drops the judging call loses
+    # this token while keeping the cipher and kdf ones its decryption leaves.
+    "messagefoundry.keywrap.pkcs12_encrypted_parts": "key_cert",
+    "messagefoundry.keywrap.refuse_weak_pkcs12_contents": "key_cert",
 }
 
 #: Qualified-name PREFIXES, longest match wins. A prefix ends in ``.`` so ``hashlib.`` cannot match

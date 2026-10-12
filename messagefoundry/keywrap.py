@@ -31,16 +31,23 @@ PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC 
 MAC at the PBKDF2 floor passes, because any other MAC is keyed by the PKCS#12 KDF, which Appendix C
 does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
 encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
-passes. SSH keys cannot reach an approved derivation at all,
+passes. A key bag inside a PKCS#12 part that is itself encrypted is checked by the same bag rules
+in a SECOND step: the caller decrypts that part with the passphrase and hands it back
+(:func:`pkcs12_encrypted_parts`, :func:`refuse_weak_pkcs12_contents`). ``pki.load_pkcs12`` runs
+both steps; a loader that runs only the first does not cover the encrypted parts. A part this
+module cannot hand over, such as one under scrypt or a cipher other than AES-CBC, is refused.
+SSH keys cannot reach an approved derivation at all,
 so the SFTP connector refuses an encrypted one outright (:func:`ssh_key_encrypted`). A database
 driver's own client key is checked as a key file before the driver opens it, when ``odbc_params``
 names it with ``sslkey`` and the driver reads that keyword. A key the driver finds by itself is not
 checked, which on psqlODBC is every client key (BACKLOG #2423).
 
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
-cipher question, not a derivation one), the inside of a PKCS#12 part that is itself encrypted
-(reaching it already needs the passphrase), and any private-key loader this module is not called
-from. Read the list of callers as the coverage, and treat it as AT LEAST that list.
+cipher question, not a derivation one; the AES-CBC limit above is only what a PKCS#12 part must use
+to be opened and checked), and any private-key loader this module is not called from. The inside of
+a PKCS#12 part that is itself encrypted IS now checked, as above, wherever the caller runs the
+second step (BACKLOG #1352). Read the list of callers as the coverage, and treat it as AT LEAST
+that list.
 
 **Keep this a leaf.** It imports the standard library only, so ``apiclient`` and every transport
 can import it without crossing a package boundary. Its refusal text names the SETTING, never the key
@@ -62,14 +69,17 @@ from typing import Final
 __all__ = [
     "PBKDF2_MIN_ITERATIONS",
     "KeyWrapRefused",
+    "Pkcs12EncryptedPart",
     "key_wrap_refusal",
     "load_checked_cert_chain",
     "load_connection_cert_chain",
+    "pkcs12_encrypted_parts",
     "pkcs12_wrap_refusal",
     "refuse_weak_cert_chain_key",
     "refuse_weak_key_file",
     "refuse_weak_key_wrap",
     "refuse_weak_pkcs12",
+    "refuse_weak_pkcs12_contents",
     "ssh_key_encrypted",
 ]
 
@@ -261,21 +271,42 @@ def _pbes2_problem(buf: bytes, params: _Tlv | None) -> str | None:
     return "is wrapped with a key derivation this engine does not recognise"
 
 
-def _pbkdf2_problem(buf: bytes, params: _Tlv | None) -> str | None:
+@dataclass(frozen=True)
+class _Pbkdf2:
+    salt: _Tlv
+    iterations: int
+    key_length: int | None
+    prf: str | None  # None when the field is absent, which RFC 8018 reads as HMAC-SHA-1
+
+
+def _pbkdf2_fields(buf: bytes, params: _Tlv | None) -> _Pbkdf2:
+    """The fields of a PBKDF2-params block. The one reader for both the floor check and the
+    PKCS#12 part hand-over, so the two cannot disagree on what parses."""
     if params is None or params.tag != 0x30:
         raise _Malformed
     parts = _children(buf, params)
     if len(parts) < 2 or len(parts) > 4:
         raise _Malformed
     iterations = _uint(buf, parts[1])
+    key_length: int | None = None
     prf: str | None = None
     for extra in parts[2:]:
         if extra.tag == 0x02:
-            _uint(buf, extra)  # keyLength: read to prove it parses, not needed
+            key_length = _uint(buf, extra)
         elif extra.tag == 0x30:
             prf, _ = _algorithm(buf, extra)
         else:
             raise _Malformed
+    return _Pbkdf2(parts[0], iterations, key_length, prf)
+
+
+def _pbkdf2_problem(buf: bytes, params: _Tlv | None) -> str | None:
+    return _pbkdf2_fields_problem(_pbkdf2_fields(buf, params))
+
+
+def _pbkdf2_fields_problem(fields: _Pbkdf2) -> str | None:
+    """Why a parsed PBKDF2 block is refused, or ``None`` when it meets the floor."""
+    iterations, prf = fields.iterations, fields.prf
     if prf is None or prf == _HMAC_SHA1:
         default = " (the default when the prf field is absent)" if prf is None else ""
         return (
@@ -584,14 +615,9 @@ def _bags_problem(buf: bytes, safe_contents: _Tlv, depth: int) -> tuple[bool, st
     return encrypted, None
 
 
-def _pfx_problem(der: bytes) -> tuple[bool, str | None, str]:
-    """``(needs_passphrase, problem, remedy)`` for a PKCS#12 bundle: every bag and encrypted part,
-    then its MAC. A bundle needs a passphrase when anything in it is encrypted or it carries a MAC.
-    ``remedy`` is what the refusal tells the operator to do; it is kept apart from ``problem`` so
-    the text says what is wrong before it says what to do (BACKLOG #2456).
-
-    The bundle must be DER this reader can walk. ``cryptography`` falls back to BER, so a BER
-    bundle loads there; here it is refused as unreadable rather than passed unchecked."""
+def _pfx_layout(der: bytes) -> tuple[list[_Tlv], list[_Tlv] | None]:
+    """``(the PFX's fields, the authSafe's ContentInfo parts)``. The parts are ``None`` when the
+    authSafe is not plain Data, the only shape this reader walks."""
     outer = _read_tlv(der, 0, len(der))
     if outer.tag != 0x30:
         raise _Malformed
@@ -600,26 +626,49 @@ def _pfx_problem(der: bytes) -> tuple[bool, str | None, str]:
         raise _Malformed
     content_type, content = _content_info(der, parts[1])
     if content_type != _PKCS7_DATA:
+        return parts, None
+    return parts, _children(der, _octet_body(der, content))
+
+
+def _encrypted_content(buf: bytes, encrypted_data: _Tlv) -> tuple[_Tlv, _Tlv, _Tlv]:
+    """``(contentType, contentEncryptionAlgorithm, encryptedContent)`` of one EncryptedData value.
+    The one reader for both the outside check and the part hand-over, so the two agree on what
+    parses. A constructed ``[0]`` is BER, which DER forbids, and absent content has nothing to
+    check, so both are refused as unreadable."""
+    fields = _children(buf, encrypted_data)
+    if len(fields) != 2 or fields[0].tag != 0x02 or fields[1].tag != 0x30:
+        raise _Malformed
+    content_info = _children(buf, fields[1])
+    if len(content_info) != 3 or content_info[2].tag != 0x80:
+        raise _Malformed
+    return content_info[0], content_info[1], content_info[2]
+
+
+def _pfx_problem(der: bytes) -> tuple[bool, str | None, str]:
+    """``(needs_passphrase, problem, remedy)`` for a PKCS#12 bundle: every bag and encrypted part,
+    then its MAC. A bundle needs a passphrase when anything in it is encrypted or it carries a MAC.
+    ``remedy`` is what the refusal tells the operator to do; it is kept apart from ``problem`` so
+    the text says what is wrong before it says what to do (BACKLOG #2456).
+
+    The bundle must be DER this reader can walk. ``cryptography`` falls back to BER, so a BER
+    bundle loads there; here it is refused as unreadable rather than passed unchecked."""
+    parts, infos = _pfx_layout(der)
+    if infos is None:
         return (
             True,
             "is a PKCS#12 bundle protected in a way this engine does not recognise",
             _REEXPORT,
         )
     encrypted = False
-    for info in _children(der, _octet_body(der, content)):
+    for info in infos:
         info_type, info_value = _content_info(der, info)
         if info_type == _PKCS7_DATA:
             bags_encrypted, problem = _bags_problem(der, _octet_body(der, info_value), 0)
             encrypted = encrypted or bags_encrypted
         elif info_type == _PKCS7_ENCRYPTED_DATA:
             encrypted = True
-            encrypted_data = _children(der, info_value)
-            if len(encrypted_data) != 2:
-                raise _Malformed
-            content_info = _children(der, encrypted_data[1])
-            if len(content_info) < 2:
-                raise _Malformed
-            problem = _wrap_problem(der, *_algorithm(der, content_info[1]))
+            _, algorithm, _ = _encrypted_content(der, info_value)
+            problem = _wrap_problem(der, *_algorithm(der, algorithm))
             if problem is not None:
                 problem = f"has an encrypted part that {problem}"
         else:
@@ -661,7 +710,12 @@ def pkcs12_wrap_refusal(
     no passphrase. The MAC rules apply over clear bags too (BACKLOG #1352), and a bundle that
     carries a MAC needs a passphrase like an encrypted one. A clear bundle with no MAC passes with
     or without one. Same rules for the message as :func:`key_wrap_refusal`: the setting and the
-    reason, never the bundle's bytes."""
+    reason, never the bundle's bytes.
+
+    This reads the OUTSIDE only. A key bag inside an encrypted part is not seen here, so ``None``
+    is not enough to decrypt a key: a loader must also open each part and check it, with
+    :func:`pkcs12_encrypted_parts` and :func:`refuse_weak_pkcs12_contents`, as
+    ``pki.load_pkcs12`` does."""
     if _too_large(pfx):
         return (
             f"{setting}: the bundle is over {_MAX_KEY_FILE_BYTES} bytes, too large to check its "
@@ -693,12 +747,167 @@ def refuse_weak_pkcs12(
     unlock_setting: str,
     passphrase_given: bool,
 ) -> None:
-    """Raise :class:`KeyWrapRefused` when :func:`pkcs12_wrap_refusal` refuses ``pfx``."""
+    """Raise :class:`KeyWrapRefused` when :func:`pkcs12_wrap_refusal` refuses ``pfx``. The outside
+    only: see that function for the second step a loader owes the encrypted parts."""
     reason = pkcs12_wrap_refusal(
         pfx, setting=setting, unlock_setting=unlock_setting, passphrase_given=passphrase_given
     )
     if reason is not None:
         raise KeyWrapRefused(reason)
+
+
+# --- PKCS#12 parts that are themselves encrypted (BACKLOG #1352) --------------------------------
+#
+# A key bag inside an EncryptedData part cannot be read without the passphrase, so the outside
+# check above never sees it. This module stays a stdlib leaf, so it does not decrypt: it hands each
+# part's parameters to the caller (:func:`pkcs12_encrypted_parts`), which decrypts with the
+# passphrase, then judges the decrypted bags (:func:`refuse_weak_pkcs12_contents`). ``pki`` is that
+# caller. Opening the part rather than refusing it is design A, a Manager decision (M4,
+# 2026-10-10), not an owner ruling: OpenSSL 3's default export writes such a part, and so does
+# the :data:`_REEXPORT` command the refusals give.
+
+#: The PBES2 content ciphers a caller is handed, by OID, with their key length in bytes. Only
+#: AES-CBC: OpenSSL 3's export and ``cryptography`` write it, and a part under any other cipher is
+#: refused rather than passed to a library unchecked.
+_AES_CBC_KEY_BYTES: Final[Mapping[str, int]] = {
+    "2.16.840.1.101.3.4.1.2": 16,
+    "2.16.840.1.101.3.4.1.22": 24,
+    "2.16.840.1.101.3.4.1.42": 32,
+}
+
+_AES_BLOCK: Final = 16
+
+
+@dataclass(frozen=True)
+class Pkcs12EncryptedPart:
+    """One EncryptedData part of a PKCS#12 bundle, as PBES2 with PBKDF2 and AES-CBC.
+
+    ``prf`` is the PBKDF2 PRF's OID, always a key of :data:`PBKDF2_MIN_ITERATIONS`, and the part's
+    iterations already meet that row's floor. PBES2 inside PKCS#12 is keyed by the passphrase's
+    own bytes, not the BMPString form the legacy PKCS#12 KDF uses."""
+
+    salt: bytes
+    iterations: int
+    prf: str
+    key_length: int
+    iv: bytes
+    ciphertext: bytes
+
+
+class _CannotOpen(Exception):
+    """An EncryptedData part this module will not hand over for decryption. Carries a reason
+    phrase, never input bytes."""
+
+
+class _WeakPart(Exception):
+    """An EncryptedData part whose own derivation is under the floor. Carries the refusal phrase
+    :func:`_pbkdf2_problem` gives, never input bytes."""
+
+
+def _encrypted_part(buf: bytes, encrypted_data: _Tlv) -> Pkcs12EncryptedPart:
+    """The parameters and ciphertext of one EncryptedData value."""
+    content_type, algorithm, content = _encrypted_content(buf, encrypted_data)
+    if _oid(buf, content_type) != _PKCS7_DATA:
+        raise _CannotOpen("a content type other than Data")
+    scheme, params = _algorithm(buf, algorithm)
+    if scheme != _PBES2:
+        raise _CannotOpen("an encryption scheme other than PBES2")
+    if params is None or params.tag != 0x30:
+        raise _Malformed
+    pbes2 = _children(buf, params)
+    if len(pbes2) != 2:
+        raise _Malformed
+    kdf, kdf_params = _algorithm(buf, pbes2[0])
+    if kdf != _PBKDF2:
+        raise _CannotOpen("a key derivation other than PBKDF2")
+    cipher, iv = _algorithm(buf, pbes2[1])
+    key_bytes = _AES_CBC_KEY_BYTES.get(cipher)
+    if key_bytes is None:
+        raise _CannotOpen("a content cipher other than AES-CBC")
+    if iv is None or iv.tag != 0x04 or iv.end - iv.start != _AES_BLOCK:
+        raise _Malformed
+    fields = _pbkdf2_fields(buf, kdf_params)
+    # The floor is judged here too, not left to an earlier call: whatever the caller did first,
+    # nothing under the floor is handed over to be derived.
+    problem = _pbkdf2_fields_problem(fields)
+    if problem is not None:
+        raise _WeakPart(problem)
+    if fields.salt.tag != 0x04:
+        raise _Malformed  # the salt is the "specified" OCTET STRING; otherSource is not used
+    if fields.key_length is not None and fields.key_length != key_bytes:
+        raise _CannotOpen("a PBKDF2 key length that does not match its cipher")
+    if fields.prf is None:  # _pbkdf2_fields_problem refused this already; it narrows the type
+        raise _Malformed
+    return Pkcs12EncryptedPart(
+        salt=buf[fields.salt.start : fields.salt.end],
+        iterations=fields.iterations,
+        prf=fields.prf,
+        key_length=key_bytes,
+        iv=buf[iv.start : iv.end],
+        ciphertext=buf[content.start : content.end],
+    )
+
+
+def pkcs12_encrypted_parts(pfx: bytes, *, setting: str) -> list[Pkcs12EncryptedPart]:
+    """Every EncryptedData part of ``pfx``, for the caller to decrypt and hand to
+    :func:`refuse_weak_pkcs12_contents`. Call it after :func:`refuse_weak_pkcs12` passed: this
+    reads only the encrypted parts, not the MAC or the clear bags.
+
+    Raises :class:`KeyWrapRefused` for a part it will not hand over. That is at least: a PBKDF2
+    derivation under the floor, a derivation other than PBKDF2 (scrypt among them), a cipher other
+    than AES-CBC, a content type other than Data, a keyLength that disagrees with the cipher, and
+    a part it cannot parse. Failing closed, because the keys inside such a part could not be
+    checked."""
+    try:
+        _, infos = _pfx_layout(pfx)
+        if infos is None:
+            raise _Malformed
+        parts = []
+        for info in infos:
+            info_type, info_value = _content_info(pfx, info)
+            if info_type == _PKCS7_ENCRYPTED_DATA:
+                parts.append(_encrypted_part(pfx, info_value))
+    except _WeakPart as weak:
+        raise KeyWrapRefused(
+            f"{setting}: the bundle has an encrypted part that {weak}. It is refused. {_REEXPORT}"
+        ) from None
+    except _CannotOpen as why:
+        raise KeyWrapRefused(
+            f"{setting}: the bundle has an encrypted part with {why}, so this engine does not "
+            f"open it to check the keys inside it. It is refused. {_REEXPORT}"
+        ) from None
+    except _Malformed:
+        raise KeyWrapRefused(
+            f"{setting}: the bundle has an encrypted part this engine cannot read, so it cannot "
+            f"open it to check the keys inside it. It is refused. {_REEXPORT}"
+        ) from None
+    return parts
+
+
+def refuse_weak_pkcs12_contents(safe_contents: bytes, *, setting: str, unlock_setting: str) -> None:
+    """Raise :class:`KeyWrapRefused` when a decrypted EncryptedData part holds a key bag whose wrap
+    is refused, by the same rules as a bag in a clear part. Pure: it reads only ``safe_contents``.
+
+    Contents that do not parse as one DER SafeContents are refused too. A wrong passphrase usually
+    fails before this, at the padding, but now and then it leaves valid padding and lands here. So
+    that text names ``unlock_setting`` first, and offers no re-export: the bundle may be fine."""
+    problem: str | None = None
+    try:
+        whole = _read_tlv(safe_contents, 0, len(safe_contents))
+        if whole.end != len(safe_contents):
+            raise _Malformed
+        _, problem = _bags_problem(safe_contents, whole, 0)
+    except _Malformed:
+        raise KeyWrapRefused(
+            f"{setting}: an encrypted part of the bundle did not decrypt to anything this engine "
+            f"can read, so the keys inside it cannot be checked. It is refused. The likely cause "
+            f"is a wrong passphrase: check {unlock_setting}"
+        ) from None
+    if problem is not None:
+        raise KeyWrapRefused(
+            f"{setting}: the bundle has an encrypted part that {problem}. It is refused. "
+            f"{_REEXPORT}"
+        )
 
 
 # --- SSH keys -----------------------------------------------------------------------------------

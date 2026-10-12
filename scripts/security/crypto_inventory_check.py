@@ -410,7 +410,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # (pkcs12.load_key_and_certificates), the read-only cert inventory (x509 load + SAN/notAfter facts),
     # and self-signed dev-cert minting (EC P-256 CertificateBuilder + SHA-256). pipeline/cert_expiry.py's
     # `_inspect` delegates its load/notAfter/days path here too (read_cert_facts), so it no longer imports
-    # `cryptography` directly — this is the single cert-tooling crypto call site.
+    # `cryptography` directly — this is the single cert-tooling crypto call site. BACKLOG #1352:
+    # .pfx import also decrypts each PKCS#12 EncryptedData part (PBKDF2 + AES-CBC) so keywrap can
+    # check the key bags inside before the bundle loads.
     "messagefoundry/pki.py": frozenset({"cryptography"}),
     # BACKLOG #1748: hashlib = sha256 of a partner-chosen FILE NAME, so `safe_name` can put a short,
     # stable label in a log line where the cleartext name (which can embed an MRN) must never go. The
@@ -943,9 +945,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
+            # BACKLOG #1352: cert import opens a PKCS#12 bundle's encrypted parts through pki.
+            "cipher:via messagefoundry.pki",
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
+            "kdf:via messagefoundry.pki",
             "key_cert:via messagefoundry.api.tls",
             "key_cert:via messagefoundry.logging_setup",
             "key_cert:via messagefoundry.pki",
@@ -1249,6 +1254,18 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/sharding.py": frozenset({"hash:hashlib.sha256"}),
     "messagefoundry/pki.py": frozenset(
         {
+            # BACKLOG #1352: load_pkcs12 decrypts each PKCS#12 EncryptedData part (PBES2, PBKDF2
+            # over HMAC-SHA-256 or -512 at the floor keywrap already checked, AES-CBC) so keywrap
+            # can judge the key bags inside before load_key_and_certificates runs.
+            "cipher:cryptography.hazmat.primitives.ciphers.Cipher",
+            "cipher:cryptography.hazmat.primitives.ciphers.algorithms.AES",
+            "cipher:cryptography.hazmat.primitives.ciphers.modes.CBC",
+            "kdf:.derive()",
+            "kdf:cryptography.hazmat.primitives.kdf.pbkdf2.PBKDF2HMAC",
+            # The two keywrap calls that hand each part over and judge the bags inside. Dropping
+            # the judging call reds this row while the cipher and kdf tokens above stay.
+            "key_cert:messagefoundry.keywrap.pkcs12_encrypted_parts",
+            "key_cert:messagefoundry.keywrap.refuse_weak_pkcs12_contents",
             "key_cert:.private_bytes()",
             "key_cert:.public_bytes()",
             "key_cert:.public_key()",
