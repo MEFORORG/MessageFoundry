@@ -2205,9 +2205,10 @@ refuses.
 
 **A keep on a field the default rules scrub turns that scrub off.** A keep on `PID-5` leaves the
 patient name in the output as captured, whatever the keep was added for. A default-scrubbed field
-already counts as decided, so a keep on one never clears a refusal. `load_rules` logs a WARNING
-that names each such field. A process logs the same set of overlay warning lines once, not once
-per load. The line names the field and the kind of scrub it lost, never a value. A keep on a
+already counts as decided, so a keep on one never clears a refusal. `load_rules` logs one WARNING
+line for each such field, but not on every load. It remembers each set of lines it has logged in
+this process, and skips a set it remembers. The line names the field and the kind of scrub it
+lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.
 
