@@ -225,18 +225,30 @@ class _EntryScreen(NamedTuple):
     types: frozenset[str] | None
 
 
+#: Stands for an entry list whose items are not known when the ``FHIR()`` factory runs: an ``env()``
+#: with no default, which resolves only when the connection is built. It counts as set, and its items
+#: are checked by :class:`FhirDestination`, which sees the resolved list.
+DEFERRED_ENTRY_LIST: Any = object()
+
+
 def _allow_list(
     value: object, setting: str, valid: Callable[[str], bool], want: str
 ) -> frozenset[str]:
     """One operator-written allow-list, checked at construction: a non-empty list of valid strings.
-    The values are configuration, not message data, so a bad one is quoted."""
+    A bad item is named by its index, never quoted: the list can come from an ``env()``, and an
+    environment value is withheld from errors (BACKLOG #1183)."""
+    if value is DEFERRED_ENTRY_LIST:
+        return frozenset()
     if isinstance(value, str) or not isinstance(value, (list, tuple)):
         raise ValueError(f"FHIR destination {setting} must be a list, got {type(value).__name__}")
     if not value:
         raise ValueError(f"FHIR destination {setting} must not be empty")
-    for item in value:
+    for index, item in enumerate(value):
         if not isinstance(item, str) or not valid(item):
-            raise ValueError(f"FHIR destination {setting} items must each be {want}, got {item!r}")
+            raise ValueError(
+                f"FHIR destination {setting} items must each be {want}; item {index} is not "
+                "(value withheld)"
+            )
     return frozenset(value)
 
 
@@ -251,7 +263,8 @@ def entry_screen_settings(interaction: str, methods: object, types: object) -> _
     ignored, as ``update_url_form`` is. Raises ``ValueError``, as the other construction checks do.
 
     Pure. The ``FHIR()`` factory calls it too, so the loaded graph never holds a connection that
-    would not build."""
+    would not build. The factory passes :data:`DEFERRED_ENTRY_LIST` for an ``env()`` it cannot read
+    yet, and ignores what this returns."""
     if interaction not in _BUNDLE_INTERACTIONS:
         for setting, value in (("allowed_entry_methods", methods), ("allowed_entry_types", types)):
             if value is not None:

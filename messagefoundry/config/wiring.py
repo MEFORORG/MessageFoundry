@@ -3000,9 +3000,19 @@ def FHIR(
     # vault BACKLOG #2804: checked here as well as in FhirDestination, so the loaded graph cannot
     # hold a transaction/batch connection with no entry allow-list. Lazy, as the smart-scope
     # advisory's import of the same module is.
-    from messagefoundry.transports.fhir import entry_screen_settings
+    from messagefoundry.transports.fhir import DEFERRED_ENTRY_LIST, entry_screen_settings
 
-    entry_screen_settings(interaction, allowed_entry_methods, allowed_entry_types)
+    def load_time(value: object) -> object:
+        # An env() standing for the whole list: its default is what an unset key resolves to, so
+        # that is checked now. With no default its items are known only at build, where
+        # FhirDestination checks them; it still counts as set.
+        if isinstance(value, EnvRef):
+            return DEFERRED_ENTRY_LIST if value.default is _UNSET else value.default
+        return value
+
+    entry_screen_settings(
+        interaction, load_time(allowed_entry_methods), load_time(allowed_entry_types)
+    )
     return ConnectionSpec(
         ConnectorType.FHIR,
         {

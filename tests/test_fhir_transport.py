@@ -1544,3 +1544,65 @@ def test_a_feed_without_the_method_list_does_not_load(tmp_path: Any) -> None:
     cfg = _write_feed(tmp_path, f'outbound("OB_TXN", FHIR(url="{BASE}", interaction="batch"))\n')
     with pytest.raises((WiringError, ValueError), match="allowed_entry_methods"):
         load_config(cfg)
+
+
+@pytest.mark.parametrize("setting", ["allowed_entry_methods", "allowed_entry_types"])
+def test_a_whole_list_env_ref_is_checked_once_it_resolves(setting: str) -> None:
+    # The factory cannot see the items of an env() that stands for the whole list, so it lets the
+    # reference through and the connector checks the resolved list. A bad resolved item is refused.
+    from messagefoundry.config.wiring import env, resolve_env_settings
+
+    over: dict[str, object] = {"allowed_entry_methods": ["POST"], setting: env("entry_list")}
+    spec = FHIR(url=BASE, interaction="transaction", **over)  # type: ignore[arg-type]
+    good = "POST" if setting == "allowed_entry_methods" else "Patient"
+
+    def build(items: list[str]) -> object:
+        return build_destination(
+            Destination(
+                name="OB_FHIR",
+                type=ConnectorType.FHIR,
+                settings=resolve_env_settings(spec.settings, {"entry_list": items}),
+            ),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+    assert isinstance(build([good]), FhirDestination)
+    with pytest.raises(ValueError, match=f"{setting} items must each be") as ei:
+        build([good, f"Patient/{URL_CANARY}"])
+    # An environment value is withheld from the error; the item is named by its index.
+    assert "item 1 is not" in str(ei.value) and URL_CANARY not in str(ei.value)
+
+
+@pytest.mark.parametrize("setting", ["allowed_entry_methods", "allowed_entry_types"])
+@pytest.mark.parametrize(
+    ("default", "match"),
+    [
+        (["post/1"], "items must each be"),
+        ([], "must not be empty"),
+        ("POST", "must be a list"),
+    ],
+)
+def test_a_whole_list_env_ref_default_is_checked_at_load(
+    setting: str, default: object, match: str
+) -> None:
+    # The default is what an unset key resolves to, so the factory checks it at load.
+    from messagefoundry.config.wiring import env, resolve_env_settings
+
+    over: dict[str, object] = {
+        "allowed_entry_methods": ["POST"],
+        setting: env("entry_list", default=default),
+    }
+    with pytest.raises(ValueError, match=f"{setting} {match}"):
+        FHIR(url=BASE, interaction="transaction", **over)  # type: ignore[arg-type]
+    # Control: a good default loads, and an unset key resolves to it.
+    good = ["POST"] if setting == "allowed_entry_methods" else ["Patient"]
+    over[setting] = env("entry_list", default=good)
+    spec = FHIR(url=BASE, interaction="transaction", **over)  # type: ignore[arg-type]
+    assert resolve_env_settings(spec.settings, {})[setting] == good
+
+
+def test_a_method_list_env_ref_defaulting_to_none_is_a_missing_list() -> None:
+    from messagefoundry.config.wiring import env
+
+    with pytest.raises(ValueError, match="requires an 'allowed_entry_methods'"):
+        FHIR(url=BASE, interaction="batch", allowed_entry_methods=env("m", default=None))  # type: ignore[arg-type]
