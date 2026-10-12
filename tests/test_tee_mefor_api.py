@@ -136,10 +136,11 @@ _PROXY_VARS = (
 
 
 def _recording_handler(
-    seen: list[tuple[str, str | None]], reply: bytes
+    seen: list[tuple[str, str | None]], reply: bytes, redirect_to: str | None
 ) -> type[BaseHTTPRequestHandler]:
     """A handler that records each request line with its Authorization header, then answers
-    ``reply`` as JSON. A CONNECT is recorded and refused, so a tunnel attempt fails fast."""
+    ``reply`` as JSON, or a 302 to ``redirect_to`` when set. A CONNECT is recorded and refused, so
+    a tunnel attempt fails fast."""
 
     class _Recorder(BaseHTTPRequestHandler):
         def log_message(self, *args: Any) -> None:
@@ -147,6 +148,12 @@ def _recording_handler(
 
         def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler API
             seen.append((self.requestline, self.headers.get("Authorization")))
+            if redirect_to is not None:
+                self.send_response(302)
+                self.send_header("Location", redirect_to)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(reply)))
@@ -163,14 +170,15 @@ def _recording_handler(
 
 @contextmanager
 def _serving(
-    reply: bytes, *, tls: ssl.SSLContext | None = None
+    reply: bytes, *, tls: ssl.SSLContext | None = None, redirect_to: str | None = None
 ) -> Iterator[tuple[int, list[tuple[str, str | None]]]]:
     """A listener on 127.0.0.1 answering every GET with ``reply``; yields its port and what it saw."""
     seen: list[tuple[str, str | None]] = []
-    server = HTTPServer(("127.0.0.1", 0), _recording_handler(seen, reply))
+    server = HTTPServer(("127.0.0.1", 0), _recording_handler(seen, reply, redirect_to))
     if tls is not None:
         server.socket = tls.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    # A short poll, so shutdown() does not wait out the default half second.
+    thread = threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True)
     thread.start()
     try:
         yield server.server_port, seen
@@ -227,6 +235,22 @@ def test_off_box_engine_still_goes_through_the_env_proxy(monkeypatch: pytest.Mon
     ]
 
 
+def test_a_redirect_off_the_box_is_refused_not_followed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # urllib copies Authorization onto a redirect, and the new host is off-box, so following it
+    # would hand the token to the proxy after all.
+    off_box = "http://elsewhere.example.invalid/messages"
+    with (
+        _serving(_PROXY_REPLY) as (proxy_port, proxy_seen),
+        _serving(_ENGINE_REPLY, redirect_to=off_box) as (engine_port, engine_seen),
+    ):
+        _set_env_proxy(monkeypatch, proxy_port)
+        get = make_getter(f"http://127.0.0.1:{engine_port}", _TOKEN, timeout=5.0)
+        with pytest.raises(MeforApiError, match="HTTP 302"):
+            get(_PATH)
+    assert proxy_seen == []
+    assert len(engine_seen) == 1
+
+
 def _engine_tls(tmp_path: Path) -> tuple[ssl.SSLContext, ssl.SSLContext]:
     """A server context with a fresh self-signed pair for 127.0.0.1, and a client context whose
     only trust anchor is that certificate."""
@@ -266,6 +290,7 @@ def test_https_loopback_engine_is_direct_and_keeps_the_callers_tls_context(
         ("127.0.0.1", True),
         ("127.8.9.10", True),  # all of 127.0.0.0/8, not just the one literal
         ("::1", True),
+        ("::ffff:127.0.0.1", True),  # IPv4-mapped; ipaddress calls it loopback from Python 3.13
         ("localhost", True),
         ("LocalHost", True),
         ("", False),  # no host is not on-box

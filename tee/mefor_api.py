@@ -37,11 +37,9 @@ class MeforApiError(RuntimeError):
 def _is_loopback_host(host: str | None) -> bool:
     """Whether ``host`` names this box, read from the URL alone with no DNS lookup (BACKLOG #2708).
 
-    The engine's rule, copied because the tee imports no ``messagefoundry``: the name
-    ``localhost``, or an address :mod:`ipaddress` calls loopback, so all of ``127.0.0.0/8`` and
-    ``::1``. Any other name cannot be proven on-box without DNS, so it is not. A missing or empty
-    host is not on-box either. The source is ``is_never_proxied_host`` in
-    ``messagefoundry/transports/bounded_read.py``."""
+    A copy of ``is_never_proxied_host`` in ``messagefoundry/transports/bounded_read.py``, which says
+    which hosts that is. The tee imports no ``messagefoundry``, so it carries its own;
+    ``tests/test_tee_mefor_api.py`` holds the two equal."""
     if not host:
         return False
     host = host.lower()
@@ -71,6 +69,18 @@ class _LoopbackDirect(urllib.request.ProxyHandler):
         return super().proxy_open(req, proxy, type)
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect (BACKLOG #2708). urllib copies the ``Authorization`` header onto the new
+    request, so a 3xx to an off-box host would carry the token there, through any set proxy.
+    Returning ``None`` makes urllib raise the 3xx as an ``HTTPError``. The engine's openers do the
+    same (``NoRedirectHandler``)."""
+
+    def redirect_request(
+        self, req: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
 def make_getter(
     base_url: str,
     token: str,
@@ -84,7 +94,7 @@ def make_getter(
     base = base_url.rstrip("/")
     # A hand-built opener must be handed the context, or it uses the default trust store instead.
     opener = urllib.request.build_opener(
-        _LoopbackDirect(), urllib.request.HTTPSHandler(context=ssl_context)
+        _LoopbackDirect(), _RefuseRedirect(), urllib.request.HTTPSHandler(context=ssl_context)
     )
 
     def get(path: str) -> dict[str, Any]:
