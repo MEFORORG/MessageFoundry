@@ -151,6 +151,7 @@ __all__ = [
     "drain_bounded",
     "hop_identity",
     "is_never_proxied_host",
+    "is_proxy_credential_header_name",
     "read_2xx_reply_text",
     "read_bounded",
     "read_bounded_text",
@@ -859,7 +860,11 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
 
     **Outside this check**, at least:
 
-    * A proxy credential carried in any header but ``Proxy-Authorization``.
+    * A proxy credential carried in any header but ``Proxy-Authorization``. The name is read in
+      any letter case and with whitespace around it, by :func:`is_proxy_credential_header_name`.
+    * A header named with trailing whitespace, on a ``CONNECT`` tunnel through a handler that
+      admits caller-set headers. urllib moves only the exact name into the ``CONNECT``, so that
+      header stays on the request sent inside the tunnel.
     * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
       trusts, so a context on the system store accepts any publicly trusted certificate for the
       proxy's host.
@@ -955,16 +960,31 @@ def _is_from_a_proxy_url(
     )
 
 
+def is_proxy_credential_header_name(name: str) -> bool:
+    """Whether ``name`` is the ``Proxy-Authorization`` header, in any letter case and with any
+    whitespace around it.
+
+    The one reading of that name, so the rules that ask the question cannot drift apart.
+    ``http.client`` sends a name that ends in a space or a tab as it is written, and a proxy may
+    read it as the plain name. Only whitespace is removed, as ``str.strip`` defines it. A name that
+    differs in any other way is another header, which the rule on
+    :class:`ProxyCredentialsRefusedError` leaves out.
+    """
+    return name.strip().lower() == "proxy-authorization"
+
+
 def _proxy_credential_header(req: urllib.request.Request) -> str | None:
-    """The ``Proxy-Authorization`` value on ``req``, read in any letter case, or ``None``.
+    """The ``Proxy-Authorization`` value on ``req``, or ``None``. The name is read by
+    :func:`is_proxy_credential_header_name`.
 
     urllib stores a header under ``str.capitalize()`` of its name, but ``do_open`` sends every
-    header it holds, so a key stored in another case would still reach the wire. The unredirected
-    headers are read first because ``do_open`` lets them win over a header of the same name.
+    header it holds, so a key stored in another case would still reach the wire. So would one
+    stored with trailing whitespace. The unredirected headers are read first because ``do_open``
+    lets them win over a header of the same name.
     """
     for headers in (req.unredirected_hdrs, req.headers):
         for name, value in headers.items():
-            if name.lower() == "proxy-authorization":
+            if is_proxy_credential_header_name(name):
                 return str(value)
     return None
 

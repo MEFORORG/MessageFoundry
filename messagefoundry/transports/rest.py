@@ -87,6 +87,7 @@ from messagefoundry.transports.bounded_read import (
     drain_bounded,
     hop_identity,
     is_never_proxied_host,
+    is_proxy_credential_header_name,
     read_2xx_reply_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -258,7 +259,7 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        if name.lower() in ("authorization", "proxy-authorization"):
+        if name.lower() == "authorization" or is_proxy_credential_header_name(name):
             # Auth is connection-configured only: a message never sets or overrides it. A proxy
             # handler's admission covers the connection's own proxy_user header, so a message must
             # not be able to supply one (vault BACKLOG #3416).
