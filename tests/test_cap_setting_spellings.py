@@ -220,6 +220,19 @@ def test_max_header_bytes_refuses_zero_in_either_spelling() -> None:
     assert _HTTP_IN({"max_header_bytes": "4096"}).max_header_bytes == 4096
 
 
+def test_max_decompressed_members_refuses_zero_in_either_spelling() -> None:
+    """The File source's gzip member cap cannot be switched off either (BACKLOG #1129): the codec's
+    ``max_members`` has no ``None``. Zero in any spelling refuses; unset, ``None`` and ``""`` take the
+    default rather than meaning "off"."""
+    for zero in (0, "0", 0.0):
+        with pytest.raises(ValueError, match="max_decompressed_members"):
+            _file({"max_decompressed_members": zero})
+    default = _file({}).max_decompressed_members
+    assert _file({"max_decompressed_members": None}).max_decompressed_members == default
+    assert _file({"max_decompressed_members": ""}).max_decompressed_members == default
+    assert _file({"max_decompressed_members": "4096"}).max_decompressed_members == 4096
+
+
 # === the poll ceiling ==============================================================================
 
 
