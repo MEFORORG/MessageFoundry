@@ -76,7 +76,9 @@ its address, its proxy, its TLS leg or its pool, raises
 built or before a send. A refusal of the REPLY is an
 :class:`~messagefoundry.transports.bounded_read.EgressReplyError`. Both carry fixed text only, and
 :func:`vault_failure_text` is how the providers' catch-all handlers keep that text rather than
-shrinking it to a type name.
+shrinking it to a type name. A CA that a TLS leg will not load is not one of these. It raises
+``urllib3``'s ``SSLError``, as a failed CA load always has, whether OpenSSL refused the CA or the
+connection refused CA text with an encryption header first (BACKLOG #3090).
 """
 
 from __future__ import annotations
@@ -99,6 +101,7 @@ import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
+from messagefoundry.auth.trust_anchors import _has_encryption_header
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     enforce_insecure_hop,
@@ -224,6 +227,7 @@ def _narrowed_pool_classes(
                     f"{connector} would open a TLS session that verifies no peer; "
                     "refusing to connect"
                 )
+            self._refuse_encrypted_ca_text()
             self._mefor_proxy_context = self._narrow_the_proxy_leg()
             self.ssl_context = factory()
             super().connect()
@@ -232,8 +236,49 @@ def _narrowed_pool_classes(
                 # leg's SSLSocket, which it names `socket`.
                 self._check_the_proxy_leg(getattr(self.sock, "socket", None))
 
+        def _refuse_encrypted_ca_text(self) -> None:
+            """Refuse CA text with an encryption header before either TLS leg loads it (#3090).
+
+            A ``str`` ``ca_cert_data`` is PEM text, and two calls load it, both as
+            ``load_verify_locations(ca_certs, ca_cert_dir, ca_cert_data)``. urllib3 loads it for the
+            Vault leg of every connection, and :meth:`_narrow_the_proxy_leg` loads it for the leg to
+            an ``https://`` proxy. A ``Proc-Type: 4,ENCRYPTED`` block in that text sends OpenSSL to
+            a password prompt. Measured: that call shape wrote the prompt, and was still waiting
+            when its process was killed. So the text first goes through the check ``anchor_cadata``
+            uses, ``trust_anchors._has_encryption_header``, and a flagged text raises the urllib3
+            error that a failed CA load raises on either leg. ``bytes`` are DER, which has no PEM
+            header: measured, the same text as ``bytes`` refused at once. Nothing the engine ships
+            sets ``ca_cert_data`` today, since requests and hvac never pass it, so this guards a
+            later caller.
+
+            **A CA file is not checked, because the load itself refuses it.** ``ca_certs`` is a
+            path. Measured, a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised
+            ``PEM lib`` at once and wrote no prompt. A check here would also open the file twice.
+            ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
+            and terminal conditions, and pins them on each platform CI runs.
+
+            **A CA directory is NOT measured, and it is not refused.** ``ca_cert_dir`` reaches
+            OpenSSL as ``capath``. OpenSSL reads a directory's files when it verifies a peer, not
+            when the directory is named, and whether an encrypted block in one of them can prompt
+            during a handshake has not been measured on any platform. A directory does reach both
+            loads today. With neither ``MEFOR_STORE_VAULT_CA_FILE`` nor
+            ``MEFOR_SECRETS_VAULT_CA_FILE`` set, the CA is whatever hvac reads from ``VAULT_CAPATH``
+            or requests reads from ``REQUESTS_CA_BUNDLE`` or ``CURL_CA_BUNDLE``, and requests passes
+            a directory on as ``ca_cert_dir``. So a refusal here would break a hop that works, and
+            the directory is loaded as before."""
+            if isinstance(self.ca_cert_data, str) and _has_encryption_header(self.ca_cert_data):
+                # Fixed text: it names no part of the CA text it refuses.
+                raise urllib3.exceptions.SSLError(
+                    f"{connector}: the CA text for this hop holds a PEM block with an encryption "
+                    "header (Proc-Type or DEK-Info). Loading it can make the TLS library wait for "
+                    "a password; refusing to load it (BACKLOG #3090)"
+                )
+
         def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:
-            """Give the TLS leg to an https proxy its own context, or ``None`` if it has none."""
+            """Give the TLS leg to an https proxy its own context, or ``None`` if it has none.
+
+            :meth:`_refuse_encrypted_ca_text` has already run, and says what this load is and is
+            not protected from."""
             if (
                 self.proxy is None
                 or self.proxy.scheme != "https"
