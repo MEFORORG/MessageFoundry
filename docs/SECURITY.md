@@ -1154,6 +1154,20 @@ replacement:
   at once (`/raw`, attachments, `/ui/messages/{id}/body`, a one-id `/messages/export`), and the
   route gates on `/outbound` and the `/responses` body stay as a second line. No deployment exists,
   so no stored role is broken by the change.
+  *Decided 2026-10-12, vault BACKLOG #2727, by the maintainers and not by an owner ruling:* the
+  rule is judged **per role**, and it stays that way. A `view_raw` role meant to pair with another
+  role's `view_summary` is refused, even for a user who would hold both roles. That cost is
+  accepted. A role is the unit an administrator grants, so such a role could later be assigned
+  alone. The premise is that every identity is built from whole roles: the built-in ones, plus
+  each custom role's decoded set. `Identity.build` has at least three callers, two in
+  `AuthService` and the embedder's system identity in `api/security.py`, and each passes whole
+  roles. While that holds and no role has the shape, no merged identity has it either.
+  `Identity.build` itself does not check this and no test pins its callers, so a caller that
+  hands it a narrowed permission set would break the premise. A rule on the merged identity
+  would need a check wherever a role reaches a user, at least each role assignment and each
+  directory group mapping. `raw_body_without_summary` in
+  [`auth/permissions.py`](../messagefoundry/auth/permissions.py) is the one predicate, and
+  `tests/test_custom_roles.py` pins the per-role answer.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
   a forbidden value that somehow reached storage is dropped.
@@ -2325,7 +2339,9 @@ route, and it would also refuse an honest directory approver whose engine row is
 sign-in.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
-flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
+flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves
+either out is named as a security loosening (vault BACKLOG #3123);
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what that gives up. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
 and do not satisfy this control.)
 
@@ -2801,8 +2817,9 @@ identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
 **rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
-opt-out**: when the instance is **exposed** (an off-loopback bind, or a declared TLS-terminating
-proxy, `[api].tls_terminated_upstream`) with `require_mfa` *turned off*, `serve` makes the
+opt-out**: when the instance is **exposed** (an off-loopback bind, a declared TLS-terminating
+proxy (`[api].tls_terminated_upstream`), or a set `[api].trusted_proxies`; vault BACKLOG #2251)
+with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** under `[security].enforcement = enforce`, the
 default in every environment, and **warns** otherwise or where
 `[security].allow_single_factor_admin_when_exposed` is set, mirroring the keyless-store and
@@ -3128,16 +3145,22 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The policy is applied** — `tests/test_field_authz_enforcement_sites.py` hits the redaction
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
-  `monitoring:diagnose` without it for the alert list). That `view_raw` role is one minting now
-  refuses (see [Custom roles](#custom-roles-adr-0045)), so this test lifts the pairing rule alone
-  to reach the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated
-  property comes back `null`. A companion assertion checks that an administrator sees all
-  fifteen, matched **per model, not per property name**, so the negative cannot pass vacuously.
-  That distinction is load-bearing: keyed on names, `last_error` looked covered by
-  `DeadLetterRow.last_error` on
-  `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
-  outbox row carries a non-null `last_error` is the dead-lettered one and its detail route was not in
-  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
+  `monitoring:diagnose` without it for the alert list). Minting now refuses that `view_raw` role
+  (see [Custom roles](#custom-roles-adr-0045)). So this test lifts the pairing rule alone to reach
+  the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated property
+  comes back `null`. It also reads each surface as an administrator, and checks two things there
+  (vault BACKLOG #2727). The administrator sees a gated value on that surface. And for each
+  model, the restricted response holds at least as many objects as the administrator saw carrying
+  one. So a surface that returns the restricted caller fewer objects of a model than that now
+  fails, where before it passed with nothing checked. That is a count per model. It does not
+  match object to object, so a surface that swaps the carrying rows for as many others of the
+  same model still passes. A companion assertion checks that an administrator sees all fifteen
+  across the surfaces, matched **per model, not per property name**. That distinction is
+  load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
+  `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message
+  whose outbox row carries a non-null `last_error` is the dead-lettered one and its detail route
+  was not in the surface list. It is now, and the coverage assertion is keyed on
+  `(model, property)` pairs.
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`

@@ -1018,12 +1018,20 @@ def test_the_oidc_flow_cache_cap_is_not_named_without_oidc() -> None:
 
 # --- [approvals]: the dual-control dwell floor and expiry ceiling (BACKLOG #2489) -------------------
 
-_HELD = ["dead_letter_replay"]
+#: The name the narrowed-list entry carries (vault BACKLOG #3123). Qualified, because a bare
+#: ``operations`` says nothing in a list of switches.
+_OPS = "approvals.operations"
 
 
 def _approvals(**over: float) -> ApprovalsSettings:
-    """Dual control ON with one held operation, so its limits are live."""
-    return ApprovalsSettings(enabled=True, operations=_HELD, **over)
+    """Dual control ON with the default operations held, so its limits are live and the held list
+    itself is not a loosening (vault BACKLOG #3123)."""
+    return ApprovalsSettings(enabled=True, **over)
+
+
+def _approval_risks(approvals: ApprovalsSettings) -> dict[str, str]:
+    """Switch name -> risk text for an ``[approvals]`` section, every other input at default."""
+    return dict(_pairs(approvals=approvals))
 
 
 @pytest.mark.parametrize(
@@ -1060,16 +1068,16 @@ def test_the_approval_limits_are_not_named_while_dual_control_holds_nothing() ->
     third call is the control: the same values with an operation held are named."""
     off = ApprovalsSettings(min_dwell_seconds=0.0, expiry_hours=0.0)
     assert _names(approvals=off) == []
+    # The empty list is named for itself (vault BACKLOG #3123). Its limits bind nothing, so they
+    # are still not named.
     no_ops = ApprovalsSettings(enabled=True, operations=[], min_dwell_seconds=0.0, expiry_hours=0.0)
-    assert _names(approvals=no_ops) == []
+    assert _names(approvals=no_ops) == [_OPS]
     held = _approvals(min_dwell_seconds=0.0, expiry_hours=0.0)
     assert _names(approvals=held) == ["min_dwell_seconds", "expiry_hours"]
 
 
 def test_the_approval_entries_say_off_at_zero_and_quote_a_looser_value() -> None:
-    def risks(approvals: ApprovalsSettings) -> dict[str, str]:
-        return dict(_pairs(approvals=approvals))
-
+    risks = _approval_risks
     off = risks(_approvals(min_dwell_seconds=0.0, expiry_hours=0.0))
     assert "the moment it is made" in off["min_dwell_seconds"]
     assert "never expires" in off["expiry_hours"]
@@ -1100,6 +1108,144 @@ async def test_posture_route_reports_the_approval_dwell_the_app_was_built_with(
     assert {"min_dwell_seconds", "expiry_hours"} <= set(loose)
     default = await switches()
     assert "min_dwell_seconds" not in default and "expiry_hours" not in default
+    # Vault BACKLOG #3123: the same route names a narrowed operations list.
+    assert _OPS not in loose and _OPS not in default
+    narrowed = await switches(_held(["dead_letter_replay"]))
+    assert _OPS in narrowed
+
+
+# --- [approvals].operations: a default operation left out of dual control (vault BACKLOG #3123) ----
+
+#: What ``[approvals].operations`` holds when the operator writes no list, read off the model.
+_DEFAULT_HELD: list[str] = ApprovalsSettings().operations
+
+
+def _held(operations: list[str], *, enabled: bool = True) -> ApprovalsSettings:
+    return ApprovalsSettings(enabled=enabled, operations=operations)
+
+
+def test_the_default_held_operations_are_the_two_the_next_test_drops() -> None:
+    """The next test reads its cases off the model, so an emptied default would leave it with no
+    case and still green. This pins the list it reads."""
+    assert _DEFAULT_HELD == ["connection_purge", "dead_letter_replay"]
+
+
+@pytest.mark.parametrize("dropped", _DEFAULT_HELD)
+def test_each_default_operation_left_out_of_dual_control_is_named(dropped: str) -> None:
+    """Each default operation is dropped in turn. The entry names the dropped one and not the kept
+    one, so it comes from the difference and not from the list being short."""
+    kept = [op for op in _DEFAULT_HELD if op != dropped]
+    assert kept, "a one-item default would make this the empty-list case"
+    risks = _approval_risks(_held(kept))
+    assert list(risks) == [_OPS]
+    assert f"leaves out the default operation {dropped}. " in risks[_OPS]
+    assert not any(op in risks[_OPS] for op in kept)
+    # Opting config_reload in does not make up for it.
+    assert _names(approvals=_held([*kept, "config_reload"])) == [_OPS]
+
+
+def test_a_dropped_purge_or_replay_is_named_by_its_own_name() -> None:
+    """The two cases the row names, written out by hand so they do not lean on the default list."""
+    purge = _approval_risks(_held(["dead_letter_replay"]))[_OPS]
+    assert "the default operation connection_purge. " in purge and "dead_letter_replay" not in purge
+    replay = _approval_risks(_held(["connection_purge"]))[_OPS]
+    assert "the default operation dead_letter_replay. " in replay
+    assert "connection_purge" not in replay
+    # Both dropped with one opt-in operation still held: each is named, and config_reload is not.
+    # The names end the sentence, so no later phrase reads as a third operation.
+    both = _approval_risks(_held(["config_reload"]))[_OPS]
+    assert "the default operations connection_purge, dead_letter_replay. " in both
+    assert "config_reload" not in both
+    for risk in (purge, replay, both):
+        assert "no second approver" in risk
+
+
+@pytest.mark.parametrize(
+    "operations",
+    [
+        ["connection_purge", "dead_letter_replay"],  # the default, written out
+        ["dead_letter_replay", "connection_purge"],  # order is not a narrowing
+        ["connection_purge", "connection_purge", "dead_letter_replay"],  # nor is a repeat
+        ["connection_purge", "dead_letter_replay", "config_reload"],  # wider is stricter
+    ],
+)
+def test_a_list_holding_every_default_operation_is_not_named(operations: list[str]) -> None:
+    assert _names(approvals=_held(operations)) == []
+
+
+@pytest.mark.parametrize("operations", [[], ["dead_letter_replay"], ["config_reload"]])
+def test_a_narrowed_list_is_not_named_while_dual_control_is_off(operations: list[str]) -> None:
+    """Dual control ships off, so off is the shipped posture whatever the list holds. The second
+    assertion is the control: the same list is named once dual control is on."""
+    assert _names(approvals=_held(operations, enabled=False)) == []
+    assert _names(approvals=_held(operations)) == [_OPS]
+
+
+def test_an_empty_list_with_dual_control_on_is_named_as_holding_nothing() -> None:
+    """``enabled = true`` with ``operations = []`` loads, and the gate then holds no action at all.
+    That is the narrowing in its largest form, and it has its own wording."""
+    risk = _approval_risks(_held([]))[_OPS]
+    assert "holds no operation" in risk
+    assert "leaves out" not in risk
+    # The wording belongs to the empty list alone.
+    assert "holds no operation" not in _approval_risks(_held(["config_reload"]))[_OPS]
+
+
+def test_a_narrowed_list_is_named_beside_its_loosened_limits() -> None:
+    """One operation still held keeps the dwell and expiry live, so all three are named."""
+    loose = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0, expiry_hours=0.0
+    )
+    assert _names(approvals=loose) == [_OPS, "min_dwell_seconds", "expiry_hours"]
+
+
+def test_the_docs_quote_the_default_held_operations() -> None:
+    """The guide and the settings reference restate the default list, and the registry follows the
+    field. So both are tied to the field here: a default that moves reds this. The last assertion
+    of each pair is the control, a longer list the row must not already hold."""
+    docs = Path(__file__).parents[1] / "docs"
+    quoted = "`[" + ", ".join(f'"{op}"' for op in _DEFAULT_HELD) + "]`"
+    longer = quoted.replace("]`", ', "config_reload"]`')
+    guide = (docs / "SECURITY-LOOSENING.md").read_text("utf-8")
+    rows = {
+        "guide": next(
+            line for line in guide.splitlines() if line.startswith("| | `[approvals].operations`")
+        ),
+        "reference": next(
+            line
+            for line in (docs / "CONFIGURATION.md").read_text("utf-8").splitlines()
+            if line.startswith("| `operations` | list[str] |")
+        ),
+    }
+    for where, row in rows.items():
+        assert quoted in row, where
+        assert longer not in row, where
+    entry = guide.split("### `[approvals].operations` without a default operation", 1)[1]
+    entry = entry.split("\n### ", 1)[0]
+    for op in _DEFAULT_HELD:
+        assert f"`{op}`" in entry, op
+
+
+@pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+def test_serve_names_a_narrowed_operations_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The serve-time loosening WARNING reads the loaded ``[approvals]``: the entry names the one
+    operation this file leaves out, which no default section could produce. The two fixtures stand
+    down the start gates this test is not about, as ``tests/test_cli.py`` does for the helper
+    borrowed here."""
+    from tests.test_cli import _SECURE_ALERTS, _SECURE_RETENTION, _run_secure_serve
+
+    narrowed = (
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS
+        + '[approvals]\nenabled = true\noperations = ["dead_letter_replay"]\n'
+    )
+    rc, _ = _run_secure_serve(tmp_path, monkeypatch, narrowed)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert f"{_OPS} (" in out and "the default operation connection_purge. " in out
 
 
 # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4) --------------------

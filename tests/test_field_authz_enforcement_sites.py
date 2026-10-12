@@ -26,6 +26,7 @@ Synthetic HL7 only — the MRN and name below are invented.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.api.field_authz import PHI_FIELDS
+from messagefoundry.api.models import MessageDetail
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import Permission
@@ -100,17 +102,45 @@ _MODEL_SIGNATURES: dict[frozenset[str], str] = {
 }
 
 
+#: The one top-level ``MessageDetail`` property the PROCESSED seed row cannot carry: it has no error
+#: text. The route-tier test expects every other property ``PHI_FIELDS`` gates on that model to be
+#: set on both rows it opens. So a property added to the map is checked there: the seed must set
+#: it on both rows, or it must be named here.
+_UNSET_ON_THE_PROCESSED_ROW = frozenset({"error"})
+
+
+def _attributed(node: object) -> list[tuple[str, dict[str, object]]]:
+    """``(model name, object)`` for every JSON object in ``node`` whose field names match a mapped
+    model's signature. The one place a response object is attributed to its model."""
+    return [
+        (model, obj)
+        for obj in _objects(node)
+        if (model := _MODEL_SIGNATURES.get(frozenset(obj))) is not None
+    ]
+
+
 def _attributed_pairs(node: object) -> set[tuple[str, str]]:
     """``{(model, property)}`` for every gated property that came back NON-null in ``node``."""
-    found: set[tuple[str, str]] = set()
-    for obj in _objects(node):
-        model = _MODEL_SIGNATURES.get(frozenset(obj))
-        if model is None:
-            continue
-        for _cls_name, prop in _GATED_PAIRS:
-            if _cls_name == model and obj.get(prop) is not None:
-                found.add((model, prop))
-    return found
+    return {
+        (model, prop)
+        for model, obj in _attributed(node)
+        for cls_name, prop in _GATED_PAIRS
+        if cls_name == model and obj.get(prop) is not None
+    }
+
+
+def _present(node: object) -> Counter[str]:
+    """Per mapped model, how many of its objects ``node`` holds."""
+    return Counter(model for model, _obj in _attributed(node))
+
+
+def _carrying(node: object) -> Counter[str]:
+    """Per mapped model, how many of its objects in ``node`` hold a non-null gated property."""
+    return Counter(
+        model
+        for model, obj in _attributed(node)
+        if any(obj.get(prop) is not None for cls_name, prop in _GATED_PAIRS if cls_name == model)
+    )
 
 
 @dataclass(frozen=True)
@@ -298,12 +328,28 @@ async def _login(client: httpx.AsyncClient, username: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
+def _path(template: str, seeded: _Seed, who: str) -> str:
+    """One ``_SURFACES`` template filled in for the caller ``who``."""
+    return template.format(
+        mid=seeded.message_id,
+        eid=seeded.error_message_id,
+        did=seeded.dead_message_id,
+        preset=seeded.presets[who],
+    )
+
+
 async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _Seed) -> None:
     """No caller lacking ``messages:view_summary`` receives ANY gated property, on ANY of the
     surfaces docs/SECURITY.md names.
 
     RULE: ``redact_unauthorized`` fails OPEN, so a PHI-bearing route that forgets to call it is
     invisible to every map-level test. This is the assertion that catches it.
+
+    An absence proves nothing about a response that holds no object to withhold from. So each
+    surface is read as the administrator first. For each model, the restricted response must hold
+    at least as many objects as the administrator saw carrying a gated value (vault BACKLOG
+    #2727). That is a count per model, not a match of each object, so it does not prove the same
+    rows came back.
     """
     async with _client(seeded.engine, seeded.service) as client:
         tokens = {
@@ -311,20 +357,25 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
             "rawonly": await _login(client, "rawonly"),
             "diagonly": await _login(client, "diagonly"),
         }
+        boss = await _login(client, "boss")
         for template, who in _SURFACES:
-            path = template.format(
-                mid=seeded.message_id,
-                eid=seeded.error_message_id,
-                did=seeded.dead_message_id,
-                preset=seeded.presets[who],
+            path = _path(template, seeded, who)
+            # The administrator reads first: a row that arrives between the two reads can then
+            # only add to the restricted count.
+            control = await client.get(_path(template, seeded, "boss"), headers=boss)
+            assert control.status_code == 200, f"{path} as boss: {control.text}"
+            carrying = _carrying(control.json())
+            assert carrying, (
+                f"{path} shows the administrator no gated value, so nothing on it tests withholding"
             )
             response = await client.get(path, headers=tokens[who])
             assert response.status_code == 200, (
                 f"{path} as {who}: {response.status_code} {response.text}"
             )
+            body = response.json()
             leaked = [
                 (prop, obj[prop])
-                for obj in _objects(response.json())
+                for obj in _objects(body)
                 for prop in _GATED_PROPERTIES
                 if obj.get(prop) is not None
             ]
@@ -333,13 +384,20 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
                 "messages:view_summary — the route is missing its redact_unauthorized call "
                 "(ASVS 8.1.2)."
             )
+            # Counter subtraction keeps only the models the restricted response is short of.
+            short = carrying - _present(body)
+            assert not short, (
+                f"{path} as {who} is short of these objects, by model: {dict(short)}. The "
+                "administrator saw that many more carrying a gated value, so the assertion above "
+                "had nothing to withhold from for them."
+            )
 
 
 def test_every_mapped_model_has_a_distinct_field_signature() -> None:
     """The attribution below is sound only while the model signatures are unique — assert it."""
     assert len(_MODEL_SIGNATURES) == len(PHI_FIELDS), (
         "two PHI_FIELDS models now share a field-name signature, so a JSON object cannot be "
-        "attributed to its model. Re-key _attributed_pairs before trusting it."
+        "attributed to its model. Re-key _attributed before trusting it."
     )
 
 
@@ -356,13 +414,7 @@ async def test_the_seed_actually_carries_every_gated_model_property_pair(seeded:
         boss = await _login(client, "boss")
         exposed: set[tuple[str, str]] = set()
         for template, _who in _SURFACES:
-            path = template.format(
-                mid=seeded.message_id,
-                eid=seeded.error_message_id,
-                did=seeded.dead_message_id,
-                preset=seeded.presets["boss"],
-            )
-            response = await client.get(path, headers=boss)
+            response = await client.get(_path(template, seeded, "boss"), headers=boss)
             assert response.status_code == 200, response.text
             exposed |= _attributed_pairs(response.json())
         assert exposed == set(_GATED_PAIRS), (
@@ -374,29 +426,39 @@ async def test_the_seed_actually_carries_every_gated_model_property_pair(seeded:
 async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identity(
     seeded: _Seed,
 ) -> None:
-    """A ``view_raw``-only identity (see ``tests/_role_pairing.py``) opens both seeded rows and reads
-    the PROCESSED row's body, but gets no top-level gated property on either row. The administrator
-    arm shows each of those properties is set on the row, so no withholding assertion is vacuous.
-    Nested properties are the surfaces test's job."""
+    """A ``view_raw``-only identity (see ``tests/_role_pairing.py``) opens two of the three seeded
+    rows, the PROCESSED one and the ERROR one, and reads the PROCESSED row's body. It gets none of
+    the top-level properties ``PHI_FIELDS`` gates on ``MessageDetail``, on either row. The
+    administrator arm shows which of those properties each row carries, so no withholding assertion
+    is vacuous. Nested properties, and the dead-lettered row, are the surfaces test's job."""
+    # Only the view_summary rows: this caller holds view_raw, so a property gated on that would
+    # rightly be returned to it.
+    gated = frozenset(
+        prop
+        for prop, permission in PHI_FIELDS[MessageDetail].items()
+        if permission is Permission.MESSAGES_VIEW_SUMMARY
+    )
+    assert gated, "PHI_FIELDS gates nothing on MessageDetail, so the loop below would check nothing"
+    # The exception names only real gated properties and is not the whole set.
+    assert gated > _UNSET_ON_THE_PROCESSED_ROW
     async with _client(seeded.engine, seeded.service) as client:
         headers = await _login(client, "rawonly")
-        response = await client.get(f"/messages/{seeded.message_id}", headers=headers)
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["summary"] is None and body["metadata"] is None
-        errored = await client.get(f"/messages/{seeded.error_message_id}", headers=headers)
-        assert errored.status_code == 200, errored.text
-        detail = errored.json()
-        assert detail["error"] is None
-        assert detail["summary"] is None and detail["metadata"] is None
-        # Positive control, per row: the administrator gets each property (masked, not null).
         boss = await _login(client, "boss")
-        for mid, props in (
-            (seeded.message_id, ("summary", "metadata")),
-            (seeded.error_message_id, ("summary", "metadata", "error")),
+        for mid, carried in (
+            (seeded.message_id, gated - _UNSET_ON_THE_PROCESSED_ROW),
+            (seeded.error_message_id, gated),
         ):
-            seen = (await client.get(f"/messages/{mid}", headers=boss)).json()
-            assert all(seen[p] is not None for p in props), (mid, seen)
+            response = await client.get(f"/messages/{mid}", headers=headers)
+            assert response.status_code == 200, response.text
+            body = response.json()
+            returned = {prop: body[prop] for prop in gated if body[prop] is not None}
+            assert not returned, f"{mid}: a view_raw-only caller was returned {returned}"
+            # Positive control: the administrator is returned each property the row carries. The
+            # value may be a display mask; only its presence is asserted here.
+            control = await client.get(f"/messages/{mid}", headers=boss)
+            assert control.status_code == 200, control.text
+            seen = control.json()
+            assert {prop for prop in gated if seen[prop] is not None} == carried, (mid, seen)
         # The body is its own fetch since BACKLOG #2345, on the same messages:view_raw gate.
         raw = await client.get(f"/messages/{seeded.message_id}/raw", headers=headers)
         assert raw.status_code == 200, raw.text
