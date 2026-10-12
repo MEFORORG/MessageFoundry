@@ -215,9 +215,11 @@ from messagefoundry.transports import (
 )
 from messagefoundry.transports.base import (
     ConnectionEventSink,
+    DeliveryResponse,
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
+    ReplyBodyDropped,
     SyncReplyResolver,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -8256,7 +8258,9 @@ class RegistryRunner:
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
             # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
             # is the single-writer discipline that yields exactly one captured reply per row.
-            if response is not None:
+            # A ReplyBodyDropped is a non-capturing delivery too: plain mark_done, which also
+            # writes the drop.
+            if isinstance(response, DeliveryResponse):
                 # ADR 0013 Increment 2: if this outbound declares reingress_to, the same
                 # capture transaction also produces a Stage.RESPONSE work-row; wake the
                 # re-ingress worker. Read live from the registry (a reload swaps it).
@@ -8304,7 +8308,30 @@ class RegistryRunner:
             else:
                 # PHASE (b): the store completion round-trip (plain mark_done — the non-capturing path).
                 _done_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                await self.store.mark_done(item.id)
+                if isinstance(response, ReplyBodyDropped):
+                    # vault BACKLOG #3040 items 2 and 5: the partner answered 2xx and its reply
+                    # body was dropped over the byte bound. The reply_dropped event commits with
+                    # the DONE flip, and the WARNING is logged only once that write has returned.
+                    # Status, bound and names only.
+                    await self.store.mark_done(
+                        item.id,
+                        reply_dropped=(
+                            f"HTTP {response.status}; reply body over the "
+                            f"{response.limit}-byte bound"
+                        ),
+                    )
+                    log.warning(
+                        "delivery worker %r: outbox row %s (message %s) answered with status %s "
+                        "and a response body over the %d-byte bound; the body is dropped, and the "
+                        "row is recorded as delivered with a reply_dropped event",
+                        name,
+                        item.id,
+                        item.message_id,
+                        response.status,
+                        response.limit,
+                    )
+                else:
+                    await self.store.mark_done(item.id)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
             # Emit the throttled per-process summary (send_ack vs mark_done) after a delivered row —

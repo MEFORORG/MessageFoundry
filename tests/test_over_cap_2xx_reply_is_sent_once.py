@@ -8,8 +8,9 @@ have sent the request again, and the message would then have dead-lettered when 
 
 The owner ruling of 2026-10-05 judges such a reply by who reads the body:
 
-* nothing looks inside it: the message is delivered, the body is dropped, and a WARNING is logged.
-  REST with capture off, and a plain FHIR write with capture off;
+* nothing looks inside it: the message is delivered and the body is dropped. The message gets a
+  ``reply_dropped`` event, and then a WARNING is logged (vault BACKLOG #3040 items 2 and 5). REST
+  with capture off, and a plain FHIR write with capture off;
 * the engine reads it to know the outcome, or passes it on: a permanent refusal, and no
   re-send. SOAP, DICOMweb and REST with capture on.
 
@@ -54,7 +55,7 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
-from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.base import NegativeAckError, ReplyBodyDropped
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     REPLY_TOO_LARGE_CODE,
@@ -81,34 +82,30 @@ _URL_MARKER = "SITE-QUERY-MARKER"
 _PAYLOAD_MARKER = "PAYLOAD-MARKER-7f3a"
 #: The byte an over-cap reply is made of on the wire. A run of it must never reach a log line.
 _REPLY_FILL = b"Z"
-#: The end of the delivered arm's WARNING: the words that say the 2xx stands.
-_TAKEN_AS_ANSWER = "the 2xx is taken as the partner's answer"
+#: The delivery worker's WARNING for a dropped body, which it logs after the row is recorded.
+_RECORDED_AS_DELIVERED = "the row is recorded as delivered with a reply_dropped event"
+#: The logger that WARNING comes from.
+_WORKER_LOGGER = "messagefoundry.pipeline.wiring_runner"
 
 
 # --- the helper -----------------------------------------------------------------------------------
 
 
-def test_an_unused_over_cap_body_reads_as_empty_and_warns(
+def test_an_unused_over_cap_body_is_reported_dropped_and_not_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level(logging.WARNING):
-        text = read_2xx_reply_text(
+    """The helper says what happened and logs nothing. The WARNING is the delivery worker's,
+    after its store write (vault BACKLOG #3040 item 2), so a line here would come first."""
+    with caplog.at_level(logging.DEBUG):
+        got = read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=201),
             limit=64,
             connector="REST connection 'OB_X'",
             encoding="utf-8",
             body_is_needed=False,
         )
-    assert text == ""
-    (record,) = caplog.records
-    assert record.levelno == logging.WARNING
-    message = record.getMessage()
-    assert message.startswith("REST connection 'OB_X' answered with status 201 and")
-    assert "64-byte bound" in message
-    assert message.endswith(_TAKEN_AS_ANSWER)
-    # vault BACKLOG #3040 item 2: the line is logged before the caller's store write, so it claims no record.
-    assert "recorded" not in message
-    assert _REPLY_FILL.decode() * 4 not in message
+    assert got == ReplyBodyDropped(status=201, limit=64)
+    assert caplog.records == []
 
 
 def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
@@ -228,17 +225,16 @@ def test_the_status_guard_lets_every_2xx_through(
     status: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     """THE CONTROL for the two tests above: the guard refuses nothing inside 200 to 299."""
-    with caplog.at_level(logging.WARNING):
-        text = read_2xx_reply_text(
+    with caplog.at_level(logging.DEBUG):
+        got = read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=status),
             limit=64,
             connector="c",
             encoding="utf-8",
             body_is_needed=False,
         )
-    assert text == ""
-    (record,) = caplog.records
-    assert f"answered with status {status} and" in record.getMessage()
+    assert got == ReplyBodyDropped(status=status, limit=64)
+    assert caplog.records == []
 
 
 def test_the_stored_refusal_keeps_its_code_and_advice_under_a_long_connection_name() -> None:
@@ -446,9 +442,12 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     dest._opener = opener
+    # Only what send() logs: building a path-form FHIR destination logs its own WARNING.
+    caplog.clear()
     with caplog.at_level(logging.WARNING):
         if side == _DELIVERED:
-            assert await dest.send(_payload(ctype, over)) is None
+            dropped = await dest.send(_payload(ctype, over))
+            assert dropped == ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
         else:
             with pytest.raises(NegativeAckError) as ei:
                 await dest.send(_payload(ctype, over))
@@ -463,15 +462,10 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     # The bound is still enforced on the read: one byte past it, and never the whole body.
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
     assert len(opener.requests) == 1
-    if side == _DELIVERED:
-        (warning,) = [r.getMessage() for r in caplog.records if "over the" in r.getMessage()]
-        assert warning.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} answered")
-        for leaked in (_URL_MARKER, "partner.example.com", _PAYLOAD_MARKER, "\x00\x00"):
-            assert leaked not in warning
-    else:
-        # A refusal is not also logged as a delivery. The delivered cases of this same test show
-        # the capture sees that WARNING when it is logged.
-        assert _TAKEN_AS_ANSWER not in caplog.text
+    # send() logs nothing on either side. The delivered side's WARNING is the delivery worker's,
+    # after its store write (vault BACKLOG #3040 item 2); the wire tests below show it is logged
+    # and that this capture would see it.
+    assert caplog.records == []
 
 
 # --- the delivery worker, on the wire -------------------------------------------------------------
@@ -544,12 +538,46 @@ class _Partner:
 class _Delivery:
     """What the store holds after the worker was offered one row ``_OFFERS`` times."""
 
+    message_id: str
     outcomes: list[_ItemOutcome]
     row_status: str
     last_error: str
     message_status: str
     captured: list[tuple[str, str | None]]
     stopped: list[str]
+    #: Every ``reply_dropped`` row on the message: (destination, detail).
+    dropped_events: list[tuple[str | None, str]]
+    #: The ``mark_done`` calls, and the worker's dropped-body WARNING, in the order they
+    #: happened. A call is entered once it has returned.
+    order: list[str]
+
+
+class _OrderLog(logging.Handler):
+    """Appends ``"WARNING"`` to ``order`` when the worker logs its dropped-body line."""
+
+    def __init__(self, order: list[str]) -> None:
+        super().__init__(logging.WARNING)
+        self._order = order
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if _RECORDED_AS_DELIVERED in record.getMessage():
+            self._order.append("WARNING")
+
+
+def _spy_on_mark_done(store: MessageStore, order: list[str], fail_done: bool) -> None:
+    """Wrap ``mark_done`` so each call enters ``order`` once it returns, as ``"mark_done"`` or,
+    when it carries a drop, ``"mark_done+reply_dropped"``. ``fail_done`` makes it raise before it
+    writes anything, as a store fault would, and enters ``"raised"`` instead."""
+    real_mark_done = store.mark_done
+
+    async def mark_done(*args: Any, **kwargs: Any) -> None:
+        if fail_done:
+            order.append("raised")
+            raise OSError("synthetic store fault")
+        await real_mark_done(*args, **kwargs)
+        order.append("mark_done+reply_dropped" if kwargs.get("reply_dropped") else "mark_done")
+
+    store.mark_done = mark_done  # type: ignore[method-assign]
 
 
 #: How often the worker is offered the row. Each offer is past any backoff, so a row that is still
@@ -557,9 +585,14 @@ class _Delivery:
 _OFFERS = 3
 
 
-async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
+async def _deliver(
+    tmp_path: Path, dest: Any, payload: str, *, fail_done: bool = False
+) -> _Delivery:
     """Queue one outbound row for ``dest`` and offer it to the delivery worker ``_OFFERS`` times."""
     outcomes: list[_ItemOutcome] = []
+    order: list[str] = []
+    order_log = _OrderLog(order)
+    worker_logger = logging.getLogger(_WORKER_LOGGER)
     store = await MessageStore.open(tmp_path / "overcap.db")
     try:
         mid = await store.enqueue_ingress(channel_id=CHANNEL, raw=RAW, now=0.0)
@@ -590,13 +623,22 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
             egress=EgressSettings(deny_by_default=False),
         )
         runner._destinations[DEST] = dest
+        _spy_on_mark_done(store, order, fail_done)
+        worker_logger.addHandler(order_log)
         for offer in range(1, _OFFERS + 1):
             # A day further on each time: past any backoff the last attempt set.
             item = await store.claim_next_fifo(DEST, now=time.time() + offer * 86400.0)
             if item is None:
                 break
-            outcome, _ = await runner._process_delivery_item(DEST, item)
+            try:
+                outcome, _ = await runner._process_delivery_item(DEST, item)
+            except OSError:
+                # Only fail_done raises. The worker's caller would re-pend the row; this stops.
+                if not fail_done:
+                    raise
+                break
             outcomes.append(outcome)
+        events = await store.events_for(mid)
         cur = await store._db.execute(
             "SELECT status, last_error FROM queue WHERE message_id=? AND stage=?",
             (mid, Stage.OUTBOUND.value),
@@ -606,6 +648,7 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
         message = await store.get_message(mid)
         assert message is not None
         return _Delivery(
+            message_id=mid,
             outcomes=outcomes,
             row_status=str(row["status"]),
             # Plaintext here: the test store has the default identity cipher.
@@ -613,8 +656,15 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
             message_status=str(message["status"]),
             captured=[(c.outcome, c.body) for c in await store.correlate_response(mid)],
             stopped=[name for name, _ in sink.stopped],
+            dropped_events=[
+                (e["destination"], str(e["detail"] or ""))
+                for e in events
+                if e["event"] == "reply_dropped"
+            ],
+            order=order,
         )
     finally:
+        worker_logger.removeHandler(order_log)
         await store.close()
 
 
@@ -642,8 +692,24 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
         assert got.row_status == OutboxStatus.DONE.value
         assert got.message_status == MessageStatus.PROCESSED.value
         assert got.last_error == ""
-        assert any(_TAKEN_AS_ANSWER in r.getMessage() for r in caplog.records)
+        # vault BACKLOG #3040 item 5: the message itself says its reply was dropped.
+        bound = DEFAULT_MAX_RESPONSE_BYTES
+        assert got.dropped_events == [(DEST, f"HTTP 200; reply body over the {bound}-byte bound")]
+        # Item 2: the row is recorded, then the drop, and only then the WARNING.
+        assert got.order == ["mark_done+reply_dropped", "WARNING"]
+        (warning,) = [r for r in caplog.records if _RECORDED_AS_DELIVERED in r.getMessage()]
+        assert warning.levelno == logging.WARNING
+        assert warning.name == _WORKER_LOGGER
+        line = warning.getMessage()
+        assert line.startswith(f"delivery worker {DEST!r}: outbox row ")
+        assert f"(message {got.message_id}) answered" in line
+        assert f"answered with status 200 and a response body over the {bound}-byte" in line
+        assert line.endswith(_RECORDED_AS_DELIVERED)
     else:
+        # A refusal writes no reply_dropped row and no dropped-body WARNING. The delivered side
+        # of this same test shows both are seen when they are written.
+        assert got.dropped_events == []
+        assert "WARNING" not in got.order
         assert got.row_status == OutboxStatus.DEAD.value
         assert got.message_status == MessageStatus.ERROR.value
         # The stored error is the fixed text: the connection, the bound, and nothing of the URL,
@@ -688,9 +754,12 @@ async def test_an_over_cap_2xx_in_another_framing_is_sent_once(
     assert got.outcomes == [_ItemOutcome.PROCESSED]
     if side == _DELIVERED:
         assert (got.row_status, got.last_error) == (OutboxStatus.DONE.value, "")
+        assert len(got.dropped_events) == 1
+        assert got.order == ["mark_done+reply_dropped", "WARNING"]
     else:
         assert got.row_status == OutboxStatus.DEAD.value
         assert f"{REPLY_TOO_LARGE_CODE}, not sent again" in got.last_error
+        assert got.dropped_events == []
 
 
 #: A reply each destination takes as a plain success.
@@ -728,6 +797,30 @@ async def test_an_in_cap_2xx_is_delivered_as_before(
     assert got.message_status == MessageStatus.PROCESSED.value
     assert got.captured == ([("accepted", body.decode())] if capture else [])
     assert not any("over the" in r.getMessage() for r in caplog.records)
+    assert got.dropped_events == []
+    assert "WARNING" not in got.order
+
+
+@pytest.mark.parametrize("case", [c for c in _RULED if c[2] == _DELIVERED], ids=_case_id)
+async def test_no_dropped_body_warning_when_the_store_write_fails(
+    case: tuple[ConnectorType, dict[str, Any], str],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    over_cap_body: bytes,
+) -> None:
+    """Vault BACKLOG #3040 item 2: the WARNING says the row is recorded as delivered, so it must
+    not be logged when the write that records it fails. The delivered side of the matrix above
+    shows the same capture sees the line when the write succeeds."""
+    ctype, over, _ = case
+    with _Partner(200, over_cap_body) as partner:
+        dest = _dest(ctype, f"{partner.url}/x", over)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype, over), fail_done=True)
+    assert len(partner.requests) == 1, partner.requests
+    assert got.order == ["raised"]
+    assert got.row_status == OutboxStatus.INFLIGHT.value
+    assert got.dropped_events == []
+    assert _RECORDED_AS_DELIVERED not in caplog.text
 
 
 @pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)

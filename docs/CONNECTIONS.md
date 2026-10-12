@@ -1479,12 +1479,12 @@ the four HTTP destinations, and their own sections point here.
 
 | Destination | Write | `capture_response` | An over-size body after a 2xx |
 |---|---|---|---|
-| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped. The message gets a `reply_dropped` event, and then a WARNING names the connection and the message |
 | REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
 | SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
 | DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
 | FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
-| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | off | **delivered**, with the same event and WARNING |
 | FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
 
 **Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
