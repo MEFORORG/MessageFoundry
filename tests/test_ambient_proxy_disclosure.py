@@ -44,7 +44,19 @@ _HOPS = "The hops that may read an environment proxy include at least HTTP-famil
 _VAULT = "the Vault and OpenBao clients"
 _POINTER = '[egress], "serve names an environment proxy at start"'
 #: Words that would make the warning claim use, refusal or protection rather than disclose.
-_CLAIM_WORDS = ("tls", "encrypt", "secure", "safe", "protected", "refuse", "use it")
+_CLAIM_WORDS = (
+    "tls",
+    "encrypt",
+    "secure",
+    "safe",
+    "protected",
+    "refuse",
+    "use it",
+    "uses",
+    "used",
+    "through",
+    "in force",
+)
 #: Every user or password fragment a test below puts in a proxy URL.
 _CREDENTIALS = ("alice", _SECRET, "bob", _SECRET2)
 
@@ -153,6 +165,8 @@ def test_hosts_drop_credentials_and_keys_no_http_hop_reads() -> None:
         "http://pro xy.example:3128",
         # A userinfo percent-encoded into what a looser parser would read as the host.
         f"http://alice%3A{_SECRET}%40proxy.example:3128",
+        # urllib reads the raw value, so a padded one is not named as the address it strips to.
+        " http://proxy.example:3128",
     ],
 )
 def test_an_unreadable_proxy_value_is_not_echoed(value: str) -> None:

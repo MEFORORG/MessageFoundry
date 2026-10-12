@@ -6,9 +6,10 @@ The owner ruling of 2026-10-11 says a proxy no engine setting names must not att
 must be disclosed. ADR 0126 Amendment B kept the urllib openers reading the environment, so
 ``serve`` and ``supervise`` disclose it: one WARNING as each engine process starts.
 
-**The warning is static, so it is true by construction.** It names each proxy entry in force, by
-a label that never carries a credential, and one fixed sentence naming hops that *may* read an
-environment proxy. It makes no claim about which hop uses which entry, what reaches the proxy, or
+**The warning is static, so it is true by construction.** It names each proxy entry that is set,
+by a label that never carries a credential, and one fixed sentence naming hops that *may* read an
+environment proxy. It does not say an entry is read: a lone ``all`` entry with no ``[vault]``
+extra reaches no hop, and it is still named. It makes no claim about which hop uses which entry, what reaches the proxy, or
 what the leg to it protects. Four review rounds found that every per-hop verdict a probe produced
 could be wrong, so the per-hop facts live once, in ``docs/CONFIGURATION.md``, *``serve`` names an
 environment proxy at start*, and the warning points there.
@@ -33,9 +34,8 @@ _READ_KEYS = ("all", "http", "https")
 _UNREADABLE = "an unreadable value"
 
 _HOPS = (
-    "HTTP-family connections (REST, SOAP, FHIR, fhir_lookup, DICOMweb) where no explicit "
-    "proxy_url applies",
-    "their OAuth2 and SMART token requests",
+    "HTTP-family connections (REST, SOAP, FHIR, fhir_lookup, DICOMweb) and their OAuth2 and SMART "
+    "token requests where no explicit proxy_url applies",
     "the alert webhook",
     "the OIDC sign-in and JWKS reads",
     "the AI broker",
@@ -59,9 +59,11 @@ def _address_of(value: str) -> str:
 
     Read by the peer-label parser the posture read-out uses for a proxy URL, so the two agree, and
     so its refusals apply here too: whitespace, a control character, or a ``%`` that could hide an
-    encoded userinfo in the host all give the placeholder rather than an echo. A value with no
-    scheme is read as ``http`` by both libraries, so it is named that way."""
-    parts = _split_address(value)
+    encoded userinfo in the host all give the placeholder rather than an echo. Leading or trailing
+    whitespace does too, though the parser strips it: urllib reads the raw value, so a clean label
+    would name an address the hop does not dial. A value with no scheme is read as ``http`` by both
+    libraries, so it is named that way."""
+    parts = _split_address(value) if value == value.strip() else None
     if parts is None:
         return _UNREADABLE
     scheme, host, port = parts
@@ -113,7 +115,7 @@ def ambient_proxy_warning(proxies: Mapping[str, str] | None = None) -> str | Non
     lines = "".join(f"The {key} proxy is {address}. " for key, address in hosts.items())
     hops = [*_HOPS, _VAULT] if _vault_importable() else list(_HOPS)
     return (
-        "a web proxy from the environment or the system proxy settings is in force. "
+        "a web proxy from the environment or the system proxy settings is set. "
         + lines
         + "The hops that may read an environment proxy include at least "
         + ", ".join(hops[:-1])
