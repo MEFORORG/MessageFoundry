@@ -75,6 +75,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
 )
 from messagefoundry.controlchars import strip_control_chars
+from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
     DeliveryError,
@@ -1032,9 +1033,15 @@ def http_credentials_sent(
     The settings half is :func:`~messagefoundry.config.static_credentials.http_hop_credentials`, the
     static-credential inventory's own reader, so the refusal and the inventory cannot disagree. A
     static ``headers`` entry is a credential when the redaction screen
-    (``config.wiring._is_secret_header``) would mask it, so an API-key header counts too. A
-    ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
-    CONNECT, not across this hop."""
+    (``config.wiring._is_secret_header``) would mask it, so an API-key header counts too. That
+    screen leans toward a false positive, which here refuses a verify-off hop that a header name
+    such as ``X-Routing-Key`` merely resembles; on a hop that already turned verification off, that
+    is the cheaper error. A credential-looking query parameter in ``url`` counts too, by the reader
+    ``query_credential_hops`` uses. A ``Proxy-Authorization`` from the proxy settings is not one: it
+    goes to the proxy, inside the CONNECT, not across this hop.
+
+    It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
+    not seen here; docs/SECURITY-LOOSENING.md lists that among the hops the rule does not reach."""
     # Lazy: both import config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
     from messagefoundry.config.wiring import _is_secret_header
@@ -1047,6 +1054,9 @@ def http_credentials_sent(
             for name, value in static.items()
             if _is_secret_header(str(name), value)
         ]
+    url = settings.get("url")
+    if isinstance(url, str) and (names := credential_query_params(url)):
+        sent.append(f"url query parameter {', '.join(names)}")
     return sent
 
 

@@ -830,6 +830,19 @@ class LdapAuthenticator:
                 "[security].enforcement = warn) -- the service-account and user passwords cross the "
                 "network in cleartext; do not use in production."
             )
+        # Every LDAPS bind carries a password: the service account's (required below) and then the
+        # user's. With ad_tls_verify=false the engine would hand both to whichever peer answered, so it
+        # is refused, with no escape and in every posture (vault BACKLOG #3230; the rule is stated in
+        # docs/SECURITY-LOOSENING.md). Until then MEFOR_ALLOW_INSECURE_TLS released it at
+        # [security].enforcement = warn (#329). Like the plain-bind refusal above, it runs before the
+        # bind secret is resolved, so a refused build never fetches the password.
+        if self._ldaps and not settings.ad_tls_verify:
+            raise LdapError(
+                "ad_tls_verify=false would send the AD service-account and user passwords to an "
+                "LDAPS peer whose certificate is not verified; refused, with no escape. Leave "
+                "ad_tls_verify on (the default). For a directory whose certificate comes from a "
+                "private or self-signed CA, pin that CA with ad_tls_ca_cert_file."
+            )
         # Resolve the effective service-account bind password ONCE at construction (ADR 0019 §5): from a
         # [secrets].provider when ad_bind_password_secret is set, else the env-sourced ad_bind_password
         # (byte-identical when no reference/provider). A configured-but-unresolvable reference fails closed
@@ -856,18 +869,6 @@ class LdapAuthenticator:
         spec = ad_anchor_spec(settings)
         if self._ldaps and spec is not None:
             self._ca_certs_data = verified_anchor_cadata(spec, enforcing=enforcing)
-        # Every LDAPS bind carries a password: the service account's (required above) and then the
-        # user's. With ad_tls_verify=false the engine would hand both to whichever peer answered, so it
-        # is refused, with no escape and in every posture (vault BACKLOG #3230; the rule is stated in
-        # docs/SECURITY-LOOSENING.md). Until then MEFOR_ALLOW_INSECURE_TLS released it at
-        # [security].enforcement = warn (#329).
-        if self._ldaps and not settings.ad_tls_verify:
-            raise LdapError(
-                "ad_tls_verify=false would send the AD service-account and user passwords to an "
-                "LDAPS peer whose certificate is not verified; refused, with no escape. Leave "
-                "ad_tls_verify on (the default). For a directory whose certificate comes from a "
-                "private or self-signed CA, pin that CA with ad_tls_ca_cert_file."
-            )
         # BACKLOG #1317, #2494. The engine builds this hop's TLS context (ASVS 12.1.2): narrowed to the
         # approved suites at TLS 1.2 and, where the interpreter allows it, TLS 1.3, then asserted.
         # Verification-off is refused above; this is the separate question of whether the

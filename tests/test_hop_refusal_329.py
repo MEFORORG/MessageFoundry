@@ -116,6 +116,18 @@ def test_ldaps_verifyoff_is_refused_in_every_posture_even_with_escape(
     assert "synthetic-bind-secret" not in message
 
 
+def test_ldaps_verifyoff_refuses_before_the_bind_secret_is_fetched() -> None:
+    """Like the plain-bind refusal, it runs before the secret provider is asked for the password."""
+
+    class _NeverCalled:
+        def get(self, ref: str) -> str:
+            raise AssertionError("the bind secret was fetched for a refused build")
+
+    s = _ldaps_verifyoff().model_copy(update={"ad_bind_password_secret": "kv/ad#pw"})
+    with pytest.raises(LdapError, match="ad_tls_verify=false"):
+        LdapAuthenticator(s, secret_provider=_NeverCalled(), posture=STAGING_PHI)  # type: ignore[arg-type]
+
+
 async def test_authservice_threads_posture_to_the_ldap_bind(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -716,8 +716,10 @@ loud warning):
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Not clamped.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
   forwarder and the API PHI-read serve hop, plus the webhook alert sink and the AI-broker endpoint.
-  *(All clamped — the webhook sink and the AI broker since #329. LDAPS was on this list until vault
-  BACKLOG #3230 made `ad_tls_verify = false` a refusal with no escape.)*
+  *(All clamped — the webhook sink and the AI broker since #329. The AI broker hop carries
+  `[ai].api_key`, and a webhook URL can carry a path secret; the credential rule does not reach
+  either yet. LDAPS was on this list until vault BACKLOG #3230 made `ad_tls_verify = false` a
+  refusal with no escape.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,

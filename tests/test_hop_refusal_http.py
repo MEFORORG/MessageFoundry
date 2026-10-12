@@ -421,6 +421,19 @@ def test_a_static_api_key_header_over_verify_off_is_refused(
     _assert_credential_refusal(exc)
 
 
+@pytest.mark.parametrize("cell", _CELLS)
+def test_a_url_query_credential_over_verify_off_is_refused(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential in the query string rides the request line to the unverified peer."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    url = f"{_HTTPS[cell][2]}?api_key={_SECRET}"
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, {"verify_tls": False, "url": url})
+    assert "url query parameter api_key" in str(exc.value)
+    _assert_credential_refusal(exc)
+
+
 def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> None:
     """The proxy credential goes to the proxy inside the CONNECT, never across this hop, so the
     credential list does not name it. An http url has no TLS to verify (refuse_cleartext_credentials

@@ -1498,6 +1498,10 @@ def _is_secret_header(name: str, value: object = None) -> bool:
     ``MONITORING_READ``. The asymmetry is not close, so this errs toward redacting -- but the VALUE arm
     is kept narrow (auth-scheme prefixes and JWTs only) rather than "long and high-entropy", because
     masking every long header value would quietly destroy the view rather than protect it.
+
+    **It is also a security control, not only a mask.** ``transports.rest.http_credentials_sent``
+    reads it to decide whether a ``verify_tls=false`` hop carries a credential (vault BACKLOG
+    #3230), so narrowing it narrows that no-escape refusal too.
     """
     if _looks_like_a_credential_value(value):
         return True
@@ -5611,10 +5615,9 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
     # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
-    value = settings.get("tls_check_hostname")
-    return isinstance(value, EnvRef) or not bool_setting(
-        settings, "tls_check_hostname", default=True
-    )
+    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+        return True
+    return not bool_setting(settings, "tls_check_hostname", default=True)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:

@@ -42,7 +42,8 @@ the one statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
-or starts the service. **No lever in this guide lifts it.** That covers `MEFOR_ALLOW_INSECURE_TLS`,
+or starts the service, except SFTP: the host key is known only once the server answers, so that
+refusal comes at connect, before the password is sent. **No lever in this guide lifts it.** That covers `MEFOR_ALLOW_INSECURE_TLS`,
 `[security].enforcement = warn`, `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each
 refusal names the connection and the settings that do fix it.
 
@@ -56,9 +57,12 @@ refusal names the connection and the settings that do fix it.
 | `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
-pair, a static `Authorization` header, and a SOAP WS-Security UsernameToken or body secret. The HTTP
-family reads that list from the same reader as the static-credential inventory, so the two cannot
-disagree. A hop with no credential is not refused by this rule. Its own loosening entry decides it.
+pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
+a static header that settings views would mask, such as `Authorization` or an API key. That last
+test leans toward caution: a header named like a key, such as `X-Routing-Key`, also counts. The
+HTTP family reads the settings half of the list from the same reader as the static-credential
+inventory, so the two cannot disagree. A hop with no credential is not refused by this rule. Its own
+loosening entry decides it.
 
 An AD bind always carries a credential, because the service account must bind first. So
 `ad_tls_verify = false` over LDAPS is refused in every case.
@@ -71,7 +75,12 @@ engine has not verified, when the lever named beside each is set:
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;
 - the AD binds over plain `ldap://`, under `ad_allow_insecure_ldap = true`;
-- the `[alerts]` SMTP relay login, under `email_tls_verify = false`.
+- the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
+- the AI broker's `[ai].api_key` over a plain `http` endpoint, and a secret in the path of an
+  alert webhook URL over `http`, each under `MEFOR_ALLOW_INSECURE_TLS` at
+  `[security].enforcement = warn`;
+- a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
+  false` hop. The refusal reads settings, so it cannot see one.
 
 An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
 leaves the engine.

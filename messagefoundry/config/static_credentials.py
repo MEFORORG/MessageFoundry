@@ -200,8 +200,8 @@ def http_hop_credentials(
 
     The connectors' refusal of a credential over ``verify_tls = false`` reads this (vault BACKLOG
     #3230), so that refusal and this inventory cannot disagree about what counts as a credential.
-    A static ``Authorization`` written into the literal ``headers`` table is not a setting this module
-    reads; the refusal checks the built headers for it."""
+    A credential written into the literal ``headers`` table, or into the ``url`` query, is not a
+    setting this module reads; the refusal adds those itself (``transports.rest.http_credentials_sent``)."""
     token = _http_token(ctype, settings, lookup=lookup)
     return (["minted bearer token"] if token else []) + _http_static(ctype, settings, token)
 
