@@ -97,7 +97,6 @@ def test_a_credential_label_glued_to_a_field_run_loses_its_value(run: str, separ
         *secretscrub._CREDENTIAL_WORDS,
         *secretscrub._TOKEN_WORDS,
         *secretscrub._KEY_MATERIAL_WORDS,
-        f"{secretscrub._ENV_PREFIX}VALUE_PW",
         "db_password",
         "db.password",
         "a_b_c_d_e_f_password",
@@ -126,7 +125,8 @@ def test_every_credential_label_word_is_kept_after_a_field_run(label: str) -> No
         (f"x|y|z,Bearer {_VALUE}", f"x ,Bearer {_VALUE}"),
         (f"x|y|z,BEARER {_VALUE}", f"x ,BEARER {_VALUE}"),
         (f"x|y|z|db_password: {_VALUE}", f"x |db_password: {_VALUE}"),
-        (f"x|y|z;{secretscrub._ENV_PREFIX}STORE_PW = {_VALUE}", f"x ;MEFOR_STORE_PW = {_VALUE}"),
+        # A quoted value with a long line after it: the value ends at its closing quote.
+        (f"x|y|z;password: '{_VALUE}' " + "w " * 2_200, f"x ;password: '{_VALUE}' w"),
         # The separator pass runs over the delimiters MSH declares, and keeps the label the same way.
         (f"MSH*$~\\&*APP\nx$y$z;password: {_VALUE}", f"x ;password: {_VALUE}"),
     ],
@@ -141,7 +141,7 @@ def test_every_credential_label_word_is_kept_after_a_field_run(label: str) -> No
         "bare-bearer",
         "bare-bearer-upper",
         "prefixed-label-after-a-pipe",
-        "env-name-spaced-equals",
+        "quoted-value-on-a-long-line",
         "declared-delimiters",
     ],
 )
@@ -165,6 +165,20 @@ def test_the_controls_answer_as_the_credential_stage_alone_does(text: str, print
     """Shapes the run never hid a label in. The third prints with no run in front of it too."""
     assert (_VALUE in secretscrub.scrub_credentials(text.replace(_RUNS["pipe"], "w"))) is printed
     assert bool(_paths_keeping(text, _VALUE)) is printed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"x|y|z;MEFOR_ZQDOE_ZQJANE_4455667: {_VALUE}",
+        f"x|y|ZQDOE_MEFOR_4455667_ZQJANE= {_VALUE}",
+    ],
+)
+def test_an_env_name_is_not_kept(text: str) -> None:
+    """A ``MEFOR_`` name is free ``[A-Z0-9_]`` text, so keeping one would print the data the run
+    scrubbed. The price, stated: its value prints, as it did before #2968."""
+    assert redact(text).startswith("[redacted] "), redact(text)
+    assert not _paths_keeping(text, "ZQDOE", "ZQJANE", "4455667")
 
 
 def test_the_kept_label_carries_no_prefix() -> None:

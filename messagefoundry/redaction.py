@@ -151,35 +151,36 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: A credential label that ENDS a field run's token, which the run then leaves in place (BACKLOG
 #: #2968). The run takes a whole token, so in ``x|y|z;password: <value>`` it took the label too.
 #: The credential filters run after this module and key on the label, so they found none and the
-#: value reached the log. :func:`_field_run_replacement` now writes the placeholder for the rest of
-#: the token and keeps this tail, so ``[redacted]password: <value>`` reaches those filters.
+#: value would reach the log on first deployment. :func:`_field_run_replacement` now writes the
+#: placeholder for the rest of the token and keeps this tail, so ``[redacted]password: <value>``
+#: reaches those filters.
 #:
 #: **What it keeps, and why no more.** The label word with an optional closing quote, then the
 #: ``:`` or ``=`` and an auth scheme word when the token holds them. Never the label's dotted or
 #: underscored prefix, which is data: ``DOE_JANE_password:`` keeps ``password:`` only. A word with no
 #: separator in the token (``x|y|z;password = <value>``, ``x|y|z;Bearer <value>``) is kept only where
 #: a credential filter would read it: a ``:`` or ``=`` after the whitespace, or the scheme word
-#: ``bearer``. A bare word directly after one of the run's own separators is a component, so it is
-#: data and goes with the run.
+#: ``bearer``. A component that is the bare word and nothing else, right after one of the run's own
+#: separators, may be data, so it goes with the run.
 #:
-#: **The words are a copy of the label arm of :data:`_CREDENTIAL_AHEAD`**, in the same order, plus
-#: ``MEFOR_`` names. A plain literal, so the static regex gate reads it, and
-#: ``tests/test_redaction_glued_credential_label.py`` holds it to that arm. The start is "no ASCII
-#: letter or digit before", wider than the credential filters' ``\b`` after a prefix, since a tail
-#: kept here starts after the placeholder and so is read there anyway.
+#: **The words are a copy of the label arm of :data:`_CREDENTIAL_AHEAD`**, in the same order. A plain
+#: literal, so the static regex gate reads it, and ``tests/test_redaction_glued_credential_label.py``
+#: holds it to that arm. The start is "no ASCII letter or digit before", wider than the credential
+#: filters' ``\b`` after a prefix, since a tail kept here starts after the placeholder and so is read
+#: there anyway. **A ``MEFOR_`` name is not kept**, though the filters read one: its name is free
+#: ``[A-Z0-9_]`` text, so ``MEFOR_DOE_JANE_4455667:`` would print what the run scrubbed. Its value
+#: still prints there, as it did before #2968.
 #:
 #: **Linear.** It is searched only over the last :data:`_TRAILING_LABEL_SPAN` characters of a token
-#: the run already matched, so each match costs a bounded scan. A ``MEFOR_`` name too long to fit is
-#: not kept, which is what the run did before.
+#: the run already matched, so each match costs a bounded scan.
 _TRAILING_CREDENTIAL_LABEL = re.compile(
-    r"""(?<![A-Za-z0-9])(?:MEFOR_[A-Z0-9_]+|(?i:"""
+    r"""(?<![A-Za-z0-9])(?i:"""
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
-    r"""|token|pass|pwd))['"]?(?:[:=](?P<scheme>(?i:bearer|basic|digest))?+|(?P<bare>))\Z"""
+    r"""|token|pass|pwd)['"]?(?:[:=](?P<scheme>(?i:bearer|basic|digest))?+|(?P<bare>))\Z"""
 )
 #: How far back from a token's end :data:`_TRAILING_CREDENTIAL_LABEL` looks: the longest word, a
-#: quote, a separator and a scheme word fit with room to spare, and so does a ``MEFOR_`` name of
-#: ordinary length.
+#: quote, a separator and a scheme word fit with room to spare.
 _TRAILING_LABEL_SPAN = 64
 #: What must follow a kept label that holds no separator of its own: whitespace, then one.
 _SEPARATOR_AFTER = re.compile(r"\s++[:=]")
@@ -189,8 +190,15 @@ _VALUE_TOKEN = re.compile(r"\S*+")
 #: read, and its label is not kept.
 _VALUE_SPAN = 4096
 #: Substrings at least one of which every credential label holds, folded: each word of
-#: :data:`_TRAILING_CREDENTIAL_LABEL` contains one, and ``tests/test_redaction_glued_credential_label.py``
+#: :data:`_TRAILING_CREDENTIAL_LABEL` contains one, and so does a ``MEFOR_`` name, which the filters
+#: read though this module does not keep one. ``tests/test_redaction_glued_credential_label.py``
 #: holds that.
+#:
+#: **A substring and not a label shape, on purpose.** A value that merely contains ``pass``, such as
+#: a weak password, loses its label and prints, as it did before #2968. A shape test would copy
+#: what the filters read as a label start, and that grows: ``secretscrub`` is taking a start after a
+#: ``%XX`` escape that :data:`_CREDENTIAL_AHEAD` deliberately does not. A missed start here would
+#: let a kept label swallow a label the filters read, and print its value.
 _LABEL_HINTS = (
     "pass",
     "pwd",
@@ -231,14 +239,18 @@ def _value_span(text: str, pos: int) -> tuple[int, int, bool] | None:
     if first == "{":
         return None
     if first in "'\"":
+        closer = text.find(first, start + 1, limit)
+        bound = limit if closer == -1 else closer
         ends = [
-            i for i in (text.find("\n", start, limit), text.find("\r", start, limit)) if i != -1
+            i for i in (text.find("\n", start, bound), text.find("\r", start, bound)) if i != -1
         ]
-        if not ends and limit < len(text):
+        if ends:  # the line ends before any closer, so the value is read to the line's end
+            return start, min(ends), True
+        if closer != -1:
+            return start, closer + 1, True
+        if limit < len(text):
             return None
-        line_end = min(ends, default=limit)
-        closer = text.find(first, start + 1, line_end)
-        return start, line_end if closer == -1 else closer + 1, True
+        return start, limit, True
     token = _VALUE_TOKEN.match(text, start, limit)
     stop = limit if token is None else token.end()
     if stop == limit < len(text) and not text[limit].isspace():
@@ -314,10 +326,10 @@ def _default_field_run_replacement(match: re.Match[str]) -> str:
 #: placeholder at the start of a token, then the tail. :func:`redact` looks for one before it pays
 #: for a second look at its switch, and :func:`_without_kept_labels` reads it.
 _KEPT_LABEL = re.compile(
-    r"""(?<!\S)\[redacted\](?:MEFOR_[A-Z0-9_]+|(?i:"""
+    r"""(?<!\S)\[redacted\](?i:"""
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
-    r"""|token|pass|pwd))['"]?(?P<separator>[:=](?i:bearer|basic|digest)?+)?"""
+    r"""|token|pass|pwd)['"]?(?P<separator>[:=](?i:bearer|basic|digest)?+)?"""
 )
 
 
@@ -370,7 +382,12 @@ def _a_kept_value_holds_a_label(text: str) -> bool:
     replaces the two names, which glues ``,secret:`` to the kept label's value, and that label's
     value then printed. A differential found that shape once in 145,564 texts. So the finished
     output is read again, and where this holds, :func:`redact` returns what it returns with no label
-    kept."""
+    kept.
+
+    **The whole call falls back, not the one label, and that is the price.** Every other kept label
+    in that text goes too, so its value prints as it did before #2968. The fallback is exactly the
+    redactor before #2968, so it cannot print anything that one did not. Taking out one tail would
+    give a text no differential has measured."""
     return any(
         value_at is not None and _value_may_hold_a_label(text, value_at)
         for value_at in map(_kept_value_at, _KEPT_LABEL.finditer(text))
