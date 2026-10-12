@@ -1229,16 +1229,34 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui/messages/{message_id}/resend-done", response_class=HTMLResponse)
     async def ui_message_resend_done(
         message_id: str,
-        # Echoed from the engine's answer and checked against the connection-name rule, so the
-        # page names only what could name a connection. `source` may be absent: a duplicate of a
-        # key first used over the JSON API without one reports the prior row's empty source.
+        request: Request,
+        # Checked against the connection-name rule, so the page names only what could name a
+        # connection.
         to: Annotated[ConnectionName, Query()],
-        source: ConnectionName | None = Query(None),
+        # The idempotency key the resend ran under. The page renders from the store's record of
+        # it, never from the query, so a crafted link cannot report a resend that never ran
+        # (vault BACKLOG #3241). The key is the unguessable value the confirm page minted.
+        key: str = Query(..., min_length=1, max_length=128),
         duplicate: bool = Query(False),
         _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
     ) -> HTMLResponse:
+        prior = (
+            await core.prior_resend(
+                engine=await deps.get_engine(request),
+                idempotency_key=key,
+                message_id=message_id,
+                to=to,
+            )
+            if _fits_key(key)
+            else None
+        )
+        if prior is None:
+            return HTMLResponse(pages.message_resend_unknown(message_id), status_code=404)
+        # `from_destination` may be empty: a key first used over the JSON API without a source.
         return HTMLResponse(
-            pages.message_resend_done(message_id, to, source or "", duplicate=duplicate)
+            pages.message_resend_done(
+                message_id, prior.to_destination, prior.from_destination, duplicate=duplicate
+            )
         )
 
     # NEITHER OUTCOME GOES TO THE MESSAGE DETAIL PAGE. That page is `require_ui(MESSAGES_VIEW_RAW)`,
@@ -1347,9 +1365,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             settle_ui_action_step_up(spend, refused=False)
         # `duplicate` means the key was already used and NOTHING was queued (ADR 0090 §4). Reporting
         # it as a send would be the same lie as answering a refusal with the success response.
-        echo = {"to": result.to, "source": result.source} if result.source else {"to": result.to}
         outcome = urlencode(
-            {**echo, "duplicate": "true" if result.status == "duplicate" else "false"}
+            {
+                "to": result.to,
+                "key": body.idempotency_key,
+                "duplicate": "true" if result.status == "duplicate" else "false",
+            }
         )
         return RedirectResponse(
             f"/ui/messages/{_seg(message_id)}/resend-done?{outcome}", status_code=303

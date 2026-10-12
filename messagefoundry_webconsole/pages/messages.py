@@ -32,6 +32,7 @@ __all__ = [
     "message_edit",
     "message_resend_confirm",
     "message_resend_done",
+    "message_resend_unknown",
     "message_search",
     "messages",
     "parse_tree_page",
@@ -612,6 +613,29 @@ def message_detail(
         *_resend_section(detail),
         el("h2", "Events"),
         events,
+        active="messages",
+    )
+
+
+def message_resend_unknown(message_id: str) -> Markup:
+    """The outcome page for a link that names no resend this engine ran (vault BACKLOG #3241).
+
+    The outcome page renders from the store's record of the resend's key, so a link someone
+    crafted, or one whose record is gone, says that and claims nothing was queued by it."""
+    return page(
+        "Resend message",
+        el("h1", "No such resend"),
+        el(
+            "p",
+            text("This link names no resend of this message, so it reports none."),
+            class_="muted",
+        ),
+        el(
+            "p",
+            el("a", "← Message detail", href=f"/ui/messages/{_seg(message_id)}", class_="btn-link"),
+            " ",
+            el("a", "All messages", href="/ui/messages", class_="btn-link"),
+        ),
         active="messages",
     )
 
