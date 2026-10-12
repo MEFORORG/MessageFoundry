@@ -234,9 +234,9 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: the separator. Its start is ``\b`` alone. Since BACKLOG #2999 ``secretscrub`` also starts a label
 #: right after a ``%XX`` escape (``_LABEL_START``), and this arm deliberately does not. Taking that
 #: start here switched the encoded run off on every text holding such a label, so the run's PHI
-#: printed. Measured over 65,728 synthetic texts, each a PHI-bearing encoded run and a label glued by
-#: one of 26 escapes: with it, 150,384 PHI values printed on the installed chain that it hid before.
-#: Without it, no value printed on any of nine log paths that it hid before. The price: where such a
+#: printed. Measured by a before-and-after differential under BACKLOG #2999, whose commit carries the
+#: numbers: with that start, PHI values the run hid printed on the installed chain; without it,
+#: no value printed on any of nine log paths that the code before it hid. The price: where such a
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
 #: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme.

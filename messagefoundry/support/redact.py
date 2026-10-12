@@ -96,8 +96,9 @@ _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
 # Where a label may start: at a word boundary, or right after a percent-encoded character, whose
-# trailing hex digit leaves no boundary before a glued label (BACKLOG #2999). Why, and what it
-# costs, are stated once, on the same constant in ``messagefoundry/secretscrub.py``.
+# trailing hex digit leaves no boundary before a glued label (BACKLOG #2999). Why, what it costs,
+# and why ``_MEFOR_SECRET`` keeps ``\b``, are stated once, on the same constant in
+# ``messagefoundry/secretscrub.py``.
 _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 
 # The quoted and braced value fragments (BACKLOG #1685). ``_ODBC_BRACED`` and the overrun are
@@ -318,7 +319,7 @@ _AUTH_SCHEME = re.compile(
 # value with no space in it takes one quote after its closer, as the old plain class did, and one with
 # a space does not; why is on the same pattern in ``messagefoundry/secretscrub.py``.
 _MEFOR_SECRET = re.compile(
-    _LABEL_START + r"(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
+    r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_NO_SPACE
     + rf"(?![^{_PLAIN_TERMINATORS}])"

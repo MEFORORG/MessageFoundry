@@ -3298,12 +3298,12 @@ _PCT_CREDENTIALS = (
     f"api_key={_PCT_VALUE}",
     f"private_key={_PCT_VALUE}",
     f"encryption_key: {_PCT_VALUE}",
-    f"MEFOR_VALUE_PW={_PCT_VALUE}",
     f"bearer {_PCT_VALUE}",
 )
 
-#: The five patterns whose start #2999 widened, named the same in both copies.
-_PCT_STARTED = ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL")
+#: The four patterns whose start #2999 widened, named the same in both copies. ``_MEFOR_SECRET`` keeps
+#: ``\b``; ``secretscrub._LABEL_START``'s comment says why.
+PCT_STARTED = ("_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL")
 
 
 def _through_the_installed_chain(line: str) -> str:
@@ -3351,11 +3351,11 @@ def test_a_label_right_after_a_percent_escape_is_read_on_every_surface(glue: str
 def test_the_percent_escape_arm_fails_with_the_old_label_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE CONTROL for the arm above: with ``\\b`` back as the start of the five patterns, in both
+    """THE CONTROL for the arm above: with ``\\b`` back as the start of the four patterns, in both
     copies, every credential it plants prints on every surface but the installed chain, where the
     URL query filter catches the ``token=`` lines. So the start is what does the work."""
     for module in (scrub_mod, redact_mod):
-        for name in _PCT_STARTED:
+        for name in PCT_STARTED:
             pattern: re.Pattern[str] = getattr(module, name)
             assert pattern.pattern.count(module._LABEL_START) == 1, f"{module.__name__}.{name}"
             old = pattern.pattern.replace(module._LABEL_START, r"\b")
@@ -3382,8 +3382,22 @@ def test_the_percent_escape_arm_fails_with_the_old_label_start(
 def test_a_word_that_only_holds_a_label_word_after_an_escape_is_left_alone(line: str) -> None:
     """THE OVER-REDACTION CONTROL (closing step 3): a hex-looking word that ends in a label word, a
     plural or longer word, and the bare ``key`` this vocabulary leaves out are not labels."""
-    for surface, apply in _PCT_SURFACES[:2]:
-        assert apply(line) == line, surface
+    assert scrub_credentials(line) == line
+    assert _write_time_filtered(line) == line
+
+
+@pytest.mark.parametrize("glue", ["%20", "%2C", "%3B"])
+@pytest.mark.parametrize("outer", ["password", "token", "secret", "api_key"])
+def test_a_mefor_label_after_an_escape_inside_a_quoted_value_keeps_it_closed(
+    glue: str, outer: str
+) -> None:
+    """Why ``_MEFOR_SECRET`` keeps ``\\b`` (code review of BACKLOG #2999). With the escape start it
+    read the inner label, took the outer value's closing quote with its own value, and "pq2"
+    printed. The whole outer value must stay hidden."""
+    line = f"connect failed {outer}='pq1 pq2{glue}MEFOR_X=v' rest"
+    for surface, apply in _PCT_SURFACES:
+        out = apply(line)
+        assert "pq2" not in out and "pq1" not in out, f"{surface}: {out!r}"
 
 
 #: Inputs for the growth arm below. Each is about ``length`` long: an escape before every run, one
@@ -3399,7 +3413,8 @@ _PCT_GROWTH_SHAPES: tuple[Callable[[int], str], ...] = (
 def test_the_percent_escape_start_grows_linearly_in_line_length() -> None:
     """The start runs on every record, on text an attacker can influence, so it must stay linear.
     THE POSITIVE CONTROL is ``_BEARER`` with a start that fires inside a word run: every character
-    of the long segment then starts a walk to its end, which is the quadratic."""
+    of the long segment then starts a walk to its end, which is the quadratic. The control runs at
+    512 and 4,096 characters, the same 8x span: at 16 KB one quadratic call takes about 2 s."""
     for module in (scrub_mod, redact_mod):
         shipped: re.Pattern[str] = module._BEARER
         control = re.compile(
@@ -3407,18 +3422,14 @@ def test_the_percent_escape_start_grows_linearly_in_line_length() -> None:
             shipped.flags,
         )
         long_segment = _PCT_GROWTH_SHAPES[-1]
-
-        def sub(text: str, pattern: re.Pattern[str] = control) -> str:
-            return pattern.sub("x", text)
-
         control_growth = _growth_between(
-            sub, long_segment(_GROWTH_LENGTHS[0]), long_segment(_GROWTH_LENGTHS[1]), rounds=5
+            partial(control.sub, "x"), long_segment(512), long_segment(4096), rounds=5
         )
         assert control_growth > _MAX_GROWTH, (
             f"{module.__name__}: the quadratic control grew only {control_growth:.1f}x, so this box "
             "or this input cannot show the hazard and the shipped reading proves nothing"
         )
-        for name in _PCT_STARTED:
+        for name in PCT_STARTED:
             pattern: re.Pattern[str] = getattr(module, name)
             for shape in _PCT_GROWTH_SHAPES:
                 growth = _growth_between(

@@ -229,6 +229,20 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # such as ``%2Cclient_secret`` was already read, because "2Cclient_" is one prefix segment.
 # ``messagefoundry.redaction._CREDENTIAL_AHEAD`` deliberately does NOT take this start, because
 # taking it printed PHI; its comment gives the measurement and the credential shape that costs.
+#
+# FOUR PATTERNS TAKE IT, AND ``_MEFOR_SECRET`` DOES NOT. That pattern runs first and its value takes a
+# trailing quote, so with this start it read a ``MEFOR_`` label glued by an escape INSIDE another
+# label's quoted value and ate that value's closer: ``password='pq1 pq2%20MEFOR_X=v' rest`` printed
+# "pq2", which the patterns before hid (found by code review, 17,989 of 200,000 nested shapes).
+# An engine secret echoes as ``(env 'MEFOR_X'='<value>')``, never glued by an escape, so it keeps
+# ``\b``. A ``MEFOR_`` label right after an escape is therefore still not read; that is a residual.
+#
+# THE START IS A TRADE, NOT ONLY A WIDENING, because the passes run one after another and each reads
+# what the last one wrote (the OPEN DEFECTS list below). A label read now that was not read before
+# can end an earlier value where it used to run on. Measured over 40,000 seeded label-dense lines
+# with escape glue, against the patterns before #2999: 577 lines print a value they hid, and 9,012
+# hide one they printed. The structured differential in
+# ``tests/test_log_redaction_secret_domain.py`` reads 0 printed.
 _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 
 # A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
@@ -701,7 +715,7 @@ _AUTH_SCHEME = re.compile(
 # there made ``password="hunter;two MEFOR_DB={x y}" mode`` print ";two", found by the second review
 # round of 2026-10-05.
 _MEFOR_SECRET = re.compile(
-    _LABEL_START + r"(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
+    r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_NO_SPACE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
