@@ -34,7 +34,7 @@ transport consumes (refuse enforcing-production-PHI off-loopback, warn non-enfor
 loopback / synthetic / attested), rather than the bare warning it used to get. The
 ``[egress].allowed_smtp`` allowlist is the authoritative fail-closed host gate (enforced by the runner
 at load/reload/start), and the deny-by-default ``[egress].allowed_recipient_domains`` list bounds the
-``recipients`` (vault BACKLOG #2616).
+``recipients`` (vault BACKLOG #2616) and the ``sender``'s domain (vault BACKLOG #2912).
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** the email; a mailbox has no
 idempotency key, so a rare duplicate is possible after a transient failure between server-accept and
@@ -80,6 +80,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     NegativeAckError,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -277,8 +278,11 @@ def checked_sender(cell: str, sender: str) -> list[Address]:
     """Check ``sender`` the way :func:`checked_envelope` does and return its ``From:`` addresses.
 
     For a cell that must refuse a bad sender before it has any recipients, such as the per-user
-    security notifier at startup. Its domain is not gated: that is a policy question, not an
-    address-shape one. Raises :class:`ValueError` naming ``cell``, never the address."""
+    security notifier at startup. This checks shape only. The ``[egress]`` check gates the
+    ``Email()`` sender's domain against ``allowed_recipient_domains`` (vault BACKLOG #2912). The
+    alert sink and the notifier send no message body (ADR 0127 limits alert mail to fields with no
+    PHI), so their senders' domains stay ungated. Raises
+    :class:`ValueError` naming ``cell``, never the address."""
     problem = envelope_address_problem(sender)
     if problem is not None:
         raise ValueError(f"{cell}: the sender {problem}")
@@ -332,7 +336,9 @@ class EmailDestination(DestinationConnector):
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
         self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="Email destination"
+        )
         self.encoding: str = str(s.get("encoding", "utf-8"))
 
         # STARTTLS-by-default posture, mirroring RestDestination's verify_tls /

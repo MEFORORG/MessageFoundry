@@ -2719,6 +2719,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     for _env_line in unread_env_warnings(settings):
         logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
+    # BACKLOG #1125 (owner ruling 2026-10-11): an environment proxy must not attach silently. Named
+    # as soon as logging reaches its handlers, before the first hop that could use it.
+    from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
+
+    warn_ambient_proxy(logging.getLogger(__name__))
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
@@ -4875,6 +4880,10 @@ def _supervise(args: argparse.Namespace) -> int:
     if logging_refused is not None:
         return logging_refused
     _log_static_credential_outcome(sc_outcome)
+    # BACKLOG #1125: the supervisor's own store open and pair renewal can go through it too.
+    from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
+
+    warn_ambient_proxy(logging.getLogger(__name__))
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
@@ -6826,7 +6835,11 @@ def _refuse_an_unauditable_write(store: Store) -> None:
     account, ``admin-unlock`` clears the lockout. Without this, a refused audit append lands after
     those writes, so the change is made and nothing records who made it. The case that reaches it: a
     keyed chain opened from a shell with no key, under a stale audited opt-out that let the open
-    through."""
+    through.
+
+    ``admin-set-notify-email`` writes its audit row first, and calls this anyway: the refusal it
+    raises exits 2, could not start, where the append's own refusal could not be told apart from a
+    busy store, which exits 1 (BACKLOG #2124)."""
     refusal = store.audit_append_refusal()
     if refusal is not None:
         raise _UnauditableWrite(
@@ -7399,7 +7412,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except (StoreKeylessError, CipherError) as exc:
         # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
         # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
-        return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
+        # Either way the store could not be opened, so exit 2, as the keyless checks beside it
+        # exit (BACKLOG #2124, a seat decision under owner delegation 2026-10-08, not an owner
+        # ruling).
+        _emit_error(f"{_sentence(exc)} Nothing was written", as_json=args.json)
+        return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -7668,7 +7685,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     **THE AUDIT ROW IS APPENDED BEFORE THE ADDRESS IS WRITTEN.** The two are separate commits, so one
     order or the other can leave them disagreeing. A keyed store opened from a shell without its key
     (the key sits in the service's NSSM environment) opens fine and then refuses a keyless append;
-    written the other way round, the address would land unaudited. This order can instead leave an
+    written the other way round, the address would land unaudited. That refusal is asked before the
+    append and exits 2, could not start; a store that refuses the append for another reason, such
+    as a busy one, exits 1 (BACKLOG #2124). This order can instead leave an
     audit row for a write that then failed; the command then appends a ``..._failed`` row and says
     so rather than reporting OK. An unaudited change to where security notices go is the worse of
     the two.
@@ -7714,8 +7733,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     wanted = args.username.strip()
     actor = f"cli:{getpass.getuser()}"
     # Store failures a refused write can raise on every backend (BACKLOG #1983). `RuntimeError` covers
-    # the audit chain's keyed-append refusal and the store's own acquire timeout; `OSError` a server
-    # backend's lost connection; the rest are the drivers' own bases, which subclass neither.
+    # at least the store's own acquire timeout. The chain's in-memory key check (no key in this
+    # shell, or the current range's key not held) is asked before the append, so that refusal does
+    # not arrive here (BACKLOG #2124); a failure the check cannot predict still can. `OSError` covers
+    # a server backend's lost connection; the rest are the drivers' own bases, which subclass neither.
     store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
 
     async def run() -> tuple[str, str, str]:
@@ -7755,11 +7776,16 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # PHI-free, and the address itself is left out, as `provision-admin` records only
             # whether one was set. The actor names the OS user, as `admin-unlock` does.
             detail = json.dumps({"username": user.username})
+            # The chain's key check, asked before the append: no key in this shell, or the current
+            # range's key not held. Exit 2 below, as `admin-unlock` exits on it (BACKLOG #2124, a
+            # seat decision under owner delegation 2026-10-08, not an owner ruling).
+            _refuse_an_unauditable_write(store)
             try:
                 await store.record_audit("auth.admin_notify_email_set", actor=actor, detail=detail)
             except store_errors as exc:
-                # The chain refused the append (no key in this shell, the current range's key not
-                # held, or a running engine holding the write lock). Nothing has been written yet.
+                # Any other refusal of the append, such as a running engine holding the write lock
+                # or a pool acquire that timed out. A busy store is not "could not start", so it
+                # keeps exit 1. Nothing has been written yet.
                 return ("audit-refused", user.username, str(exc))
             try:
                 await store.set_user_notify_email(user.id, email=address)
@@ -7784,14 +7810,28 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     try:
         outcome, username, extra = run_guarded(run())
-    # #1916, #1780, #3054 (no key): could not start
-    except (KeylessAuditChainRefused, StoreNotFoundError, _StoreKeyUnresolved) as exc:
+    # #1916, #1780, #3054 (no key): could not start. And #2124: the chain's key check refused the
+    # audit row, which `admin-unlock` exits 2 on with the same text (a seat decision under owner
+    # delegation 2026-10-08, not an owner ruling).
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _StoreKeyUnresolved,
+        _UnauditableWrite,
+    ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if outcome == "open-refused":
+        # The store could not be opened, so the command could not start: exit 2, the code ADR 0171
+        # Amendment C gives "could not start" (BACKLOG #2124, a seat decision under owner
+        # delegation 2026-10-08, not an owner ruling). A `CipherError` here is raised by the open,
+        # before the command reads an account, so it is the same "could not start" as a
+        # `StoreKeylessError`. Exit 1 stays a refusal about the account.
+        _emit_error(f"{_sentence(extra)} Nothing was written", as_json=args.json)
+        return 2
     refusals = {
-        "open-refused": f"{extra}. Nothing was written",
         "no-such-user": f"no account named {username!r}",
         "not-admin": f"the account {username!r} is not an Administrator; the start gate asks only "
         "about enabled Administrators",

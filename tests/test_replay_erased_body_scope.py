@@ -310,9 +310,10 @@ _MARKER_PREDICATE = (
 
 _MARKER_GUARDED: dict[tuple[str, str, str], tuple[str, ...]] = {
     **_GUARDED,
-    ("store.py", "MessageStore", "resend_to"): ("LEFT JOIN shared_body",),
-    ("postgres.py", "PostgresStore", "resend_to"): ("LEFT JOIN shared_body",),
-    ("sqlserver.py", "SqlServerStore", "resend_to"): ("LEFT JOIN shared_body",),
+    # BACKLOG #2593: each backend reads the source row and opens it under its own tag, with no join.
+    ("store.py", "MessageStore", "resend_to"): ("payload FROM queue WHERE",),
+    ("postgres.py", "PostgresStore", "resend_to"): ("payload FROM queue WHERE",),
+    ("sqlserver.py", "SqlServerStore", "resend_to"): ("payload FROM queue WHERE",),
 }
 
 

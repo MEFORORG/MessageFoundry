@@ -87,6 +87,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    float_setting,
     intake_open,
     positive_cap,
     probe_tcp_reachable,
@@ -750,8 +751,12 @@ class MLLPDestination(DestinationConnector):
             raise ValueError("MLLP destination requires a 'host' setting (the downstream peer)")
         self.host: str = host
         self.port: int = int(s["port"])
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
-        self.connect_timeout: float = float(s.get("connect_timeout", 10.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="MLLP destination"
+        )
+        self.connect_timeout: float = float_setting(
+            s.get("connect_timeout", 10.0), knob="connect_timeout", transport="MLLP destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         # Per-outbound frame cap. This bounds ONLY the ACK-read decoder (the reply we read back); the
         # OUTGOING frame written by send() is deliberately UNCAPPED (frame() never truncates), so a
@@ -1769,17 +1774,25 @@ class MLLPSource(SourceConnector):
         # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).
         # The runner builds every other ACK itself.
         self.ack_mode: AckMode = config.ack_mode
-        # Every cap on THIS listener: key absent → secure default; None/0 → disabled, in whichever
-        # spelling arrives. `_cap_setting` is what makes that last clause true — see it for why
-        # deciding "off" before the conversion read a string `"0"` as a live cap of zero. All five go
-        # through it, so there is one rule here rather than a per-key convention to look up. It lives
-        # in transports/base.py now (BACKLOG #1872), where the raw-TCP, X12 and HTTP listeners read
-        # their caps through `positive_cap` on top of it.
-        self.max_connections: int | None = _cap_setting(
-            s.get("max_connections", DEFAULT_MAX_CONNECTIONS), int
+        # Every cap on THIS listener: key absent -> secure default; None/0 -> disabled, in whichever
+        # spelling arrives. `_cap_setting` is what makes that last clause true -- see it for why
+        # deciding "off" before the conversion read a string `"0"` as a live cap of zero. It lives in
+        # transports/base.py (BACKLOG #1872). Most caps go through `positive_cap` on top of it, which
+        # refuses a negative or a NaN, as the raw-TCP, X12 and HTTP listeners do.
+        # `max_connections_per_host` and `max_frame_seconds` keep guards of their own below, each
+        # with its own message. An int cap is held to the count rule in `count_setting` on either
+        # path (BACKLOG #3431).
+        self.max_connections: int | None = positive_cap(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS),
+            int,
+            knob="max_connections",
+            transport="MLLP",
         )
         self.max_connections_per_host: int | None = _cap_setting(
-            s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST), int
+            s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST),
+            int,
+            knob="max_connections_per_host",
+            transport="MLLP",
         )
         if self.max_connections_per_host is not None and self.max_connections_per_host < 1:
             # Only a NEGATIVE value reaches here: `_cap_setting` passes one through on purpose, and
@@ -1789,44 +1802,35 @@ class MLLPSource(SourceConnector):
             # it: the unbounded table this control is not allowed to contain. Refuse at build, where
             # dry-run and `check` surface it, rather than at the first connection.
             raise ValueError(
-                "MLLP max_connections_per_host must be at least 1 (use None or 0 to disable the "
-                f"per-host cap), got {self.max_connections_per_host}"
+                "MLLP max_connections_per_host must be at least 1 (value withheld; use None or 0 to "
+                "disable the per-host cap)"
             )
-        self.receive_timeout: float | None = _cap_setting(
-            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT), float
+        self.receive_timeout: float | None = positive_cap(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT),
+            float,
+            knob="receive_timeout",
+            transport="MLLP",
         )
-        self.max_frame_bytes: int | None = _cap_setting(
-            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES), int
+        self.max_frame_bytes: int | None = positive_cap(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES),
+            int,
+            knob="max_frame_bytes",
+            transport="MLLP",
         )
         self.max_frame_seconds: float | None = _cap_setting(
-            s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS), float
+            s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS),
+            float,
+            knob="max_frame_seconds",
+            transport="MLLP",
         )
-        if self.max_frame_seconds is not None and not self.max_frame_seconds >= 0:
-            # Negative reaches here too, and would expire every frame the instant one opened — a
+        if self.max_frame_seconds is not None and self.max_frame_seconds < 0:
+            # Negative reaches here, and would expire every frame the instant one opened — a
             # listener that drops every sender, configured from a value the author meant as "off".
-            # Written `not >= 0` rather than `< 0` so NaN is refused as well: TOML can spell `nan`,
-            # `_cap_setting` cannot recognise it (`nan != 0`), and every comparison with it is false
-            # — so `min()` against the idle bound would silently drop the deadline and a bare
-            # `wait_for(..., nan)` would fire at once.
+            # `_cap_setting` has already refused a NaN (BACKLOG #3432).
             raise ValueError(
-                "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
-                f"disable the frame deadline), got {self.max_frame_seconds}"
+                "MLLP max_frame_seconds must be a number of seconds, zero or more (value withheld; "
+                "use None or 0 to disable the frame deadline)"
             )
-        # BACKLOG #1872: the three caps above with no guard of their own. `_cap_setting` passes a
-        # negative through on purpose, and each one refuses everything: a negative `receive_timeout`
-        # makes every peer look idle the moment it connects and closes it as an idle timeout, a
-        # negative `max_connections` admits no connection, and a negative `max_frame_bytes` rejects
-        # every frame. Written `not > 0` so NaN is refused with them. The same rule the other three
-        # listeners get from `positive_cap`, applied here without touching the call sites above.
-        for knob, cap in (
-            ("max_connections", self.max_connections),
-            ("receive_timeout", self.receive_timeout),
-            ("max_frame_bytes", self.max_frame_bytes),
-        ):
-            if cap is not None and not cap > 0:
-                raise ValueError(
-                    f"MLLP {knob}={cap!r} must be above zero (use None or 0 to disable it)"
-                )
         # BACKLOG #1725 act 3. Read through `positive_cap`, which also names the key when the value
         # is not a number; a negative one would let no frame be handled at all.
         self.max_inflight_frames: int | None = positive_cap(

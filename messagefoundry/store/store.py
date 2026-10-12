@@ -63,6 +63,7 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
+from dataclasses import fields as _dc_fields
 from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -133,6 +134,18 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
+from messagefoundry.store.queue_tag import (
+    QUEUE_TAG_COLUMNS,
+    QUEUE_TAG_SELECT,
+    QueueTagError,
+    alert_queue_tag_failure,
+    is_tag_failure,
+    open_queue_cell,
+    queue_payload_aad,
+    queue_row_aad,
+    report_queue_tag_failure,
+)
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.schema_verify import (
     SchemaMismatchError,
     is_schema_step_error,
@@ -888,8 +901,10 @@ UPLOAD_RESERVATION_STALE_AFTER = 300.0
 #:    :meth:`QueueStore.purge_dead_letters`, and the server backends' twins);
 #: 2. a real body is written through ``self._cipher.encrypt`` (:meth:`_insert_outbound_row`), never
 #:    through ``_enc``, so on a keyed store it is a ``mfenc:`` cell and can never be ``''``;
-#: 3. a store-once row's ``''`` inline payload is a DEREF SENTINEL, not an erasure — it carries a
-#:    live ``body_ref``, and the purge releases that ref *before* it blanks the row.
+#: 3. a store-once row's ``payload`` holds its sealed ``shared_body`` key (BACKLOG #2593), and the
+#:    purge releases that ref *before* it blanks the row. So the ``body_ref`` arm decides nothing
+#:    for a row the store wrote. It is harmless for any other row: a blank payload is never
+#:    delivered, because the claim refuses it (:func:`~messagefoundry.store.queue_tag.open_queue_cell`).
 #:
 #: Spliced into at least :meth:`QueueStore.replay` and :meth:`QueueStore.replay_dead` so neither can
 #: re-queue a delivery whose content no longer exists: the connector would be handed a zero-byte
@@ -983,31 +998,18 @@ class OutboxItem:
     created_at: float | None = None
 
     @classmethod
-    def from_row(
-        cls,
-        row: aiosqlite.Row,
-        cipher: Cipher,
-        *,
-        body_aad: bytes,
-        shared_ciphertext: str | None = None,
-    ) -> OutboxItem:
-        """Build an item from a claimed queue row, decrypting its body for processing/delivery.
+    def from_row(cls, row: aiosqlite.Row, payload: str) -> OutboxItem:
+        """Build an item from a claimed queue row and its already-opened body.
 
-        ``shared_ciphertext`` is the store-once deref seam: when a row carries a ``body_ref`` (its body
-        lives once in ``shared_body``), the caller passes that shared copy's ciphertext here and it is
-        decrypted in place of the row's empty inline ``payload``. ``None`` (no ref) decrypts the inline
-        ``payload`` exactly as before — byte-identical. ``body_aad`` is the cell-binding AAD (ASVS
-        11.3.3) the caller built for the ciphertext's *source* cell: ``cell_aad("shared_body","body",
-        hash)`` for a deref'd shared body, ``cell_aad("queue","payload", row.id)`` for an inline one — so
-        the deref never reconstructs the wrong cell's AAD (a v1 row ignores it via dual-read)."""
-        ciphertext = shared_ciphertext if shared_ciphertext is not None else row["payload"]
+        The caller opens the body: the row's own ``payload`` under its routing tag, or, for a
+        store-once row, the shared body its sealed reference names (BACKLOG #2593,
+        :meth:`MessageStore._outbox_item_from_row`)."""
         return cls(
             id=row["id"],
             message_id=row["message_id"],
             channel_id=row["channel_id"],
             destination_name=row["destination_name"],
-            # decrypt the body for processing/delivery, bound to its source cell (ASVS 11.3.3)
-            payload=cipher.decrypt(ciphertext, aad=body_aad),
+            payload=payload,
             attempts=row["attempts"],
             stage=row["stage"],
             # Plaintext metadata (the handler to run), not a body — never encrypted. NULL off-routed.
@@ -1222,24 +1224,163 @@ class ConnectionEventWrite(TypedDict):
     now: NotRequired[float | None]
 
 
-# The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
+#: The session columns a session seal leaves out, each with the reason (BACKLOG #2592). Everything
+#: else in :class:`SessionRecord` is sealed, so a column added later is covered by default.
+#: ``tests/test_session_seal.py`` pins this list.
+SESSION_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "last_used_at": "written on every request, by parallel requests on one session",
+        "seal": "the seal itself",
+    }
+)
+
+# The one sessions INSERT, shared by every backend's create_session (BACKLOG #2592: it writes the
+# whole sealed row, so the account's epoch and the seal go in with it).
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-    " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
-    " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
+    " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
+    " user_epoch, seal)"
+    " VALUES (?,?,?,?,?,NULL,?,?,NULL,?,?,?,?)"
 )
 
-
-# BACKLOG #2143: the IdP step-up's write-back of the auth_time it accepted, in the `?` dialect SQLite
-# and SQL Server share. Bind the new value three times. It only ever moves FORWARD, so two step-ups on
-# one session that land out of order cannot leave the older value behind for a replay to pass. A
-# NULL (every password re-proof) leaves the stored value as it was. Each placeholder is CAST, because
-# inside an expression SQL Server has no column to infer a NULL parameter's type from.
-_IDP_AUTH_TIME_FORWARD_SQL: Final = (
-    "CASE WHEN CAST(? AS FLOAT) IS NOT NULL"
-    " AND (idp_auth_time IS NULL OR CAST(? AS FLOAT) > idp_auth_time)"
-    " THEN CAST(? AS FLOAT) ELSE idp_auth_time END"
+# BACKLOG #2592: the one statement that rewrites a session's sealed columns, used only by the store's
+# session write helper. It writes every sealed column and the new seal, and only over the exact row
+# the helper read and verified: the compare on `seal` makes a concurrent change lose cleanly.
+_SESSION_RESEAL: Final = (
+    "UPDATE sessions SET token_hash=?, user_id=?, created_at=?, expires_at=?, revoked_at=?,"
+    " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
+    " seal=? WHERE token_hash=? AND seal=?"
 )
+
+#: Raises an account's session epoch, which ends every session minted under the old one (BACKLOG
+#: #2592). Run beside every whole-account revoke.
+_BUMP_SESSION_EPOCH_SQL: Final = "UPDATE users SET session_epoch=session_epoch+1 WHERE id=?"
+
+
+def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
+    """The parameters :data:`_SESSION_RESEAL` binds, in order: ``new``'s sealed columns and seal,
+    then the key and the seal of the row as it was read."""
+    return (
+        new.token_hash,
+        new.user_id,
+        new.created_at,
+        new.expires_at,
+        new.revoked_at,
+        new.client,
+        new.reauth_at,
+        new.mfa_verified_at,
+        new.auth_mechanism,
+        new.idp_auth_time,
+        new.user_epoch,
+        new.seal,
+        old.token_hash,
+        old.seal,
+    )
+
+
+def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
+    """The parameters :data:`_SESSION_INSERT` binds, in order."""
+    return (
+        record.token_hash,
+        record.user_id,
+        record.created_at,
+        record.expires_at,
+        record.last_used_at,
+        record.client,
+        record.reauth_at,
+        record.auth_mechanism,
+        record.idp_auth_time,
+        record.user_epoch,
+        record.seal,
+    )
+
+
+def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
+    """``record`` with its seal set: the sealer's seal over its sealed fields, or empty on a store
+    with no sealer (BACKLOG #2592)."""
+    seal = "" if sealer is None else sealer.seal(SESSION_KIND, record.seal_fields())
+    return replace(record, seal=seal)
+
+
+def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
+    """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
+    key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
+    return sealer is None or sealer.verify(SESSION_KIND, record.seal_fields(), record.seal)
+
+
+def session_sealed_by_retired_key(sealer: RowSealer | None, record: SessionRecord) -> bool:
+    """Whether ``record`` carries a genuine seal made under a RETIRED store key: a session minted
+    before the key changed and not yet ended by ``rotate-key``. It is refused like any other row
+    that fails; this only says the refusal is a key change, not an integrity failure."""
+    return sealer is not None and sealer.sealed_by_retired_key(
+        SESSION_KIND, record.seal_fields(), record.seal
+    )
+
+
+def new_session_record(
+    *,
+    token_hash: str,
+    user_id: str,
+    now: float,
+    expires_at: float,
+    client: str | None,
+    seed_reauth: bool,
+    auth_mechanism: str | None,
+    idp_auth_time: float | None,
+    user_epoch: int,
+) -> SessionRecord:
+    """The row ``create_session`` writes, with every float as the backend will read it back, so the
+    seal made over it verifies after the round trip (BACKLOG #2592).
+
+    ``reauth_at = now`` seeds the step-up window from sign-in (ASVS 7.5.3). ``seed_reauth=False``
+    (an MFA-pending session, WP-14) leaves it NULL, so enrolment or step-up needs an explicit
+    password re-proof: a stolen pre-MFA token cannot ride the sign-in's step-up freshness."""
+    now = float(now)
+    return SessionRecord(
+        token_hash=token_hash,
+        user_id=user_id,
+        created_at=now,
+        expires_at=float(expires_at),
+        last_used_at=now,
+        revoked_at=None,
+        client=client,
+        reauth_at=now if seed_reauth else None,
+        mfa_verified_at=None,
+        auth_mechanism=auth_mechanism,
+        idp_auth_time=_opt_float(idp_auth_time),
+        user_epoch=int(user_epoch),
+    )
+
+
+def reauth_stamp(
+    now: float, client: str | None, idp_auth_time: float | None
+) -> Callable[[SessionRecord], SessionRecord]:
+    """The change ``mark_session_reauthed`` makes to a session row, for the session write helper.
+
+    ``reauth_at`` becomes ``now``. A ``client`` re-anchors the session's address; ``None`` keeps the
+    stored one (WP-L3-13). ``idp_auth_time`` only ever moves FORWARD (BACKLOG #2143), so two
+    step-ups landing out of order cannot leave the older value behind for a replay to pass."""
+    when = float(now)
+    idp = _opt_float(idp_auth_time)
+
+    def apply(s: SessionRecord) -> SessionRecord:
+        forward = s.idp_auth_time
+        if idp is not None and (forward is None or idp > forward):
+            forward = idp
+        return replace(
+            s,
+            reauth_at=when,
+            client=s.client if client is None else client,
+            idp_auth_time=forward,
+        )
+
+    return apply
+
+
+def mfa_stamp(now: float) -> Callable[[SessionRecord], SessionRecord]:
+    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14)."""
+    when = float(now)
+    return lambda s: replace(s, mfa_verified_at=when)
 
 
 # The session-cap predicates, in the `?` dialect SQLite and SQL Server share (BACKLOG #1900). Each
@@ -1569,9 +1710,11 @@ _SET_FEDERATED_IF_UNBOUND_SQL: Final = (
     "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
     " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
 )
-#: The session sweep a bind and an unbind each run inside their own transaction.
+#: The session sweep a bind and an unbind each run inside their own transaction. A revoke blanks
+#: the seal (BACKLOG #2592): that needs no key, and a revoked row then fails its seal even with
+#: ``revoked_at`` put back to NULL. Each caller also raises the account's session epoch.
 _REVOKE_USER_SESSIONS_SQL: Final = (
-    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
 )
 
 
@@ -1691,6 +1834,12 @@ class UserRecord:
     # ``must_change_password``, for ADR 0164's reason: record a lifecycle fact, never infer it from
     # mutable credential state. The login-time rehash (``set_password_hash``) never writes it.
     password_generated: bool = False
+    # THE ACCOUNT'S SESSION EPOCH (BACKLOG #2592). Every whole-account session revoke raises it by
+    # one, and a session resolves only while its own ``user_epoch`` equals it. The session's copy is
+    # sealed; this column is not yet, because the account row has no seal of its own. Until it does,
+    # the epoch orders the store's own writes (a sign-in racing an "end every session") and is not
+    # an integrity control on its own.
+    session_epoch: int = 0
 
     def sign_in_locked(self, now: float) -> bool:
         """Whether the SIGN-IN lock is live at ``now``."""
@@ -1751,6 +1900,9 @@ class UserRecord:
             # A ``.get()``: a missing key decodes as "chosen", which keeps the account LOCKABLE --
             # the closed direction for guessing.
             password_generated=bool(d.get("password_generated", 0)),
+            # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
+            # session minted before a revoke also carries, so it is the OPEN direction.
+            session_epoch=int(d["session_epoch"]),
         )
 
 
@@ -1818,6 +1970,13 @@ class SessionRecord:
     #: written before the column existed, which the IdP step-up refuses as
     #: ``step_up_idp_auth_time_missing``.
     idp_auth_time: float | None = None
+    #: The account's ``users.session_epoch`` when this session was minted or last re-sealed
+    #: (BACKLOG #2592). A whole-user revoke raises the account's epoch, so a session that carries an
+    #: older one resolves to nothing.
+    user_epoch: int = 0
+    #: The row's integrity seal (``mfseal:v1:...``, BACKLOG #2592) over every field above except the
+    #: ones :data:`SESSION_SEAL_EXCLUDED` names. Empty on a revoked row and on a keyless store.
+    seal: str = ""
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -1833,6 +1992,20 @@ class SessionRecord:
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
             auth_mechanism=d.get("auth_mechanism"),
             idp_auth_time=_opt_float(d.get("idp_auth_time")),
+            # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
+            user_epoch=int(d["user_epoch"]),
+            seal=d["seal"] or "",
+        )
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        """The ``(name, value)`` pairs a session seal covers, in field order (BACKLOG #2592).
+
+        Built from the dataclass's own fields, so a field added later is sealed by default and
+        only an entry in :data:`SESSION_SEAL_EXCLUDED` leaves one out."""
+        return tuple(
+            (f.name, getattr(self, f.name))
+            for f in _dc_fields(self)
+            if f.name not in SESSION_SEAL_EXCLUDED
         )
 
     def is_live(self, *, now: float, idle_seconds: float) -> bool:
@@ -5000,7 +5173,7 @@ CREATE TABLE IF NOT EXISTS queue (
                                       -- pass-through completion marker (#1580); NULL otherwise
     payload          TEXT NOT NULL,   -- stage body (encoded): ingress/routed=raw, outbound=transformed
     body_ref         TEXT,            -- store-once-deliver-many: when set, the body lives ONCE in
-                                      -- shared_body[body_ref] and payload is '' (deref'd at delivery);
+                                      -- shared_body[body_ref] and payload seals that key (#2593);
                                       -- NULL = body is inline in payload (the default, byte-identical)
     status           TEXT NOT NULL,
     attempts         INTEGER NOT NULL DEFAULT 0,
@@ -5442,7 +5615,8 @@ CREATE TABLE IF NOT EXISTS users (
     second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: failures from a caller who already proved one factor
     second_step_locked_until REAL,             -- ADR 0197: the second-step lock expiry; NULL = not locked
     second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: how many times the second-step lock was set
-    password_generated   INTEGER NOT NULL DEFAULT 0  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
+    password_generated   INTEGER NOT NULL DEFAULT 0,  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
+    session_epoch        INTEGER NOT NULL DEFAULT 0  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -5484,7 +5658,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     reauth_at    REAL,                         -- last credential re-verification (login / /me/reauth)
     mfa_verified_at REAL,                      -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
     auth_mechanism TEXT,                       -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
-    idp_auth_time REAL                         -- the IdP's auth_time for an oidc session (BACKLOG #2143)
+    idp_auth_time REAL,                        -- the IdP's auth_time for an oidc session (BACKLOG #2143)
+    user_epoch   INTEGER NOT NULL DEFAULT 0,   -- users.session_epoch at mint (BACKLOG #2592)
+    seal         TEXT NOT NULL DEFAULT ''      -- integrity seal over the row; '' once revoked (#2592)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
@@ -5711,6 +5887,10 @@ class MessageStore:
         # load — so this is a permanent 0 and there is no increment site in this module.
         self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
+        # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None when the
+        # cipher holds no in-process authorization root (keyless), and then no seal is written or
+        # checked.
+        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
         # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
         # may already count for another store, so close() must not settle its reserve here.
         self._cipher_foreign = False
@@ -5861,6 +6041,11 @@ class MessageStore:
     def cipher(self) -> Cipher:
         """This store's LIVE at-rest cipher — see :meth:`messagefoundry.store.base.Store.cipher`."""
         return self._cipher
+
+    def row_sealer(self) -> RowSealer | None:
+        """This store's row sealer, or ``None`` on a keyless store. See
+        :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
+        return self._row_sealer
 
     def _decode_row(
         self, row: aiosqlite.Row, table: str, pk: tuple[object, ...], *columns: str
@@ -6379,7 +6564,9 @@ class MessageStore:
     # migration/rotation loops, binding cell_aad(table, column, id). (ASVS 11.3.3, ADR 0019.)
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
-        ("queue", "payload"),
+        # NB: `queue.payload` is cipher-covered but NOT id-keyed: its tag binds the row's routing
+        # fields (BACKLOG #2593, `queue_row_aad`), so it has its own pass in _encrypt_existing_rows
+        # and reencrypt_to_active.
         ("messages", "error"),
         ("queue", "last_error"),
         ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
@@ -6474,6 +6661,15 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
                 total += await self._seal_surface(table, column, like, aad_cols=("id",))
+            # The `queue.payload` cell binds the row's routing fields (BACKLOG #2593).
+            total += await self._seal_surface(
+                "queue",
+                "payload",
+                like,
+                aad_cols=QUEUE_TAG_COLUMNS,
+                key_cols=("id",),
+                aad_of=queue_row_aad,
+            )
             # The `state` table (composite PK, ADR 0005) binds its AAD to (namespace, key).
             total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
             # The `reference` table (composite PK name,version,key — ADR 0006).
@@ -6534,13 +6730,16 @@ class MessageStore:
         *,
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
+        aad_of: Callable[[aiosqlite.Row], bytes] | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext, in ONE transaction; return the count.
 
         The caller holds ``self._lock``. ``aad_cols`` rebuild the cell AAD the write/read path binds;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. All identifiers are code
-        constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. ``aad_of``, when given,
+        builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
+        queue payload's routing tag, BACKLOG #2593). All identifiers are code constants from
+        :meth:`_encrypt_existing_rows`; only the marker pattern is a parameter.
 
         Three steps, in this order:
 
@@ -6610,7 +6809,12 @@ class MessageStore:
                     [
                         (
                             self._cipher.encrypt(
-                                r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                                r["v"],
+                                aad=(
+                                    aad_of(r)
+                                    if aad_of is not None
+                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
+                                ),
                             ),
                             *(r[c] for c in keys),
                         )
@@ -6728,6 +6932,8 @@ class MessageStore:
                     await self._commit()
                     await self._charge_bound_batch()
                     total += len(rows)
+            # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
+            total += await self._reencrypt_queue_payload_to_active(cipher, active_like, batch)
             # The `state` table has a composite PK (namespace,key), not an `id`, so it can't ride the
             # generic id-keyed loop above — rotate it with its own pass (ADR 0005).
             total += await self._reencrypt_state_to_active(cipher, active_like, batch)
@@ -6748,8 +6954,16 @@ class MessageStore:
             total += await self._reencrypt_message_events_to_active(cipher, active_like, batch)
             total += await self._reencrypt_connection_events_to_active(cipher, active_like, batch)
             total += await self._reencrypt_alert_instances_to_active(cipher, active_like, batch)
+            # BACKLOG #2592: a rotation ends every session. A session seal verifies only under the
+            # active key's root, so a row sealed before the rotation would otherwise be refused, and
+            # alerted on, the next time it was presented.
+            cur = await self._db.execute("DELETE FROM sessions")
+            await self._commit()
+            ended = cur.rowcount if cur.rowcount is not None else 0
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
+        if ended:
+            log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
     @staticmethod
@@ -6761,6 +6975,52 @@ class MessageStore:
         under the cell-bound writer, upgrades to a cell-bound v4 value. The single seam every rotation
         loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
+
+    async def _reencrypt_queue_payload_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
+        (:func:`queue_row_aad`, BACKLOG #2593); caller holds ``self._lock``. The id-keyed loop's
+        shape, with the tag columns selected so the decrypt and the encrypt share one tag.
+        A cell that does not open under its own tag with a key this process holds
+        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
+        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
+        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
+        ``id``, since a skipped row still matches the marker filter."""
+        total = skipped = 0
+        after = ""
+        while True:
+            cur = await self._db.execute(
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                " WHERE payload NOT LIKE ? AND payload <> '' AND id > ? ORDER BY id LIMIT ?",
+                (active_like, after, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            after = rows[-1]["id"]
+            updates: list[tuple[str, str]] = []
+            for r in rows:
+                try:
+                    updates.append(
+                        (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
+                    )
+                except CipherError:
+                    if not is_tag_failure(cipher, r["payload"]):
+                        raise
+                    skipped += 1
+            if updates:
+                await self._db.executemany("UPDATE queue SET payload=? WHERE id=?", updates)
+                await self._commit()
+                await self._charge_bound_batch()
+                total += len(updates)
+        if skipped:
+            log.warning(
+                "rotation left %d queue row(s) whose payload does not open under its own tag"
+                " under a held key; no claim or read opens them (BACKLOG #2593)",
+                skipped,
+            )
+        return total
 
     async def _reencrypt_attachment_chunks_to_active(
         self, cipher: AesGcmCipher, active_like: str, batch: int
@@ -7111,6 +7371,9 @@ class MessageStore:
             # this credential", which keeps the account LOCKABLE -- the closed direction. The
             # startup census names any such account that has no way past the lock.
             ("password_generated", "INTEGER NOT NULL DEFAULT 0"),
+            # BACKLOG #2592: the account's session epoch. 0 on an existing row, which every
+            # existing session (user_epoch 0 below) matches, so nothing is signed out by the add.
+            ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -7218,6 +7481,15 @@ class MessageStore:
         # NULL as step_up_idp_auth_time_missing.
         if "idp_auth_time" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN idp_auth_time REAL")
+        # BACKLOG #2592: the account epoch a session was minted under, and the row's integrity seal.
+        # An existing row gets epoch 0 and an empty seal: it still resolves on a keyless store, and a
+        # keyed store refuses it, since a keyed process treats a missing seal as a failed one.
+        if "user_epoch" not in session_cols:
+            await db.execute(
+                "ALTER TABLE sessions ADD COLUMN user_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+        if "seal" not in session_cols:
+            await db.execute("ALTER TABLE sessions ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -7811,28 +8083,38 @@ class MessageStore:
 
         ``body_ref`` is the store-once seam: ``None`` (default) inlines the encrypted body in ``payload``
         (byte-identical to the pre-feature path); a non-``None`` content-address hash references the single
-        copy in ``shared_body`` and stores an empty inline ``payload`` (dereferenced at delivery). The
-        caller (:meth:`_insert_outbound_deliveries`) reserves the shared_body row before passing a ref."""
+        copy in ``shared_body``, and ``payload`` holds that hash sealed under the row's tag (BACKLOG
+        #2593), dereferenced at delivery. The caller (:meth:`_insert_outbound_deliveries`) reserves the
+        shared_body row before passing a ref."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
         row_id = uuid4().hex
-        # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
-        # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
+        # BACKLOG #2593: the payload is sealed under the row's own routing tag. A shared-body row seals
+        # its `shared_body` key here instead of leaving the cell blank, so every deliverable row holds
+        # exactly one sealed cell and a blank payload is never delivered on a keyed store.
         #
-        # DO NOT "simplify" the else-arm to `self._enc(...)`. `_enc` short-circuits a falsy value to
-        # itself, so a legitimately EMPTY body would land as '' — indistinguishable at rest from a
-        # retention erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The
-        # direct `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two
-        # apart on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
+        # DO NOT "simplify" this to `self._enc(...)`. `_enc` short-circuits a falsy value to itself,
+        # so a legitimately EMPTY body would land as '' — indistinguishable at rest from a retention
+        # erasure, and `_REPLAYABLE_BODY` (BACKLOG #1560) would then refuse to replay it. The direct
+        # `encrypt('')` writes a real `mfenc:` cell instead, which is exactly what keeps the two apart
+        # on a keyed store. (Keyless, `IdentityCipher.encrypt('')` is '' and they do collapse; the
         # guard is replay-only, so a first delivery is unaffected either way.)
-        stored_payload = (
-            ""
-            if body_ref is not None
-            else self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id))
+        stored_payload = self._cipher.encrypt(
+            payload if body_ref is None else body_ref,
+            aad=queue_payload_aad(
+                row_id=row_id,
+                message_id=mid,
+                stage=Stage.OUTBOUND.value,
+                channel_id=channel_id,
+                destination_name=dest_name,
+                handler_name=None,
+                body_ref=body_ref,
+            ),
         )
         if body_ref is None:
-            # A1: an inline body is one durable copy; a shared-body row (body_ref set) stores '' here and
-            # the single copy is counted once in _reserve_shared_body (store-once-aware amplification).
+            # A1: an inline body is one durable copy; a shared-body row (body_ref set) stores only its
+            # sealed reference here, and the single copy is counted once in _reserve_shared_body
+            # (store-once-aware amplification).
             self.body_copies += 1
         await self._db.execute(
             "INSERT INTO queue"
@@ -7866,7 +8148,7 @@ class MessageStore:
         never kept twice at rest beyond the brief route→transform window (mirrors the ingress row)."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
-        # Hoist the row id so the payload can bind to its own (queue, payload, id) cell (ASVS 11.3.3).
+        # Hoist the row id so the payload can bind to its own row tag (ASVS 11.3.3).
         row_id = uuid4().hex
         await self._db.execute(
             "INSERT INTO queue"
@@ -7879,7 +8161,18 @@ class MessageStore:
                 Stage.ROUTED.value,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+                self._cipher.encrypt(
+                    payload,
+                    aad=queue_payload_aad(
+                        row_id=row_id,
+                        message_id=mid,
+                        stage=Stage.ROUTED.value,
+                        channel_id=channel_id,
+                        destination_name=None,
+                        handler_name=handler_name,
+                        body_ref=None,
+                    ),
+                ),
                 OutboxStatus.PENDING.value,
                 now,
                 created_at,
@@ -7945,7 +8238,7 @@ class MessageStore:
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059).
             ingress_created_at = now
-            # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+            # Hoist the row id so the ingress payload binds to its own row tag.
             ingress_row_id = uuid4().hex
             await self._db.execute(
                 "INSERT INTO queue"
@@ -7957,7 +8250,18 @@ class MessageStore:
                     mid,
                     Stage.INGRESS.value,
                     channel_id,
-                    self._cipher.encrypt(raw, aad=cell_aad("queue", "payload", ingress_row_id)),
+                    self._cipher.encrypt(
+                        raw,
+                        aad=queue_payload_aad(
+                            row_id=ingress_row_id,
+                            message_id=mid,
+                            stage=Stage.INGRESS.value,
+                            channel_id=channel_id,
+                            destination_name=None,
+                            handler_name=None,
+                            body_ref=None,
+                        ),
+                    ),
                     OutboxStatus.PENDING.value,
                     now,
                     ingress_created_at,
@@ -8543,41 +8847,62 @@ class MessageStore:
             try:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
-                log.warning("dead-lettering undecryptable outbox row %s: %s", row["id"], exc)
                 # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
                 # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
-                await self.dead_letter_now(
-                    row["id"], f"undecryptable payload: {exc}", _standalone=True
-                )
+                await self._dead_letter_unopenable(row, exc)
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
         """Build an :class:`OutboxItem` from a claimed queue row, dereferencing a shared body if any.
 
-        Store-once-deliver-many deref: a row with a non-NULL ``body_ref`` holds its body once in
-        ``shared_body`` (its inline ``payload`` is empty); fetch that single encrypted copy and decrypt it
-        as the row's body. A row with no ``body_ref`` decrypts its inline ``payload`` directly — byte-
-        identical to the pre-feature path (no shared_body read). A missing shared body (corruption /
-        premature GC) raises like any undecryptable payload, so the caller dead-letters that one row
-        rather than stalling the lane."""
-        body_ref = row["body_ref"] if "body_ref" in row.keys() else None  # noqa: SIM118
-        if body_ref is None:
-            # Inline body — bound to this queue row's own cell (ASVS 11.3.3).
-            return OutboxItem.from_row(
-                row, self._cipher, body_aad=cell_aad("queue", "payload", row["id"])
-            )
+        The row's ``payload`` is opened under the tag its own routing fields build (BACKLOG #2593), so
+        a row whose ``stage``, ``channel_id``, ``destination_name``, ``handler_name``, ``message_id``
+        or body kind changed outside the store raises :class:`QueueTagError`. An inline row's cell is
+        its body. A store-once row's cell is the sealed ``shared_body`` key; it must equal the
+        ``body_ref`` column, and the single shared copy it names is then decrypted as the body. A
+        missing shared body (corruption / premature GC) raises like any undecryptable payload, so the
+        caller dead-letters that one row rather than stalling the lane."""
+        if row["body_ref"] is None:
+            return OutboxItem.from_row(row, open_queue_cell(self._cipher, row))
         async with self._read() as db:
-            cur = await db.execute("SELECT body FROM shared_body WHERE hash=?", (body_ref,))
-            br = await cur.fetchone()
+            return OutboxItem.from_row(row, await self._open_queue_body(db, row, alert=False))
+
+    async def _open_queue_body(
+        self, db: aiosqlite.Connection, row: aiosqlite.Row, *, alert: bool = True
+    ) -> str:
+        """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593).
+
+        An inline row's ``payload`` is the body. A store-once row's ``payload`` is the sealed
+        ``shared_body`` key, checked against ``body_ref`` by :func:`open_queue_cell`; the single
+        shared copy that key names is read on ``db`` and decrypted under its content-address cell.
+
+        ``alert`` is for a read (a resend source, a body view): a tag failure there raises the
+        alert and propagates, refusing the read. A claim leaves it off, because its dead-letter
+        path reports the failure with an audit row as well."""
+        try:
+            opened = open_queue_cell(self._cipher, row)
+        except QueueTagError:
+            if alert:
+                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+            raise
+        if row["body_ref"] is None:
+            return opened
+        cur = await db.execute("SELECT body FROM shared_body WHERE hash=?", (opened,))
+        br = await cur.fetchone()
         if br is None:
-            raise CipherError(f"shared body {body_ref} missing")
+            raise CipherError(f"shared body {opened} missing")
         # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
-        return OutboxItem.from_row(
-            row,
-            self._cipher,
-            body_aad=cell_aad("shared_body", "body", body_ref),
-            shared_ciphertext=br["body"],
-        )
+        return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
+
+    async def _dead_letter_unopenable(self, row: aiosqlite.Row, exc: Exception) -> None:
+        """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
+        runs after the claim committed, so it must never join a group batch). A row that failed its
+        queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
+        (BACKLOG #2593). The lane moves on either way."""
+        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
+        if isinstance(exc, QueueTagError):
+            await report_queue_tag_failure(self, self._cipher, row)
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
@@ -8696,13 +9021,10 @@ class MessageStore:
             # let the next poll advance to the new head, rather than re-raising into the worker (H-1).
             # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
             # payload is also pushed as an `integrity_drift` alert: the cipher's refusal hook reaches
-            # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its tag still
-            # gets no push alert -- a documented follow-up.
-            log.warning("dead-lettering undecryptable queue row %s: %s", claimed["id"], exc)
+            # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
+            # is audited and alerted too (BACKLOG #2593).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
-            await self.dead_letter_now(
-                claimed["id"], f"undecryptable payload: {exc}", _standalone=True
-            )
+            await self._dead_letter_unopenable(claimed, exc)
             return None
 
     async def claim_next_fifo_batch(
@@ -8780,10 +9102,7 @@ class MessageStore:
             try:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
-                log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-                await self.dead_letter_now(
-                    row["id"], f"undecryptable payload: {exc}", _standalone=True
-                )
+                await self._dead_letter_unopenable(row, exc)
         return items
 
     async def claim_fifo_heads(
@@ -8904,10 +9223,7 @@ class MessageStore:
                 try:
                     items.append(await self._outbox_item_from_row(row))
                 except Exception as exc:
-                    log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-                    await self.dead_letter_now(
-                        row["id"], f"undecryptable payload: {exc}", _standalone=True
-                    )
+                    await self._dead_letter_unopenable(row, exc)
             if items:
                 by_lane[lane] = items
             else:
@@ -9227,7 +9543,7 @@ class MessageStore:
                 artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
                 work_created = now
-                # Hoist the row id so the artifact-ref payload binds to its own (queue, payload, id) cell.
+                # Hoist the row id so the artifact-ref payload binds to its own row tag.
                 work_row_id = uuid4().hex
                 await self._db.execute(
                     "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -9240,7 +9556,18 @@ class MessageStore:
                         reingress_to,
                         None,
                         None,
-                        self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
+                        self._enc(
+                            artifact_ref,
+                            aad=queue_payload_aad(
+                                row_id=work_row_id,
+                                message_id=message_id,
+                                stage=Stage.RESPONSE.value,
+                                channel_id=reingress_to,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        ),
                         OutboxStatus.PENDING.value,
                         0,
                         now,
@@ -9357,7 +9684,7 @@ class MessageStore:
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
-            # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+            # Hoist the row id so the ingress payload binds to its own row tag.
             pt_ingress_id = uuid4().hex
             await self._db.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -9370,7 +9697,18 @@ class MessageStore:
                     pt_channel,
                     None,
                     None,
-                    self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
+                    self._cipher.encrypt(
+                        body,
+                        aad=queue_payload_aad(
+                            row_id=pt_ingress_id,
+                            message_id=new_mid,
+                            stage=Stage.INGRESS.value,
+                            channel_id=pt_channel,
+                            destination_name=None,
+                            handler_name=None,
+                            body_ref=None,
+                        ),
+                    ),
                     OutboxStatus.PENDING.value,
                     0,
                     now,
@@ -9405,7 +9743,7 @@ class MessageStore:
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
-        # Hoist the row id so the (empty) marker payload binds to its own (queue, payload, id) cell —
+        # Hoist the row id so the (empty) marker payload binds to its own row tag —
         # the marker is finalizer-only, but a PHI-body read (outbox_payloads_for) still derefs it.
         marker_id = uuid4().hex
         await self._db.execute(
@@ -9419,7 +9757,18 @@ class MessageStore:
                 pt_name,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
-                self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
+                self._cipher.encrypt(
+                    "",
+                    aad=queue_payload_aad(
+                        row_id=marker_id,
+                        message_id=parent_id,
+                        stage=Stage.OUTBOUND.value,
+                        channel_id=pt_name,
+                        destination_name=pt_name,
+                        handler_name=PASSTHROUGH_MARKER_HANDLER,
+                        body_ref=None,
+                    ),
+                ),
                 status,
                 0,
                 now,
@@ -9478,7 +9827,7 @@ class MessageStore:
         async with _writer_txn(self._db, self._lock):
             # 1. The work-row must still be INFLIGHT (the claim set it so); it carries the artifact ref.
             cur = await self._db.execute(
-                "SELECT message_id, payload FROM queue WHERE id=? AND stage=? AND status=?",
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=? AND status=?",
                 (response_row_id, Stage.RESPONSE.value, OutboxStatus.INFLIGHT.value),
             )
             wr = await cur.fetchone()
@@ -9487,13 +9836,7 @@ class MessageStore:
                 return False
             origin_id = wr["message_id"]
             try:
-                ref = (
-                    self._dec(
-                        wr["payload"],
-                        aad=cell_aad("queue", "payload", response_row_id),
-                    )
-                    or ""
-                )
+                ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
             except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
@@ -9614,7 +9957,7 @@ class MessageStore:
                 if not peek_failed:
                     # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059)
                     ingress_created = now
-                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    # Hoist the row id so the payload binds to its own row tag.
                     reingress_row_id = uuid4().hex
                     await self._db.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -9628,7 +9971,16 @@ class MessageStore:
                             None,
                             None,
                             self._cipher.encrypt(
-                                body, aad=cell_aad("queue", "payload", reingress_row_id)
+                                body,
+                                aad=queue_payload_aad(
+                                    row_id=reingress_row_id,
+                                    message_id=new_mid,
+                                    stage=Stage.INGRESS.value,
+                                    channel_id=loopback_channel_id,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
                             ),
                             OutboxStatus.PENDING.value,
                             0,
@@ -9669,13 +10021,13 @@ class MessageStore:
         for the message raw, so the peek and the raw always agree."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT payload FROM queue WHERE id=? AND stage=?",
+                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
                 (response_row_id, Stage.RESPONSE.value),
             )
             row = await cur.fetchone()
             if row is None:
                 return None
-            ref = self._dec(row["payload"], aad=cell_aad("queue", "payload", response_row_id)) or ""
+            ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
             try:
                 mid, dest, seq_s = ref.split("\x1f")
             except ValueError:
@@ -10619,10 +10971,8 @@ class MessageStore:
                     src_where += " AND destination_name=?"
                     src_params.append(from_)
                 cur = await self._db.execute(
-                    "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
-                    " COALESCE(sb.body, q.payload) AS _body_ciphertext"
-                    " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
-                    f" WHERE {src_where} ORDER BY q.destination_name",
+                    f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                    f" WHERE {src_where} ORDER BY destination_name",
                     tuple(src_params),
                 )
                 rows = list(await cur.fetchall())
@@ -10640,17 +10990,16 @@ class MessageStore:
                 src = rows[0]
                 src_channel = str(src["channel_id"])
                 src_dest = str(src["destination_name"])
-                # The body's cell depends on its source: a store-once shared body (body_ref set) binds
-                # to the shared_body content-address; an inline payload binds to the queue row (11.3.3).
-                body_aad = (
-                    cell_aad("shared_body", "body", src["body_ref"])
-                    if src["body_ref"] is not None
-                    else cell_aad("queue", "payload", src["id"])
-                )
-                decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
                 # must-fix #2 / §5: a retention-nulled ('') source body would ship a zero-length body
-                # recorded PROCESSED. Reject rather than resend nothing. (A '' inline payload is exactly
-                # what purge_message_bodies leaves; the deref COALESCE already resolved any shared body.)
+                # recorded PROCESSED. Reject rather than resend nothing. A '' payload is exactly what
+                # purge_message_bodies leaves; a store-once row holds its sealed reference there.
+                # Otherwise the body is opened under the source row's own tag (BACKLOG #2593), and a
+                # store-once row's sealed reference decides which shared body is read.
+                decoded = (
+                    ""
+                    if src["payload"] == "" and src["body_ref"] is None
+                    else await self._open_queue_body(self._db, src)
+                )
                 if not decoded:
                     raise ResendSourceEmpty(
                         f"message {message_id} source body was purged by retention -- cannot resend"
@@ -10801,7 +11150,7 @@ class MessageStore:
                     origin_actor=actor,
                 )
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
-                # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                # Hoist the row id so the payload binds to its own row tag.
                 resubmit_row_id = uuid4().hex
                 await self._db.execute(
                     "INSERT INTO queue"
@@ -10814,7 +11163,16 @@ class MessageStore:
                         Stage.INGRESS.value,
                         channel_id,
                         self._cipher.encrypt(
-                            raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                            raw,
+                            aad=queue_payload_aad(
+                                row_id=resubmit_row_id,
+                                message_id=new_mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=channel_id,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
                         ),
                         OutboxStatus.PENDING.value,
                         now,
@@ -11289,27 +11647,31 @@ class MessageStore:
         each outbound delivery — the parity-comparison read path (#14). Kept separate from
         ``outbox_for`` so the metadata-only message-detail view never materializes plaintext bodies;
         the API gates this behind ``MESSAGES_VIEW_RAW`` and audits the access."""
-        # LEFT JOIN the single shared copy so a body_ref row's body is decrypted from shared_body.body;
-        # an inline row (NULL body_ref) keeps its own queue.payload. COALESCE picks the right ciphertext
-        # source per row so store-once is transparent to this PHI-body read (the #14 parity comparison).
+        # Each body is opened under its row's own tag (BACKLOG #2593): an inline row's payload is the
+        # body, and a store-once row's sealed reference names the single shared copy, so store-once is
+        # transparent to this PHI-body read (the #14 parity comparison). A purged row ('') reads as an
+        # empty body. A live row whose tag fails refuses the whole read and raises the alert. A dead
+        # row whose tag fails is left out: the claim dead-lettered and reported it already, and its
+        # metadata, error included, stays in outbox_for.
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT q.*, "
-                "COALESCE(sb.body, q.payload) AS _body_ciphertext "
-                "FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref "
-                "WHERE q.message_id=? AND q.stage=? ORDER BY q.destination_name",
+                "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
                 (message_id, Stage.OUTBOUND.value),
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
                 d = self._decode_row(r, "queue", (r["id"],), "last_error")
-                # The body's cell depends on its source (store-once shared body vs inline payload).
-                body_aad = (
-                    cell_aad("shared_body", "body", r["body_ref"])
-                    if r["body_ref"] is not None
-                    else cell_aad("queue", "payload", r["id"])
-                )
-                d["payload"] = self._dec(d.pop("_body_ciphertext"), aad=body_aad)
+                dead = r["status"] == OutboxStatus.DEAD.value
+                try:
+                    d["payload"] = (
+                        ""
+                        if r["payload"] == "" and r["body_ref"] is None
+                        else await self._open_queue_body(db, r, alert=not dead)
+                    )
+                except QueueTagError:
+                    if not dead:
+                        raise
+                    continue
                 out.append(d)
             return out
 
@@ -12838,6 +13200,7 @@ class MessageStore:
                 # transaction, as set_user_federated_subject does.
                 await self._commit()
                 return None
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             appended = await self._append_audits((audit,), now=now)
             await self._commit()
@@ -13454,6 +13817,7 @@ class MessageStore:
                 # Nothing written, so nothing is revoked. The commit ends the empty transaction.
                 await self._commit()
                 return None
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return int(revoked.rowcount)
@@ -13503,6 +13867,7 @@ class MessageStore:
                 "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
                 (now, user_id),
             )
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return FederatedUnbind(
@@ -13591,43 +13956,62 @@ class MessageStore:
         idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
-        # MFA-PENDING session (WP-14) leaves it NULL, so enrollment/step-up needs an explicit
-        # password re-verify — a stolen pre-MFA token can't ride the login's step-up freshness.
-        params = (
-            token_hash,
-            user_id,
-            now,
-            expires_at,
-            now,
-            client,
-            now if seed_reauth else None,
-            auth_mechanism,
-            idp_auth_time,
-        )
-        if require_federated_subject is None:
-            async with _writer_guard(self._db, self._lock):
-                await self._db.execute(_SESSION_INSERT, params)
-                await self._commit()
-            return True
-        # _writer_txn for the GUARDED path, not the _writer_guard the unguarded one uses (BACKLOG
-        # #1474). The lock alone is what makes the read and the INSERT atomic against
-        # clear_user_federated_subject, which takes the same lock — but this branch is a
-        # MULTI-statement writer with an explicit transaction, so it goes through _writer_txn, which
-        # unwinds on BaseException (ADR 0159). The refusal below rolls back itself, as that helper's
-        # contract requires.
+        # _writer_txn, not a short writer: the account's row is read first in the same transaction
+        # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
+        # path's binding check). The lock alone is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject and every whole-account revoke, which take the same lock.
+        # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
+                "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=?", (user_id,)
             )
             row = await cur.fetchone()
-            bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-            if bound != require_federated_subject:
-                await self._db.rollback()
-                return False
-            await self._db.execute(_SESSION_INSERT, params)
+            if require_federated_subject is not None:
+                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
+                if bound != require_federated_subject:
+                    await self._db.rollback()
+                    return False
+            record = new_session_record(
+                token_hash=token_hash,
+                user_id=user_id,
+                now=now,
+                expires_at=expires_at,
+                client=client,
+                seed_reauth=seed_reauth,
+                auth_mechanism=auth_mechanism,
+                idp_auth_time=idp_auth_time,
+                user_epoch=0 if row is None else int(row["session_epoch"]),
+            )
+            record = seal_session(self._row_sealer, record)
+            await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True
+
+    async def _write_session(
+        self,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+    ) -> SessionRecord | None:
+        """The one writer of a session's sealed columns (BACKLOG #2592). Call it inside a writer
+        transaction on ``self._db``.
+
+        Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
+        every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
+        there is no unrevoked row or the compare lost to a concurrent write. Raises
+        :class:`RowSealError`, and writes nothing, when the row it read does not verify: re-sealing
+        it would turn a change made outside this helper into a sealed row."""
+        cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        current = SessionRecord.from_mapping(dict(row))
+        if current.revoked_at is not None:
+            return None
+        if not session_seal_ok(self._row_sealer, current):
+            raise RowSealError(SESSION_KIND)
+        updated = seal_session(self._row_sealer, change(current))
+        cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
+        return updated if cur.rowcount == 1 else None
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         async with self._read() as db:
@@ -13673,46 +14057,38 @@ class MessageStore:
         client: str | None = None,
         idp_auth_time: float | None = None,
     ) -> None:
-        now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-            # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
-            await self._db.execute(
-                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
-                f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
-                (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
-            )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        async with _writer_txn(self._db, self._lock):
+            await self._write_session(token_hash, stamp)
             await self._commit()
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
         """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
         issuance for an MFA-delegated AD/Kerberos login."""
-        now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE sessions SET mfa_verified_at=? WHERE token_hash=?", (now, token_hash)
-            )
+        stamp = mfa_stamp(time.time() if now is None else now)
+        async with _writer_txn(self._db, self._lock):
+            await self._write_session(token_hash, stamp)
             await self._commit()
 
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
-        old hash stops resolving in the same transaction. Reports its rowcount so the caller can fail
-        closed when the session was revoked out from under it."""
-        async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE sessions SET token_hash=? WHERE token_hash=? AND revoked_at IS NULL",
-                (new_token_hash, token_hash),
+        old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
+        re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
+        when the session was revoked out from under it."""
+        async with _writer_txn(self._db, self._lock):
+            rotated = await self._write_session(
+                token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             await self._commit()
-            return bool(cur.rowcount)
+        return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
                 (now, token_hash),
             )
             await self._commit()
@@ -13728,7 +14104,7 @@ class MessageStore:
         re-key the row between them."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
                 (now, token_hash),
             )
             row = None
@@ -13744,17 +14120,38 @@ class MessageStore:
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
-        caller's current session — "sign out everywhere else"). Returns the number revoked."""
+        caller's current session — "sign out everywhere else"). Returns the number revoked.
+
+        Raises the account's session epoch in the same transaction (BACKLOG #2592), so an older copy
+        of any of those rows resolves to nothing. The kept session is re-sealed under the new epoch
+        through :meth:`_write_session`; if its own seal does not verify, that raises
+        :class:`RowSealError` and the whole transaction, revokes included, rolls back."""
         now = time.time() if now is None else now
-        sql = _REVOKE_USER_SESSIONS_SQL
-        params: list[object] = [now, user_id]
-        if except_token_hash is not None:
-            sql += " AND token_hash != ?"
-            params.append(except_token_hash)
-        async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(sql, params)
+        async with _writer_txn(self._db, self._lock):
+            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+            if except_token_hash is None:
+                cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+            else:
+                cur = await self._db.execute(
+                    _REVOKE_USER_SESSIONS_SQL + " AND token_hash != ?",
+                    (now, user_id, except_token_hash),
+                )
+            revoked = int(cur.rowcount)
+            if except_token_hash is not None:
+                epoch = await self._session_epoch(user_id)
+                await self._write_session(
+                    except_token_hash,
+                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+                )
             await self._commit()
-            return int(cur.rowcount)
+        return revoked
+
+    async def _session_epoch(self, user_id: str) -> int:
+        """The account's session epoch, read on the writer connection inside the caller's
+        transaction (BACKLOG #2592). 0 for an account that is not there."""
+        cur = await self._db.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
+        row = await cur.fetchone()
+        return 0 if row is None else int(row["session_epoch"])
 
     async def enforce_session_cap(
         self,
@@ -13778,7 +14175,7 @@ class MessageStore:
             # `tests/test_writer_txn_is_the_only_begin.py` cannot read a local and pins how many it
             # cannot read.
             cur = await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
                 f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
                 f"{_sqlite_session_cap_keep_sql(split_mfa_pending)}",
                 (now, user_id, now, now, now, *(per_group * groups)),
@@ -13948,9 +14345,9 @@ class MessageStore:
                     *inflight,
                 ),
             )
-            # Blank the kept (delivered/cancelled) outbound payloads for the same eligible set. Inline
-            # bodies have a non-blank payload; a store-once row's payload is already '' and its
-            # body_ref was just nulled above, so this UPDATE simply clears its last_error.
+            # Blank the kept (delivered/cancelled) outbound payloads for the same eligible set. An
+            # inline row's payload is its body; a store-once row's payload is its sealed reference
+            # (BACKLOG #2593), and its body_ref was just nulled above. This UPDATE blanks both.
             await self._db.execute(
                 f"UPDATE queue SET payload='', last_error=NULL "
                 f"WHERE stage=? AND status IN (?, ?) AND (payload <> '' OR last_error IS NOT NULL) "

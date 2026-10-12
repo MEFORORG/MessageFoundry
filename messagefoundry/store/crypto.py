@@ -193,6 +193,20 @@ _BODY_DIGEST_LEN = 32  # bytes — HMAC-SHA256 key
 #: The algorithm name an audit row records beside each body digest.
 BODY_DIGEST_ALG = "hmac-sha256"
 
+# Row integrity seals (BACKLOG #2592). Two HKDF-SHA256 steps, each the shape of
+# `_derive_audit_mac_key`. The AUTHORIZATION ROOT is derived from the DEK under its own purpose label,
+# so it is a different key from the audit key, the rotation-fingerprint key and every data key, and a
+# data-key roll never touches it. The ROW-SEAL KEY is derived from that root under a second label
+# followed by the store id. Both labels are fixed-length, so `label || store_id` is unambiguous.
+_AUTHZ_ROOT_INFO = b"mefor/root/authz/v1"
+_ROW_SEAL_INFO = b"mefor/row-seal/v1"
+# Domain label for :func:`row_seal_key_id`, the id a stored seal names its key by.
+_ROW_SEAL_KEY_ID_INFO = b"mefor/row-seal-key-id/v1\x00"
+_AUTHZ_KEY_LEN = 32  # bytes — HMAC-SHA256 key
+#: The store id the row-seal key is derived with until a store id is minted (BACKLOG #2592). Empty,
+#: so the derivation is well defined now and changes by construction once a real id is supplied.
+NO_STORE_ID: bytes = b""
+
 # Per-store data sub-key (ADR 0196, BACKLOG #2070). The cell-bound writer seals under
 # HKDF-SHA256(DEK, salt=None, info=_STORE_DATA_KEY_INFO || store_salt), not under the DEK itself. Each
 # store mints a random salt when it is created, so a fresh store is a fresh AES key by construction,
@@ -295,6 +309,10 @@ UPLOADED_FILE_AAD_TABLE = "uploaded_file"
 #: AAD. Never the row key and never the value, so an implementation may forward it to an alert.
 UnmarkedRefusalHook = Callable[[str, str], None]
 
+#: Called when a store cell fails the tag its own row builds (BACKLOG #2593), with the table and a
+#: PHI-free reason. The store cannot reach the AlertSink; the engine arms this to forward it.
+TagFailureHook = Callable[[str, str], None]
+
 
 class _UnmarkedPolicy:
     """What a KEYED cipher does with a stored value that carries no ``mfenc:`` marker (BACKLOG #1169,
@@ -319,6 +337,24 @@ class _UnmarkedPolicy:
 
     _allow_unmarked: bool
     _refusal_hook: UnmarkedRefusalHook | None
+    # A class default, so a subclass that never calls _init_unmarked_policy still reports nowhere.
+    _tag_failure_hook: TagFailureHook | None = None
+
+    def set_tag_failure_hook(self, hook: TagFailureHook | None) -> None:
+        """Register the callback fired when a cell fails its row tag (``None`` clears it). The same
+        thread-safety rule as :meth:`set_refusal_hook` applies (BACKLOG #2593)."""
+        self._tag_failure_hook = hook
+
+    def report_tag_failure(self, table: str, reason: str) -> None:
+        """Fire the tag-failure hook. Anything it raises is swallowed, so an alert never changes
+        what the caller already did with the row (BACKLOG #2593)."""
+        hook = self._tag_failure_hook
+        if hook is None:
+            return
+        try:
+            hook(table, reason)
+        except Exception:  # noqa: BLE001 — an alert failure must never change the caller's outcome
+            _log.debug("cipher tag-failure hook raised; the dead-letter itself still stands")
 
     def _init_unmarked_policy(self, allow_unmarked: bool) -> None:
         self._allow_unmarked = allow_unmarked
@@ -615,6 +651,10 @@ class Cipher(Protocol):
 
     def audit_mac_fn(self) -> AuditMacFn | None: ...
 
+    def authz_root(self) -> bytes | None: ...
+
+    def retired_authz_roots(self) -> Sequence[bytes]: ...
+
 
 def _fingerprint(key: bytes | bytearray) -> str:
     """A stable, self-identifying ``key_id``: first ``_KEY_ID_LEN`` hex of SHA-256(key). One-way
@@ -649,6 +689,47 @@ def audit_key_id(mac_key: bytes) -> str:
     from the at-rest ``key_id`` in ``mfenc:`` markers and reveals nothing either key could be
     recovered from."""
     return hashlib.sha256(_AUDIT_KEY_ID_INFO + mac_key).hexdigest()[:_KEY_ID_LEN]
+
+
+def _derive_authz_root(dek: bytes | bytearray) -> bytes:
+    """The authorization root: HKDF-SHA256 over the store DEK under ``mefor/root/authz/v1``
+    (BACKLOG #2592).
+
+    Called on the live DEK at cipher construction, before :func:`_install_key` wipes it, exactly as
+    :func:`_derive_audit_mac_key` is. Only the derived root is kept. Row seals are keyed from it by
+    :func:`derive_row_seal_key`, never from the DEK or the audit key."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=_AUTHZ_KEY_LEN, salt=None, info=_AUTHZ_ROOT_INFO)
+    return hkdf.derive(bytes(dek))
+
+
+def derive_row_seal_key(authz_root: bytes, store_id: bytes) -> bytes:
+    """The row-seal key: HKDF-SHA256 over the authorization root, HKDF salt ``None``, ``info`` the
+    label ``mefor/row-seal/v1`` followed by ``store_id`` (BACKLOG #2592).
+
+    A different store id gives an independent key, so a seal made for one store does not verify
+    for another. Until a store id is minted the caller passes :data:`NO_STORE_ID`."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_AUTHZ_KEY_LEN,
+        salt=None,
+        info=_ROW_SEAL_INFO + bytes(store_id),
+    )
+    return hkdf.derive(authz_root)
+
+
+def row_seal_key_id(seal_key: bytes) -> str:
+    """The stable, non-secret id a stored seal names its key by (BACKLOG #2592).
+
+    A one-way digest of the DERIVED seal key under its own label, the way :func:`audit_key_id` names
+    an audit key. So it changes whenever the root or the store id changes, and reveals nothing either
+    key could be recovered from."""
+    return hashlib.sha256(_ROW_SEAL_KEY_ID_INFO + seal_key).hexdigest()[:_KEY_ID_LEN]
 
 
 def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
@@ -923,6 +1004,14 @@ class IdentityCipher:
         """No isolated-module MAC — the identity cipher's chain is in-process keyless SHA-256."""
         return None
 
+    def authz_root(self) -> None:
+        """No DEK, so no authorization root: a keyless store writes and checks no row seals."""
+        return None
+
+    def retired_authz_roots(self) -> Sequence[bytes]:
+        """No DEK, so no retired roots either."""
+        return ()
+
 
 class AesGcmCipher(_UnmarkedPolicy):
     """AES-256-GCM **keyring** cipher with M9 crypto-agility. Encrypts with the active key; decrypts
@@ -956,6 +1045,12 @@ class AesGcmCipher(_UnmarkedPolicy):
         # Derive the audit-chain HMAC key from the LIVE active DEK before _install_key zeroizes it (#190).
         # Only the derived key is retained; the raw DEK is never held as an attribute.
         self._audit_mac_key = _derive_audit_mac_key(active_key)
+        # BACKLOG #2592: the authorization root, from the same live active DEK at the same point. Only
+        # the ACTIVE key's root: a session seal verifies under the newest root generation alone.
+        self._authz_root = _derive_authz_root(active_key)
+        # The retired keys' roots, derived at the same point. A seal never verifies under one: they
+        # only let a row sealed before a key change be recognised as such (BACKLOG #2592).
+        self._retired_authz_roots = tuple(_derive_authz_root(key) for key in retired_keys)
         # BACKLOG #1904: one audit key per keyring entry, RETIRED keys included, derived the same way and
         # at the same point (before _install_key zeroizes the DEK). A chain keyed under a key that has
         # since been rotated to retired must still verify; deriving from the active key alone made the
@@ -1112,6 +1207,20 @@ class AesGcmCipher(_UnmarkedPolicy):
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
 
+    def holds_key_for(self, stored: str) -> bool:
+        """Whether this keyring holds the key the marker of ``stored`` names (BACKLOG #2593).
+
+        Lets a caller tell a cell whose AEAD tag fails under a key it holds (the cell does not
+        belong where it is) from one sealed under a key that is not configured. False for an
+        unmarked or malformed value. Reads only the marker, never the ciphertext."""
+        if not stored.startswith(MARKER_PREFIX):
+            return False
+        try:
+            key_id, _salt, _blob = self._parse(stored)
+        except CipherError:
+            return False
+        return key_id in self._keyring
+
     def audit_mac_key(self) -> bytes:
         """The HKDF-derived HMAC key for the tamper-evident audit chain (#190-B). Keys the
         ``audit_row_hash`` chain so it cannot be forged without the DEK. Non-secret to *hold* here (it
@@ -1129,6 +1238,16 @@ class AesGcmCipher(_UnmarkedPolicy):
         isolated-module MAC — so no ``audit_mac_fn`` provider. Keeping this ``None`` leaves the default
         ``aesgcm`` audit chain BYTE-IDENTICAL to pre-ADR-0138."""
         return None
+
+    def authz_root(self) -> bytes:
+        """The authorization root derived from the ACTIVE DEK (BACKLOG #2592). Row seals are keyed
+        from it (:func:`derive_row_seal_key`). Held in-process like the audit key; never logged."""
+        return self._authz_root
+
+    def retired_authz_roots(self) -> Sequence[bytes]:
+        """The authorization roots of the retired keys (BACKLOG #2592). No seal is verified under
+        one; they only name the keys a row sealed before a key change was sealed under."""
+        return self._retired_authz_roots
 
     # --- persisted per-key invocation bound (ASVS 11.3.4) --------------------
 

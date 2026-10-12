@@ -1153,8 +1153,9 @@ class EngineClient:
     def verify_mfa(self, code: str) -> None:
         """Satisfy the current session's second factor with a TOTP or single-use recovery code. Raises
         :class:`ApiError` (401) on a wrong code, and (403) on a directory account the directory could
-        not confirm, whose code was not checked (BACKLOG #2023). Does not itself trigger the MFA
-        handler."""
+        not confirm, whose code was not checked (BACKLOG #2023). Raises :class:`IdpStepUpRequired`
+        for an ``oidc`` session that already met its factor, whose code was not checked either
+        (BACKLOG #2142). Does not itself trigger the MFA handler."""
         self._refuse_credential_on_cleartext("a second factor")
         self._adopt_rotated(
             self._request("POST", "/auth/mfa-verify", json={"code": code}, _allow_mfa=False)

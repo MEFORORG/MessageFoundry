@@ -608,8 +608,9 @@ async def test_the_guard_reads_the_binding_while_holding_the_sqlite_writer_lock(
 
         async def wedged_execute(sql: str, *args: object, **kwargs: object) -> object:
             nonlocal unbind, read_ran, lock_held_at_read
-            # The guard's own read. The unbind's read starts "SELECT username," so it cannot match.
-            if sql.startswith("SELECT oidc_issuer, oidc_subject FROM users") and not read_ran:
+            # The guard's own read, which also takes the account's session epoch (BACKLOG #2592).
+            # The unbind's read starts "SELECT username," so it cannot match.
+            if sql.startswith("SELECT oidc_issuer, oidc_subject") and not read_ran:
                 read_ran = True
                 lock_held_at_read = store._lock.locked()
                 unbind = asyncio.create_task(

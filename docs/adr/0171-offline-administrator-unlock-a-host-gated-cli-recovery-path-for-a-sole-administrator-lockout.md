@@ -344,3 +344,14 @@ code no longer follows the helper that prints it.
   `admin-unlock` does not route it yet, no longer holds.
 - A store cipher the settings cannot build, a key that is not base64 of 32 bytes among them, is
   one of those key errors (`StoreCipherConfigError`), so all four commands exit 2 on it too.
+- **Added 2026-10-11 (BACKLOG #2124, a seat decision under owner delegation 2026-10-08, not an
+  owner ruling).** `admin-set-notify-email` exits 2 when its store open raises `StoreKeylessError`
+  or `CipherError`, and when the audit chain's key check refuses its audit row before the append,
+  as `admin-unlock` exits on that check. `provision-admin`'s "an Administrator exists" probe exits
+  2 on the same two open errors. Each exited 1. A `CipherError` there is raised by the open,
+  before the command reads an account: a row the key in this shell cannot decrypt, or a corrupt
+  row. Either way the store could not be opened, so it is "could not start" rather than a refusal
+  about the account. Unlike `audit-verify`, these commands do not report on rows, so a corrupt row
+  is not a finding here. A busy store that refuses the append itself, such as a running engine holding the write
+  lock, keeps exit 1. `admin-reset-totp` still exits 1 on the two open errors; this note does not
+  cover it.

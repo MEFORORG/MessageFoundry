@@ -1,0 +1,13 @@
+- **`serve` names a web proxy it may pick up from the environment.** With an environment or
+  system proxy set, `serve` and `supervise` each log one WARNING at start. It names each proxy
+  that is set, never a user or password from its URL, and the hops that may read one. If either
+  cannot build that WARNING, it logs a value-free one saying a proxy may be set. What each says, and what
+  reaches the proxy, is in
+  [CONFIGURATION.md](../docs/CONFIGURATION.md#serve-names-an-environment-proxy-at-start).
+  ([BACKLOG #1125](../docs/BACKLOG.md))
+- **The deployment documents now state what a proxy in front of the engine must do about request
+  framing.** A reverse proxy or load balancer must refuse the ambiguous request shapes the engine's
+  own parser refuses, send each body with one `Content-Length`, and drop a connection after an
+  error. A forward proxy named by `proxy_url` must not re-frame what it carries. See
+  [DEPLOYMENT.md](../docs/DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses).
+  ([BACKLOG #1125](../docs/BACKLOG.md))

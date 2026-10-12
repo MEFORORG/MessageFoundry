@@ -373,8 +373,10 @@ class AlertSink(Protocol):
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         """A held dual-control request was RELEASED by an approver whose account changed after the
-        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
-        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. It is
+        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``), or an
+        interrupted release was RESOLVED by such an account (BACKLOG #2125). The act went ahead:
+        this flags it and refuses nothing. ``name`` is ``approval:<approval id>`` for a release and
+        ``approval:<approval id>:resolve`` for a resolution, so each is its own instance. It is
         not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898),
         and the colon keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``.
@@ -885,8 +887,9 @@ class LoggingAlertSink:
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         log.warning(
-            "ALERT approval_approver_provenance: %s request %r was released by an approver whose "
-            "account changed after the request (%s)",
+            "ALERT approval_approver_provenance: %s request %r was released (key approval:<id>) "
+            "or resolved (key approval:<id>:resolve) by an account that changed after the "
+            "request (%s)",
             operation,
             name,
             ", ".join(changed),
@@ -1073,6 +1076,27 @@ UPLOADED_FILE_TABLE = "uploaded_file"
 UPLOAD_CIPHER_SUBJECT = "upload-cipher"
 
 
+#: The ``integrity_drift`` subject for an authority row whose integrity seal did not verify (BACKLOG
+#: #2592). Its own subject, so it throttles and routes apart from the cipher and the audit chain.
+AUTHORITY_SEAL_SUBJECT = "authority-seal"
+
+
+def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call raises
+    ``integrity_drift`` under :data:`AUTHORITY_SEAL_SUBJECT` with the given reason.
+
+    The reason names a row kind and a short id prefix, never a row value, so it carries no PHI.
+    Never raises: an alert failure must not change what a sign-in or a request resolves to."""
+
+    def _raise(reason: str) -> None:
+        try:
+            sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning("authority-seal integrity alert could not be delivered")
+
+    return _raise
+
+
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:
     """Raise the refusal alert for an unmarked value in ``table.column``: ``upload-cipher`` for the
     uploaded-file store, ``store-cipher`` for everything else.
@@ -1120,3 +1144,37 @@ def store_cipher_refusal_forwarder(
             loop.call_soon_threadsafe(alert_store_cipher_refusal, sink, table, column)
 
     return _refused
+
+
+#: The ``integrity_drift`` subject for a queue row whose payload failed the tag its own routing fields
+#: build (BACKLOG #2593). Its own subject, so it throttles and routes apart from the cipher refusal.
+QUEUE_TAG_SUBJECT = "queue-tag"
+
+
+def alert_cell_tag_failure(sink: AlertSink, table: str, reason: str) -> None:
+    """Raise ``integrity_drift`` for a store cell that failed its row tag. The reason names a stage
+    and a short row-id prefix, never a row value, so it carries no PHI. Never raises."""
+    subject = QUEUE_TAG_SUBJECT if table == "queue" else f"{table}-tag"
+    try:
+        sink.integrity_drift(subject, reason=reason, drift_count=1)
+    except Exception:  # noqa: BLE001 — an alert-sink failure must never undo the dead-letter
+        log.warning("cell-tag integrity alert could not be delivered")
+
+
+def cell_tag_failure_forwarder(
+    sink: AlertSink, loop: asyncio.AbstractEventLoop
+) -> Callable[[str, str], None]:
+    """A cipher tag-failure hook that raises :func:`alert_cell_tag_failure` on ``sink``, hopping onto
+    ``loop`` when it fires on another thread (the shape of :func:`store_cipher_refusal_forwarder`)."""
+
+    def _failed(table: str, reason: str) -> None:
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            alert_cell_tag_failure(sink, table, reason)
+        else:
+            loop.call_soon_threadsafe(alert_cell_tag_failure, sink, table, reason)
+
+    return _failed

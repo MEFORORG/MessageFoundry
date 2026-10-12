@@ -162,7 +162,8 @@ The `ha-postgres.yaml` manifest carries an AWS-NLB annotation block (commented) 
 - **NO L7 / HTTP ingress for MLLP.** MLLP is a long-lived raw-TCP framing (start/end blocks), not
   request/response HTTP. An L7 ingress controller (ALB / nginx-ingress / Gateway API HTTPRoute) cannot
   carry it. Use an **L4** NLB. (The API plane *can* sit behind an L7 ingress — only the MLLP data plane
-  cannot.)
+  cannot. That ingress must refuse ambiguous request framing; see
+  [DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses).)
 - **NO HorizontalPodAutoscaler for MLLP.** HA replicas are for **failover**, not for spreading one
   partner's load. Only the leader processes (active-passive); sticky long-lived MLLP senders do not
   rebalance across replicas; and autoscaling conflicts with **per-channel FIFO / single-writer-per-lane**.

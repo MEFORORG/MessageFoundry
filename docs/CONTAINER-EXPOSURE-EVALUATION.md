@@ -223,6 +223,11 @@ Posture-B refusal never fires. It does declare a terminator, so the engine warns
 That runbook is maintainer-internal — [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what
 is withheld and what you can request.
 
+The proxy container must also refuse ambiguous request framing, because the engine sees only the
+in-pod hop.
+[DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses)
+lists the shapes and rules.
+
 > **WARNING: Keep `trusted_proxies` to the proxy's exact address(es).** Every host inside a `trusted_proxies`
 > entry may set `X-Forwarded-For` to any value, and the engine hands that value on as the client
 > address — so a broad range like `10.0.0.0/8` on a LAN numbered out of 10/8 lets *any* workstation

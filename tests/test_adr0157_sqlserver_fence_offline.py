@@ -234,7 +234,18 @@ _SELECT_ROW: dict[str, tuple[Any, ...]] = {
     "SELECT message_id, destination_name FROM queue WHERE id=?": ("m1", "OB1"),
     # ingress_handoff's guard read: a payload that is not a three-part ref takes the corrupt-ref
     # DEAD branch, which is one of the two fenced writes there.
-    "SELECT message_id, payload FROM queue WHERE id=? AND stage=? AND status=?": ("m1", "bad-ref"),
+    # It selects the queue tag's columns first (BACKLOG #2593), then the payload.
+    "SELECT id, message_id, stage, channel_id, destination_name, handler_name, body_ref, payload"
+    " FROM queue WHERE id=? AND stage=? AND status=?": (
+        "row-1",
+        "m1",
+        "response",
+        "LOOP",
+        None,
+        None,
+        None,
+        "bad-ref",
+    ),
 }
 
 

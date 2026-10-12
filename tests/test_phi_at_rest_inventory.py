@@ -714,6 +714,13 @@ def _per_backend_cipher_counts() -> dict[str, int]:
                 and node.args[0].value.lower() in tables  # type: ignore[attr-defined]
             ):
                 pairs.add((node.args[0].value, node.args[1].value))  # type: ignore[attr-defined]
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("queue_payload_aad", "queue_row_aad")
+            ):
+                # BACKLOG #2593: the queue payload's tag has its own builder, not a cell_aad literal.
+                pairs.add(("queue", "payload"))
         # The doc counts CELLS THAT CAN HOLD A ROW. `shared_body` is created by every backend's DDL
         # and declared cipher-covered, but the server backends never INSERT into it (the ADR 0100
         # body-dedup path is SQLite-only), so §2 states the count "minus shared_body.body". Asserted,
