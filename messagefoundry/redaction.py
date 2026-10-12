@@ -272,8 +272,54 @@ def _value_may_hold_a_label(text: str, pos: int) -> bool:
     The test is a folded substring test, wider than any label: a value that merely contains
     ``pass`` loses its label, which is what the run did before. Linear: a plain value is the next
     token, which no other kept label reads, and a quoted one is read for a bounded span."""
-    span = _value_span(text, pos)
+    span = _label_value_span(text, pos)
     return span is None or _holds_a_label_hint(text[span[0] : span[1]])
+
+
+#: Auth scheme words a token label's value may open with, which the credential filters read past
+#: (``_BEARER``'s ``(?:bearer|basic|digest)\s+``). ``bearer`` is not here: it is a label hint, so a
+#: value that opens with it already holds one.
+_SCHEME_VALUE_WORDS = frozenset({"basic", "digest"})
+
+
+def _label_value_span(text: str, pos: int) -> tuple[int, int, bool] | None:
+    """:func:`_value_span`, read past an opening ``Basic`` or ``Digest`` to the value after it.
+
+    **Code review round 2 measured the reason.** ``x|y|z;Authorization: Digest username=aa,token:
+    <value>`` read as ``Digest`` alone, which holds no hint, so the label was kept. The filters take
+    the scheme and the next token as the value, which swallowed ``token:``, and its value printed.
+    The quoted flag is the second value's."""
+    span = _value_span(text, pos)
+    if span is None or span[2] or text[span[0] : span[1]].casefold() not in _SCHEME_VALUE_WORDS:
+        return span
+    after = _value_span(text, span[1])
+    return None if after is None else (span[0], after[1], after[2])
+
+
+def _inside_an_earlier_value(text: str, pos: int) -> bool:
+    """Whether the token at ``pos`` may sit inside an earlier label's quoted or braced value.
+
+    **A kept label can end an earlier value early, and the rest of that value then prints.** Code
+    review round 2 measured two shapes. In ``password: "aa x|y|z;secret" : <value> "`` the kept
+    ``secret"`` brought back a quote the run had taken, and the earlier value closed on it. In
+    ``password: "aa <value> x|y|z;api_key: "<other>`` the kept label changed where the filters ended
+    the earlier quoted value. Either way a value the run's text kept covered printed.
+
+    So a label is not kept where, in the :data:`_VALUE_SPAN` characters before its token, a quote or
+    a brace follows the last label word. A window with no line break in it cannot show where the
+    line, and so a quoted value, starts, so it counts as yes. Folded as :func:`_holds_a_label_hint`
+    folds, and wider than any real value: a closed quoted value before the token counts too, and
+    its label then goes with the run, as it did before #2968."""
+    start = max(0, pos - _VALUE_SPAN)
+    before = text[start:pos]
+    if start > 0 and "\n" not in before and "\r" not in before:
+        return True
+    if not before.isascii():
+        for dotted in _DOTTED_I:
+            before = before.replace(dotted, "i")
+    folded = before.casefold()
+    last = max(folded.rfind(hint) for hint in _LABEL_HINTS)
+    return last != -1 and any(mark in folded[last:] for mark in "'\"{")
 
 
 def _holds_a_label_hint(text: str) -> bool:
@@ -312,7 +358,7 @@ def _field_run_replacement(match: re.Match[str], delimiters: frozenset[str]) -> 
         scheme = tail.start("scheme")
         if scheme != -1:
             kept = kept[: scheme - tail.start()] + kept[scheme - tail.start() :].lower()
-    if _value_may_hold_a_label(text, value_at):
+    if _value_may_hold_a_label(text, value_at) or _inside_an_earlier_value(text, start):
         return _REDACTED
     return _REDACTED + kept
 
@@ -356,7 +402,7 @@ def _without_kept_labels(text: str) -> str:
         value_at = _kept_value_at(match)
         if value_at is None:
             return match.group()
-        span = _value_span(text, value_at)
+        span = _label_value_span(text, value_at)
         if span is None or (span[2] and _ENCODED_SEPARATOR.search(text, span[0], span[1])):
             return match.group()
         return _REDACTED
@@ -374,24 +420,27 @@ def _kept_value_at(match: re.Match[str]) -> int | None:
     return None if separator is None else separator.end()
 
 
-def _a_kept_value_holds_a_label(text: str) -> bool:
-    """Whether a kept label in :func:`redact`'s finished output takes a value that holds a label.
+def _a_kept_label_reads_wrong(text: str) -> bool:
+    """Whether a kept label in :func:`redact`'s finished output takes a value that holds a label,
+    or sits inside an earlier value (:func:`_inside_an_earlier_value`).
 
-    :func:`_field_run_replacement` reads the value before the passes after the run, and those
-    passes can change it. In ``x|y|z;pwd: Wilhelmina Pemberly,secret: <value>`` the name run
-    replaces the two names, which glues ``,secret:`` to the kept label's value, and that label's
-    value then printed. A differential found that shape once in 145,564 texts. So the finished
-    output is read again, and where this holds, :func:`redact` returns what it returns with no label
-    kept.
+    :func:`_field_run_replacement` reads both before the passes after the run, and those passes can
+    change them. In ``x|y|z;pwd: Wilhelmina Pemberly,secret: <value>`` the name run replaces the
+    two names, which glues ``,secret:`` to the kept label's value, and that label's value then
+    printed. A differential found that shape once in 145,564 texts. So the finished output is read
+    again, and where this holds, :func:`redact` returns what it returns with no label kept.
 
     **The whole call falls back, not the one label, and that is the price.** Every other kept label
-    in that text goes too, so its value prints as it did before #2968. The fallback is exactly the
-    redactor before #2968, so it cannot print anything that one did not. Taking out one tail would
-    give a text no differential has measured."""
-    return any(
-        value_at is not None and _value_may_hold_a_label(text, value_at)
-        for value_at in map(_kept_value_at, _KEPT_LABEL.finditer(text))
-    )
+    in that text goes too, so its value prints as it did before #2968. The fallback runs the steps
+    the redactor ran before #2968 (``keep_labels=False``), so its output is that redactor's output.
+    Taking out one tail instead would give a text no differential has measured."""
+    for match in _KEPT_LABEL.finditer(text):
+        value_at = _kept_value_at(match)
+        if value_at is None:
+            continue
+        if _value_may_hold_a_label(text, value_at) or _inside_an_earlier_value(text, match.start()):
+            return True
+    return False
 
 
 #: A field run whose separators are PERCENT-ENCODED, in a URL or a form body: ``%7C``, ``%5E``,
@@ -1983,9 +2032,11 @@ def redact(text: str) -> str:
     costs a second pass of the stages on that text only. On a later call the label is already in
     the input, so the credential test also leaves out each kept label whose value the run cannot
     break (:func:`_without_kept_labels` says why that is safe). And the finished output is read
-    once more: where a kept label's value holds a label (:func:`_a_kept_value_holds_a_label`), the
-    call returns what it returns with no label kept. Each rule was found by a before-and-after
-    differential, and the commit that added them carries the numbers.
+    once more: where a kept label's value holds a label, or the label may sit inside an earlier
+    value (:func:`_a_kept_label_reads_wrong`), the call returns what it returns with no label kept.
+    Each rule was found by a before-and-after differential or a code review, and the commits that
+    added them carry the numbers. Those are measurements, not a proof: each rule reads a value the
+    way the credential filters read one, and a filter that learns a new value form can open a gap.
 
     **A text the widened stage could read is left alone too** (:func:`_needs_widened_stage`). Those
     rules keep some values by their surroundings: a bare value under a JSON ``name`` stays while more
@@ -1995,7 +2046,7 @@ def redact(text: str) -> str:
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
     out = _redact(text, keep_labels=True)
-    if _REDACTED in out and _holds_a_label_hint(out) and _a_kept_value_holds_a_label(out):
+    if _REDACTED in out and _holds_a_label_hint(out) and _a_kept_label_reads_wrong(out):
         return _redact(text, keep_labels=False)
     return out
 
@@ -2011,13 +2062,15 @@ def _redact(text: str, *, keep_labels: bool) -> str:
     # and it would switch the run off on text where it applied before, so the run's PHI would
     # print. So where one may be in ``out``, the switch reads the stages as they ran before #2968,
     # and its credential test leaves out a kept label already in the input (a later call).
-    gate = out
-    if _CREDENTIAL_AHEAD.search(out) is not None and _KEPT_LABEL.search(out) is not None:
-        if keep_labels:
-            gate = _redact_stages(text, keep_labels=False)
+    # With ``keep_labels=False`` none of this runs, so that call is the redactor before #2968.
+    gate = credential_gate = out
+    if (
+        keep_labels
+        and _CREDENTIAL_AHEAD.search(out) is not None
+        and _KEPT_LABEL.search(out) is not None
+    ):
+        gate = _redact_stages(text, keep_labels=False)
         credential_gate = _without_kept_labels(gate)
-    else:
-        credential_gate = gate
     # This module's own bound note is joined by a line break (:data:`_TRAILING_NOTES`). It is the one
     # unprintable character that is not a peer's, so it is set aside before the test below.
     note = _TRAILING_NOTES.search(gate) if gate.endswith("unscanned]") else None

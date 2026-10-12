@@ -257,6 +257,38 @@ def test_a_label_whose_value_holds_a_label_is_not_kept(text: str) -> None:
     assert not _paths_keeping(text, _VALUE)
 
 
+@pytest.mark.parametrize(
+    ("text", "values"),
+    [
+        (f"x|y|z;Authorization: Digest username=aa,token: {_VALUE}", (_VALUE,)),
+        (f"x|y|z;bearer: Digest zq9aa1z,pwd: {_VALUE}", (_VALUE,)),
+        (f"x|y|z;token: Basic aa,secret: {_VALUE}", (_VALUE,)),
+        (f'password: "aa x|y|z;secret" : {_VALUE} "', (_VALUE,)),
+        (f"password: 'aa x|y|z;token' = {_VALUE} bb'", (_VALUE,)),
+        (f'password: "aa {_VALUE} x|y|z;api_key: "zq9cc3z', (_VALUE, "zq9cc3z")),
+        (f"client_secret='aa {_VALUE} x|y|z;api_key:\t'zq9cc3z", (_VALUE, "zq9cc3z")),
+    ],
+    ids=[
+        "digest-then-label",
+        "bearer-label-digest-then-label",
+        "basic-then-label",
+        "kept-quote-closes-an-earlier-value",
+        "kept-single-quote-closes-an-earlier-value",
+        "inside-an-earlier-open-value",
+        "inside-an-earlier-open-single-quoted-value",
+    ],
+)
+def test_review_round_two_shapes_print_nothing_new(text: str, values: tuple[str, ...]) -> None:
+    """Code review round 2 measured each of these printing a value the run's text kept covered:
+    a value that opens with a scheme word and swallows a later label, and a kept label inside an
+    earlier label's quoted value. Each value that the redactor before #2968 hid stays hidden."""
+    kept = _paths_keeping(text, *values)
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(redaction, "_TRAILING_CREDENTIAL_LABEL", re.compile(r"(?!)"))
+        before = _paths_keeping(text, *values)
+    assert not set(kept) - set(before), (kept, before)
+
+
 def test_a_label_a_later_pass_glues_into_the_value_is_read_again() -> None:
     """The value is read when the run keeps the label, and the passes after the run can change it.
     Here the name run replaces the two names, which glues ``,secret:`` to the kept label's value,
