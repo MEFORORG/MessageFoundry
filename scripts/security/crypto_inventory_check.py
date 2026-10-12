@@ -928,7 +928,8 @@ IMPORT_ONLY: dict[str, str] = {
         "inventoried"
     ),
     "tee/mefor_api.py": (
-        "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
+        "accepts an ssl context as a parameter and hands it to an HTTPSHandler on its own opener; "
+        "tee/__main__.py builds it"
     ),
 }
 

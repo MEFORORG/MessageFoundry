@@ -230,7 +230,8 @@ lookup. So it covers exactly the hosts the guards call on-box, and a host they c
 to the proxy. The guards refuse a cleartext hop to such a host, so none is a hop the engine judged
 on-box. It is also a rule of the engine's `urllib` openers only. A client built on another HTTP
 library is outside it: the operator API client and the `tee` tool follow the environment proxy even
-for a loopback address. [Corrected 2026-10-12: the operator API client does not; see Amendment D.]
+for a loopback address. [Corrected 2026-10-12: the operator API client does not, and since BACKLOG
+#2708 the `tee` tool does not either; see Amendment D.]
 
 - **`ProxyConfig.for_host` returns `None` for a loopback target**, as it does for a `proxy_no_proxy`
   match. The opener would dial that host direct anyway, so the pre-emptive `Proxy-Authorization`
@@ -293,8 +294,11 @@ contradicts. The sentences stay in place, each marked with a pointer here.
   [`[egress]` key table](../CONFIGURATION.md#egress) says what applies to such a URL.
 - **Amendment B's "the operator API client ... follow[s] the environment proxy".** It does not.
   `EngineClient._open_transport` in `apiclient/client.py` builds httpx with `trust_env=False`
-  (BACKLOG #2318), and `tests/test_apiclient_ignores_env_proxy.py` pins it. The `tee` tool half of
-  the sentence is still true: it calls plain `urlopen`, which reads the environment proxy.
+  (BACKLOG #2318), and `tests/test_apiclient_ignores_env_proxy.py` pins it. The `tee` tool half was
+  still true when this amendment was written, because it called plain `urlopen`. It is not now.
+  `make_getter` in `tee/mefor_api.py` dials a loopback engine direct by its own copy of this
+  amendment's rule, and an off-box engine still reaches the proxy (BACKLOG #2708). The tee imports no
+  engine code, so it cannot share the handler. `tests/test_tee_mefor_api.py` pins both cases.
 
 ### Amendment E (2026-10-12) — a proxy written `https://` gets no pass
 
