@@ -1487,17 +1487,12 @@ by this rule. It has its own, below.
 a second proxy included (vault BACKLOG #2572, #3410).** The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. A connection with such a `proxy_url` still builds, and its sends are refused on those legs.
-A request that goes direct, past every proxy, is not refused. The error names no part of the proxy
-URL, and `[security].enforcement` does not relax it. Writing the proxy `https://` does not by itself
-get a credential past the rule. urllib can send `CONNECT`, with the credential header, before any
-TLS. A `proxy_url` serves both schemes, so expect sends to an `https` target through a credentialed
-one to be refused. urllib's bypass list is `NO_PROXY` or the system bypass list. A connection's own
-`proxy_no_proxy` is not that list. A host it names skips the connection's `proxy_url` and still
-follows a proxy from the environment. The rule, an example of a leg it lets through, and what it does not
-check are stated once, on
-[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). Take the credentials
-out of the proxy URL.
+broker. A connection with such a `proxy_url` still builds. The error names no part of the proxy
+URL, and `[security].enforcement` does not relax it. A connection's own `proxy_no_proxy` is not
+urllib's bypass list: a host it names skips the connection's `proxy_url` and still follows a proxy
+from the environment. The rule, an example of a leg it lets through, and what it does not check are
+stated once, on [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
+Take the credentials out of the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a

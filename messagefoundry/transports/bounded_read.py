@@ -750,11 +750,11 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
 
     **It also refuses a request that would carry a credential from a proxy URL to a proxy in
     cleartext** (vault BACKLOG #2572, #3410). :class:`ProxyCredentialsRefusedError` states the rule.
-    The check is made here, per request and per proxy, because this method
-    sees every proxy a request is handed to, from every source:
-    the environment, the system settings, and a ``proxy_url`` an operator configured. It is not
-    made when the handler is built. Shared openers are built at import, and a refusal there would
-    stop the engine starting over a proxy that many of its hops never use.
+    The check is made here, per request and per proxy, because this method sees every proxy a
+    request is handed to, from every source: the environment, the system settings, and a
+    ``proxy_url`` an operator configured. It is not made when the handler is built. Shared openers
+    are built at import, and a refusal there would stop the engine starting over a proxy that many
+    of its hops never use.
     """
 
     def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> Any:  # noqa: A002
@@ -802,17 +802,17 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     TLS. A proxy value with no scheme is read as cleartext. An unparseable value that holds an
     ``@`` is refused too. urllib's own error would quote it.
 
-    A request that sends a proxy no credential is let through. One measured example of a leg let
-    through is an ``http`` target sent to a credentialed ``https://`` proxy whose own host urllib's
-    bypass list names. That send reaches the proxy over TLS. It is an example, not a list.
+    One measured example of a leg let through is an ``http`` target sent to a credentialed
+    ``https://`` proxy whose own host urllib's bypass list names. That send reaches the proxy over
+    TLS. It is an example, not a list.
     ``tests/test_proxy_url_credentials_refused.py`` pins at least that example on the wire.
 
     **Outside this check**, at least:
 
     * It does not verify the TLS of a leg it lets through (vault BACKLOG #3418).
     * It does not check a credential header on a request that goes direct, past every proxy (vault
-      BACKLOG #3417). urllib's redirect handler can copy that header onto a new request. The
-      engine's own openers refuse redirects, but :func:`build_strict_opener` does not.
+      BACKLOG #3417). urllib's redirect handler can copy that header onto a new request, and
+      :func:`build_strict_opener` does not refuse redirects.
     * A ``Proxy-Authorization`` header a caller set, such as the one a connection's ``proxy_user``
       makes, is not this check's. Sent to a proxy written ``https://``, it can cross in a
       cleartext ``CONNECT``, and nothing here refuses it (vault BACKLOG #3416).

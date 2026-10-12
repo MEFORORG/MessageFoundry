@@ -184,10 +184,12 @@ def test_an_http_target_reaches_a_bypassed_https_proxy_over_tls_first(
 
     for build in (urllib.request.build_opener, build_strict_opener):
         with _WireProxy() as proxy:
-            monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
+            monkeypatch.delenv("NO_PROXY", raising=False)  # the previous pass set it
             value = f"https://{_CRED}@{proxy.address}"
-            handler = urllib.request.ProxyHandler({"http": value, "https": value})
-            _open_and_discard(build(handler), _HTTP_TARGET)
+            opener = build(urllib.request.ProxyHandler({"http": value, "https": value}))
+            # Set after the build, so the pass shows the bypass list is read at send time.
+            monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
+            _open_and_discard(opener, _HTTP_TARGET)
         assert proxy.connections == 1
         assert proxy.tls_first == 1
         assert proxy.cleartext == []
