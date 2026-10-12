@@ -886,12 +886,13 @@ SURVEY_CRITERION = (
     "**This page's criterion.** A wheel that is not designated is owed a route when it carries "
     "another project's code, compiled or source. A wheel that carries only another project's "
     "data is listed below with what it carries. It is owed no route, because data holds another "
-    "project's tables and none of its logic. That a data-only wheel owes no route rests on owner "
-    "ruling R1 of 2026-10-06, recorded in the vault. The reason given here is this page's own. "
-    "The ruling names code, compiled or source, and data. It does not name tables kept as "
-    "generated Python modules. This page counts them as data. That part is this page's choice, "
-    "and a reader can draw it elsewhere. A wheel whose answer is not established, for any form, "
-    "is treated as carrying code."
+    "project's tables and none of its logic. For a wheel that is not designated, that no-route "
+    "line rests on an owner ruling of 2026-10-06. That ruling is about wheels that carry only "
+    "another project's data, and the maintainers' private security records hold it. The reason "
+    "given here is this page's own. The ruling names code, compiled or source, and data, but not "
+    "tables kept as generated Python modules. This page counts them as data. That part is this "
+    "page's choice, and a reader can draw it elsewhere. A wheel whose answer is not established, "
+    "for any form, is treated as carrying code."
 )
 
 
