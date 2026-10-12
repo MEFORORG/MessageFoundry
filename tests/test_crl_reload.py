@@ -1360,6 +1360,9 @@ def test_only_a_refusal_that_stops_a_context_or_is_reported_keeps_a_pass_open() 
     # A refusal time can lift, recorded beside a file check that stops the context for good.
     assert sticky((LAPSES_FIRST, False), (FIX, True))
     assert sticky((WAIT, False), (BAD_SIGNATURE, True))
+    # A hop at the cap whose copy lapses first, beside a hop that fails a file check. A restart
+    # stops the first whenever the lapse ends, and the file to fix is what is reported.
+    assert sticky((LAPSES_FIRST, False), (RESTART, True), (FIX, True))
     # Another context is stopped by the wait alone, so the pass stays open for it.
     assert not sticky((WAIT, False), (FIX, True), (WAIT, True))
     assert not sticky((RESTART, False), (NO_ISSUER, True))
@@ -1436,3 +1439,32 @@ def test_a_retried_refusal_keeps_its_label_while_a_short_lived_holder_comes_and_
     assert after is not None and after.refusal == first.refusal
     assert _refusals_logged(caplog) == 1
     assert refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_bytes_put_back_after_a_change_are_named_by_the_hops_that_hold_the_file_now(
+    pki: _Pki,
+) -> None:
+    # The kept label lasts as long as its refusal. Here the refused file is taken away, the hop
+    # that held it goes, and two others load the file. The same bytes put back must be named by
+    # the two hops stale now, so by the path. Red while the label outlived the refusal: it still
+    # read "outbound connection 'gone' tls_crl_file", a setting no hop had any more.
+    original = pki.crl.read_bytes()
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
+    gone = _holder(pki, pki.ca_file, "gone")
+    pki.crl.write_bytes(future)
+    first = _reload(pki)
+    assert first is not None and first.refusal is not None
+    assert "outbound connection 'gone' tls_crl_file" in first.refusal.reason  # control
+
+    pki.crl.write_bytes(original)
+    assert _reload(pki) is None  # every holder is current again, so the refusal is dropped
+    del gone
+    hops = [_holder(pki, pki.ca_file, "one"), _holder(pki, pki.ca_file, "two")]
+    pki.crl.write_bytes(future)
+    again = _reload(pki)
+
+    assert again is not None and again.refusal is not None
+    assert again.refusal.fingerprint == first.refusal.fingerprint  # the same bytes
+    assert f"CRL file {str(pki.crl)!r}" in again.refusal.reason, again.refusal.reason
+    assert "'gone'" not in again.refusal.reason
+    assert len(hops) == 2  # both contexts stay alive, so both hold the file during the pass

@@ -365,8 +365,8 @@ class _Refusals:
         context takes the file, or meets a check it had not reached, which may outrank the
         refusal reported. False while the refusal reported can itself lift, because the operator
         would go on reading it afterwards. A refusal that can lift but is neither changes nothing
-        when it does: a file check stopped its context first, and a refusal that outranks it is
-        the one reported (vault BACKLOG #2866).
+        when it does: a check that does not lift stops its context all the same, and a refusal
+        that outranks it is the one reported (vault BACKLOG #2866).
 
         "Final" is the reload's rule, not a proof. A file check reads the hop's CA list, which a
         CA directory can still add to. A file to fix was already final on its own, and a wait
@@ -383,7 +383,7 @@ _UNREADABLE: set[str] = set()
 #: The last unexpected failure per file outside a judged version, so its traceback is logged once.
 _FAILED: dict[str, str] = {}
 #: The fingerprint of each held file's bytes when a pass last judged them, and the label it gave
-#: them, so every pass over the same bytes names the file the same way (:func:`_label`).
+#: them, so every retry of one refusal names the file the same way (:func:`_label`).
 _LABELS: dict[str, tuple[tuple[int, int], str]] = {}
 
 
@@ -433,7 +433,7 @@ class _Change:
     #: The bytes, or ``None`` when the stamp was unchanged and they were not read this pass.
     pem: bytes | None
     fingerprint: tuple[int, int]
-    #: True when these bytes were refused before, for a reason time can lift.
+    #: True when these bytes were refused before, and not for good (:attr:`_Refusals.sticky`).
     retry: bool
 
 
@@ -462,8 +462,8 @@ def _triage(
         return None
     prior = reload_refusal(key, fingerprint)
     if prior is not None and prior.sticky:
-        # Nothing but a change to the file can alter this verdict, so these bytes are not judged
-        # again. A refusal time can lift is retried every pass.
+        # The reload treats this verdict as final until the file changes, so these bytes are not
+        # judged again. :attr:`_Refusals.sticky` says which verdicts are retried every pass.
         return prior
     return _Change(pem, fingerprint, retry=prior is not None)
 
@@ -473,18 +473,24 @@ def _label(
     fingerprint: tuple[int, int],
     stale: Sequence[tuple[ssl.SSLContext, HeldCrl]],
     path: str,
+    *,
+    refused: bool,
 ) -> str:
     """How a pass names the file whose bytes have ``fingerprint``: the label those bytes were
-    first judged under, worked out from the holders that were ``stale`` then.
+    first refused under, worked out from the holders that were ``stale`` then.
 
     Every reason leads with the label, and :func:`_finish` logs a refusal again when its reason
     changes. A label worked out afresh each pass changed for the same bytes. The stale set shrinks
     as contexts take the file, so the path became one holder's setting once the others were
     current. Reading every holder instead would not hold still either: a short-lived context
     built from the file as it is now comes and goes between passes. So the label is worked out
-    once per file version and kept (vault BACKLOG #3099)."""
+    when the bytes are first refused, and kept while that refusal stands (vault BACKLOG #3099).
+
+    ``refused`` says a refusal for these bytes is on record. Without one the label is worked out
+    afresh: bytes put back after a change may meet different holders, and must not be named by
+    the ones that were stale the first time."""
     kept = _LABELS.get(key)
-    if kept is not None and kept[0] == fingerprint:
+    if refused and kept is not None and kept[0] == fingerprint:
         return kept[1]
     shown = next((h.configured_path for _, h in stale if h.configured_path), path)
     # The setting, only when every stale holder recorded the same one. Several listeners can share
@@ -517,7 +523,7 @@ def _reload_path(
         clear_reload_refusal(key)
         return None
     prior = reload_refusal(key, fingerprint)
-    label = _label(key, fingerprint, stale, path)
+    label = _label(key, fingerprint, stale, path, refused=prior is not None)
     refusals = _Refusals()
     reloaded = 0
     blocks: tuple[CrlBlock, ...] = ()  # stays empty when the bytes cannot be judged
