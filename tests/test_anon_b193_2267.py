@@ -88,8 +88,10 @@ def _run(db: str, out: Path, *extra: str) -> int:
         ('[hl7]\nkeep = ["PID-5.1"]\n', "PID-5.1"),
         ("[fhir]\n", "fhir"),
         (None, "cannot read anon overlay"),
+        # Every row would fail on this rule, so it must refuse the run, not the rows (#2997).
+        ('[hl7]\ndrop = ["MSH-2"]\n', "sets a rule on MSH-2"),
     ],
-    ids=["malformed", "not-utf8", "component-path", "unknown-table", "missing"],
+    ids=["malformed", "not-utf8", "component-path", "unknown-table", "missing", "unwritable-rule"],
 )
 def test_a_bad_overlay_refuses_the_run_once(
     body: str | bytes | None,

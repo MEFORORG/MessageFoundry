@@ -217,6 +217,58 @@ class AnonError(ValueError):
 
 _LOG = logging.getLogger(__name__)
 
+#: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
+#: id, and 3 in MSH, because MSH-1 and MSH-2 hold the message's own delimiters. With either of
+#: those rewritten the output has no readable header, and the leak-check has no separators to
+#: walk it with.
+_FIRST_REWRITABLE_FIELD = 1
+_FIRST_REWRITABLE_MSH_FIELD = 3
+_UNWRITABLE_WHY = (
+    "which no rule can rewrite: field 0 is the segment id, and MSH-1 and MSH-2 hold the "
+    "message's delimiters"
+)
+
+
+def _unwritable_fields(rules: tuple[FieldRule, ...]) -> tuple[str, ...]:
+    """The fields ``rules`` would rewrite and no rule can: a segment id, MSH-1 or MSH-2. Sorted,
+    and empty when the rule set is fine.
+
+    The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
+    path with a stray space or newline are named like ``MSH-2``. A path whose number ``int()``
+    cannot read is not a whole-field address, and it is not this check's to name.
+    ``FieldRule`` refuses every path that is not a whole-field address when the rule is built,
+    field 0 and ``MSH-02`` included (BACKLOG #2330). So for those spellings this check is a
+    second line, and for ``MSH-1`` and ``MSH-2`` it is the only one. A ``KEEP`` rewrites
+    nothing, so it is allowed (BACKLOG #2265).
+    """
+    named: set[str] = set()
+    for rule in rules:
+        if rule.kind == SurrogateKind.KEEP:
+            continue
+        segment, _, number = rule.path.partition("-")
+        try:
+            field = int(number)
+        except ValueError:
+            continue
+        is_msh = segment.upper() == "MSH"
+        if field < (_FIRST_REWRITABLE_MSH_FIELD if is_msh else _FIRST_REWRITABLE_FIELD):
+            named.add(f"{segment}-{field}")
+    return tuple(sorted(named))
+
+
+def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
+    """Refuse a rule set that would rewrite a segment id, MSH-1 or MSH-2 (a body-free
+    :class:`AnonError`).
+
+    Both adapters call this for every message, so a rule set built in code meets the refusal
+    too. :func:`load_rules` runs the same check once, on the overlay (BACKLOG #2997)."""
+    named = _unwritable_fields(rules)
+    if named:
+        raise AnonError(
+            f"a rule names {', '.join(named)}, {_UNWRITABLE_WHY}. Repair or remove a later MSH "
+            "line that carries data there. Refusing to emit"
+        )
+
 
 def _validate_path(path: str) -> str:
     _check_field_path(path)
@@ -240,6 +292,9 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
     an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
     and column. It quotes nothing from the file, and it chains no other exception.
+
+    An overlay whose final rule set would rewrite ``MSH-1`` or ``MSH-2`` is refused here too, once,
+    with the field named (BACKLOG #2997). A ``keep`` on either still loads.
 
     A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
     it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
@@ -300,6 +355,14 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
     rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
+    # Checked on the final rule set, so a later keep on the same path lifts the refusal. Left to
+    # the adapters alone, this rule would fail every message and the tee would report a count.
+    unwritable = _unwritable_fields(rules)
+    if unwritable:
+        raise RuleError(
+            f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, {_UNWRITABLE_WHY}. "
+            "Remove the rule, or change it to a keep"
+        )
     for cancelled in kept_defaults(rules):
         _LOG.warning(
             "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
