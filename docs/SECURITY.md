@@ -1450,8 +1450,8 @@ functions too, and they gate on the **same 29-permission catalogue** through par
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 116 of the 126 carry a gate; the 10 that do not are the
-sign-in and re-auth entry points, listed after the table. Where the console is served it is the
+**Route → permission map (`/ui` plane).** 116 of the 126 carry a gate. The 10 that do not are the
+sign-in, sign-out, re-auth and second-factor entry points and the CSP report sink, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
 `/ui/statistics/reset-*` pair, the three `/ui/dead-letters/*/replay` variants,
@@ -1627,8 +1627,14 @@ first passes, so it can re-prove its password to reach the enrolment (ADR 0197 A
 page (a session whose passkey is already proven gets there through `/ui`). Its POST charges one
 per-actor ceremony attempt and refuses any code with a 400, because the account holds no TOTP to
 check it against.
-None of them is reachable without a live session cookie — "unauthenticated" here means
-"carries no `Depends` gate", not "open".
+"Unauthenticated" here means "carries no `Depends` gate", not "open". Five of them act with no
+session cookie at all, by design: the two `/ui/login` routes and `GET /ui/sso` start a session,
+`POST /ui/csp-report` is the browser's report sink, and `POST /ui/logout` answers a caller with no
+session by sending it to the sign-in page. With federation on, the two `/ui/oidc/start` routes and
+`GET /ui/oidc/callback` join them. Each of the others reads the session cookie by hand, and with no
+live session it acts on nothing and sends the browser to sign in (`POST /ui/reauth/webauthn`
+answers 401). `GET /ui/reauth` checks its `next` before the cookie, so an unregistered `next` goes
+to `/ui` first.
 
 The `/ui/static` **mount** is the eleventh unauthenticated served path, and it is not a route at all:
 `StaticFiles` serves it with **no gate whatsoever** — no session, no permission, not even the 503

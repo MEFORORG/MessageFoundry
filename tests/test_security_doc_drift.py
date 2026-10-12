@@ -176,7 +176,8 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
         # BACKLOG #1982: the console's approve and reject mirror the JSON approve and reject, both
         # require_paced, which require_ui charges too. They are flagged only because the JSON
-        # resolve, same method and permission, is require_step_up; the console offers no resolve.
+        # resolve, same method and permission, is require_step_up. The console's own resolve
+        # (BACKLOG #2460) carries require_ui_step_up, so it is not in this set.
         ("POST", "/ui/approvals/{approval_id}/approve"),
         ("POST", "/ui/approvals/{approval_id}/reject"),
         # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload") and BACKLOG #1822 removed
@@ -1141,7 +1142,8 @@ def test_ungated_ui_routes_are_exactly_the_reviewed_allowlist() -> None:
     ungated = {(m, p) for m, p, _perms, gate in _ui_route_rows() if gate is None}
     assert ungated == _UI_NO_GATE_ROUTES, (
         f"the un-gated /ui route set changed: {sorted(ungated ^ _UI_NO_GATE_ROUTES)}. These are the "
-        "sign-in and re-auth entry points; anything else here is a console route that lost its gate."
+        "sign-in, sign-out, re-auth and second-factor entry points and the CSP report sink; anything "
+        "else here is a console route that lost its gate."
     )
     block = _section(_doc_text(), _H_UI_ROUTE_MAP)
     assert f"**Unauthenticated `/ui` routes ({len(ungated)}).**" in block, (
