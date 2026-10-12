@@ -1144,3 +1144,37 @@ def store_cipher_refusal_forwarder(
             loop.call_soon_threadsafe(alert_store_cipher_refusal, sink, table, column)
 
     return _refused
+
+
+#: The ``integrity_drift`` subject for a queue row whose payload failed the tag its own routing fields
+#: build (BACKLOG #2593). Its own subject, so it throttles and routes apart from the cipher refusal.
+QUEUE_TAG_SUBJECT = "queue-tag"
+
+
+def alert_cell_tag_failure(sink: AlertSink, table: str, reason: str) -> None:
+    """Raise ``integrity_drift`` for a store cell that failed its row tag. The reason names a stage
+    and a short row-id prefix, never a row value, so it carries no PHI. Never raises."""
+    subject = QUEUE_TAG_SUBJECT if table == "queue" else f"{table}-tag"
+    try:
+        sink.integrity_drift(subject, reason=reason, drift_count=1)
+    except Exception:  # noqa: BLE001 — an alert-sink failure must never undo the dead-letter
+        log.warning("cell-tag integrity alert could not be delivered")
+
+
+def cell_tag_failure_forwarder(
+    sink: AlertSink, loop: asyncio.AbstractEventLoop
+) -> Callable[[str, str], None]:
+    """A cipher tag-failure hook that raises :func:`alert_cell_tag_failure` on ``sink``, hopping onto
+    ``loop`` when it fires on another thread (the shape of :func:`store_cipher_refusal_forwarder`)."""
+
+    def _failed(table: str, reason: str) -> None:
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            alert_cell_tag_failure(sink, table, reason)
+        else:
+            loop.call_soon_threadsafe(alert_cell_tag_failure, sink, table, reason)
+
+    return _failed

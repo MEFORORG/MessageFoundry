@@ -309,6 +309,10 @@ UPLOADED_FILE_AAD_TABLE = "uploaded_file"
 #: AAD. Never the row key and never the value, so an implementation may forward it to an alert.
 UnmarkedRefusalHook = Callable[[str, str], None]
 
+#: Called when a store cell fails the tag its own row builds (BACKLOG #2593), with the table and a
+#: PHI-free reason. The store cannot reach the AlertSink; the engine arms this to forward it.
+TagFailureHook = Callable[[str, str], None]
+
 
 class _UnmarkedPolicy:
     """What a KEYED cipher does with a stored value that carries no ``mfenc:`` marker (BACKLOG #1169,
@@ -332,6 +336,24 @@ class _UnmarkedPolicy:
 
     _allow_unmarked: bool
     _refusal_hook: UnmarkedRefusalHook | None
+    # A class default, so a subclass that never calls _init_unmarked_policy still reports nowhere.
+    _tag_failure_hook: TagFailureHook | None = None
+
+    def set_tag_failure_hook(self, hook: TagFailureHook | None) -> None:
+        """Register the callback fired when a cell fails its row tag (``None`` clears it). The same
+        thread-safety rule as :meth:`set_refusal_hook` applies (BACKLOG #2593)."""
+        self._tag_failure_hook = hook
+
+    def report_tag_failure(self, table: str, reason: str) -> None:
+        """Fire the tag-failure hook. Anything it raises is swallowed, so an alert never changes
+        what the caller already did with the row (BACKLOG #2593)."""
+        hook = self._tag_failure_hook
+        if hook is None:
+            return
+        try:
+            hook(table, reason)
+        except Exception:  # noqa: BLE001 — an alert failure must never change the caller's outcome
+            _log.debug("cipher tag-failure hook raised; the dead-letter itself still stands")
 
     def _init_unmarked_policy(self, allow_unmarked: bool) -> None:
         self._allow_unmarked = allow_unmarked
