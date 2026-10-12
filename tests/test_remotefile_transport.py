@@ -2315,12 +2315,23 @@ async def test_a_folded_nlst_entry_is_refused_by_the_poll_loop(
 class _NlstRefusingFtp(_NlstOnlyFtp):
     """An NLST-only server that answers ``NLST`` with one permanent reply (BACKLOG #1130)."""
 
-    def __init__(self, reply: str) -> None:
+    def __init__(self, reply: str, *, dir_exists: bool = True) -> None:
         super().__init__([])
         self._reply = reply
+        self._dir_exists = dir_exists
+        self.cwds: list[str] = []
 
     def nlst(self, path: str) -> list[str]:
         raise ftplib.error_perm(self._reply)
+
+    def pwd(self) -> str:
+        return "/home"
+
+    def cwd(self, path: str) -> str:
+        if path != "/home" and not self._dir_exists:
+            raise ftplib.error_perm("550 No such file or directory")
+        self.cwds.append(path)
+        return "250 OK"
 
 
 @pytest.mark.parametrize(
@@ -2330,8 +2341,20 @@ class _NlstRefusingFtp(_NlstOnlyFtp):
 def test_an_nlst_empty_directory_refusal_lists_nothing(reply: str) -> None:  # #1130
     # Some NLST-only servers refuse NLST on an empty directory. That is an empty poll, not a
     # permanent failure, on the poll listing and on the publish listing alike.
-    assert _FtpClient._list(_NlstRefusingFtp(reply), "/in") == []  # type: ignore[arg-type]
+    ftp = _NlstRefusingFtp(reply)
+    assert _FtpClient._list(ftp, "/in") == []  # type: ignore[arg-type]
+    assert ftp.cwds == ["/in", "/home"]  # the directory was confirmed, and the session put back
     assert _FtpClient._names(_NlstRefusingFtp(reply), "/in") == set()  # type: ignore[arg-type]
+
+
+def test_an_nlst_empty_reply_for_a_missing_directory_still_fails() -> None:  # #1130
+    # Some servers send the empty-directory reply for a directory that is not there. A mistyped
+    # remote_dir must fail as before, not poll as empty for good.
+    ftp = _NlstRefusingFtp("550 No files found", dir_exists=False)
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._list(ftp, "/inbx")  # type: ignore[arg-type]
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._names(ftp, "/inbx")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -2513,32 +2536,50 @@ _OTHER_FORM_LINE = "the server's listing form looks unsupported"
 
 
 @pytest.mark.parametrize(
-    "name",
-    ["/data/in/a.hl7", "in/a.hl7", "sub/a.hl7", "./a.hl7", "//srv/in/a.hl7"],
+    ("remote_dir", "name"),
+    [
+        ("/in", "/srv/ftp/in/a.hl7"),  # a resolved absolute path
+        ("/in", "in/a.hl7"),  # relative to the server's current directory
+        ("/in/", "/data/in/a.hl7"),
+        ("in", "/srv/ftp/in/a.hl7"),
+        ("/data/in", "//srv/in/a.hl7"),
+    ],
 )
-def test_a_path_with_no_traversal_shape_is_another_listing_form(name: str) -> None:  # #1130
+def test_a_path_into_remote_dir_with_no_traversal_shape_is_another_listing_form(
+    remote_dir: str, name: str
+) -> None:  # #1130
     assert _is_contained_name(name) is False
-    assert _is_other_listing_form(name) is True
+    assert _is_other_listing_form(name, remote_dir) is True
 
 
 @pytest.mark.parametrize(
     "name",
     [
         "../x/a.hl7",
-        "/in/../a.hl7",
-        "/in/a..b.hl7",  # doubt goes to the traversal side
-        r"in\a.hl7",
-        "in/sub\\a.hl7",
+        "/srv/in/../in/a.hl7",
+        "/srv/in/a..b.hl7",  # doubt goes to the traversal side
+        r"srv\in/a.hl7",
         "C:/in/a.hl7",
-        "/in/a.hl7:stream",
-        "/in/a\nb.hl7",
+        "/srv/in/a.hl7:stream",
+        "/srv/in/a\nb.hl7",
+        "/etc/a.hl7",  # another directory
+        "//host/share/a.hl7",
+        "in/sub/a.hl7",  # a subdirectory
+        "./a.hl7",
         "/",
         "C:evil.hl7",  # no slash: a single name the guard refused for another reason
         "a.hl7",
     ],
 )
-def test_a_traversal_shape_or_a_bare_name_is_not_another_listing_form(name: str) -> None:  # #1130
-    assert _is_other_listing_form(name) is False
+def test_a_traversal_shape_or_another_directory_is_not_another_listing_form(
+    name: str,
+) -> None:  # #1130
+    assert _is_other_listing_form(name, "/in") is False
+
+
+def test_no_entry_is_another_listing_form_of_the_root() -> None:  # #1130
+    # "/" has no last part to match, and its own prefix form is accepted outright.
+    assert _is_other_listing_form("/srv/a.hl7", "/") is False
 
 
 async def test_another_listing_form_logs_its_own_warning_without_a_name(
@@ -2596,12 +2637,15 @@ async def test_another_listing_form_warning_is_rate_limited(
 async def test_a_traversal_name_beside_another_form_still_logs_the_traversal_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # #1130
-    client = _HostileListingClient(["../../drops/MRN123456789_ADT.hl7", "/data/in/a.hl7"])
+    # An absolute path outside remote_dir is traversal-shaped too: it keeps the per-poll WARNING.
+    client = _HostileListingClient(
+        ["../../drops/MRN123456789_ADT.hl7", "/etc/MRN555555555.hl7", "/data/in/a.hl7"]
+    )
     src = _src(monkeypatch, client)
     src._handler = _RecordingHandler()
     with filtered_sink(_REMOTE_LOGGER) as sink:
         await src._poll_once()
-    assert sink.text.count(_TRAVERSAL_LINE) == 1
+    assert sink.text.count(_TRAVERSAL_LINE) == 2
     assert "1 listing entry named a path" in sink.text
     assert "MRN" not in sink.text
     assert client.ops == []

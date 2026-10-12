@@ -209,19 +209,24 @@ def _is_contained_name(name: object) -> bool:
 OTHER_FORM_WARNING_SECONDS = 900.0
 
 
-def _is_other_listing_form(name: str) -> bool:
-    """True if ``name``, already refused by :func:`_is_contained_name`, reads as a path in a listing
-    form this connector does not accept rather than as a traversal attempt (BACKLOG #1130).
+def _is_other_listing_form(name: str, remote_dir: str) -> bool:
+    """True if ``name``, which has a ``/`` and so is refused by :func:`_is_contained_name`, reads as
+    an entry of ``remote_dir`` in a listing form this connector does not accept, rather than as a
+    traversal attempt (BACKLOG #1130).
 
-    That is a name with a ``/`` and none of the traversal shapes: no ``..`` anywhere, no ``\\``, no
-    ``:`` (a drive or a stream), and no control character. A resolved absolute path
-    (``/data/in/a.hl7``) or one relative to the server's current directory (``in/a.hl7``) qualifies.
-    It is refused all the same; only the log line differs. Doubt goes to the traversal side, so
-    ``/in/a..b.hl7`` logs as traversal: misreading an attack as a format mismatch is the worse
-    error."""
+    Two tests, both needed. The name has none of the traversal shapes: no ``..`` anywhere, no
+    ``\\``, no ``:`` (a drive or a stream), and no control character. And its parent directory's
+    last part is ``remote_dir``'s last part. So for ``remote_dir = "/in"``, a resolved absolute path
+    (``/srv/ftp/in/a.hl7``) or one relative to the server's current directory (``in/a.hl7``)
+    qualifies, and ``/etc/a.hl7``, ``//host/share/a.hl7`` and ``in/sub/a.hl7`` do not. It is refused
+    all the same; only the log line differs. Doubt goes to the traversal side, so ``/in/a..b.hl7``
+    logs as traversal: misreading an attack as a format mismatch is the worse error."""
+    leaf = posixpath.basename(remote_dir.rstrip("/"))
+    parent = posixpath.dirname(name).rstrip("/")
     return (
-        "/" in name
-        and bool(name.strip("/"))
+        bool(leaf)
+        and "/" in name
+        and parent.rpartition("/")[2] == leaf
         and ".." not in name
         and "\\" not in name
         and ":" not in name
@@ -420,16 +425,26 @@ _NLST_EMPTY_REPLY = re.compile(r"550[ -]\s*no files found\b", re.IGNORECASE)
 
 def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
     """``NLST`` of ``remote_dir``, with the empty-directory refusal :data:`_NLST_EMPTY_REPLY`
-    matches read as no entries. Every other permanent reply raises, for ``_op`` to map. A server
-    that sends this text for a missing directory has that one fault read as an empty poll too."""
+    matches read as no entries. Every other permanent reply raises, for ``_op`` to map.
+
+    Some servers send that reply for a missing directory too, and a mistyped ``remote_dir`` must
+    not poll as empty for good. So the directory is confirmed with ``CWD`` first, then the session
+    is returned to where ``PWD`` found it, since later commands may use relative paths. A refused
+    ``CWD`` raises the original ``NLST`` reply. The three round trips are paid only on this reply."""
     try:
         return ftp.nlst(remote_dir)
     except ftplib.error_perm as exc:
-        if _NLST_EMPTY_REPLY.match(str(exc)):
-            # The reply text past the match is the server's, and may name a path: not logged.
-            logger.debug("REMOTEFILE NLST answered 550 No files found; read as an empty directory")
-            return []
-        raise
+        if not _NLST_EMPTY_REPLY.match(str(exc)):
+            raise
+        home = ftp.pwd()
+        try:
+            ftp.cwd(remote_dir)
+        except ftplib.error_perm:
+            raise exc from None
+        ftp.cwd(home)
+        # The reply text past the match is the server's, and may name a path: not logged.
+        logger.debug("REMOTEFILE NLST answered 550 No files found; read as an empty directory")
+        return []
 
 
 class _BoundedSink:
@@ -2283,7 +2298,7 @@ class RemoteFileSource(SourceConnector):
         # The connection's record name (inbound:<name>), or "" for an unnamed source. BACKLOG #1130
         # also names it in the other-listing-form WARNING (see _log_other_form).
         self._connection = "" if config.name is None else inbound_record_name(config.name)
-        _validate_common(s, connection=None if config.name is None else self._connection)
+        _validate_common(s, connection=self._connection or None)
         # Vault BACKLOG #2370: the poller verifies its FTPS server under [tls], as the outbound does,
         # and its warnings and refusals spell it inbound:<name>, as _validate_common above does.
         self._client = _make_client(
@@ -2444,9 +2459,12 @@ class RemoteFileSource(SourceConnector):
         # Keyed so two entries that list one name never compare a None mtime with a str.
         listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
         self._prune_settle(listing)
-        # Counted over the whole listing, not in the loop below, which can stop early. Every such
-        # name has a "/", so _is_contained_name has refused it already.
-        self._log_other_form(sum(1 for entry in listing if _is_other_listing_form(entry.name)))
+        # Taken over the whole listing, not in the loop below, which can stop early. Every such name
+        # has a "/", so _is_contained_name refuses it there.
+        other_form = {
+            entry.name for entry in listing if _is_other_listing_form(entry.name, self._remote_dir)
+        }
+        self._log_other_form(sum(1 for entry in listing if entry.name in other_form))
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, (name, size, mtime) in enumerate(listing):
             if self._stop.is_set():
@@ -2474,7 +2492,7 @@ class RemoteFileSource(SourceConnector):
                 # A name in another listing form, with no traversal shape, was counted and logged
                 # once above instead (BACKLOG #1130), so an operator can tell a server's listing
                 # format from an attack. It is refused here all the same.
-                if not _is_other_listing_form(name):
+                if name not in other_form:
                     logger.warning(
                         "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
                         "(not a single safe name); left in place, not retrieved",
