@@ -2116,17 +2116,61 @@ def _codec_key(name: str) -> str:
     return name.replace("-", "").replace("_", "").lower()
 
 
-#: Every stdlib codec name and alias, normalized. Built from the ``encodings`` package rather than by
-#: ``codecs.lookup``, which runs third-party search functions and caches each name it misses: the very
-#: value this check declines to echo would stay in process memory. A third-party codec is not named.
-_KNOWN_CODECS = frozenset(
-    _codec_key(n)
-    for n in (
-        *encodings.aliases.aliases,
+#: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str
+#: transforms, and ``undefined``, which only ever raises. ``tests/test_safe_exc_unicode_errors.py``
+#: checks the transforms against the codec registry, so a new one cannot join the names unseen.
+_NOT_TEXT_CODECS = frozenset(
+    {
+        "aliases",
+        "base64_codec",
+        "bz2_codec",
+        "hex_codec",
+        "quopri_codec",
+        "rot_13",
+        "undefined",
+        "uu_codec",
+        "zlib_codec",
+    }
+)
+
+
+def _text_codec_names() -> set[str]:
+    """Each stdlib text codec's module name and its aliases, as the ``encodings`` package spells
+    them."""
+    modules = {
         *encodings.aliases.aliases.values(),
         *(m.name for m in pkgutil.iter_modules(encodings.__path__)),
-    )
-)
+    }
+    modules = {m for m in modules if not m.startswith("_")} - _NOT_TEXT_CODECS
+    aliases = {
+        alias
+        for alias, module in encodings.aliases.aliases.items()
+        if module in modules and not alias.isdigit()
+    }
+    return modules | aliases
+
+
+#: The rule: a name is rendered if it is a stdlib TEXT codec's module name or a non-numeric alias of
+#: one, normalized, or if it is ``cp`` plus one to five digits (:data:`_CODE_PAGE`). Built from the
+#: ``encodings`` package rather than by ``codecs.lookup``, which runs third-party search functions
+#: and caches each name it misses: the very value this check declines to echo would stay in process
+#: memory. A third-party codec is not named. The build costs under 1 ms at import (measured 0.7 to
+#: 0.9 ms), so it is not deferred.
+_KNOWN_CODECS = frozenset(_codec_key(n) for n in _text_codec_names())
+
+#: A Windows code page as the code-page codecs report one: real ``oem`` errors carry ``cp1``, and
+#: ``codecs.code_page_encode`` carries ``cp<number>`` for pages with no ``encodings`` module. The
+#: shape is two fixed letters and at most five digits, so it is accepted by pattern.
+_CODE_PAGE = re.compile(r"cp[0-9]{1,5}")
+
+
+def _names_a_codec(encoding: object) -> bool:
+    """Whether ``encoding`` is a name :func:`_unicode_error_detail` may print (see
+    :data:`_KNOWN_CODECS` for the rule). ``type(...) is str``, as for the reason below."""
+    if type(encoding) is not str or not _CODEC_NAME.fullmatch(encoding):
+        return False
+    return _codec_key(encoding) in _KNOWN_CODECS or _CODE_PAGE.fullmatch(encoding) is not None
+
 
 #: ``.reason`` phrases known to be fixed text. At least the stdlib idna and punycode codecs put the
 #: offending label INTO ``.reason``, so a reason is rendered only from this list, never on trust.
@@ -2171,8 +2215,10 @@ def _unicode_error_text(exc: UnicodeError) -> str:
     The class name alone is the fallback: a bare ``UnicodeError``, or one whose attributes are missing,
     not the standard types, or raise when read. A bare one's message is free text this function cannot
     vouch for. ``.encoding`` is rendered only when it names a stdlib codec, so a value someone else set
-    there is not echoed. ``.reason`` is rendered only from a fixed list. Windows ``mbcs`` raises with
-    ``start == end``, so an empty span still names its position."""
+    there is not echoed. ``.reason`` is rendered only from a fixed list.
+
+    An empty span (``start == end``) prints no position (vault BACKLOG #3206). Windows ``mbcs`` and
+    ``oem`` raise with ``start == end == 0`` wherever the character sat, so the index is not one."""
     name = type(exc).__name__
     detail = _unicode_error_detail(exc)
     return f"{name}: {detail}" if detail else name
@@ -2201,15 +2247,13 @@ def _unicode_error_detail(exc: UnicodeError) -> str:
         return ""
     if type(start) is not int or type(end) is not int or not 0 <= start <= end:
         return ""
-    where = f"position {start}" if end <= start + 1 else f"positions {start}-{end - 1}"
-    codec = (
-        f"{encoding!r} codec "
-        if type(encoding) is str
-        and _CODEC_NAME.fullmatch(encoding)
-        and _codec_key(encoding) in _KNOWN_CODECS
-        else ""
-    )
-    text = f"{codec}cannot {verb} at {where}"
+    codec = f"{encoding!r} codec " if _names_a_codec(encoding) else ""
+    text = f"{codec}cannot {verb}"
+    # An empty span names no character, so its start is not a position (:func:`_unicode_error_text`).
+    if end == start + 1:
+        text = f"{text} at position {start}"
+    elif end > start:
+        text = f"{text} at positions {start}-{end - 1}"
     # `type(...) is str`, not isinstance: a str subclass can compare equal to a listed phrase.
     if type(reason) is str and reason in _FIXED_UNICODE_REASONS:
         text = f"{text}: {reason}"
