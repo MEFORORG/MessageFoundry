@@ -15,20 +15,18 @@ import ast
 import pathlib
 import sqlite3
 import time
-from collections.abc import AsyncIterator
-from dataclasses import fields
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import pytest
-from _totp_clock import pin_totp_clock
 
 from messagefoundry.auth import totp
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import SESSION_KIND, RowSealError
 from messagefoundry.store.store import (
     SESSION_SEAL_EXCLUDED,
     MessageStore,
@@ -41,6 +39,7 @@ from tests._session_seal_contract import (
     assert_session_seal_contract,
     dollar_placeholders,
 )
+from tests._totp_clock import pin_totp_clock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _STORE_DIR = _ROOT / "messagefoundry" / "store"
@@ -324,85 +323,124 @@ async def _pending_factor(
     return identity.user_id, out.token, totp.totp(enroll.secret, now=t1)
 
 
-def _refuse(kind: str) -> Any:
-    async def refuse(*args: Any, **kwargs: Any) -> None:
-        raise RowSealError(kind)
+def _spy(
+    calls: list[str],
+    name: str,
+    method: Callable[..., Awaitable[Any]],
+    before: Callable[[], Awaitable[None]] | None,
+) -> Callable[..., Awaitable[Any]]:
+    """Wrap a store method to record its name, run ``before`` if given, then call the real one."""
 
-    return refuse
-
-
-def _spy(calls: list[str], name: str, method: Any) -> Any:
     async def spy(*args: Any, **kwargs: Any) -> Any:
         calls.append(name)
+        if before is not None:
+            await before()
         return await method(*args, **kwargs)
 
     return spy
 
 
-async def _assert_verify_ends_the_session(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, *, refused: str
-) -> list[str]:
-    """Drive ``verify_mfa`` with the store refusing the ``refused`` session stamp for its seal, and
-    assert the leg ends the session and records no success (BACKLOG #2592). Returns the stamps and
-    success writes the store was asked for."""
-    service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+_WATCHED = ("mark_session_mfa_verified", "mark_session_reauthed", "record_login_success")
+_COUNTED = ("auth.mfa_verified", "auth.mfa_failed", AUTHORITY_SEAL_FAILED_ACTION)
+
+
+@dataclass
+class _Run:
+    """What one :func:`_verify` run did: the verify's answer, the store writes it asked for in
+    order, the integrity alerts raised, and how many audit rows of each :data:`_COUNTED` action it
+    added."""
+
+    out: Elevation
+    token: str
+    user_id: str
+    calls: list[str]
+    alerts: list[str]
+    added: dict[str, int]
+
+
+async def _verify(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch, *, tamper: str | None
+) -> _Run:
+    """Run ``verify_mfa`` with a good code on a local session that owes its factor.
+
+    With ``tamper`` naming one of the two session stamps, the session row is changed outside the
+    store just before that stamp, so the store's own write helper refuses the stamp for its seal.
+    That is the real refusal path, not an injected exception."""
+    store, path = keyed
+    alerts: list[str] = []
+    service = AuthService(
+        store, AuthSettings(mfa_verify_min_elapsed_seconds=0), integrity_alert=alerts.append
+    )
     user_id, token, code = await _pending_factor(service, monkeypatch)
-    verified_before = len(await store.list_audit(action="auth.mfa_verified"))
+
+    async def tamper_row() -> None:
+        await _raw_for(path)(
+            "UPDATE sessions SET client=? WHERE token_hash=?", ("192.0.2.77", hash_token(token))
+        )
+
     calls: list[str] = []
-    for name in ("mark_session_mfa_verified", "mark_session_reauthed", "record_login_success"):
-        monkeypatch.setattr(store, name, _spy(calls, name, getattr(store, name)))
-    monkeypatch.setattr(store, refused, _spy(calls, refused, _refuse(SESSION_KIND)))
+    for name in _WATCHED:
+        before = tamper_row if name == tamper else None
+        monkeypatch.setattr(store, name, _spy(calls, name, getattr(store, name), before))
+    counts = {a: len(await store.list_audit(action=a)) for a in _COUNTED}
 
     out = await service.verify_mfa(token, code, client="192.0.2.9")
 
-    assert out.session_lost and not out.ok and out.token is None
-    row = await store.get_session(hash_token(token))
+    added = {a: len(await store.list_audit(action=a)) - counts[a] for a in _COUNTED}
+    return _Run(out, token, user_id, calls, alerts, added)
+
+
+async def _assert_session_ended(keyed: tuple[MessageStore, Path], run: _Run) -> None:
+    """The refused-stamp outcome (BACKLOG #2592): the session is gone, nothing records a success,
+    and nothing is charged to the second-step counter."""
+    store, _ = keyed
+    assert run.out.session_lost and not run.out.ok and run.out.token is None
+    row = await store.get_session(hash_token(run.token))
     assert row is not None and row.revoked_at is not None
-    assert await service.identity_for_token(token) is None
-    assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
-    assert len(await store.list_audit(action="auth.mfa_verified")) == verified_before
-    assert "record_login_success" not in calls
-    user = await store.get_user(user_id)
-    assert user is not None and user.second_step_failed_attempts == 0  # nothing charged either
-    return calls
+    assert run.added == {
+        "auth.mfa_verified": 0,
+        "auth.mfa_failed": 0,
+        AUTHORITY_SEAL_FAILED_ACTION: 1,
+    }
+    assert len(run.alerts) == 1 and hash_token(run.token)[:12] in run.alerts[0]
+    assert "record_login_success" not in run.calls
+    user = await store.get_user(run.user_id)
+    assert user is not None and user.second_step_failed_attempts == 0
 
 
 async def test_verify_mfa_ends_the_session_when_the_factor_stamp_is_refused(
     keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store, _ = keyed
-    calls = await _assert_verify_ends_the_session(
-        store, monkeypatch, refused="mark_session_mfa_verified"
-    )
+    run = await _verify(keyed, monkeypatch, tamper="mark_session_mfa_verified")
+    await _assert_session_ended(keyed, run)
     # The leg stops at the first refusal: the reauth stamp is never asked for.
-    assert calls == ["mark_session_mfa_verified"]
+    assert run.calls == ["mark_session_mfa_verified"]
 
 
 async def test_verify_mfa_ends_the_session_when_the_reauth_stamp_is_refused(
     keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store, _ = keyed
-    calls = await _assert_verify_ends_the_session(
-        store, monkeypatch, refused="mark_session_reauthed"
-    )
-    assert calls == ["mark_session_mfa_verified", "mark_session_reauthed"]
+    run = await _verify(keyed, monkeypatch, tamper="mark_session_reauthed")
+    await _assert_session_ended(keyed, run)
+    assert run.calls == ["mark_session_mfa_verified", "mark_session_reauthed"]
 
 
 async def test_verify_mfa_succeeds_when_no_stamp_is_refused(
     keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Control for the two tests above: the same flow on the same keyed store, with no refusal.
-    store, _ = keyed
-    service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
-    _, token, code = await _pending_factor(service, monkeypatch)
-    verified_before = len(await store.list_audit(action="auth.mfa_verified"))
-
-    out = await service.verify_mfa(token, code, client="192.0.2.9")
-
-    assert out.ok and not out.session_lost and out.token is not None
-    assert await service.mfa_satisfied(out.token) is True
-    assert len(await store.list_audit(action="auth.mfa_verified")) == verified_before + 1
-    assert await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION) == []
+    # Control for the two tests above: the same flow and the same spies, with no row changed. It
+    # also shows the session takes the non-OIDC branch, so the reauth test reaches its stamp.
+    run = await _verify(keyed, monkeypatch, tamper=None)
+    assert run.out.ok and not run.out.session_lost and run.out.token is not None
+    assert run.calls == list(_WATCHED)
+    assert run.added == {
+        "auth.mfa_verified": 1,
+        "auth.mfa_failed": 0,
+        AUTHORITY_SEAL_FAILED_ACTION: 0,
+    }
+    assert run.alerts == []
+    service = AuthService(keyed[0], AuthSettings())
+    assert await service.mfa_satisfied(run.out.token) is True
 
 
 # --- static guards --------------------------------------------------------------------------
