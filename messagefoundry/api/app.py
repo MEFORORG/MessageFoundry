@@ -221,6 +221,7 @@ from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
+    ExportStopped,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -2066,17 +2067,6 @@ def _summary(row: Row) -> MessageSummary:
         # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
         metadata=user_metadata(d.get("metadata")),
     )
-
-
-class ExportStopped(RuntimeError):
-    """A running bulk export lost its caller's standing, so the stream aborts (BACKLOG #1154).
-
-    The response has already started, so no status code can say so. Raising aborts the transfer,
-    and the client sees an incomplete download rather than a short file that looks complete. The
-    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
-    and uvicorn writes a traceback. Returning without the final body message would avoid
-    that, but the ``@app.middleware("http")`` layers above would then finish the response cleanly,
-    which is the short file this exists to prevent."""
 
 
 def _export_ndjson_line(row: Row) -> bytes:
