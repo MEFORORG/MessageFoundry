@@ -4550,8 +4550,10 @@ class EgressSettings(_Section):
     # site-wide proxy from this file (only per-connection proxies apply; an off-box hop still follows
     # the environment proxy urllib reads on its own). "default" = the OS default web
     # proxy (getproxies()); an http(s):// address = an explicit proxy. A loopback host is never
-    # proxied, whichever of these named the proxy (vault BACKLOG #2579). Credentials stay per-connection
-    # (secrets via env()), not a global TOML value. Env: MEFOR_EGRESS_PROXY_URL.
+    # proxied, whichever of these named the proxy (vault BACKLOG #2579). Put proxy credentials on each
+    # connection (secrets via env()). This field has no validator, so a user:password@ written in it
+    # is inherited with the URL; docs/CONFIGURATION.md [egress] says what then applies.
+    # Env: MEFOR_EGRESS_PROXY_URL.
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
