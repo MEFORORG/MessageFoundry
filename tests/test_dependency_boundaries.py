@@ -1529,17 +1529,17 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 # messagefoundry.anon`, a `from messagefoundry import (` wrapped over several lines, and two spaces
 # after `from`. It also reads a call spelled `import_module(...)` or `x.import_module(...)` whose
 # name is a literal, with a literal `package` when the name is relative. And it reads a call
-# spelled `__import__(...)` or `x.__import__(...)` with a literal, absolute name, and a literal
-# list, tuple or set `fromlist`. A relative import that climbs past its top package is resolved
+# spelled `__import__(...)` or `x.__import__(...)` with a literal name, unless a literal, nonzero
+# `level` makes it relative, and a literal list, tuple or set `fromlist`. A relative import that climbs past its top package is resolved
 # the same way in both forms: clamped at the top and reported, though it would fail at run time.
 # The parse cannot see a docstring or a comment, which is why the text search stays.
 #
 # WHAT NEITHER SEES. At least an import whose name is built at run time, a call through any other
-# name, an `exec` of source text, a relative `__import__`, any file outside the walked trees, and a
-# file outside the package that never spells `anon` as a whole word. The parse reads only files
-# that do, for speed, so a name split across two adjacent literals, written with an escape, or in
-# letters the parser folds to `anon` passes. These searches hold the tree against an accident, not
-# against an evasion.
+# name, a literal name passed through `*` or `**`, an `exec` of source text, a relative
+# `__import__`, any file outside the walked trees, and a file outside the package that never spells
+# `anon` as a whole word. The parse reads only files that do, for speed, so a name split across two
+# adjacent literals, written with an escape, or in letters the parser folds to `anon` passes. These
+# searches hold the tree against an accident, not against an evasion.
 #
 # A REAL import is a different matter from a line that only looks like one. ADR 0030 section 1
 # allows the harness to import the package directly, and nothing does yet. An owner ruling says
@@ -1620,10 +1620,10 @@ _UNFLOORED_ANON_ROOTS: Mapping[str, str] = MappingProxyType(
 #: Shared by every failure that may be a real import, and so put first in each.
 _REAL_ANON_IMPORT_ADVICE = (
     "If a hit is a REAL import, the import must go. ADR 0030 section 1 allows the harness to "
-    "import the package, but the owner ruled that the import gives way to the record's absence "
-    "claim, which says no file outside the package imports it (owner ruling 2026-10-12, #3006 "
-    "part 3). An author who needs the package waits for its move, BACKLOG #1192. Do not hide the "
-    "import from these searches by rewording it or building its name at run time."
+    "import the package. The record's absence claim says no file outside the package imports it. "
+    "The owner ruled that the import gives way to the claim (owner ruling 2026-10-12, BACKLOG "
+    "#3006 part 3). An author who needs the package waits for its move, BACKLOG #1192. Do not "
+    "hide the import from these searches by rewording it or building its name at run time."
 )
 
 
@@ -1700,8 +1700,9 @@ def _parsed_anon_imports(rel: PurePosixPath, source: str) -> list[str]:
         if not isinstance(name, str):
             continue
         if callee == "__import__":
-            # Only an absolute one: a relative `__import__` resolves against its caller's
-            # globals, which a parse cannot read.
+            # Skipped only when a literal, nonzero `level` makes it relative: that resolves
+            # against its caller's globals, which a parse cannot read. A `level` built at run
+            # time is read as absolute, which may report more than runs, never less.
             if _literal_argument(node, 4, "level") in (None, 0):
                 named.add(name)
                 fromlist = _literal_argument(node, 3, "fromlist")
@@ -1901,7 +1902,10 @@ def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
         "messagefoundry/far.py": "from ...anon import Keyer\n",
         "harness/call_set.py": '__import__("messagefoundry", None, None, {"anon"})\n',
         "harness/call_bad.py": '__import__("messagefoundry", fromlist={["anon"]})\n',
-        "harness/near.py": "from messagefoundry import anonymize\nimport messagefoundry.anonymous\n",
+        # The `# anon` comment makes the parse read this file, so its near names reach the check.
+        "harness/near.py": (
+            "# anon\nfrom messagefoundry import anonymize\nimport messagefoundry.anonymous\n"
+        ),
         "harness/built.py": 'import_module("messagefoundry." + "anon")\n',
         "messagefoundry/sub/rel.py": "from ..anon import Keyer\n",
         "messagefoundry/call.py": 'importlib.import_module("messagefoundry.anon.leak")\n',
