@@ -3537,7 +3537,7 @@ only. A user in multiple mapped groups gets the union of those roles.
 unescapes each value and escapes it again one way, and sorts the parts of a multi-valued RDN. The
 result is printable ASCII: ASCII letters are lower-cased, and every non-ASCII or control
 character is written as hex escapes of its UTF-8 bytes. The maps store that form, and a key
-whose canonical form passes 256 characters is refused. So a key matches however either side
+whose canonical form passes 512 characters is refused. So a key matches however either side
 escapes a value: Active Directory writes `CN=C# Developers,OU=Groups,...` with the `#` unescaped,
 and `CN=C\# Developers` and `CN=C\23 Developers` name the same group.
 

@@ -25,6 +25,8 @@ async def assert_group_map_keys_at_width_store(store: Any) -> None:
     """Both maps store and read back a DN at 512 beside a role id and a channel at their widths.
     One call, both tables, so the two composite keys are sized together."""
     assert len(AT_WIDTH) == 512
+    # The PostgreSQL map has a foreign key to roles, and its suite's fixture empties roles.
+    await store.upsert_role(role_id="operator", display_name="Operator", description=None)
     await store.set_ad_group_role_map([(AT_WIDTH, "operator")])
     assert await store.roles_for_ad_groups([AT_WIDTH]) == {"operator"}
     await store.set_ad_group_scope_map([(AT_WIDTH, CHANNEL_AT_WIDTH)])

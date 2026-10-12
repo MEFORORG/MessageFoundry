@@ -113,6 +113,7 @@ async def store() -> AsyncIterator[object]:
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "user_roles",
                 "ad_group_role_map",
+                "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it
                 "users",
                 "roles",
             ):
