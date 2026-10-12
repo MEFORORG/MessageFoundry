@@ -118,9 +118,10 @@ def test_leak_token_table_matches_publish_guard() -> None:
 
 
 def test_leak_tables_load_empty_without_the_publish_guard(tmp_path: Path) -> None:
-    # Where no guard is reachable (an installed wheel with no scripts/ above it) the token tables
-    # must load EMPTY -- never a stale or fragmented copy -- so no customer/vendor token ships in
-    # the tee. Exercise the loader against a tree that has no scripts/security above it.
+    # Where no guard is reachable (an installed wheel, which has no scripts/security beside the
+    # package) the token tables must load EMPTY -- never a stale or fragmented copy -- so no
+    # customer/vendor token ships in the tee. Exercise the loader against a tree that has no guard
+    # at that one path.
     # The loader tries one path, under parents[2] of the file it is given (BACKLOG #2344). Shape
     # the stand-in like the package so that folder is inside tmp_path.
     assert tee_leak._load_publish_guard(tmp_path / "root" / "tee" / "anon" / "leak.py") is None
@@ -141,7 +142,7 @@ def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
     """
     guard = tee_leak._load_publish_guard()
     if guard is None:
-        pytest.skip("guard absent (e.g. an installed wheel with no scripts/ above it)")
+        pytest.skip("guard absent (an installed wheel has no scripts/security beside the package)")
     if not getattr(guard, "TOKENS_PRESENT", False):
         pytest.skip(
             "no token source configured (fork CI / fresh clone) — tables legitimately empty"
