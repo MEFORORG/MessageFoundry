@@ -445,14 +445,17 @@ def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
     except ftplib.error_perm as exc:
         if not _NLST_EMPTY_REPLY.match(str(exc)):
             raise
+        unconfirmed = (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto)
         try:
             home = ftp.pwd()
-            if home:  # '' cannot put the session back, so it confirms nothing
-                ftp.cwd(remote_dir)
-                ftp.cwd(home)
-        except (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto):
+        except unconfirmed:
             raise exc from None
-        if not home:
+        if not home:  # '' cannot put the session back, so it confirms nothing
+            raise exc from None
+        try:
+            ftp.cwd(remote_dir)
+            ftp.cwd(home)
+        except unconfirmed:
             raise exc from None
         # The reply text past the match is the server's, and may name a path: not logged.
         logger.debug("REMOTEFILE NLST answered 550 No files found; read as an empty directory")
@@ -2495,7 +2498,7 @@ class RemoteFileSource(SourceConnector):
                 # the very operation being refused. Left in place, and logged on every poll rather
                 # than once, except for the other-form entry described below. No name is logged:
                 # this arm has refused the name as an unsafe path component, so it is the one place
-                # that must not hand it to `safe_name` either — the host:dir and the fact of a
+                # that must not hand it to `safe_name` either. The host:dir and the fact of a
                 # refusal are the signal.
                 #
                 # This comment used to justify that by asserting "names are not logged at INFO+

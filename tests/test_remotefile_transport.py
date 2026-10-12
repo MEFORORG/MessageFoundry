@@ -2699,6 +2699,21 @@ async def test_another_listing_form_matches_the_pattern_against_the_file_name(
     assert client.ops == []
 
 
+async def test_another_listing_form_is_not_counted_on_a_match_of_its_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # The reverse: "*in*" matches the full path through its directory, but not the file name, so
+    # the poller would not read it and the entry raises no line.
+    client = _NlstListingClient(["/data/in/README.txt"])
+    src = _src(monkeypatch, client, pattern="*in*")
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _OTHER_FORM_LINE not in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+    assert src._other_form_warned_at is None
+
+
 async def test_a_path_from_any_other_listing_still_logs_as_traversal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # #1130
