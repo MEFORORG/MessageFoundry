@@ -111,7 +111,8 @@ def _proc_status_kib(field: str) -> int | None:
     """One ``kB`` field of ``/proc/self/status``, such as ``VmData``, or ``None`` where it cannot be
     read (no procfs, or no such field)."""
     try:
-        with open("/proc/self/status", encoding="ascii") as status:
+        # latin-1, not ascii: the first line is the process name, which may not be ASCII.
+        with open("/proc/self/status", encoding="latin-1") as status:
             for line in status:
                 if line.startswith(field + ":"):
                     return int(line.split()[1])
@@ -132,8 +133,10 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     ``load_config``, so a graph larger than ``mem_mb`` does not start the worker over its cap.
     ``RLIMIT_DATA`` counts writable private memory and not address space that is only reserved. A
     thread's glibc malloc arena reserves about 64 MiB and keeps it mapped after the thread exits, so
-    an ``RLIMIT_AS`` cap became a lifetime budget that innocent threads used up. A live thread's
-    stack does count, and glibc keeps up to about 40 MiB of exited threads' stacks mapped for reuse.
+    an ``RLIMIT_AS`` cap became a lifetime budget that innocent threads used up. An arena's peak
+    writable size does count after its threads exit, which is why the parent also starts this
+    process with ``MALLOC_ARENA_MAX=2``. A live thread's stack counts too, and glibc keeps up to
+    about 40 MiB of exited threads' stacks mapped for reuse.
     Elsewhere on POSIX ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so."""
     try:
         import resource
@@ -161,6 +164,11 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
             mem_mb,
         )
     try:
+        hard = resource.getrlimit(rlimit)[1]  # type: ignore[attr-defined,unused-ignore]
+        if hard != resource.RLIM_INFINITY:  # type: ignore[attr-defined,unused-ignore]
+            # An inherited hard limit (a service unit, a container) cannot be raised. Stay under it
+            # rather than fail the setrlimit and run with no cap at all.
+            limit = min(limit, hard)
         resource.setrlimit(rlimit, (limit, limit))  # type: ignore[attr-defined,unused-ignore]
     except (ValueError, OSError) as exc:
         log.warning("sandbox worker: could not set the memory cap (%s)", exc)
@@ -359,27 +367,32 @@ def main() -> int:
             # dead-letter) and respawns a clean child, rather than hanging to the wall cap.
             log.error("sandbox worker: undecodable request frame (%s)", exc)
             return 1
-        recycle = False
         try:
-            resp = _respond(registry, req, boot.code_sets)
-        except MemoryError as exc:
+            resp: bytes | None = _respond(registry, req, boot.code_sets)
+        except MemoryError:
+            # Caught here rather than around the Handler alone, so a result too big to encode is
+            # answered the same way. The reply is built AFTER this block: until it ends, the
+            # traceback keeps the Handler's frames, and the memory their locals hold, alive.
+            resp = None
+        if resp is None:
             # A call that ran out of memory may leave memory held (a module global, a cache, a
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so
-            # the parent starts a fresh worker (vault BACKLOG #3133 part 2). Caught here rather than
-            # around the Handler alone, so a result too big to encode is answered the same way.
-            recycle = True
-            resp = codec.encode_fail(
-                request_id=req.request_id,
-                phase=req.phase,
-                name=req.name,
-                kind=codec.FAIL_MEMORY,
-                error=f"{_error_text(exc)}; {memory_cap}",
-            )
+            # the parent starts a fresh worker (vault BACKLOG #3133 part 2).
+            with contextlib.suppress(OSError, SandboxError, MemoryError):
+                _write_frame(
+                    stdout,
+                    codec.encode_fail(
+                        request_id=req.request_id,
+                        phase=req.phase,
+                        name=req.name,
+                        kind=codec.FAIL_MEMORY,
+                        error=f"MemoryError; {memory_cap}",
+                    ),
+                )
+            return 1  # with no reply sent, the parent reads EOF and reports a crash instead
         try:
             _write_frame(stdout, resp)
         except (OSError, SandboxError) as exc:
-            if recycle:
-                return 1  # a fallback "error" frame would leave the parent unaware it must reap
             # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time —
             # report it instead of dying so the child's "survives for the next message" contract holds,
             # rather than the parent reading EOF and paying a full config-reload respawn.
@@ -396,8 +409,6 @@ def main() -> int:
                 )
             except (OSError, SandboxError):
                 return 1
-        if recycle:
-            return 1
 
 
 if __name__ == "__main__":

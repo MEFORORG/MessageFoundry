@@ -228,6 +228,8 @@ def test_the_sandbox_hands_its_worker_one_engine_switch_and_no_other_engine_vari
 
     engine_names = {n for n in captured["env"] if n.startswith(childenv.ENGINE_ENV_PREFIX)}
     assert engine_names == {settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV}
+    # One thread arena at most, so threads cannot spend [sandbox].mem_mb (vault BACKLOG #3133).
+    assert captured["env"]["MALLOC_ARENA_MAX"] == "2"
     assert captured["argv"] == childenv.python_child_argv(sandbox_mod.WORKER_MODULE)
 
 

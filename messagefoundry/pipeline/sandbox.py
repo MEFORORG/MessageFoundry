@@ -616,6 +616,26 @@ class SandboxSession:
         # this generation's reads.
         self._responses = queue.Queue()
         self._generation += 1
+        # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
+        # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
+        # decision: the config-source escape and the enforcement dial that unlocks it (vault
+        # BACKLOG #2599). The child runs ``load_config`` itself, so with only the escape it
+        # would refuse a directory its parent loaded at ``warn``. The dial is a posture
+        # switch, not a secret, and every spelling of it the parent's check read crosses, so
+        # the child's check reads the same variables. The operator's
+        # ``[sandbox].pass_environment`` names cross with them.
+        env = worker_environment(
+            extra_names=(
+                INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+                *security_enforcement_env_names(),
+                *self.policy.pass_environment,
+            )
+        )
+        # At most one glibc malloc arena besides the main one. An arena keeps its peak writable size
+        # counted in VmData after its threads exit, so with one per thread, the threads a Handler
+        # starts would spend [sandbox].mem_mb for the worker's whole life (vault BACKLOG #3133 part
+        # 2). Ignored by other allocators. An operator's own value, named in pass_environment, wins.
+        env.setdefault("MALLOC_ARENA_MAX", "2")
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
@@ -631,21 +651,7 @@ class SandboxSession:
             bufsize=0,
             close_fds=True,
             start_new_session=sys.platform != "win32",
-            # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
-            # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
-            # decision: the config-source escape and the enforcement dial that unlocks it (vault
-            # BACKLOG #2599). The child runs ``load_config`` itself, so with only the escape it
-            # would refuse a directory its parent loaded at ``warn``. The dial is a posture
-            # switch, not a secret, and every spelling of it the parent's check read crosses, so
-            # the child's check reads the same variables. The operator's
-            # ``[sandbox].pass_environment`` names cross with them.
-            env=worker_environment(
-                extra_names=(
-                    INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
-                    *security_enforcement_env_names(),
-                    *self.policy.pass_environment,
-                )
-            ),
+            env=env,
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
         # BOTH drains start before anything that can raise between here and the boot frame write. For
@@ -934,8 +940,9 @@ class SandboxSession:
                     # fresh one rather than writing to a worker on its way out (vault BACKLOG #3133).
                     if proc is self._proc:
                         self._kill(proc)
+                    # The worker's text names the cap it set, or says it set none.
                     raise SandboxError(
-                        f"sandbox {phase} {name!r} hit the memory cap, and its worker was "
+                        f"sandbox {phase} {name!r} ran out of memory, and its worker was "
                         f"recycled: {resp.error}"
                     )
                 verdict = "denied" if resp.kind == "denied" else "failed"

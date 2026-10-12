@@ -473,7 +473,7 @@ def test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker(tmp_pa
     registry, config_dir = _mem_graph(tmp_path, ballast_mib=0)
     session = _mem_session(config_dir, mem_mb=128)
     try:
-        with pytest.raises(SandboxError, match="hit the memory cap") as caught:
+        with pytest.raises(SandboxError, match="ran out of memory") as caught:
             _deliveries(registry, "h_runaway", sandbox=session, run_context=RunContext())
         assert "128 MiB above the loaded graph" in str(caught.value)
         # The worker exited and was reaped, so the next message gets a fresh one and succeeds.
@@ -513,7 +513,7 @@ def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
         assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
         assert session._proc is not None
         first = session._proc.pid
-        with pytest.raises(SandboxError, match="hit the memory cap, and its worker was recycled"):
+        with pytest.raises(SandboxError, match="ran out of memory, and its worker was recycled"):
             _deliveries(registry, "h_oom", sandbox=session, run_context=RunContext())
         assert session._proc is None
         assert _deliveries(
