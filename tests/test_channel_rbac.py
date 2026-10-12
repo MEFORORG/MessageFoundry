@@ -465,8 +465,8 @@ async def test_scope_is_checked_before_the_engine_not_started_503(engine: Engine
 async def test_unprovisioned_operator_reaches_nothing_until_granted(engine: Engine) -> None:
     """BACKLOG #1152 (ASVS 8.2.2), the INVERSION of the test that used to pin the permissive default.
 
-    A freshly minted non-administrator has never had a scope written -- ``create_user``'s INSERT does
-    not list ``channel_scope``, so the column is SQL NULL. That used to resolve to "every channel",
+    A freshly minted non-administrator has never had a scope written -- ``create_user``'s INSERT
+    binds ``channel_scope`` as None, so the column is SQL NULL. That used to resolve to "every channel",
     which meant every per-channel check in the API narrowed nobody on a default install. It now
     resolves to the empty set, so the same account reaches no message until somebody grants a
     channel, and the grant is what changes the answer -- asserted here in the same test so a

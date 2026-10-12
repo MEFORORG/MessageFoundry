@@ -147,6 +147,9 @@ def _make_store(conn: _FakeConn, ops: list[str]) -> SqlServerStore:
         command_timeout=0, acquire_timeout=30.0
     )
     store._acquire_wait = AcquireWaitHistogram()
+    # __new__ skips the constructor, which sets the row sealer (BACKLOG #2592). None is what it
+    # sets on a keyless store; create_user seals its row through it.
+    store._row_sealer = None
     store.committed_txns = 0
     store.body_copies = 0
     return store

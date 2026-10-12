@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import inspect
 import re
-from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from messagefoundry.api import create_managed_app
 from messagefoundry.auth.ldap import AdPrincipal
@@ -30,16 +30,13 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.store.base import Store
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, new_user_record
 from tests._admin_account import provision_totp
 
 # The three store classes, reused rather than re-derived — that module's docstring establishes the
 # property this file depends on: the drivers are imported method-locally, so all three classes import
 # on a bare venv and neither test below needs an ``importorskip`` gate.
 from tests.test_store_capability_matrix import _BACKENDS
-
-#: A bound parameter in any of the three dialects. Anything else in a VALUES slot is a literal.
-_PLACEHOLDER = re.compile(r"\A(\?|\$\d+|%s)\Z")
 
 
 async def _directory_signed_in(store: Store) -> str:
@@ -102,47 +99,119 @@ async def test_a_fresh_store_gets_no_account(tmp_path: Path) -> None:
         await served.close()
 
 
-def _disabled_values_slot(func: Callable[..., object]) -> str:
-    """The VALUES entry that ``create_user``'s INSERT puts in the ``disabled`` column.
-
-    Read positionally off the statement's own column list rather than by a fixed index, so
-    reordering the columns cannot make this silently inspect the wrong slot.
-    """
-    src = " ".join(inspect.getsource(func).replace('"', "").split())
-    match = re.search(r"INSERT INTO users \((.*?)\) VALUES \((.*?)\)", src)
-    assert match is not None, f"no INSERT INTO users found in {func!r}"
-    columns = [c.strip() for c in match.group(1).split(",")]
-    values = [v.strip() for v in match.group(2).split(",")]
-    assert len(columns) == len(values), f"{len(columns)} columns against {len(values)} values"
-    return values[columns.index("disabled")]
-
-
 def test_no_store_backend_can_be_asked_to_create_a_disabled_account() -> None:
     """The 'disabled' arm is not merely unused — it is **unexpressible**, at two altitudes.
 
     ``create_user`` carries no ``disabled`` parameter on the :class:`Store` protocol, so no caller
-    can request one; and each backend hardcodes the column rather than binding it, so the absent
-    parameter is not merely unplumbed. Both are asserted because the signature alone would not catch
-    an INSERT that started deciding the column for itself. Reaching the disabled arm of 6.3.2 is
-    therefore a protocol change across three backends, not a keyword at the one call site — a cost
-    the redesign has to price rather than discover.
+    can request one. Since BACKLOG #2592 every backend writes the whole sealed row through one
+    INSERT that binds every column, ``disabled`` included, from :func:`new_user_record`. So the
+    second altitude moved there: that builder takes no ``disabled`` parameter either, it sets the
+    column to a literal False rather than deciding it from its inputs, and each backend's
+    ``create_user`` builds its row with it. Both altitudes are asserted because the signature alone
+    would not catch a row builder that started deciding the column for itself. Reaching the
+    disabled arm of 6.3.2 is therefore a protocol change across three backends and the shared
+    builder, not a keyword at the one call site — a cost the redesign has to price rather than
+    discover. :func:`test_every_backend_binds_disabled_false_in_its_user_insert` checks the value
+    each backend's INSERT really binds.
     """
-    signatures = {"protocol": Store.create_user} | {
+    signatures = {"protocol": Store.create_user, "new_user_record": new_user_record} | {
         name: cls.create_user for name, cls in _BACKENDS.items()
     }
     for name, func in signatures.items():
         params = inspect.signature(func).parameters
-        assert "disabled" not in params, f"{name}.create_user grew a 'disabled' parameter"
+        assert "disabled" not in params, f"{name} grew a 'disabled' parameter"
         # Positive control: the signature was really read. Without it a moved attribute or an empty
         # parameter mapping would satisfy the assertion above for the wrong reason.
-        assert "username" in params, f"{name}.create_user signature did not read as expected"
+        assert "username" in params, f"{name} signature did not read as expected"
+
+    # The builder hardcodes the column. Read off its source, whitespace-normalised, so a computed
+    # value (`disabled=password_hash is None`) cannot pass. The count is the positive control: one
+    # assignment, so the read found the row literal rather than a stray mention.
+    builder = " ".join(inspect.getsource(new_user_record).split())
+    assignments = re.findall(r"\bdisabled=([^,)]+)", builder)
+    assert len(assignments) == 1, f"expected one 'disabled=' in new_user_record, saw {assignments}"
+    assert assignments[0].strip() == "False", f"new_user_record sets disabled={assignments[0]!r}"
 
     for name, cls in _BACKENDS.items():
-        slot = _disabled_values_slot(cls.create_user)
-        assert not _PLACEHOLDER.match(slot), (
-            f"{name} now binds 'disabled' rather than hardcoding it"
+        assert "new_user_record(" in inspect.getsource(cls.create_user), (
+            f"{name}.create_user no longer builds its row with new_user_record"
         )
-        assert slot.upper() in {"0", "FALSE"}, f"{name} hardcodes 'disabled' as {slot!r}, not false"
+
+
+#: Two account shapes that differ in every input ``create_user`` takes, so a backend whose INSERT
+#: derived ``disabled`` from one of them would bind True for at least one shape.
+_ACCOUNT_SHAPES: list[dict[str, object]] = [
+    {
+        "user_id": "u-local",
+        "username": "local-op",
+        "auth_provider": "local",
+        "display_name": "Local Operator",
+        "email": "local@example.invalid",
+        "password_hash": "not-a-real-hash",
+        "must_change_password": True,
+        "password_generated": True,
+    },
+    {
+        "user_id": "u-dir",
+        "username": "dir-op",
+        "auth_provider": "ad",
+        "directory_object_id": "a79c897c-1793-5458-bd1b-b3ae0642c0e3",
+        "password_generated": False,
+        "adopt_notify_email": False,
+    },
+]
+
+
+async def test_every_backend_binds_disabled_false_in_its_user_insert() -> None:
+    """The behavioural half of the test above: what each backend's ``create_user`` really writes.
+
+    SQLite runs for real and the row is read back. The two server backends need a live database, so
+    their one write call, ``_execute_with_audits``, is captured instead, and the bound ``disabled``
+    value is read positionally off the captured statement's own column list. The username slot is
+    the positive control: it proves the positional read lines up with the bound parameters.
+    """
+    sqlite = await MessageStore.open(":memory:")
+    try:
+        for shape in _ACCOUNT_SHAPES:
+            await sqlite.create_user(**shape)  # type: ignore[arg-type]
+            user = await sqlite.get_user(str(shape["user_id"]))
+            assert user is not None and user.username == shape["username"]
+            assert user.disabled is False, f"SQLite created {shape['username']} disabled"
+    finally:
+        await sqlite.close()
+
+    for name, cls in _BACKENDS.items():
+        if cls is MessageStore:
+            continue
+        store: Any = object.__new__(cls)  # the offline idiom: no pool, no I/O
+        store._row_sealer = None  # what the constructor sets on a keyless store
+        captured: list[tuple[str, tuple[object, ...]]] = []
+
+        async def _capture(
+            sql: str,
+            params: tuple[object, ...],
+            audits: object,
+            *,
+            now: float,
+            _into: list[tuple[str, tuple[object, ...]]] = captured,
+        ) -> None:
+            _into.append((sql, tuple(params)))
+
+        store._execute_with_audits = _capture
+        for shape in _ACCOUNT_SHAPES:
+            await store.create_user(**shape)
+        assert len(captured) == len(_ACCOUNT_SHAPES), f"{name} wrote {len(captured)} statements"
+        for (sql, params), shape in zip(captured, _ACCOUNT_SHAPES, strict=True):
+            match = re.search(r"INSERT INTO users \((.*?)\) VALUES", " ".join(sql.split()))
+            assert match is not None, f"{name}.create_user did not write an INSERT INTO users"
+            columns = [c.strip() for c in match.group(1).split(",")]
+            assert len(columns) == len(params), (
+                f"{name}: {len(columns)} columns, {len(params)} params"
+            )
+            assert params[columns.index("username")] == shape["username"], f"{name} slots misread"
+            assert params[columns.index("disabled")] is False, (
+                f"{name} bound disabled={params[columns.index('disabled')]!r} for {shape['username']}"
+            )
 
 
 async def test_a_directory_sign_in_creates_a_roleless_row() -> None:

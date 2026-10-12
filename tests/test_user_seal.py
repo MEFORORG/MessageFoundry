@@ -390,10 +390,12 @@ def _service_reader_calls() -> list[tuple[str, str]]:
 def test_the_service_reads_users_through_its_loaders() -> None:
     """A raw user read outside the loaders would act on a record nobody checked."""
     calls = _service_reader_calls()
+    # Liveness, before the absence check: the walk finds every loader's own read, so it is reading
+    # this file, and an empty walk cannot pass for a clean one.
+    assert len(calls) >= len(_LOADERS), calls
+    assert {f for f, _ in calls} == set(_LOADERS)
     stray = [(f, r) for f, r in calls if r not in _LOADERS.get(f, frozenset())]
     assert not stray, stray
-    # Liveness: the walk finds every loader's own read, so it is reading this file.
-    assert {f for f, _ in calls} == set(_LOADERS)
 
 
 def test_only_the_loader_builds_a_checked_user() -> None:
