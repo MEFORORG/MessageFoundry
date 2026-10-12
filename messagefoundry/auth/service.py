@@ -9190,7 +9190,11 @@ class AuthService:
         try:
             user = await self._store.get_user(session.user_id)
             username = user.username if user is not None else session.user_id
-            await self._audit("auth.admin_action_new_ip", actor=username, detail=_json(detail))
+            # The client column too (vault BACKLOG #3197), so a search or export by address finds
+            # this row. `seen_ip` stays in the detail beside `known_ip`, which it is compared with.
+            await self._audit(
+                "auth.admin_action_new_ip", actor=username, detail=_json(detail), client=client_ip
+            )
             written = True
         finally:
             if not written:

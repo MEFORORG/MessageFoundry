@@ -89,6 +89,10 @@ this line.**
 
 ### Security
 
+- **The audit page shows where each entry came from.** `/ui/audit` has a Client column, which
+  shows the address the engine recorded for the entry, or a dash when no client was in scope.
+  An operator tracing a run of refused sign-ins can now see their source on the page, not only in
+  the export. No seam change: `AuditEntry.client` was already sent. (vault BACKLOG #3197)
 - **A forged federated sign-in callback no longer cancels the real one.** A callback to
   `/ui/oidc/callback` whose `state` does not match now keeps the flow cookie, so the real IdP
   return can still finish the sign-in. Any page can send a browser to that URL with the cookie,

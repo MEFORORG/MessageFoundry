@@ -8238,6 +8238,58 @@ async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) 
     assert row["client"] == "192.0.2.46"
 
 
+@pytest.mark.parametrize(
+    ("reason", "slug"),
+    [
+        ("start_non_navigation_fetch", "non_navigation_fetch"),
+        ("start_failed", "start_failed"),
+        ("callback_non_navigation_fetch", "non_navigation_fetch"),
+        ("idp_error", "idp_error"),
+        ("malformed_callback", "malformed_callback"),
+    ],
+)
+async def test_every_other_oidc_route_reject_records_the_client(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, reason: str, slug: str
+) -> None:
+    """Vault BACKLOG #3197. The other five ``/ui/oidc`` route rejects, beside the cookie-less
+    callback above: each writes its closed-set reason under ``auth.login_failed`` with the caller's
+    address, so a spray of any of them shows its source (#2132). The control for each arm is its
+    own reason: the row asserted is the one this reject writes, not a row from some other refusal."""
+    from messagefoundry.auth import oidc as _oidc
+
+    service = _oidc_service(engine)
+    await service.initialize()
+    probe = {"Sec-Fetch-Mode": "cors"}
+    async with _oidc_client(engine, service, peer="192.0.2.47") as c:
+        if reason == "start_non_navigation_fetch":
+            r = await c.post("/ui/oidc/start", headers=probe, follow_redirects=False)
+        elif reason == "start_failed":
+
+            async def refuse(**_kw: object) -> tuple[str, str]:
+                raise _oidc.FlowError("refused")
+
+            monkeypatch.setattr(service, "begin_oidc_login", refuse)
+            r = await c.post("/ui/oidc/start", follow_redirects=False)
+        else:
+            c.cookies.set("mf_oidc_flow", "someflow")
+            query = {
+                "callback_non_navigation_fetch": "?code=abc&state=xyz",
+                "idp_error": "?error=access_denied&state=xyz",
+                "malformed_callback": "?code=abc",
+            }[reason]
+            headers = probe if reason == "callback_non_navigation_fetch" else {}
+            r = await c.get("/ui/oidc/callback" + query, headers=headers, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/login?e=oidc_failed"
+    rows = [
+        a
+        for a in await engine.store.list_audit(action="auth.login_failed")
+        if json.loads(a["detail"] or "{}").get("reason") == slug
+    ]
+    assert len(rows) == 1, rows
+    assert rows[0]["client"] == "192.0.2.47"
+
+
 async def test_a_forged_state_callback_keeps_the_flow_and_its_cookie(engine: Engine) -> None:
     """BACKLOG #3198: a callback with a wrong ``state`` consumes nothing. Any page can send the
     browser here with the SameSite=Lax flow cookie, so clearing that cookie, or popping the flow,
