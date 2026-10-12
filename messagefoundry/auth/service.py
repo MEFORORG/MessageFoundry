@@ -6897,18 +6897,19 @@ class AuthService:
                 detail=_json({"reason": plan.aborted, "asked": plan.asked}),
             )
             return
-        # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
-        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row. A
-        # pass of referrals only never reaches here: it is not a trip (BACKLOG #2538).
+        # The ceiling is taken over the breaker's own denominator, which counts held probes (ADR
+        # 0195 amendment 2026-10-11, BACKLOG #2138). A pass of referrals only never reaches here: it
+        # is not a trip (BACKLOG #2538).
         ceiling = reconcile.breaker_ceiling(
             probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
             max_fraction=self._settings.ad_session_revoke_max_fraction,
         )
+        held_note = f" ({len(plan.held)} of them held)" if plan.held else ""
         self._reconcile_alert = (
             f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
             f"revoked more than {ceiling} of the {plan.judged} signed-in directory principals it "
-            f"judged ({len(plan.held)} held account(s) left out). No "
+            f"probed{held_note}. No "
             f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
             f"ad_bind_dn service account's read rights."
         )
@@ -6921,7 +6922,6 @@ class AuthService:
                 {
                     "reason": plan.aborted,
                     "probed": plan.probed,
-                    "judged": plan.judged,
                     "ceiling": ceiling,
                 }
             ),

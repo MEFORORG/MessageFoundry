@@ -151,7 +151,7 @@ class RigAdminError(RuntimeError):
 
 class RigUnreachable(RigAdminError):
     """The engine gave no usable answer: it is down, killed or still starting, or its answer
-    broke off or ran past :data:`MAX_API_REPLY_BYTES`."""
+    broke off, or ran or claimed to run past :data:`MAX_API_REPLY_BYTES`."""
 
 
 class RigSignInRefused(RigAdminError):
@@ -159,7 +159,8 @@ class RigSignInRefused(RigAdminError):
 
 
 class RigReplyRefused(RigUnreachable):
-    """The engine answered with more than :data:`MAX_API_REPLY_BYTES`; none of the answer is kept.
+    """The engine's answer ran past :data:`MAX_API_REPLY_BYTES`, or its ``Content-Length`` said it
+    would; none of the answer is kept.
 
     A kind of :class:`RigUnreachable`, so a caller polling a node treats it as a node that did not
     answer and asks again, as the failover rig does for an oversized status answer."""
@@ -382,9 +383,17 @@ def _context(cacert: str | None) -> ssl.SSLContext:
 def _read_bounded(reply: _Readable) -> bytes:
     """The whole answer ``reply`` holds, refused once it passes :data:`MAX_API_REPLY_BYTES`.
 
-    It reads at most one piece past the cap, and never returns an answer cut short: callers parse
-    it. A sized read stops quietly where a whole read would raise ``IncompleteRead``, so an answer
-    that ends before its ``Content-Length`` is refused here, as an engine that did not answer."""
+    An answer whose ``Content-Length`` already passes the cap is refused before any of it is read.
+    Every other answer is counted as it arrives, and read at most one piece past the cap. It never
+    returns an answer cut short: callers parse it. A sized read stops quietly where a whole
+    read would raise ``IncompleteRead``, so an answer that ends before its ``Content-Length`` is
+    refused here, as an engine that did not answer."""
+    stated = getattr(reply, "length", None)  # http.client's Content-Length; None when unstated
+    if isinstance(stated, int) and stated > MAX_API_REPLY_BYTES:
+        raise RigReplyRefused(
+            f"the engine's answer states a length over the {MAX_API_REPLY_BYTES}-byte limit; "
+            "none of it is read"
+        )
     chunks: list[bytes] = []
     total = 0
     while chunk := reply.read(_READ_CHUNK_BYTES):
