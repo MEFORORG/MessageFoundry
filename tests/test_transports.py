@@ -1741,7 +1741,7 @@ def test_file_source_member_cap_reads_unset_and_string_values(
     assert src.max_decompressed_members == expected
 
 
-@pytest.mark.parametrize("bad", [0, "0", 0.0, -1, "-1", 0.5, "many"])
+@pytest.mark.parametrize("bad", [0, "0", 0.0, -1, "-1", 0.5, "many", True, False])
 def test_file_source_member_cap_refuses_zero_and_bad_values(bad: object) -> None:  # #1129
     # The codec's member cap has no off switch, so zero is refused rather than read as "off".
     settings = {"directory": "x", "max_decompressed_members": bad}

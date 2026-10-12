@@ -2654,7 +2654,8 @@ def File(
     decompress: Literal["gzip"]
     | None = None,  # inbound: "gzip" gunzips each drop before the sniff/scan/split
     max_decompressed_bytes: int | None = 64 * 1024 * 1024,  # inbound: decompression-bomb ceiling
-    max_decompressed_members: int = 1024,  # inbound: gzip members one drop may hold (no off switch)
+    max_decompressed_members: int
+    | None = 1024,  # inbound: gzip members one drop may hold; None = the default, never off
 ) -> ConnectionSpec:
     """A File endpoint. Inbound polls ``directory`` for ``pattern``; outbound writes ``filename``
     (atomically). ``encoding`` is the file charset (outbound). ``max_file_bytes`` mirrors

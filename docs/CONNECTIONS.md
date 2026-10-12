@@ -1102,7 +1102,7 @@ its own policy block below):
   tools write, is one member per 64 KiB block. So a BGZF drop near the 64 MiB byte ceiling trips the
   member cap first, and a site with that feed raises `max_decompressed_members` for that connection.
   The member cap cannot be turned off: unset or `None` takes the default, and `0` in any spelling is
-  refused when the connection is built. Both caps are checked in a trial pass that keeps no output,
+  refused when the inbound connection is built. Both caps are checked in a trial pass that keeps no output,
   before the real gunzip runs (see *Unpacking a payload* above), so each admitted drop is inflated
   twice. A corrupt,
   over-ceiling or over-cap archive is **quarantined to `.error`, never accept-and-dropped**, and the

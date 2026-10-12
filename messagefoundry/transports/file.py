@@ -351,6 +351,11 @@ def _member_cap(value: object) -> int:
     operator who wrote 0 meaning "no cap". This is the ``max_header_bytes`` rule on the HTTP source."""
     if value is None or value == "":
         return DEFAULT_MAX_DECOMPRESSED_MEMBERS
+    if isinstance(value, bool):
+        # True would read as a cap of 1. gzip_decompress refuses a bool for max_members too.
+        raise ValueError(
+            f"file source max_decompressed_members={value!r} must be a count, not a bool"
+        )
     cap = positive_cap(
         value,
         int,
@@ -728,7 +733,8 @@ class FileSource(SourceConnector):
             knob="max_decompressed_bytes",
             transport="file source",
         )
-        # Caps the gzip members in one drop (BACKLOG #1129). Only consulted when `decompress` is set.
+        # Caps the gzip members in one drop (BACKLOG #1129). Only consulted when `decompress` is set,
+        # but read at build either way, like `max_decompressed_bytes`, so a typo fails early.
         self.max_decompressed_members: int = _member_cap(s.get("max_decompressed_members"))
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
         self.error_dir = self.directory / s.get("error_subdir", ".error")

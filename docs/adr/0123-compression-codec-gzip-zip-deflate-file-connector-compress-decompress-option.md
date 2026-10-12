@@ -115,7 +115,7 @@ the **codec and the byte ceiling only** — never any decompressed content.
 
 > **Amendment 2026-10-11 (BACKLOG #1129): a trial pass checks the caps before the real
 > decompression.** Each decompressor first inflates the whole input in bounded chunks and keeps none
-> of the output. That trial pass counts the bytes, and the gzip members or zip entries, and raises
+> of the output. That trial pass counts the bytes, and for gzip the members, and raises
 > the same `CompressionError` the real pass would the moment a cap would be crossed. So an over-cap
 > stream is refused before the real decompression starts, and no output is kept. Only an admitted
 > stream is inflated again for real. The owner ruled on 2026-10-11 that a bounded inflate that
@@ -131,7 +131,7 @@ the **codec and the byte ceiling only** — never any decompressed content.
 > `max_output_bytes=None`. The zip entry count is read from the central directory before either
 > pass. `gzip_decompress` always runs the trial pass, because its member cap cannot be off.
 > The File connector gains `max_decompressed_members`, default 1024, so a site can raise the gzip
-> member cap for one connection, such as a BGZF feed. Zero is refused at build, since the codec
+> member cap for one connection, such as a BGZF feed. An inbound File connection refuses zero at build, since the codec
 > offers no off switch. A ZIP central-directory declared-size pre-filter was allowed by the owner
 > but is not built.
 

@@ -38,7 +38,7 @@ Two invariants shape the surface:
   ceiling only — **never any decompressed content** (it is PHI).
 
   A **trial pass** runs ahead of the real one (BACKLOG #1129). It inflates the whole input in
-  bounded chunks, keeps none of the output, and counts the bytes and the members or entries. It
+  bounded chunks, keeps none of the output, and counts the bytes, and for gzip the members. It
   raises the same error the real pass would, at the moment a cap would be crossed. So an over-cap
   stream is refused before the real decompression starts, and keeps no output at all. Only a stream
   the trial pass admits is inflated again for real. The owner ruled on 2026-10-11 that a bounded
@@ -397,7 +397,8 @@ def zip_decompress(
     member that way and keeps nothing, so an over-ceiling archive is refused before any member is kept;
     see the module docstring. Every member name is checked before either pass reads a byte. Content
     is checked only in the real pass, so an archive with both an over-ceiling total and a member
-    whose content is refused is refused for the ceiling. A corrupt
+    whose content is refused is refused for the ceiling. That also means an archive refused for
+    its content costs one trial inflate first, which the byte ceiling bounds. A corrupt
     archive, too many members, an over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption, a
     compression method, a format version) raises :class:`CompressionError`, which names a member by
     its position and never by its filename. Duplicate file member names also refuse the whole
@@ -513,7 +514,8 @@ def _read_zip_member(
     """Read one member in bounded chunks. Returns its bytes, or ``b""`` when ``keep_output`` is
     false, and the archive's running output total after it. Raises :class:`CompressionError` the
     moment the total passes ``max_output_bytes``, and before that chunk is kept."""
-    kept = bytearray()
+    # A list joined once builds the member's bytes in one copy; a bytearray would need a second.
+    kept: list[bytes] = []
     total = produced_before
     with zf.open(info, "r") as member:
         while block := member.read(_CHUNK):
@@ -524,8 +526,8 @@ def _read_zip_member(
                     "(possible decompression bomb)"
                 )
             if keep_output:
-                kept += block
-    return bytes(kept), total
+                kept.append(block)
+    return b"".join(kept), total
 
 
 def _zip_overlap_reason(zf: zipfile.ZipFile) -> str | None:
