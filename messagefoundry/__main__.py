@@ -8817,6 +8817,17 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
         print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
         return 2
+    except ValueError as exc:
+        # vault BACKLOG #3247: under key_provider=vault the provider builds its Vault client outside
+        # its own `try`, and at least the outbound length bound, the TLS suite assertion and the
+        # strict-reader mount refuse with a bare ValueError. Only the key is resolved here: no store
+        # is open and nothing was changed, so this is "could not start", exit 2. It reached the
+        # dispatch floor and exited 1, an aborted rotation's code. Rendered through `safe_exc`, as
+        # that floor renders it, so this arm prints nothing the floor would not.
+        from messagefoundry.redaction import safe_exc
+
+        print(f"error: cannot load the active key for rotation: {safe_exc(exc)}", file=sys.stderr)
+        return 2
     if not active_key:
         print(
             "error: rotate-key needs an active key — set MEFOR_STORE_ENCRYPTION_KEY (or "
