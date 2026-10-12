@@ -61,9 +61,12 @@ class CaptureSink:
       that carries PHI, discard the capture, add a rule for that field, and capture again.
     * A tally covers one run, and the sink appends. A file that already held lines has bodies
       that no summary covers.
-    * Each record's ``control_id`` is the MSH-10 of the body the sink writes. With an anonymizer,
-      that is the anonymized body, so the id follows the rules: a rule that rewrites MSH-10
-      rewrites the id too. It is ``None`` when that body does not parse.
+    * Each record's ``control_id`` is the MSH-10 of the body the sink writes, read the way the
+      ACK reads it. With an anonymizer, that is the anonymized body, so the id follows the rules:
+      a rule that rewrites MSH-10 rewrites the id too. It is ``None`` when that body does not
+      parse.
+    * An overlay ``keep`` on a field the default rules scrub turns that scrub off. ``load_rules``
+      logs a WARNING for each, and ``kept_defaults`` in the ``rules`` module lists them.
     * ``received_at`` is the real time of capture. No rule shifts it, an MSH-7 rule included.
     * Any anonymizer error drops the message. The sink logs one WARNING per drop that names the
       exception class, never its text or the body, and counts it in ``anon_failed``. A weak salt
@@ -200,7 +203,10 @@ class CaptureSink:
         self._write(peek.control_id, raw)
         replies += frame_neutralised(build_ack(peek, code="AA", ack_mode=self._ack_mode))
 
-    def _write(self, control_id: str | None, raw: str) -> None:
+    def _write(self, received_id: str | None, raw: str) -> None:
+        # ``received_id`` is MSH-10 as delivered. It is written only when there is no anonymizer;
+        # with one, the id is read again from the anonymized body below.
+        control_id = received_id
         assert self._file is not None, "CaptureSink.start() must be called before messages arrive"
         if self._anonymizer is not None:
             try:
@@ -216,8 +222,7 @@ class CaptureSink:
                 log.warning("anonymizer refused a message; dropped it (%s)", type(exc).__name__)
                 return
             # Read the id from the body being written, not the one received, so a rule that rewrites
-            # MSH-10 never leaves the real id beside the surrogate body (BACKLOG #2994). The id the
-            # caller passed is used only when there is no anonymizer, which saves a second parse.
+            # MSH-10 never leaves the real id beside the surrogate body (BACKLOG #2994).
             control_id = _control_id_of(raw)
         json.dump(
             {"control_id": control_id, "raw": raw, "received_at": time.time()},
@@ -230,15 +235,18 @@ class CaptureSink:
 
 
 def _control_id_of(body: str) -> str | None:
-    """MSH-10 of ``body``, or ``None`` when ``body`` does not parse.
+    """MSH-10 of ``body``, read as ``_handle`` reads the delivered bytes; ``None`` if it won't parse.
+
+    ``body`` goes back to the bytes it was decoded from (latin-1) and is parsed from bytes, as the
+    ACK's id is, so a body the rules left alone yields the very id the ACK echoed. A body with a
+    character latin-1 cannot hold came from no delivered bytes, so it is treated as unparseable.
 
     It never raises: it runs after the anonymizer's fail-closed catch, where an exception would
-    lose a body that is safe to write. ``HL7PeekError`` is a ``ValueError``, so the read-fault
-    family covers the parse refusal too. Not ``harness.scenarios._core.control_id_of``: that one
-    decodes bytes as UTF-8, and importing it would pull the scenario drivers into this sink. The
-    tee's ``_anonymize_captures`` applies the same rule with its own reader.
+    lose a body that is safe to write. ``HL7PeekError`` and ``UnicodeEncodeError`` are both
+    ``ValueError``s, so the read-fault family covers the refusal and the encode. The tee's ``_anonymize_captures`` reads its id from the
+    anonymized body as well, with the tee relay's own reader.
     """
     try:
-        return Peek.parse(body).control_id or None  # a blank MSH-10 is written as null, not ""
+        return Peek.parse(body.encode("latin-1")).control_id
     except PEEK_READ_FAULTS:
         return None

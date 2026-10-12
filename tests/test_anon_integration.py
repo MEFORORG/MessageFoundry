@@ -11,6 +11,8 @@ import logging
 import os
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -75,8 +77,14 @@ def test_capture_sink_anonymizes_on_capture(tmp_path) -> None:
     assert "DOE" not in record["raw"] and "999" not in record["raw"]  # PHI scrubbed on capture
 
 
-# A rule set that rewrites MSH-10, the case BACKLOG #2994 is about. The default rules keep it.
-_MSH10_RULES = (*DEFAULT_RULES, FieldRule("MSH-10", SurrogateKind.ID))
+# Rules that rewrite MSH-10, the case BACKLOG #2994 is about, and MSH-7. The defaults keep both.
+_MSH_RULES = (
+    *DEFAULT_RULES,
+    FieldRule("MSH-10", SurrogateKind.ID),
+    FieldRule("MSH-7", SurrogateKind.DATE),
+)
+# MSH-7 with a month, day and time, so the date rule visibly changes it.
+_RAW_TIMED = _RAW.replace("|20260101||", "|20260315142233||")
 
 
 def test_capture_sink_control_id_follows_an_msh10_rule(tmp_path) -> None:
@@ -84,20 +92,47 @@ def test_capture_sink_control_id_follows_an_msh10_rule(tmp_path) -> None:
 
     async def run() -> CaptureSink:
         sink = CaptureSink(
-            out, ports=(0,), anonymizer=lambda r: anonymize(r, salt=_SALT, rules=_MSH10_RULES)
+            out, ports=(0,), anonymizer=lambda r: anonymize(r, salt=_SALT, rules=_MSH_RULES)
         )
         await sink.start()
         try:
-            ack = await _send_and_ack(sink.bound_ports[0], _RAW.encode("latin-1"))
+            ack = await _send_and_ack(sink.bound_ports[0], _RAW_TIMED.encode("latin-1"))
         finally:
             await sink.stop()
         # The ACK still answers the sender's own id: only the record follows the rules.
         assert b"MSA|AA|C1" in ack
         return sink
 
+    before = time.time()
     sink = asyncio.run(run())
+    after = time.time()
     assert sink.captured == 1
-    _assert_id_follows_the_rules(json.loads(out.read_text().splitlines()[0]))
+    record = json.loads(out.read_text().splitlines()[0])
+    _assert_id_follows_the_rules(record)
+    # received_at is the sink's own clock at capture, whatever the MSH-7 rule did to the header.
+    assert Peek.parse(record["raw"]).field("MSH-7") != "20260315142233"  # control: rule ran
+    assert before <= record["received_at"] <= after
+
+
+def test_capture_sink_control_id_is_read_as_the_ack_reads_it(tmp_path) -> None:
+    # A non-ASCII MSH-10 under the default rules, which keep it: the anonymized record must carry
+    # the id the ACK echoed and a capture with no anonymizer writes, not a second reading of it.
+    payload = _RAW.encode("latin-1").replace(b"|C1|", b"|C\xe91|")
+    plain, anon = tmp_path / "plain.jsonl", tmp_path / "anon.jsonl"
+
+    async def run(out: Path, anonymizer: Callable[[str], str] | None) -> None:
+        sink = CaptureSink(out, ports=(0,), anonymizer=anonymizer)
+        await sink.start()
+        try:
+            await _send_and_ack(sink.bound_ports[0], payload)
+        finally:
+            await sink.stop()
+
+    asyncio.run(run(plain, None))
+    asyncio.run(run(anon, lambda r: anonymize(r, salt=_SALT)))
+    plain_id = json.loads(plain.read_text(encoding="utf-8"))["control_id"]
+    assert plain_id == Peek.parse(payload).control_id  # control: the reader the ACK uses
+    assert json.loads(anon.read_text(encoding="utf-8"))["control_id"] == plain_id
 
 
 def _assert_id_follows_the_rules(record: dict[str, object]) -> None:
@@ -235,10 +270,10 @@ def test_tee_anonymize_captures_end_to_end(tmp_path, monkeypatch) -> None:
 
 def test_tee_anonymize_captures_control_id_follows_an_msh10_rule(tmp_path, monkeypatch) -> None:
     db = str(tmp_path / "tee.db")
-    _seed_capture(db, _RAW.encode("latin-1"))  # the stored row's own id is the real "C1"
+    _seed_capture(db, _RAW_TIMED.encode("latin-1"))  # the stored row's own id is the real "C1"
     monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
     overlay = tmp_path / "anon.toml"
-    overlay.write_text('[hl7.fields]\n"MSH-10" = "id"\n', encoding="utf-8")
+    overlay.write_text('[hl7.fields]\n"MSH-10" = "id"\n"MSH-7" = "date"\n', encoding="utf-8")
     out = tmp_path / "ds.jsonl"
 
     rc = tee_main(["anonymize-captures", "--db", db, "--out", str(out), "--overlay", str(overlay)])
@@ -246,8 +281,19 @@ def test_tee_anonymize_captures_control_id_follows_an_msh10_rule(tmp_path, monke
     (line,) = out.read_text().splitlines()
     record = json.loads(line)
     _assert_id_follows_the_rules(record)
-    # received_at is the relay's real receive time, kept on purpose (docs/PHI.md section 9).
-    assert isinstance(record["received_at"], float)
+    # received_at is the relay's real receive time, kept on purpose (docs/PHI.md section 9), and
+    # the MSH-7 rule does not move it.
+    assert Peek.parse(record["raw"]).field("MSH-7") != "20260315142233"  # control: rule ran
+
+    async def stored_at() -> float:
+        store = await RelayStore.open(db)
+        try:
+            (row,) = await store.captures()
+        finally:
+            await store.close()
+        return row.at
+
+    assert record["received_at"] == asyncio.run(stored_at())
 
 
 def test_tee_anonymize_captures_refuses_no_msh_body(tmp_path, monkeypatch) -> None:

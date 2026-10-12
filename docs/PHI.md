@@ -2094,7 +2094,9 @@ The writers are the harness `CaptureSink` and `python -m tee anonymize-captures`
 - **`control_id` is read from the anonymized body**, not from the message as received. The
   default rules keep `MSH-10`, so the id is the sender's own and a record still matches its
   source. An overlay that maps `MSH-10` changes the id with it. A record then never pairs the
-  real id with a surrogate body. When the anonymized body does not parse, the id is `null`.
+  real id with a surrogate body. The sink writes `null` when the anonymized body does not parse.
+  The tee reads only the first line, as its relay does, and writes `null` when that line holds no
+  `MSH-10`.
 - **`received_at` is the real time the message was captured.** No rule touches it, and an `MSH-7`
   rule does not shift it. The sink writes its own clock at capture, and the tee writes the
   relay's receive time. It is a full date and time, one more reason the output is not Safe Harbor
