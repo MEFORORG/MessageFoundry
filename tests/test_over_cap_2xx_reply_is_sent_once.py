@@ -28,6 +28,9 @@ Three layers:
   the recorded status the ruling names. The same harness shows a 500 IS sent again, so a count of
   one is not something it reports for every reply.
 
+The last section applies the same rule to a 2xx body cut short of its declared length, or
+misframed (BACKLOG #2989). Each layer above is repeated there for those two.
+
 Synthetic data only.
 """
 
@@ -56,12 +59,15 @@ from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
+    REPLY_MISFRAMED_CODE,
     REPLY_TOO_LARGE_CODE,
+    REPLY_TRUNCATED_CODE,
+    EgressReplyError,
     ResponseTooLargeError,
     TruncatedResponseError,
     read_2xx_reply_text,
 )
-from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp
+from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp, _wire
 from tests.test_digest_refusal_classification import _FACTORY, _LABEL, _build, _Stops
 
 #: The name ``_build`` gives every destination, and so the name a WARNING or refusal carries.
@@ -148,17 +154,22 @@ class _ShortResp(_ExactResp):
 
 
 @pytest.mark.parametrize("body_is_needed", [False, True])
-def test_a_truncated_body_is_still_raised_as_it_was(body_is_needed: bool) -> None:
-    """Only the byte bound is handled. A truncated reply after a 2xx is still a retryable
-    ``TruncatedResponseError``, in both modes: that is a different question, left alone."""
-    with pytest.raises(TruncatedResponseError):
+@pytest.mark.parametrize("status", [404, 500])
+def test_a_truncated_body_on_another_status_is_still_raised_as_it_was(
+    status: int, body_is_needed: bool
+) -> None:
+    """A truncated body after a 2xx follows the same rule as an over-cap one since BACKLOG #2989,
+    and the section at the end of this file covers it. On any other status the helper still
+    changes nothing: the retryable ``TruncatedResponseError`` is raised in both modes."""
+    with pytest.raises(TruncatedResponseError) as ei:
         read_2xx_reply_text(
-            _ShortResp(b"y" * 5),
+            _ShortResp(b"y" * 5, status=status),
             limit=64,
             connector="c",
             encoding="utf-8",
             body_is_needed=body_is_needed,
         )
+    assert not isinstance(ei.value, NegativeAckError)
 
 
 @pytest.mark.parametrize("body_is_needed", [False, True])
@@ -588,3 +599,183 @@ async def test_an_over_cap_body_on_a_500_is_retried_as_before(
     assert "HTTP 500" in got.last_error
     assert REPLY_TOO_LARGE_CODE not in got.last_error
     assert got.captured == []
+
+
+# --- a truncated or misframed 2xx body follows the same rule (BACKLOG #2989) ----------------------
+#
+# The same principle as the ruling above: judge the body by who reads it. ADR 0095 Amendment B.1
+# records who decided it for these two. If that decision changes, these tests and the codes they
+# pin are the ones to change.
+
+#: The peer promised 50 bytes and sent 5, then closed.
+_TRUNCATED_2XX = b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\nConnection: close\r\n\r\nhello"
+#: Two framings at once, which RFC 9112 section 6.1 calls an error. The chunked body is complete.
+_MISFRAMED_2XX = (
+    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    b"\r\n5\r\nhello\r\n0\r\n\r\n"
+)
+_UNREADABLE = {
+    "truncated": (_TRUNCATED_2XX, REPLY_TRUNCATED_CODE, "ended before its declared length"),
+    "misframed": (_MISFRAMED_2XX, REPLY_MISFRAMED_CODE, "is misframed ("),
+}
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+@pytest.mark.parametrize("status", [200, 201, 299])
+def test_an_unreadable_2xx_body_nobody_needs_reads_as_empty_and_warns(
+    kind: str, status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    raw, _code, said = _UNREADABLE[kind]
+    with caplog.at_level(logging.WARNING):
+        text = read_2xx_reply_text(
+            _wire(raw.replace(b"200 OK", f"{status} OK".encode(), 1)),
+            connector="REST connection 'OB_X'",
+            encoding="utf-8",
+            body_is_needed=False,
+        )
+    assert text == ""
+    (record,) = caplog.records
+    message = record.getMessage()
+    assert message.startswith(f"REST connection 'OB_X' answered with status {status} and")
+    assert said in message
+    assert "recorded as delivered" in message
+    assert "hello" not in message
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+def test_an_unreadable_2xx_body_that_is_needed_is_a_permanent_refusal(kind: str) -> None:
+    raw, code, _said = _UNREADABLE[kind]
+    with pytest.raises(NegativeAckError) as ei:
+        read_2xx_reply_text(
+            _wire(raw),
+            connector="SOAP connection 'OB_X'",
+            encoding="utf-8",
+            body_is_needed=True,
+        )
+    err = ei.value
+    assert err.code == code
+    # One reply, not the connection: it must not stop the lane.
+    assert (err.permanent, err.credential_fault, err.config_fault) == (True, False, False)
+    assert str(err).startswith(f"SOAP connection 'OB_X': {code}, not sent again. A 2xx reply body")
+    assert str(err).endswith("Check the partner before a replay")
+    assert "hello" not in str(err)
+    assert err.__context__ is None
+    assert err.__cause__ is None
+
+
+@pytest.mark.parametrize("body_is_needed", [False, True])
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+def test_an_unreadable_body_on_a_non_2xx_is_still_raised_as_it_was(
+    kind: str, body_is_needed: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE CONTROL: the 2xx is what decides. On a 500 the retryable error is raised unchanged."""
+    raw, _code, _said = _UNREADABLE[kind]
+    with caplog.at_level(logging.WARNING), pytest.raises(EgressReplyError) as ei:
+        read_2xx_reply_text(
+            _wire(raw.replace(b"200 OK", b"500 Server Error", 1)),
+            connector="c",
+            encoding="utf-8",
+            body_is_needed=body_is_needed,
+        )
+    assert not isinstance(ei.value, NegativeAckError)
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+@pytest.mark.parametrize("case", _RULED, ids=_case_id)
+async def test_send_follows_the_ruling_for_an_unreadable_2xx_body(
+    case: tuple[ConnectorType, dict[str, Any], str], kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each destination's ``_post``, with the opener counted: the request is sent once either way."""
+    ctype, over, side = case
+    raw, code, said = _UNREADABLE[kind]
+    dest = _build(ctype, f"https://partner.example.com/x?site={_URL_MARKER}", **over)
+    opener = _FakeOpener(_wire(raw))
+    dest._opener = opener
+    with caplog.at_level(logging.WARNING):
+        if side == _DELIVERED:
+            assert await dest.send(_payload(ctype, over)) is None
+        else:
+            with pytest.raises(NegativeAckError) as ei:
+                await dest.send(_payload(ctype, over))
+            assert (ei.value.code, ei.value.permanent) == (code, True)
+            assert ei.value.config_fault is False
+            identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
+            assert str(ei.value).startswith(f"{identity}: {code}, not sent again")
+            assert _URL_MARKER not in str(ei.value)
+    assert len(opener.requests) == 1
+    warned = [r.getMessage() for r in caplog.records if "recorded as delivered" in r.getMessage()]
+    if side == _DELIVERED:
+        (warning,) = warned
+        assert said in warning
+        assert _URL_MARKER not in warning
+    else:
+        assert warned == []
+
+
+class _RawPartner:
+    """A loopback partner that answers every request with the same raw reply bytes, and counts."""
+
+    def __init__(self, raw: bytes) -> None:
+        self.requests: list[str] = []
+        outer = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def _serve(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                outer.requests.append(self.command)
+                self.close_connection = True
+                with contextlib.suppress(OSError):
+                    self.wfile.write(raw)
+
+            do_POST = do_PUT = _serve
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+
+    def __enter__(self) -> _RawPartner:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+@pytest.mark.parametrize("case", _RULED, ids=_case_id)
+async def test_an_unreadable_2xx_is_sent_once_and_recorded_as_ruled(
+    case: tuple[ConnectorType, dict[str, Any], str],
+    kind: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE ITEM, on the wire. Before BACKLOG #2989 each offer sent the request again."""
+    ctype, over, side = case
+    raw, code, _said = _UNREADABLE[kind]
+    with _RawPartner(raw) as partner:
+        dest = _build(ctype, f"{partner.url}/x?site={_URL_MARKER}", **over)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype, over))
+    assert len(partner.requests) == 1, partner.requests
+    assert got.outcomes == [_ItemOutcome.PROCESSED]
+    assert got.stopped == [], "one unreadable reply must not stop the lane"
+    assert got.captured == []
+    if side == _DELIVERED:
+        assert got.row_status == OutboxStatus.DONE.value
+        assert got.message_status == MessageStatus.PROCESSED.value
+        assert any("recorded as delivered" in r.getMessage() for r in caplog.records)
+    else:
+        assert got.row_status == OutboxStatus.DEAD.value
+        assert got.message_status == MessageStatus.ERROR.value
+        identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
+        assert f"{identity}: {code}, not sent again" in got.last_error
+        for leaked in (_URL_MARKER, "127.0.0.1", _PAYLOAD_MARKER, "hello"):
+            assert leaked not in got.last_error
