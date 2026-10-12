@@ -211,12 +211,11 @@ def _trial_from(text: str, *, waited: bool) -> Trial:
     if "READY" not in lines:
         return Trial("BROKEN", " | ".join(lines), prompted)
     after = lines[lines.index("READY") + 1 :]
-    if waited:
-        return Trial("WAITING", " | ".join(after), prompted)
+    # A result line means the load returned, even if the child was slow to exit and was killed.
     result = next((line for line in after if line.startswith(("RAISED", "LOADED"))), None)
-    if result is None:
-        return Trial("BROKEN", " | ".join(after), prompted)
-    return Trial(result.split(" ", 1)[0], result, prompted)
+    if result is not None:
+        return Trial(result.split(" ", 1)[0], result, prompted)
+    return Trial("WAITING" if waited else "BROKEN", " | ".join(after), prompted)
 
 
 def _run_in_a_pty(mode: str, path: str, wait: float) -> Trial:

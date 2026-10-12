@@ -50,6 +50,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.auth.trust_anchors import _has_encryption_header
 from tests._encrypted_pem_probe import (
     CAFILE_MODES,
     CONDITIONS,
@@ -74,6 +75,15 @@ def shapes(tmp_path_factory: pytest.TempPathFactory) -> Path:
     directory = tmp_path_factory.mktemp("encrypted-pem")
     write_shapes(directory)
     return directory
+
+
+def test_the_shapes_are_the_ones_the_engine_calls_encrypted(shapes: Path) -> None:
+    """The pin's premise. Each encrypted shape is text the engine's own header check refuses, the
+    one ``anchor_cadata`` and the Vault hop run, and the plain shape is not. Otherwise the pin
+    could pass on files the engine would never call encrypted."""
+    for name in ENCRYPTED_SHAPES:
+        assert _has_encryption_header((shapes / name).read_text("ascii")), name
+    assert not _has_encryption_header((shapes / PLAIN_SHAPE).read_text("ascii"))
 
 
 def _path_loads() -> list[tuple[str, str]]:

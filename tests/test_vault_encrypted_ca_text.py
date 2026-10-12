@@ -15,17 +15,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import requests
-from urllib3._base_connection import ProxyConfig
-from urllib3.util import parse_url
 
 from messagefoundry.config.tls_policy import InsecureHopRefused
-from messagefoundry.transports.strict_requests import (
-    StrictReplyAdapter,
-    _narrowed_pool_classes,
-    vault_failure_text,
-)
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
+from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+
+# requests and urllib3 come with the [vault] extra, and strict_requests imports both. So they are
+# imported inside the tests, and a leg without the extra skips this file instead of failing to
+# collect it.
+pytestmark = pytest.mark.skipif(
+    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
+    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
+)
 
 _BEGIN = "-----BEGIN CERTIFICATE-----\n"
 #: A body that is not a certificate. Nothing here hands it to OpenSSL.
@@ -64,6 +65,12 @@ def _contexts(kind: type) -> tuple[list[Any], Any]:
     return made, factory
 
 
+def _strict() -> Any:
+    from messagefoundry.transports import strict_requests
+
+    return strict_requests
+
+
 def _stop_at_the_socket(conn: Any) -> None:
     """Replace the one call that opens a socket, so ``connect`` raises ``_Stopped`` there."""
 
@@ -75,14 +82,23 @@ def _stop_at_the_socket(conn: Any) -> None:
 
 def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
     """A narrowed connection that opens no socket, to Vault directly or through an https proxy."""
-    cls = _narrowed_pool_classes(factory, connector="Vault test hop")["https"].ConnectionCls
+    from urllib3.connection import ProxyConfig
+    from urllib3.util import parse_url
+
+    classes = _strict()._narrowed_pool_classes(factory, connector="Vault test hop")
+    cls = classes["https"].ConnectionCls
     conn: Any
     if proxied:
         conn = cls(
             "vault.test",
             8200,
             proxy=parse_url("https://proxy.test:3128"),
-            proxy_config=ProxyConfig(None, False, None, None),
+            proxy_config=ProxyConfig(
+                ssl_context=None,
+                use_forwarding_for_https=False,
+                assert_hostname=None,
+                assert_fingerprint=None,
+            ),
             **ca,
         )
         conn.set_tunnel("vault.test", 8200, scheme="https")
@@ -150,8 +166,10 @@ def test_a_ca_directory_reaches_the_proxy_leg_and_is_not_refused(tmp_path: Path)
     and ``CURL_CA_BUNDLE`` the same way. This drives requests' own pool builder with a directory as
     ``verify``, so it pins the hand-off and not a copy of it. Red under: a refusal of a set
     ``ca_cert_dir``, which would stop a hop that works today."""
+    import requests
+
     made, factory = _contexts(_RecordingContext)
-    adapter = StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
+    adapter = _strict().StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
     request = requests.Request("GET", "https://vault.test:8200/v1/sys/health").prepare()
     pool = adapter.get_connection_with_tls_context(
         request, str(tmp_path), proxies={"https": "https://proxy.test:3128"}
@@ -175,8 +193,10 @@ def test_the_refusal_reaches_the_caller_with_its_text(proxy: str | None) -> None
     ``SSLError`` raised before a proxy has connected as a ``ProxyError``, and the providers would
     then report a type name only. Red under: the refusal raised as ``urllib3.exceptions.SSLError``,
     which comes out as ``requests.exceptions.SSLError`` direct and ``ProxyError`` through a proxy."""
+    import requests
+
     made, factory = _contexts(_NoTlsLoad)
-    adapter = StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
+    adapter = _strict().StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
     text = _PLAIN.replace(_BEGIN, _BEGIN + _HEADERS)
     # requests never sets ca_cert_data, so a later caller is stood in for at the pool manager.
     adapter.poolmanager.connection_pool_kw["ca_cert_data"] = text
@@ -189,5 +209,5 @@ def test_the_refusal_reaches_the_caller_with_its_text(proxy: str | None) -> None
     session.mount("https://", adapter)
     with pytest.raises(InsecureHopRefused, match="encryption header") as refusal:
         session.get("https://127.0.0.1:9/v1/sys/health", proxies=proxies, timeout=5)
-    assert vault_failure_text(refusal.value) == str(refusal.value)
+    assert _strict().vault_failure_text(refusal.value) == str(refusal.value)
     assert made == [], "a TLS context was built for CA text the hop refuses"
