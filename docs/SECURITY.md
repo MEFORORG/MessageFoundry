@@ -288,6 +288,11 @@ Amendment A, BACKLOG #1136). No start writes a password file. Engines before tha
 one-time password to `bootstrap-admin.txt` beside the store; if a development checkout still holds
 one, delete it.
 
+Like `--username`, `--email` is required (BACKLOG #1138, ADR 0183 Amendment D), so no Administrator
+this command creates starts without a notification address. It refuses at least a missing, blank,
+malformed or over-long address, before the password prompt. It checks only the address's form, not
+that mail reaches it.
+
 **What a start does with no enabled Administrator.** At the shipped posture, once the earlier start
 checks pass (at least the store key, the low-disk floor and the `[alerts]` checks), the ADR 0167
 notice-deliverability gate refuses the start, and the refusal names `provision-admin` and the store
@@ -345,10 +350,10 @@ sign-in, password and code in one request.
 
 Re-running with the same username completes a provision an earlier run left half-written. The same
 repair takes over any enabled local account with that name that holds no roles, such as one an
-administrator created with none. The command says it completed an existing roleless account. It
-sets the new password, grants Administrator, and moves the notification address when `--email` is
-given. So the account's earlier holder is told: a `first_administrator_takeover` notice goes to the
-notification address the account held **before** the repair (BACKLOG #2019).
+administrator created with none. The command says it completed an existing roleless account. A
+repair takes the notification address from `--email`. The account may be somebody else's, so its
+earlier holder is told. A `first_administrator_takeover` notice goes to the notification address the
+account held **before** the repair (BACKLOG #2019).
 
 - The command builds the notifier from the same `[auth]`, `[alerts]` and `[secrets]` settings
   `serve` uses. It sends nothing when the account had no address, or when no channel can be built.
@@ -360,13 +365,18 @@ notification address the account held **before** the repair (BACKLOG #2019).
 - The `auth.first_administrator_provisioned` audit row gains `holder_notice`: `dispatched`,
   `no_prior_address`, `no_channel`, or null for a fresh create. It is written after the notice, so
   `dispatched` means the notifier took it. It does not mean the mail was delivered. The row also
-  gains `notify_email_moved`. The `notified` field keeps its old meaning: an address was given with
-  `--email`.
-- **An account that already holds a notification address needs `--email`** (BACKLOG #2288).
-  Without it the command refuses before the password prompt and writes nothing. Kept silently,
-  that address would receive every later notice for the new Administrator. A first run given
-  `--email` that stopped after creating the account left that address there, so run the same
-  command again, with `--email`. You may give the address the account already holds.
+  gains `notify_email_moved`. The `notified` field keeps its meaning: an address was given. Every
+  run of this command now gives one, so every row it writes reads true (BACKLOG #1138). It says
+  nothing about the notice to the earlier holder; `holder_notice` records that.
+- **Of the account's two addresses, a repair sets only the notification address** (BACKLOG #2288,
+  BACKLOG #1138). The profile `email` keeps what the account held, which may be the earlier
+  holder's. Correct it on the web console's user page if it is not the new Administrator's. The old
+  notification address gets the new Administrator's later notices only if you give it again as
+  `--email`, which is allowed. When the address changes, the takeover notice names the new one, so
+  the earlier holder learns where later notices go. The comparison is case-sensitive, so the same
+  mailbox typed in a different case counts as a change. From BACKLOG #2288 until ADR 0183 Amendment
+  D (2026-10-10), only a repair of an account that held an address needed `--email` (ADR 0183
+  Amendment C). Amendment D says where that refusal still applies. It cannot fire from this command.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes
 and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role
