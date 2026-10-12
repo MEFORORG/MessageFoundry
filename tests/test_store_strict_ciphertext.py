@@ -604,6 +604,32 @@ async def test_a_plant_on_a_purged_keyed_surface_is_refused(tmp_path: Path) -> N
         await store.close()
 
 
+async def test_a_plant_on_the_keyed_queue_payload_is_refused_not_sealed(tmp_path: Path) -> None:
+    """``queue.payload`` is sealed under the row's routing tag (BACKLOG #2593), through the same
+    ``_seal_surface`` with its own ``aad_of``. The marker must short-circuit it like any other
+    surface: a plant there is left as it is and reported, never sealed under a genuine tag. Every
+    other payload is purged first, so no ciphertext is left and only the marker can refuse it."""
+    db = tmp_path / "queue.db"
+    key = generate_key()
+    await _seed(db, 2, _keyed(key))
+    assert ("queue", "payload") in _keyed_surfaces(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE queue SET payload=''")  # what retention writes
+        qid = conn.execute("SELECT id FROM queue ORDER BY id LIMIT 1").fetchone()[0]
+        conn.execute("UPDATE queue SET payload=? WHERE id=?", (_PLANT, qid))
+    cipher = _keyed(key)
+    seen: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda table, column: seen.append((table, column)))
+    store = await MessageStore.open(db, cipher=cipher)
+    try:
+        with sqlite3.connect(db) as conn:
+            at_rest = conn.execute("SELECT payload FROM queue WHERE id=?", (qid,)).fetchone()[0]
+        assert at_rest == _PLANT  # NOT sealed under the row's routing tag
+        assert seen == [("queue", "payload")]  # the open found it and alerted
+    finally:
+        await store.close()
+
+
 async def test_legacy_plaintext_is_sealed_once_then_the_surface_stays_keyed(tmp_path: Path) -> None:
     """An existing keyless store: its first keyed open seals the legacy rows and writes the marker
     for every surface, the empty ones included. The markers survive a restart, a keyless open in
