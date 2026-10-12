@@ -5,8 +5,9 @@
 ``build_destination`` runs the ``[egress]`` check itself (vault BACKLOG #2605), so a test that is
 about a connector's own behaviour must hand it a policy that lets that connector through. This one
 is the audited allow-any opt-out plus the two lists that stay deny-by-default under it: the
-forward-proxy host and the recipient domains, each taken from the connection's own settings. It
-permits exactly that connection and lists nothing else.
+forward-proxy host and the recipient domains, each taken from the connection's own settings. The
+recipient-domain list also gates an Email sender's domain (vault BACKLOG #2912), so the sender's
+domain is listed too. It permits exactly that connection and lists nothing else.
 """
 
 from __future__ import annotations
@@ -16,16 +17,20 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.transports.email import envelope_recipients
+from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 
 
 def permitting(settings: Mapping[str, Any]) -> EgressSettings:
-    """Allow-any egress that also lists this connection's proxy host and recipient domains."""
+    """Allow-any egress that also lists this connection's proxy host, and its recipient and sender
+    domains."""
     proxy = urllib.parse.urlsplit(str(settings.get("proxy_url") or "")).hostname
     try:
         addresses = envelope_recipients(settings.get("recipients"))
     except ValueError:
         addresses = []  # a malformed list is the connector's to refuse, not this helper's
+    sender = settings.get("sender")
+    if isinstance(sender, str) and envelope_address_problem(sender) is None:
+        addresses.append(sender)  # a malformed sender is the connector's to refuse, as above
     return EgressSettings(
         deny_by_default=False,
         allowed_proxy=[proxy] if proxy else [],

@@ -421,6 +421,51 @@ in-flight rows stranded.
 > enforced through their markers and not at the door. After an operator start the calendar owns
 > such an inbound again, as Decision 3 says, and a door refusal would take that from it.
 
+> **Amendment (vault BACKLOG #3094): what can still stop an activation after the hook, and for how
+> long.** The activation reads no config dir before its re-apply, as the #3067 amendment says. So
+> an empty dir, or one that does not answer, cannot stop it. After the takeover hook, at least the
+> trust-anchor preflights and the reload can still refuse it. The tests in
+> `tests/test_dr_running_config_dir.py` that name vault BACKLOG #3094 pin at least the first, fourth
+> and fifth points below.
+>
+> - The settings and registry preflights share one bound, `[dr].takeover_timeout_seconds`, for the
+>   two together. They run under the coordinator's lock, so an anchor on a share that stopped
+>   answering used to hold every later activate and release too. One that does not answer in time
+>   is an abort like any refusal. Its reason says the preflight stopped it, not that a bind
+>   failed. The timeout cancels the preflight, which frees the lock but not the read. A read blocked
+>   on the share sits in a default-executor thread that no cancel can stop, so that thread may stay
+>   stuck until the share answers. Nothing refuses a retry while it is stuck. Each retry against the
+>   same dead share can strand one more thread, and enough of them could use up the default
+>   executor.
+> - The reload after them is not bounded. Cancelling it partway rolls back a takeover the VIP has
+>   already moved for. A lane's first build is isolated to that lane, as the #3263 amendment says.
+>   So the reload's own reads still have no bound: at least each outbound and FTPS poller CA
+>   it checks, and a `validate_startup` probe. A bound on each anchor read, in
+>   `messagefoundry/auth/trust_anchors.py`, would cover those too. It is not built.
+> - The preflights do not move before the hook. Running them there as well would write their audit
+>   rows twice. Running them only there would let an anchor changed during the hook load unchecked.
+>   The deeper fix splits the reload into a prepare step before the hook and an apply step after
+>   it. It is not built.
+> - Every abort row of an activation names the `dr_seed` marker that attempt wrote, as
+>   `seed_segment`. It also records `vip_hook_ran`. The `takeover_hook` row of
+>   [CONFIGURATION.md](../CONFIGURATION.md) says what it and the reason record when the hook never
+>   started, exits non-zero, or times out. The marker stays, as audit rows do, and a retry writes its own, so each
+>   attempt's fork point is recorded. When the hook ran before an abort, at step 3 or step 4, the
+>   reason says the VIP may have moved to this box. An interrupted reload with no hook says the
+>   same, because the reload may have bound a listener first. An activation cut off in the
+>   preflight with no hook says nothing about the VIP, because no reload ran. The engine does not
+>   run the release hook to undo the takeover. That could
+>   hand the address to a primary that is down, so the runbook leaves it to the operator.
+> - An error that no abort path catches is now an audited abort of kind `error`, which the route
+>   answers with `503`. This holds only while the profile is not yet applied, and every step after
+>   the hook has its own arm. An error from the seed marker's digest provider is one example. Such an
+>   error used to escape with no abort row, and the route answered a bare `500`. It can recur on
+>   every retry, so its reason sends the operator to the engine log first. If the audit store
+>   refuses every write, the abort row cannot be written either, and only the log records it.
+> - `engine.stop()` still neither waits for nor cancels an activation. The managed lifespan drains
+>   the long operations first. That cancels a running activation, and its own arm records it (vault
+>   BACKLOG #2751). Only an embedder that drives the coordinator itself meets the gap.
+
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
 **Locked (owner posture, 2026-06-28): the DR store is COLD-seeded from #60's encrypted backups on activation —
@@ -696,8 +741,10 @@ against the change record, not just "a" backup); (ii) verify the restore complet
 truncated/aborted restore); and (iii) **optionally** set `[dr].restore_token` to a local JSON token
 (`{"expected_backup_archive": "<the most-recent engine dr_backup archive name the restored DB should carry,
 sourced from the PRIMARY's `dr_backup` record — NOT read back from the restored DB>"}`) so the gate enforces a
-**vintage floor** (a mismatching/stale restore is then refused closed). The full engine-driven server-DB seed that
-would make vintage engine-verifiable is deferred (ADR 0102 option (a), an owner decision).
+**vintage floor** (a mismatching/stale restore is then refused closed). A full engine-driven server-DB seed
+would make vintage engine-verifiable. That seed is ADR 0102 option (a), and it still needs owner sign-off to
+start. ADR 0102's 2026-10-11 amendment leaves it unscheduled: a seat decision under owner delegation
+2026-10-08, not an owner ruling.
 
 ## Acceptance Criteria
 

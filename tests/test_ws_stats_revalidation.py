@@ -302,6 +302,37 @@ async def test_no_frame_follows_a_revocation(
     assert len(harness.frames) == 1, harness.frames
 
 
+async def test_an_administrator_narrowing_closes_the_feed_rather_than_shrinking_a_frame(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3381. ``set_channel_scope`` revokes the session on every write, so an
+    administrator's narrowing closes the feed with 1008 at the next frame. The narrowing runs to
+    completion inside the first frame's ``store.stats()``, as in
+    :func:`test_no_frame_follows_a_revocation`. So the revoke has landed before the second frame's
+    re-check, and exactly one frame goes out. A re-check that ran between the scope write and its
+    revoke could still send one frame on the smaller scope; this test does not reach that window."""
+    monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.02)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    real_stats = engine.store.stats
+    calls = 0
+
+    async def stats_then_narrow() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await service.set_channel_scope(uid, ["IB_A"], actor="admin")
+        return await real_stats()
+
+    monkeypatch.setattr(engine.store, "stats", stats_then_narrow)
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    await harness.run(timeout=_HARNESS_TIMEOUT)
+    assert harness.close_code == 1008
+    assert len(harness.frames) == 1, harness.frames
+
+
 async def test_a_live_session_keeps_streaming_frame_after_frame(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

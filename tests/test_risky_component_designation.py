@@ -1363,14 +1363,25 @@ _READ = "**Read from the carried project's own advisories:**"
 #: The forms the survey answers for, with the words the page uses for each. Compiled code is the
 #: wheel's own top-level answer in the record; the other two are entries under these keys.
 _FORMS = {"compiled": "compiled code", "source": "source code", "data": "data"}
-#: What the page must say about its own rule, once. Held here in this module's own words, so a
-#: renderer that drops or reverses the rule cannot pass by agreeing with itself.
+#: What the page must say about its own rule, once, and where the rule's authority comes from: the
+#: owner ruling for the data-only line, and the page's own choice for generated modules. Held here
+#: in this module's own words, so a renderer that drops or reverses either cannot pass by agreeing
+#: with itself.
 _CRITERION = (
     "A wheel that is not designated is owed a route when it carries another project's code, "
     "compiled or source.",
     "A wheel that carries only another project's data is listed below with what it carries.",
     "It is owed no route, because data holds another project's tables and none of its logic.",
     "A wheel whose answer is not established, for any form, is treated as carrying code.",
+    "For a wheel that is not designated, that no-route line rests on an owner ruling of "
+    "2026-10-06.",
+    "That ruling is about wheels that carry only another project's data, and the maintainers' "
+    "private security records hold it.",
+    "The reason given here is this page's own.",
+    "The ruling names code, compiled or source, and data, but not tables kept as generated "
+    "Python modules.",
+    "This page counts them as data.",
+    "That part is this page's choice, and a reader can draw it elsewhere.",
 )
 #: The page's unit, held the same way: what counts as a bundled copy, and what does not.
 _UNIT = (

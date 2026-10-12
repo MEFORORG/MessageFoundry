@@ -101,6 +101,7 @@ def run_hook(
     usage_script: Path | None = None,
     payload: str | None = None,
     env_extra: dict[str, str] | None = None,
+    extra_args: list[str] | None = None,
 ) -> tuple[int, str, str | None]:
     """Drive the hook exactly as the harness drives a PreToolUse hook: JSON on stdin, JSON on stdout.
 
@@ -111,6 +112,7 @@ def run_hook(
         args += ["-StateDir", str(state_dir)]
     if usage_script is not None:
         args += ["-UsageScript", str(usage_script)]
+    args += extra_args or []
     if payload is None:
         payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {}})
     proc = subprocess.run(
@@ -593,3 +595,321 @@ def test_a_cancelled_account_still_never_blocks_the_spawn(tmp_path: Path) -> Non
     code, out, _ = run_hook(root / "mefor-usage")
     assert code == 0
     assert '"permissionDecision"' not in out, out
+
+
+# ------------------------------------------------- the Steward's status.json, as a labelled fallback
+#
+# BACKLOG #1459. A Desktop or SDK session never runs a statusLine, so on a Desktop-only config root the
+# statusLine reading is UNKNOWN for good. The hook then also reads the Steward's status.json, as its own
+# labelled block with its own age and TTL (seat decision under owner delegation 2026-10-08, not an owner
+# ruling). Every fixture here is synthetic and lives under tmp_path; nothing reads the real ~/.claude.
+
+ORG = "11111111-aaaa-4bbb-8ccc-000000000001"
+ACCT = "22222222-aaaa-4bbb-8ccc-000000000002"
+OTHER = "33333333-aaaa-4bbb-8ccc-000000000003"
+DESKTOP = {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}
+SDK = {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}
+FALLBACK_LABEL = "This is NOT a statusLine reading"
+
+
+def steward_entry(
+    five: float = 61.5, weekly: float = 22.4, age_s: float = 90.0, ttl: float = 300.0, **over: Any
+) -> dict[str, Any]:
+    """One pool entry in the shape watch.py's _read_pool writes, cache version 3."""
+    entry: dict[str, Any] = {
+        "org": ORG,
+        "account": ACCT,
+        "how": "cli login record",
+        "kind": "reading",
+        "source": "api",
+        "levels": {"5-hour": five, "weekly": weekly},
+        "resets": {},
+        "ts": time.time() - age_s,
+        "ttl": ttl,
+        # Both fields the hook must never print: a severity label that reads like a stop order, and
+        # the login's name.
+        "state": "URGENT STOP",
+        "who": "someone@example.invalid",
+    }
+    entry.update(over)
+    return entry
+
+
+def steward_files(
+    tmp_path: Path,
+    pools: dict[str, Any] | None = None,
+    version: int = 3,
+    login: dict[str, Any] | None = None,
+) -> list[str]:
+    """Write a synthetic status.json and login record, and return the hook arguments naming them."""
+    status = tmp_path / "steward-status.json"
+    record = tmp_path / "login.json"
+    if pools is None:
+        pools = {ORG: steward_entry()}
+    status.write_text(json.dumps({"version": version, "pools": pools}), encoding="utf-8")
+    if login is None:
+        # THE PROJECT KEYS DIFFER ONLY BY CASE ON PURPOSE. A real .claude.json carries such pairs, and
+        # plain ConvertFrom-Json throws on them; without this the fixture passes on a record no real
+        # root has, and every real root reads "no readable login record".
+        login = {
+            "oauthAccount": {"organizationUuid": ORG, "accountUuid": ACCT},
+            "projects": {"c:/work/repo": {}, "C:/work/repo": {}},
+        }
+    record.write_text(json.dumps(login), encoding="utf-8")
+    sessions = tmp_path / "claude-code-sessions"
+    sessions.mkdir(exist_ok=True)
+    return [
+        "-StewardStatusFile",
+        str(status),
+        "-LoginRecord",
+        str(record),
+        "-DesktopSessionsDir",
+        str(sessions),
+    ]
+
+
+SID = "44444444-aaaa-4bbb-8ccc-000000000004"
+APP_ACCT = "55555555-aaaa-4bbb-8ccc-000000000005"
+
+
+def desktop_record(tmp_path: Path, acct: str, org: str, sid: str = SID) -> None:
+    """A desktop-app session record: the two parent directories ARE the identity (watch.py)."""
+    where = tmp_path / "claude-code-sessions" / acct / org
+    where.mkdir(parents=True)
+    (where / "local_fixture.json").write_text(
+        json.dumps({"sessionId": "local_fixture", "cliSessionId": sid}), encoding="utf-8"
+    )
+
+
+def desktop_context(
+    tmp_path: Path,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    session_id: str = SID,
+) -> str:
+    """The hook's text for a root no statusLine ever published, so the fallback is the only reading.
+
+    The default is a Desktop session with a pinned config root and no desktop record, which watch.py
+    names by that root's login record."""
+    if env is None:
+        env = {**DESKTOP, "CLAUDE_CONFIG_DIR": str(tmp_path / "pinned-root")}
+    payload = json.dumps({"tool_name": "Task", "session_id": session_id, "tool_input": {}})
+    return context_of(tmp_path / "never-published", env_extra=env, extra_args=args, payload=payload)
+
+
+def test_a_desktop_session_reads_the_steward_file_labelled_and_aged(tmp_path: Path) -> None:
+    """THE POSITIVE CONTROL for the fallback. Two fixtures, two values, both demanded back, and every
+    percentage on a line that names the Steward and carries the Steward's own age."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    ctx_a = desktop_context(a, steward_files(a, {ORG: steward_entry(five=61.5, weekly=22.4)}))
+    ctx_b = desktop_context(b, steward_files(b, {ORG: steward_entry(five=8.5, weekly=77.0)}))
+
+    assert "61.5%" in ctx_a and "22.4%" in ctx_a, ctx_a
+    assert "8.5%" in ctx_b and "77.0%" in ctx_b, ctx_b
+    assert "61.5%" not in ctx_b
+
+    # The statusLine verdict stays what the reader said; the fallback never replaces it.
+    assert "verdict: UNKNOWN" in ctx_a
+    assert "fallback verdict: READ" in ctx_a, ctx_a
+    assert FALLBACK_LABEL in ctx_a
+    for line in ctx_a.splitlines():
+        if _PERCENTAGE.search(line):
+            assert line.startswith("  steward "), f"a fallback number lost its label: {line!r}"
+            assert re.search(r"read \d+(\.\d+)? min ago by the Steward; its TTL is 5 min", line), (
+                line
+            )
+    assert "URGENT STOP" not in ctx_a, "the Steward's severity label must not read as a verdict"
+    assert "example.invalid" not in ctx_a, "the login's name must not be printed"
+
+
+def test_a_fallback_past_its_own_ttl_is_unknown_and_never_a_number(tmp_path: Path) -> None:
+    """Stale by the entry's OWN TTL gives UNKNOWN. The control is the same entry inside its TTL, and an
+    entry the statusLine's 20-minute limit would condemn reads anyway, because that limit is not its."""
+    stale = desktop_context(tmp_path, steward_files(tmp_path, {ORG: steward_entry(age_s=301)}))
+    assert "fallback verdict: UNKNOWN" in stale, stale
+    assert "past the Steward's own TTL of 5 min" in stale, stale
+    assert _PERCENTAGE.search(stale) is None, f"a stale fallback printed a number: {stale}"
+
+    fresh = desktop_context(tmp_path, steward_files(tmp_path, {ORG: steward_entry(age_s=200)}))
+    assert "fallback verdict: READ" in fresh, fresh
+
+    own_ttl = steward_entry(age_s=30 * 60, ttl=3600)
+    long_lived = desktop_context(tmp_path, steward_files(tmp_path, {ORG: own_ttl}))
+    assert "fallback verdict: READ" in long_lived, long_lived
+    assert re.search(r"read 30\.\d min ago by the Steward; its TTL is 60 min", long_lived), (
+        long_lived
+    )
+
+
+_SELF_DISAGREEING = {
+    "oauthAccount": {"organizationUuid": ORG, "accountUuid": ACCT},
+    "cachedUsageUtilization": {"accountUuid": OTHER},
+}
+
+
+@pytest.mark.parametrize(
+    ("pool", "over", "login", "version", "reason"),
+    [
+        pytest.param(OTHER, {}, None, 3, "has no entry for pool", id="no-entry"),
+        pytest.param(ORG, {"account": OTHER}, None, 3, "does not name this", id="other-account"),
+        pytest.param(ORG, {"org": None}, None, 3, "does not name this", id="entry-names-none"),
+        pytest.param(ORG, {"ts": None}, None, 3, "carries no read time", id="no-read-time"),
+        pytest.param(
+            ORG, {"burn": [40.0, 1.0, "5-hour"]}, None, 3, "projection", id="projection-run-out"
+        ),
+        pytest.param(ORG, {}, _SELF_DISAGREEING, 3, "disagrees with itself", id="self-disagree"),
+        pytest.param(ORG, {}, {"oauthAccount": {}}, 3, "names no account", id="no-login"),
+        pytest.param(ORG, {}, None, 2, "reads only version 3", id="schema-version"),
+        pytest.param(ORG, {"kind": "unknown"}, None, 3, "not a reading", id="not-reading"),
+        pytest.param(ORG, {"age_s": -600}, None, 3, "FUTURE", id="future-dated"),
+        pytest.param(ORG, {"ttl": "soon"}, None, 3, "TTL that is not a number", id="bad-ttl"),
+        pytest.param(ORG, {"levels": {}}, None, 3, "carries no percentages", id="no-levels"),
+    ],
+)
+def test_a_fallback_that_cannot_name_this_pool_is_refused(
+    tmp_path: Path,
+    pool: str,
+    over: dict[str, Any],
+    login: dict[str, Any] | None,
+    version: int,
+    reason: str,
+) -> None:
+    """Each way the file or the login record fails to name THIS config root's pool is UNKNOWN with its
+    own reason, and none of them prints a number. Another account's headroom is the hazard. The entry
+    is built here, not at collection, so its read time is relative to this run."""
+    pools = {pool: steward_entry(**over)}
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, pools, version, login))
+    assert "fallback verdict: UNKNOWN" in ctx, ctx
+    assert reason in ctx, ctx
+    assert _PERCENTAGE.search(ctx) is None, f"a number was printed anyway: {ctx}"
+
+
+def test_the_desktop_record_names_the_pool_before_the_login_record(tmp_path: Path) -> None:
+    """watch.py names a Desktop session's pool from the app's own record first: the login record is
+    the CLI's login, measured naming one account while the session billed another. The two pools carry
+    different numbers, so the output says which one was read."""
+    pools = {
+        ORG: steward_entry(five=61.5, weekly=22.4),
+        OTHER: steward_entry(five=44.5, weekly=11.5, org=OTHER, account=APP_ACCT),
+    }
+    args = steward_files(tmp_path, pools)
+    desktop_record(tmp_path, acct=APP_ACCT, org=OTHER)
+
+    ctx = desktop_context(tmp_path, args)
+    assert "44.5%" in ctx and "11.5%" in ctx, ctx
+    assert "61.5%" not in ctx, "the login record's pool was read for a session the app recorded"
+    assert "named by the desktop app's record for this session" in ctx, ctx
+
+    # Control: another session's id finds no record, so the pinned root's login record names the pool.
+    other = desktop_context(tmp_path, args, session_id="not-this-session")
+    assert "61.5%" in other and "named by this config root's login record" in other, other
+
+
+def test_an_unpinned_desktop_session_with_no_record_is_refused(tmp_path: Path) -> None:
+    """watch.py's last resort there is the app's CURRENT account, which moves when the owner switches
+    login. The fallback refuses rather than read that global signal as this session's pool."""
+    ctx = desktop_context(tmp_path, steward_files(tmp_path), env=DESKTOP)
+    assert "fallback verdict: UNKNOWN" in ctx and "no config root is pinned" in ctx, ctx
+    assert _PERCENTAGE.search(ctx) is None, ctx
+
+
+def test_a_desktop_login_record_with_no_org_is_refused(tmp_path: Path) -> None:
+    """watch.py falls through to the app's current org for a Desktop session with no org, so an
+    account-only key is never the Steward's answer there."""
+    login = {"oauthAccount": {"accountUuid": ACCT}}
+    pools = {f"acct:{ACCT}": steward_entry(org="")}
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, pools, login=login))
+    assert "names no organization" in ctx, ctx
+    assert _PERCENTAGE.search(ctx) is None, ctx
+
+    # Control: an SDK session runs watch.py's non-desktop branch, which does use the account key.
+    sdk = desktop_context(tmp_path, steward_files(tmp_path, pools, login=login), env=SDK)
+    assert "fallback verdict: READ" in sdk and "pool account 22222222" in sdk, sdk
+
+
+def test_a_missing_or_zero_ttl_means_the_stewards_default(tmp_path: Path) -> None:
+    """watch.py reads `entry.get("ttl") or TTL_OK`, so a missing or zero TTL is 300 seconds."""
+    entry = steward_entry(ttl=0)
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, {ORG: entry}))
+    assert "fallback verdict: READ" in ctx and "its TTL is 5 min" in ctx, ctx
+    del entry["ttl"]
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, {ORG: entry}))
+    assert "fallback verdict: READ" in ctx and "its TTL is 5 min" in ctx, ctx
+
+
+def test_the_production_paths_resolve_without_naming_any_file(tmp_path: Path) -> None:
+    """No -StateDir and no file parameters: the hook finds status.json, the login record and the
+    desktop record the way it does on a real box, through MEFOR_USAGE_DIR, CLAUDE_CONFIG_DIR and
+    APPDATA, all pointed at tmp_path so nothing real is read."""
+    usage = tmp_path / "usage"
+    usage.mkdir()
+    (usage / "usage-now.py").write_text("# stand-in: watch.py keeps DIR only beside it\n")
+    steward_files(usage, {OTHER: steward_entry(five=44.5, org=OTHER, account=APP_ACCT)})
+    (usage / "steward-status.json").rename(usage / "status.json")
+    root = tmp_path / "root"
+    root.mkdir()
+    (usage / "login.json").rename(root / ".claude.json")
+    appdata = tmp_path / "appdata"
+    desktop_record(appdata / "Claude", acct=APP_ACCT, org=OTHER)
+
+    env = {
+        **DESKTOP,
+        "MEFOR_USAGE_DIR": str(usage),
+        "CLAUDE_CONFIG_DIR": str(root),
+        "APPDATA": str(appdata),
+    }
+    payload = json.dumps({"tool_name": "Task", "session_id": SID, "tool_input": {}})
+    ctx = context_of(None, env_extra=env, payload=payload)
+    assert str(usage / "status.json") in ctx, ctx
+    assert "44.5%" in ctx and "named by the desktop app's record" in ctx, ctx
+
+
+def test_a_missing_window_is_unknown_and_never_a_zero(tmp_path: Path) -> None:
+    """watch.py writes only the windows it read, and PowerShell turns a missing key into 0 on a cast."""
+    entry = steward_entry()
+    del entry["levels"]["weekly"]
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, {ORG: entry}))
+    assert "61.5%" in ctx, "positive control: the window that is present still reads"
+    assert "steward 7d  UNKNOWN" in ctx, ctx
+    assert "0.0%" not in ctx, f"a missing window was printed as zero usage: {ctx}"
+
+
+def test_a_desktop_sourced_entry_states_the_age_of_its_data(tmp_path: Path) -> None:
+    """A desktop-sourced entry was built from a sample already sample_age seconds old, so the data is
+    older than the Steward's read, and the printed age must say so."""
+    entry = steward_entry(age_s=60, source="desktop", sample_age=600)
+    ctx = desktop_context(tmp_path, steward_files(tmp_path, {ORG: entry}))
+    assert re.search(r"data 11\.\d min old; read 1\.\d min ago by the Steward", ctx), ctx
+
+
+def test_a_steward_file_that_was_never_written_is_unknown(tmp_path: Path) -> None:
+    args = steward_files(tmp_path)
+    (tmp_path / "steward-status.json").unlink()
+    ctx = desktop_context(tmp_path, args)
+    assert "fallback verdict: UNKNOWN -- the Steward has never written this file" in ctx, ctx
+
+
+def test_the_fallback_appears_only_where_no_statusline_can_publish(tmp_path: Path) -> None:
+    """A terminal session can publish its own reading, so it gets no fallback; neither does a fresh
+    statusLine reading, nor a probe under -StateDir that did not name both fixture files. The SDK run
+    is the positive control for the negative assertions, on the same arguments."""
+    args = steward_files(tmp_path)
+    assert FALLBACK_LABEL in desktop_context(
+        tmp_path, args, env={"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}
+    )
+    assert FALLBACK_LABEL not in desktop_context(
+        tmp_path, args, env={"CLAUDE_CODE_ENTRYPOINT": "cli"}
+    )
+
+    for named in (args[:2], args[:4]):
+        assert FALLBACK_LABEL not in desktop_context(tmp_path, named), (
+            "under -StateDir the hook must not fall through to a real login record or session store"
+        )
+
+    state = tmp_path / "fresh"
+    collect(state, reading())
+    _, _, fresh = run_hook(state, env_extra=DESKTOP, extra_args=args)
+    assert fresh is not None and "verdict: OK" in fresh, fresh
+    assert FALLBACK_LABEL not in fresh, fresh

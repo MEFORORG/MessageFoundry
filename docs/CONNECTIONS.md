@@ -908,7 +908,7 @@ figure stops matching the constant named beside it.
 
 | Surface | Permitted type | Extension | Maximum size | Unpacked size |
 |---|---|---|---|---|
-| `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB |
+| `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB, and `max_decompressed_members`, default `DEFAULT_MAX_DECOMPRESSED_MEMBERS` = 1,024 |
 | `remotefile`: SFTP or FTP drop directory, `Sftp(...)` / `Ftp(...)` ([Remote file](#remote-file--sftp--ftp)) | as for `file` | chosen by `pattern` (default `*.hl7`) | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB, charged against the listed size and again against the bytes read | no unpacking on intake; the connector has no `decompress` setting |
 | `dimse`: DICOM C-STORE SCP, an inbound `DICOM(...)`; its size, peer and TLS settings are under [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025) | DICOM objects in the SCP's accepted presentation contexts | not applicable; objects arrive over DIMSE | `max_object_bytes`, default `DEFAULT_MAX_OBJECT_BYTES` = 128 MiB (`transports/dicom.py`), charged before decode | a Deflated Explicit VR LE object is inflated in bounded memory before decode, capped at the lesser of `max_object_bytes` and `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Setting `max_object_bytes` to `0` or `None` does not remove either cap; the DICOM section says what it does instead |
 | `http`: web-service listener, `Http(...)` ([HTTP](#http-web-service-listener--http-inbound-only-adr-0023)) | the inbound's declared `content_type` | not applicable; a request body | `max_body_bytes`, default `DEFAULT_MAX_BODY_BYTES` = 16 MiB (`transports/http_listener.py`); headers `DEFAULT_MAX_HEADER_BYTES` = 64 KiB | no unpacking on intake. The listener decodes no `Content-Encoding` and no transfer coding. It refuses a body whose `Transfer-Encoding` is exactly `chunked`, and reads any other body as sent, up to the cap |
@@ -925,7 +925,7 @@ figure stops matching the constant named beside it.
 | `harness/drivers/mllp.py` (`MLLPDriver`), `harness/mllp.py` (`SendWorker`, the Compose and Send tabs), `harness/load/sender.py` (`PersistentConnection`), `harness/fuzz/transport.py` (`WireMLLPDriver`), `harness/drivers/tcp.py` (`TcpDriver`), `harness/drivers/x12.py` (`X12Driver`) and `harness/drivers/http.py` (`HttpDriver`): at least these harness clients read what the engine under test answers to each message they send, each under a stated maximum, and the rig API row below gives the load rig's own API reads; and `messagefoundry/apiclient/client.py`, the API client the harness and the web console share, reading each API response body. The engine is another party here, as in the rows above, although these start no server | an ACK or other reply frame, an X12 interchange, an HTTP inbound's answer, or an API response. A reply is read for its acknowledgement code or receipt and shown or counted; an API response is decoded as JSON | not applicable; a reply on the client's own connection | MLLP: `DEFAULT_MAX_FRAME_BYTES` = 16 MiB per reply frame, the engine's MLLP default. A larger frame is refused, never buffered whole and never cut short: the driver and the Compose and Send tabs record the send as failed with `reply refused`, and the load sender counts it in `frame_refusals` and its transport errors, closes the connection without calling it an engine close, and reconnects. The fuzzer caps a reply frame at `_MAX_REPLY_BYTES` = 1 MiB, because an ACK is a few hundred bytes, and all one case reads back at `_MAX_EXCHANGE_BYTES` = 16 MiB; past either, the case's outcome is `malformed`, a finding. TCP: the driver reads at most `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB, plus at most one 64 KiB read past it, and a reply frame over 16 MiB is recorded as no reply. X12: the same, at `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB. HTTP: the driver reads at most `MAX_REPLY_BYTES` = 64 KiB of an answer and leaves the rest unread, so a longer answer is cut there rather than refused; the driver reads it only for the engine's `message_id` receipt or an error status. API client: `MAX_RESPONSE_BYTES` = 128 MiB per response body, eight times the per-message cap because a message body comes back JSON-escaped at up to six bytes per byte; a larger body raises `ApiError` and none of it is kept | no unpacking. The API client lets `httpx` decode a `Content-Encoding`, and charges the cap on the decoded bytes |
 | `harness/load/shardcert_ladder.py` (`read_node_log`, behind the three timing aggregators) and `harness/load/failover.py` (`EngineNode.log_tail`): the load rig's reads of the log each engine node writes. The rig keeps a node log only when `MEFOR_BENCH_KEEP_NODE_LOGS` names a directory, and the timing aggregators read only those kept logs. The rig starts the engine and opens the file its output goes to, but the engine under test writes the content, so it counts as another party's | a node log, read for its timing lines or, on a failed start, for its last lines | not applicable; the rig names each log itself, `<node_id>.log` | `MAX_NODE_LOG_BYTES` = 1 GiB per log, 64 times the per-message cap: the timing aggregators read a whole log, and an INFO-level node log stays far below that in a rung's hold. Reads go through the same bounded reader as the watch pane, but follow a symlink: the rig names each path itself. A larger log, or one that is not a regular file, is refused before it is read, logged with its path and size and never its content, and contributes nothing, the same as a missing log; none of it is read in part. `log_tail` reads only the last `limit` bytes, 4,000 by default, and never the rest | no unpacking |
 | `harness/load/coord.py` (`FileDropCoord.read`): the two-box rig's coordination messages, which the other box writes into a directory both share, a mount or a synced folder. Another host writes them, so they count | a JSON object of counts, ports and timestamps, one per file | `<run_id>.<name>.json`, a name the rig builds; nothing else in the directory is read | `MAX_COORD_MESSAGE_BYTES` = 1 MiB per message; a real one is a few KiB. Read through the same bounded reader as the watch pane, but a symlink is followed, so the cap and the regular-file check apply to its target. A larger file, or one that is not a regular file, raises `CoordMessageRefused` naming the file and the reason, which stops the run with that reason rather than being polled again until a timeout that would name the wrong cause. It is not a timeout, so no caller that treats a missing optional message as absent swallows it; not every command turns it into a clean abort yet, and where none catches it the run ends with a traceback | no unpacking |
-| `harness/load/rigadmin.py` (the rig's sign-in, and its `get` command), `harness/load/failover.py` (`EngineNode`'s `/health`, `/cluster/status` and `/stats` polls), `harness/load/shardcert.py` (its `/health` wait) and `harness/drivers/dimse.py` (`DimseDriver`, which reads the engine SCP's C-STORE responses): the rig API row. These are the load rig's own reads of the engine API, and the DIMSE driver's reads of the engine's SCP. The connscale, estate and ingress-probe runners poll through `EngineNode` and sign in through `rigadmin`, so these caps cover them too. The engine under test is another party here, as in the rows above | a JSON answer, or for `get`, an answer from any route. For the DIMSE driver: the association accept, the C-STORE response and the release | not applicable; an answer on the client's own connection | `rigadmin`: `MAX_API_REPLY_BYTES` = 128 MiB per answer, the API client's `MAX_RESPONSE_BYTES`, because `get` reads any route, a message body included. It reads in 64 KiB pieces and never cuts an answer short. A larger answer raises `RigReplyRefused` and none of it is kept. Callers treat that as an engine that did not answer, the same as an answer that ends before its stated length. `failover` and `shardcert`: `MAX_STATUS_REPLY_BYTES` = 1 MiB per answer, because each is a role or a few counters. The answer is streamed. A larger one is logged by path and limit and treated as no answer, the same as a node that is down. DIMSE: `MAX_ASSOCIATION_READ_BYTES` = 1 MiB per association, for the accept, the response and the release together. pynetdicom reads any PDU length a peer announces, so the driver charges the cap in the socket before each read, and a PDU that would pass it is never read. The driver then records `reply refused`, although the engine may have stored the object. A status that came back inside the cap stands, even if the release then passes it | no unpacking. `failover` asks for no content coding and charges the cap on the bytes as sent, so a compressed answer is never inflated; it fails to parse instead |
+| `harness/load/rigadmin.py` (the rig's sign-in, and its `get` command), `harness/load/failover.py` (`EngineNode`'s `/health`, `/cluster/status` and `/stats` polls), `harness/load/shardcert.py` (its `/health` wait) and `harness/drivers/dimse.py` (`DimseDriver`, which reads the engine SCP's C-STORE responses): the rig API row. These are the load rig's own reads of the engine API, and the DIMSE driver's reads of the engine's SCP. The connscale, estate and ingress-probe runners poll through `EngineNode` and sign in through `rigadmin`, so these caps cover them too. The engine under test is another party here, as in the rows above | a JSON answer, or for `get`, an answer from any route. For the DIMSE driver: the association accept, the C-STORE response and the release | not applicable; an answer on the client's own connection | `rigadmin`: `MAX_API_REPLY_BYTES` = 128 MiB per answer, the API client's `MAX_RESPONSE_BYTES`, because `get` reads any route, a message body included. An answer whose `Content-Length` is over the cap is refused before any of it is read. Any other answer is read in 64 KiB pieces and never cut short. A larger answer raises `RigReplyRefused` and none of it is kept. Callers treat that as an engine that did not answer, the same as an answer that ends before its stated length. A refusal's body is read the same way, and a body that stalls or breaks off is no answer on a refusal as on a success. `rigadmin` follows no redirect: a 3xx is refused unread and named by its status alone, so the session's bearer never follows one to another host. It also dials a loopback engine direct when a web proxy is set, so a proxy never reads the sign-in password or the bearer on an `http` hop. `failover` and `shardcert`: `MAX_STATUS_REPLY_BYTES` = 1 MiB per answer, because each is a role or a few counters. The answer is streamed. A larger one is logged by path and limit and treated as no answer, the same as a node that is down. Both keep httpx's default, which follows no redirect. DIMSE: `MAX_ASSOCIATION_READ_BYTES` = 1 MiB per association, for the accept, the response and the release together. pynetdicom reads any PDU length a peer announces, so the driver charges the cap in the socket before each read, and a PDU that would pass it is never read. The driver then records `reply refused`, although the engine may have stored the object. A status that came back inside the cap stands, even if the release then passes it | no unpacking. `failover` asks for no content coding and charges the cap on the bytes as sent, so a compressed answer is never inflated; it fails to parse instead |
 | `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
 
 Two limits apply after intake. The first covers the rows keyed by a connector type, the first eight.
@@ -949,7 +949,17 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
   name or content fails the checks in `parsing/sniff.py`. `gzip_decompress` caps the number of gzip
   members at `max_members`, default 1024 (BACKLOG #1129). A gzip stream has no member list to read
   first. So the codec counts each member as it starts, and refuses the one past the cap before it
-  inflates. A Handler is ordinary Python, though, and can unpack with any library instead, such as
+  inflates. Each decompressor checks its caps in a trial pass before the real one (BACKLOG #1129).
+  The trial pass inflates the whole input in bounded chunks, keeps none of the output, and refuses a
+  stream the moment it would pass the byte ceiling or, for gzip, the member cap. The zip member cap
+  is read from the central directory before either pass. Only a stream it admits is
+  inflated again for real, so an over-cap stream is refused with no output kept. The cost is that an
+  admitted stream is inflated twice. That is less than double the time, because the real pass also
+  copies its output; [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)
+  records a measurement. The trial pass is skipped
+  only where it has nothing to refuse: with `max_output_bytes=None` on `deflate_decompress`,
+  `deflate_decompress_with_tail` and `zip_decompress`. `gzip_decompress` always runs it, because its
+  member cap cannot be turned off. A Handler is ordinary Python, though, and can unpack with any library instead, such as
   `gzip` or `zipfile` directly. The engine then sets no bound, and the Handler author owns the
   unpacked-size limit.
 
@@ -1087,9 +1097,15 @@ its own policy block below):
   `decompress="gzip"` is enabled it gunzips each drop **before** the content sniff, the AV scan, and the
   batch split (so all three see the real bytes), and `max_decompressed_bytes` (default 64 MiB) caps the
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
-  provide (ASVS 5.2.3). The gunzip also refuses a drop of more gzip members than `gzip_decompress`'s
-  `max_members` default (see *Unpacking a payload* above), with no per-connection setting. Members
-  that inflate to nothing pass any byte ceiling, so the member count is its own limit. A corrupt,
+  provide (ASVS 5.2.3). The gunzip also refuses a drop of more gzip members than
+  `max_decompressed_members` (default 1024, BACKLOG #1129). Members that inflate to nothing pass any
+  byte ceiling, so the member count is its own limit. A BGZF file, the blocked gzip that genomics
+  tools write, is one member per 64 KiB block. So a BGZF drop near the 64 MiB byte ceiling trips the
+  member cap first, and a site with that feed raises `max_decompressed_members` for that connection.
+  The member cap cannot be turned off: unset or `None` takes the default, and `0` in any spelling is
+  refused when the inbound connection is built. Both caps are checked in a trial pass that keeps no output,
+  before the real gunzip runs (see *Unpacking a payload* above), so each admitted drop is inflated
+  twice. A corrupt,
   over-ceiling or over-cap archive is **quarantined to `.error`, never accept-and-dropped**, and the
   decompressed body is never logged. Multi-entry zip stays Handler-composed.
 - **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize file, or one
@@ -1314,6 +1330,41 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `remotefile._ftp_connect_refusal`, and the 4xx rule in `remotefile._FtpClient._connect`. Why an
   unclear login refusal is read as a credential fault is in `remotefile._names_connection_limit`.
   A busy reply that also carries a credential word stops the lane too.
+- **An FTP server without `MLSD` must name `NLST` entries in one of two forms (BACKLOG #1130).** The
+  poller lists with `MLSD` and falls back to `NLST` when the server refuses it. It accepts an `NLST`
+  entry in only two forms:
+  - a bare name, such as `a.hl7`;
+  - `remote_dir` exactly as configured, then `/` and a bare name, such as `/in/a.hl7`. A trailing
+    slash on `remote_dir` may be kept or dropped.
+
+  Any other form is refused, which is deliberate. That covers at least a resolved absolute path
+  (`/srv/ftp/in/a.hl7` for `remote_dir = "in"`) and a path relative to the server's current
+  directory (`in/a.hl7` for `remote_dir = "/in"`). Rewriting a path to its last part would read
+  `../x/a.hl7` as `a.hl7`, so the poller refuses rather than rewrites. A refused entry stays on the
+  server and is never read.
+
+  Only an `NLST` entry can name a path legitimately, so only an `NLST` entry can get the WARNING
+  that the server's listing form looks unsupported. The entry must pass three tests:
+  - its parent directory has the same last part as `remote_dir`;
+  - it has no `..`, `\`, `:`, leading `//` or control character;
+  - `pattern` matches its file name, the part after the last `/`. An entry ending in `/` or `/.`
+    has no file name, so it never passes.
+
+  That WARNING names the connection and a count, never a file. It repeats at most every 15 minutes
+  while the condition lasts. An entry that passes the first two tests but not the third is refused
+  with no line, as is any file the pattern skips. Any other refused name, such as `/etc/a.hl7`, is
+  treated as traversal. It logs its own WARNING on every poll, also with no file name. Where a
+  server's `NLST` form is refused, set `remote_dir` to the spelling the server echoes back, or
+  enable `MLSD` on the server.
+- **An empty directory is not an error on an `NLST`-only FTP server (BACKLOG #1130).** Some such
+  servers answer `NLST` on an empty directory with `550 No files found`. The connector reads that
+  exact reply as an empty listing. Any other permanent reply still fails, including `550 No such
+  file or directory`, since that also answers a directory that is not there. Some servers send
+  `550 No files found` for a missing directory too, so the connector first confirms the directory
+  exists with `CWD`, then returns to the directory `PWD` reported. A mistyped `remote_dir` still
+  fails. So does a server whose `PWD` reply quotes no directory, since the connector could not
+  return to it. `CWD` cannot tell an empty directory from one the account may enter but not list,
+  so that one polls as empty if the server answers it the same way.
 - **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
   `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
   nothing else. A server missing either fails the handshake with a permanent `SFTP connection
@@ -1477,9 +1528,10 @@ error. The error names no part of the proxy URL, and `[security].enforcement` do
 request that goes direct is not refused: one to a loopback host, or to a host that `NO_PROXY` or the
 system bypass list names. A connection's own `proxy_no_proxy` is not that list. A host it names
 skips the connection's `proxy_url` and still follows a proxy from the environment.
-**Writing the proxy `https://` is not refused, and it does not protect the credentials either:**
-`urllib` sends `CONNECT`, with the credential header, before any TLS. Take the credentials out of
-the proxy URL.
+**Writing the proxy `https://` is not refused, and it does not keep the credentials off the wire
+either.** When the leg to the proxy has no TLS is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
+out of the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
@@ -2092,7 +2144,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `host` | str / `env()` | — (required) | SMTP server host. |
-| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain is not checked against `[egress].allowed_recipient_domains`. |
+| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain must be listed in `[egress].allowed_recipient_domains`, like a recipient's, because bounces and replies can carry the message body. |
 | `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. An entry with a line break is refused at load too. |
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
@@ -2121,8 +2173,8 @@ counts" in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) is the rule, a
 
 **The recipients are gated too, and that gate is deny-by-default.** `allowed_smtp` gates only the
 relay hop, so every address in `recipients` must also sit in a domain listed in
-`[egress].allowed_recipient_domains`. An empty list refuses every `Email()` destination. The
-matching rules are in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress).
+`[egress].allowed_recipient_domains`. So must the `sender`'s domain, since bounces go there. An
+empty list refuses every `Email()` destination. The matching rules are in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress).
 
 Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does

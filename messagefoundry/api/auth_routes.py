@@ -753,7 +753,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Satisfy the current session's second factor with a TOTP code or a single-use recovery code.
         Authenticated but **not** step-up/MFA-gated (this is *how* a session becomes MFA-satisfied);
         rate-limited like login. A wrong code is a 401 and changes nothing. A directory account the
-        directory does not confirm is a 403, and its code is not checked (BACKLOG #2023).
+        directory does not confirm is a 403, and its code is not checked (BACKLOG #2023). An
+        ``oidc`` session that already met its factor is a 403 with ``X-Step-Up-Via: idp``, and its
+        code is not checked either (BACKLOG #2142).
 
         The session is RE-KEYED on success (ASVS 7.2.4) and the new bearer token is in the body:
         this is the exact transition — pre-MFA to MFA-satisfied — that must not happen in place."""
@@ -765,6 +767,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
         elevation = await service.verify_mfa(token, body.code, client=client)
         if elevation.token is None:
+            if elevation.idp_step_up_required:
+                # BACKLOG #2142, ADR 0142 Amendment F: an oidc session that already met its factor
+                # owes no code, and a code opens no window for it. The code was not read, and the
+                # token still authenticates, so a 403 naming the leg that works, with the header
+                # /me/reauth's own refusal sends.
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "this session was signed in through the identity provider and owes no code;"
+                    " step up there through the web console at /ui/reauth",
+                    headers={"X-Step-Up-Via": "idp"},
+                )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
                 # 403 rather than the 401 that would send the client back to sign-in.

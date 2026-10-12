@@ -9,6 +9,10 @@ refuses that; it cannot be told apart from a real second person in software. Wha
 * limb (b): a release whose approver account was created, had its password changed, or enrolled TOTP
   after the request writes an ``approval.approver_provenance`` audit row and raises an alert, and is
   STILL released. An approver older than the request produces neither.
+* BACKLOG #2125: resolving an ``interrupted`` release runs the same check on the RESOLVER. A
+  resolver whose account changed after the request writes the same row, with ``act`` ``resolve``,
+  and the same alert, and the resolution still goes ahead. Seat decision under owner delegation
+  2026-10-08, not an owner ruling.
 * limb (c): creating or promoting an Administrator raises ``administrator_granted``; the
   ``user.created`` row carries the creating administrator's address; the new account's notification
   address gets an ``ACCOUNT_CREATED`` notice.
@@ -27,7 +31,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.api import security as security_module
-from messagefoundry.api.approvals import ApprovalGate
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.notifications import ACCOUNT_CREATED
 from messagefoundry.auth.passwords import hash_password
@@ -44,7 +48,7 @@ from tests._admin_account import create_local_user_chosen
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _client_with_sink, _hold_replay
 from tests.test_approval_requester_recheck import _Sink as _RecheckSink
-from tests.test_approvals import ON, PW, _add, _service, _token
+from tests.test_approvals import ON, PW, _add, _interrupt, _service, _StaleRead, _token
 from tests.test_auth_service import _FakeNotifier
 
 _FLAG = "approval.approver_provenance"
@@ -137,6 +141,7 @@ async def test_an_approver_created_after_the_request_is_flagged_and_released(
     assert detail["approval_id"] == approval_id
     assert detail["requester"] == "maker"
     assert "account_created" in detail["changed"]
+    assert detail["act"] == "release"  # BACKLOG #2125: a resolver's row says "resolve"
     assert sink.events[0][0] == "approval_approver_provenance"
     assert sink.events[0][1] == f"approval:{approval_id}"
     assert len(await engine.store.list_audit(action="approval.approved")) == 1
@@ -248,6 +253,158 @@ async def test_the_flag_is_written_over_http_with_the_approvers_address(engine: 
         assert r.status_code == 200, r.text
     rows = await _flags(engine)
     assert len(rows) == 1 and rows[0]["client"] == "127.0.0.1"
+
+
+# --- BACKLOG #2125: the resolver of an interrupted release ---------------------------------------
+
+
+async def _resolve_it(gate: ApprovalGate, approval_id: str, resolver_id: str) -> None:
+    out = await gate.resolve_interrupted(
+        approval_id,
+        outcome="effects_applied",
+        resolver="resolver",
+        resolver_user_id=resolver_id,
+        client="10.0.0.8",
+    )
+    # Never refused: the resolution goes ahead in every case.
+    assert out["resolved_by"] == "resolver" and out["status"] == "resolved_applied"
+
+
+async def test_a_resolver_whose_password_changed_after_the_request_is_flagged(
+    engine: Engine,
+) -> None:
+    """RED when: resolve_interrupted stops calling _approver_changes, or stops writing the flag."""
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    resolver = await _add(service, "resolver", Role.ADMINISTRATOR)  # older than the request
+    sink = _Sink()
+    gate = _gate(engine, service, sink)
+    approval_id = await _request(gate, maker)
+    await _interrupt(engine, approval_id)
+    await engine.store.set_password(
+        resolver,
+        password_hash=hash_password("another-strong-passphrase"),
+        must_change_password=False,
+        password_generated=False,
+    )
+
+    await _resolve_it(gate, approval_id, resolver)
+
+    rows = await _flags(engine)
+    assert len(rows) == 1
+    assert rows[0]["actor"] == "resolver"
+    assert rows[0]["client"] == "10.0.0.8"  # ADR 0150: the resolver's address
+    assert json.loads(str(rows[0]["detail"])) == {
+        "approval_id": approval_id,
+        "operation": "dead_letter_replay",
+        "requester": "maker",
+        "changed": ["password_changed"],
+        "act": "resolve",
+    }
+    # Its own key, so it is not folded into, or throttled by, a release flag on the same request.
+    assert sink.events == [
+        (
+            "approval_approver_provenance",
+            f"approval:{approval_id}:resolve",
+            {"operation": "dead_letter_replay", "changed": ("password_changed",)},
+        )
+    ]
+    assert len(await engine.store.list_audit(action="approval.resolved")) == 1
+
+
+async def test_a_broken_sink_does_not_stop_the_resolution(engine: Engine) -> None:
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    gate = _gate(engine, service, _RaisingSink())
+    approval_id = await _request(gate, maker)
+    await _interrupt(engine, approval_id)
+    resolver = await _add(service, "resolver", Role.ADMINISTRATOR)  # minted after the request
+
+    await _resolve_it(gate, approval_id, resolver)
+
+    assert len(await _flags(engine)) == 1  # the durable row still lands
+
+
+async def test_a_lost_resolver_flag_pages_and_the_resolution_stands(engine: Engine) -> None:
+    """docs/SECURITY.md: a resolution's provenance row that fails to write is logged and pages
+    audit_write_failed. The resolution has already moved the row, so it still answers."""
+
+    class _PagingSink(_Sink):
+        def audit_write_failed(self, name: str, *, action: str) -> None:
+            self.events.append(("audit_write_failed", name, {"action": action}))
+
+    class _FlagRefused:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(engine.store, name)
+
+        async def record_audit(self, action: str, **kw: Any) -> Any:
+            if action == _FLAG:
+                raise OSError("audit log unreachable")
+            return await engine.store.record_audit(action, **kw)
+
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    sink = _PagingSink()
+    gate = ApprovalGate(
+        _FlagRefused(), ON, resolve_identity=service.identity_for_user_id, alert_sink=sink
+    )
+    gate.register("dead_letter_replay", "replay", _noop, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, maker)
+    await _interrupt(engine, approval_id)
+    resolver = await _add(service, "resolver", Role.ADMINISTRATOR)  # minted after the request
+
+    await _resolve_it(gate, approval_id, resolver)
+
+    assert await _flags(engine) == []
+    assert ("audit_write_failed", f"approval:{approval_id}", {"action": _FLAG}) in sink.events
+    assert len(await engine.store.list_audit(action="approval.resolved")) == 1
+
+
+async def test_a_resolver_older_than_the_request_is_not_flagged(engine: Engine) -> None:
+    """The control for the test above: the same path with no account change flags nothing."""
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    resolver = await _add(service, "resolver", Role.ADMINISTRATOR)
+    sink = _Sink()
+    gate = _gate(engine, service, sink)
+    approval_id = await _request(gate, maker)
+    await _interrupt(engine, approval_id)
+
+    await _resolve_it(gate, approval_id, resolver)
+
+    assert await _flags(engine) == []
+    assert sink.events == []
+    assert len(await engine.store.list_audit(action="approval.resolved")) == 1
+
+
+async def test_a_resolver_who_loses_the_race_writes_no_flag(engine: Engine) -> None:
+    """Only a resolution that moved the row is flagged. Both resolvers are minted after the request
+    and both read 'interrupted' from a stale row, so the loser reaches the store's guard."""
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    approval_id = await _request(_gate(engine, service, _Sink()), maker)
+    await _interrupt(engine, approval_id)
+    winner = await _add(service, "winner", Role.ADMINISTRATOR)
+    loser = await _add(service, "loser", Role.ADMINISTRATOR)
+    stale = await engine.store.get_pending_approval(approval_id)
+    sink = _Sink()
+    gate = ApprovalGate(
+        _StaleRead(engine.store, stale),
+        ON,
+        resolve_identity=service.identity_for_user_id,
+        alert_sink=sink,
+    )
+    await gate.resolve_interrupted(
+        approval_id, outcome="effects_applied", resolver="winner", resolver_user_id=winner
+    )
+    with pytest.raises(ApprovalError) as caught:
+        await gate.resolve_interrupted(
+            approval_id, outcome="effects_not_applied", resolver="loser", resolver_user_id=loser
+        )
+    assert caught.value.status == 409
+
+    assert [str(r["actor"]) for r in await _flags(engine)] == ["winner"]
+    assert len(sink.events) == 1
 
 
 # --- limb (c): the Administrator grant --------------------------------------------------------
@@ -390,6 +547,7 @@ def test_the_alert_keys_can_never_name_a_connection() -> None:
     """BACKLOG #1898: no control_action fires on these event types. The keys must also never
     parse as a connection name, so neither can be a restart's default target."""
     assert not is_connection_name("approval:0123abcd")
+    assert not is_connection_name("approval:0123abcd:resolve")  # BACKLOG #2125
     assert not is_connection_name("user:admin2")
 
 
@@ -406,6 +564,25 @@ async def test_the_notifier_sink_emits_both_events() -> None:
     assert by_type["approval_approver_provenance"]["changed"] == ["account_created"]
     assert by_type["administrator_granted"]["connection"] == "user:admin2"
     assert by_type["administrator_granted"]["granted_by"] == "admin1"
+
+
+async def test_a_resolve_flag_is_its_own_notifier_instance() -> None:
+    """BACKLOG #2125: a release flag and a resolve flag on one request are two instances. The
+    reason says "acting account", never "approver", since the key says which act it was."""
+    transport = _RecordingTransport("t")
+    sink = NotifierAlertSink([transport])
+    sink.approval_approver_provenance(
+        "approval:a1", operation="dead_letter_replay", changed=("password_changed",)
+    )
+    sink.approval_approver_provenance(
+        "approval:a1:resolve", operation="dead_letter_replay", changed=("password_changed",)
+    )
+    await _drain(sink)
+    reasons = {e["connection"]: e["reason"] for e in transport.events}
+    assert reasons == {
+        "approval:a1": "acting account changed after the request: password_changed",
+        "approval:a1:resolve": "acting account changed after the request: password_changed",
+    }
 
 
 #: A CR, an LF, a C1 next-line and a Unicode line separator: each can end a line for some reader.

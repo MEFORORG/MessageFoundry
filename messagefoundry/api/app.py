@@ -5674,8 +5674,7 @@ def create_app(
         covers the scope it started with, the stream records ``messages_export.stopped`` and aborts
         (BACKLOG #1154). Each streamed body is re-checked against that row's per-channel scope, which
         covers at least the starting one (load-bearing for the attacker-suppliable ``ids`` path); an
-        out-of-scope id is skipped +
-        audited (``auth.channel_denied``).
+        out-of-scope id is skipped + audited (``auth.channel_denied``).
         The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
         selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
         a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
@@ -5748,7 +5747,11 @@ def create_app(
 
         def _still_covers(current: Identity) -> bool:
             """Whether ``current``'s channel scope still covers the scope the export started with
-            (None = every channel). A widened scope covers it; only a narrowed one stops it."""
+            (None = every channel). This is the check for a scope change that reached the session
+            without a revoke: a widened scope covers it, and a narrowed one stops the export. An
+            administrator's change of either direction revokes the session, and once the revoke
+            lands the standing re-check stops the export. Until then the session is still live.
+            In that window, after ``set_channel_scope`` writes the scope, this is the only check."""
             if current.allowed_channels is None:
                 return True
             start = identity.allowed_channels
@@ -5806,8 +5809,11 @@ def create_app(
                     raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
                 # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
                 # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                # Read with THIS row's identity: it covers the starting scope, and a channel granted
-                # mid-export is now the caller's to read.
+                # Read with THIS row's identity, which covers the starting scope. A channel that
+                # reached this session without a revoke is then readable on the ``ids`` path only:
+                # a search-mode save-all chose its rows with the starting scope. After a direct
+                # store write that lasts to the end of the export. After an administrator's write
+                # it lasts only until the revoke lands, when the next row's re-check stops it.
                 row = await read_scoped_message(engine, current, mid, request)
                 if row is None:
                     continue
@@ -8677,7 +8683,9 @@ def create_app(
                 # Re-resolved before EVERY frame, the first included: a token revoked between the
                 # handshake and accept() gets no frame at all (SEC-018), and no frame goes out on an
                 # identity older than this loop's turn (BACKLOG #1154, ASVS 8.3.2). A refusal closes
-                # the feed, and a narrowed channel scope shapes this frame.
+                # the feed. An administrator's scope change revokes the session, so it closes the
+                # feed too; a scope change that reached the session without a revoke shapes this
+                # frame.
                 current = await _reauthorize()
                 if current is None:
                     await websocket.close(code=1008)
