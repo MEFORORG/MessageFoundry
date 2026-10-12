@@ -133,6 +133,9 @@ folder as `-ProjectRoot`, or the service reads its value file from the folder ab
 
 **`-ListenHost` must be an IP address or a host name**, and no path may contain a double quote.
 Each goes on the service's command line, so the installer refuses anything else before it acts.
+No path nssm stores may contain `%`, and `-ListenHost` takes it only before a numeric IPv6 zone,
+such as `fe80::1%12`. nssm expands `%NAME%` when the service starts, so the service would read
+something other than what the installer checked.
 
 Override any of them, e.g.:
 

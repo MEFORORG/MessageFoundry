@@ -400,6 +400,23 @@ function Set-ServiceAccount {
 }
 # END pinned-hash check
 
+function Disable-RefusedService {
+    <#
+      Set $ServiceName to Disabled after a refusal, and return the sentence that says what happened:
+      that it was set to Disabled, so $Consequence, or that it could not be and must be disabled by
+      hand before the next boot. The refusal message reports this, rather than assuming it.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Consequence)
+    try {
+        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction Stop
+        return "'$ServiceName' was set to Disabled so $Consequence."
+    } catch {
+        return ("WARNING: '$ServiceName' could NOT be set to Disabled ($($_.Exception.Message)), so " +
+            "it may start at the next boot. Disable it by hand: Set-Service -Name '$ServiceName' " +
+            "-StartupType Disabled.")
+    }
+}
+
 function Set-AdminOnlyAcl {
     <#
       Make a folder or file this script created administrator-only: inheritance off, SYSTEM and
@@ -1162,9 +1179,7 @@ function Set-ServiceTokenHardening {
     )
     $fail = {
         param([string]$Why)
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-        throw ("$Why '$ServiceName' was set to Disabled so it cannot start with a token this " +
-            "script did not set.")
+        throw "$Why $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start with a token this script did not set')"
     }
     $calls = @(
         @("sidtype", $ServiceName, $SidType),
@@ -1290,6 +1305,16 @@ function Get-DefaultServiceConfig {
     return ""
 }
 
+function Assert-NoNssmExpansion {
+    <#
+      Throw when $Path holds '%'. nssm stores at least the service's arguments, interpreter path,
+      working directory and log paths as expandable strings and expands %NAME% at start, so the
+      service would use a path other than the one this installer checked (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Path.Contains('%')) { throw "A path nssm stores for the service cannot contain '%': $Path" }
+}
+
 function Format-QuotedPath {
     <#
       $Path in double quotes for the service's command line. A drive root such as D:\ ends in a
@@ -1300,9 +1325,7 @@ function Format-QuotedPath {
     # No Windows path holds a double quote. One here would end the quoted path early, and the
     # parser would read the rest as more arguments, such as a second --host.
     if ($Path.Contains('"')) { throw "A path on the service's command line cannot contain a double quote: $Path" }
-    # nssm stores the arguments as an expandable registry string, so %NAME% can be expanded at
-    # start, and the service would read a path other than the one this installer checked.
-    if ($Path.Contains('%')) { throw "A path on the service's command line cannot contain '%': $Path" }
+    Assert-NoNssmExpansion $Path
     return '"' + ($Path -replace '\\+$', '$0$0') + '"'
 }
 
@@ -1346,9 +1369,13 @@ function Test-ListenHost {
       as '0' or '1.2', and the engine's resolver reads '0' as 0.0.0.0, every interface. For the
       same reason a host name's last label may not be all digits or start with 0x, so '0x0' is
       refused too.
+
+      '%' is taken only before a numeric IPv6 zone, such as fe80::1%12. nssm expands %NAME% in the
+      stored arguments at start, and PowerShell 7's IPAddress.TryParse takes a named zone, such as
+      ::1%PATH%, so a named one would reach the service as more arguments.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
-    if ($Value -notmatch '^[A-Za-z0-9.:%-]{1,253}\z') { return $false }
+    if ($Value -notmatch '^(?=.{1,253}\z)[A-Za-z0-9.:-]+(%\d{1,10})?\z') { return $false }
     $parsed = $null
     if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) {
         if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { return $true }
@@ -1383,7 +1410,9 @@ function Get-LockPathProblem {
     $root = [System.IO.Path]::GetPathRoot($Path)
     if ($root -and $trimmed -eq $root.TrimEnd('\')) { return "it is the root of a volume" }
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    # Unread, it cannot be shown not to be a junction, so it is not locked.
+    if (-not $item) { return "it does not exist or could not be read" }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
         return "it is a junction, a link or a mounted volume"
     }
     $prefix = $trimmed + '\'
@@ -1397,7 +1426,7 @@ function Get-LockPathProblem {
             return "it is inside '$outer'"
         }
     }
-    if ($null -ne $OnlyFolders -and $item) {
+    if ($null -ne $OnlyFolders) {
         $own = @($OnlyFolders | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
         try {
             $others = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction Stop |
@@ -1462,7 +1491,8 @@ $NssmDir = Resolve-AbsolutePath $NssmDir
 
 # --- the service's command line, built before anything acts (vault BACKLOG #2626) --------------------
 # Built here, so a value it refuses stops the install before the NSSM copy below. -ListenHost goes
-# in unquoted, so it is checked; Format-QuotedPath refuses a path holding a double quote.
+# in unquoted, so it is checked; Format-QuotedPath refuses a path holding a double quote or '%'
+# (Assert-NoNssmExpansion says why).
 if (-not (Test-ListenHost $ListenHost)) {
     throw ("invalid -ListenHost '$ListenHost': pass an IP address, such as 127.0.0.1, or a host " +
         "name of letters, digits, hyphens and dots.")
@@ -1472,6 +1502,8 @@ $AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config $(Forma
 # #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
 if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }
 if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
+# The paths nssm stores outside the arguments; the log paths sit under -DataDir.
+foreach ($stored in @($PythonExe, $AppDirectory, $DataDir)) { Assert-NoNssmExpansion $stored }
 
 # --- what -LockConfigDir may lock (vault BACKLOG #2626) ------------------------------------------------
 # Set-SecureConfigAcl re-owns everything below the folder it locks, so it must never reach these.
@@ -1733,9 +1765,9 @@ if ($ServiceExisted) {
 try {
     Set-ServiceImage -ServiceName $ServiceName -Path $NssmPath
 } catch {
-    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
-    throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled so it cannot start from an " +
-        "unchecked image. Remove it with .\uninstall-service.ps1 and re-run.")
+    $why = $_.Exception.Message
+    $disabled = Disable-RefusedService -ServiceName $ServiceName -Consequence "it cannot start from an unchecked image"
+    throw "$why $disabled Remove it with .\uninstall-service.ps1 and re-run."
 }
 
 # The interpreter, with the options in $AppParams ahead of `-m messagefoundry` (vault BACKLOG #2701).
@@ -1748,10 +1780,12 @@ Invoke-Nssm set $ServiceName AppParameters $AppParams
 $storedParams = (Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters" `
     -ErrorAction Stop).GetValue('AppParameters', $null, 'DoNotExpandEnvironmentNames')
 if ($storedParams -cne $AppParams) {
-    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+    $disabled = Disable-RefusedService -ServiceName $ServiceName -Consequence "it cannot start with arguments other than these"
+    # Only a legacy host is a cause that a newer PowerShell fixes.
+    $advice = if (Test-LegacyNativeArgumentPassing) { "Re-run this installer from PowerShell 7.3 or later." }
+              else { "This host already escapes arguments for nssm, so re-running from it will not help; report both strings as an installer defect." }
     throw ("nssm stored the service's arguments as [$storedParams], not [$AppParams], so this host " +
-        "passed them to nssm differently from what the installer expected. '$ServiceName' was set " +
-        "to Disabled. Re-run this installer from PowerShell 7.3 or later.")
+        "passed them to nssm differently from what the installer expected. $disabled $advice")
 }
 Invoke-Nssm set $ServiceName AppDirectory $AppDirectory
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"

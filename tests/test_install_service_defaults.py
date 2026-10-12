@@ -106,7 +106,9 @@ def test_a_drive_root_project_root_keeps_its_closing_quote(tmp_path: Path) -> No
         "  } | ConvertTo-Json -Compress\n"
     )
     got = json.loads(
-        _ok(_extract(_SCRIPT, ["Format-QuotedPath"], body), tmp_path).strip().splitlines()[-1]
+        _ok(_extract(_SCRIPT, ["Assert-NoNssmExpansion", "Format-QuotedPath"], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
     )
     assert got == {"root": '"D:\\\\"', "folder": '"D:\\hl7"'}
 
@@ -235,6 +237,7 @@ def test_get_lock_path_problem_refuses_a_root_a_junction_a_holder_and_the_checko
                 f"Get-LockPathProblem -Path {q(str(dedicated))} -Holds @({q(str(data))}, "
                 f"{q(str(repo))}, '') -NotWithin @({q(str(repo))})"
             ),
+            "missing": f"Get-LockPathProblem -Path {q(str(tmp_path / 'absent'))}",
         },
     )
     assert got["drive"] == got["system"] == "it is the root of a volume"
@@ -246,6 +249,8 @@ def test_get_lock_path_problem_refuses_a_root_a_junction_a_holder_and_the_checko
     assert got["dedicated"] == ""
     assert got["crowded"] == "it holds other folders: config"
     assert got["own"] == ""
+    # Unread, a path cannot be shown not to be a junction, so it is not locked.
+    assert got["missing"] == "it does not exist or could not be read"
 
 
 def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_anything_acts(
@@ -260,27 +265,36 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
     assert text.index("if (-not (Test-ListenHost $ListenHost)) {") < first_act
     body = (
         "  $quote = try { Format-QuotedPath 'D:\\x\" --host 0.0.0.0 \"' } catch { 'refused' }\n"
-        "  $percent = try { Format-QuotedPath 'D:\\%TEMP%\\cfg' } catch { 'refused' }\n"
+        "  $percent = try { Format-QuotedPath 'D:\\%TEMP%\\cfg' } catch { $_.Exception.Message }\n"
         "  [pscustomobject]@{\n"
         "    quote = $quote\n"
         "    percent = $percent\n"
-        "    good = @('127.0.0.1', '::1', 'fe80::1', '0.0.0.0', 'localhost', 'engine-1.example.org', '3par-mgmt' |"
+        "    good = @('127.0.0.1', '::1', 'fe80::1', 'fe80::1%12', '0.0.0.0', 'localhost', "
+        "'engine-1.example.org', '3par-mgmt', '10.0.0.1x', '1e5' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
         "    bad = @('127.0.0.1 --host 0.0.0.0', '\"127.0.0.1\"', '', '-x', 'a..b', 'a_b', '0', "
-        "'1.2', '0x0', '127.0.0.010', 'a.1' |"
+        "'1.2', '0x0', '127.0.0.010', 'a.1', '::1%PATH%', 'fe80::1%TEMP%', 'host%1' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
         "  } | ConvertTo-Json -Compress\n"
     )
     got = json.loads(
-        _ok(_extract(_SCRIPT, ["Format-QuotedPath", "Test-ListenHost"], body), tmp_path)
+        _ok(
+            _extract(
+                _SCRIPT, ["Assert-NoNssmExpansion", "Format-QuotedPath", "Test-ListenHost"], body
+            ),
+            tmp_path,
+        )
         .strip()
         .splitlines()[-1]
     )
     assert got == {
         "quote": "refused",
-        "percent": "refused",
-        "good": [True] * 7,
-        "bad": [False] * 11,
+        "percent": "A path nssm stores for the service cannot contain '%': D:\\%TEMP%\\cfg",
+        # '10.0.0.1x' and '1e5' are host names: no resolver reads them as a number, so they do
+        # not widen the bind, and a name that does not resolve fails at start.
+        "good": [True] * 10,
+        # nssm expands %NAME% at start, and PowerShell 7's IPAddress.TryParse takes a named zone.
+        "bad": [False] * 14,
     }
 
 
@@ -385,6 +399,7 @@ def test_each_path_reaches_the_service_whole_on_each_host(host: str, tmp_path: P
     script = _extract(
         _SCRIPT,
         [
+            "Assert-NoNssmExpansion",
             "Format-QuotedPath",
             "Test-LegacyNativeArgumentPassing",
             "ConvertTo-NativeArgument",
@@ -457,7 +472,43 @@ def test_the_stored_arguments_are_read_back_unexpanded_and_a_mismatch_disables_t
         "GetValue('AppParameters', $null, 'DoNotExpandEnvironmentNames')" in text[read : read + 300]
     )
     compare = text.index("if ($storedParams -cne $AppParams) {", read)
-    disable = text.index("Set-Service -Name $ServiceName -StartupType Disabled", compare)
-    assert disable < text.index("throw", compare)
+    disable = text.index("Disable-RefusedService -ServiceName $ServiceName", compare)
+    refusal = text.index("throw", compare)
+    assert disable < refusal
+    # The advice names a newer PowerShell only where this host is the legacy kind it would fix.
+    assert text.index("if (Test-LegacyNativeArgumentPassing)", compare) < refusal
     # Before anything else is set on the service.
     assert compare < text.index("Invoke-Nssm set $ServiceName AppDirectory $AppDirectory")
+
+
+def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> None:
+    """The refusal used to say the service "was set to Disabled" even when that call failed
+    silently. Now it reports what happened, and a failure tells the operator to do it by hand."""
+    assert _SCRIPT is not None
+    body = (
+        "  function Set-Service { param($Name, $StartupType, $ErrorAction)\n"
+        "    if ($Name -eq 'Gone') { throw 'no such service' } }\n"
+        "  [pscustomobject]@{\n"
+        "    done = (Disable-RefusedService -ServiceName 'Svc' -Consequence 'it cannot start')\n"
+        "    failed = (Disable-RefusedService -ServiceName 'Gone' -Consequence 'it cannot start')\n"
+        "  } | ConvertTo-Json -Compress\n"
+    )
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Disable-RefusedService"], body), tmp_path).strip().splitlines()[-1]
+    )
+    assert got["done"] == "'Svc' was set to Disabled so it cannot start."
+    assert got["failed"].startswith(
+        "WARNING: 'Gone' could NOT be set to Disabled (no such service)"
+    )
+    assert "Set-Service -Name 'Gone' -StartupType Disabled" in got["failed"]
+
+
+def test_a_path_nssm_expands_is_refused_with_percent_before_anything_acts() -> None:
+    """nssm expands %NAME% at start in the interpreter path, the working directory and the log
+    paths under -DataDir, as it does in the arguments."""
+    text = _text()
+    check = text.index(
+        "foreach ($stored in @($PythonExe, $AppDirectory, $DataDir)) { Assert-NoNssmExpansion $stored }"
+    )
+    assert text.index("$PythonExe = Get-EngineInterpreter") < check
+    assert check < text.index("$NssmPath = Resolve-Nssm")
