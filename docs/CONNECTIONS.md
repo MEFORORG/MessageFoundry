@@ -276,8 +276,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > certificate revocation checking** — stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately
 > attempts none — so on the **shipped default** (a PHI-classified instance at
 > `[security].enforcement = enforce`) a **verifying** outbound TLS hop to a **non-loopback** host is
-> **refused at construction** (`messagefoundry check` / dry-run / reload / the `serve` pre-flight), not
-> merely warned. **At least nine** hops carry that gate — the connection-level ones are
+> **refused at construction** (`messagefoundry check`, dry-run, reload, and the live build when
+> `serve` starts), not merely warned. **At least nine** hops carry that gate — the connection-level ones are
 > **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), EMAIL/SMTP, and a connection's SMART token
 > endpoint**, and since BACKLOG #2193 **the DICOM C-STORE SCU with `tls=true`, an FTPS upload, a
 > `Direct()` relay that sets a `username`, and an https `FhirLookup` read**, plus some that are not

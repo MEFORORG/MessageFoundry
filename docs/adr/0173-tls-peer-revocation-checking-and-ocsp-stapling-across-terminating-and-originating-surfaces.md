@@ -707,7 +707,8 @@ OAuth2 token hop. Two reasons:
   instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
 
 **The refusal on the ECH arm names the attestation alone.** The default text offers
-`[tls].crl_file` and an egress proxy, and neither can cross an ECH hop. So
+`[tls].crl_file`, which cannot cross an ECH hop. (It also offered an egress proxy, which no call
+site could set, until BACKLOG #2987 removed it.) So
 `refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
 `ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
 crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`

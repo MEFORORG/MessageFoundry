@@ -1295,8 +1295,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
   revocation in the engine and needs no attestation.
 - **What it cannot do:** it never reaches a cleartext or verify-off hop, which keep their own
-  refusals. It is a claim about one named hop, which is why it crosses an enforcing instance where the
-  process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299).
+  refusals. It is a claim about one named connection, which is why it crosses an enforcing instance
+  where the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299). That is one hop on
+  most connections, and two on a `FhirLookup`, as above.
 - **How it is recorded:** a flag without a reason, a blank reason, or a reason without the flag fails
   at load, on both authoring surfaces. Each time the attestation lets a hop through that an enforcing
   instance would otherwise refuse, the engine logs a WARNING naming the hop and your reason, at every
