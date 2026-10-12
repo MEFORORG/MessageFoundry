@@ -1300,6 +1300,9 @@ function Format-QuotedPath {
     # No Windows path holds a double quote. One here would end the quoted path early, and the
     # parser would read the rest as more arguments, such as a second --host.
     if ($Path.Contains('"')) { throw "A path on the service's command line cannot contain a double quote: $Path" }
+    # nssm stores the arguments as an expandable registry string, so %NAME% can be expanded at
+    # start, and the service would read a path other than the one this installer checked.
+    if ($Path.Contains('%')) { throw "A path on the service's command line cannot contain '%': $Path" }
     return '"' + ($Path -replace '\\+$', '$0$0') + '"'
 }
 
@@ -1341,17 +1344,19 @@ function Test-ListenHost {
 
       An IPv4 address must be written as four numbers. IPAddress.TryParse also takes shorthand such
       as '0' or '1.2', and the engine's resolver reads '0' as 0.0.0.0, every interface. For the
-      same reason a host name's last label must start with a letter, so '0x0' is refused too.
+      same reason a host name's last label may not be all digits or start with 0x, so '0x0' is
+      refused too.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
     if ($Value -notmatch '^[A-Za-z0-9.:%-]{1,253}\z') { return $false }
     $parsed = $null
     if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) {
         if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { return $true }
-        return $Value -match '^\d{1,3}(\.\d{1,3}){3}\z'
+        # No leading zero: the resolver reads '010' as octal.
+        return $Value -match '^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}\z'
     }
     $label = '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
-    return $Value -match "^($label\.)*[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\z"
+    return $Value -match "^($label\.)*(?![0-9]+\z)(?!0[xX])$label\z"
 }
 
 function Get-LockPathProblem {
@@ -1394,8 +1399,12 @@ function Get-LockPathProblem {
     }
     if ($null -ne $OnlyFolders -and $item) {
         $own = @($OnlyFolders | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
-        $others = @(Get-ChildItem -LiteralPath $Path -Directory -Force |
-            Where-Object { $own -notcontains $_.FullName.TrimEnd('\') } | ForEach-Object { $_.Name })
+        try {
+            $others = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction Stop |
+                Where-Object { $own -notcontains $_.FullName.TrimEnd('\') } | ForEach-Object { $_.Name })
+        } catch {
+            return "its folders could not be listed ($($_.Exception.Message))"
+        }
         if ($others) { return "it holds other folders: $($others -join ', ')" }
     }
     return ""
@@ -1471,7 +1480,11 @@ if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectR
 if ($LockConfigDir) {
     $LockKeepOut = @($DataDir, (Split-Path -Parent $DbPath), $NssmDir, $RepoRoot, $AppDirectory,
         $(if ($PythonExe) { Split-Path -Parent $PythonExe }), $env:SystemRoot, $env:ProgramFiles,
-        ${env:ProgramFiles(x86)}, $env:ProgramData, $(if ($env:USERPROFILE) { Split-Path -Parent $env:USERPROFILE }))
+        ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:ProgramData,
+        # The profiles folder. PUBLIC sits in it whichever account runs this; USERPROFILE does not
+        # when that account is SYSTEM.
+        $(if ($env:PUBLIC) { Split-Path -Parent $env:PUBLIC }),
+        $(if ($env:USERPROFILE) { Split-Path -Parent $env:USERPROFILE }))
     # Nothing under the Windows folder is a config folder.
     $LockNotWithin = @($env:SystemRoot)
     $configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut -NotWithin $LockNotWithin
@@ -1730,12 +1743,15 @@ Invoke-Nssm set $ServiceName Application $PythonExe
 Invoke-Nssm set $ServiceName AppParameters $AppParams
 # Read back what nssm stored, where the service reads it at each start. Invoke-Nssm's escaping
 # depends on how this host passes arguments, and a wrong guess would otherwise show only as a
-# service that fails at its first start (vault BACKLOG #2626).
-$storedParams = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters" `
-    -Name AppParameters -ErrorAction Stop).AppParameters
+# service that fails at its first start (vault BACKLOG #2626). nssm stores it as an expandable
+# string, so it is read unexpanded. On a mismatch the service is set to Disabled first, as above.
+$storedParams = (Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters" `
+    -ErrorAction Stop).GetValue('AppParameters', $null, 'DoNotExpandEnvironmentNames')
 if ($storedParams -cne $AppParams) {
-    throw ("nssm stored the service's arguments as [$storedParams], not [$AppParams]. Re-run this " +
-        "installer from PowerShell 7, or set AppParameters by hand.")
+    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+    throw ("nssm stored the service's arguments as [$storedParams], not [$AppParams], so this host " +
+        "passed them to nssm differently from what the installer expected. '$ServiceName' was set " +
+        "to Disabled. Re-run this installer from PowerShell 7.3 or later.")
 }
 Invoke-Nssm set $ServiceName AppDirectory $AppDirectory
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"

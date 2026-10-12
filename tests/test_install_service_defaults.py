@@ -171,6 +171,9 @@ def test_lock_config_dir_refuses_a_config_it_must_not_lock_before_anything_acts(
         "$env:ProgramFiles",
         "${env:ProgramFiles(x86)}",
         "$env:ProgramData",
+        "$env:ProgramW6432",
+        "Split-Path -Parent $env:PUBLIC",
+        "Split-Path -Parent $env:USERPROFILE",
     ):
         assert name in listed, name
 
@@ -257,12 +260,14 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
     assert text.index("if (-not (Test-ListenHost $ListenHost)) {") < first_act
     body = (
         "  $quote = try { Format-QuotedPath 'D:\\x\" --host 0.0.0.0 \"' } catch { 'refused' }\n"
+        "  $percent = try { Format-QuotedPath 'D:\\%TEMP%\\cfg' } catch { 'refused' }\n"
         "  [pscustomobject]@{\n"
         "    quote = $quote\n"
-        "    good = @('127.0.0.1', '::1', 'fe80::1', '0.0.0.0', 'localhost', 'engine-1.example.org' |"
+        "    percent = $percent\n"
+        "    good = @('127.0.0.1', '::1', 'fe80::1', '0.0.0.0', 'localhost', 'engine-1.example.org', '3par-mgmt' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
         "    bad = @('127.0.0.1 --host 0.0.0.0', '\"127.0.0.1\"', '', '-x', 'a..b', 'a_b', '0', "
-        "'1.2', '0x0', '10.0.0.1x' |"
+        "'1.2', '0x0', '127.0.0.010', 'a.1' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
         "  } | ConvertTo-Json -Compress\n"
     )
@@ -271,7 +276,12 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
         .strip()
         .splitlines()[-1]
     )
-    assert got == {"quote": "refused", "good": [True] * 6, "bad": [False] * 10}
+    assert got == {
+        "quote": "refused",
+        "percent": "refused",
+        "good": [True] * 7,
+        "bad": [False] * 11,
+    }
 
 
 def test_a_legacy_escape_doubles_trailing_backslashes_only_where_the_host_adds_quotes(
@@ -431,3 +441,23 @@ def test_the_settings_file_and_the_value_folder_share_one_anchor() -> None:
     anchor = text.index("$ValuesAnchor = if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }")
     assert anchor < text.index("Get-DefaultServiceConfig -Anchor $ValuesAnchor")
     assert anchor < text.index('$ValueFolder = Join-Path $ValuesAnchor "environments"')
+
+
+def test_the_stored_arguments_are_read_back_unexpanded_and_a_mismatch_disables_the_service() -> (
+    None
+):
+    """The escaping Invoke-Nssm applies is a guess about the host. The registry value nssm wrote
+    is the answer, read without expanding %NAME%, and a mismatch leaves the service Disabled."""
+    text = _text()
+    stored = text.index("Invoke-Nssm set $ServiceName AppParameters $AppParams")
+    read = text.index(
+        '"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\$ServiceName\\Parameters"', stored
+    )
+    assert (
+        "GetValue('AppParameters', $null, 'DoNotExpandEnvironmentNames')" in text[read : read + 300]
+    )
+    compare = text.index("if ($storedParams -cne $AppParams) {", read)
+    disable = text.index("Set-Service -Name $ServiceName -StartupType Disabled", compare)
+    assert disable < text.index("throw", compare)
+    # Before anything else is set on the service.
+    assert compare < text.index("Invoke-Nssm set $ServiceName AppDirectory $AppDirectory")
