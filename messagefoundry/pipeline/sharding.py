@@ -82,15 +82,20 @@ def shard_ids(registry: Registry) -> list[str]:
 
 
 def join_shard_names(names: Iterable[str]) -> str:
-    """Engine shard names in sorted order, joined with ``/``, for a log line or a refusal.
+    """Engine shard names in sorted order, joined with `` / ``, for a log line or a refusal.
 
     Never joined with a comma. The log's PHI pass
     (:data:`messagefoundry.redaction._COMMA_NAME_RUN`) takes two capitalized words around a comma
     for a family-comma-given name, so ``EAST, WEST`` and ``East,West`` each reached the log as
     ``[redacted]`` (vault BACKLOG #3227). Lower-case names passed, which is why it went unseen.
-    The operator picks the names, so the text is worded to pass rather than the pass loosened.
+
+    The spaces around the slash matter too. Without them, numeric names build a date shape
+    (``12/34/5678``), and the same pass scrubs that, which the comma never did.
+
+    This keeps the JOIN from adding a scrubbed shape. A name the pass scrubs by itself, such as
+    ``East Wing`` or an eight-digit number, is still scrubbed.
     """
-    return "/".join(sorted(names))
+    return " / ".join(sorted(names))
 
 
 def require_unified_store(store_backend: StoreBackend, ids: Sequence[str]) -> None:
@@ -114,7 +119,7 @@ def require_unified_store(store_backend: StoreBackend, ids: Sequence[str]) -> No
     is_server_db = store_backend in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER)
     if not is_server_db and len(distinct) > 1:
         raise ValueError(
-            f"multi-process sharding ({len(distinct)} shards: {join_shard_names(distinct)}) requires a server-DB "
+            f"multi-process sharding ({len(distinct)} engine shards: {join_shard_names(distinct)}) requires a server-DB "
             "store (Postgres or SQL Server) so every shard shares ONE unified database — a single-file "
             f"store like {store_backend.value!r} would split the message store into one file per shard "
             "(fragmenting search / reporting / audit / replay), which is not allowed. Set [store].backend "

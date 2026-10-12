@@ -843,7 +843,7 @@ async def test_supervise_names_two_crash_looped_engine_shards_past_the_log_redac
     assert ("down after a crash loop" if survivor else "whole fleet is down") in closing
     logged = redaction.redact(closing)
     assert all(name in logged for name in names), logged
-    assert "/".join(sorted(names)) in logged
+    assert " / ".join(sorted(names)) in logged
 
 
 # --- the pre-flight: a config must load the way an engine shard will load it (vault BACKLOG #2587) -------

@@ -73,16 +73,21 @@ def test_require_unified_store_refuses_multi_shard_sqlite() -> None:
         require_unified_store(StoreBackend.SQLITE, ["a", "b"])
 
 
-@pytest.mark.parametrize("names", [["EAST", "WEST"], ["East", "West"]], ids=["caps", "title"])
+@pytest.mark.parametrize(
+    "names",
+    [["EAST", "WEST"], ["East", "West"], ["12", "34", "5678"]],
+    ids=["caps", "title", "numeric"],
+)
 def test_require_unified_store_names_engine_shards_past_the_log_redaction(names: list[str]) -> None:
     # `supervise` logs this refusal, and the log's PHI pass takes two capitalized words around a
     # comma for a family-comma-given name. Joined with a comma the names reached the log as
-    # `2 shards: [redacted]` (vault BACKLOG #3227), so they join with `/`.
+    # `2 shards: [redacted]` (vault BACKLOG #3227), so they join with ` / `. The numeric case holds
+    # the spaces: a bare `/` builds `12/34/5678`, which the same pass scrubs as a date.
     with pytest.raises(ValueError, match="server-DB") as refused:
         require_unified_store(StoreBackend.SQLITE, names)
     logged = redaction.redact(str(refused.value))
     assert all(name in logged for name in names), logged
-    assert f"2 shards: {'/'.join(names)})" in logged
+    assert f"{len(names)} engine shards: {' / '.join(names)})" in logged
 
 
 def test_require_unified_store_allows_single_or_no_shard_on_sqlite() -> None:
