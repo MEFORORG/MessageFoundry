@@ -2282,7 +2282,9 @@ route, and it would also refuse an honest directory approver whose engine row is
 sign-in.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
-flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
+flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves
+either out is named as a security loosening (vault BACKLOG #3123);
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what that gives up. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
 and do not satisfy this control.)
 

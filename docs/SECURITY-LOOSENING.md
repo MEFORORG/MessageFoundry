@@ -89,6 +89,7 @@ section reference.
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
+| | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any entry covering more than one address is named, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
@@ -116,7 +117,7 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[auth].step_up_max_age_seconds`, `[auth].totp_skew_steps`, `[auth].initial_password_expiry_hours`,
-`[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
+`[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs` and `[backup].allow_unencrypted` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
@@ -1000,6 +1001,31 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `approval.requested` row, since a looser floor writes no `approval.too_early` row. Review the open
   approval queue, and reject a stale request rather than leave it pending.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
+### `[approvals].operations` without a default operation — that action runs on one caller's authority
+> **Conditional** on `[approvals].enabled` (vault BACKLOG #3123, ASVS 2.3.5). Dual control ships off,
+> so a list written while it is off is not named. With it on, the default list holds
+> `connection_purge` and `dead_letter_replay`. A list that leaves either out is named as
+> `approvals.operations`, and the entry names each operation left out. An **empty** list loads and
+> holds nothing, so it is named too, with its own wording. Adding `config_reload` holds more and is
+> not named, and it does not make up for a default operation left out.
+- **What you lose:** the second approver for each operation left out. A purge or a dead-letter replay
+  left out of the list runs at once, on the caller's own authority. With an empty list every action
+  does, as it would with dual control off.
+- **When acceptable:** a site that has decided one of the two does not need a second person, such as
+  a replay its on-call operator must be able to run alone. There is no good case for an
+  empty list with dual control on: turn dual control off instead, so the setting says what the
+  engine does.
+- **Compensating controls:** an operation left out still needs its own permission and step-up; the
+  route table in [SECURITY.md](SECURITY.md) lists both. Review the audit rows for the action itself,
+  since a call that is not held writes no `approval.requested` row.
+- **Where it is reported:** `security_loosenings()` names it, so the serve-time warning,
+  `messagefoundry security show` and `GET /security/posture` list it. Nothing refuses it. The
+  serve-time advisory about exposed dual control reads `enabled` only, so it stays quiet for a
+  narrowed or an empty list.
+- **Reversible:** yes, immediately — restore the default (or delete the `operations` line) and
+  restart. [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+  says what happens to a request that was already held when its operation left the list.
 
 ### `[api].trusted_proxies` covering more than one address, up to every address — a host that is not the proxy may set its own source address
 > **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit
