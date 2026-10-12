@@ -2638,6 +2638,22 @@ def _github_anchor(heading: str) -> str:
 _SECURITY_TABLE_ANCHOR = _github_anchor(_H_SECURITY_TABLE)
 
 
+def _doc_section(name: str, heading: str, until: str = "\n## ") -> str:
+    """``name`` from the line that starts with ``heading`` up to the next ``until``."""
+    text = _doc(name)
+    start = text.index("\n" + heading)
+    return text[start : text.index(until, start + 1)]
+
+
+def _phi_off_loopback_paragraphs() -> list[str]:
+    """The docs/PHI.md section 1 paragraph on the controls that matter off loopback, unflattened."""
+    return [
+        p
+        for p in re.split(r"\n\s*\n", _doc("docs/PHI.md"))
+        if "only become material off-loopback" in _flat(p)
+    ]
+
+
 def _security_table() -> dict[str, list[str]]:
     """The guide's security controls table, as label -> the row's four cells, emphasis removed.
 
@@ -2648,8 +2664,7 @@ def _security_table() -> dict[str, list[str]]:
         f"{_GUIDE} must hold the heading {_H_SECURITY_TABLE!r} once. README.md, docs/PHI.md and "
         "the guide's own sections 1 and 6 link to it; rename it and those links together."
     )
-    start = guide.index(_H_SECURITY_TABLE)
-    block = guide[start : guide.index("\n### ", start + 1)]
+    block = _doc_section(_GUIDE, _H_SECURITY_TABLE, until="\n### ")
     tables = [t for t in _tables(block) if t[0][:2] == ["Control", "Status"]]
     assert len(tables) == 1, f"{_GUIDE}'s security controls section must hold one table"
     rows = {
@@ -2902,8 +2917,8 @@ def test_the_twelfth_sweep_no_doc_says_a_built_control_is_missing(name: str, sub
 
     The guide holds the one table that states these facts, so the subject must occur there. Its row
     marked "Not built" reds through the row unit. README.md links to that table and names neither
-    control now (vault BACKLOG #2970). So for README.md the scan has a clause floor and the link
-    must be present, and a sentence that brings the claim back still reds."""
+    control now (vault BACKLOG #2970). So for README.md the scan has a clause floor, and a sentence
+    that brings the claim back still reds. The linking test below holds README.md's link."""
     pattern = {
         "second factor": _SECOND_FACTOR,
         "off-box logs or de-identification": _BUILT_ELSEWHERE,
@@ -2918,10 +2933,6 @@ def test_the_twelfth_sweep_no_doc_says_a_built_control_is_missing(name: str, sub
     if name == _GUIDE:
         assert any(pattern.search(c) for c in clauses), (
             f"{name} no longer names the {subject} at all, and it holds the table that states it"
-        )
-    else:
-        assert _SECURITY_TABLE_ANCHOR in text, (
-            f"{name} must link to the security controls table, which states the {subject} for it"
         )
     stale = [c for c in clauses if pattern.search(c) and _ABSENT.search(c)]
     for line in text.splitlines():
@@ -3489,7 +3500,6 @@ def test_the_security_controls_table_states_what_the_code_does() -> None:
     row(r"^MLLP-over-TLS", "Built", "Off.")
     assert ApiSettings.model_fields["tls_client_ca_file"].default is None
     assert "`[api].tls_client_ca_file`" in row(r"^mTLS\b", "Built", "Off.")
-    assert callable(check_inbound_revocation)
     row(r"revocation", "Built")
     # Raw TCP and X12 take no TLS setting. The second-round probe floors each signature at 10.
     assert not any(
@@ -3517,8 +3527,8 @@ def test_the_security_controls_table_states_what_the_code_does() -> None:
 
 #: A control the table states, under the names the pages gave it.
 _TABLE_CONTROL = re.compile(
-    r"\bMFA\b|\bTOTP\b|\bpasskeys?\b|second factor|off-box log|log (?:shipping|forwarding)"
-    r"|de-identification framework|at-rest (?:body )?encryption|encryption[- ]at[- ]rest"
+    rf"{_SECOND_FACTOR.pattern}|{_BUILT_ELSEWHERE.pattern}"
+    r"|at-rest (?:body )?encryption|encryption[- ]at[- ]rest"
     r"|\bmTLS\b|MLLP-over-TLS|(?:native|transport) TLS|\bRBAC\b",
     re.IGNORECASE,
 )
@@ -3527,33 +3537,23 @@ _TABLE_CONTROL = re.compile(
 _TABLE_STATUS = re.compile(rf"\bbuilt\b|\bby default\b|{_ABSENT.pattern}", re.IGNORECASE)
 
 
-def _guide_section(heading: str, until: str = "\n## ") -> str:
-    guide = _doc(_GUIDE)
-    start = guide.index("\n" + heading)
-    return guide[start : guide.index(until, start + 1)]
-
-
 #: Each place that restated the table's facts, with how to cut it out of its page, the link it
 #: must carry, and a clause floor below its count on 2026-10-12.
 _LINKING_SCOPES: dict[str, tuple[Callable[[], str], str, int]] = {
-    "README.md": (lambda: _doc("README.md"), "docs/EARLY-ADOPTER-GUIDE.md", 100),
-    "guide section 1": (lambda: _guide_section("## 1. What MessageFoundry is"), "](", 10),
+    "README.md": (lambda: _doc("README.md"), _GUIDE, 100),
+    "guide section 1": (lambda: _doc_section(_GUIDE, "## 1. What MessageFoundry is"), "](", 10),
     "guide section 6 opening": (
-        lambda: _guide_section("## 6. Security & PHI hardening", until="\n- [ ]"),
+        lambda: _doc_section(_GUIDE, "## 6. Security & PHI hardening", until="\n- [ ]"),
         "](",
         3,
     ),
     "docs/PHI.md off-loopback paragraph": (
-        lambda: "\n\n".join(
-            p
-            for p in re.split(r"\n\s*\n", _doc("docs/PHI.md"))
-            if "only become material off-loopback" in _flat(p)
-        ),
+        lambda: "\n\n".join(_phi_off_loopback_paragraphs()),
         "(EARLY-ADOPTER-GUIDE.md",
         3,
     ),
     "docs/PHI.md known limitations": (
-        lambda: _doc("docs/PHI.md").split("\n## 12. Known limitations", 1)[1].split("\n## ", 1)[0],
+        lambda: _doc_section("docs/PHI.md", "## 12. Known limitations"),
         "(EARLY-ADOPTER-GUIDE.md",
         5,
     ),
@@ -3944,7 +3944,7 @@ def test_the_thirteenth_sweep_phi_qualifies_the_second_factor_for_oidc() -> None
 
     docs/PHI.md section 1 links to the security controls table for the factor now (vault BACKLOG
     #2970), so the table's second-factor row is where the reach is stated. That row must name the
-    claim. It is read beside PHI.md's paragraphs, so the old sentence reds in either place."""
+    claim, whatever else it says. PHI.md's own paragraphs are still read for the old sentence."""
     factor_row = " | ".join(_security_row(r"second factor"))
     for token in ("`[security].require_mfa`", "`[auth].oidc_require_mfa_claim`"):
         assert token in factor_row, (
@@ -3953,17 +3953,14 @@ def test_the_thirteenth_sweep_phi_qualifies_the_second_factor_for_oidc() -> None
         )
     paragraphs = [p for p in re.split(r"\n\s*\n", _doc("docs/PHI.md")) if "require_mfa`" in p]
     assert paragraphs, "docs/PHI.md names require_mfa nowhere, so this check reads nothing"
-    units = [*paragraphs, factor_row]
-    assert len(units) >= 2, "the scan needs PHI.md's paragraphs and the table's row"
     bare = [
         _flat(p)[:120]
-        for p in units
+        for p in paragraphs
         if re.search(r"\bany bind\b|\bevery (?:sign-in|session|bind)\b", _flat(p), re.I)
         and "oidc_require_mfa_claim" not in p
     ]
     assert not bare, (
-        f"docs/PHI.md, or the table, says the engine's factor applies on any bind without the "
-        f"OIDC claim: {bare}"
+        f"docs/PHI.md says the engine's factor applies on any bind without the OIDC claim: {bare}"
     )
 
 
@@ -4284,11 +4281,7 @@ def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
             "built is not the same as on."
         )
     doc = _doc("docs/PHI.md")
-    off_loopback = [
-        _flat(p)
-        for p in re.split(r"\n\s*\n", doc)
-        if "only become material off-loopback" in _flat(p)
-    ]
+    off_loopback = [_flat(p) for p in _phi_off_loopback_paragraphs()]
     assert off_loopback, "docs/PHI.md no longer has its off-loopback controls paragraph"
     paragraphs = [
         *off_loopback,
