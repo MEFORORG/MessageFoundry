@@ -222,6 +222,38 @@ def test_control_an_admission_covers_the_plain_name_in_any_case(name: str) -> No
     assert f"{_NAME}: {_VALUE}\r\n".encode() in proxy.cleartext[0]
 
 
+def _https_proxy_for_http_only(
+    proxy: _WireProxy, *, admitted: bool
+) -> urllib.request.OpenerDirector:
+    """Only ``http`` is proxied, to a proxy written ``https://``, on a context that fully
+    verifies. That is the one leg that reaches a proxy over TLS first."""
+    handler = LoopbackDirectProxyHandler(
+        {"http": f"https://{proxy.address}"}, caller_header_admitted=admitted
+    )
+    return build_strict_opener(handler)
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("name", [_NAME + " ", _NAME + "\x00"], ids=["space", "nul"])
+def test_an_oddly_spelled_header_does_not_cross_a_verified_tls_leg(
+    name: str, admitted: bool
+) -> None:
+    """The plain name may cross this leg, because the proxy takes it as its own. A proxy is not
+    sure to take any other spelling that way, and could pass it on to the ``http`` destination."""
+    with _WireProxy() as proxy:
+        opener = _https_proxy_for_http_only(proxy, admitted=admitted)
+        _refused(opener, _request(name, _HTTP_TARGET), "#3416")
+    assert proxy.connections == 0
+
+
+def test_control_the_plain_name_crosses_a_verified_tls_leg() -> None:
+    with _WireProxy() as proxy:
+        opener = _https_proxy_for_http_only(proxy, admitted=False)
+        _open_and_discard(opener, _request(_NAME, _HTTP_TARGET))
+    assert proxy.tls_first == 1
+    assert proxy.cleartext == []
+
+
 def test_a_second_header_never_hides_a_proxy_url_credential() -> None:
     """Two proxies. urllib makes a header from the first one's URL and carries it on to the
     second. The request also holds a caller-set header under another key, stored first. Every

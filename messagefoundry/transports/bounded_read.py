@@ -835,7 +835,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     guard, ``transports.rest.refuse_cleartext_credential_hop``. It admits a ``proxy_user``
     credential in at least these cases: under ``[security].enforcement = warn``, where it logs a
     WARNING, and when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``. The
-    connection's proxy handler then carries ``caller_header_admitted``. The exception never covers
+    connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
+    header in its plain spelling only. A header named with any other character at either end is
+    never admitted, and is refused on every proxy leg, a verified TLS leg included: neither urllib
+    nor a proxy is sure to take that spelling as the proxy's own. The exception never covers
     a request that goes direct, and never a credential from a proxy URL, including one a request
     carries on to a second proxy. **A TLS leg whose context does not fully verify the proxy is
     refused regardless**, admitted or not, because that guard never reads the TLS context.
@@ -916,7 +919,8 @@ def _sends_cleartext_proxy_credentials(
     # An admission covers the header its connection made, which is spelled plainly. urllib moves
     # only that spelling into a CONNECT, so any other would stay on the request sent inside the
     # tunnel, and the destination would read it. So no other spelling is ever admitted.
-    admitted = caller_header_admitted and all(_is_spelled_plainly(name) for name in carried)
+    oddly_spelled = not all(_is_spelled_plainly(name) for name in carried)
+    admitted = caller_header_admitted and not oddly_spelled
     if not _is_from_a_proxy_url(carried.values(), user, password, proxies) and (
         not carried or admitted
     ):
@@ -927,8 +931,9 @@ def _sends_cleartext_proxy_credentials(
         return False
     # The TLS leg. urllib then hands the request back to the opener, so an https proxy that takes
     # it is checked here again, with req.type now "https". The strict https handler checks that
-    # its context verifies the proxy.
-    return not (req.type == "http" and (scheme or "").lower() == "https")
+    # its context verifies the proxy. An oddly spelled header does not cross even that leg: a
+    # proxy that did not take it as its own could pass it on to the destination.
+    return oddly_spelled or not (req.type == "http" and (scheme or "").lower() == "https")
 
 
 def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, context: object) -> None:
@@ -972,7 +977,7 @@ def is_proxy_credential_header_name(name: str) -> bool:
     name. A name that differs in any other way is another header, which the rule on
     :class:`ProxyCredentialsRefusedError` leaves out.
     """
-    return _NOT_A_NAME_EDGE.sub("", name).lower() == _PLAIN_NAME
+    return _PROXY_CREDENTIAL_NAME.fullmatch(name) is not None
 
 
 def _is_spelled_plainly(name: str) -> bool:
@@ -1152,8 +1157,11 @@ def _is_a(handler: object, kinds: type | tuple[type, ...]) -> bool:
 _TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
 _TOKEN = f"[{_TCHARS}]+"
 _FIELD_NAME = re.compile(_TOKEN)
-#: A run of characters at either end of a header name that no field name can hold.
-_NOT_A_NAME_EDGE = re.compile(rf"\A[^{_TCHARS}]+|[^{_TCHARS}]+\Z")
+#: ``Proxy-Authorization`` in any ASCII letter case, with any run of characters that no field
+#: name can hold at either end. Matched whole, so a long name costs linear time.
+_PROXY_CREDENTIAL_NAME = re.compile(
+    rf"[^{_TCHARS}]*{_PLAIN_NAME}[^{_TCHARS}]*", re.ASCII | re.IGNORECASE
+)
 #: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
 #: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
 _OBS_FOLD = re.compile(r"\r?\n[ \t]")
