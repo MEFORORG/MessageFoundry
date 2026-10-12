@@ -2819,7 +2819,7 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
             # OpenSSL's text names no path. reason is None for some errors, such as a bad PEM body,
             # and absent on an SSLError built in Python.
             reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
-            problem = f"holds no usable CA certificate: {reason}"
+            problem = f"OpenSSL could not load as PEM certificates: {reason}"
         else:
             problem = f"cannot be read: {exc.strerror or type(exc).__name__}"
         raise CaFileUnreadable(f"{setting} names a CA file that {problem}") from exc

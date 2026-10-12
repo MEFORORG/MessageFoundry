@@ -373,23 +373,37 @@ def test_a_missing_instance_ca_file_names_the_tls_block(mode: str, tmp_path: Pat
     ],
     ids=["client-context", "https-handler"],
 )
+@pytest.mark.parametrize(
+    ("policy", "connection_ca", "setting"),
+    [
+        ("system", True, "tls_ca_file of connection 'OB'"),
+        ("augment", False, "[tls].internal_ca_file"),
+    ],
+    ids=["pinned-connection-ca", "augment-instance-ca"],
+)
 def test_a_ca_file_that_is_not_pem_names_the_setting_too(
-    build: Callable[[TrustAnchor], object], tmp_path: Path
+    build: Callable[[TrustAnchor], object],
+    policy: str,
+    connection_ca: bool,
+    setting: str,
+    tmp_path: Path,
 ) -> None:
     """Vault BACKLOG #2977 item 10. A file that reads but holds no CA was re-raised as a raw
     SSLError naming nothing. It now gets the same worded error, naming the setting and not the
-    path. The cause keeps the SSLError for a reader who needs OpenSSL's reason."""
-    junk = tmp_path / "junk.pem"
-    junk.write_text("not a certificate", encoding="utf-8")
+    path. Both load arms: a connection's own CA, and an instance CA added to the OS roots. The
+    cause keeps the SSLError for a reader who needs OpenSSL's reason."""
+    junk = str(tmp_path / "junk.pem")
+    Path(junk).write_text("not a certificate", encoding="utf-8")
     anchor = resolve_trust_anchor(
-        connection_ca_file=str(junk), host="10.1.2.3", policy=TrustAnchorPolicy(), connection="OB"
+        connection_ca_file=junk if connection_ca else None,
+        host="10.1.2.3",
+        policy=TrustAnchorPolicy(internal_ca_file=junk, mode=policy),  # type: ignore[arg-type]
+        connection="OB",
     )
     with pytest.raises(CaFileUnreadable) as caught:
         build(anchor)
     message = str(caught.value)
-    assert message.startswith(
-        "tls_ca_file of connection 'OB' names a CA file that holds no usable CA certificate"
-    ), message
+    assert message.startswith(f"{setting} names a CA file that OpenSSL could not load"), message
     assert "junk.pem" not in message
     assert isinstance(caught.value.__cause__, ssl.SSLError)
 
