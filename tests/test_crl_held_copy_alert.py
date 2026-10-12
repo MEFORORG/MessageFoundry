@@ -67,17 +67,33 @@ class _Ca:
     name: x509.Name
     pem: bytes
 
-    def crl(self, *, days: float, number: int) -> bytes:
-        """A CRL this CA signed, revoking nothing, whose nextUpdate is ``days`` from now."""
+    def crl(
+        self,
+        *,
+        days: float,
+        number: int,
+        starts_in_days: float = 0.0,
+        key: ec.EllipticCurvePrivateKey | None = None,
+        delta: bool = False,
+    ) -> bytes:
+        """A CRL naming this CA, revoking nothing, whose nextUpdate is ``days`` from now. It takes
+        effect ``starts_in_days`` from now, is signed by ``key`` in place of the CA's own, and is a
+        delta CRL when ``delta`` (the last three for BACKLOG #3176)."""
         now = datetime.datetime.now(datetime.UTC)
-        crl = (
+        builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.name)
-            .last_update(now - datetime.timedelta(hours=1, minutes=number))
+            .last_update(
+                now
+                - datetime.timedelta(hours=1, minutes=number)
+                + datetime.timedelta(days=starts_in_days)
+            )
             .next_update(now + datetime.timedelta(days=days))
             .add_extension(x509.CRLNumber(number), False)
-            .sign(self.key, hashes.SHA256())
         )
+        if delta:
+            builder = builder.add_extension(x509.DeltaCRLIndicator(number - 1), True)
+        crl = builder.sign(key or self.key, hashes.SHA256())
         return crl.public_bytes(serialization.Encoding.PEM)
 
 
@@ -567,30 +583,6 @@ def test_the_syslog_forwarder_records_its_ca_bundle_crl(ca: _Ca, tmp_path: Path)
 # --- BACKLOG #3176: CA-file remedies that would restart into a refusal -----------------------------
 
 
-def _odd_crl(
-    ca: _Ca,
-    *,
-    starts_in_days: float = 0.0,
-    key: ec.EllipticCurvePrivateKey | None = None,
-    delta: bool = False,
-) -> bytes:
-    """A CRL naming ``ca`` as its issuer, good for ninety days from when it takes effect, that a
-    restart would load and then refuse peers on: it takes effect later, it is signed by ``key``
-    instead of the CA's own, or it is a delta CRL."""
-    now = datetime.datetime.now(datetime.UTC)
-    start = now - datetime.timedelta(hours=1) + datetime.timedelta(days=starts_in_days)
-    builder = (
-        x509.CertificateRevocationListBuilder()
-        .issuer_name(ca.name)
-        .last_update(start)
-        .next_update(start + datetime.timedelta(days=90))
-        .add_extension(x509.CRLNumber(9), False)
-    )
-    if delta:
-        builder = builder.add_extension(x509.DeltaCRLIndicator(8), True)
-    return builder.sign(key or ca.key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
-
-
 def _replaced_bundle(ca: _Ca, tmp_path: Path, new_crl: bytes) -> tuple[ssl.SSLContext, Path]:
     """A hop that loaded a CA file whose CRL lapses in about five days, after which the operator
     put ``new_crl`` in its place."""
@@ -616,7 +608,7 @@ def test_a_not_yet_valid_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
 ) -> None:
     # Alone for its issuer, a CRL not in effect yet is the one OpenSSL picks, and it refuses every
     # peer under that issuer with "CRL is not yet valid". Before the fix this read "Restart".
-    hop, bundle = _replaced_bundle(ca, tmp_path, _odd_crl(ca, starts_in_days=2))
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=2))
 
     detail = _bundle_detail(bundle)
 
@@ -630,7 +622,7 @@ def test_a_badly_signed_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
 ) -> None:
     # The CRL names this CA but another key signed it. OpenSSL checks that only at the handshake,
     # so a restart loads it and then every handshake it judges fails. Before the fix: "Restart".
-    hop, bundle = _replaced_bundle(ca, tmp_path, _odd_crl(ca, key=_another_ca().key))
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, key=_another_ca().key))
 
     detail = _bundle_detail(bundle)
 
@@ -646,7 +638,7 @@ def test_a_crl_the_engine_cannot_judge_in_the_ca_file_is_fixed_before_a_restart(
     # The two ways a CA file's CRL cannot be judged: a delta CRL, which only the strict reading
     # refuses (before the fix it read "Restart"), and a block that does not parse at all.
     garbled = b"-----BEGIN X509 CRL-----\nbm90IGEgQ1JM\n-----END X509 CRL-----\n"
-    new_crl = _odd_crl(ca, delta=True) if kind == "delta" else garbled
+    new_crl = ca.crl(days=90, number=3, delta=True) if kind == "delta" else garbled
     hop, bundle = _replaced_bundle(ca, tmp_path, new_crl)
 
     detail = _bundle_detail(bundle)
@@ -732,11 +724,11 @@ def test_a_refused_reload_of_such_a_file_keeps_its_remedy_alone_and_first(
 # --- BACKLOG #3176: a failure grouping the rows, or recording a CA-file CRL -------------------------
 
 
-def test_a_failure_grouping_the_crl_rows_costs_the_crl_alerts_not_the_scan(
+def test_a_failure_grouping_the_crl_rows_costs_only_the_shared_rows_note(
     ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Before the fix the grouping ran before the loop, so it raised out of run_once and no row was
-    # judged that pass. Now it fails inside the per-row try, and every row is still judged.
+    # judged or alerted that pass. Now it is logged once, and only shared_with is lost.
     crl = tmp_path / "crl.pem"
     crl.write_bytes(ca.crl(days=5.5, number=1))
     cert = tmp_path / "cert.pem"
@@ -755,7 +747,10 @@ def test_a_failure_grouping_the_crl_rows_costs_the_crl_alerts_not_the_scan(
 
     assert [c.label for c in checks] == ["tls.crl_file", "api"]
     assert [c[0] for c in sink.cert_calls] == ["api"]
-    assert any("crl_expiry alert sink failed" in r.getMessage() for r in caplog.records)
+    assert [c[0] for c in sink.crl_calls] == ["tls.crl_file"]
+    assert sink.crl_notes == [(False, "", ())]
+    errors = [r for r in caplog.records if "could not group the CRL rows" in r.getMessage()]
+    assert len(errors) == 1
 
 
 def test_a_failure_recording_a_ca_file_crl_is_logged_as_a_defect_not_a_bad_crl(
