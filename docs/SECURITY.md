@@ -3651,7 +3651,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   longer has this problem: its step-up is the IdP leg above. See ADR 0142 *Consequences* and
   Amendment B.
 - **Out of scope:** SAML 2.0, cloud-only (non-hybrid) users, a JSON/API federated path (`/ui` only),
-  refresh tokens, and RP-initiated logout. So a sign-out at the IdP does not end an engine session;
+  refresh tokens, RP-initiated logout, and back-channel logout. With no back-channel receiver, a
+  sign-out at the IdP does not end an engine session;
   [The engine session is independent of the IdP session](#the-engine-session-is-independent-of-the-idp-session-asvs-761)
   says what does.
 
@@ -3925,10 +3926,12 @@ says under *Time since the IdP sign-in is bounded too*. **A Kerberos session has
 
 **The directory reconciler above is the one path from the directory to a live session.** It runs
 every `[auth].ad_session_recheck_seconds`, 300 seconds by default, over directory accounts that hold
-a session. Every federated account is also a directory account, so it covers both legs. It acts at
-least on the directory events in the table's last row. In each case it ends every session of that
-account. It never disables or deletes the engine account itself. For a disable or delete it waits
-for `[auth].ad_session_recheck_strikes` passes, 2 by default.
+a session. Every federated account is also a directory account, so it reaches both legs. One
+exception: it skips a federated binding on a row with no directory id, as that section says. It acts
+at least on the directory events in the table's last row. When it revokes, it ends every session of
+that account. It never disables or deletes the engine account itself. A disable or delete takes
+`[auth].ad_session_recheck_strikes` passes. A large estate takes more, because each pass probes at
+most `[auth].ad_session_recheck_max_users` accounts.
 [Directory session reconciliation](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
 has the full rule, including when a pass revokes nothing. It does not see at least these: a sign-out
 or revocation at the IdP, a password reset in the directory, and an account expiry or lockout. Of
@@ -3938,7 +3941,7 @@ the account's status flags, the pass reads only the disabled flag.
 receiver would add an unauthenticated POST surface, and the reconciler already ends a disabled
 account's sessions ([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
 Amendment B.2). The SPNEGO library the engine uses, pyspnego, does not expose the Kerberos ticket's
-lifetime, and the project declined to fork or patch it to get one. A fixed fallback in its place
+lifetime. The project declined to fork or patch it to get one. A fixed fallback in its place
 would look like a directory bound when it is not
 ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md), amendment of 2026-07-21). So the
 engine bounds its own sessions with short caps, and the reconciler carries directory changes.
@@ -3948,13 +3951,14 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
 - lower `[security].max_session_hours` or `[security].sign_out_after_idle_minutes`, which bound every
   session on both legs;
 - for OIDC, set `[auth].oidc_session_max_hours`, or lower `[auth].oidc_max_age_seconds`;
-- keep the reconciler on, and shorten its window by lowering `[auth].ad_session_recheck_seconds`
-  (60 at least) or `[auth].ad_session_recheck_strikes`. Setting the interval to `0` turns it off,
-  and that is a declared loosening;
+- keep the reconciler on, and shorten its window: lower `[auth].ad_session_recheck_seconds`, or raise
+  `[auth].ad_session_recheck_max_users` on a large estate. Setting the interval to `0` turns the
+  reconciler off, and that is a declared loosening. Lowering `ad_session_recheck_strikes` also
+  shortens it, at a cost: with 1, one ambiguous "not found" revokes;
 - end one user's sessions at once with `DELETE /users/{user_id}/sessions`, or by disabling the user
   in the engine.
 
-[CONFIGURATION.md](CONFIGURATION.md) gives each setting's range.
+[CONFIGURATION.md](CONFIGURATION.md) documents each setting.
 
 ### Session inventory & targeted revocation (WP-10)
 
