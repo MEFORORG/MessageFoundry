@@ -9,6 +9,7 @@ deterministic aggregation/mapping/report logic is exercised in isolation.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from harness.acceptance.matrix import MATRIX, Status
@@ -24,6 +25,7 @@ from harness.acceptance.runner import (
     _parse_junit_by_file,
     run_matrix,
 )
+from messagefoundry.terminal_text import escape_for_markdown_cell
 
 _JUNIT = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites><testsuite name="pytest" tests="4">
@@ -109,6 +111,42 @@ def test_reports_render(tmp_path: Path) -> None:
     assert any(line.startswith("A1,") for line in csv_text.splitlines())
     console = render_console(results)
     assert "A1" in console and "exit" in console
+
+
+def _md_data_rows(md: str) -> list[str]:
+    # Every table line but the header ("| ID |...") and the rule ("|---|...").
+    return [line for line in md.splitlines() if line.startswith("| ") and "| ID |" not in line]
+
+
+def test_render_markdown_keeps_a_hostile_detail_in_one_row() -> None:
+    # BACKLOG #2897: the report escaped only the pipe, so a newline in a detail ended the row and
+    # the peer's next line read as a forged one. Every cell now takes the verify report's rule.
+    hostile = "boom\n| A9 | forged | x | PASS | all good |\r<img src=x>`c`$x$\x1b[2J"
+    row = replace(MATRIX[0], id="A1|x", title=f"t{hostile}", per_db="p|q\nr")
+    md = render_markdown([RowResult(row, Status.FAIL, hostile)])
+    rows = _md_data_rows(md)
+    assert len(rows) == 1  # the newline did not start a forged row
+    assert rows[0].count("|") == 6  # five cells, every pipe the peer sent inert
+    assert rows[0].startswith("| A1&#124;x | t")
+    assert "| p&#124;q\\x0ar |" in rows[0]
+    assert "\\x0a&#124; A9 &#124; forged" in rows[0]
+    assert "\\x0d&lt;img src=x&gt;&#96;c&#96;&#36;x&#36;\\x1b[2J" in rows[0]
+    assert not any(ch in md for ch in "\x1b\r<")
+
+
+def test_render_markdown_uses_the_verify_reports_cell_rule() -> None:
+    from messagefoundry.verify.model import CheckResult
+    from messagefoundry.verify.report import render_markdown as render_verify_markdown
+
+    detail = "C:\\Users\\svc \u2014 see [store].path; a\\|b & `x`"
+    row = RowResult(MATRIX[0], Status.FAIL, detail)
+    acceptance = _md_data_rows(render_markdown([row]))
+    verify = render_verify_markdown([CheckResult("a", "t", Status.FAIL, detail)])
+    assert len(acceptance) == 1
+    cell = escape_for_markdown_cell(detail)
+    assert acceptance[0].endswith(f"| {cell} |")
+    assert f"| {cell} |" in verify
+    assert cell == "C:\\Users\\svc \u2014 see [store].path; a\\\\&#124;b &amp; &#96;x&#96;"
 
 
 def test_render_csv_neutralizes_formula_injection() -> None:

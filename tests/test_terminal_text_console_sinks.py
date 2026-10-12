@@ -493,22 +493,22 @@ def test_the_strict_alphabet_and_the_per_character_rule_agree_over_every_code_po
 
 
 def test_the_markdown_cell_pattern_matches_exactly_its_replacement_keys() -> None:
-    from messagefoundry.verify import report
+    from messagefoundry import terminal_text
 
-    assert len(report._MD_CELL) >= 7
-    for key in report._MD_CELL:
-        assert report._MD_CELL_RE.fullmatch(key), key
-    # Every match must be a key, or _md_cell raises KeyError: walk every single code point and
-    # every ASCII pair, which covers each key's length.
-    assert max(len(key) for key in report._MD_CELL) == 2
+    table, pattern = terminal_text._MD_CELL, terminal_text._MD_CELL_RE
+    assert len(table) >= 7
+    for key in table:
+        assert pattern.fullmatch(key), key
+    # Every match must be a key, or escape_for_markdown_cell raises KeyError: walk every single
+    # code point and every ASCII pair, which covers each key's length.
+    assert max(len(key) for key in table) == 2
     for code in range(0x110000):
         char = chr(code)
-        assert (report._MD_CELL_RE.fullmatch(char) is not None) is (char in report._MD_CELL), code
+        assert (pattern.fullmatch(char) is not None) is (char in table), code
     for first in range(0x80):
         for second in range(0x80):
             pair = chr(first) + chr(second)
-            matched = report._MD_CELL_RE.fullmatch(pair) is not None
-            assert matched is (pair in report._MD_CELL), pair
+            assert (pattern.fullmatch(pair) is not None) is (pair in table), pair
 
 
 @pytest.mark.parametrize(
