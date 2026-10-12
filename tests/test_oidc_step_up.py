@@ -23,11 +23,12 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
+from _totp_clock import pin_totp_clock
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from messagefoundry.auth import oidc
+from messagefoundry.auth import oidc, totp
 from messagefoundry.auth.identity import SessionMechanism
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryBind
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.service import (
     DIRECTORY_ROLES_DEMOTED,
     FLOW_PURPOSE_MISMATCH,
@@ -40,7 +41,9 @@ from messagefoundry.auth.service import (
     AuthService,
 )
 from messagefoundry.auth.tokens import hash_token, mint_token
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
     DEFAULT_SUB,
@@ -97,9 +100,11 @@ async def _oidc_session(
     service: AuthService,
     monkeypatch: pytest.MonkeyPatch,
     rsa_key: rsa.RSAPrivateKey,
+    *,
+    client: str | None = None,
     **claim_over: Any,
 ) -> str:
-    out = await _oidc_login(service, monkeypatch, rsa_key, **claim_over)
+    out = await _oidc_login(service, monkeypatch, rsa_key, client=client, **claim_over)
     assert out.ok and out.token is not None, out
     return out.token
 
@@ -714,7 +719,7 @@ async def test_another_persons_older_idp_answer_is_a_subject_mismatch_not_stale(
         service = await _service(store, rsa_key)
         skew = service._settings.oidc_clock_skew_seconds
         signed_in = {"engine-clock-stale": time.time() - 10 * skew, "idp-clock-not-later": None}
-        over = {} if signed_in[which] is None else {"auth_time": signed_in[which]}
+        over: dict[str, Any] = {} if signed_in[which] is None else {"auth_time": signed_in[which]}
         token = await _oidc_session(service, monkeypatch, rsa_key, **over)
         held = await _held_auth_time(store, token)
         assert held is not None
@@ -883,6 +888,162 @@ async def test_the_idp_step_up_records_its_address_only_for_an_account_that_owes
 
         assert out.ok, out
         assert await store.list_known_login_addresses(uid, since=0.0) == recorded
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2142: a TOTP code completes an OIDC session's factor but opens no window ---------------
+#
+# Seat decision under owner delegation 2026-10-08, not an owner ruling (ADR 0142 Amendment F). It
+# extends ADR 0142 Amendment B: an OIDC session's step-up window and its address anchor move only at
+# the IdP. A local session's code still opens the window, which the last test pins.
+
+_T0 = 1_700_000_000.0
+_T1 = _T0 + totp.DEFAULT_PERIOD
+
+
+class _ProbingLdap(_FakeLdap):
+    """Also answers ``verify_mfa``'s directory check (BACKLOG #2023) with the account present."""
+
+    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        return DirectoryProbe(DirectoryAnswer.FOUND, PRINCIPAL)
+
+
+async def _enrol_totp(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch, token: str
+) -> tuple[str, str, tuple[str, ...]]:
+    """Enrol a TOTP on the session's account; return ``(secret, the session's rotated token, the
+    recovery codes)``.
+
+    The enrolment spends ``_T0``'s step, so the code the test verifies uses ``_T1``'s."""
+    identity = await service.identity_for_token(token, activity=False)
+    assert identity is not None
+    pin_totp_clock(monkeypatch, _T0)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enroll.secret, now=_T0), token=token
+    )
+    assert confirmed.ok and confirmed.token is not None, confirmed
+    pin_totp_clock(monkeypatch, _T1)
+    return enroll.secret, confirmed.token, confirmed.recovery_codes
+
+
+async def test_a_code_completes_a_pending_oidc_factor_but_opens_no_window(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``verify_mfa`` stamps ``reauth_at`` or re-anchors the address for an OIDC session.
+
+    The sign-in carries no accepted MFA claim, so the session owes the engine factor. The code meets
+    it, and the session rotates, but the window stays shut and the anchor stays at the sign-in's
+    address: the new address still trips the new-address signal until the IdP step-up. The address
+    record still learns the address, because a factor was proved from it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(
+            store,
+            rsa_key,
+            ldap=_ProbingLdap(),
+            oidc_require_mfa_claim=False,
+            mfa_verify_min_elapsed_seconds=0,
+            admin_new_ip_step_up=True,
+        )
+        first = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
+        secret, _enrolled, _codes = await _enrol_totp(service, monkeypatch, first)
+        pending = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
+        assert not await service.mfa_satisfied(pending)
+
+        verified = await service.verify_mfa(pending, totp.totp(secret, now=_T1), client="10.0.0.9")
+
+        assert verified.ok and verified.token is not None and verified.token != pending
+        new = verified.token
+        assert await service.mfa_satisfied(new), "the code no longer completes the factor"
+        session = await store.get_session(hash_token(new))
+        assert session is not None and session.auth_mechanism == SessionMechanism.OIDC.value
+        assert session.reauth_at is None, "a TOTP code opened an OIDC session's step-up window"
+        assert not await service.has_recent_step_up(new)
+        assert session.client == "10.0.0.1", "a TOTP code re-anchored an OIDC session"
+        assert await service.flag_new_client_ip(new, "10.0.0.9", path=NEXT)
+        uid = await _user_id(service, new)
+        assert "10.0.0.9" in await store.list_known_login_addresses(uid, since=0.0)
+        assert await _audit_rows(store, "auth.mfa_verified")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", ["totp", "recovery"])
+async def test_a_code_on_a_satisfied_oidc_session_is_refused_unread(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """RED when: an OIDC session whose holder enrolled a TOTP renews its window with a code alone,
+    or spends a code that can do nothing.
+
+    The sign-in's MFA claim already met the factor, so the code has nothing to complete. Before
+    BACKLOG #2142 it opened the window with no IdP round trip, which is the case the decision
+    closes. Verifying it now would only burn a TOTP step or a single-use recovery code, so it is
+    refused unread, as ``reauth`` refuses a password: the session survives, nothing rotates, no
+    recovery code is spent and nothing is charged. The IdP step-up still opens the window."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(
+            store, rsa_key, ldap=_ProbingLdap(), mfa_verify_min_elapsed_seconds=0
+        )
+        token = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
+        assert await service.mfa_satisfied(token)
+        secret, token, recovery = await _enrol_totp(service, monkeypatch, token)
+        identity = await service.identity_for_token(token, activity=False)
+        assert identity is not None and recovery
+        left = (await service.mfa_status(identity)).recovery_codes_remaining
+        code = totp.totp(secret, now=_T1) if kind == "totp" else recovery[0]
+
+        refused = await service.verify_mfa(token, code, client="10.0.0.1")
+
+        assert not refused.ok and refused.idp_step_up_required and not refused.session_lost
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.revoked_at is None, "the token must still work"
+        assert session.reauth_at is None
+        assert not await service.has_recent_step_up(token)
+        assert (await service.mfa_status(identity)).recovery_codes_remaining == left
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == 0
+        rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.mfa_failed")]
+        assert rows[-1] == {"reason": IDP_STEP_UP_REQUIRED}
+        # The TOTP step was not consumed either: the store still takes it as new. Asked last,
+        # because asking consumes it.
+        step = int(_T1 // totp.DEFAULT_PERIOD)
+        assert await store.consume_totp_step(identity.user_id, step), "the code was read"
+
+        flow_id, _url = await _begin(service, token)
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+        assert out.ok and out.elevation.token is not None, out
+        assert await service.has_recent_step_up(out.elevation.token)
+    finally:
+        await store.close()
+
+
+async def test_a_code_on_a_local_session_still_opens_the_window_and_re_anchors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the OIDC arm keys on the session's mechanism, so a password-minted session's
+    code still opens the window and moves the anchor to the address that proved it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        await service.initialize()
+        _identity, token, password = await login_admin(service)
+        secret, _enrolled, _codes = await _enrol_totp(service, monkeypatch, token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.0.0.1")
+        assert out.ok and out.token is not None and out.mfa_required
+
+        verified = await service.verify_mfa(
+            out.token, totp.totp(secret, now=_T1), client="10.0.0.9"
+        )
+
+        assert verified.ok and verified.token is not None
+        session = await store.get_session(hash_token(verified.token))
+        assert session is not None and session.auth_mechanism == SessionMechanism.PASSWORD.value
+        assert session.reauth_at is not None
+        assert await service.has_recent_step_up(verified.token)
+        assert session.client == "10.0.0.9"
     finally:
         await store.close()
 

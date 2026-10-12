@@ -33,7 +33,7 @@ from fastapi import Depends, FastAPI
 from messagefoundry.api import create_app
 from messagefoundry.api.security import _STEP_UP_VIA_HEADER, require_reauth_only
 from messagefoundry.apiclient import ApiError, EngineClient, IdpStepUpRequired
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_DISABLE,
@@ -173,7 +173,7 @@ def _assert_idp_hint(site: str, r: httpx.Response, action: str | None) -> None:
     detail = r.json()["detail"]
     assert "/ui/reauth" in detail, (site, detail)
     assert "/me/reauth" not in detail, (site, detail)
-    # BACKLOG #2142 owns whether a code may clear this step-up; the hint must not answer it.
+    # BACKLOG #2142: a code opens no window on an oidc session, so the hint must not name it.
     assert "mfa-verify" not in detail, (site, detail)
     assert "X-MFA-Required" not in r.headers, site
 
@@ -239,6 +239,34 @@ async def test_every_other_session_keeps_the_password_refusal_byte_for_byte(
             assert r.status_code == 200, (site, r.status_code, r.text)
             continue
         _assert_password_refusal(site, r, actions[site])
+
+
+async def test_mfa_verify_refuses_a_satisfied_oidc_session_with_the_idp_header(
+    engine: Engine, service: AuthService
+) -> None:
+    """BACKLOG #2142, ADR 0142 Amendment F: an ``oidc`` session that already met its factor owes
+    no code, and a code opens no window for it, so ``POST /auth/mfa-verify`` refuses it unread with
+    the header ``POST /me/reauth`` sends. A password session's wrong code is the control: still the
+    ordinary 401, so the refusal keys on the session's mechanism."""
+    uid = await _add_admin(service)
+    secret = "JBSWY3DPEHPK3PXP"
+    await service.store.set_totp_secret(uid, secret=secret)
+    wrong = "000000" if totp.totp(secret) != "000000" else "111111"
+    assert await service.store.enable_totp(uid, recovery_code_hashes=[])
+    oidc_token = await _session(service, uid, "tok-mfa-oidc", mechanism="oidc")
+    password_token = await _session(service, uid, "tok-mfa-pw", mechanism="password")
+    for token in (oidc_token, password_token):
+        await service.store.mark_session_mfa_verified(hash_token(token))
+    async with _client_at(engine, service, HOME) as c:
+        refused = await c.post("/auth/mfa-verify", headers=_auth(oidc_token), json={"code": wrong})
+        assert refused.status_code == 403, refused.text
+        assert refused.headers.get(_STEP_UP_VIA_HEADER) == "idp"
+        assert "/ui/reauth" in refused.json()["detail"]
+        control = await c.post(
+            "/auth/mfa-verify", headers=_auth(password_token), json={"code": wrong}
+        )
+        assert control.status_code == 401, control.text
+        assert _STEP_UP_VIA_HEADER not in control.headers
 
 
 async def test_the_hint_is_true_because_post_me_reauth_refuses_the_oidc_session(
