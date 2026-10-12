@@ -1783,7 +1783,12 @@ issuer. The engine applies a replaced file only when all three of these hold:
 
 1. The file passes the rules a start applies. Every CRL parses, has a `nextUpdate`, is not a delta CRL
    and has not expired. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
-   engine refuses one. The file carries no certificate the hop does not already trust.
+   engine refuses one. A `-----BEGIN X509 CRL-----` marker inside a comment line refuses the file
+   too, on purpose: the engine cannot tell that text from a CRL the file is meant to hold. Take
+   the marker text out of the comment. The file carries no certificate the hop does not already
+   trust. On a hop that already holds a CRL, a start also makes a private copy of the file in the
+   engine's temporary directory. If it cannot make or read that copy, it refuses and names the
+   setting and the file. That refusal is about the temporary directory, not the CRL.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so without this rule a badly signed CRL would be applied
    and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer sends in its handshake,
