@@ -6176,7 +6176,7 @@ class RegistryRunner:
             # (In per_lane the equivalent check sits inside the worker loop's own except:backoff.)
             log.exception("pooled buildup check failed for stage %s lane %s", stage, lane)
 
-    def build_check(self, registry: Registry) -> None:
+    def build_check(self, registry: Registry, env_values: Mapping[str, Any] | None = None) -> None:
         """Construct (and discard) every connector in ``registry`` so a bad connector spec fails
         BEFORE a reload quiesces anything — i.e. the running graph is left untouched. Construction
         is side-effect-free (no socket bind / file I/O — binding happens later in ``start_inbound``).
@@ -6189,11 +6189,14 @@ class RegistryRunner:
         on a backend that can't re-ingress (Postgres/SQL Server/any non-SQLite) BEFORE the swap, so a
         reload/promote can never bring a PT-on-non-SQLite graph live; the reference-set backend
         allow-list (:func:`check_reference_backend_supported`) does the same for an ADR 0006
-        ``Reference(...)`` on a backend with no snapshot store (SQL Server)."""
+        ``Reference(...)`` on a backend with no snapshot store (SQL Server).
+
+        ``env_values`` defaults to the runner's own. A dry run passes the values it re-read, so it
+        checks them without making them the live graph's (vault BACKLOG #2596)."""
         build_check_registry(
             registry,
             inbound_bind_host=self._inbound_bind_host,
-            env_values=self._env_values,
+            env_values=self._env_values if env_values is None else env_values,
             egress=self._egress,
             reserved_bindings=self._reserved_bindings,
             posture=self._hop_posture,
@@ -6695,7 +6698,9 @@ class RegistryRunner:
             )
         return stranded
 
-    async def reload(self, new_registry: Registry | None = None) -> None:
+    async def reload(
+        self, new_registry: Registry | None = None, env_values: Mapping[str, Any] | None = None
+    ) -> None:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
         ``None`` re-applies the graph that is current once the reload lock is held, so a reload
@@ -6726,7 +6731,17 @@ class RegistryRunner:
         async with self._reload_lock:
             if new_registry is None:
                 new_registry = self.registry
-            self.build_check(new_registry)  # raises before any change on a bad connector
+            # ``env_values`` go live with the graph, under the same lock. A refused or rolled-back
+            # reload puts the previous ones back before it restarts the previous graph's intake
+            # (vault BACKLOG #2596). ``None`` keeps the runner's values.
+            old_env_values = self._env_values
+            if env_values is not None:
+                self._env_values = dict(env_values)
+            try:
+                self.build_check(new_registry)  # raises before any change on a bad connector
+            except BaseException:
+                self._env_values = old_env_values
+                raise
             # What the clear below removes, so a reload that is refused or rolled back puts it
             # back and leaves the markers as they were (vault BACKLOG #3262).
             cleared: dict[tuple[Direction, str], str] | None = None
@@ -6756,6 +6771,7 @@ class RegistryRunner:
                     old, new_registry, old_inbound_names
                 )
             except BaseException:
+                self._env_values = old_env_values
                 self._restore_dr_markers(cleared)
                 raise
             # Step 2 rebuilds both lookup executors for the new graph; the rollback restores these.
@@ -6925,6 +6941,7 @@ class RegistryRunner:
                         "reload failed; rolling back inbound intake to the previous graph"
                     )
                 self.registry = old
+                self._env_values = old_env_values
                 self._restore_dr_markers(cleared)
                 # The lookup executors and ADR 0057 inline eligibility follow the registry back, before
                 # the first await below, so no worker that reads them after the restore pairs the old

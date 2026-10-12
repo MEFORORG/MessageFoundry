@@ -1326,24 +1326,56 @@ async def test_a_release_refused_at_the_second_check_keeps_the_running_env_value
     assert eng_any._env_values == runner_any._env_values == {"HOST": "unreviewed.example.invalid"}
 
 
-async def test_a_swap_the_runner_refuses_keeps_the_running_env_values(
+async def test_a_swap_that_rolls_back_restarts_intake_on_the_old_env_values(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The values go live at the swap, and the swap itself can still refuse and keep the old
-    graph. The old values stay with it."""
+    """The values go live with the swap, and the swap itself can still fail and roll back to the
+    old graph. The rollback restarts the old graph's intake on the old values, not the new ones."""
+    first, second = {"HOST": "first.example.invalid"}, {"HOST": "second.example.invalid"}
+    values = dict(first)
+    monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(values))
+    await engine.reload_detail(dry_run=False)
+    runner = engine.registry_runner
+    assert runner is not None
+    eng_any, runner_any = cast(Any, engine), cast(Any, runner)
+    restarted_on: list[dict[str, Any]] = []
+    real_start = runner_any._checked_inbound_start
+
+    async def _recording_start(name: str) -> None:
+        restarted_on.append(dict(runner_any._env_values))
+        await real_start(name)
+
+    async def _failing_reconcile(_old: object, _new: object) -> None:
+        raise RuntimeError("an outbound connection failed to close")
+
+    monkeypatch.setattr(runner, "_checked_inbound_start", _recording_start)
+    monkeypatch.setattr(runner, "_reconcile_outbounds", _failing_reconcile)
+    values.update(second)
+    with pytest.raises(RuntimeError):
+        await engine.reload_detail(dry_run=False)
+    assert restarted_on and restarted_on[-1] == first  # the rollback's restart
+    assert eng_any._env_values == runner_any._env_values == first
+
+
+async def test_a_dry_run_checks_the_new_env_values_without_applying_them(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     values = {"HOST": "first.example.invalid"}
     monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(values))
     await engine.reload_detail(dry_run=False)
     runner = engine.registry_runner
     assert runner is not None
+    checked: list[object] = []
+    real_check = runner.build_check
 
-    async def _refused(_registry: object) -> None:
-        raise WiringError("a connector failed its build check")
+    def _recording_check(registry: Any, env_values: Any = None) -> None:
+        checked.append(env_values)
+        real_check(registry, env_values)
 
-    monkeypatch.setattr(runner, "reload", _refused)
+    monkeypatch.setattr(runner, "build_check", _recording_check)
     values["HOST"] = "second.example.invalid"
-    with pytest.raises(WiringError):
-        await engine.reload_detail(dry_run=False)
+    await engine.reload_detail(dry_run=True)
+    assert checked == [{"HOST": "second.example.invalid"}]
     eng_any, runner_any = cast(Any, engine), cast(Any, runner)
     assert eng_any._env_values == runner_any._env_values == {"HOST": "first.example.invalid"}
 

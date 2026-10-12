@@ -5401,11 +5401,12 @@ def create_app(
         # doomed repeat is never told "held"; the core answers it after the spend, as the inline
         # path does, so the refusal is no cheaper to reach than an inline one.
         hold_params: dict[str, Any] | None = None
+        hold_refusal: Exception | None = None
         if not req.dry_run:
             try:
                 hold_params = await _reload_hold_params(engine, gate, req.config_dir, user.username)
-            except _RELOAD_REFUSALS:
-                pass  # the core takes the params again and answers the refusal after the spend
+            except _RELOAD_REFUSALS as exc:
+                hold_refusal = exc  # audited and answered by the core, after the spend
             else:
                 held = await _rejoin_without_proof(
                     request, gate, "config_reload", hold_params, user
@@ -5421,6 +5422,7 @@ def create_app(
             gate=gate,
             request=request,
             hold_params=hold_params,
+            hold_refusal=hold_refusal,
         )
 
     async def _reload_config_core(
@@ -5432,17 +5434,22 @@ def create_app(
         gate: ApprovalGate | None,
         request: Request,
         hold_params: dict[str, Any] | None = None,
+        hold_refusal: Exception | None = None,
     ) -> ReloadResult | PendingApprovalResponse:
         """:func:`reload_config` past its step-up. The console calls this through the seam, behind
         its own action-bound gate, which has already spent the proof. ``hold_params`` are the ones
-        the route's rejoin captured, so a first request takes the directory's digest once; the
-        console passes none and they are captured here."""
+        the route's rejoin captured, so a first request takes the directory's digest once, and
+        ``hold_refusal`` is the refusal taking them met instead. The console passes neither, and
+        the params are captured here."""
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
         # own step-up + config:deploy check (in reload_config, or the console's own gate) — the second
         # approver is an additional control, not a replacement. On hold, 202 + the pending id; the
         # captured config_dir is replayed on release.
         if gate is not None and not req.dry_run:
+            if hold_refusal is not None:
+                # A hold its release could only refuse is not filed (vault BACKLOG #2596).
+                await _answer_refused_reload(engine, hold_refusal, req, request, user)
             if hold_params is None:
                 try:
                     hold_params = await _reload_hold_params(

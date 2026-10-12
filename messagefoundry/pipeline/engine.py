@@ -2470,9 +2470,20 @@ class Engine:
         :meth:`reload_detail` in an :class:`ApprovedConfig` (vault BACKLOG #2596). The target is
         found by :meth:`_existing_reload_target`, as a reload finds it, so a path outside the reload
         roots is never read, and its refusal propagates: a hold that release can only refuse is
-        never filed. ``None`` means the directory resolved but its digest could not be taken; the
-        reason is logged at WARNING."""
-        path = await self._existing_reload_target(config_dir)
+        never filed. ``None`` means no digest could be taken for another reason, such as a parent
+        the service cannot read; the reason is logged at WARNING, and the release refuses it."""
+        try:
+            path = await self._existing_reload_target(config_dir)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            # Not a refusal the reload routes answer (_RELOAD_REFUSALS), so it must not escape the
+            # request as a 500. The hold is filed with no digest, as an unreadable bundle's is.
+            # The error can carry a client's config_dir, so it is scrubbed for py/log-injection.
+            log.warning(
+                "config reload target could not be resolved: %s", scrub_log_argument(safe_exc(exc))
+            )
+            return None
         return await self._content_digest(path)
 
     async def _content_digest(self, path: Path) -> str | None:
@@ -2544,15 +2555,6 @@ class Engine:
         if self._registry_preflight is not None:
             values = self._env_values if env_values is None else env_values
             await self._registry_preflight(registry, values)
-
-    def _apply_env_values(self, values: dict[str, Any]) -> None:
-        """Make ``values`` the ones the engine and its live runner resolve ``env()`` against. With
-        no provider a reload re-reads nothing, so there is nothing to apply."""
-        if values is self._env_values:
-            return
-        self._env_values = values
-        if self._registry_runner is not None:
-            self._registry_runner.set_env_values(values)
 
     async def preflight_settings(self) -> None:
         """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none
@@ -2638,8 +2640,9 @@ class Engine:
         (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / an
         environment value file this reload could not read) — the caller maps these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
-        live graph is the one that was already running. A real reload applies the environment
-        values it re-read only at the swap, so a raise also leaves the running values as they were.
+        live graph is the one that was already running. A reload applies the environment values it
+        re-read only with the swap, and a dry run never applies them, so a raise also leaves the
+        running values as they were.
         """
         failures: list[ReloadStepFailure] = []
         if not dry_run:
@@ -2700,19 +2703,23 @@ class Engine:
                     "could not re-read this environment's values for the reload, so the live graph "
                     f"is unchanged: {refusal}"
                 )
-        if dry_run:
-            # A dry run's checker reuses the live runner, so it needs the values now. It swaps
-            # nothing and carries no approval.
-            self._apply_env_values(env_values)
         try:
             # Off the event loop: load_config executes user config modules (arbitrary, potentially
             # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
             registry = await asyncio.to_thread(load_config, path)  # WiringError on a bad config
-        except WiringError:
+        except WiringError as exc:
             if approval is not None:
                 # An edit after the first check can also break the load. Name the edit, so a
                 # tamper is audited as one and not as a bad config (vault BACKLOG #2596).
-                _require_approved(await self._content_digest(path), approval)
+                try:
+                    _require_approved(await self._content_digest(path), approval)
+                except (ConfigDigestMismatch, ConfigDigestUnavailable):
+                    # The refusal names the digest, so the load error would otherwise go unlogged.
+                    log.warning(
+                        "a released config reload also failed to load: %s",
+                        scrub_log_argument(safe_exc(exc)),
+                    )
+                    raise
             raise
         fingerprint: dict[str, object] | None = None
         if not dry_run:
@@ -2811,16 +2818,16 @@ class Engine:
                 hop_posture=self._hop_posture,
                 trust_anchor_policy=self._trust_anchor_policy,
                 simulate_all=self._shadow_settings.simulate_all_egress,
-                env_values=self._env_values,
+                env_values=env_values,
                 coordinator=self._coordinator,
             )
-            checker.build_check(registry)
+            # The values it re-read are checked, never applied: a dry run changes nothing live.
+            checker.build_check(registry, env_values)
             return ReloadOutcome(registry=registry, applied=False, directory=path)
-        # Every check has passed, so the values go live with the graph. The swap still builds and can
-        # refuse; wherever a refusal keeps the old graph, it puts the old values back too.
-        previous_env_values = self._env_values
-        self._apply_env_values(env_values)
+        # Every check has passed, so the values go live with the graph, and a refused swap keeps
+        # the old values with the old graph (vault BACKLOG #2596).
         if runner is None:
+            previous_env_values, self._env_values = self._env_values, env_values
             runner = self.add_registry(registry)
             try:
                 runner.build_check(registry)  # bad connector → WiringError (422), before any start
@@ -2832,16 +2839,12 @@ class Engine:
                 # cancellation, so clearing the reference then would orphan a running runner that
                 # engine.stop() could no longer reach.
                 self._registry_runner = None
-                self._apply_env_values(previous_env_values)
+                self._env_values = previous_env_values
                 raise
         else:
-            try:
-                await runner.reload(registry)
-            except BaseException:
-                # RegistryRunner.reload restores the previous graph on a failure or a cancellation
-                # (vault BACKLOG #2753) before it propagates, so the previous values go with it.
-                self._apply_env_values(previous_env_values)
-                raise
+            # The runner swaps the values under its reload lock and restores them on a rollback.
+            await runner.reload(registry, env_values)
+            self._env_values = env_values
         # ---- THE NEW GRAPH IS LIVE FROM HERE (BACKLOG #1111, ASVS 2.3.3) --------------------------
         # Nothing below can put the old graph back: the runner owns the new registry and the old one
         # is gone, and the swap is not a store transaction that could roll back. So a failure below is

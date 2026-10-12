@@ -2003,17 +2003,19 @@ row is still read from the engine's live state when it is written.
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
 digest of the target directory, taken at request time. An approver sees it in the queue. The
 release takes the digest again twice. The first check runs before any config module runs. The
-second runs right after the load, before any check that can refuse the graph as invalid, so an
-edit that also breaks the graph is still recorded as an edit. The second digest is the one the
-`config_reload` row records. If either differs from the approved one, nothing loads past that
-point and nothing swaps. The running graph keeps the environment values it had, because a real
-reload applies the values it re-read only at the swap. The approve answers **422**, the request
+second runs right after the load, and before the checks that refuse an invalid graph. A load that
+fails is checked too. So an edit that also breaks the graph is recorded as an edit. The second
+digest is the one the `config_reload` row records. If either differs from the approved one,
+nothing loads past that point and nothing swaps. The running graph keeps the environment values
+it had. A reload applies the values it re-read only with the swap, and a rolled-back swap puts
+the old ones back. A dry run checks the values and never applies them. The approve answers **422**, the request
 moves to `failed`, and a `config_reload_failed` row records reason `digest_mismatch` with
 `approved_fingerprint` and `current_fingerprint`. A hold that took no digest is refused the same
 way, with reason `no_approved_digest`. A release that cannot take the digest now is refused with
 reason `digest_unavailable`, and the engine logs the cause at WARNING. The requester asks again,
 and a second approver reviews the new bytes. A request whose directory is outside the reload roots
-or missing is refused as an inline reload is, and no hold is filed. A repeat request joins an open
+or missing is refused with the status and refusal row an inline reload gets, and no hold is filed.
+It writes no `config_reload_attempted` row, because nothing was attempted. A repeat request joins an open
 hold only while the digest is unchanged. An ungated reload takes no request-time digest. At least
 these limits remain:
 
@@ -2026,8 +2028,10 @@ these limits remain:
   before the second check refuses it. An edit reverted while the release loads is not seen at all.
   Hashing, compiling and running the same bytes is that same step 1;
 - the request-time digest is taken before the route checks its step-up proof. A directory that
-  resolves but cannot be read still files a hold with no digest, though its release is certain to
-  be refused;
+  cannot be read, or whose path fails to resolve for a reason other than being missing, still
+  files a hold with no digest. Its release is certain to be refused;
+- a swap that fails while reconciling outbound connections does not roll those connections back.
+  Any it already rebuilt keep the new graph's settings and values;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
   before a toggle is refused at release and must be asked for again;
 - a repeat after an edit files a second hold and leaves the first pending. The first is refused
