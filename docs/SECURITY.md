@@ -289,9 +289,9 @@ one-time password to `bootstrap-admin.txt` beside the store; if a development ch
 one, delete it.
 
 Like `--username`, `--email` is required (BACKLOG #1138, ADR 0183 Amendment D), so no Administrator
-this command creates starts without a notification address. It refuses at least a missing, blank, malformed or
-over-long address, before the password prompt. It checks only the address's form, not that mail
-reaches it.
+this command creates starts without a notification address. It refuses at least a missing, blank,
+malformed or over-long address, before the password prompt. It checks only the address's form, not
+that mail reaches it.
 
 **What a start does with no enabled Administrator.** At the shipped posture, once the earlier start
 checks pass (at least the store key, the low-disk floor and the `[alerts]` checks), the ADR 0167
@@ -337,8 +337,7 @@ key and an `otpauth://` URI. You add it to the app and type the code the app sho
 SHA-256, so add the account by its URI, which names the algorithm; an app that takes only the key
 must be set to SHA-256. The command
 checks that code before it writes anything, so a wrong code writes nothing; after five wrong codes it
-stops. It then writes the account, the password, the TOTP key and recovery codes, the notification
-address, and the role last.
+stops. It then writes the account, the password, the TOTP key and recovery codes, and the role last.
 It prints the recovery codes once. The account starts with a way past a sign-in lock: the combined
 sign-in, password and code in one request.
 
@@ -351,10 +350,10 @@ sign-in, password and code in one request.
 
 Re-running with the same username completes a provision an earlier run left half-written. The same
 repair takes over any enabled local account with that name that holds no roles, such as one an
-administrator created with none. The command says it completed an existing roleless account. A run
-that finishes writes in the order above, taking the notification address from `--email`. The account may be somebody else's, so its earlier holder is told. A
-`first_administrator_takeover` notice goes to the notification address the account held **before**
-the repair (BACKLOG #2019).
+administrator created with none. The command says it completed an existing roleless account. A
+repair takes the notification address from `--email`. The account may be somebody else's, so its
+earlier holder is told. A `first_administrator_takeover` notice goes to the notification address the
+account held **before** the repair (BACKLOG #2019).
 
 - The command builds the notifier from the same `[auth]`, `[alerts]` and `[secrets]` settings
   `serve` uses. It sends nothing when the account had no address, or when no channel can be built.
@@ -374,10 +373,10 @@ the repair (BACKLOG #2019).
   holder's. Correct it on the web console's user page if it is not the new Administrator's. The old
   notification address gets the new Administrator's later notices only if you give it again as
   `--email`, which is allowed. When the address changes, the takeover notice names the new one, so
-  the earlier holder learns where later notices go. The comparison is
-  case-sensitive, so the same mailbox typed in a different case counts as a change. From BACKLOG
-  #2288 until #1138, only a repair of an account that held an address needed `--email` (ADR 0183
-  Amendment C). Amendment D says where that refusal still applies.
+  the earlier holder learns where later notices go. The comparison is case-sensitive, so the same
+  mailbox typed in a different case counts as a change. From BACKLOG #2288 until ADR 0183 Amendment
+  D (2026-10-10), only a repair of an account that held an address needed `--email` (ADR 0183
+  Amendment C). Amendment D says where that refusal still applies. It cannot fire from this command.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes
 and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role
