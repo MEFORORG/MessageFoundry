@@ -72,6 +72,10 @@ HMAC-SHA256 when a store key is set, else keyless SHA-256.
 > the current chain before choosing one. The change is recorded in
 > [ADR 0193](0193-audit-chain-key-ranges-survive-a-store-key-rotation.md), amendment 2026-10-01.
 
+> **RE-MEASURED (2026-10-11, BACKLOG #1421).** The re-measure that correction asks for is done.
+> Read [Re-measured 2026-10-11 against the `seq` chain](#re-measured-2026-10-11-against-the-seq-chain)
+> before the 2026-09-05 measurements below.
+
 **The row `id` is not in the payload.** The only link between two rows is the earlier row's stored
 `row_hash`, folded in as `prev_hash`. `record_audit` (`:7603`) reads that head under the store lock
 immediately before it inserts:
@@ -262,6 +266,59 @@ copies of that reasoning is exactly how the records drifted apart before PR 805 
 **Out of scope** — cost 2 of #1421 (the standalone commit per authenticated read), any change to
 `[security].audit_all_authorization_decisions`, and any engine behaviour at all. Nothing is built
 here.
+
+## Re-measured 2026-10-11 against the `seq` chain
+
+The status stays **Proposed**. This section adds measurements and a status for each limb. It
+changes no finding above except where it says so.
+
+**What was decided, and by whom.** The vault runbook `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`,
+entry *#1421 (batch 240)*, takes **no deletion lever** and rejects hard delete and reseal. That is a
+**seat decision under owner delegation 2026-10-08, not an owner ruling.** Thinning the #1277 grant
+trail remains the owner's. BACKLOG #1421 stays open.
+
+### The deletion shapes, driven again
+
+Driven at engine `ea00d88137`, the way the 2026-09-05 table was. Each case used a throwaway SQLite
+store, synthetic rows written through the real `record_audit`, one shape applied with plain SQL, then
+`verify_audit_chain` run bare and against an anchor taken before the change. The keyed store held a
+genesis row and 5 rows; the keyless store held 5 rows.
+
+| Case | Keyed store, bare verify | Keyless store, bare verify | Against the held anchor |
+|---|---|---|---|
+| control: untouched | `True`, 6 rows | `True`, 5 rows | `True` |
+| control: edit seq 3's `actor` | `False` at seq=3 | `False` at seq=3 | `False` |
+| A: delete interior seq 3 | `False` at seq=3, *"sequence number 4 where 3 was expected"* | same | `False` |
+| B: delete the two oldest | `False` at seq=1, *"sequence number 3 where 1 was expected"* | same | `False` |
+| D: delete the two newest | **`True`, 4 rows** | **`True`, 4 rows** | `False` |
+| G: delete seq 2 and 3, then reseal with the store key | **`True`, 4 rows** | **`True`, 3 rows** | `False` |
+| G2: the same, resealed without a key | `False` at seq=1 (the genesis row must be keyed) | **`True`, 3 rows** | `False` |
+
+Both controls fired. Four things changed from the 2026-09-05 table:
+
+1. **A gap now names itself.** The `seq` check reports the missing position and why. Under the
+   `id` chain, case A showed only as a hash mismatch at the next row.
+2. **An oldest-first delete is caught at seq=1**, because it removes the genesis row.
+3. **On a keyed store, a clean reseal now needs the store key.** A writer with only table access
+   gets G2, which fails. A writer who holds the key gets G, which verifies clean. On a keyless store
+   anyone can reseal. So the crux above still holds for a keyless store and for a key holder.
+4. **Unchanged: a bare walk cannot see a cut tail (D).** A held anchor still catches every shape.
+
+### Each limb, against the tree at `ea00d88137`
+
+| Limb | Status | Evidence |
+|---|---|---|
+| #1421 cost 1: nothing bounds `audit_log` | **Not built, by decision** | `RetentionSettings.audit_days` is accepted and no purge reads it. The `Store` protocol in `store/base.py` has eight `purge_*` methods (`purge_alert_instances`, `purge_message_bodies`, `purge_dead_letters`, `purge_state`, `purge_connection_events`, `purge_search_presets`, `purge_reference_snapshots`, `purge_expired_sessions`) and none for `audit_log`. The 2026-10-08 seat decision takes no deletion lever. |
+| #1421 cost 1: the records disagree about why | **Shipped** 2026-09-03 (PR 805) | The `audit_days` comment in `config/settings.py` points at the `audit_days` row of `docs/CONFIGURATION.md`. |
+| #1421 cost 2: a standalone commit per authenticated read | **Not built** | `MessageStore.record_audit` appends under `_writer_guard(self._db, self._lock)`. The group-committer comment in `store/store.py` still reads *"claim\*/reference-snapshot/audit stay STANDALONE"*. |
+| #1421 cost 3: the `_audit_all_authz` docstring | **Shipped** 2026-09-03 | `api/security.py`, `_audit_all_authz`. |
+| #1421 cost 4: the ADR 0118 record | **Shipped** 2026-09-03 | ADR 0118 §5 amendment. |
+| Recommendation 1: the anchor as a routine step | **Partly shipped** | Shipped: `audit-anchor` and `audit-verify --expected-anchor` (`__main__.py`, `_audit_anchor` and `_audit_verify`); the seal step in `docs/EARLY-ADOPTER-GUIDE.md`, *"Seal the audit DB across any gap in custody"*; and `[integrity].audit_anchor_file`, which the engine feeds to `expected_prefix` at start (BACKLOG #328, `pipeline/engine.py` through `read_audit_anchor_file`). Not shipped: both start-time knobs ship off (`IntegritySettings.audit_verify_on_start = False`, `audit_anchor_file = ""`), and nothing holds an anchor off-box for the operator. |
+| Recommendation 2: a write-time bound on read grants | **Not built** | `AuthService.audit_permission_granted` still writes one row per call, with no sampling. Thinning the grant trail is the owner's. |
+| Recommendation 3: archive-first, restore-capable | **Not built** | Its purge step is a delete, and the 2026-10-08 seat decision takes no deletion lever. |
+| Recommendation 4: reject hard delete and reseal | **Decided** 2026-10-08 | Seat decision under owner delegation 2026-10-08, not an owner ruling. |
+| A richer `verify_audit_chain` result | **Partly shipped** | `AuditVerdict` in `store/store.py` carries `key_unavailable`, `keyless_walk` and `rows`, and the message names the first break by `seq`, row id and reason. Not shipped: `rows` is set on a clean verdict only (`-1` otherwise), the verdict names only the first divergent position, and it gives no clean-suffix length. |
+| A growth warning, since `max_db_mb` ships `0` | **Shipped** 2026-10-11 | `RetentionSettings.audit_log_warn_rows`, default 4,000,000, and `RetentionRunner._check_audit_growth`. The default is a seat decision under owner delegation 2026-10-08, not an owner ruling. One grant row measured about 270 bytes of SQLite with its indexes, so the default is about 1.1 GB. The `audit_log_warn_rows` row of [CONFIGURATION.md](../CONFIGURATION.md#retention) is the source of record. |
 
 ## To resolve on acceptance
 

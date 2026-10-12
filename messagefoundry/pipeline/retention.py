@@ -14,7 +14,8 @@ pass that does real work writes **one** ``audit_log`` entry recording the cutoff
 message content). When the store outgrows ``max_db_mb`` it raises an advisory ``storage_threshold``
 alert. On a SQLite store it also logs a WARNING each pass while free space on the store's volume is
 below ``min_free_disk_mb`` (BACKLOG #290); ``serve`` refuses to start below that same floor, through
-:func:`read_disk_floor`.
+:func:`read_disk_floor`. On every backend it logs a WARNING each pass while ``audit_log`` holds more
+rows than ``audit_log_warn_rows`` (BACKLOG #1421), because nothing prunes that table.
 
 It is owned by the :class:`~messagefoundry.pipeline.engine.Engine` (started in ``start``, cancelled in
 ``stop``) rather than the per-graph runner, so it is independent of config reloads and runs once per
@@ -284,6 +285,12 @@ class RetentionPass:
     # records it, so its purge row says the purge may survive in the -wal file. False when no
     # truncate ran.
     wal_left_untruncated: bool = False
+    # `audit_log` held more rows than `[retention].audit_log_warn_rows` this pass (BACKLOG #1421), and
+    # a WARNING was logged. NOT part of `did_work`, and that matters more here than for the disk
+    # floor: the audit row a did-work pass writes would land in the very table this warns about, so
+    # the warning would grow the table by one row every pass. False when the warning is off, when
+    # the read failed, or on a pass the duration cap cut short before the check.
+    audit_log_over_warn: bool = False
 
     @property
     def did_work(self) -> bool:
@@ -362,7 +369,9 @@ class RetentionRunner:
         spawns no task. Every purge window is off by default, but the low-disk floor
         (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL truncate (``wal_checkpoint_seconds``,
         vault BACKLOG #2619) ship ON, so on a file-backed SQLite store the runner starts on stock
-        settings to run those two. It purges nothing unless a window is set.
+        settings to run those two. The audit-log growth warning (``audit_log_warn_rows``, BACKLOG
+        #1421) ships ON as well and applies to every backend, so stock settings start the runner on
+        SQL Server and Postgres too. It purges nothing unless a window is set.
 
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
         per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
@@ -377,6 +386,7 @@ class RetentionRunner:
             or s.search_preset_days
             or s.reference_snapshot_days
             or s.max_db_mb
+            or s.audit_log_warn_rows
             or self._wal_truncate_applies()
             or s.vacuum_time() is not None
             or self._disk_floor_applies()
@@ -407,12 +417,13 @@ class RetentionRunner:
         self._task = asyncio.create_task(self._run())
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
-            "min_free_disk_mb=%d wal_checkpoint_seconds=%g vacuum_at=%r app_log_days=%d "
-            "app_log_compress_days=%d max_pass_seconds=%g (every %gs)",
+            "min_free_disk_mb=%d audit_log_warn_rows=%d wal_checkpoint_seconds=%g vacuum_at=%r "
+            "app_log_days=%d app_log_compress_days=%d max_pass_seconds=%g (every %gs)",
             self._settings.messages_days,
             self._settings.dead_letter_days,
             self._settings.max_db_mb,
             self._settings.min_free_disk_mb,
+            self._settings.audit_log_warn_rows,
             self._settings.wal_checkpoint_seconds,
             self._settings.vacuum_at,
             self._settings.app_log_days,
@@ -721,6 +732,9 @@ class RetentionRunner:
             vacuumed = True
 
         size_bytes, over_limit = (0, False) if _deadline_hit() else await self._check_size()
+        # After the leader gate, unlike the disk floor: audit_log is the one shared store's table,
+        # not this host's volume, so only the node that runs retention should count and warn.
+        audit_log_over_warn = False if _deadline_hit() else await self._check_audit_growth()
 
         result = RetentionPass(
             messages_purged=messages_purged,
@@ -746,6 +760,7 @@ class RetentionRunner:
             capped=capped,
             below_disk_floor=below_disk_floor,
             wal_left_untruncated=wal_left_untruncated,
+            audit_log_over_warn=audit_log_over_warn,
         )
         if result.did_work:
             await self._audit(result)
@@ -882,6 +897,48 @@ class RetentionRunner:
             except Exception:
                 log.warning("storage_threshold alert sink failed", exc_info=True)
         return size_bytes, over
+
+    async def _check_audit_growth(self) -> bool:
+        """Log a WARNING when ``audit_log`` holds more rows than ``audit_log_warn_rows`` (BACKLOG
+        #1421). Returns True only for a measured count above the threshold.
+
+        Advisory, by scope, like the disk floor: it changes nothing and writes no audit row. The
+        line carries two numbers and setting names only, never a row's contents.
+
+        The measure is the newest row's sequence number, read through the store's own
+        ``audit_anchor``: one awaited seek on the UNIQUE ``seq`` index on every backend, so it costs
+        the same at any table size and never blocks the event loop. A full ``COUNT(*)`` would scan
+        a table that only grows, every pass. On an intact chain the newest ``seq`` IS the row count.
+        On a damaged one it can only be higher, because ``seq`` values are distinct and at least 1,
+        so the warning may come early and never late.
+
+        A read that fails logs a WARNING with its reason and returns False, so a backend that
+        cannot answer degrades visibly rather than silently. It never stops the pass."""
+        threshold = self._settings.audit_log_warn_rows
+        if threshold <= 0:
+            return False
+        try:
+            rows, _head = await self._store.audit_anchor()
+        except Exception:
+            log.warning(
+                "audit_log growth check skipped: reading the newest audit row failed; the pass "
+                "continues",
+                exc_info=True,
+            )
+            return False
+        if rows <= threshold:
+            return False
+        log.warning(
+            "audit_log holds about %d rows (its newest sequence number), above the "
+            "[retention].audit_log_warn_rows threshold of %d. "
+            "Nothing prunes audit_log: [retention].audit_days is not enforced, and no engine "
+            "feature deletes audit rows. Plan storage for its growth, then raise the threshold to "
+            "acknowledge this size. Setting [security].audit_all_authorization_decisions = false "
+            "slows the growth and is reported as a loosening.",
+            rows,
+            threshold,
+        )
+        return True
 
     def _sweep_app_logs(self, now: float) -> int:
         """Delete application-log FILES older than ``app_log_days`` from ``[logging].log_dir`` — one
