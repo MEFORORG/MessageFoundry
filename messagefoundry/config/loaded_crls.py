@@ -124,9 +124,11 @@ class ReloadRefusal:
 
     ``fingerprint`` is the refused file's :func:`crl_fingerprint`, so a refusal stops applying the
     moment the file changes again. ``remedy`` is what the operator does next, in the words both the
-    reload and the expiry monitor log. ``sticky`` is True when nothing but a change to the file can
-    alter the verdict, so the reload does not judge those bytes again; False for a refusal time can
-    lift, such as a CRL not yet in effect."""
+    reload and the expiry monitor log. ``sticky`` is True when the reload treats the verdict as
+    final until the file changes, so it does not judge those bytes again; False while it will judge
+    them again next pass, such as for a CRL not yet in effect. The exact rule is the reload's:
+    ``_Refusals.sticky`` in :mod:`messagefoundry.pipeline.crl_reload` says when a refusal that can
+    lift keeps a pass open, and that "final" is that rule and not a proof."""
 
     fingerprint: tuple[int, int]
     reason: str
