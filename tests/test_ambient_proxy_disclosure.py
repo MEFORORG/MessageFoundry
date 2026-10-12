@@ -38,16 +38,19 @@ _VAULT = "the Vault and OpenBao clients"
 _NO_SAFETY_WORDS = ("tls", "encrypt", "secure", "safe", "protected")
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def no_ambient_proxy(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     """Clear every proxy source ``urllib.request.getproxies()`` reads, so the box's own settings
-    cannot decide a test. The system readers are stubbed on the platforms that have them."""
+    cannot decide a test. The system readers are stubbed on the platforms that have them, and so
+    are the system bypass readers, which the probe's handlers consult through ``proxy_bypass``."""
     for name in list(os.environ):
         if name.lower().endswith("_proxy"):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("REQUEST_METHOD", raising=False)
     monkeypatch.setattr(urllib.request, "getproxies_registry", dict, raising=False)
     monkeypatch.setattr(urllib.request, "getproxies_macosx_sysconf", dict, raising=False)
+    for reader in ("proxy_bypass_registry", "proxy_bypass_macosx_sysconf"):
+        monkeypatch.setattr(urllib.request, reader, lambda host: False, raising=False)
     assert urllib.request.getproxies() == {}, "a proxy source survived the fixture"
     return monkeypatch
 
@@ -185,7 +188,7 @@ def test_the_warning_lists_the_hops_the_code_would_send_through_each_proxy(
     for line in lines:
         assert line in text, (line, text)
     assert text.count(" proxy is ") == len(lines), text
-    assert ("The urllib hops are" in text) == any(_URLLIB in line for line in lines)
+    assert ("The urllib hops include" in text) == any(_URLLIB in line for line in lines)
     assert _SECRET not in text and "alice" not in text and "@" not in text
     for word in _NO_SAFETY_WORDS:
         assert word not in text.lower(), word
@@ -218,9 +221,60 @@ def test_without_the_vault_extra_the_vault_clients_are_not_named(
     monkeypatch.setattr(
         importlib.util, "find_spec", lambda name, *a: None if name == "hvac" else real(name, *a)
     )
-    text = ambient_proxy_warning(proxies={"all": _P})
+    # Nothing reads an all-only proxy then, so it attaches to nothing and is not disclosed.
+    assert ambient_proxy_warning(proxies={"all": _P}) is None
+    text = ambient_proxy_warning(proxies={"all": _Q, "https": _P})
     assert text is not None and "Vault" not in text
-    assert _line("all", _P, "no engine hop reads it") in text
+    assert _line("all", _Q, "no engine hop reads it") in text
+    assert _line("https", _P, f"{_URLLIB} use it for https targets") in text
+
+
+def test_a_refusal_is_pinned_on_the_entry_that_refused() -> None:
+    """An http target passes the clean http entry, then fails on the https entry's credentials.
+    Only the https entry is said to be refused."""
+    text = ambient_proxy_warning(
+        proxies={"http": "https://proxy.example:443", "https": "http://u:pw@other.example:3128"}
+    )
+    assert text is not None
+    assert "The http proxy is https://proxy.example:443: the Vault" in text, text
+    assert f"{_URLLIB} refuse it for http and https targets" in text, text
+
+
+@pytest.mark.parametrize(
+    ("proxies", "line"),
+    [
+        pytest.param(
+            {"http": "socks5h://socks.example:1080"},
+            _line(
+                "http",
+                "socks5h://socks.example:1080",
+                f"{_URLLIB} refuse it for http targets",
+                f"{_VAULT} refuse it for an http:// Vault",
+            ),
+            id="a-scheme-urllib-cannot-open",
+        ),
+        pytest.param(
+            # urllib re-types the request between the two entries until the stack runs out, in the
+            # engine's own opener as in the probe. The warning must still log, not stop serve, and
+            # both entries in the loop are said to be refused.
+            {"http": "all://proxy.example:1", "all": _Q},
+            _line(
+                "http",
+                "all://proxy.example:1",
+                f"{_URLLIB} refuse it for http targets",
+                f"{_VAULT} refuse it for an http:// Vault",
+            ),
+            id="a-proxy-that-loops",
+        ),
+    ],
+)
+def test_a_proxy_a_real_send_would_fail_on_is_refused_not_used(
+    proxies: dict[str, str], line: str
+) -> None:
+    text = ambient_proxy_warning(proxies=proxies)
+    assert text is not None and line in text, text
+    if "all" in proxies:
+        assert f"The all proxy is {_Q}: {_URLLIB} refuse it for http targets;" in text, text
 
 
 def test_the_probe_dials_nothing(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -41,12 +41,15 @@ _READ_KEYS = ("all", "http", "https")
 _PROBE_HOST = "ambient-proxy-probe.invalid"
 _TARGET_SCHEMES = ("http", "https")
 
+#: What a probe through the real handlers raises where a real send would fail.
+_PROBE_FAILS = (urllib.error.URLError, ValueError, RecursionError)
+
 _URLLIB = "the urllib hops"
 _VAULT = "the Vault and OpenBao clients"
 _URLLIB_DEFINED = (
-    "The urllib hops are HTTP-family connections (REST/SOAP/FHIR/fhir_lookup/DICOMweb) and their "
-    "OAuth2 and SMART token requests wherever no explicit proxy_url applies to the host, the alert "
-    "webhook, the OIDC sign-in requests and the AI broker. "
+    "The urllib hops include at least HTTP-family connections (REST/SOAP/FHIR/fhir_lookup/DICOMweb) "
+    "and their OAuth2 and SMART token requests wherever no explicit proxy_url applies to the host, "
+    "the alert webhook, the OIDC sign-in requests and the AI broker. "
 )
 _POINTER = (
     "Which hosts go direct, and what each hop sends the proxy, is in docs/CONFIGURATION.md, "
@@ -95,7 +98,11 @@ class _RouteProbe(LoopbackDirectProxyHandler):
 
     ``reached`` holds each entry key the handler re-addressed the request to. urllib can chain two:
     an ``http`` target whose proxy is written ``https://`` is re-sent through the ``https`` entry.
-    ``refused_by`` is the key of the innermost entry that raised, or ``None``."""
+    ``refused_by`` is the key of the innermost entry that refused, or ``None``.
+
+    A ``RecursionError`` sets no ``refused_by``. An ``http`` entry written ``all://`` beside an
+    ``all`` entry re-types the request back and forth until the stack runs out, in the engine's
+    opener as in this one, so every entry in ``reached`` is part of the failure."""
 
     def __init__(self, proxies: dict[str, str]) -> None:
         super().__init__(proxies)
@@ -129,18 +136,20 @@ def _urllib_findings(entries: dict[str, str]) -> Iterator[tuple[str, str, str, b
     for target in _TARGET_SCHEMES:
         probe = _RouteProbe(entries)
         opener = urllib.request.OpenerDirector()
-        opener.add_handler(probe)
-        opener.add_handler(_NoSend())
+        # UnknownHandler, as build_opener adds: a proxy scheme urllib cannot open fails here too.
+        for handler in (probe, _NoSend(), urllib.request.UnknownHandler()):
+            opener.add_handler(handler)
         url = f"{target}://{_PROBE_HOST}/"  # a URL, not a path: built apart from open()
         try:
             opener.open(url)
-        except (urllib.error.URLError, ValueError):
-            refused = True
+        except _PROBE_FAILS:
+            # Pinned on the entry that failed, not on a clean one the request passed first.
+            keys = {probe.refused_by} if probe.refused_by else probe.reached
+            for key in sorted(keys):
+                yield key, _URLLIB, target, True
         else:
-            refused = False
-        keys = probe.reached | ({probe.refused_by} if probe.refused_by else set())
-        for key in sorted(keys):
-            yield key, _URLLIB, target, refused
+            for key in sorted(probe.reached):
+                yield key, _URLLIB, target, False
 
 
 def _vault_findings(entries: dict[str, str]) -> Iterator[tuple[str, str, str, bool]]:
@@ -167,9 +176,10 @@ def _vault_findings(entries: dict[str, str]) -> Iterator[tuple[str, str, str, bo
             try:
                 # The refusal the Vault clients run at construction, in the order they run it. It
                 # raises InsecureHopRefused, a ValueError; a parser's own ValueError also stops a
-                # client being built, so both count as a refusal.
+                # client being built, so both count as a refusal. Only the selected entry is
+                # passed, so the proxy it checks is the one this names.
                 _refuse_an_insecure_vault_hop(
-                    session, url, connector="probe", request_proxies=dict(entries)
+                    session, url, connector="probe", request_proxies={key: entries[key]}
                 )
             except ValueError:
                 refused = True
@@ -206,6 +216,8 @@ def ambient_proxy_warning(proxies: Mapping[str, str] | None = None) -> str | Non
     ``proxies`` defaults to ``urllib.request.getproxies()``. A ``NO_PROXY`` of exactly ``*`` sends
     every hop direct in both client libraries, so there is then nothing to disclose. The value is
     compared unstripped, as urllib compares it, so a padded ``*`` that bypasses nothing still warns.
+    A proxy set that no engine hop reads, such as an ``all`` proxy without the ``[vault]`` extra,
+    attaches to nothing, so it is not disclosed either.
     """
     found = urllib.request.getproxies() if proxies is None else proxies
     if found.get("no") == "*":
@@ -214,11 +226,13 @@ def ambient_proxy_warning(proxies: Mapping[str, str] | None = None) -> str | Non
     if not entries:
         return None
     findings = [*_urllib_findings(entries), *_vault_findings(entries)]
+    if not findings:
+        return None
     lines = [
-        f"The {key} proxy is {_address_of(value)}: "
+        f"The {key} proxy is {address}: "
         + _clauses([(f, t, r) for k, f, t, r in findings if k == key])
         + ". "
-        for key, value in entries.items()
+        for key, address in environment_proxy_hosts(entries).items()
     ]
     return (
         "a web proxy from the environment or the system proxy settings is in force, and no engine "
