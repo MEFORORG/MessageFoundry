@@ -13,6 +13,25 @@ import socket
 import threading
 
 
+def _drain_body(conn: socket.socket, head: bytes) -> None:
+    """Read the rest of a request body before answering. Closing a socket with unread bytes sends
+    a reset on Windows, which the client can read as a failed send."""
+    headers, _, body = head.partition(b"\r\n\r\n")
+    length = 0
+    for line in headers.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            try:
+                length = int(value.strip() or 0)
+            except ValueError:
+                return  # a bad length: answer without reading on, rather than kill the thread
+    while len(body) < length:
+        more = conn.recv(8192)
+        if not more:
+            return
+        body += more
+
+
 class _WireProxy:
     """A loopback socket that records, per connection, what arrived before any TLS.
 
@@ -67,6 +86,7 @@ class _WireProxy:
             if conn.recv(16)[:1] == b"\x16":
                 self.tls_after_connect += 1
         else:
+            _drain_body(conn, head)
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
 
     def __enter__(self) -> _WireProxy:

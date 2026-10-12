@@ -145,6 +145,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "settings_file_path",
     "settings_error_detail",
     "keyless_opt_out_refusal",
     "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
@@ -9424,6 +9425,13 @@ def settings_error_detail(exc: Exception) -> str:
     return str(exc)
 
 
+def settings_file_path(config_path: str | Path | None) -> Path:
+    """The settings file :func:`load_settings` reads for ``config_path``: that path, else
+    ``./messagefoundry.toml``, which it reads only when it exists. One rule, so the ``serve`` start
+    check vets the file the load read (vault BACKLOG #2626)."""
+    return Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
+
+
 def load_settings(
     *,
     config_path: str | Path | None = None,
@@ -9446,7 +9454,7 @@ def load_settings(
     data: dict[str, dict[str, Any]] = {}
     file_data: Mapping[str, Any] = {}
 
-    path = Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
+    path = settings_file_path(config_path)
     if config_path is not None and not path.exists():
         raise FileNotFoundError(f"service config not found: {path}")
     if (config_path is not None or default_file) and path.exists():
