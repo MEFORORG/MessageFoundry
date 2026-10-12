@@ -287,10 +287,10 @@ A retry was the other choice, and it was not taken. urllib answers an endpoint's
 after a first send, so each retry would send the message body once more with no credential. A retry
 also could not succeed until someone changes the peer or the connection.
 
-The token hop is left as it was. `smart.request_token` maps the same refusal to a retryable
-`DeliveryError`. So a bearer connection behind a Digest web proxy would get either outcome: a retry
-when the token must be minted, and a stop when a cached token lets the delivery hop meet the 407.
-That difference is open, and this amendment does not settle it.
+The token hop was left as it was, and B.1 below closes that. `smart.request_token` mapped the same
+refusal to a retryable `DeliveryError`. So a bearer connection behind a Digest web proxy would have
+got either outcome: a retry when the token must be minted, and a stop when a cached token lets the
+delivery hop meet the 407.
 
 The costs, at least these:
 
@@ -313,12 +313,15 @@ The costs, at least these:
   refusing web proxy would still fail each message in turn, as before.
 
 The fault is raised only where a Digest handler is on the opener and refuses. These unanswered
-challenges do not raise it, at least: a Basic challenge and a Digest challenge with no nonce
-(both read as a plain 401 or 407), a Digest challenge whose `qop` urllib does not support (read as
-unreachable, and retried), and any challenge on a connection with no Digest set up. A DICOMweb
-endpoint challenge cannot raise it, since that destination has no origin Digest. A web proxy
-challenge can raise it only for an `http://` destination, since proxy Digest is refused for
-`https://`.
+challenges do not raise it, at least: a Basic challenge (read as a plain 401 or 407, on purpose;
+see B.1), a 407 on a request that went direct rather than through the proxy (read as a plain 407,
+since BACKLOG #2989), and any challenge on a connection with no Digest set up. A Digest challenge
+with no nonce, and one whose `qop` urllib does not support, did not raise it either until B.1. A
+DICOMweb endpoint challenge cannot raise it, since that destination has no origin Digest. A web
+proxy challenge can raise it only for an `http://` destination, since proxy Digest is refused for
+`https://`. A `proxy_url` that carries credentials and is not written `https://` never meets a
+407 at all: the opener refuses it before any request leaves (vault BACKLOG #2572, engine PR 2018),
+as a `ProxyCredentialsRefusedError`, which each send reads as unreachable and retries.
 
 The probe arms and the `FhirLookup` read are not deliveries, so they carry no fault marker. A probe
 raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.
@@ -328,3 +331,84 @@ Tests: `tests/test_digest_refusal_classification.py`, at least
 `test_post_reports_a_refused_challenge_as_a_configuration_fault`,
 `test_post_still_reports_a_bad_request_value_as_one` and
 `test_a_refused_challenge_stops_the_lane_and_keeps_the_row`.
+
+### B.1 Follow-ups (2026-10-11, BACKLOG #2989, batch 250)
+
+> **Recorded 2026-10-11 by a Builder seat for batch 250.** It describes the code in the pull
+> request for BACKLOG #2989.
+
+**The owner kept the lane stop.** Owner ruling R4 of 2026-10-05, in the vault's
+`docs/security/ASVS-OWNER-RULINGS-2026-10-05.md`, answered `Keep the lane stop (Recommended)`. So
+`auth_challenge_refused` keeps `config_fault=True`, and the costs listed above still describe the
+built behaviour.
+
+**More challenges now raise the fault.** The Digest handlers also refuse a challenge with no realm
+or no nonce, and one whose `qop` does not offer `auth`. urllib answered none of these. It returned
+None for the first two, so each read as a plain 401 or 407. It raised a `URLError` for the third,
+so each send read it as unreachable and retried it. A `qop` list that offers `auth` is now answered
+with `qop=auth`, whatever else it lists and however it is spaced. urllib had refused
+`"auth-int, auth"` because it splits on a bare comma.
+
+**A Basic challenge stays a plain 401 or 407, on purpose.** It is a well-formed challenge for a
+scheme the engine supports, and the status the peer sent reaches the operator as it is. Refusing it
+would stop the lane on a challenge that may be one path's or one request's, which is the weakness
+listed above for FHIR. urllib reads only the first challenge header, so a peer that lists Basic
+before Digest gets the same plain status.
+
+**The token hop raises the same fault, for an `http://` token endpoint.** `smart.request_token`
+now raises what `auth_challenge_refused` builds when the web proxy's Digest handler refuses. It is
+still a `DeliveryError`, so each caller's contract holds. This is narrower than it looks. An
+`https://` token endpoint is reached through a `CONNECT` tunnel, and urllib raises the proxy's 407
+there as an `OSError` before any handler sees it, so that case still reads as unreachable and is
+retried. That gap is left open.
+
+**A 407 on a request that went direct is not the proxy's.** The proxy Digest handler answered
+nothing on such a request, but it still screened the challenge, so an NTLM 407 from the origin or
+the hop to it raised the proxy's refusal and stopped the lane. The handler now returns before it
+screens, and urllib raises the 407 as it is.
+
+**The class is the right grain for all eleven arms.** `_post` and `_probe` on REST, SOAP, FHIR and
+DICOMweb, `_get` and `_probe` on the `FhirLookup` read, and `smart.request_token` each catch the
+whole `HttpAuthError` class. Each `try` holds the opener call and the reply read, and nothing else
+there raises the class. Every other raiser runs when a connection is built. So every
+`HttpAuthError` those arms can see is a challenge a Digest handler refused. A wire-time raiser
+added later inside one of those blocks would be read as this fault; `HttpAuthError`'s docstring
+names its one wire-time use, and that is the place to check first.
+
+**A send-time hop refusal is now a configuration fault too.** Each `_post` re-checks a permitted
+insecure hop before a bearer is minted or a byte crosses (ADR 0092 decision 4). It did that outside
+every `try`, so the raw `InsecureHopRefused`, a `ValueError`, left the send unclassified, and the
+delivery worker filed it as an internal error. `InsecureHopGuard.assert_delivery_url` now raises a
+`NegativeAckError` with code `insecure-hop-refused`, `permanent` and `config_fault`. The guard keys
+on the connection's own URL and the posture it was built with, so every queued row would meet the
+same refusal. This was the Builder's choice, by the reasoning of A.1 and R4. It inherits the cost
+listed above: under `"stop"` only the code reaches the operator, so the refusal's text, which
+names the cell, the host and the redacted URL, is on no log line or alert. Before, it went down
+the internal-error path, which stored that text. The alternative was a
+retryable `DeliveryError`, as the probe raises and the Direct and EMAIL sends raise. The hop check
+runs first, so a refused hop is reported over a refused Digest challenge, and the opener is never
+called.
+
+**A truncated or misframed 2xx reply is judged by who reads the body.** This is not a Digest
+change, but the review of engine PR 2013 left it open in the same row. Owner ruling R5 of
+2026-10-05 decided an over-size body after a 2xx by who reads it. A body cut short of its declared
+length, or a misframed one, now follows the same rule, with its own code: `reply-truncated` or
+`reply-misframed`. Where nothing reads the body, the message is delivered, the body is dropped and
+a WARNING is logged. Where the engine reads it to know the outcome or passes it on, the delivery is
+a permanent refusal that is not sent again. Either way the request is sent once.
+`bounded_read.read_2xx_reply_text` states the rule, and the table under REST in
+`docs/CONNECTIONS.md` says which destination does which. **Provenance: decided 2026-10-11 by the
+batch 250 Manager under the owner's driver rule, applying R5's principle. The owner has not ruled
+on it and may overturn it.** A partner or a middlebox that closes the connection cleanly before
+the declared length counts as cut short, so where the body is needed that message dead-letters
+once rather than being sent again. A read that times out, or one that a connection reset cuts off,
+part-way through a 2xx body is still retried, and sends the request again.
+
+**A 407 on a bypassed request dead-letters each message, and does not stop the lane.** A 407 on a request
+that went direct reaches each send's status classification, which makes it a permanent reject of
+that one message, so a queue meeting it drains to dead-letter one row at a time. An MD5 or SHA-256
+407 on such a request already behaved that way before #2989; only an NTLM or malformed one stopped
+the lane, and only because the proxy handler screened a challenge that was not its own.
+
+Tests: `tests/test_digest_refusal_classification.py`, the section headed BACKLOG #2989, and
+`tests/test_over_cap_2xx_reply_is_sent_once.py`, the section at its end.
