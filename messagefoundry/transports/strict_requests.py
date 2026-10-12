@@ -134,8 +134,12 @@ class VaultHopRefused(InsecureHopRefused):
     Still an ``InsecureHopRefused``, so a handler written for the base type catches it.
 
     **Build it only in this module, and only from fixed text.**
-    ``tests/test_vault_hop_refusal_marker.py`` reads the source for both halves: no other module
-    under ``messagefoundry/`` builds one, and this module builds no bare ``InsecureHopRefused``.
+    ``tests/test_vault_hop_refusal_marker.py`` reads the source for part of that. No other module
+    under ``messagefoundry/`` calls this name. This module calls neither ``InsecureHopRefused``
+    nor ``enforce_insecure_hop``, which raises it. And each text built here is a literal, the
+    connector label, a module constant, or one helper the test names. The scans match a call by
+    name, so they do not see an alias or a subclass, and they cannot judge the helper's own text.
+    A reviewer still has to.
     """
 
 
@@ -524,8 +528,9 @@ def vault_failure_text(exc: BaseException) -> str:
 
     **The reply half is still by type.** An ``EgressReplyError`` is built in this module and in
     ``bounded_read`` only, at least today, and both use fixed text. Call this only from a handler
-    around an hvac call on a client :func:`mount_strict_reply_adapter` mounted, which is the six
-    Vault provider handlers today.
+    around an hvac call on a client :func:`mount_strict_reply_adapter` mounted. Today that is at
+    least the handlers in ``store/crypto_transit.py``, ``store/keyprovider_vault.py`` and
+    ``config/secretprovider_vault.py``.
     """
     if isinstance(exc, (VaultHopRefused, EgressReplyError)):
         return str(exc)
@@ -595,12 +600,13 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     host direct (``bounded_read.LoopbackDirectProxyHandler``, vault BACKLOG #2579). requests
     has no such handler, which is why this hop refuses instead.
 
-    Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a ``ValueError``, with
-    fixed text."""
+    Raises :class:`VaultHopRefused`, a ``ValueError``, with fixed text."""
     scheme, host = _vault_scheme_and_host(url)
     if scheme == "https":
         return
     on_box = scheme == "http" and not proxy and bool(host) and is_loopback_hop_host(host)
+    # The three constants leave `on_box` as the only input. The call stays so this cell follows
+    # the shared authority if its rule for an on-box hop ever changes.
     disposition = insecure_hop_disposition(
         enforcing=True,  # no posture in scope (docstring); fail closed
         is_loopback_hop=on_box,
@@ -666,8 +672,7 @@ def _refuse_cleartext_proxy_credentials(proxy: str | None, *, connector: str) ->
 
     Refused under every ``[security].enforcement`` setting, for the reason the cleartext refusal
     gives: this hop has no posture in scope and no acceptance field. There is no loopback
-    exception. Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` with fixed
-    text."""
+    exception. Raises :class:`VaultHopRefused` with fixed text."""
     if proxy and _proxy_carries_cleartext_credentials(proxy):
         raise VaultHopRefused(f"{connector}: {_CLEARTEXT_PROXY_CREDENTIALS}")
 
@@ -739,9 +744,9 @@ def _refuse_an_insecure_vault_hop(
       cannot be read as one URL.
 
     An ``https://`` Vault needs no more; :func:`_narrowed_pool_classes` covers its proxy leg. All
-    three raise :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, outside any
-    ``except``, so none carries a parser error that quotes the address. The proxy settings can
-    change after this runs, so the adapter checks again before each send."""
+    three raise :class:`VaultHopRefused`, outside any ``except``, so none carries a parser error
+    that quotes the address. The proxy settings can change after this runs, so the adapter checks
+    again before each send."""
     hop = _prepared_vault_hop(session, url, request_proxies)
     sent, proxy = hop if hop is not None else ("", None)
     _refuse_cleartext_proxy_credentials(proxy, connector=connector)
@@ -771,7 +776,7 @@ def mount_strict_reply_adapter(
     ``limit`` is the reply ceiling. The Transit client passes :data:`MAX_VAULT_REPLY_BYTES`; the KV
     client reads small secrets and keeps the shared egress ceiling.
 
-    Also raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a
+    Also raises :class:`VaultHopRefused`, an ``InsecureHopRefused`` and so a
     :class:`ValueError`, when the Vault address is not ``https://``, unless it is loopback and
     reached with no proxy (BACKLOG #2317), and when requests would send an ``http://`` Vault
     address through an ``https://`` proxy, whose TLS leg requests would not verify (BACKLOG #300),

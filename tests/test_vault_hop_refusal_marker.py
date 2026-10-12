@@ -8,14 +8,17 @@ elsewhere its text can echo a host (``transports/rest.py``), so a handler that m
 would have printed the host. The hop's own refusals are now a marked subclass,
 ``VaultHopRefused``, and only that subclass keeps its text.
 
-Two source scans hold the marker to its meaning: no module but ``strict_requests`` builds one, and
-``strict_requests`` builds no bare ``InsecureHopRefused``.
+Three source scans hold the marker to its meaning. No module but ``strict_requests`` calls the
+name. ``strict_requests`` calls neither ``InsecureHopRefused`` nor ``enforce_insecure_hop``. And
+each marked refusal is built from a shape that cannot interpolate a caller's value. The scans match
+a call by name, so an alias or a subclass is outside what they see.
 
 Synthetic data only: the host, key names and wrapped key are made up.
 """
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +28,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.store import keyprovider_vault
 from messagefoundry.store.keyprovider import KeyProviderError
-from tests._ast_sites import call_sites, parse_source
+from tests._ast_sites import call_sites, callee_name, parse_source
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 #: ``strict_requests`` imports ``requests`` and ``urllib3`` at module scope.
@@ -61,13 +64,76 @@ def test_only_the_strict_reader_module_builds_the_marked_refusal() -> None:
     assert elsewhere == {}, f"{_MARKER} is built outside strict_requests.py: {elsewhere}"
 
 
-def test_the_strict_reader_module_builds_no_unmarked_hop_refusal() -> None:
-    """A check added here that raised the base type would lose its text at every handler."""
-    unmarked = _lines_building(_HOME, "InsecureHopRefused")
-    assert unmarked == [], f"strict_requests.py builds a bare InsecureHopRefused at {unmarked}"
-    # The control for both scans: the same scan sees the marked sites in this module, so an empty
-    # answer is not the scan seeing nothing at all.
+@pytest.mark.parametrize("unmarked", ["InsecureHopRefused", "enforce_insecure_hop"])
+def test_the_strict_reader_module_builds_no_unmarked_hop_refusal(unmarked: str) -> None:
+    """A check added here that raised the base type would lose its text at every handler. The
+    shared ``enforce_insecure_hop`` raises the base type, so a call to it counts too."""
+    lines = _lines_building(_HOME, unmarked)
+    assert lines == [], f"strict_requests.py calls {unmarked} at lines {lines}"
+    # The control for these scans: the same scan sees the marked sites in this module, so an
+    # empty answer is not the scan seeing nothing at all.
     assert _lines_building(_HOME, _MARKER)
+
+
+#: Helpers in ``strict_requests`` whose return value is a refusal's whole text. Each takes the
+#: connector label and returns it with a fixed reason. Read a helper before adding it here.
+_TEXT_HELPERS = frozenset({"_unverifiable_proxy_leg"})
+
+
+def _is_label_or_constant(node: ast.expr) -> bool:
+    """``connector``, ``self._connector``, or a module constant spelled in upper case."""
+    if isinstance(node, ast.Name):
+        return node.id == "connector" or node.id.isupper()
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "_connector"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def _is_fixed_text(call: ast.Call) -> bool:
+    """Whether a refusal is built from one argument that can carry only fixed text: a literal, a
+    listed helper's result, or an f-string whose holes are the connector label or a constant."""
+    if len(call.args) != 1 or call.keywords:
+        return False
+    text = call.args[0]
+    if isinstance(text, ast.Constant):
+        return isinstance(text.value, str)
+    if isinstance(text, ast.Call):
+        return callee_name(text, bare_only=True) in _TEXT_HELPERS
+    if isinstance(text, ast.JoinedStr):
+        return all(
+            _is_label_or_constant(part.value)
+            for part in text.values
+            if isinstance(part, ast.FormattedValue)
+        )
+    return False
+
+
+def test_every_marked_refusal_is_built_from_fixed_text() -> None:
+    """The marker means the text names no address, proxy URL, token or reply. This holds each
+    site to a shape that cannot interpolate one. It does not read a listed helper's own text."""
+    sites = call_sites(parse_source(_HOME.read_text(encoding="utf-8")), _MARKER)
+    loose = [site.lineno for site in sites if not _is_fixed_text(site)]
+    assert loose == [], f"a marked refusal interpolates something at lines {loose}"
+    assert sites, "the scan saw no marked refusal at all"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'VaultHopRefused(f"{connector}: proxy {proxy} refused")',
+        'VaultHopRefused(f"{connector}: {request.url} refused")',
+        "VaultHopRefused(str(exc))",
+        'VaultHopRefused("refused: " + url)',
+        "VaultHopRefused(_other_helper(connector))",
+    ],
+)
+def test_the_fixed_text_scan_can_fail(source: str) -> None:
+    """The control for the scan above: each of these would put a caller's value in the text."""
+    (site,) = call_sites(parse_source(source), _MARKER)
+    assert not _is_fixed_text(site)
 
 
 @_needs_the_vault_extra

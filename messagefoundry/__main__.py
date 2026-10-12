@@ -8812,24 +8812,16 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     try:
         active_key = resolve_active_key(settings.store)
-    except _key_unresolved() as exc:
+    except _key_unresolved() + (ValueError,) as exc:
         # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
         # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
+        #
+        # ValueError (vault BACKLOG #3247): under key_provider=vault the Vault client build can
+        # refuse with a bare one, which reached the dispatch floor and exited 1, an aborted
+        # rotation's code. Taken and printed whole, as `build_store_cipher` treats the same refusal
+        # when the open below meets it: it comes from the settings or the key provider, and only
+        # the key is resolved here, so nothing a store holds can reach this arm.
         print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        # vault BACKLOG #3247: under key_provider=vault the Vault client build can refuse with a
-        # bare ValueError, which is not in `_key_unresolved()`. Only the key is resolved here: no
-        # store is open and nothing was changed, so exit 2 as above, never an aborted rotation's
-        # exit 1. Exactly ValueError, as `privilege_probes._why` reads the same refusals: those
-        # carry engine-written text, and a subclass can quote what a parser or a server read, so
-        # it still goes to the dispatch floor. Rendered through `safe_exc`, as that floor would.
-        # The arm can go once the provider raises its own type for a client it cannot build.
-        if type(exc) is not ValueError:
-            raise
-        from messagefoundry.redaction import safe_exc
-
-        print(f"error: cannot load the active key for rotation: {safe_exc(exc)}", file=sys.stderr)
         return 2
     if not active_key:
         print(

@@ -37,9 +37,15 @@ _AT_REST_ENV = (
     "MEFOR_STORE_VAULT_WRAPPED_DEK",
 )
 
-#: Stands in for the fixed text of a client-build refusal. Synthetic.
-_REFUSAL = "Vault transit key provider: synthetic client-build refusal"
+#: Stands in for the fixed text of a client-build refusal. Synthetic, and longer than the 200
+#: characters ``safe_exc`` keeps: the TLS suite refusals are about 400 to 500, and their last
+#: sentence says what to change, so a cut would drop the remedy.
+_REFUSAL = "Vault transit key provider: synthetic client-build refusal. " + "Change it. " * 20
 _KEY_CHECK_LINE = "cannot load the active key for rotation"
+
+
+class _ParseError(ValueError):
+    """A ``ValueError`` subclass, as a parser raises."""
 
 
 def _select_the_vault_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
@@ -54,7 +60,9 @@ def _select_the_vault_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
-    "refusal", [ValueError, KeyProviderError], ids=["bare-value-error", "key-provider-error"]
+    "refusal",
+    [ValueError, _ParseError, KeyProviderError],
+    ids=["bare-value-error", "value-error-subclass", "key-provider-error"],
 )
 def test_rotate_key_exits_2_when_the_vault_client_build_refuses(
     refusal: type[Exception],
@@ -62,8 +70,10 @@ def test_rotate_key_exits_2_when_the_vault_client_build_refuses(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A bare ``ValueError`` exited 1 before the fix. ``KeyProviderError`` is the control: the
-    command already handled it, and it keeps its exit code and its text."""
+    """A ``ValueError`` exited 1 before the fix, bare or subclassed. A subclass is taken too,
+    because the store open already takes it: ``build_store_cipher`` raises any ``ValueError`` from
+    the same build as ``StoreCipherConfigError``, and the command exits 2 on that. The refusal is
+    printed whole. ``KeyProviderError`` is the control: the command already handled it."""
     db = _select_the_vault_provider(monkeypatch, tmp_path)
     builds = 0
 
@@ -81,26 +91,6 @@ def test_rotate_key_exits_2_when_the_vault_client_build_refuses(
     assert _REFUSAL in captured.err, captured.err
     assert "Traceback" not in captured.err, captured.err
     assert "OK:" not in captured.out, captured.out
-
-
-def test_a_value_error_subclass_still_reaches_the_dispatch_floor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The arm takes exactly ``ValueError``. A subclass can quote what a parser or a server read,
-    so it is left to the dispatch floor, which exits 1 as it did before."""
-
-    class _Parse(ValueError):
-        pass
-
-    db = _select_the_vault_provider(monkeypatch, tmp_path)
-
-    def refuse(addr: str | None, token: str | None) -> object:
-        raise _Parse(_REFUSAL)
-
-    monkeypatch.setattr(keyprovider_vault, "_build_client", refuse)
-
-    assert main(["rotate-key", "--db", db]) == 1
-    assert _KEY_CHECK_LINE not in capsys.readouterr().err
 
 
 def test_rotate_key_exits_2_on_a_real_client_build_refusal(
