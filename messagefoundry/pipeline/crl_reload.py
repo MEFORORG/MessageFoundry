@@ -333,8 +333,9 @@ class _Refusals:
 
     def __init__(self) -> None:
         self.strongest: tuple[str, str] | None = None
-        #: True once a refusal that can lift (:data:`_RETRIED`) is what stopped a context, or the
-        #: whole pass. That context may still take these bytes, so the next pass judges them again.
+        #: True once the next pass must judge these bytes again. Either a refusal that can lift
+        #: (:data:`_RETRIED`) is what stopped a context or the whole pass, so that context may
+        #: still take them, or the reason reported carries a warning that ends with time.
         self.pending = False
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None

@@ -395,10 +395,14 @@ def test_the_alert_stays_while_any_held_copy_is_not_current(
 # --- a bad replacement is refused and the old copy kept --------------------------------------------
 
 
-def _planted_bundle(pki: _Pki, tmp_path: Path) -> bytes:
+def _planted_ca(tmp_path: Path) -> _Pki:
+    """A second CA, which no hop trusts unless a test gives it that CA's certificate."""
     (tmp_path / "planted").mkdir()
-    planted = _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
-    return planted.ca_pem + _fresher(pki)
+    return _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
+
+
+def _planted_bundle(pki: _Pki, tmp_path: Path) -> bytes:
+    return _planted_ca(tmp_path).ca_pem + _fresher(pki)
 
 
 @pytest.mark.parametrize(
@@ -902,10 +906,8 @@ def test_a_wait_never_outranks_a_context_at_the_cap(pki: _Pki) -> None:
 
 def test_a_wait_never_outranks_a_file_to_fix(pki: _Pki, tmp_path: Path) -> None:
     hop = pki.outbound_hop()
-    (tmp_path / "planted").mkdir()
-    planted = _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
-    pki.crl.write_bytes(planted.ca_pem + future)
+    pki.crl.write_bytes(_planted_ca(tmp_path).ca_pem + future)
 
     outcome = _reload(pki)
 
@@ -1247,22 +1249,32 @@ def test_a_file_to_fix_is_reported_for_a_context_at_the_cap(
 # --- vault BACKLOG #2866 items 3 and 4: a refusal that holds still across passes -------------------
 
 
-def _judged(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
-    """The bytes each pass judged, so a test can tell a pass that judged the file from one that
-    returned the refusal it already had."""
-    seen: list[bytes] = []
-    real = crl_reload.judge_crl_bytes
+def _refusals_logged(caplog: pytest.LogCaptureFixture) -> int:
+    return sum("refused to apply" in r.getMessage() for r in caplog.records)
+
+
+def _assert_refused_for_good(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two passes over the file as it is now. The first refuses it as a file to fix, for good. The
+    second hands that refusal back without judging the bytes again, and logs nothing more."""
+    judged: list[int] = []
+    real = tls_policy_module.judge_crl_bytes
 
     def spy(pem: bytes, **kwargs: object) -> object:
-        seen.append(pem)
+        judged.append(len(pem))
         return real(pem, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(crl_reload, "judge_crl_bytes", spy)
-    return seen
+    caplog.clear()  # a control pass before this one logged its own refusal
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first, second = _reload(pki), _reload(pki)
 
-
-def _refusals_logged(caplog: pytest.LogCaptureFixture) -> int:
-    return sum("refused to apply" in r.getMessage() for r in caplog.records)
+    assert first is not None and first.refusal is not None
+    assert first.refusal.remedy == FIX and first.refusal.sticky
+    assert second is not None and second.refusal == first.refusal
+    assert len(judged) == 1  # the second pass did not judge the same bytes again
+    assert _refusals_logged(caplog) == 1
 
 
 def test_a_file_openssl_cannot_load_is_refused_for_good_beside_a_copy_that_lapses_first(
@@ -1280,16 +1292,7 @@ def test_a_file_openssl_cannot_load_is_refused_for_good_beside_a_copy_that_lapse
     assert lapses.refusal.remedy == LAPSES_FIRST and not lapses.refusal.sticky
 
     pki.crl.write_bytes(late.replace(b"-----END X509 CRL", b" -----END X509 CRL"))
-    judged = _judged(monkeypatch)
-    caplog.clear()  # the control's refusal was logged too
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
-        first, second = _reload(pki), _reload(pki)
-
-    assert first is not None and first.refusal is not None
-    assert first.refusal.remedy == FIX and first.refusal.sticky
-    assert second is not None and second.refusal == first.refusal
-    assert len(judged) == 1  # the second pass did not judge the same bytes again
-    assert _refusals_logged(caplog) == 1
+    _assert_refused_for_good(pki, monkeypatch, caplog)
     assert _accepts(hop, pki.server())
 
 
@@ -1300,8 +1303,6 @@ def test_a_context_that_waits_and_also_fails_a_file_check_is_refused_for_good(
     # Waiting cannot help this hop: once the wait lifts, the certificate still refuses the file.
     # Red before the fix, which left the pass open because a wait had been recorded.
     hop = pki.outbound_hop()
-    (tmp_path / "planted").mkdir()
-    planted = _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
     future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
     pki.crl.write_bytes(future)
     waits = _reload(pki)
@@ -1309,17 +1310,8 @@ def test_a_context_that_waits_and_also_fails_a_file_check_is_refused_for_good(
     assert waits is not None and waits.refusal is not None
     assert waits.refusal.remedy == WAIT and not waits.refusal.sticky
 
-    pki.crl.write_bytes(planted.ca_pem + future)
-    judged = _judged(monkeypatch)
-    caplog.clear()  # the control's refusal was logged too
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
-        first, second = _reload(pki), _reload(pki)
-
-    assert first is not None and first.refusal is not None
-    assert first.refusal.remedy == FIX and first.refusal.sticky
-    assert second is not None and second.refusal == first.refusal
-    assert len(judged) == 1
-    assert _refusals_logged(caplog) == 1
+    pki.crl.write_bytes(_planted_ca(tmp_path).ca_pem + future)
+    _assert_refused_for_good(pki, monkeypatch, caplog)
     assert _accepts(hop, pki.server())
 
 
@@ -1330,8 +1322,7 @@ def test_a_file_check_on_one_context_keeps_the_pass_open_for_one_that_only_waits
     # lifts. ``trusting`` does, so only time holds it back, and it must get the file once the CRL
     # takes effect. A fix refusal that closed the pass whatever else it held would never give it
     # the file: the pass would hand back the first refusal for good.
-    (tmp_path / "planted").mkdir()
-    planted = _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
+    planted = _planted_ca(tmp_path)
     both = tmp_path / "both.pem"
     both.write_bytes(pki.ca_pem + planted.ca_pem)
     strict = pki.outbound_hop()
@@ -1345,7 +1336,7 @@ def test_a_file_check_on_one_context_keeps_the_pass_open_for_one_that_only_waits
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
         waiting = _reload(pki)
         # Two days on, the CRL is in effect and both held copies are still in date.
-        later = _reload(pki, now=time.time() + 2 * 86400)
+        later = _reload(pki, now=time.time() + (2 * _DAY).total_seconds())
 
     assert waiting is not None and waiting.reloaded == 0 and waiting.refusal is not None
     assert waiting.refusal.remedy == FIX and not waiting.refusal.sticky
