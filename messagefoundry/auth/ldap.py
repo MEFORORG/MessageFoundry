@@ -1463,11 +1463,19 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
         server = _kerberos_acceptor(settings)
         server.step(token)
         principal = server.client_principal if _kerberos_context_complete(server) else None
-    except (spnego.exceptions.SpnegoError, ValueError, struct.error) as exc:
+    except (
+        spnego.exceptions.SpnegoError,
+        ValueError,
+        struct.error,
+        KeyError,
+        StopIteration,
+    ) as exc:
         # SpnegoError is the SSPI/GSSAPI (Windows/Linux-krb5) rejection; the pure-Python provider
-        # instead raises a bare ValueError/struct.error while parsing an untrusted token. Both are
-        # a failed SSO attempt — map to LdapError so authenticate_kerberos audits an
-        # `auth.login_error` reject (AUTH-K-AUDIT) rather than escaping to an unaudited 500.
+        # instead raises a bare ValueError/struct.error while parsing an untrusted token, and
+        # StopIteration or KeyError on a first NegTokenResp, which names a mechanism it never set up
+        # (BACKLOG #3186). Each is a failed SSO attempt — map to LdapError so authenticate_kerberos
+        # audits an `auth.login_error` reject (AUTH-K-AUDIT) rather than escaping to an unaudited
+        # 500. A StopIteration must not reach asyncio.to_thread at all: a Future refuses it.
         raise LdapError(str(exc)) from exc
     if not principal:
         return None
