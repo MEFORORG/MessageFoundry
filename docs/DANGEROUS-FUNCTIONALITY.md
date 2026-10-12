@@ -901,11 +901,18 @@ loader in the engine, which executes every config module again.
 `messagefoundry-harness` is a tool for testing an engine. It ships as its own distribution, and
 the engine wheel holds none of it. A harness command never runs inside the engine. It runs with the
 rights of whoever starts it, on the machine they start it on. The harness's `config/` modules are
-the exception: an engine the harness starts loads and runs them in its own process. The harness
-sends synthetic messages only. Paths in this section are under `harness/`.
+the exception: an engine the harness starts loads and runs them in its own process. Paths in this
+section are under `harness/`.
+
+The harness is built for synthetic messages. Treat that as a rule for its operator, not a
+property of the code. At least `load/corpus.py` replays a file of captured messages the operator
+names, meant to be de-identified first, and `reconcile/capture.py` records whatever an engine
+sends it. So what the harness carries is only as clean as what its operator gives it.
 
 It holds at least four of the classes above, and one of its own. This section is a floor, not a
-full list. It imports no `ctypes` and no archive or compression library.
+full list. No harness module imports `ctypes`, or an archive or compression library, itself. That
+is a claim about imports only. At least `sinks/dimse.py` inflates a compressed data set a peer
+sends it, through the engine's own bounded inflate helper.
 
 **Process starts.** 7 harness modules start a process, each from an argument list:
 
@@ -932,8 +939,10 @@ them. At least five things are open:
   there named like a module the child imports would load in its place. One start differs: the
   provisioning child runs `load/rigadmin.py` by file path with `-P`.
 - No start takes its environment from `messagefoundry/childenv.py`, and
-  `tests/test_child_process_environment.py` does not read the harness. So no test checks what a
-  harness child is handed.
+  `tests/test_child_process_environment.py` does not read the harness. So the check that holds
+  every engine start to that module does not reach a harness start. Some harness tests do check
+  what one child is handed, at least `tests/test_rig_admin.py` for the provisioning child and the
+  `rigadmin run` child.
 - `rigadmin run` signs in, then starts the command its caller names with `--token=<session>`
   added. The session is an argument of that child. It is visible wherever the machine shows a
   process's command line.
@@ -942,9 +951,11 @@ them. At least five things are open:
 node at least these, unless the run sets them itself: `MEFOR_SECURITY_ENFORCEMENT=warn`,
 `MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI=true`, `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=false` and
 `MEFOR_SECURITY_REQUIRE_MFA=false`. On Windows it adds `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`. It
-passes `--allow-insecure-bind` when the run binds the inbound listener off loopback. These suit a
-synthetic load graph. An engine started this way would not protect real messages, so never point
-one at them.
+passes `--allow-insecure-bind` when the run binds the inbound listener off loopback. Some runs go
+further. `load/multishard.py` and `load/shardcert.py` set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`
+and `MEFOR_ALLOW_INSECURE_TLS=1` for their engines on every platform, whatever the run's own
+environment says. These suit a synthetic load graph. An engine started this way would not protect
+real messages, so never point one at them.
 
 **Import by name.** 2 harness modules import a module named at run time:
 
@@ -964,16 +975,18 @@ one at them.
 
 Every engine the harness starts also loads the config folder the run gives it, and executes it
 (section 1). The runners name that folder the same way, as `harness/config/<name>` under the
-working directory. At least the failover, connection-scale, estate and multi-shard runs do. So a
+working directory. At least the failover, connection-scale, estate and `multishard` runs do. So a
 harness command started from another folder would make its engine run whatever sits at that path
-there, not the folder the harness ships. On Windows that engine also gets
+there, not the folder the harness ships. That engine may also carry
 `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`, described above, which eases the engine's check on who can
 write its config folder.
 
 **Emptying a message store.** At least `load/connscale/runner.py` and `load/shardcert.py` open the
-store that the `MEFOR_STORE_*` variables name and delete the rows of its pipeline tables before a
-step. A run on a machine whose environment names a store that holds real messages would delete
-them. Run the harness only where those variables name a test store.
+store that the `MEFOR_STORE_*` variables name and delete rows from it before a step. The first
+clears the pipeline tables. The second also clears at least the `state`, `leader_lease`, `nodes`
+and `cluster_config` tables, and ignores any error from a delete. A run on a machine whose
+environment names a store that holds real messages would delete them, and could clear that
+store's cluster records too. Run the harness only where those variables name a test store.
 
 **A run-time function swap.** This class is the harness's own. `provision-admin` reads the new
 password from a terminal and takes it no other way. A test rig has no terminal. So

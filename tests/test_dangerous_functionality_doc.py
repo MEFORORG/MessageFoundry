@@ -1884,11 +1884,16 @@ def test_harness_drift_is_reported() -> None:
         _drop_line(text, "| `load/connscale/probe.py` |"),
         _drop_line(text, "- `acceptance/probes.py` imports"),
         _drop_line(text, "- `load/shardcert.py` loads"),
+        # Anchored on the lead, not on "modules", so a correct count of 1 keeps the break live.
         _replace_once(
-            text, f"{n_starts} harness modules start", f"{n_starts + 1} harness modules start"
+            text,
+            f"{_HARNESS_STARTS_LEAD} {n_starts} harness module",
+            f"{_HARNESS_STARTS_LEAD} {n_starts + 1} harness module",
         ),
         _replace_once(
-            text, f"{n_imports} harness modules import", f"{n_imports + 1} harness modules import"
+            text,
+            f"{_HARNESS_IMPORTS_LEAD} {n_imports} harness module",
+            f"{_HARNESS_IMPORTS_LEAD} {n_imports + 1} harness module",
         ),
         _replace_once(
             text,
