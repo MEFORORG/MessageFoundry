@@ -20,15 +20,15 @@ proxy written ``https://``, because the controls below depend on it:
   re-enters the opener with the request re-addressed to the proxy, and the ``https`` entry then
   tunnels to the proxy itself. It does not when urllib's bypass list matches the proxy's own host.
 * An ``http`` target on an opener with no ``https`` proxy starts TLS first. So does that
-  bypass-list case, measured once by hand. The ``no_ambient_proxy`` fixture turns bypass off, so no
-  test here pins it.
+  bypass-list case. The ``no_ambient_proxy`` fixture turns bypass off, so its test sets
+  ``NO_PROXY`` itself.
 
-So the accepted control tested here for a credentialed ``https://`` proxy is the
-no-``https``-proxy shape, and its test reads the wire as well as the result. The first two
-shapes are refused (vault BACKLOG #3410), the bypass case aside, and so is the same leak across two DIFFERENT proxies: urllib keeps the first proxy's header when it
-hands the request on, so the second proxy got it in a cleartext ``CONNECT``. The two-proxy section
-below runs two recording sockets at once. If a later CPython opens TLS to a proxy, the measurement
-goes red and says so.
+The rule the engine applies is stated once, on ``ProxyCredentialsRefusedError``. These tests pin
+at least the legs above, and they read the wire as well as the result. The cleartext legs are
+refused (vault BACKLOG #3410). So is the same leak across two DIFFERENT proxies. urllib keeps the
+first proxy's header when it hands the request on, and the second proxy got it in a cleartext
+``CONNECT``. The two-proxy section below runs two recording sockets at once. If a later CPython
+opens TLS to a proxy, the measurement goes red and says so.
 
 Synthetic data only: the credentials are made up and every host name is reserved.
 """
@@ -157,14 +157,40 @@ def test_measured_urllib_sends_these_proxy_credentials_in_cleartext(
 
 
 def test_measured_urllib_opens_tls_first_for_an_http_target_with_no_https_proxy() -> None:
-    """The one shape in which a proxy written ``https://`` gets a TLS session before anything
-    else. Measured on plain urllib and on the engine's opener, where it is also not refused."""
+    """A proxy written ``https://`` gets a TLS session before anything else on this leg.
+    Measured on plain urllib and on the engine's opener, where it is also not refused."""
     for build in (urllib.request.build_opener, build_strict_opener):
         with _WireProxy() as proxy:
             value = f"https://{_CRED}@{proxy.address}"
             _open_and_discard(build(urllib.request.ProxyHandler({"http": value})), _HTTP_TARGET)
         assert proxy.cleartext == []
         assert proxy.tls_first == 1
+
+
+def test_an_http_target_reaches_a_bypassed_https_proxy_over_tls_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One proxy written ``https://`` for both schemes, and ``NO_PROXY`` names the proxy's own
+    host. Plain urllib and the engine's opener both send the ``http`` request to the proxy over
+    TLS: one connection, TLS first, no cleartext request head (vault BACKLOG #3410). The control is
+    the engine's opener with no bypass list, which is refused before it dials."""
+    with _WireProxy() as proxy:
+        value = f"https://{_CRED}@{proxy.address}"
+        opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
+        with pytest.raises(ProxyCredentialsRefusedError) as raised:
+            opener.open(_HTTP_TARGET, timeout=5)
+    assert proxy.connections == 0
+    _assert_fixed_refusal(raised.value)
+
+    for build in (urllib.request.build_opener, build_strict_opener):
+        with _WireProxy() as proxy:
+            monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
+            value = f"https://{_CRED}@{proxy.address}"
+            handler = urllib.request.ProxyHandler({"http": value, "https": value})
+            _open_and_discard(build(handler), _HTTP_TARGET)
+        assert proxy.connections == 1
+        assert proxy.tls_first == 1
+        assert proxy.cleartext == []
 
 
 # --- the refusal, on the wire --------------------------------------------------------------------
