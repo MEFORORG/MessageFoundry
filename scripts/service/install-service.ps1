@@ -1338,13 +1338,20 @@ function Test-ListenHost {
       Whether $Value can go on the service's command line as the --host value: an IP address, or a
       host name of letters, digits, hyphens and dots. It goes in unquoted, so anything else, such as
       a space, would add arguments (vault BACKLOG #2626).
+
+      An IPv4 address must be written as four numbers. IPAddress.TryParse also takes shorthand such
+      as '0' or '1.2', and the engine's resolver reads '0' as 0.0.0.0, every interface. For the
+      same reason a host name's last label must start with a letter, so '0x0' is refused too.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
     if ($Value -notmatch '^[A-Za-z0-9.:%-]{1,253}\z') { return $false }
     $parsed = $null
-    if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) { return $true }
+    if ([System.Net.IPAddress]::TryParse($Value, [ref]$parsed)) {
+        if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { return $true }
+        return $Value -match '^\d{1,3}(\.\d{1,3}){3}\z'
+    }
     $label = '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
-    return $Value -match "^$label(\.$label)*\z"
+    return $Value -match "^($label\.)*[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\z"
 }
 
 function Get-LockPathProblem {
@@ -1354,12 +1361,18 @@ function Get-LockPathProblem {
       Administrators the owner of everything below $Path (Set-SecureConfigAcl). So $Path must not be
       a volume root, a junction or mounted folder, or a folder that holds or is any of $Holds, such
       as the data directory or this checkout. With -NotWithin, it must also not be inside one of
-      those folders (vault BACKLOG #2626).
+      those folders. With -OnlyFolders, every folder directly in $Path must be one of those: a
+      folder that also holds, say, a File connection's drop folders is not MessageFoundry's own,
+      and locking it would take the service's write access to them (vault BACKLOG #2626).
+
+      These compare the paths as written. An 8.3 short name or a substituted drive for one of
+      $Holds is not recognised.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
         [string[]]$Holds = @(),
-        [string[]]$NotWithin = @()
+        [string[]]$NotWithin = @(),
+        [AllowNull()][string[]]$OnlyFolders = $null
     )
     $trimmed = $Path.TrimEnd('\')
     $root = [System.IO.Path]::GetPathRoot($Path)
@@ -1378,6 +1391,12 @@ function Get-LockPathProblem {
         if ($prefix.StartsWith($outer.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
             return "it is inside '$outer'"
         }
+    }
+    if ($null -ne $OnlyFolders -and $item) {
+        $own = @($OnlyFolders | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
+        $others = @(Get-ChildItem -LiteralPath $Path -Directory -Force |
+            Where-Object { $own -notcontains $_.FullName.TrimEnd('\') } | ForEach-Object { $_.Name })
+        if ($others) { return "it holds other folders: $($others -join ', ')" }
     }
     return ""
 }
@@ -1451,11 +1470,15 @@ if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectR
 # acts. The value and settings folders are checked again where they are locked, below.
 if ($LockConfigDir) {
     $LockKeepOut = @($DataDir, (Split-Path -Parent $DbPath), $NssmDir, $RepoRoot, $AppDirectory,
-        $(if ($PythonExe) { Split-Path -Parent $PythonExe }), $env:SystemRoot)
-    $configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut
+        $(if ($PythonExe) { Split-Path -Parent $PythonExe }), $env:SystemRoot, $env:ProgramFiles,
+        ${env:ProgramFiles(x86)}, $env:ProgramData, $(if ($env:USERPROFILE) { Split-Path -Parent $env:USERPROFILE }))
+    # Nothing under the Windows folder is a config folder.
+    $LockNotWithin = @($env:SystemRoot)
+    $configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut -NotWithin $LockNotWithin
     if ($configLockProblem) {
         throw ("-LockConfigDir will not lock the config directory '$Config': $configLockProblem. " +
-            "Point -Config at a dedicated folder (docs/SERVICE.md 'Lock down the config directory').")
+            "Point -Config at a dedicated folder (docs/SERVICE.md 'Lock down the config directory " +
+            "(CONFIG-2)').")
     }
 }
 
@@ -1705,6 +1728,15 @@ try {
 # The interpreter, with the options in $AppParams ahead of `-m messagefoundry` (vault BACKLOG #2701).
 Invoke-Nssm set $ServiceName Application $PythonExe
 Invoke-Nssm set $ServiceName AppParameters $AppParams
+# Read back what nssm stored, where the service reads it at each start. Invoke-Nssm's escaping
+# depends on how this host passes arguments, and a wrong guess would otherwise show only as a
+# service that fails at its first start (vault BACKLOG #2626).
+$storedParams = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters" `
+    -Name AppParameters -ErrorAction Stop).AppParameters
+if ($storedParams -cne $AppParams) {
+    throw ("nssm stored the service's arguments as [$storedParams], not [$AppParams]. Re-run this " +
+        "installer from PowerShell 7, or set AppParameters by hand.")
+}
 Invoke-Nssm set $ServiceName AppDirectory $AppDirectory
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"
 Invoke-Nssm set $ServiceName Description "MessageFoundry HL7 v2 integration engine."
@@ -1888,22 +1920,25 @@ if ($ServiceAccount) {
 $ValueFolder = Join-Path $ValuesAnchor "environments"
 $StartFolders = @()
 if (Test-Path -LiteralPath $ValueFolder -PathType Container) {
-    $StartFolders += [pscustomobject]@{ Path = $ValueFolder; NotWithin = @() }
+    $StartFolders += [pscustomobject]@{ Path = $ValueFolder; NotWithin = @(); OnlyFolders = $null }
 }
-# The settings file's folder is wherever that file sits, so it is locked only when it is a folder
-# of its own: not a volume root, not the checkout or a folder inside it, and not a folder that
-# holds the data directory or the install. The value folder may sit in the checkout, as the
-# config directory may: it is a folder of its own by name, and the windows-service-smoke CI leg
-# locks the checkout's environments\ this way.
+# The settings file's folder is wherever that file sits, and locking it reaches every folder below
+# it. So it is locked only when it is MessageFoundry's own: Get-LockPathProblem's checks, not in
+# the checkout, and holding no folder but -Config and the value folder. The value folder may sit
+# in the checkout, as the config directory may: it is a folder of its own by name, and the
+# windows-service-smoke CI leg locks the checkout's environments\ this way.
 if ($ServiceConfig) {
-    $StartFolders += [pscustomobject]@{ Path = (Split-Path -Parent $ServiceConfig); NotWithin = @($RepoRoot) }
+    $StartFolders += [pscustomobject]@{
+        Path = (Split-Path -Parent $ServiceConfig); NotWithin = @($RepoRoot); OnlyFolders = @($Config, $ValueFolder)
+    }
 }
 $StartFolders = @($StartFolders | Where-Object { $_.Path.TrimEnd('\') -ne $Config.TrimEnd('\') })
 $UnlockedFolders = @()
 if ($LockConfigDir) {
     $LockPaths = @($Config)
     foreach ($folder in $StartFolders) {
-        $problem = Get-LockPathProblem -Path $folder.Path -Holds $LockKeepOut -NotWithin $folder.NotWithin
+        $problem = Get-LockPathProblem -Path $folder.Path -Holds $LockKeepOut `
+            -NotWithin (@($folder.NotWithin) + $LockNotWithin) -OnlyFolders $folder.OnlyFolders
         if ($problem) { $UnlockedFolders += "'$($folder.Path)' ($problem)" }
         else { $LockPaths += $folder.Path }
     }

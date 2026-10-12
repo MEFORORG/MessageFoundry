@@ -133,12 +133,12 @@ def test_lock_config_dir_locks_each_start_folder_it_may() -> None:
     text = _text()
     folder = text.index('$ValueFolder = Join-Path $ValuesAnchor "environments"')
     settings = text.index(
-        "$StartFolders += [pscustomobject]@{ Path = (Split-Path -Parent $ServiceConfig); "
-        "NotWithin = @($RepoRoot) }"
+        "Path = (Split-Path -Parent $ServiceConfig); NotWithin = @($RepoRoot); "
+        "OnlyFolders = @($Config, $ValueFolder)"
     )
     block = text.index("if ($LockConfigDir) {\n    $LockPaths = @($Config)")
     check = text.index(
-        "Get-LockPathProblem -Path $folder.Path -Holds $LockKeepOut -NotWithin $folder.NotWithin"
+        "-NotWithin (@($folder.NotWithin) + $LockNotWithin) -OnlyFolders $folder.OnlyFolders"
     )
     cleared = text.index("else { $LockPaths += $folder.Path }")
     lock = text.index("Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount")
@@ -153,12 +153,25 @@ def test_lock_config_dir_locks_each_start_folder_it_may() -> None:
 
 def test_lock_config_dir_refuses_a_config_it_must_not_lock_before_anything_acts() -> None:
     text = _text()
-    check = text.index("$configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut")
+    check = text.index(
+        "$configLockProblem = Get-LockPathProblem -Path $Config -Holds $LockKeepOut "
+        "-NotWithin $LockNotWithin"
+    )
     assert "throw" in text[check : check + 300]
     assert check < text.index("$NssmPath = Resolve-Nssm")
     keep = text.index("$LockKeepOut = @(")
-    listed = text[keep : text.index("\n", text.index("$env:SystemRoot", keep))]
-    for name in ("$DataDir", "$NssmDir", "$RepoRoot", "$AppDirectory", "$DbPath", "$PythonExe"):
+    listed = text[keep : text.index("$LockNotWithin = @($env:SystemRoot)", keep)]
+    for name in (
+        "$DataDir",
+        "$NssmDir",
+        "$RepoRoot",
+        "$AppDirectory",
+        "$DbPath",
+        "$PythonExe",
+        "$env:ProgramFiles",
+        "${env:ProgramFiles(x86)}",
+        "$env:ProgramData",
+    ):
         assert name in listed, name
 
 
@@ -207,6 +220,14 @@ def test_get_lock_path_problem_refuses_a_root_a_junction_a_holder_and_the_checko
                 f"Get-LockPathProblem -Path {q(str(neighbour))} -Holds @({q(str(repo))}) "
                 f"-NotWithin @({q(str(repo))})"
             ),
+            "crowded": (
+                f"Get-LockPathProblem -Path {q(str(dedicated))} "
+                f"-OnlyFolders @({q(str(dedicated / 'other'))})"
+            ),
+            "own": (
+                f"Get-LockPathProblem -Path {q(str(dedicated))} "
+                f"-OnlyFolders @({q(str(dedicated / 'CONFIG'))})"
+            ),
             "dedicated": (
                 f"Get-LockPathProblem -Path {q(str(dedicated))} -Holds @({q(str(data))}, "
                 f"{q(str(repo))}, '') -NotWithin @({q(str(repo))})"
@@ -220,6 +241,8 @@ def test_get_lock_path_problem_refuses_a_root_a_junction_a_holder_and_the_checko
     assert got["inside"] == f"it is inside '{repo}'"
     assert got["neighbour"] == ""
     assert got["dedicated"] == ""
+    assert got["crowded"] == "it holds other folders: config"
+    assert got["own"] == ""
 
 
 def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_anything_acts(
@@ -236,9 +259,10 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
         "  $quote = try { Format-QuotedPath 'D:\\x\" --host 0.0.0.0 \"' } catch { 'refused' }\n"
         "  [pscustomobject]@{\n"
         "    quote = $quote\n"
-        "    good = @('127.0.0.1', '::1', '0.0.0.0', 'localhost', 'engine-1.example.org' |"
+        "    good = @('127.0.0.1', '::1', 'fe80::1', '0.0.0.0', 'localhost', 'engine-1.example.org' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
-        "    bad = @('127.0.0.1 --host 0.0.0.0', '\"127.0.0.1\"', '', '-x', 'a..b', 'a_b' |"
+        "    bad = @('127.0.0.1 --host 0.0.0.0', '\"127.0.0.1\"', '', '-x', 'a..b', 'a_b', '0', "
+        "'1.2', '0x0', '10.0.0.1x' |"
         " ForEach-Object { Test-ListenHost $_ })\n"
         "  } | ConvertTo-Json -Compress\n"
     )
@@ -247,7 +271,7 @@ def test_a_path_with_a_double_quote_and_a_bad_listen_host_are_refused_before_any
         .strip()
         .splitlines()[-1]
     )
-    assert got == {"quote": "refused", "good": [True] * 5, "bad": [False] * 6}
+    assert got == {"quote": "refused", "good": [True] * 6, "bad": [False] * 10}
 
 
 def test_a_legacy_escape_doubles_trailing_backslashes_only_where_the_host_adds_quotes(
