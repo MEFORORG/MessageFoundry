@@ -366,7 +366,6 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     A schema refusal quotes at most :data:`_QUOTE_LIMIT` characters of any one overlay key or
     value, and of the whole list of unknown keys.
     """
-    effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     if overlay is None:
         return DEFAULT_RULES
 
@@ -416,6 +415,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     fields = hl7.get("fields", {})
     if not isinstance(fields, dict):
         raise RuleError("anon overlay [hl7.fields] must be a table of path = kind")
+    effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     for path, raw_kind in fields.items():
         effective[_validate_path(path)] = _coerce_kind(path, raw_kind)
     for path in _as_path_list(hl7, "keep"):
@@ -493,14 +493,13 @@ def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, 
     not listed. :func:`load_rules` logs each entry, and a caller with a console of its own can
     repeat them there.
     """
-    now = {r.path: r for r in rules}
+    in_force = {r.path: r for r in rules}
     quiet = (SurrogateKind.KEEP, SurrogateKind.DROP)
+    pairs = ((default, in_force.get(default.path)) for default in DEFAULT_RULES)
     return tuple(
-        (default, now[default.path])
-        for default in DEFAULT_RULES
-        if default.path in now
-        and now[default.path].kind != default.kind
-        and now[default.path].kind not in quiet
+        (default, now)
+        for default, now in pairs
+        if now is not None and now.kind != default.kind and now.kind not in quiet
     )
 
 
