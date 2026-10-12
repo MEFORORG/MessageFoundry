@@ -43,9 +43,18 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import AuditAppend
 from messagefoundry.uploads import UploadStore
 from tests._admin_account import create_local_user_chosen
+from tests._bound_proof import ReprovingTransport
 from tests.test_uploads_strict_ciphertext import _BREAKS
 
 PW = "Correct-Horse-Battery-Staple-9"
+
+
+def _asgi(**kwargs: Any) -> ReprovingTransport:
+    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
+    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
+    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
+
+
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN123^^^H^MR||DOE^JANE\r"
 ADT2 = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A04|MSG2|P|2.5.1\rPID|1||MRN999\r"
 BATCH = ADT + ADT2
@@ -75,13 +84,12 @@ def _keyed_store(root: Path) -> UploadStore:
 
 
 async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
-    # The upload store is this file's subject, so a resend keeps the session window here.
-    # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+    # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+    # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
+    # pins the gate itself.
     service = AuthService(
         engine.store,
-        AuthSettings(
-            admin_write_min_interval_seconds=0, require_mfa=False, require_action_step_up=False
-        ),
+        AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
     )
     await service.initialize()
     uid = await create_local_user_chosen(
@@ -167,7 +175,7 @@ async def test_routes_503_when_unconfigured(engine: Engine, tmp_path: Path) -> N
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+    transport = _asgi(app=create_app(engine, allow_no_auth=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.get("/uploads")
         assert r.status_code == 503
@@ -179,7 +187,7 @@ async def test_upload_list_browse_roundtrip(engine: Engine, tmp_path: Path) -> N
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         up = await c.post(
@@ -227,7 +235,7 @@ async def test_uploads_listing_is_paged(engine: Engine, tmp_path: Path) -> None:
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         for n in range(5):
@@ -274,7 +282,7 @@ async def test_upload_denied_for_viewer(engine: Engine, tmp_path: Path) -> None:
 
     service = await _make_user(engine, Role.VIEWER, name="vw")  # no files:* permissions
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "vw")
         up = await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
@@ -291,7 +299,7 @@ async def test_upload_rejects_disallowed_extension(engine: Engine, tmp_path: Pat
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         up = await c.post(
@@ -318,7 +326,7 @@ async def test_upload_rejects_content_extension_mismatch(engine: Engine, tmp_pat
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         not_hl7 = b"this is a plain text line, not an HL7 message\n"
@@ -335,7 +343,7 @@ async def test_upload_accepts_txt_and_xml(engine: Engine, tmp_path: Path) -> Non
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         t = await c.post(
@@ -364,7 +372,7 @@ async def test_upload_rejects_binary_container_415(engine: Engine, tmp_path: Pat
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     containers = [
         ("shot.txt", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01 rest of jpeg"),  # JPEG
         ("doc.txt", b"%PDF-1.7\n1 0 obj<<>>endobj\n%%EOF"),  # PDF
@@ -396,7 +404,7 @@ async def test_upload_rejects_nul_body_415(engine: Engine, tmp_path: Path) -> No
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         up = await c.post(
@@ -417,7 +425,7 @@ async def test_upload_text_formats_pass_text_only_gate(engine: Engine, tmp_path:
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         for name, blob in (
@@ -442,7 +450,7 @@ async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_pa
         max_upload_files_per_user=1,
     )
     app = create_app(engine, auth=service, store_settings=settings)
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         first = await c.post(
@@ -468,7 +476,7 @@ async def test_browse_and_delete_path_traversal_404(engine: Engine, tmp_path: Pa
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         # A path-traversal-shaped id never resolves to a file, and no filesystem touch happens.
@@ -494,7 +502,7 @@ async def test_delete_confirm_audits(engine: Engine, tmp_path: Path) -> None:
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         fid = (
@@ -516,7 +524,7 @@ async def test_no_upload_audit_row_carries_the_file_name(engine: Engine, tmp_pat
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     name = "MRN_SYNTH_0001.hl7"
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
@@ -554,7 +562,7 @@ async def test_resend_injects_via_enqueue_ingress(engine: Engine, tmp_path: Path
     await engine.start()
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         fid = (
@@ -592,7 +600,7 @@ async def test_resend_unknown_and_not_running_inbound(engine: Engine, tmp_path: 
     )  # registered but engine NOT started → not running
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         fid = (
@@ -635,7 +643,7 @@ async def test_browse_requires_step_up_and_audits_shape(engine: Engine, tmp_path
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         login = await c.post(
             "/auth/login", json={"username": "op", "password": PW, "provider": "local"}
@@ -716,7 +724,7 @@ async def test_uploaded_files_are_owner_only_across_operators(
     service = await _make_user(engine, Role.OPERATOR, name="op")
     op2_id = await _add_user(service, Role.OPERATOR, name="op2")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h1 = await _login(c, "op")
         fid = (
@@ -779,7 +787,7 @@ async def test_administrator_override_reaches_another_operators_upload(
     service = await _make_user(engine, Role.OPERATOR, name="op")
     await _add_user(service, Role.ADMINISTRATOR, name="root")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h1 = await _login(c, "op")
         fid = (
@@ -817,7 +825,7 @@ async def test_upload_with_no_owner_id_is_reachable_only_with_the_override(
     service = await _make_user(engine, Role.OPERATOR, name="op")
     await _add_user(service, Role.ADMINISTRATOR, name="root")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h1 = await _login(c, "op")
         fid = (
@@ -874,7 +882,7 @@ async def test_a_recreated_username_cannot_reach_the_departed_operators_upload(
     departed = await service.store.get_user_by_username("op")
     assert departed is not None
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h1 = await _login(c, "op")
         fid = (
@@ -937,7 +945,7 @@ async def test_the_prune_audit_row_names_the_system_not_the_pruned_files_owner(
         uploads_retention_days=30,
     )
     app = create_app(engine, auth=service, store_settings=settings)
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h1 = await _login(c, "op")
         fid = (
@@ -1006,7 +1014,7 @@ async def test_a_deadline_mid_sweep_still_writes_a_prune_row_per_deleted_file(
     )
     app = create_app(engine, auth=service, store_settings=settings)
     us = app.state.upload_store
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         aged: set[str] = set()
@@ -1070,7 +1078,7 @@ async def test_a_prune_failure_of_any_kind_never_fails_the_upload(
         raise RuntimeError("a sidecar the scan could not read")
 
     app.state.upload_store.prune_expired = _boom
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
@@ -1095,7 +1103,7 @@ async def test_uploaded_browse_moves_the_needle_into_a_post_body(
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         fid = (
@@ -1257,7 +1265,7 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
     await _add_user(service, Role.ADMINISTRATOR, name="root")
     root = tmp_path / "uploads"
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         ha = await _login(c, "root")
@@ -1322,7 +1330,7 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
     await _add_user(service, Role.ADMINISTRATOR, name="root")
     root = tmp_path / "uploads"
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
-    transport = httpx.ASGITransport(app=app)
+    transport = _asgi(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _login(c, "op")
         ha = await _login(c, "root")

@@ -325,3 +325,27 @@ async def test_prior_resend_answers_only_a_repeat_of_the_same_request(engine: En
     assert await engine.prior_resend("k-reingress", message_id=other, to=None) is None
     assert await engine.prior_resend("k-reingress", message_id=mid, to="OB_X") is None
     assert await engine.prior_resend("unused", message_id=mid, to=None) is None
+
+
+#: The suites whose subject is what the bound routes DO. They used to switch the proof off, so they
+#: ran in a posture the engine does not ship (PR 2142 item 7). They now run with it on, through
+#: tests/_bound_proof.py (vault BACKLOG #3241).
+_SUITES_ON_THE_SHIPPED_DEFAULT = (
+    "test_approvals.py",
+    "test_dual_control_reload.py",
+    "test_reload_cancellation.py",
+    "test_resend_ingress_guards.py",
+    "test_upload_api.py",
+    "test_message_export.py",
+    "test_resend.py",
+)
+
+
+def test_the_bound_route_suites_run_with_the_proof_on() -> None:
+    """A suite that switches the bound proof off again reds here. Only the org opt-out test in
+    test_message_export.py may build a service with it off, and it names the opt-out by hand."""
+    here = Path(__file__).resolve().parent
+    for name in _SUITES_ON_THE_SHIPPED_DEFAULT:
+        source = (here / name).read_text(encoding="utf-8")
+        assert "require_action_step_up=False" not in source, f"{name} switches the bound proof off"
+        assert "ReprovingTransport" in source, f"{name} no longer re-proves as a client does"

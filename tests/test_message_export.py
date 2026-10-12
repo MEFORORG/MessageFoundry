@@ -32,8 +32,16 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._bound_proof import ReprovingTransport
 
 PW = "a-strong-test-passphrase"  # ≥15, satisfies the ASVS policy
+
+
+def _asgi(**kwargs: Any) -> ReprovingTransport:
+    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
+    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
+    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
+
 
 ADT_A = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSGA|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
 ADT_B = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSGB|P|2.5.1\rPID|1||MRN9002^^^H^MR||ROE^RICHARD\r"
@@ -61,9 +69,9 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine, *, bound: bool = False) -> AuthService:
-    # ``bound`` keeps the shipped default, an export proof bound to the action (vault BACKLOG #2625).
-    # The other tests here are about what an export selects and records, so they keep the window.
+async def _service(engine: Engine, *, bound: bool = True) -> AuthService:
+    # ``bound`` is the shipped default, an export proof bound to the action (vault BACKLOG #2625),
+    # which _client re-proves for (vault BACKLOG #3241). Only the org opt-out test turns it off.
     service = AuthService(
         engine.store,
         AuthSettings(
@@ -75,12 +83,20 @@ async def _service(engine: Engine, *, bound: bool = False) -> AuthService:
 
 
 def _client(
-    engine: Engine, service: AuthService, *, raise_app_exceptions: bool = True
+    engine: Engine,
+    service: AuthService,
+    *,
+    raise_app_exceptions: bool = True,
+    reprove: bool = True,
 ) -> httpx.AsyncClient:
     # raise_app_exceptions=False hands back what streamed before the app raised, as a real client
     # sees a broken download, rather than re-raising the app's exception into the test.
-    transport = httpx.ASGITransport(
-        app=create_app(engine, auth=service), raise_app_exceptions=raise_app_exceptions
+    # reprove=False is for the tests whose subject is the step-up refusal itself.
+    app = create_app(engine, auth=service)
+    transport = (
+        _asgi(app=app, raise_app_exceptions=raise_app_exceptions)
+        if reprove
+        else httpx.ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
     )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
@@ -146,10 +162,10 @@ async def _seed(engine: Engine) -> tuple[str, str]:
 async def test_export_requires_step_up(engine: Engine) -> None:
     """A fresh login's window does not reach an export: it takes a proof bound to the export, spent
     by the one request it opens (vault BACKLOG #2625)."""
-    service = await _service(engine, bound=True)
+    service = await _service(engine)
     await _add_user(service, "op", [Role.OPERATOR.value])
     await _seed(engine)
-    async with _client(engine, service) as c:
+    async with _client(engine, service, reprove=False) as c:
         token = await _login(c, "op")
         # POST, because a needle-selected save-all sends its criteria in the body (BACKLOG #1184);
         # the gate is the same on both shapes.
@@ -174,10 +190,10 @@ async def test_export_requires_step_up(engine: Engine) -> None:
 
 async def test_export_keeps_the_window_under_the_org_opt_out(engine: Engine) -> None:
     """``[auth].require_action_step_up = false`` puts the export back on the session window."""
-    service = await _service(engine)
+    service = await _service(engine, bound=False)
     await _add_user(service, "op", [Role.OPERATOR.value])
     await _seed(engine)
-    async with _client(engine, service) as c:
+    async with _client(engine, service, reprove=False) as c:
         token = await _login(c, "op")
         ok = await c.post("/messages/export", headers=_auth(token), json={"content": "JANE"})
         assert ok.status_code == 200, ok.text
@@ -304,11 +320,10 @@ async def test_export_charges_the_per_actor_phi_read_budget(engine: Engine) -> N
     so without an explicit admission charge one actor could stream far more bodies per minute here than
     the per-actor budget allows through ``/messages``. It must draw from the SAME bucket."""
     service = AuthService(
-        # The PHI-read budget is the subject; the export keeps the window (vault BACKLOG #2625).
+        # The PHI-read budget is the subject. The export proof is on, as shipped, and _client
+        # re-proves for it (vault BACKLOG #3241).
         engine.store,
-        AuthSettings(
-            require_mfa=False, phi_read_rate_limit_per_actor=2, require_action_step_up=False
-        ),
+        AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=2),
     )
     await service.initialize()
     await _add_user(service, "op", [Role.OPERATOR.value])
@@ -331,11 +346,10 @@ async def test_export_throttled_at_admission_writes_no_audit_and_streams_nothing
     """The charge is at ADMISSION — before selection — so a refused export does no store work and
     cannot leave a ``messages_export`` row claiming bodies that were never streamed."""
     service = AuthService(
-        # The PHI-read budget is the subject; the export keeps the window (vault BACKLOG #2625).
+        # The PHI-read budget is the subject. The export proof is on, as shipped, and _client
+        # re-proves for it (vault BACKLOG #3241).
         engine.store,
-        AuthSettings(
-            require_mfa=False, phi_read_rate_limit_per_actor=1, require_action_step_up=False
-        ),
+        AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=1),
     )
     await service.initialize()
     await _add_user(service, "op", [Role.OPERATOR.value])
@@ -638,7 +652,14 @@ async def test_an_export_longer_than_the_idle_window_does_not_idle_its_own_sessi
         return await real(message_id)
 
     async with _client(engine, service, raise_app_exceptions=False) as c:
-        token = await _login(c, "op")
+        # Proved up front: a re-proof re-keys the session, and this test reads that session after.
+        proved = await c.post(
+            "/me/reauth",
+            json={"password": PW, "purpose": "message_export"},
+            headers=_auth(await _login(c, "op")),
+        )
+        assert proved.status_code == 200, proved.text
+        token = str(proved.json()["token"])
         monkeypatch.setattr(engine.store, "get_message", slow)
         r = await c.get("/messages/export", headers=_auth(token), params={"ids": ids})
     assert r.status_code == 200, r.text

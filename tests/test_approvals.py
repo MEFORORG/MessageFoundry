@@ -41,9 +41,18 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import OutboxStatus
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._bound_proof import ReprovingTransport
 from tests._operator_audit_atomic_contract import AppendFailed, failing_append
 
 PW = "a-strong-test-passphrase"
+
+
+def _asgi(**kwargs: Any) -> ReprovingTransport:
+    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
+    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
+    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
+
+
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 # min_dwell_seconds=0: these tests request and release within milliseconds, which the shipped 2.0 s
 # floor (ASVS 2.4.2) would refuse. The floor has its own suite, tests/test_approval_min_dwell.py.
@@ -67,13 +76,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def _service(engine: Engine) -> AuthService:
     # Approvals is a step-up admin flow, not an MFA test: pin require_mfa=False so the BACKLOG #187
     # secure default (require_mfa now ON) doesn't 403 the request before the approval path is exercised.
-    # Dual control is this file's subject, so a purge keeps the session window here.
-    # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+    # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+    # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
+    # pins the gate itself.
     service = AuthService(
         engine.store,
-        AuthSettings(
-            admin_write_min_interval_seconds=0, require_mfa=False, require_action_step_up=False
-        ),
+        AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False),
     )
     await service.initialize()
     return service
@@ -83,7 +91,7 @@ def _client(
     engine: Engine, service: AuthService, approvals: ApprovalsSettings
 ) -> httpx.AsyncClient:
     app = create_app(engine, auth=service, approvals=approvals)
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    return httpx.AsyncClient(transport=_asgi(app=app), base_url="http://t")
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
@@ -1278,7 +1286,7 @@ def _app_client(
         return {"requeued": 0}
 
     gate.register("dead_letter_replay", "replay", _counts, permission=Permission.MESSAGES_REPLAY)
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    client = httpx.AsyncClient(transport=_asgi(app=app), base_url="http://t")
     return gate, client
 
 

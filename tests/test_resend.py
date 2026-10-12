@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -38,6 +39,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._bound_proof import ReprovingTransport
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 # A transformed outbound body, distinct from the raw, so a test can prove resend ships the TRANSFORMED
@@ -307,7 +309,7 @@ async def test_resend_endpoint_resent_then_duplicate_and_audited(tmp_path: Path)
         mid = await engine.store.enqueue_message(
             channel_id="in1", raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
         )
-        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        transport = _asgi(app=create_app(engine, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             r = await c.post(
                 f"/messages/{mid}/resend",
@@ -345,7 +347,7 @@ async def test_resend_endpoint_unknown_target_and_not_running(tmp_path: Path) ->
         mid = await engine.store.enqueue_message(
             channel_id="in1", raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
         )
-        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        transport = _asgi(app=create_app(engine, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             not_running = await c.post(
                 f"/messages/{mid}/resend",
@@ -388,7 +390,7 @@ async def test_resend_endpoint_retention_nulled_source_is_409(tmp_path: Path) ->
         for r in await engine.store.outbox_for(mid):
             await engine.store.mark_done(str(r["id"]))
         await engine.store.purge_message_bodies(older_than=9_999_999_999.0)
-        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        transport = _asgi(app=create_app(engine, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             resp = await c.post(
                 f"/messages/{mid}/resend",
@@ -405,6 +407,12 @@ async def test_resend_endpoint_retention_nulled_source_is_409(tmp_path: Path) ->
 PW = "Sup3rSecret!!"
 
 
+def _asgi(**kwargs: Any) -> ReprovingTransport:
+    """The ASGI transport, re-proving an action-bound step-up as a JSON client does, so this
+    suite runs with ``[auth].require_action_step_up`` on, as shipped (vault BACKLOG #3241)."""
+    return ReprovingTransport(httpx.ASGITransport(**kwargs), PW)
+
+
 async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path: Path) -> None:
     # A channel-scoped operator scoped to the ORIGIN channel but NOT the alternate outbound must be
     # refused (403) BEFORE any resend — PHI can't be pushed to a partner the caller can't reach.
@@ -417,10 +425,11 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        # The bound proof is not this test's subject, so it keeps the session window.
-        # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+        # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+        # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
+        # pins the gate itself. No admin-write gap, or the re-proved retry would be paced.
         service = AuthService(
-            engine.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+            engine.store, AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
         )
         await service.initialize()
         uid = await create_local_user_chosen(
@@ -448,7 +457,7 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
         mid = await engine.store.enqueue_message(
             channel_id="in1", raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
         )
-        transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+        transport = _asgi(app=create_app(engine, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             login = await c.post(
                 "/auth/login", json={"username": "op", "password": PW, "provider": "local"}
@@ -478,10 +487,11 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        # The bound proof is not this test's subject, so it keeps the session window.
-        # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+        # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+        # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
+        # pins the gate itself. No admin-write gap, or the re-proved retry would be paced.
         service = AuthService(
-            engine.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+            engine.store, AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
         )
         await service.initialize()
         uid = await create_local_user_chosen(
@@ -508,7 +518,7 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
         mid = await engine.store.enqueue_message(
             channel_id="in1", raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
         )
-        transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+        transport = _asgi(app=create_app(engine, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             login = await c.post(
                 "/auth/login", json={"username": "v", "password": PW, "provider": "local"}
@@ -541,10 +551,11 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
         _running_registry(tmp_path)
     )  # registered but engine NOT started -> not running
     try:
-        # The bound proof is not this test's subject, so it keeps the session window.
-        # Vault BACKLOG #2625's action-bound proof is pinned in tests/test_bound_step_up_injection.py.
+        # The shipped default: the action-bound proof is on, and _asgi re-proves for it
+        # as a JSON client does (vault BACKLOG #3241). tests/test_bound_step_up_injection.py
+        # pins the gate itself. No admin-write gap, or the re-proved retry would be paced.
         service = AuthService(
-            engine.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+            engine.store, AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
         )
         await service.initialize()
         uid = await create_local_user_chosen(
@@ -572,12 +583,20 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
         mid = await engine.store.enqueue_message(
             channel_id="in1", raw=ADT, deliveries=[("OB1", TRANSFORMED)], source_type="file"
         )
-        transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+        transport = _asgi(app=create_app(engine, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             login = await c.post(
                 "/auth/login", json={"username": "op", "password": PW, "provider": "local"}
             )
-            h = {"Authorization": f"Bearer {login.json()['token']}"}
+            # Proved before the request, so the one resend writes the one grant row; a refused
+            # first attempt would write its own (vault BACKLOG #3241).
+            proved = await c.post(
+                "/me/reauth",
+                json={"password": PW, "purpose": "message_resend"},
+                headers={"Authorization": f"Bearer {login.json()['token']}"},
+            )
+            assert proved.status_code == 200, proved.text
+            h = {"Authorization": f"Bearer {proved.json()['token']}"}
             r = await c.post(
                 f"/messages/{mid}/resend",
                 json={"to": "OB2", "idempotency_key": "k1", "source": "OB1"},
