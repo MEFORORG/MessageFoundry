@@ -1453,18 +1453,30 @@ class _PolicyCallingParamiko(_FakeParamiko):
 
 
 def test_sftp_password_login_never_takes_the_escape(
-    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Vault BACKLOG #3230: the escape would auto-accept an unknown host key, and the password would
     then go to whichever server answered. A password login refuses the unknown key instead, before
     it authenticates, with text naming the connection and the fix."""
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _PolicyCallingParamiko)
     _PolicyCallingSSHClient.authenticated = False
-    client = _SftpClient(
-        {"host": "h", "port": 22, "remote_dir": "/in", "username": "svc", "password": "synthetic"},
-        name="OB_SFTP",
-    )
+    with caplog.at_level(logging.WARNING):
+        client = _SftpClient(
+            {
+                "host": "h",
+                "port": 22,
+                "remote_dir": "/in",
+                "username": "svc",
+                "password": "synthetic",
+            },
+            name="OB_SFTP",
+        )
     assert client._accept_unknown is False
+    # Said at build, before any delivery is refused at connect.
+    assert any(
+        "connection 'OB_SFTP'" in r.getMessage() and "logs in with a password" in r.getMessage()
+        for r in caplog.records
+    )
     with pytest.raises(_RemoteError) as ei:
         client.list_dir("/in")
     assert ei.value.permanent is True

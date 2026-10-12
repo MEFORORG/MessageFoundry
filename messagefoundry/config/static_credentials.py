@@ -199,7 +199,7 @@ def http_hop_credentials(
     it sends none.
 
     The connectors' refusal of a credential over ``verify_tls = false`` reads this (vault BACKLOG
-    #3230), so that refusal and this inventory cannot disagree about what counts as a credential.
+    #3230), so the two agree on every credential this module reads.
     A credential written into the literal ``headers`` table, or into the ``url`` query, is not a
     setting this module reads; the refusal adds those itself (``transports.rest.http_credentials_sent``)."""
     token = _http_token(ctype, settings, lookup=lookup)

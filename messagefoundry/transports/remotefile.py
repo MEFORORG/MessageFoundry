@@ -1647,7 +1647,18 @@ class _SftpClient(_RemoteClient):
         # (posture unstamped) the escape is refused since vault BACKLOG #2354 (it used to be unclamped).
         # A password login is outside the escape altogether (vault BACKLOG #3230): AutoAddPolicy would
         # hand the password to whichever server answered. A key-only login keeps the escape.
-        self._accept_unknown = not self._password and weakened_tls_escape_permitted_here()
+        escape = weakened_tls_escape_permitted_here()
+        self._accept_unknown = escape and not self._password
+        if escape and self._password:
+            # Said at build, so the operator learns it before a delivery is refused at connect.
+            logger.warning(
+                "%sREMOTEFILE sftp %s logs in with a password, so %s does not let it accept an "
+                "unknown host key; an unknown key is refused at connect. Add the server's host key "
+                "to known_hosts.",
+                hop_name_prefix(self._name),
+                self._host,
+                INSECURE_TLS_ESCAPE_ENV,
+            )
         if self._accept_unknown:
             logger.warning(
                 "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "

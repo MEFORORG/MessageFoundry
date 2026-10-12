@@ -43,9 +43,10 @@ the one statement of that rule; other pages link here.
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
 or starts the service, except SFTP: the host key is known only once the server answers, so that
-refusal comes at connect, before the password is sent. **No lever in this guide lifts it.** That covers `MEFOR_ALLOW_INSECURE_TLS`,
-`[security].enforcement = warn`, `tls_hop_attested`, `cleartext_accepted` and a loopback host. Each
-refusal names the connection and the settings that do fix it.
+refusal comes at connect, before the password is sent. **No lever in this guide lifts a refusal in
+the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
+`tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection and
+the settings that do fix it.
 
 | Hop | Refused when it carries a credential and | What fixes it |
 |---|---|---|
@@ -60,9 +61,10 @@ A credential here means at least a password, a static or minted bearer token, an
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
 a static header that settings views would mask, such as `Authorization` or an API key. That last
 test leans toward caution: a header named like a key, such as `X-Routing-Key`, also counts. The
-HTTP family reads the settings half of the list from the same reader as the static-credential
-inventory, so the two cannot disagree. A hop with no credential is not refused by this rule. Its own
-loosening entry decides it.
+HTTP family reads its auth-setting credentials from the same reader as the static-credential
+inventory. That inventory does not yet count a static header or a `url` query credential, so for
+those two kinds this rule is the wider of the two. A hop with no credential is not refused by this
+rule. Its own loosening entry decides it.
 
 An AD bind always carries a credential, because the service account must bind first. So
 `ad_tls_verify = false` over LDAPS is refused in every case.

@@ -1031,7 +1031,8 @@ def http_credentials_sent(
     BACKLOG #3230). Empty when it sends none.
 
     The settings half is :func:`~messagefoundry.config.static_credentials.http_hop_credentials`, the
-    static-credential inventory's own reader, so the refusal and the inventory cannot disagree. A
+    static-credential inventory's own reader, so the two agree on every auth setting. The two
+    additions below are this refusal's alone; the inventory does not count them yet. A
     static ``headers`` entry is a credential when the redaction screen
     (``config.wiring._is_secret_header``) would mask it, so an API-key header counts too. That
     screen leans toward a false positive, which here refuses a verify-off hop that a header name
