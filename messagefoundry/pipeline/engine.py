@@ -84,7 +84,7 @@ from messagefoundry.pipeline.secret_rotation import (
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
-from messagefoundry.pipeline.sharding import owned_destination_set
+from messagefoundry.pipeline.sharding import join_shard_names, owned_destination_set
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
@@ -2584,8 +2584,9 @@ class Engine:
                 # universe here would leave this shard claiming by a NEW map while siblings claim by
                 # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
                 # others get none (ACKed messages stall with no alert). Fail closed instead.
-                old_ids = ",".join(running.all_shard_ids) if running.all_shard_ids else "<single>"
-                new_ids = ",".join(registry.all_shard_ids) if registry.all_shard_ids else "<single>"
+                old, new = running.all_shard_ids, registry.all_shard_ids
+                old_ids = join_shard_names(old) if old else "<single>"
+                new_ids = join_shard_names(new) if new else "<single>"
                 raise WiringError(
                     f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
                     "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "

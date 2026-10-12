@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry.config.settings import EgressSettings, StoreBackend
 from messagefoundry.config.wiring import (
     MLLP,
@@ -70,6 +71,18 @@ def _registry() -> Registry:
 def test_require_unified_store_refuses_multi_shard_sqlite() -> None:
     with pytest.raises(ValueError, match="server-DB"):
         require_unified_store(StoreBackend.SQLITE, ["a", "b"])
+
+
+@pytest.mark.parametrize("names", [["EAST", "WEST"], ["East", "West"]], ids=["caps", "title"])
+def test_require_unified_store_names_engine_shards_past_the_log_redaction(names: list[str]) -> None:
+    # `supervise` logs this refusal, and the log's PHI pass takes two capitalized words around a
+    # comma for a family-comma-given name. Joined with a comma the names reached the log as
+    # `2 shards: [redacted]` (vault BACKLOG #3227), so they join with `/`.
+    with pytest.raises(ValueError, match="server-DB") as refused:
+        require_unified_store(StoreBackend.SQLITE, names)
+    logged = redaction.redact(str(refused.value))
+    assert all(name in logged for name in names), logged
+    assert f"2 shards: {'/'.join(names)})" in logged
 
 
 def test_require_unified_store_allows_single_or_no_shard_on_sqlite() -> None:

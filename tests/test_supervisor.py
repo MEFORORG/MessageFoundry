@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry.childenv import python_child_argv
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.pipeline import supervisor as supervisor_mod
@@ -782,6 +783,67 @@ async def test_supervise_keeps_running_while_any_shard_is_alive(
     )
     assert "a down after a crash loop" in errors[1]
     assert not any("whole fleet" in e for e in errors)
+
+
+@pytest.mark.parametrize("names", [("EAST", "WEST"), ("East", "West")], ids=["caps", "title"])
+@pytest.mark.parametrize("survivor", [False, True], ids=["whole-fleet", "one-alive"])
+async def test_supervise_names_two_crash_looped_engine_shards_past_the_log_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    names: tuple[str, str],
+    survivor: bool,
+) -> None:
+    """Two engine shards trip the breaker, and the closing ERROR line must still name both once the
+    log's PHI pass has read it (vault BACKLOG #3227). That pass takes two capitalized words around a
+    comma for a family-comma-given name, so ``EAST, WEST`` reached the log as ``[redacted]``. Both
+    closing lines are held: every engine shard down, and two down beside one still alive."""
+    time_ = _FakeTime()
+    built: list[Supervisor] = []
+    real = Supervisor
+
+    async def spawn(spec: ShardSpec) -> _FakeProcess:
+        p = _FakeProcess()
+        if spec.shard in names:
+            p.finish(3)
+        return p
+
+    def _supervisor(specs: list[ShardSpec]) -> Supervisor:
+        sup = real(
+            specs, spawn=_spawner(spawn), crash_loop_limit=2, clock=time_.clock, sleep=time_.sleep
+        )
+        built.append(sup)
+        return sup
+
+    async def _loads(config: str) -> None:
+        return None
+
+    specs = [_spec(name, 8765 + i) for i, name in enumerate(names)]
+    if survivor:
+        specs.append(_spec("spare", 8799))
+    monkeypatch.setattr(supervisor_mod, "discover_shard_specs", lambda *a, **k: specs)
+    monkeypatch.setattr(supervisor_mod, "preflight_shard_config", _loads)
+    monkeypatch.setattr(supervisor_mod, "Supervisor", _supervisor)
+
+    with caplog.at_level(logging.ERROR, logger=supervisor_mod.__name__):
+        task = asyncio.create_task(supervise("cfg", install_signal_handlers=False, **_DISCOVERY))
+        try:
+            for _ in range(400):
+                if built and built[0].crash_looped == set(names):
+                    break
+                await asyncio.sleep(0)
+            assert built[0].crash_looped == set(names)
+        finally:
+            # With one engine shard alive supervise runs on, so the cancel stands in for the signal
+            # handler. With none alive it has returned by itself and the cancel does nothing.
+            if survivor:
+                task.cancel()
+            code = await asyncio.wait_for(task, timeout=5.0)
+    assert code == (0 if survivor else 1)
+    closing = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR][-1]
+    assert ("down after a crash loop" if survivor else "whole fleet is down") in closing
+    logged = redaction.redact(closing)
+    assert all(name in logged for name in names), logged
+    assert "/".join(sorted(names)) in logged
 
 
 # --- the pre-flight: a config must load the way an engine shard will load it (vault BACKLOG #2587) -------

@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry.config.settings import BackupSettings, DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError, load_config
 from messagefoundry.pipeline import Engine
@@ -313,7 +314,7 @@ async def test_reload_refuses_shard_universe_change_and_accepts_same_set(tmp_pat
         assert eng._owned_lanes() == owned_before
 
         # Changed universe {a,b,c}: refused, and the refusal message names the shard sets.
-        with pytest.raises(WiringError, match=r"engine-shard set.*a,b.*a,b,c"):
+        with pytest.raises(WiringError, match=r"engine-shard set.*a/b.*a/b/c"):
             await eng.reload(three)
 
         # The running graph is untouched by the refusal — still shard a of {a,b}, still running.
@@ -324,6 +325,37 @@ async def test_reload_refuses_shard_universe_change_and_accepts_same_set(tmp_pat
         assert eng._owned_lanes() == owned_before
     finally:
         await eng.stop()
+
+
+@pytest.mark.parametrize(
+    "names", [("EAST", "NORTH", "WEST"), ("East", "North", "West")], ids=["caps", "title"]
+)
+async def test_the_reload_refusal_names_engine_shards_past_the_log_redaction(
+    tmp_path: Path, names: tuple[str, str, str]
+) -> None:
+    """The reload route logs this refusal through ``safe_exc``, and that PHI pass takes two
+    capitalized words around a comma for a family-comma-given name. Joined with a comma the two
+    sets reached the log as ``([redacted] -> [redacted],WEST)`` (vault BACKLOG #3227), so they join
+    with ``/``."""
+    east, north, west = names
+    two = _write_cfg(tmp_path / "cfg_two", tmp_path, [east, west])
+    three = _write_cfg(tmp_path / "cfg_three", tmp_path, [east, north, west])
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=_only(east),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    eng.add_registry(_only(east)(load_config(two)))
+    await eng.start()
+    try:
+        with pytest.raises(WiringError, match="engine-shard set") as refused:
+            await eng.reload(three)
+    finally:
+        await eng.stop()
+    logged = redaction.safe_exc(refused.value, limit=8192)
+    assert all(name in logged for name in names), logged
+    assert f"({east}/{west} -> {east}/{north}/{west})" in logged
 
 
 # --- 4. DR activation recovery scoping -------------------------------------------
