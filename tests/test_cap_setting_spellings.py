@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from decimal import Decimal
+from fractions import Fraction
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,14 +32,17 @@ from messagefoundry.config.wiring import (
     _NAMED_CASTS,
     MLLP,
     ConnectionSpec,
+    Database,
     DatabasePoll,
     Http,
     Sftp,
+    Soap,
     env,
     resolve_env_settings,
 )
-from messagefoundry.transports import build_source, mllp
+from messagefoundry.transports import build_destination, build_source, database, mllp
 from messagefoundry.transports.base import cap_setting, positive_cap, resolve_poll_ceiling
+from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.dicom import DicomScpSource, DicomScuDestination
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.http_listener import DEFAULT_MAX_HEADER_BYTES, HttpSource
@@ -251,9 +257,12 @@ def test_the_poll_ceiling_reads_a_string_zero_as_unlimited_like_the_toml_zero() 
     for off in (0, "0", None, "", 0.0):
         assert resolve_poll_ceiling(off, knob="poll_max_files", transport="file source") is None
     assert resolve_poll_ceiling("25", knob="poll_max_files", transport="file source") == 25
-    for bad in (-1, "-1", 0.5):
+    for bad in (-1, "-1"):
         with pytest.raises(ValueError, match="positive number of items per poll"):
             resolve_poll_ceiling(bad, knob="poll_max_files", transport="file source")
+    # A fraction is not a count at all, so it is refused before the range check (BACKLOG #3431).
+    with pytest.raises(ValueError, match="poll_max_files=0.5 is not a valid int value"):
+        resolve_poll_ceiling(0.5, knob="poll_max_files", transport="file source")
     assert _file({"poll_max_files": "0"}).poll_max_files is None
 
 
@@ -332,9 +341,40 @@ def _database(over: dict[str, Any]) -> Any:
     )
 
 
-#: (builder, settings key, attribute) for every cap read as an ``int`` count, whichever helper reads
-#: it: ``positive_cap``, ``resolve_poll_ceiling``, the MLLP listener's own ``cap_setting`` calls, and
-#: the two caps with no off switch (``max_header_bytes``, ``max_decompressed_members``).
+def _database_out(over: dict[str, Any]) -> Any:
+    settings = Database(
+        server="db.example", database="d", statement="INSERT INTO t (a) VALUES (:a)"
+    )
+    return build_destination(
+        Destination(
+            name="OB_DB", type=ConnectorType.DATABASE, settings={**settings.settings, **over}
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+def _lookup(over: dict[str, Any]) -> SimpleNamespace:
+    executor = DatabaseLookupExecutor(
+        {"clarity": {"server": "db.example", "database": "d", **over}},
+        egress=EgressSettings(deny_by_default=False),
+    )
+    return SimpleNamespace(pool_max=executor._pool_max["clarity"])
+
+
+def _soap(over: dict[str, Any]) -> Any:
+    return build_destination(
+        Destination(
+            name="OB_SOAP",
+            type=ConnectorType.SOAP,
+            settings={**Soap(url="https://api.example.com/svc").settings, **over},
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+#: (builder, settings key, attribute) for every cap read as an ``int`` count with a range check on top:
+#: ``positive_cap``, ``resolve_poll_ceiling``, the MLLP listener's ``max_connections_per_host``, and the
+#: two caps with no off switch (``max_header_bytes``, ``max_decompressed_members``).
 _INT_CAPS = [
     pytest.param(_MLLP_IN, "max_connections", "max_connections", id="mllp-in-max_connections"),
     pytest.param(
@@ -380,33 +420,85 @@ _INT_CAPS = [
     pytest.param(_SCU, "max_object_bytes", "_max_object_bytes", id="scu-max_object_bytes"),
 ]
 
+#: Integer settings read by ``count_setting`` alone. Each was a bare ``int()`` before #3431. None has a
+#: range check, so a negative is not refused here; that is a separate question for each setting.
+_COUNT_ONLY = [
+    pytest.param(_SCP, "max_associations", "_max_associations", id="scp-max_associations"),
+    pytest.param(_SCP, "max_pdu_size", "_max_pdu_size", id="scp-max_pdu_size"),
+    pytest.param(_SCU, "max_pdu_size", "_max_pdu_size", id="scu-max_pdu_size"),
+    pytest.param(_database_out, "pool_max", "_pool_max", id="database-out-pool_max"),
+    pytest.param(
+        _database_out, "capture_max_rows", "_capture_max_rows", id="database-out-capture_rows"
+    ),
+    pytest.param(
+        _database_out, "capture_max_bytes", "_capture_max_bytes", id="database-out-capture_bytes"
+    ),
+    pytest.param(_database, "pool_max", "_pool_max", id="database-in-pool_max"),
+    pytest.param(_lookup, "pool_max", "pool_max", id="database-lookup-pool_max"),
+    pytest.param(
+        _soap, "ws_timestamp_ttl_seconds", "ws_timestamp_ttl_seconds", id="soap-timestamp_ttl"
+    ),
+]
 
-@pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS)
-@pytest.mark.parametrize("bad", [True, False, 1.9, 2048.5, 0.5, -1, math.inf, math.nan])
-def test_an_integer_cap_refuses_a_bool_or_a_fraction(
+_NOT_A_COUNT = [True, False, 1.9, 2048.5, 0.5, Decimal("1.9"), Fraction(19, 10), math.inf, math.nan]
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS + _COUNT_ONLY)
+@pytest.mark.parametrize("bad", _NOT_A_COUNT)
+def test_an_integer_setting_refuses_a_bool_or_a_fraction(
     build: Build, key: str, attr: str, bad: object
 ) -> None:
     """``int()`` turns ``True`` into 1 and ``1.9`` into 1, so before #3431 either one built a live
     cap of one byte or one connection, a cap that refuses nearly everything. Each is a typo, so each
-    is a build error that names the key.
+    is a build error that names the key. A ``Decimal`` or a ``Fraction`` is held to the same rule.
 
-    Red mutation: drop the ``refuse_non_count`` call from ``positive_cap``. Every ``True`` and
-    ``1.9`` case on a ``positive_cap`` site builds cleanly. ``0.5``, ``-1``, ``inf`` and ``nan`` were
-    already refused and stay as controls."""
+    Red mutation: let ``cap_setting`` read an ``int`` cap with ``int()`` again, or put a bare
+    ``int()`` back on any ``_COUNT_ONLY`` site. That site's ``True``, ``1.9``, ``Decimal`` and
+    ``Fraction`` cases build cleanly."""
     del attr
-    with pytest.raises(ValueError, match=key):
+    with pytest.raises(ValueError, match=f"{key}=.* is not a valid int value"):
         build({key: bad})
 
 
 @pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS)
-def test_an_integer_cap_accepts_a_whole_float_and_padded_text(
+def test_an_integer_cap_still_refuses_a_negative(build: Build, key: str, attr: str) -> None:
+    """The range check on top of the count rule still runs on every ``_INT_CAPS`` site."""
+    del attr
+    with pytest.raises(ValueError, match=key):
+        build({key: -1})
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _INT_CAPS + _COUNT_ONLY)
+def test_an_integer_setting_accepts_a_whole_number_and_padded_text(
     build: Build, key: str, attr: str
 ) -> None:
-    """The control for the refusal above: a TOML ``2048.0`` is a whole count, and an uncast
-    ``env()`` reference hands over text such as ``" 7 "`` or ``"+5"``, which ``int()`` reads."""
+    """The control for the refusal above: a TOML ``2048.0`` is a whole count, and so is a whole
+    ``Decimal``. An uncast ``env()`` reference hands over text such as ``" 7 "`` or ``"+5"``, which
+    ``int()`` reads."""
     assert getattr(build({key: 2048.0}), attr) == 2048
+    assert getattr(build({key: Decimal("4096")}), attr) == 4096
     assert getattr(build({key: " 7 "}), attr) == 7
     assert getattr(build({key: "+5"}), attr) == 5
+
+
+async def test_the_reference_sync_pool_size_is_a_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DATABASE reference source reads ``pool_max`` by the same rule, before any pool is made."""
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    made: list[object] = []
+
+    async def _no_pool(*args: object, **kwargs: object) -> object:
+        made.append(args)
+        raise AssertionError("the pool size should have been refused before a pool was made")
+
+    monkeypatch.setattr(database, "_make_pool", _no_pool)
+    base = {"server": "db.example", "database": "d", "statement": "SELECT a", "key_column": "a"}
+    for bad in (True, 1.9, Decimal("1.9"), Fraction(19, 10)):
+        with pytest.raises(ValueError, match="reference source pool_max=.* is not a valid int"):
+            await _load_database_source(
+                {**base, "pool_max": bad}, EgressSettings(deny_by_default=False)
+            )
+    assert made == []
 
 
 def _from_spec(spec: ConnectionSpec) -> Any:
@@ -442,5 +534,7 @@ def test_the_bool_refusal_says_why() -> None:
         positive_cap(True, int, knob="k", transport="t")
     with pytest.raises(ValueError, match="whole number"):
         positive_cap(1.9, int, knob="k", transport="t")
+    with pytest.raises(ValueError, match="whole number"):
+        positive_cap(Decimal("1.9"), int, knob="k", transport="t")
     # A float cap is not a count, so a fraction is the whole point of it.
     assert positive_cap(1.9, float, knob="k", transport="t") == 1.9

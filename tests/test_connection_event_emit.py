@@ -797,16 +797,19 @@ def test_a_sub_one_cap_is_still_refused_and_is_not_swallowed_as_off() -> None:
 
     The narrow way to read a string zero as off is to convert first and test the result. On an `int`
     cap that also reads `-0.5` as off, because `int(-0.5)` is `0` — turning a refusal into a silently
-    disabled security cap, and in the fail-open direction. `_cap_setting` tests a float view instead,
-    so a sub-1 value still reaches the guard that was written for it.
+    disabled security cap, and in the fail-open direction. `_cap_setting` refuses a fraction on an
+    `int` cap outright (BACKLOG #3431), so nothing truncates to zero, and a whole negative still
+    reaches the guard that was written for it.
 
     Only reachable from a hand-written Python kwarg: `connections.toml` refuses a float or a string
     on an integer key, and an uncast `env()` ref hands over text that `int()` rejects. Pinned anyway,
     because the whole subject of this group is a spelling nobody expected to be reachable either.
     """
-    for bad in (-0.5, 0.5, -1):
-        with pytest.raises(ValueError, match="max_connections_per_host must be at least 1"):
+    for bad in (-0.5, 0.5):
+        with pytest.raises(ValueError, match=r"max_connections_per_host=-?0\.5 is not a valid int"):
             _mllp(max_connections_per_host=bad)
+    with pytest.raises(ValueError, match="max_connections_per_host must be at least 1"):
+        _mllp(max_connections_per_host=-1)
     # The float cap has no truncation to hide behind, so its guard sees the value as written.
     with pytest.raises(ValueError, match="max_frame_seconds must be a number of seconds"):
         _mllp(max_frame_seconds=-0.5)

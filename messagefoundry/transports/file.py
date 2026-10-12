@@ -351,8 +351,6 @@ def _member_cap(value: object) -> int:
     operator who wrote 0 meaning "no cap". This is the ``max_header_bytes`` rule on the HTTP source."""
     if value is None or value == "":
         return DEFAULT_MAX_DECOMPRESSED_MEMBERS
-    # positive_cap refuses a bool and a fraction above one (BACKLOG #3431), which would otherwise read
-    # as a cap of 1. gzip_decompress refuses a bool for max_members too.
     cap = positive_cap(
         value,
         int,
