@@ -77,6 +77,8 @@ __all__ = [
     "DEFAULT_MAX_ITEMS_PER_POLL",
     "cap_setting",
     "count_setting",
+    "float_setting",
+    "positive_seconds",
     "positive_cap",
     "resolve_poll_ceiling",
 ]
@@ -110,9 +112,10 @@ __all__ = [
 DEFAULT_MAX_ITEMS_PER_POLL = 500
 
 
-#: Text that spells zero in plain digits: ``"0"``, ``"00"``, ``"0.0"``, ``"-0.0"``, ``".0"``. An
-#: ``int`` cap reads this as "off" without ``float()``, so text that ``float()`` merely rounds to
-#: zero, such as ``"1e-400"``, reaches :func:`count_setting` and is refused there (BACKLOG #3431).
+#: Text that spells zero in plain digits: ``"0"``, ``"00"``, ``"0.0"``, ``"-0.0"``, ``".0"``. A cap
+#: reads this as "off" without ``float()``, so text that ``float()`` merely rounds to zero, such as
+#: ``"1e-400"``, reaches :func:`count_setting` or :func:`float_setting` and is refused there
+#: (BACKLOG #3431, #3432).
 _ZERO_TEXT = re.compile(r"[+-]?(?:0+(?:\.0*)?|\.0+)")
 
 
@@ -142,8 +145,8 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
     here already ``env()``-resolved, and a resolved value stays out of an error, as it does in
     ``_lookup_max_rows`` in ``transports/database.py`` (BACKLOG #1183). Every raise below sits outside
     the handler, so ``int()``'s own message, which quotes the value, is not left on ``__context__``
-    (BACKLOG #1796). This covers the type refusals here and in :func:`cap_setting` only. At least the
-    range refusals in :func:`positive_cap` and :func:`resolve_poll_ceiling` still quote the value."""
+    (BACKLOG #1796). The range refusals in :func:`positive_cap`, :func:`resolve_poll_ceiling` and
+    :func:`poll_interval` withhold it too (BACKLOG #3432)."""
     reason: str
     if isinstance(value, bool):
         reason = "a count is not a bool"
@@ -169,6 +172,81 @@ def count_setting(value: Any, *, knob: str, transport: str) -> int:
     else:
         reason = f"a count is a number or text, not {type(value).__name__}"
     raise ValueError(f"{transport} {knob} is not a valid int value (value withheld): {reason}")
+
+
+def float_setting(value: Any, *, knob: str, transport: str) -> float:
+    """Read one float setting, such as a timeout or a rate, as a finite number, or refuse it naming
+    the key (BACKLOG #3432).
+
+    **This docstring holds the rule; the readers that use it point here.** They are at least every
+    ``float`` cap read through :func:`cap_setting`, :func:`poll_interval`, and the timeout reads that
+    call this directly. A bare ``float()`` turns ``True`` into 1.0, takes ``"nan"`` and ``"inf"``,
+    and rounds ``"1e-400"`` to ``0.0``. So a bool built a one-second timeout, a NaN built a timeout
+    that fires at once, and text that only rounds to zero could turn a guard off. So:
+
+    - an ``int`` or a ``float`` passes, and so does another real number, such as a ``Decimal`` or a
+      ``Fraction``;
+    - a bool is refused, ``False`` as well as ``True``: a bool is not a number of seconds;
+    - a NaN or an infinity is refused, and so is a number too large for a float, such as ``1e400``;
+    - a value that ``float()`` only rounds to zero is refused, such as the text ``"1e-400"`` or
+      ``Decimal("1e-400")``. Text is zero only when it spells zero in plain digits, such as ``"0"``,
+      ``"0.0"`` or ``"-0"``, so ``"0e0"`` is refused too;
+    - other text is read by ``float()``, so ``" 2.5 "`` and ``"+2.5"`` pass;
+    - anything else is refused, whatever ``float()`` would have made of it.
+
+    Zero and negatives come back as they are. What a zero means, and whether a negative is a typo, is
+    each caller's own question, answered with a message naming its own key.
+
+    **A TOML literal is parsed before this rule sees it.** ``tomllib`` reads ``x = 1e-400`` as
+    ``0.0``, so in ``connections.toml`` that literal reads exactly as a written ``0.0`` does, which is
+    zero. That stays: the spelling is gone before any reader runs, and the alternative is a
+    ``parse_float`` hook on the whole file. Text from an uncast ``env()`` reference keeps its
+    spelling, so the rule above applies to it.
+
+    The refusal names the transport, the key and the reason, and withholds the value, by the rule in
+    :func:`count_setting` (BACKLOG #1183, #1796)."""
+    reason: str
+    if isinstance(value, bool):
+        reason = "it is a bool"
+    elif isinstance(value, str | numbers.Number):
+        # numbers.Number promises no conversion to float; one without it (a complex) raises TypeError.
+        number: Any = value
+        try:
+            seconds = float(number)
+        except OverflowError:
+            reason = "it is too large for a float"
+        except (TypeError, ValueError):
+            reason = "it is not a real number"
+        else:
+            if not math.isfinite(seconds):
+                reason = "it is not a finite number"
+            elif seconds == 0 and not _spells_zero(value):
+                reason = "float() rounds it to zero, but it is not zero"
+            else:
+                return seconds
+    else:
+        reason = f"it is a {type(value).__name__}, not a number or text"
+    raise ValueError(f"{transport} {knob} is not a valid float value (value withheld): {reason}")
+
+
+def positive_seconds(value: Any, *, knob: str, transport: str) -> float:
+    """:func:`float_setting`, then refuse a value that is not above zero, withholding it.
+
+    For a number of seconds with no "off", where zero or a negative would make every wait end at
+    once: at least ``poll_seconds``, the HTTP reply timeouts and the Timer's ``interval_seconds``."""
+    seconds = float_setting(value, knob=knob, transport=transport)
+    if seconds <= 0:
+        raise ValueError(
+            f"{transport} {knob} must be a number of seconds above zero (value withheld)"
+        )
+    return seconds
+
+
+def _spells_zero(value: Any) -> bool:
+    """Whether ``value`` is an exact zero: text in plain digits, or a number equal to zero."""
+    if isinstance(value, str):
+        return _ZERO_TEXT.fullmatch(value.strip()) is not None
+    return bool(value == 0)
 
 
 def cap_setting[NumT: (int, float)](
@@ -197,40 +275,27 @@ def cap_setting[NumT: (int, float)](
     ``"0.0"`` or ``"-0.0"``, or when ``int()`` reads it as ``0``. Text is never tested with
     ``float()`` there, which would round ``"1e-400"`` to ``0.0`` and read it as off; that text goes to
     :func:`count_setting`, which refuses it, as it refuses ``"0e0"``. A number that equals zero, such
-    as ``0.0`` or ``-0.0``, is off too. On a ``float`` cap, any text ``float()`` reads as zero is off.
-    A ``float`` cap refuses a bool too, ``False`` included.
+    as ``0.0`` or ``-0.0``, is off too.
+
+    **A ``float`` cap is read by :func:`float_setting`, and the same exact zeros are its only "off"
+    (BACKLOG #3432).** So ``"1e-400"`` and ``"0e0"`` are refused there rather than read as off, and a
+    bool, a NaN and an infinity are refused too. That function's docstring holds the rule, including
+    why a ``connections.toml`` literal ``1e-400`` still reads as zero.
 
     A negative value is returned as-is, for the callers that refuse one at build with a message naming
     their own key; :func:`positive_cap` is that caller for most sites. It is a different mistake with a
     different answer, and folding it into "off" here would swallow the typo. A value that is not a
-    number is refused here, naming the key and withholding the value, by the rule in
-    :func:`count_setting`.
+    number is refused here, naming the key and withholding the value.
     """
     if value is None or value == "":
         return None
+    if isinstance(value, str) and _ZERO_TEXT.fullmatch(value.strip()):
+        return None
     if kind is int:
-        if isinstance(value, str) and _ZERO_TEXT.fullmatch(value.strip()):
-            return None
         count = count_setting(value, knob=knob, transport=transport)
         return None if count == 0 else count
-    if isinstance(value, str):
-        with contextlib.suppress(ValueError):
-            if float(value) == 0:  # at least "0", " 0 ", "0.0" and "-0.0"
-                return None
-    if isinstance(value, bool):
-        # float(True) is 1.0, so a bool would build a one-second timeout or a rate of one per second.
-        raise ValueError(
-            f"{transport} {knob} is not a valid float value (value withheld): it is a bool"
-        )
-    cap: NumT | None
-    try:
-        cap = kind(value)
-    except (TypeError, ValueError, OverflowError):
-        cap = None
-    if cap is None:
-        # Raised after the handler ends: float()'s own message quotes the value (BACKLOG #1796).
-        raise ValueError(f"{transport} {knob} is not a valid float value (value withheld)")
-    # A NaN is not zero, so it comes back for the caller's range check to refuse.
+    # kind is float here, so kind() converts nothing; it gives the result the NumT type.
+    cap = kind(float_setting(value, knob=knob, transport=transport))
     return None if cap == 0 else cap
 
 
@@ -244,20 +309,18 @@ def positive_cap[NumT: (int, float)](
 ) -> NumT | None:
     """:func:`cap_setting`, then refuse at build whatever is left that is not above zero (BACKLOG #1872).
 
-    After zero has been read as "off", what reaches the check is a negative or a NaN. Each one is a
-    cap that refuses all traffic, or, for a timeout, closes every peer the moment it connects, and
-    nobody writes one on purpose. Refused here, the typo surfaces at wiring and in ``messagefoundry
-    check``, not as a connection that reports running and accepts nothing. Written ``not cap > 0``
-    rather than ``cap <= 0`` so a NaN float cap is refused too: every comparison with NaN is false, so
-    ``cap_setting`` cannot read it as off either. An ``int`` cap is a count, so it is held to the rule
-    in :func:`count_setting` first.
+    After zero has been read as "off", what reaches the check is a negative. It is a cap that refuses
+    all traffic, or, for a timeout, closes every peer the moment it connects, and nobody writes one on
+    purpose. Refused here, the typo surfaces at wiring and in ``messagefoundry check``, not as a
+    connection that reports running and accepts nothing. :func:`cap_setting` has already refused a
+    NaN (BACKLOG #3432). The refusal withholds the value, by the rule in :func:`count_setting`.
 
     ``off_hint`` ends the not-above-zero refusal. The default tells the operator how to turn the cap
     off. A caller where ``None``/``0`` does NOT turn it off passes its own text, so the refusal does not
     point at an off switch that does not exist (the DICOM SCP's ``max_object_bytes``, BACKLOG #2103)."""
     cap = cap_setting(value, kind, knob=knob, transport=transport)
-    if cap is not None and not cap > 0:
-        raise ValueError(f"{transport} {knob}={value!r} must be above zero ({off_hint})")
+    if cap is not None and cap <= 0:
+        raise ValueError(f"{transport} {knob} must be above zero (value withheld; {off_hint})")
     return cap
 
 
@@ -273,7 +336,7 @@ def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None
     Clamping it to 1 would instead silently ingest at a rate nobody asked for. The connector already
     raises a :class:`ValueError` for a bad ``after_read``, so a bad number surfaces the same way: at
     wiring / ``messagefoundry check``, before the connection ever starts. The count itself is read by
-    :func:`count_setting`."""
+    :func:`count_setting`, and the refusal withholds the value by its rule."""
     # ``value`` is typed Any rather than object because every call site reads it out of an untyped
     # settings mapping; object would need a `type: ignore` on this line, and a suppression a reader
     # has to decide whether to trust is worse than the honest Any.
@@ -282,8 +345,8 @@ def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None
         return None
     if ceiling < 1:
         raise ValueError(
-            f"{transport} {knob}={value!r} must be a positive number of items per poll "
-            f"(or 0 for unlimited)"
+            f"{transport} {knob} must be a positive number of items per poll "
+            "(value withheld; or 0 for unlimited)"
         )
     return ceiling
 
@@ -300,18 +363,10 @@ def poll_interval(settings: Mapping[str, Any], *, default: float, transport: str
     ``interval_seconds``.
 
     Deliberately not :func:`positive_cap`: that helper reads ``0`` as "off", and an interval has no
-    off. Written ``not interval > 0`` so a NaN, for which every comparison is false, is refused by
-    the same test."""
-    value = settings.get("poll_seconds", default)
-    try:
-        interval = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{transport} poll_seconds={value!r} is not a number of seconds") from exc
-    if not (math.isfinite(interval) and interval > 0):
-        raise ValueError(
-            f"{transport} poll_seconds={value!r} must be a finite number of seconds above zero"
-        )
-    return interval
+    off. Read by :func:`positive_seconds` (BACKLOG #3432)."""
+    return positive_seconds(
+        settings.get("poll_seconds", default), knob="poll_seconds", transport=transport
+    )
 
 
 # A source hands each inbound message (raw bytes, MLLP framing already stripped) to this

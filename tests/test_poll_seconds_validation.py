@@ -68,7 +68,7 @@ _SOURCES: dict[str, tuple[Callable[..., Any], str, float]] = {
 @pytest.mark.parametrize("source", list(_SOURCES))
 @pytest.mark.parametrize(
     "value",
-    [0, 0.0, -1, -0.5, math.nan, math.inf, "0", "nan", "soon"],
+    [0, 0.0, -1, -0.5, math.nan, math.inf, "0", "nan", "soon", True, False, "1e-400"],
     ids=[
         "zero",
         "zero-float",
@@ -79,13 +79,16 @@ _SOURCES: dict[str, tuple[Callable[..., Any], str, float]] = {
         "zero-text",
         "nan-text",
         "not-a-number",
+        "true",
+        "false",
+        "rounds-to-zero",
     ],
 )
 def test_a_poll_interval_that_is_not_a_finite_positive_number_is_refused(
     source: str, value: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     build, _, _ = _SOURCES[source]
-    with pytest.raises(ValueError, match="poll_seconds="):
+    with pytest.raises(ValueError, match="poll_seconds "):
         build(tmp_path, monkeypatch, value)
 
 
@@ -104,5 +107,5 @@ def test_the_refusal_names_the_source_and_says_what_is_wanted() -> None:
     with pytest.raises(ValueError) as caught:
         poll_interval({"poll_seconds": 0}, default=1.0, transport="file source")
     assert str(caught.value) == (
-        "file source poll_seconds=0 must be a finite number of seconds above zero"
+        "file source poll_seconds must be a number of seconds above zero (value withheld)"
     )

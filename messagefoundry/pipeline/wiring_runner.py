@@ -218,6 +218,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
 
 __all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
@@ -2071,7 +2072,7 @@ class RegistryRunner:
             self.store,
             self._reply_rendezvous,
             destination=str(settings["reply_from"]),
-            timeout=float(settings.get("reply_timeout") or 30.0),
+            timeout=reply_seconds(settings, "reply_timeout"),
             content_type=str(settings.get("reply_content_type") or "passthrough"),
             on_timeout=str(settings.get("reply_on_timeout") or "504"),
             metrics=metrics,

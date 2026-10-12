@@ -18,6 +18,7 @@ range check, not a coercion asymmetry, and it has its own tests below.
 from __future__ import annotations
 
 import math
+import operator
 from collections.abc import Callable
 from decimal import Decimal
 from fractions import Fraction
@@ -34,21 +35,37 @@ from messagefoundry.config.wiring import (
     ConnectionSpec,
     Database,
     DatabasePoll,
+    Ftp,
     Http,
     Sftp,
     Soap,
+    WiringError,
     env,
     resolve_env_settings,
 )
 from messagefoundry.transports import build_destination, build_source, database, mllp
-from messagefoundry.transports.base import cap_setting, positive_cap, resolve_poll_ceiling
+from messagefoundry.transports.base import (
+    cap_setting,
+    float_setting,
+    poll_interval,
+    positive_cap,
+    resolve_poll_ceiling,
+)
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.dicom import DicomScpSource, DicomScuDestination
+from messagefoundry.transports.dicomweb import DicomWebDestination
+from messagefoundry.transports.direct import DirectDestination
+from messagefoundry.transports.email import EmailDestination
+from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.file import FileSource
+from messagefoundry.transports.http_auth import oauth2_cc_provider_from_settings
 from messagefoundry.transports.http_listener import DEFAULT_MAX_HEADER_BYTES, HttpSource
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.remotefile import RemoteFileSource
+from messagefoundry.transports.rest import RestDestination
+from messagefoundry.transports.smart import token_provider_from_settings
 from messagefoundry.transports.tcp import TcpDestination, TcpSource
+from messagefoundry.transports.timer import TimerSource
 from messagefoundry.transports.x12 import X12Destination, X12Source
 
 Build = Callable[[dict[str, Any]], Any]
@@ -212,7 +229,7 @@ def test_a_string_zero_burst_defaults_to_the_rate_like_a_number_zero(
     assert getattr(string_zero, burst_attr) == 100.0
     assert getattr(build({rate_key: 100, key: "7"}), burst_attr) == 7.0  # the control
     # The refusal names the connector too, so a listener that stops passing its own name shows up.
-    with pytest.raises(ValueError, match=f"{transport} {key}="):
+    with pytest.raises(ValueError, match=rf"{transport} {key} must be above zero \(value withheld"):
         build({rate_key: 100, key: -1})
 
 
@@ -327,13 +344,16 @@ def test_positive_cap_refuses_what_is_left_after_zero_reads_as_off() -> None:
     for bad in (0.5, math.nan, "1e3", "lots", [1], math.inf):
         with pytest.raises(ValueError, match=r"^t k is not a valid int value \(value withheld\)"):
             positive_cap(bad, int, knob="k", transport="t")
-    # A whole negative is a range refusal, which still quotes the value.
+    # A whole negative is a range refusal, which withholds the value too (BACKLOG #3432).
     for negative in (-1, "-1"):
-        with pytest.raises(ValueError, match="t k="):
+        with pytest.raises(ValueError, match=r"^t k must be above zero \(value withheld"):
             positive_cap(negative, int, knob="k", transport="t")
-    for bad_seconds in (-0.5, "-0.5", math.nan):
-        with pytest.raises(ValueError, match="t k="):
+    for bad_seconds in (-0.5, "-0.5"):
+        with pytest.raises(ValueError, match=r"^t k must be above zero \(value withheld"):
             positive_cap(bad_seconds, float, knob="k", transport="t")
+    # A NaN is not a number of seconds at all, so it is refused before the range check.
+    with pytest.raises(ValueError, match=r"^t k is not a valid float value \(value withheld\)"):
+        positive_cap(math.nan, float, knob="k", transport="t")
 
 
 # === an integer cap is a whole count (BACKLOG #3431) ==============================================
@@ -595,8 +615,9 @@ def test_an_integer_cap_reads_only_an_exact_zero_as_off() -> None:
     for not_zero in ("1e-400", "0e0", "0x0", "zero"):
         with pytest.raises(ValueError, match=r"^t k is not a valid int value"):
             cap_setting(not_zero, int, knob="k", transport="t")
-    # A float cap is not a count, so text float() reads as zero is still "off" there.
-    assert cap_setting("0e0", float, knob="k", transport="t") is None
+    # A float cap takes the same exact zeros as "off", and refuses the same exponent text (#3432).
+    with pytest.raises(ValueError, match=r"^t k is not a valid float value"):
+        cap_setting("0e0", float, knob="k", transport="t")
 
 
 @pytest.mark.parametrize("kind", [int, float])
@@ -614,3 +635,301 @@ def test_a_refusal_withholds_the_value(kind: type[int] | type[float]) -> None:
     assert sentinel not in str(caught.value)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+# === a float cap or timeout is a finite number (BACKLOG #3432) =====================================
+
+
+def _timer(over: dict[str, Any]) -> TimerSource:
+    return TimerSource(Source(type=ConnectorType.TIMER, settings={"body": "x", **over}))
+
+
+def _ftp(over: dict[str, Any]) -> RemoteFileSource:
+    settings = {**Ftp(host="ftp.example.com", remote_dir="/in").settings, **over}
+    src = build_source(
+        Source(type=ConnectorType.REMOTEFILE, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(src, RemoteFileSource)
+    return src
+
+
+def _url_dest(cls: type[Any], ctype: ConnectorType, url: str) -> Build:
+    return lambda over: cls(Destination(name="OB_TEST", type=ctype, settings={"url": url, **over}))
+
+
+_EMAIL_BASE = {
+    "host": "smtp.example.com",
+    "sender": "a@example.com",
+    "recipients": ["b@example.com"],
+}
+
+
+def _email(over: dict[str, Any]) -> EmailDestination:
+    return EmailDestination(
+        Destination(name="OB", type=ConnectorType.EMAIL, settings={**_EMAIL_BASE, **over})
+    )
+
+
+def _fhir_lookup(over: dict[str, Any]) -> SimpleNamespace:
+    executor = FhirLookupExecutor(
+        {"epic": {"url": "https://fhir.example.com/r4", **over}},
+        egress=EgressSettings(deny_by_default=False),
+    )
+    return SimpleNamespace(timeout_seconds=executor._timeout["epic"])
+
+
+def _db_lookup(over: dict[str, Any]) -> SimpleNamespace:
+    executor = DatabaseLookupExecutor(
+        {"clarity": {"server": "db.example", "database": "d", **over}},
+        egress=EgressSettings(deny_by_default=False),
+    )
+    return SimpleNamespace(acquire_timeout=executor._acquire_timeout["clarity"])
+
+
+def _oauth2(over: dict[str, Any]) -> Any:
+    return oauth2_cc_provider_from_settings(
+        {
+            "oauth2_token_url": "https://auth.example.com/token",
+            "oauth2_client_id": "c",
+            "oauth2_client_secret": "s",
+            **over,
+        }
+    )
+
+
+#: Float caps where ``None``/``0`` turns the cap off: (builder, key, attribute). At least one per
+#: connector that reads one.
+_FLOAT_OFF_BY_ZERO = [
+    pytest.param(_MLLP_IN, "receive_timeout", "receive_timeout", id="mllp-in-receive_timeout"),
+    pytest.param(_MLLP_IN, "max_frame_seconds", "max_frame_seconds", id="mllp-in-frame_seconds"),
+    pytest.param(_MLLP_IN, _RATE, _RATE, id="mllp-rate"),
+    pytest.param(_MLLP_OUT, "idle_timeout_seconds", "idle_timeout_seconds", id="mllp-out-idle"),
+    pytest.param(_TCP_IN, "receive_timeout", "receive_timeout", id="tcp-in-receive_timeout"),
+    pytest.param(_TCP_IN, "max_frame_seconds", "max_frame_seconds", id="tcp-in-frame_seconds"),
+    pytest.param(_TCP_OUT, "idle_timeout_seconds", "idle_timeout_seconds", id="tcp-out-idle"),
+    pytest.param(_X12_IN, "receive_timeout", "receive_timeout", id="x12-in-receive_timeout"),
+    pytest.param(_X12_IN, "max_frame_seconds", "max_frame_seconds", id="x12-in-frame_seconds"),
+    pytest.param(
+        _X12_OUT, "max_connection_age_seconds", "max_connection_age_seconds", id="x12-out-age"
+    ),
+    pytest.param(_HTTP_IN, "receive_timeout", "receive_timeout", id="http-in-receive_timeout"),
+    pytest.param(_HTTP_IN, _RATE, _RATE, id="http-rate"),
+    pytest.param(
+        _SCP,
+        "max_associations_per_second",
+        "max_associations_per_second",
+        id="scp-association-rate",
+    ),
+]
+
+#: Timeouts read by ``float_setting`` alone, where zero is not "off": (builder, key, attribute).
+#: Each was a bare ``float()`` before #3432.
+_TIMEOUTS = [
+    pytest.param(_MLLP_OUT, "timeout_seconds", "timeout", id="mllp-out-timeout"),
+    pytest.param(_MLLP_OUT, "connect_timeout", "connect_timeout", id="mllp-out-connect"),
+    pytest.param(_TCP_OUT, "timeout_seconds", "timeout", id="tcp-out-timeout"),
+    pytest.param(_TCP_OUT, "connect_timeout", "connect_timeout", id="tcp-out-connect"),
+    pytest.param(_X12_OUT, "timeout_seconds", "timeout", id="x12-out-timeout"),
+    pytest.param(_X12_OUT, "connect_timeout", "connect_timeout", id="x12-out-connect"),
+    pytest.param(_SCP, "timeout_seconds", "_timeout", id="scp-timeout"),
+    pytest.param(_SCU, "timeout_seconds", "_timeout", id="scu-timeout"),
+    pytest.param(_SCU, "connect_timeout", "_connect_timeout", id="scu-connect"),
+    pytest.param(_database_out, "acquire_timeout", "_acquire_timeout", id="database-out-acquire"),
+    pytest.param(_database, "acquire_timeout", "_acquire_timeout", id="database-in-acquire"),
+    pytest.param(_db_lookup, "acquire_timeout", "acquire_timeout", id="database-lookup-acquire"),
+    pytest.param(
+        _url_dest(FhirDestination, ConnectorType.FHIR, "https://fhir.example.com/r4"),
+        "timeout_seconds",
+        "timeout",
+        id="fhir-timeout",
+    ),
+    pytest.param(_fhir_lookup, "timeout_seconds", "timeout_seconds", id="fhir-lookup-timeout"),
+    pytest.param(
+        _url_dest(RestDestination, ConnectorType.REST, "https://api.example.com/x"),
+        "timeout_seconds",
+        "timeout",
+        id="rest-timeout",
+    ),
+    pytest.param(_soap, "timeout_seconds", "timeout", id="soap-timeout"),
+    pytest.param(
+        _url_dest(DicomWebDestination, ConnectorType.DICOMWEB, "https://pacs.example.com/studies"),
+        "timeout_seconds",
+        "timeout",
+        id="dicomweb-timeout",
+    ),
+    pytest.param(_email, "timeout_seconds", "timeout", id="email-timeout"),
+    pytest.param(_remote, "connect_timeout", "_client._timeout", id="sftp-connect"),
+    pytest.param(_ftp, "connect_timeout", "_client._timeout", id="ftp-connect"),
+    pytest.param(_file, "min_age_seconds", "min_age_seconds", id="file-min_age"),
+    pytest.param(_timer, "interval_seconds", "interval_seconds", id="timer-interval"),
+    pytest.param(_HTTP_IN, "reply_timeout", "reply_timeout", id="http-reply_timeout"),
+    pytest.param(_HTTP_IN, "reply_write_timeout", "reply_write_timeout", id="http-reply_write"),
+    pytest.param(_oauth2, "oauth2_timeout_seconds", "timeout_seconds", id="oauth2-timeout"),
+]
+
+#: Each is refused by every float setting. ``"1e-400"`` is text ``float()`` only rounds to zero;
+#: ``[2.5]`` is a type ``float()`` refuses anyway, refused here naming the key.
+_NOT_SECONDS = [True, False, math.nan, math.inf, -math.inf, "nan", "inf", "1e400", "1e-400", [2.5]]
+
+
+def _refusal(key: str) -> str:
+    return rf"{key} is not a valid float value \(value withheld\)"
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _FLOAT_OFF_BY_ZERO + _TIMEOUTS)
+@pytest.mark.parametrize("bad", _NOT_SECONDS)
+def test_a_float_setting_refuses_a_bool_a_nan_an_infinity_or_a_rounded_zero(
+    build: Build, key: str, attr: str, bad: object
+) -> None:
+    """``float(True)`` is 1.0, ``float("nan")`` is a timeout that fires at once, and
+    ``float("1e-400")`` is ``0.0``, which turned a float cap off. Each is refused, naming the key.
+
+    Red mutation: put a bare ``float()`` back on any ``_TIMEOUTS`` site, or test a float cap's text
+    with ``float(value) == 0`` again. That site's cases build cleanly."""
+    del attr
+    with pytest.raises(ValueError, match=_refusal(key)):
+        build({key: bad})
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _FLOAT_OFF_BY_ZERO + _TIMEOUTS)
+def test_a_float_setting_accepts_a_number_or_its_text(build: Build, key: str, attr: str) -> None:
+    """The control for the refusal above: a number, its text from an uncast ``env()``, and a
+    ``Decimal`` all read as the number."""
+    for good in (2.5, "2.5", " 2.5 ", Decimal("2.5")):
+        assert operator.attrgetter(attr)(build({key: good})) == 2.5, repr(good)
+
+
+@pytest.mark.parametrize(("build", "key", "attr"), _FLOAT_OFF_BY_ZERO)
+def test_a_float_cap_reads_only_an_exact_zero_as_off(build: Build, key: str, attr: str) -> None:
+    """``0``, ``"0"``, ``"0.0"`` and ``"-0"`` turn the cap off. ``"0e0"`` is exponent text, refused as
+    ``"1e-400"`` is, so no spelling that merely rounds to zero switches a guard off."""
+    for zero in (0, 0.0, "0", " 0.0 ", "-0", None, ""):
+        assert getattr(build({key: zero}), attr) is None, repr(zero)
+    with pytest.raises(ValueError, match=_refusal(key)):
+        build({key: "0e0"})
+
+
+def test_the_direct_and_smart_timeouts_refuse_a_bool() -> None:
+    """The Direct destination and the SMART token provider load key material after reading the
+    timeout, so only the refusal is driven here; the reader is the one the tables above pin."""
+    direct_base = {
+        **_EMAIL_BASE,
+        "signing_cert": "unused",
+        "signing_key": "unused",
+        "recipient_cert": "unused",
+        "trust_anchor": "unused",
+    }
+    for bad in (True, False, math.nan, "1e-400"):
+        with pytest.raises(ValueError, match=_refusal("timeout_seconds")):
+            DirectDestination(
+                Destination(
+                    name="OB",
+                    type=ConnectorType.DIRECT,
+                    settings={**direct_base, "timeout_seconds": bad},
+                )
+            )
+        with pytest.raises(ValueError, match=_refusal("smart_timeout_seconds")):
+            token_provider_from_settings(
+                {
+                    "smart_token_url": "https://auth.example.com/token",
+                    "smart_client_id": "c",
+                    "smart_private_key": "unused",
+                    "smart_timeout_seconds": bad,
+                }
+            )
+
+
+async def test_the_reference_sync_acquire_timeout_is_refused_before_a_pool_is_made(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read after the pool was made, a refusal would have left that pool unclosed."""
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    async def _no_pool(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the timeout should have been refused before a pool was made")
+
+    monkeypatch.setattr(database, "_make_pool", _no_pool)
+    base = {"server": "db.example", "database": "d", "statement": "SELECT a", "key_column": "a"}
+    for bad in (True, False, math.nan, "inf", "1e-400"):
+        with pytest.raises(ValueError, match=_refusal("reference source acquire_timeout")):
+            await _load_database_source(
+                {**base, "acquire_timeout": bad}, EgressSettings(deny_by_default=False)
+            )
+
+
+def test_an_http_reply_timeout_must_be_above_zero() -> None:
+    """``docs/CONNECTIONS.md`` says each must be positive. A numeric ``0`` used to become the
+    default while ``"0"`` became a zero budget; both are refused now. Unset takes 30 seconds."""
+    for key in ("reply_timeout", "reply_write_timeout"):
+        for bad in (0, "0", -1, "-0.5"):
+            with pytest.raises(ValueError, match=rf"HTTP source {key} must be a number of seconds"):
+                _HTTP_IN({key: bad})
+        for unset in (None, ""):
+            assert getattr(_HTTP_IN({key: unset}), key) == 30.0
+        assert getattr(_HTTP_IN({}), key) == 30.0
+
+
+_RANGE_REFUSALS = [
+    pytest.param(lambda v: positive_cap(v, int, knob="k", transport="t"), -7, id="positive_cap"),
+    pytest.param(lambda v: positive_cap(v, float, knob="k", transport="t"), -7.5, id="float_cap"),
+    pytest.param(lambda v: resolve_poll_ceiling(v, knob="k", transport="t"), -7, id="poll_ceiling"),
+    pytest.param(
+        lambda v: poll_interval({"poll_seconds": v}, default=1.0, transport="t"),
+        -7.5,
+        id="poll_interval",
+    ),
+    pytest.param(lambda v: _HTTP_IN({"max_header_bytes": v}), "00", id="max_header_bytes"),
+    pytest.param(lambda v: _file({"max_decompressed_members": v}), "00", id="max_members"),
+    pytest.param(lambda v: _MLLP_IN({"max_connections_per_host": v}), -7, id="mllp-per_host"),
+    pytest.param(lambda v: _MLLP_IN({"max_frame_seconds": v}), -7.5, id="mllp-frame_seconds"),
+    pytest.param(lambda v: _HTTP_IN({"reply_timeout": v}), -7.5, id="http-reply_timeout"),
+]
+
+
+@pytest.mark.parametrize(("refuse", "value"), _RANGE_REFUSALS)
+def test_a_range_refusal_withholds_the_value(refuse: Callable[[Any], Any], value: Any) -> None:
+    """A setting arrives ``env()``-resolved, so a range refusal keeps the value out of its message,
+    as the type refusals already did (BACKLOG #1183, #1796).
+
+    Red mutation: put ``{value!r}`` back in any of these refusals."""
+    with pytest.raises(ValueError) as caught:
+        refuse(value)
+    message = str(caught.value)
+    assert "value withheld" in message, message
+    assert str(value) not in message, message
+
+
+def test_float_setting_states_one_rule() -> None:
+    """The reader itself, once: exact zeros come back as zero, and every value that is not a finite
+    real number is refused without its value."""
+    for zero in (0, 0.0, -0.0, "0", "-0.0", Decimal(0)):
+        assert float_setting(zero, knob="k", transport="t") == 0.0, repr(zero)
+    assert float_setting(Fraction(5, 2), knob="k", transport="t") == 2.5
+    assert float_setting(-3, knob="k", transport="t") == -3.0
+    for bad in (Decimal("1e-400"), Decimal("NaN"), 10**400, complex(1, 0), b"2.5", None):
+        with pytest.raises(ValueError, match=r"^t k is not a valid float value \(value withheld\)"):
+            float_setting(bad, knob="k", transport="t")
+    with pytest.raises(ValueError) as caught:
+        float_setting("SENTINEL-3432", knob="k", transport="t")
+    assert "SENTINEL-3432" not in str(caught.value)
+    assert caught.value.__context__ is None
+    # A number too large for a float says so, rather than calling it not a number.
+    with pytest.raises(ValueError, match="too large for a float"):
+        float_setting(10**400, knob="k", transport="t")
+
+
+@pytest.mark.parametrize("key", ["reply_timeout", "reply_write_timeout"])
+@pytest.mark.parametrize("bad", [True, math.nan, math.inf, -7.25, 0])
+def test_the_http_factory_refuses_what_the_connector_refuses(key: str, bad: object) -> None:
+    """The ``Http`` factory checks the two reply timeouts at wiring. ``isinstance(v, int | float)``
+    let a bool through, and ``v <= 0`` let NaN and infinity through, so the factory and the connector
+    disagreed. The refusal also withholds the value now.
+
+    Red mutation: drop the bool or the ``math.isfinite`` clause from the factory check."""
+    overrides: dict[str, Any] = {key: bad}
+    with pytest.raises(WiringError) as caught:
+        Http(port=0, reply_from="OB_REPLY", **overrides)
+    message = str(caught.value)
+    assert f"Http {key} must be a finite positive number of seconds (value withheld)" in message
+    assert "-7.25" not in message

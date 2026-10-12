@@ -38,6 +38,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     InboundHandler,
     SourceConnector,
+    float_setting,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -152,8 +153,12 @@ class TcpDestination(DestinationConnector):
         self.host: str = host
         self.port: int = int(s["port"])
         self.codec = _codec_from_settings(s)
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
-        self.connect_timeout: float = float(s.get("connect_timeout", 10.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="TCP destination"
+        )
+        self.connect_timeout: float = float_setting(
+            s.get("connect_timeout", 10.0), knob="connect_timeout", transport="TCP destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         self.expect_reply: bool = bool(s.get("expect_reply", False))
         self.max_frame_bytes: int | None = positive_cap(

@@ -71,6 +71,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     NegativeAckError,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -560,7 +561,9 @@ class FhirDestination(DestinationConnector):
                 "(ASVS 14.2.1); see docs/SECURITY-LOOSENING.md",
                 config.name,
             )
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="FHIR destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the FHIR server reply (assigned resource / ETag / OperationOutcome). Default
         # False → returns None, byte-identical.
@@ -1309,7 +1312,11 @@ class FhirLookupExecutor:
                 )
             refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
             self._base[cname] = url
-            self._timeout[cname] = float(s.get("timeout_seconds", 30.0))
+            self._timeout[cname] = float_setting(
+                s.get("timeout_seconds", 30.0),
+                knob="timeout_seconds",
+                transport=f"FhirLookup {cname!r}",
+            )
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
             # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
             # Validated like the DB lookups': a flag written into this mutable dict without its
