@@ -118,6 +118,8 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    count_setting,
+    float_setting,
     peer_ip_allowed,
     positive_cap,
     register_destination,
@@ -565,9 +567,15 @@ class DicomScpSource(SourceConnector):
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
         )
-        self._max_associations = int(s.get("max_associations", 10))
-        self._max_pdu_size = int(s.get("max_pdu_size", 16384))
-        self._timeout = float(s.get("timeout_seconds", 30.0))
+        self._max_associations = count_setting(
+            s.get("max_associations", 10), knob="max_associations", transport="DICOM-SCP source"
+        )
+        self._max_pdu_size = count_setting(
+            s.get("max_pdu_size", 16384), knob="max_pdu_size", transport="DICOM-SCP source"
+        )
+        self._timeout = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOM-SCP source"
+        )
         # Association-rate pacing (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). The keys are NOT
         # max_messages_per_second/message_burst and are not read through mllp._pacing_settings, because
         # the UNIT here is an association, not a message — see _pace_association for why a message-rate
@@ -1283,9 +1291,19 @@ class DicomScuDestination(DestinationConnector):
             knob="max_object_bytes",
             transport="DICOM-SCU destination",
         )
-        self._max_pdu_size = int(s.get("max_pdu_size", 16384))
-        self._timeout = float(s.get("timeout_seconds", 30.0))
-        self._connect_timeout = float(s.get("connect_timeout", 10.0))
+        self._max_pdu_size = count_setting(
+            s.get("max_pdu_size", 16384), knob="max_pdu_size", transport="DICOM-SCU destination"
+        )
+        self._timeout = float_setting(
+            s.get("timeout_seconds", 30.0),
+            knob="timeout_seconds",
+            transport="DICOM-SCU destination",
+        )
+        self._connect_timeout = float_setting(
+            s.get("connect_timeout", 10.0),
+            knob="connect_timeout",
+            transport="DICOM-SCU destination",
+        )
         # Build the client TLS context now so a bad cert/key fails at construction (check/dry-run), not
         # at the first delivery (like the SCP / MLLP / REST). #190 (ADR 0093): thread the instance [tls]
         # internal-CA trust-anchor policy so an internal hop that names no tls_ca_file of its own verifies

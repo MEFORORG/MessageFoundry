@@ -3,18 +3,112 @@
 """The `messagefoundry service {install,start,stop,status}` CLI subparser (ADR 0088).
 
 Dispatch-level coverage: `status` shells `sc query` (mocked here), and the elevated actions delegate
-to messagefoundry.service. No real service is touched."""
+to messagefoundry.service. No test reads or changes a real OS service, on any host.
+
+`start` and `stop` read the service state before they elevate, so a test that stubbed only the
+elevation still ran a real `sc query`. Its result then depended on the host's service, not on the
+test (BACKLOG #3441). The autouse fixture below fails any test that reaches the real boundary."""
 
 from __future__ import annotations
 
+import ctypes
 import subprocess
 import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
 import messagefoundry.service as svc
 from messagefoundry.__main__ import main
+
+
+class _ReachedServiceManager(BaseException):
+    """A test reached a real service-manager call.
+
+    A BaseException, because `run_cli` catches `Exception` and turns it into exit 1. An ordinary
+    exception would let a test that expects exit 1 pass after reaching the real call."""
+
+
+def _tripwire(what: str, hits: list[str]) -> Callable[..., object]:
+    def _trip(*_args: object, **_kwargs: object) -> object:
+        hits.append(what)
+        raise _ReachedServiceManager(f"a test reached the real {what}")
+
+    return _trip
+
+
+_SPAWN = "subprocess.Popen (sc query)"
+_ELEVATE = "ShellExecuteExW elevation"
+_SHELL32 = "ctypes.windll.shell32"
+
+
+class _WindllTripwire:
+    """Stands in for `ctypes.windll`. Only `shell32`, the `ShellExecuteW` that `install_service`
+    elevates through, trips. Any other DLL comes from the real `windll`, and off Windows it is an
+    AttributeError, as it would be with no `windll` at all."""
+
+    def __init__(self, hits: list[str], real: object) -> None:
+        self._hits = hits
+        self._real = real
+
+    def __getattr__(self, name: str) -> object:
+        if name == "shell32":
+            self._hits.append(_SHELL32)
+            raise _ReachedServiceManager(f"a test reached the real {_SHELL32}")
+        if self._real is None:
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_service_manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Replace every service-manager call in `messagefoundry.service` with a tripwire.
+
+    The calls are a spawned `sc query`, the ShellExecuteExW elevation and `ctypes.windll.shell32`.
+    `Popen` is the one `run`, `check_output` and `call` all go through. A test that needs a call
+    stubs it itself, which replaces the tripwire for that test. The teardown check catches a hit
+    that something swallowed, so an unswallowed hit also shows as a teardown error."""
+    hits: list[str] = []
+    monkeypatch.setattr(subprocess, "Popen", _tripwire(_SPAWN, hits))
+    monkeypatch.setattr(svc, "_runas_wait", _tripwire(_ELEVATE, hits))
+    real_windll = getattr(ctypes, "windll", None)
+    monkeypatch.setattr(ctypes, "windll", _WindllTripwire(hits, real_windll), raising=False)
+    yield hits
+    assert hits == [], f"a test reached the real service manager: {hits}"
+
+
+@pytest.mark.parametrize(
+    ("argv", "state", "boundary"),
+    [
+        (["service", "status"], None, _SPAWN),
+        (["service", "stop"], None, _SPAWN),
+        (["service", "start"], None, _SPAWN),
+        # The state read is stubbed, so these reach the elevation that comes after it.
+        (["service", "stop"], "running", _ELEVATE),
+        (["service", "start"], "stopped", _ELEVATE),
+        (["service", "install", "--env", "dev"], None, _SHELL32),
+    ],
+)
+def test_the_guard_trips_on_every_unstubbed_service_call(
+    monkeypatch: pytest.MonkeyPatch,
+    _no_real_service_manager: list[str],
+    argv: list[str],
+    state: str | None,
+    boundary: str,
+) -> None:
+    """The control for the fixture above: with the platform forced to win32 and the boundary left
+    unstubbed, each command reaches that exact tripwire. This runs on every host, so the guard is
+    proved on Linux too."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(svc, "install_script_path", lambda: Path("install-service.ps1"))
+    if state is not None:
+        monkeypatch.setattr(svc, "service_state", lambda name: state)
+
+    with pytest.raises(_ReachedServiceManager):
+        main(argv)
+    assert _no_real_service_manager == [boundary]
+    _no_real_service_manager.clear()  # the hit was the point; keep the teardown check green
 
 
 def test_service_status_dispatch(
@@ -44,6 +138,7 @@ def test_service_start_dispatch(
         calls.append((action, name))
         return svc.ServiceControlOutcome.DISPATCHED
 
+    monkeypatch.setattr(svc, "service_state", lambda name: "stopped")
     monkeypatch.setattr(svc, "control_service_ex", _control)
 
     assert main(["service", "start", "--name", "MyEngine"]) == 0
@@ -51,12 +146,15 @@ def test_service_start_dispatch(
     assert "completed" in capsys.readouterr().out
 
 
-def test_service_stop_off_windows_returns_1(monkeypatch: pytest.MonkeyPatch) -> None:
-    # control_service_ex is UNSUPPORTED off Windows (no-op); the CLI surfaces that as a non-zero exit.
-    monkeypatch.setattr(
-        svc, "control_service_ex", lambda action, name: svc.ServiceControlOutcome.UNSUPPORTED
-    )
+def test_service_stop_off_windows_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Off Windows the state read is `unavailable` and the elevation is UNSUPPORTED, so `stop` exits
+    1. The platform is forced, so the real off-Windows path runs on a Windows host too."""
+    monkeypatch.setattr(sys, "platform", "linux")  # the same module object service.py reads
+
     assert main(["service", "stop"]) == 1
+    assert "Windows-only" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("action", ["start", "stop"])
@@ -76,7 +174,10 @@ def test_service_start_stop_refused_elevation_exits_1(
     says: str,
 ) -> None:
     """A declined UAC prompt or a failed elevation is a non-zero exit with the reason on stderr, so
-    a wrapper script never reads it as success (vault BACKLOG #2787). The elevation is stubbed."""
+    a wrapper script never reads it as success (vault BACKLOG #2787). The elevation is stubbed, and
+    so is the state read. It reports the other state, and again when a FAILED makes the CLI re-ask."""
+    other = "running" if action == "stop" else "stopped"
+    monkeypatch.setattr(svc, "service_state", lambda name: other)
     monkeypatch.setattr(svc, "control_service_ex", lambda action, name: outcome)
 
     assert main(["service", action, "--name", "MyEngine"]) == 1

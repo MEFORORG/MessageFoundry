@@ -778,6 +778,7 @@ def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
             audit_chain_unkeyed=None,
             remote_debug=remote_debug,
             startup=None,
+            service_env=None,
         )
     ]
 

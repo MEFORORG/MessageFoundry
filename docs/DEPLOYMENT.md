@@ -143,6 +143,63 @@ Both cases carry more startup checks, and a declared proxy triggers some of them
 bind. [Before you expose off-loopback](#before-you-expose-off-loopback) has them, and its step 1
 names the acknowledgement key.
 
+### A proxy in front of the API must refuse the request shapes the engine refuses
+
+**This is a deployment requirement on the proxy or load balancer you run in front of the engine.**
+Request smuggling needs two parsers that disagree about where a request ends. The proxy reads each
+client request first, so its parser decides for the whole chain. The engine's own parser protects
+only the hop it can see, and it cannot see what your proxy accepted from the client.
+
+The engine API parses requests with llhttp, through `httptools`, which `serve` pins (BACKLOG
+#1125). That parser refuses at least the shapes below, each with one `400`, and the engine closes
+the connection before any engine code runs. llhttp refuses more than this table lists, so treat it
+as the shapes that were measured, not as the whole set. `tests/test_api_request_framing_wire.py` sends each one on a real
+socket, and its `_REFUSED` table holds the exact bytes.
+
+| A request that carries | What your proxy must do |
+|---|---|
+| Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. |
+| `Transfer-Encoding` twice, or as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
+| `Content-Length` twice, even with equal values, or as a list such as `2, 2`, or holding anything but digits, such as `+2` or `0_2` | Refuse it. |
+| Whitespace between a field name and its colon, such as `Content-Length : 2` | Refuse it. |
+| A header line folded onto the next line (obs-fold) | Refuse it. Do not unfold it and forward the result. |
+| Head lines ended by a bare LF, or a bare CR inside a header line | Refuse it. |
+| A chunk size that is not hex digits, or chunk lines ended by a bare LF | Refuse it. |
+
+"Refuse" means answer the client with an error yourself, `400` or `501`, and close that client
+connection. A proxy that rewrites an ambiguous request into a clean one is the danger: the engine
+then reads a request the client did not send.
+
+Your proxy must also meet at least these four rules.
+
+1. **Send each request body to the engine with one `Content-Length`.** Buffer the body first. The
+   engine answers a chunked request body with `411`. nginx buffers by default
+   (`proxy_request_buffering on`).
+2. **Do not reuse a connection to the engine after an error.** After an engine `400`, or a response
+   the proxy could not read to its framed end, drop that connection. The engine closes it too. One
+   request per connection to the engine is the simplest safe setting. nginx works that way unless
+   you configure keep-alive to the upstream.
+3. **Re-check requests that arrive over HTTP/2 or HTTP/3.** If the proxy speaks HTTP/1.1 to the
+   engine, it must refuse such a request when it carries `Transfer-Encoding`, or a `content-length`
+   that does not match the body it received. It must also refuse a CR, LF or NUL in any field name
+   or value (RFC 9113 section 8.2.1). Then it writes the request to the engine with its own
+   `Content-Length`.
+4. **Never turn `_` into `-` in a field name.** The engine reads `Transfer_Encoding` as an ordinary
+   header and frames the request by `Content-Length`. A proxy that renamed it would create a framing
+   header the client never sent. nginx drops field names with an underscore by default
+   (`underscores_in_headers off`).
+
+**Check your proxy, because nothing in the engine can.** Replay each shape in `_REFUSED` through the
+proxy with a second request appended, as that test does. The client must get exactly one response,
+an error, and the appended request must never be answered. Two responses mean the proxy and the
+engine framed the bytes differently. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
+[REMOTE-CONSOLE.md](REMOTE-CONSOLE.md#option-b--tls-terminated-upstream-reverse-proxy--load-balancer))
+needs the same check.
+
+A forward proxy for the engine's own outbound hops has a separate rule.
+[CONFIGURATION.md, `[egress]`](CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries)
+has it.
+
 ### Web console from another machine
 
 This picture answers how an operator on another PC would reach the engine. There is no client to
@@ -237,10 +294,13 @@ Container-specific essentials (all detailed in [`../docker/README.md`](../docker
 - **Store volume must persist** (named volume / PVC, never the ephemeral layer) or the at-least-once
   invariant is void across a restart; enable the at-rest cipher (`MEFOR_STORE_ENCRYPTION_KEY` +
   `MEFOR_STORE_REQUIRE_ENCRYPTION=true`).
-- **Exposure:** Topology A (in-process TLS — the **recommended** of the two; TLS is **not** configured
-  out of the box, `[api].tls_cert_file` defaults unset) or Topology B (reverse-proxy / same-pod sidecar).
-  Reaching a published port means binding off-loopback in the container, so the bind guard requires TLS —
-  exactly as on bare metal. Every listen type is guarded (MLLP, HTTP, the DICOM SCP, raw TCP/X12); raw
+- **Exposure:** Topology A (in-process TLS — the **recommended** of the two) or Topology B
+  (reverse-proxy / same-pod sidecar). The engine serves TLS out of the box, on a self-signed pair it
+  mints on first run (ADR 0172). `[api].tls_cert_file` defaults unset, and an off-loopback bind refuses
+  that placeholder by default, so Topology A needs an operator certificate. Under Topology B with no
+  operator certificate, the engine speaks plain HTTP to the proxy, so point the proxy at `http`.
+  Reaching a published port means binding off-loopback in the container, so the bind guard requires an
+  operator certificate or a declared TLS terminator, exactly as on bare metal. Every listen type is guarded (MLLP, HTTP, the DICOM SCP, raw TCP/X12); raw
   TCP/X12 have no TLS to enable, so publishing those ports means firewalling/segmenting them instead.
 - **Signals:** PID 1 is `tini`; `SIGTERM` → graceful `engine.stop()`. Allow a stop grace of ≥30s.
 
@@ -504,7 +564,7 @@ self-signed placeholder).
 | **FHIR destination** (ADR 0024/0043) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | SMART Backend Services bearer (signed `client_assertion`), or static bearer / basic — refused over plaintext | `[egress].allowed_http` — **and the SMART token endpoint host is checked against the same list** |
 | **DICOMweb destination** (STOW-RS, ADR 0025) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | optional bearer / basic, refused over plaintext | `[egress].allowed_http` |
 | **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired` — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
-| **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` (relay) + `[egress].allowed_recipient_domains` (recipients) |
+| **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` (relay) + `[egress].allowed_recipient_domains` (recipients and the sender's domain) |
 | **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. **WARNING:** `use_tls=false` is gated by the **raw** `MEFOR_ALLOW_INSECURE_TLS` — it does **not** route through the cleartext-hop authority and is **not clamped** by `enforcement` (AUTH credentials stay refused) | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
 | **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-enforced or verified** — a hop with no TLS keyword, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and connects anyway, on any posture | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
 | **File destination** | local filesystem | n/a (no network) | n/a | `[egress].allowed_file_dirs` |
@@ -710,7 +770,7 @@ does not resolve to a listed `host:port` makes the config **fail at load / reloa
 | `[egress].allowed_db` | DATABASE destination + the DB poll source |
 | `[egress].allowed_remote` | RemoteFile SFTP/FTPS/FTP (source + destination) |
 | `[egress].allowed_smtp` | **EMAIL (SMTP) destinations** (the relay host) |
-| `[egress].allowed_recipient_domains` | **EMAIL recipients**, by domain. **Deny-by-default**; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
+| `[egress].allowed_recipient_domains` | **EMAIL recipients** and the EMAIL **sender**, by domain. **Deny-by-default**; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
 | `[egress].allowed_direct` | **Direct S/MIME HISP relay destinations** (deliberately separate from `allowed_smtp` — a distinct trust relationship) |
 | `[egress].allowed_file_dirs` | File destination directories |
 | `[egress].allowed_syslog` | the off-box log forwarder's collector (`[logging].forward_host`). Checked at start, not at config load; see [CONFIGURATION.md](CONFIGURATION.md#egress) |

@@ -62,8 +62,10 @@ def _seed(
     admin_email: str | None = None,
     admin_disabled: bool = False,
     viewer: bool = False,
+    key: str | None = None,
 ) -> None:
-    """A keyless store holding one Administrator, provisioned the way the command does it.
+    """A store holding one Administrator, provisioned the way the command does it; keyless unless
+    ``key`` is given.
 
     Built through ``provision_first_administrator`` rather than ``initialize()``, so no bootstrap
     account is minted and the Administrator here is the only one. ``viewer`` adds a second, enabled,
@@ -71,7 +73,11 @@ def _seed(
     """
 
     async def run() -> None:
-        store = await MessageStore.open(db)
+        if key is None:
+            store = await MessageStore.open(db)
+        else:
+            cipher = make_cipher(key)
+            store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
             service = AuthService(store, AuthSettings())
             outcome = await service.provision_first_administrator(
@@ -157,25 +163,29 @@ async def _start(app: object) -> None:
         pass
 
 
-def test_the_setter_unstrands_an_administrator_provisioned_without_an_address(
+def test_the_setter_unstrands_an_administrator_with_no_address(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """THE WAVE'S ACCEPTANCE CHECK, end to end through the real lifespan.
 
-    Provision with no ``--email``; the next start is refused. Run the setter; the next start passes.
-    The refusal half is the control: without it, a passing second start is equally consistent with
-    an app that starts whatever the store holds.
+    An enabled Administrator with no address; the next start is refused. Run the setter; the next
+    start passes. The refusal half is the control: without it, a passing second start is equally
+    consistent with an app that starts whatever the store holds.
+
+    ``provision-admin`` can no longer leave this state, since BACKLOG #1138 made ``--email``
+    required, so the Administrator is written through the service, as a store an earlier build
+    wrote would hold it. The old no-address invocation is pinned as refused here too.
     """
     monkeypatch.chdir(tmp_path)
     key = generate_key()
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
-    _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = tmp_path / "strand.db"
-    assert main(["provision-admin", "--username", _ADMIN, "--db", str(db)]) == 0
-    warned = capsys.readouterr().out
-    assert "WARNING: no notification address" in warned
-    # The warning points at the exit that works, not at a re-run provision-admin refuses.
-    assert _CMD in warned
+    with pytest.raises(SystemExit) as no_email:
+        main(["provision-admin", "--username", _ADMIN, "--db", str(db)])
+    assert no_email.value.code == 2
+    assert not db.exists()
+    capsys.readouterr()
+    _seed(db, key=key)
 
     with pytest.raises(RuntimeError) as refused:
         asyncio.run(_start(_shipped_posture_app(db, key)))
@@ -403,6 +413,9 @@ def test_a_keyed_store_opened_without_its_key_writes_nothing_unaudited(
     The store opens, but its keyed audit chain refuses a keyless append. If the address were written
     first, it would land with no audit row and the command would die with a traceback. So the audit
     row goes first, and the refusal is a clean error that leaves the column untouched.
+
+    Exit 2, "could not start", as ``admin-unlock`` exits on the same refusal (BACKLOG #2124, a seat
+    decision under owner delegation 2026-10-08, not an owner ruling). It exited 1 before.
     """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
@@ -420,8 +433,11 @@ def test_a_keyed_store_opened_without_its_key_writes_nothing_unaudited(
             await store.close()
 
     asyncio.run(seed())
-    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 1
-    assert "keyed" in _error(capsys)
+    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "keyed" in error
+    assert "audit row would be refused" in error  # the key check, not the append's own refusal
+    assert "refusing to write anything" in error
 
     async def read_back() -> str | None:
         cipher = make_cipher(key)
@@ -571,13 +587,85 @@ def test_a_keyed_store_with_encrypted_rows_is_refused_at_open(
         await store.close()
 
     asyncio.run(seal())
-    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 1
+    # Exit 2, could not start (BACKLOG #2124, a seat decision under owner delegation 2026-10-08,
+    # not an owner ruling). It exited 1 before.
+    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
     assert "Nothing was written" in error
     # The OPEN refused, not the later audit append: the store's own text names the key variable,
     # and the append branch's wording is absent.
     assert "MEFOR_STORE_ENCRYPTION_KEY" in error
     assert "audit row goes first" not in error
+
+
+def test_a_row_the_open_cannot_decrypt_is_could_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``CipherError`` shares the open's except arm with ``StoreKeylessError``: a keyed open that
+    meets a row it cannot read (BACKLOG #2308), here a row sealed under another key than the one in
+    this shell. The store could not be opened, so exit 2 too (BACKLOG #2124, a seat decision under
+    owner delegation 2026-10-08, not an owner ruling)."""
+    monkeypatch.chdir(tmp_path)
+    sealing_key = generate_key()
+    db = tmp_path / "unreadable.db"
+    _seed(db, key=sealing_key)
+    # A plaintext state row, sealed by the keyed open below, as in the test above.
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
+        ("ns", "k", json.dumps({"v": 1}), 0.0, "m1"),
+    )
+    con.commit()
+    con.close()
+
+    async def seal() -> None:
+        cipher = make_cipher(sealing_key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        await store.close()
+
+    asyncio.run(seal())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # not the sealing key
+    assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    # The CipherError arm's text, not another could-not-start refusal that also exits 2.
+    assert "no configured key decrypts" in error and error.endswith("Nothing was written")
+
+
+@pytest.mark.parametrize("busy_error", ["acquire-timeout", "database-locked"])
+def test_a_busy_store_that_refuses_the_audit_row_keeps_exit_1(
+    busy_error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The control on the keyless exit 2 above. A store that refuses the append because it is busy
+    (a pool acquire that timed out, or a running engine holding SQLite's write lock) passes the key
+    check, so it is not "could not start" and keeps the refusal's exit 1 (BACKLOG #2124). The
+    locked case is a ``sqlite3.DatabaseError``, which the outer "cannot open the store" arm would
+    answer with exit 2 if the inner arm stopped catching it."""
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "busy.db"
+    _seed(db)
+    raised: Exception = (
+        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s")
+        if busy_error == "acquire-timeout"
+        else sqlite3.OperationalError("database is locked")
+    )
+
+    async def busy(*_a: object, **_k: object) -> None:
+        raise raised
+
+    with monkeypatch.context() as m:
+        m.setattr(MessageStore, "record_audit", busy)
+        assert (
+            main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 1
+        )
+    error = _error(capsys)
+    assert "audit row goes first" in error and str(raised) in error
+    assert _notify_email(db, _ADMIN) is None
+    assert _audit_rows(db) == []
 
 
 # --- 6. a server backend's driver errors (BACKLOG #1983) ----------------------------------------
@@ -613,6 +701,9 @@ class _DriverStore:
 
     async def get_user_role_ids(self, _user_id: str) -> list[str]:
         return [Role.ADMINISTRATOR.value]
+
+    def audit_append_refusal(self) -> str | None:
+        return None  # the key check passes; the append itself is what these tests refuse
 
     async def record_audit(self, action: str, **_k: object) -> None:
         raise_this = self._failed_audit if action.endswith("_failed") else self._audit

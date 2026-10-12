@@ -95,6 +95,11 @@ _UPSERT_WRITTEN_CELL = ("state", "value")
 _MIN_WRITTEN_CELLS = 17
 
 
+#: The builders of the queue payload's routing tag (BACKLOG #2593). A call to either seals
+#: ``queue.payload`` exactly as a ``cell_aad("queue", "payload", ...)`` literal once did.
+_QUEUE_TAG_BUILDERS = frozenset({"queue_payload_aad", "queue_row_aad"})
+
+
 def _covered_cells(tree: ast.AST) -> set[tuple[str, str]]:
     """Every ``cell_aad("<table>", "<column>", ...)`` literal in the module.
 
@@ -104,11 +109,15 @@ def _covered_cells(tree: ast.AST) -> set[tuple[str, str]]:
     """
     found: set[tuple[str, str]] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or len(node.args) < 2:
+        if not isinstance(node, ast.Call):
             continue
         fn = node.func
         name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
-        if name != "cell_aad":
+        if name in _QUEUE_TAG_BUILDERS:
+            # BACKLOG #2593: the queue payload's tag has its own builder, not a cell_aad literal.
+            found.add(("queue", "payload"))
+            continue
+        if name != "cell_aad" or len(node.args) < 2:
             continue
         table, column = node.args[0], node.args[1]
         if (

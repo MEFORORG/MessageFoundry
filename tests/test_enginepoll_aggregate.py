@@ -92,11 +92,11 @@ def _poller_over(
     fakes: list[Any] = [_FakeClient(s) for s in per_shard_scripts]  # duck-typed EngineClients
     poller._clients = fakes
 
-    def fake_sample_shard(client: object) -> _ShardSample | None:
+    def fake_sample_shard(self: EnginePoller, index: int, client: object) -> _ShardSample | None:
         assert isinstance(client, _FakeClient)
         return client.next_sample()
 
-    monkeypatch.setattr(enginepoll.EnginePoller, "_sample_shard", staticmethod(fake_sample_shard))
+    monkeypatch.setattr(enginepoll.EnginePoller, "_sample_shard", fake_sample_shard)
     return poller
 
 

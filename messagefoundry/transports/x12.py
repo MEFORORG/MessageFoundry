@@ -49,6 +49,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     encode_wire_body,
+    float_setting,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -167,8 +168,12 @@ class X12Destination(DestinationConnector):
         self.host: str = host
         self.port: int = int(s["port"])
         self.encoding: str = str(s.get("encoding", "utf-8"))
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
-        self.connect_timeout: float = float(s.get("connect_timeout", 10.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="X12 destination"
+        )
+        self.connect_timeout: float = float_setting(
+            s.get("connect_timeout", 10.0), knob="connect_timeout", transport="X12 destination"
+        )
         self.expect_reply: bool = bool(s.get("expect_reply", False))
         # ADR 0016: capture the returned interchange (the 271/TA1) as a reply; ta1_required makes a
         # no-reply a retry. capture_response is forced True by reingress_to at wiring time (ADR 0013).

@@ -81,6 +81,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     NegativeAckError,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.email import checked_envelope
@@ -172,6 +173,8 @@ _MIN_RSA_BITS = 2048
 #: EC curves admitted for Direct S/MIME material. All three are at or above 128-bit security, so
 #: unlike the RSA floor this list needs no "does not meet the verb" caveat. Named positively so a
 #: curve nobody considered is excluded by construction rather than admitted by an absent deny-rule.
+#: ``parsing/xml/signature.py`` holds a copy for its XML-DSig key floor (BACKLOG #1166), and a test
+#: pins the two equal. A change here changes that floor too, so it needs the same ruling.
 _APPROVED_EC_CURVES = frozenset({"secp256r1", "secp384r1", "secp521r1"})
 
 
@@ -262,7 +265,9 @@ class DirectDestination(DestinationConnector):
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
         self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="Direct destination"
+        )
         self.encoding: str = str(s.get("encoding", "utf-8"))
 
         # S/MIME material — the whole point of Direct. Loaded and cross-checked at construction so a

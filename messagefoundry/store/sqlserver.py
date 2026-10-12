@@ -50,6 +50,7 @@ from collections.abc import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from dataclasses import replace
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
@@ -122,6 +123,18 @@ from messagefoundry.store.privilege import (
     classify_audit_writes,
     sqlserver_excess,
 )
+from messagefoundry.store.queue_tag import (
+    QUEUE_TAG_COLUMNS,
+    QUEUE_TAG_SELECT,
+    QueueTagError,
+    alert_queue_tag_failure,
+    is_tag_failure,
+    open_queue_cell,
+    queue_payload_aad,
+    queue_row_aad,
+    report_queue_tag_failure,
+)
+from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -130,9 +143,10 @@ from messagefoundry.store.sealed_cache import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
-    _IDP_AUTH_TIME_FORWARD_SQL,
+    _BUMP_SESSION_EPOCH_SQL,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
+    _SESSION_INSERT,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     _SQL_ADMIN_GUARD_COUNTS,
@@ -165,6 +179,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
+    FailOutcome,
     FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
@@ -214,15 +229,22 @@ from messagefoundry.store.store import (
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
+    mfa_stamp,
+    new_session_record,
     next_lockout_state,
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
     password_claim_set,
     read_transit_bound_attestation_rows,
+    reauth_stamp,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
+    seal_session,
+    session_insert_params,
+    session_reseal_params,
+    session_seal_ok,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -599,6 +621,21 @@ def _mssql_session_cap_keep_sql(split_mfa_pending: bool) -> str:
         ")"
         for group in _session_cap_groups(split_mfa_pending)
     )
+
+
+# BACKLOG #2592: store.py's _SESSION_RESEAL with an OUTPUT clause, so the compare's outcome is read
+# from a rowset that a session-wide SET NOCOUNT ON cannot hide (BACKLOG #2283). Same parameters.
+_MSSQL_SESSION_RESEAL: Final = (
+    "UPDATE sessions SET token_hash=?, user_id=?, created_at=?, expires_at=?, revoked_at=?,"
+    " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
+    " seal=? OUTPUT inserted.token_hash WHERE token_hash=? AND seal=?"
+)
+#: The whole-account session sweep, counted from ``OUTPUT``: revoke and blank the seal (BACKLOG
+#: #2592). Each caller raises the account's session epoch in the same transaction.
+_MSSQL_REVOKE_USER_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
+    " WHERE user_id=? AND revoked_at IS NULL"
+)
 
 
 # --- ADR 0071 B5 PR1: hoisted handoff SQL + pure param-builders (async/sync shared) --------------
@@ -1969,7 +2006,9 @@ _SCHEMA: list[str] = [
         second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0,
         -- ADR 0197 Amendment A (BACKLOG #1131): 1 while the credential in force is
         -- engine-generated; wrong passwords arm no sign-in lock then.
-        password_generated BIT NOT NULL DEFAULT 0)""",
+        password_generated BIT NOT NULL DEFAULT 0,
+        -- BACKLOG #2592: raised by every whole-account session revoke.
+        session_epoch INT NOT NULL DEFAULT 0)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -2015,6 +2054,10 @@ _SCHEMA: list[str] = [
     # holder chose this credential", which keeps the account LOCKABLE -- the closed direction.
     """IF COL_LENGTH('users','password_generated') IS NULL
         ALTER TABLE users ADD password_generated BIT NOT NULL DEFAULT 0""",
+    # BACKLOG #2592: the account's session epoch. 0 on an existing row, which every existing
+    # session's epoch matches, so the add signs nobody out.
+    """IF COL_LENGTH('users','session_epoch') IS NULL
+        ALTER TABLE users ADD session_epoch INT NOT NULL DEFAULT 0""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -2087,7 +2130,8 @@ _SCHEMA: list[str] = [
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,
         revoked_at FLOAT NULL, client NVARCHAR(256) NULL, reauth_at FLOAT NULL,
         mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL,
-        idp_auth_time FLOAT NULL)""",
+        idp_auth_time FLOAT NULL, user_epoch INT NOT NULL DEFAULT 0,
+        seal NVARCHAR(128) NOT NULL DEFAULT N'')""",
     """IF COL_LENGTH('sessions','reauth_at') IS NULL
         ALTER TABLE sessions ADD reauth_at FLOAT NULL""",
     """IF COL_LENGTH('sessions','mfa_verified_at') IS NULL
@@ -2101,6 +2145,12 @@ _SCHEMA: list[str] = [
     # step_up_idp_auth_time_missing.
     """IF COL_LENGTH('sessions','idp_auth_time') IS NULL
         ALTER TABLE sessions ADD idp_auth_time FLOAT NULL""",
+    # BACKLOG #2592: the account epoch a session was minted under, and the row's integrity seal. An
+    # existing row gets epoch 0 and an empty seal, which a keyed store refuses.
+    """IF COL_LENGTH('sessions','user_epoch') IS NULL
+        ALTER TABLE sessions ADD user_epoch INT NOT NULL DEFAULT 0""",
+    """IF COL_LENGTH('sessions','seal') IS NULL
+        ALTER TABLE sessions ADD seal NVARCHAR(128) NOT NULL DEFAULT N''""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
@@ -2532,6 +2582,8 @@ class SqlServerStore:
         # the weakened-TLS clamp against the real production-PHI posture (not the unclamped escape).
         self._posture = posture
         self._cipher: Cipher = cipher or IdentityCipher()
+        # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
+        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
         # #190 audit-chain HMAC key (HKDF-derived; None, with no MAC provider, is the keyless mode).
         self._audit_mac_key = audit_mac_key
         # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit ``generate_hmac``) keying the
@@ -3362,7 +3414,7 @@ class SqlServerStore:
         # 14.2.7). Leaving it would fail this pass with *Invalid object name 'outbox'* on EVERY keyed
         # open — and the keyed path does not run in CI (every SQL Server leg is keyless), so
         # `tests/test_sqlserver_encrypt_pass_tables.py` is the only mechanism that can catch a stale
-        # entry here. Rows the migration folded in are covered by `("queue", "payload")` below: the
+        # entry here. Rows the migration folded in are covered by the `queue.payload` pass below: the
         # migration carries the payload over VERBATIM, so a legacy plaintext body arrives unencrypted
         # and this pass — which runs after `_ensure_schema` — seals it on the same open.
         #
@@ -3373,7 +3425,6 @@ class SqlServerStore:
         # ciphertext-of-empty (BACKLOG #1169). NULL is excluded by NOT LIKE on its own.
         for table, column in (
             ("messages", "raw"),
-            ("queue", "payload"),
             (
                 "users",
                 "totp_secret",
@@ -3388,6 +3439,15 @@ class SqlServerStore:
             ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed, nullable
         ):
             total += await self._seal_surface(table, column, like, aad_cols=("id",))
+        # `queue.payload` binds the row's routing fields, not its id alone (BACKLOG #2593).
+        total += await self._seal_surface(
+            "queue",
+            "payload",
+            like,
+            aad_cols=QUEUE_TAG_COLUMNS,
+            key_cols=("id",),
+            aad_of=queue_row_aad,
+        )
         # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
         # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
         # natural columns while the UPDATE keys on `id` (ASVS 11.3.3, ADR 0019).
@@ -3456,6 +3516,7 @@ class SqlServerStore:
         *,
         aad_cols: tuple[str, ...],
         key_cols: tuple[str, ...] | None = None,
+        aad_of: Callable[[dict[str, Any]], bytes] | None = None,
         batch: int = 500,
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
@@ -3463,7 +3524,8 @@ class SqlServerStore:
         The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
         surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
         11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. Every identifier is a code
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD
+        from the row instead (the queue payload's routing tag, BACKLOG #2593). Every identifier is a code
         constant and is bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is
         a parameter.
 
@@ -3520,7 +3582,12 @@ class SqlServerStore:
                             f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
                             (
                                 self._cipher.encrypt(
-                                    r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                                    r["v"],
+                                    aad=(
+                                        aad_of(r)
+                                        if aad_of is not None
+                                        else cell_aad(table, column, *(r[c] for c in aad_cols))
+                                    ),
                                 ),
                                 *(r[c] for c in keys),
                             ),
@@ -5020,7 +5087,7 @@ class SqlServerStore:
                     ),
                 )
                 for dest_name, payload in deliveries:
-                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    # Hoist the row id so the payload binds to its own row tag.
                     row_id = uuid4().hex
                     await cur.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -5033,7 +5100,18 @@ class SqlServerStore:
                             Stage.OUTBOUND.value,
                             channel_id,
                             dest_name,
-                            self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+                            self._cipher.encrypt(
+                                payload,
+                                aad=queue_payload_aad(
+                                    row_id=row_id,
+                                    message_id=mid,
+                                    stage=Stage.OUTBOUND.value,
+                                    channel_id=channel_id,
+                                    destination_name=dest_name,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            ),
                             OutboxStatus.PENDING.value,
                             now,
                             now,
@@ -5053,7 +5131,7 @@ class SqlServerStore:
         self, cur: Any, message_id: str, channel_id: str, dest_name: str, payload: str, now: float
     ) -> None:
         """Insert one ``stage='outbound'`` queue row (lane = destination_name)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         await cur.execute(
             _SQL_INSERT_QUEUE_OUTBOUND,
             _insert_outbound_params(
@@ -5061,7 +5139,18 @@ class SqlServerStore:
                 message_id,
                 channel_id,
                 dest_name,
-                self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+                self._cipher.encrypt(
+                    payload,
+                    aad=queue_payload_aad(
+                        row_id=row_id,
+                        message_id=message_id,
+                        stage=Stage.OUTBOUND.value,
+                        channel_id=channel_id,
+                        destination_name=dest_name,
+                        handler_name=None,
+                        body_ref=None,
+                    ),
+                ),
                 now,
             ),
         )
@@ -5073,7 +5162,7 @@ class SqlServerStore:
         self, cur: Any, message_id: str, channel_id: str, dest_name: str, payload: str, now: float
     ) -> None:
         """Synchronous twin of :meth:`_insert_outbound` (ADR 0071 B5)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         cur.execute(
             _SQL_INSERT_QUEUE_OUTBOUND,
             _insert_outbound_params(
@@ -5081,7 +5170,18 @@ class SqlServerStore:
                 message_id,
                 channel_id,
                 dest_name,
-                self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+                self._cipher.encrypt(
+                    payload,
+                    aad=queue_payload_aad(
+                        row_id=row_id,
+                        message_id=message_id,
+                        stage=Stage.OUTBOUND.value,
+                        channel_id=channel_id,
+                        destination_name=dest_name,
+                        handler_name=None,
+                        body_ref=None,
+                    ),
+                ),
                 now,
             ),
         )
@@ -5097,7 +5197,7 @@ class SqlServerStore:
         now: float,
     ) -> None:
         """Insert one ``stage='routed'`` queue row (lane = channel_id)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         await cur.execute(
             _SQL_INSERT_QUEUE_ROUTED,
             _insert_routed_params(
@@ -5105,7 +5205,18 @@ class SqlServerStore:
                 message_id,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+                self._cipher.encrypt(
+                    payload,
+                    aad=queue_payload_aad(
+                        row_id=row_id,
+                        message_id=message_id,
+                        stage=Stage.ROUTED.value,
+                        channel_id=channel_id,
+                        destination_name=None,
+                        handler_name=handler_name,
+                        body_ref=None,
+                    ),
+                ),
                 now,
             ),
         )
@@ -5121,7 +5232,7 @@ class SqlServerStore:
         now: float,
     ) -> None:
         """Synchronous twin of :meth:`_insert_routed` (ADR 0071 B5)."""
-        row_id = uuid4().hex  # hoisted so the payload binds to its own (queue, payload, id) cell
+        row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
         cur.execute(
             _SQL_INSERT_QUEUE_ROUTED,
             _insert_routed_params(
@@ -5129,7 +5240,18 @@ class SqlServerStore:
                 message_id,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
+                self._cipher.encrypt(
+                    payload,
+                    aad=queue_payload_aad(
+                        row_id=row_id,
+                        message_id=message_id,
+                        stage=Stage.ROUTED.value,
+                        channel_id=channel_id,
+                        destination_name=None,
+                        handler_name=handler_name,
+                        body_ref=None,
+                    ),
+                ),
                 now,
             ),
         )
@@ -5191,14 +5313,25 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
-            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
+            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             await cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
                 _insert_queue_ingress_params(
                     pt_ingress_id,
                     new_mid,
                     pt_channel,
-                    self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
+                    self._cipher.encrypt(
+                        body,
+                        aad=queue_payload_aad(
+                            row_id=pt_ingress_id,
+                            message_id=new_mid,
+                            stage=Stage.INGRESS.value,
+                            channel_id=pt_channel,
+                            destination_name=None,
+                            handler_name=None,
+                            body_ref=None,
+                        ),
+                    ),
                     now,
                 ),
             )
@@ -5266,14 +5399,25 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
-            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own queue cell
+            pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
                 _insert_queue_ingress_params(
                     pt_ingress_id,
                     new_mid,
                     pt_channel,
-                    self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
+                    self._cipher.encrypt(
+                        body,
+                        aad=queue_payload_aad(
+                            row_id=pt_ingress_id,
+                            message_id=new_mid,
+                            stage=Stage.INGRESS.value,
+                            channel_id=pt_channel,
+                            destination_name=None,
+                            handler_name=None,
+                            body_ref=None,
+                        ),
+                    ),
                     now,
                 ),
             )
@@ -5297,14 +5441,25 @@ class SqlServerStore:
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
         payload is the empty-body sentinel; ``next_attempt_at`` is ``now`` (terminal, never due)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
-        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own queue cell
+        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own row tag
         await cur.execute(
             _SQL_INSERT_QUEUE_PT_MARKER,
             _insert_marker_params(
                 marker_id,
                 parent_id,
                 pt_name,
-                self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
+                self._cipher.encrypt(
+                    "",
+                    aad=queue_payload_aad(
+                        row_id=marker_id,
+                        message_id=parent_id,
+                        stage=Stage.OUTBOUND.value,
+                        channel_id=pt_name,
+                        destination_name=pt_name,
+                        handler_name=PASSTHROUGH_MARKER_HANDLER,
+                        body_ref=None,
+                    ),
+                ),
                 status,
                 now,
             ),
@@ -5319,14 +5474,25 @@ class SqlServerStore:
     ) -> None:
         """Synchronous twin of :meth:`_insert_passthrough_marker_mssql` (ADR 0071 B5)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
-        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own queue cell
+        marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own row tag
         cur.execute(
             _SQL_INSERT_QUEUE_PT_MARKER,
             _insert_marker_params(
                 marker_id,
                 parent_id,
                 pt_name,
-                self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
+                self._cipher.encrypt(
+                    "",
+                    aad=queue_payload_aad(
+                        row_id=marker_id,
+                        message_id=parent_id,
+                        stage=Stage.OUTBOUND.value,
+                        channel_id=pt_name,
+                        destination_name=pt_name,
+                        handler_name=PASSTHROUGH_MARKER_HANDLER,
+                        body_ref=None,
+                    ),
+                ),
                 status,
                 now,
             ),
@@ -5397,7 +5563,7 @@ class SqlServerStore:
                     )
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
                     created_at = now
-                    # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+                    # Hoist the row id so the ingress payload binds to its own row tag.
                     ingress_row_id = uuid4().hex
                     await cur.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -5410,7 +5576,16 @@ class SqlServerStore:
                             Stage.INGRESS.value,
                             channel_id,
                             self._cipher.encrypt(
-                                raw, aad=cell_aad("queue", "payload", ingress_row_id)
+                                raw,
+                                aad=queue_payload_aad(
+                                    row_id=ingress_row_id,
+                                    message_id=mid,
+                                    stage=Stage.INGRESS.value,
+                                    channel_id=channel_id,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
                             ),
                             OutboxStatus.PENDING.value,
                             now,
@@ -5593,9 +5768,7 @@ class SqlServerStore:
                     await conn.rollback()
                     return False  # already handed off (crash-restart) — idempotent no-op
                 for handler_name, payload in handlers:
-                    routed_row_id = (
-                        uuid4().hex
-                    )  # hoisted so the payload binds to its own queue cell
+                    routed_row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
                     acc.add(
                         _SQL_INSERT_QUEUE_ROUTED,
                         _insert_routed_params(
@@ -5604,7 +5777,16 @@ class SqlServerStore:
                             channel_id,
                             handler_name,
                             self._cipher.encrypt(
-                                payload, aad=cell_aad("queue", "payload", routed_row_id)
+                                payload,
+                                aad=queue_payload_aad(
+                                    row_id=routed_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.ROUTED.value,
+                                    channel_id=channel_id,
+                                    destination_name=None,
+                                    handler_name=handler_name,
+                                    body_ref=None,
+                                ),
                             ),
                             now,
                         ),
@@ -5871,9 +6053,7 @@ class SqlServerStore:
                     )
                     applied.append(((namespace, key), value))
                 for dest_name, payload in deliveries:
-                    outbound_row_id = (
-                        uuid4().hex
-                    )  # hoisted so the payload binds to its own queue cell
+                    outbound_row_id = uuid4().hex  # hoisted so the payload binds to its own row tag
                     acc.add(
                         _SQL_INSERT_QUEUE_OUTBOUND,
                         _insert_outbound_params(
@@ -5882,7 +6062,16 @@ class SqlServerStore:
                             channel_id,
                             dest_name,
                             self._cipher.encrypt(
-                                payload, aad=cell_aad("queue", "payload", outbound_row_id)
+                                payload,
+                                aad=queue_payload_aad(
+                                    row_id=outbound_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.OUTBOUND.value,
+                                    channel_id=channel_id,
+                                    destination_name=dest_name,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
                             ),
                             now,
                         ),
@@ -6127,7 +6316,7 @@ class SqlServerStore:
                     artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
                     work_created = now
-                    # Hoist the row id so the artifact-ref payload binds to its own queue cell.
+                    # Hoist the row id so the artifact-ref payload binds to its own row tag.
                     work_row_id = uuid4().hex
                     await cur.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -6140,7 +6329,16 @@ class SqlServerStore:
                             Stage.RESPONSE.value,
                             reingress_to,
                             self._cipher.encrypt(
-                                artifact_ref, aad=cell_aad("queue", "payload", work_row_id)
+                                artifact_ref,
+                                aad=queue_payload_aad(
+                                    row_id=work_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.RESPONSE.value,
+                                    channel_id=reingress_to,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
                             ),
                             OutboxStatus.PENDING.value,
                             now,
@@ -6846,21 +7044,20 @@ class SqlServerStore:
             try:
                 # (1) Guard-read the in-flight work-row (also opens the txn -> applock not first).
                 await cur.execute(
-                    "SELECT message_id, payload FROM queue WHERE id=? AND stage=? AND status=?",
+                    f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                    " WHERE id=? AND stage=? AND status=?",
                     (response_row_id, Stage.RESPONSE.value, OutboxStatus.INFLIGHT.value),
                 )
                 wr = await cur.fetchone()
                 if wr is None:
                     await conn.rollback()
                     return False  # already consumed by a committed prior run (idempotent no-op)
-                origin_id = wr[0]
+                work_row = dict(zip((*QUEUE_TAG_COLUMNS, "payload"), wr, strict=True))
+                origin_id = work_row["message_id"]
                 # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
                 try:
                     ref = (
-                        self._cipher.decrypt(
-                            wr[1], aad=cell_aad("queue", "payload", response_row_id)
-                        )
-                        or ""
+                        self._cipher.decrypt(work_row["payload"], aad=queue_row_aad(work_row)) or ""
                     )
                     origin_msg_id, dest, seq_s = ref.split("\x1f")
                     seq = int(seq_s)
@@ -6991,7 +7188,7 @@ class SqlServerStore:
                     if not peek_failed:
                         # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
                         ingress_created = now
-                        # Hoist the row id so the payload binds to its own queue cell.
+                        # Hoist the row id so the payload binds to its own row tag.
                         reingress_row_id = uuid4().hex
                         await cur.execute(
                             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -7004,7 +7201,16 @@ class SqlServerStore:
                                 Stage.INGRESS.value,
                                 loopback_channel_id,
                                 self._cipher.encrypt(
-                                    body, aad=cell_aad("queue", "payload", reingress_row_id)
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=reingress_row_id,
+                                        message_id=new_mid,
+                                        stage=Stage.INGRESS.value,
+                                        channel_id=loopback_channel_id,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
                                 ),
                                 OutboxStatus.PENDING.value,
                                 now,
@@ -7054,15 +7260,12 @@ class SqlServerStore:
         if the artifact body is missing/empty. Reads the SAME immutable artifact ``ingress_handoff``
         re-reads, so the peek and the persisted raw always agree."""
         row = await self._fetchone(
-            "SELECT payload FROM queue WHERE id=? AND stage=?",
+            f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
             (response_row_id, Stage.RESPONSE.value),
         )
         if row is None:
             return None
-        ref = (
-            self._cipher.decrypt(row["payload"], aad=cell_aad("queue", "payload", response_row_id))
-            or ""
-        )
+        ref = self._cipher.decrypt(row["payload"], aad=queue_row_aad(row)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
         except ValueError:
@@ -7422,7 +7625,6 @@ class SqlServerStore:
         # The `<> ''` + NOT LIKE guard is null/empty-safe (NULL excluded by NOT LIKE; '' by <> '').
         for table, column in (
             ("messages", "raw"),
-            ("queue", "payload"),
             ("users", "totp_secret"),
             ("messages", "summary"),
             ("messages", "metadata"),
@@ -7459,6 +7661,8 @@ class SqlServerStore:
                         raise
                 await self._charge_bound_batch()
                 total += len(rows)
+        # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
+        total += await self._reencrypt_queue_payload_to_active(active_like, batch)
         # `state` has a composite PK (namespace, [key]) — its own pass (can't ride the id-keyed loop
         # above). transform_handoff writes state.value encrypted, so a rotation MUST rotate it too or a
         # later retired-key drop silently loses all transform cross-message state (review HIGH).
@@ -7624,6 +7828,58 @@ class SqlServerStore:
         )
         if total:
             log.info("re-encrypted %d row(s) to the active key", total)
+        # BACKLOG #2592: a rotation ends every session; store.py's reencrypt_to_active says why.
+        # Counted from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (BACKLOG #2283).
+        ended = len(await self._execute_output("DELETE FROM sessions OUTPUT deleted.token_hash"))
+        if ended:
+            log.info("ended %d session(s): a store key rotation signs every operator out", ended)
+        return total
+
+    async def _reencrypt_queue_payload_to_active(self, active_like: str, batch: int) -> int:
+        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
+        (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
+        selected so the decrypt and the encrypt share one tag.
+        A cell that does not open under its own tag with a key this process holds
+        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
+        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
+        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
+        ``id``, since a skipped row still matches the marker filter."""
+        total = skipped = 0
+        after = ""
+        while True:
+            rows = await self._fetchall(
+                f"SELECT TOP (?) {QUEUE_TAG_SELECT}, payload FROM queue"
+                " WHERE payload NOT LIKE ? AND payload <> '' AND id > ? ORDER BY id",
+                (batch, active_like, after),
+            )
+            if not rows:
+                break
+            after = rows[-1]["id"]
+            updates: list[tuple[str, str]] = []
+            for r in rows:
+                try:
+                    updates.append((self._reencrypt_value(r["payload"], queue_row_aad(r)), r["id"]))
+                except CipherError:
+                    if not is_tag_failure(self._cipher, r["payload"]):
+                        raise
+                    skipped += 1
+            if updates:
+                async with self._acquire() as conn, self._cursor(conn) as cur:
+                    try:
+                        for enc, rid in updates:
+                            await cur.execute("UPDATE queue SET payload=? WHERE id=?", (enc, rid))
+                        await self._commit(conn)
+                    except Exception:
+                        await conn.rollback()
+                        raise
+                await self._charge_bound_batch()
+                total += len(updates)
+        if skipped:
+            log.warning(
+                "rotation left %d queue row(s) whose payload does not open under its own tag"
+                " under a held key; no claim or read opens them (BACKLOG #2593)",
+                skipped,
+            )
         return total
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
@@ -8159,12 +8415,9 @@ class SqlServerStore:
         for row in rows:
             d = dict(zip(columns, row))  # noqa: B905
             try:
-                payload = self._cipher.decrypt(
-                    d["payload"], aad=cell_aad("queue", "payload", d["id"])
-                )
+                payload = self._open_claimed(d, stage)
             except CipherError as exc:
-                log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
-                await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+                await self._dead_letter_unopenable(d, stage, exc)
                 continue
             items.append(
                 OutboxItem(
@@ -8179,6 +8432,49 @@ class SqlServerStore:
                 )
             )
         return items
+
+    def _open_claimed(self, d: dict[str, Any], stage: str) -> str:
+        """A claimed row's body, opened under its routing tag (BACKLOG #2593).
+
+        A claim's OUTPUT carries no ``stage`` and no ``body_ref``. Each claim's WHERE fixes the
+        stage, so the tag takes it from the claim. No claim on this backend reads ``body_ref`` or
+        dereferences a shared body, so the tag is the inline kind: a row sealed any other way fails
+        it, and a ``body_ref`` set outside the store reaches no other body here. The resend source
+        and the body view do read ``body_ref``, and they refuse such a row. Adding the two columns
+        to the OUTPUT would change the versioned claim procedures (ADR 0114), so it is not done
+        here."""
+        return open_queue_cell(self._cipher, {**d, "stage": stage, "body_ref": None})
+
+    async def _dead_letter_unopenable(
+        self, d: dict[str, Any], stage: str, exc: CipherError
+    ) -> None:
+        """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
+        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way."""
+        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
+        await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+        if isinstance(exc, QueueTagError):
+            await report_queue_tag_failure(self, self._cipher, {**d, "stage": stage})
+
+    async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:
+        """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
+        twin is :meth:`MessageStore._open_queue_body`. This backend writes no store-once rows, but a
+        row whose ``body_ref`` is set is still dereferenced. The column picks the body kind and the
+        tag binds that kind, so a column changed outside the store fails the tag rather than
+        choosing another body. A tag failure raises the alert when ``alert`` is set, and
+        propagates, refusing the read. ``cur`` is the caller's cursor."""
+        try:
+            opened = open_queue_cell(self._cipher, row)
+        except QueueTagError:
+            if alert:
+                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+            raise
+        if row["body_ref"] is None:
+            return opened
+        await cur.execute("SELECT body FROM shared_body WHERE hash=?", (opened,))
+        br = await cur.fetchone()
+        if br is None:
+            raise CipherError(f"shared body {opened} missing")
+        return self._cipher.decrypt(br[0], aad=cell_aad("shared_body", "body", opened))
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # H1: the engine pushes the held leader epoch + lease key here on promotion (read from the
@@ -8301,10 +8597,9 @@ class SqlServerStore:
         if row is None or d is None:
             return None
         try:
-            payload = self._cipher.decrypt(d["payload"], aad=cell_aad("queue", "payload", d["id"]))
+            payload = self._open_claimed(d, stage)
         except CipherError as exc:
-            log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
-            await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+            await self._dead_letter_unopenable(d, stage, exc)
             return None
         return OutboxItem(
             id=d["id"],
@@ -8451,12 +8746,9 @@ class SqlServerStore:
         items: list[OutboxItem] = []
         for d in decoded:
             try:
-                payload = self._cipher.decrypt(
-                    d["payload"], aad=cell_aad("queue", "payload", d["id"])
-                )
+                payload = self._open_claimed(d, stage)
             except CipherError as exc:
-                log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
-                await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+                await self._dead_letter_unopenable(d, stage, exc)
                 continue
             items.append(
                 OutboxItem(
@@ -8962,12 +9254,9 @@ class SqlServerStore:
             items: list[OutboxItem] = []
             for d in sorted(lane_rows, key=lambda r: r["seq"]):
                 try:
-                    payload = self._cipher.decrypt(
-                        d["payload"], aad=cell_aad("queue", "payload", d["id"])
-                    )
+                    payload = self._open_claimed(d, stage)
                 except CipherError as exc:
-                    log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
-                    await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+                    await self._dead_letter_unopenable(d, stage, exc)
                     continue
                 items.append(
                     OutboxItem(
@@ -9208,10 +9497,11 @@ class SqlServerStore:
 
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
-    ) -> float | None:
-        """See the base contract: returns ``next_attempt_at`` on the retry branch, whether or not the
-        row was still INFLIGHT or PENDING to re-pend, and ``None`` when dead-lettered/missing (the
-        runner arms the per-lane retry wake on a float, WS-C)."""
+    ) -> FailOutcome:
+        """See the base contract: returns a :class:`FailOutcome` whose ``retry_at`` is set on the
+        retry branch, whether or not the row was still INFLIGHT or PENDING to re-pend (the runner
+        arms the per-lane retry wake on it, WS-C), and whose ``dead`` is 1 when this call
+        dead-lettered the row."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9223,7 +9513,7 @@ class SqlServerStore:
                 row = await cur.fetchone()
                 if row is None:
                     await self._commit(conn)
-                    return None
+                    return FailOutcome()
                 message_id, destination_name, attempts = row[0], row[1], row[2]
                 # max_attempts None = retry forever (never dead-letter here); a finite cap dead-letters
                 # once exhausted (mirrors the SQLite backend's mark_failed).
@@ -9273,7 +9563,7 @@ class SqlServerStore:
                     await cur.execute(sql, params)
                     if not await cur.fetchall():
                         await self._commit(conn)
-                        return next_at
+                        return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
                 else:
                     await self._exec_terminal(
                         cur, "mark_failed(dead)", (outbox_id,), sql, params, checked=bool(guard)
@@ -9284,16 +9574,18 @@ class SqlServerStore:
                 if status == OutboxStatus.DEAD.value:
                     await self._maybe_finalize(cur, message_id, now)
                     await self._commit(conn)
-                    return None
+                    return FailOutcome(
+                        dead=1, head_id=outbox_id, attempts=attempts, dead_messages=(message_id,)
+                    )
                 await self._commit(conn)
-                return next_at
+                return FailOutcome(retry_at=next_at, head_id=outbox_id, attempts=attempts)
             except Exception:
                 await conn.rollback()
                 raise
-        # Reached only when _fence_scope swallowed a rejected DEAD branch. None is what the DEAD branch
-        # returns, so _mark_failed_and_arm arms no retry timer: D1 re-pended the row, and only the
-        # SUCCESSOR may claim it.
-        return None
+        # Reached only when _fence_scope swallowed a rejected DEAD branch. No retry time, so
+        # _mark_failed_and_arm arms no retry timer: D1 re-pended the row, and only the SUCCESSOR may
+        # claim it. Nothing is dead: the fence rolled the DEAD write back.
+        return FailOutcome()
 
     async def mark_batch_failed(
         self,
@@ -9301,11 +9593,12 @@ class SqlServerStore:
         error: str,
         retry: RetryPolicy,
         now: float | None = None,
-    ) -> float | None:
+    ) -> FailOutcome:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
+        all dead-letter together). Returns a :class:`FailOutcome` naming the first member still
+        present, with the shared ``next_attempt_at`` or the count written DEAD.
         On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
         own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
         when every member was skipped."""
@@ -9324,7 +9617,7 @@ class SqlServerStore:
                         present.append((outbox_id, row[0], row[1], row[2]))
                 if not present:
                     await self._commit(conn)
-                    return None
+                    return FailOutcome()
                 head_attempts = present[0][3]
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
@@ -9356,6 +9649,7 @@ class SqlServerStore:
                     + guard
                 )
                 finalize: dict[str, None] = {}
+                changed = 0
                 for outbox_id, message_id, destination_name, attempts in present:
                     params = (
                         status,
@@ -9378,6 +9672,7 @@ class SqlServerStore:
                             params,
                             checked=bool(guard),
                         )
+                    changed += 1
                     await self._event(
                         cur,
                         message_id,
@@ -9391,12 +9686,18 @@ class SqlServerStore:
                 for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
-                return None if status == OutboxStatus.DEAD.value else next_at
+                return FailOutcome(
+                    retry_at=next_at if retrying else None,
+                    dead=0 if retrying else changed,
+                    head_id=present[0][0],
+                    attempts=head_attempts,
+                    dead_messages=tuple(finalize),  # filled on the DEAD branch only
+                )
             except Exception:
                 await conn.rollback()
                 raise
         # Reached only when _fence_scope swallowed a rejected DEAD branch (D1 re-pended).
-        return None
+        return FailOutcome()
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
@@ -10180,7 +10481,16 @@ class SqlServerStore:
                                 src_channel,
                                 to,
                                 self._cipher.encrypt(
-                                    body, aad=cell_aad("queue", "payload", outbox_id)
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=outbox_id,
+                                        message_id=child_mid,
+                                        stage=Stage.OUTBOUND.value,
+                                        channel_id=src_channel,
+                                        destination_name=to,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
                                 ),
                                 now,
                             ),
@@ -10202,33 +10512,35 @@ class SqlServerStore:
                             src_where += " AND destination_name=?"
                             src_params.append(from_)
                         await cur.execute(
-                            "SELECT q.destination_name, q.channel_id,"
-                            " COALESCE(sb.body, q.payload) AS body_ciphertext, q.id, q.body_ref"
-                            " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
-                            f" WHERE {src_where} ORDER BY q.destination_name",
+                            f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
+                            f" WHERE {src_where} ORDER BY destination_name",
                             tuple(src_params),
                         )
-                        rows = await cur.fetchall()
+                        rows = [
+                            dict(zip((*QUEUE_TAG_COLUMNS, "payload"), r, strict=True))
+                            for r in await cur.fetchall()
+                        ]
                         if not rows:
                             raise ResendSourceNotFound(
                                 f"message {message_id} has no delivered body"
                                 + (f" for source {from_!r}" if from_ is not None else "")
                                 + " to resend"
                             )
-                        if from_ is None and len({r[0] for r in rows}) > 1:
+                        if from_ is None and len({r["destination_name"] for r in rows}) > 1:
                             raise ResendSourceAmbiguous(
                                 f"message {message_id} was delivered to multiple destinations --"
                                 " specify the source destination (from) to resend"
                             )
-                        src_dest, src_channel, body_ciphertext = rows[0][0], rows[0][1], rows[0][2]
-                        src_queue_id, src_body_ref = rows[0][3], rows[0][4]
-                        # The body's cell depends on its source (store-once shared body vs inline payload).
-                        src_body_aad = (
-                            cell_aad("shared_body", "body", src_body_ref)
-                            if src_body_ref is not None
-                            else cell_aad("queue", "payload", src_queue_id)
+                        src = rows[0]
+                        src_dest, src_channel = src["destination_name"], src["channel_id"]
+                        # A '' payload is what retention leaves. Otherwise the body is opened under
+                        # the source row's own tag (BACKLOG #2593); the body_ref column picks the kind
+                        # and the tag binds it, so a changed column fails the tag.
+                        decoded = (
+                            ""
+                            if src["payload"] == "" and src["body_ref"] is None
+                            else await self._open_queue_body(cur, src)
                         )
-                        decoded = self._dec(body_ciphertext, aad=src_body_aad)
                         if not decoded:
                             raise ResendSourceEmpty(
                                 f"message {message_id} source body was purged by retention -- cannot resend"
@@ -10245,7 +10557,16 @@ class SqlServerStore:
                                 src_channel,
                                 to,
                                 self._cipher.encrypt(
-                                    body, aad=cell_aad("queue", "payload", outbox_id)
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=outbox_id,
+                                        message_id=message_id,
+                                        stage=Stage.OUTBOUND.value,
+                                        channel_id=src_channel,
+                                        destination_name=to,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
                                 ),
                                 now,
                             ),
@@ -10387,7 +10708,7 @@ class SqlServerStore:
                                 actor,
                             ),
                         )
-                        # Hoist the row id so the payload binds to its own queue cell.
+                        # Hoist the row id so the payload binds to its own row tag.
                         resubmit_row_id = uuid4().hex
                         await cur.execute(
                             _SQL_INSERT_QUEUE_INGRESS,
@@ -10397,7 +10718,16 @@ class SqlServerStore:
                                 Stage.INGRESS.value,
                                 channel_id,
                                 self._cipher.encrypt(
-                                    raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                                    raw,
+                                    aad=queue_payload_aad(
+                                        row_id=resubmit_row_id,
+                                        message_id=new_mid,
+                                        stage=Stage.INGRESS.value,
+                                        channel_id=channel_id,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
                                 ),
                                 OutboxStatus.PENDING.value,
                                 now,
@@ -10803,15 +11133,25 @@ class SqlServerStore:
             "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
             (message_id, Stage.OUTBOUND.value),
         )
-        for r in rows:
-            # SS keeps bodies inline (no shared_body deref on this path), so payload is queue.payload.
-            r["payload"] = self._cipher.decrypt(
-                r["payload"], aad=cell_aad("queue", "payload", r["id"])
-            )
-            r["last_error"] = self._dec(
-                r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
-            )  # H4: null/legacy-plaintext-safe decrypt
-        return rows
+        # Each body is opened under its row's own tag (BACKLOG #2593), as SQLite does: a purged
+        # row ('') reads as an empty body, a live row whose tag fails refuses the read and alerts,
+        # and a dead row whose tag fails is left out, since its claim already reported it.
+        out: list[dict[str, Any]] = []
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            for r in rows:
+                dead = r["status"] == OutboxStatus.DEAD.value
+                try:
+                    if r["payload"] != "" or r["body_ref"] is not None:
+                        r["payload"] = await self._open_queue_body(cur, r, alert=not dead)
+                except QueueTagError:
+                    if not dead:
+                        raise
+                    continue
+                r["last_error"] = self._dec(
+                    r["last_error"], aad=cell_aad("queue", "last_error", r["id"])
+                )  # H4: null/legacy-plaintext-safe decrypt
+                out.append(r)
+        return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
         rows = await self._fetchall(
@@ -11952,11 +12292,8 @@ class SqlServerStore:
                             # Nothing written, so nothing is revoked or audited.
                             await conn.rollback()
                             return None
-                        await cur.execute(
-                            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
-                            " WHERE user_id=? AND revoked_at IS NULL",
-                            (now, user_id),
-                        )
+                        await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+                        await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                         revoked = len(await cur.fetchall())
                         appended = await self._append_audits(cur, (audit,), now=now)
                         await self._commit(conn)
@@ -12643,8 +12980,9 @@ class SqlServerStore:
                     # Nothing written, so nothing is revoked. The rollback frees the connection.
                     await conn.rollback()
                     return None
+                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
                 await cur.execute(
-                    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
                     (now, user_id),
                 )
                 revoked = cur.rowcount
@@ -12710,8 +13048,9 @@ class SqlServerStore:
                     "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
                     (now, user_id),
                 )
+                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
                 await cur.execute(
-                    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
                     (now, user_id),
                 )
                 count = cur.rowcount
@@ -12804,53 +13143,102 @@ class SqlServerStore:
         idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # reauth_at seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves it
-        # NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
-        insert = (
-            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
-            " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
-        )
-        params = (
-            token_hash,
-            user_id,
-            now,
-            expires_at,
-            now,
-            client,
-            now if seed_reauth else None,
-            auth_mechanism,
-            idp_auth_time,
-        )
-        if require_federated_subject is None:
-            await self._execute(insert, params)
-            return True
-        # BACKLOG #1474. UPDLOCK/ROWLOCK, not a plain read: the lock is the whole guard. Either a
-        # concurrent unbind committed first and this read sees the cleared pair (so the insert is
-        # refused), or this transaction holds the users row and the unbind waits behind it — and its
-        # session sweep, which runs after its own users UPDATE, then sees this session and revokes
-        # it. An unlocked read admits the interleaving that loses the session. The hint pair is this
-        # file's FOR UPDATE analog, as register_failed_login and consume_totp_step take it.
+        # BACKLOG #1474 and #2592. UPDLOCK/ROWLOCK, not a plain read: the lock is the guard. Either a
+        # concurrent unbind or whole-account revoke committed first, and this read sees the cleared
+        # pair (so the insert is refused) and the raised session epoch; or this transaction holds
+        # the users row and that writer waits behind it, and its session sweep, which runs after its
+        # own users UPDATE, then sees this session and revokes it. An unlocked read admits the
+        # interleaving that loses the session. The hint pair is this file's FOR UPDATE analog, as
+        # register_failed_login and consume_totp_step take it.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute(
-                    "SELECT oidc_issuer, oidc_subject FROM users"
-                    " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                    (user_id,),
-                )
+                # An unguarded sign-in takes a shared lock held to the commit (HOLDLOCK): it still
+                # waits behind a revoke's users UPDATE, and parallel sign-ins of one account do not
+                # wait on each other.
+                if require_federated_subject is None:
+                    await cur.execute(
+                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
+                        " WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+                        (user_id,),
+                    )
+                else:
+                    await cur.execute(
+                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
+                        " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (user_id,),
+                    )
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
                 # closes the cursor before the pooled connection is reused (EF-6).
                 rows = await cur.fetchall()
-                bound = None if not rows else (rows[0][0], rows[0][1])
-                if bound != require_federated_subject:
-                    await conn.rollback()
-                    return False
-                await cur.execute(insert, params)
+                if require_federated_subject is not None:
+                    bound = None if not rows else (rows[0][0], rows[0][1])
+                    if bound != require_federated_subject:
+                        await conn.rollback()
+                        return False
+                record = new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    user_epoch=0 if not rows else int(rows[0][2]),
+                )
+                record = seal_session(self._row_sealer, record)
+                await cur.execute(_SESSION_INSERT, session_insert_params(record))
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
         return True
+
+    async def _write_session(
+        self,
+        cur: Any,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+    ) -> SessionRecord | None:
+        """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
+        ``MessageStore._write_session`` states the contract. Call it on ``cur`` inside an open
+        transaction. The read takes ``UPDLOCK, ROWLOCK``, so the compare on the seal is a second
+        guard, not the only one. The write reports through ``OUTPUT``, which a session-wide
+        ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
+        await cur.execute(
+            "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?", (token_hash,)
+        )
+        columns = [c[0] for c in cur.description]
+        rows = await cur.fetchall()
+        if not rows:
+            return None
+        current = SessionRecord.from_mapping(dict(zip(columns, rows[0])))  # noqa: B905
+        if current.revoked_at is not None:
+            return None
+        if not session_seal_ok(self._row_sealer, current):
+            raise RowSealError(SESSION_KIND)
+        updated = seal_session(self._row_sealer, change(current))
+        await cur.execute(_MSSQL_SESSION_RESEAL, session_reseal_params(updated, current))
+        written = await cur.fetchall()
+        return updated if written else None
+
+    async def _write_session_txn(
+        self, token_hash: str, change: Callable[[SessionRecord], SessionRecord]
+    ) -> SessionRecord | None:
+        """:meth:`_write_session` in a transaction of its own, committed before it returns."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                updated = await self._write_session(cur, token_hash, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return updated
+
+    def row_sealer(self) -> RowSealer | None:
+        """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
+        :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
+        return self._row_sealer
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
@@ -12890,43 +13278,28 @@ class SqlServerStore:
         client: str | None = None,
         idp_auth_time: float | None = None,
     ) -> None:
-        now = time.time() if now is None else now
-        # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
-        # only moves forward, and a NULL leaves it (BACKLOG #2143): the clause is store.py's, which
-        # says why.
-        await self._execute(
-            "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
-            f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
-            (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
-        )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        await self._write_session_txn(token_hash, stamp)
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE sessions SET mfa_verified_at=? WHERE token_hash=?", (now, token_hash)
-        )
+        await self._write_session_txn(token_hash, mfa_stamp(time.time() if now is None else now))
 
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        This op's whole contract is whether a row was re-keyed, so it reads an ``OUTPUT`` rowset and
-        never ``cursor.rowcount`` (BACKLOG #2283). A session-wide ``SET NOCOUNT ON`` can leave the
-        count at ``-1`` for a zero-match UPDATE, and ``bool(-1)`` would report a revoked session
-        as re-keyed; ``_exec_terminal`` reads its fence the same way for the same reason.
-        ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
+        The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
+        #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
+        #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
         clustered-PK row move is width-safe."""
-        rows = await self._execute_output(
-            "UPDATE sessions SET token_hash=? OUTPUT inserted.token_hash"
-            " WHERE token_hash=? AND revoked_at IS NULL",
-            (new_token_hash, token_hash),
+        rotated = await self._write_session_txn(
+            token_hash, lambda s: replace(s, token_hash=new_token_hash)
         )
-        return bool(rows)
+        return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+            "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
             (now, token_hash),
         )
 
@@ -12936,7 +13309,7 @@ class SqlServerStore:
         Through ``_execute_output`` rather than ``_fetchone``, which commits as a READ, while this is
         a durable write (BACKLOG #2283)."""
         rows = await self._execute_output(
-            "UPDATE sessions SET revoked_at=? OUTPUT inserted.*"
+            "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.*"
             " WHERE token_hash=? AND revoked_at IS NULL",
             (now, token_hash),
         )
@@ -12949,17 +13322,38 @@ class SqlServerStore:
 
         Counted from an ``OUTPUT`` rowset, as ``rotate_session`` is (BACKLOG #2283). The count is
         audited and returned to the API caller, and ``cursor.rowcount`` under a session-wide
-        ``SET NOCOUNT ON`` would report ``-1``. The rowset is one row per session of one user."""
+        ``SET NOCOUNT ON`` would report ``-1``. The rowset is one row per session of one user.
+
+        Raises the account's session epoch and re-seals the kept session in the same transaction
+        (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
+        runs first, so it takes the account row's lock before any session row, the order
+        ``create_session`` takes them in."""
         now = time.time() if now is None else now
-        sql = (
-            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
-            " WHERE user_id=? AND revoked_at IS NULL"
-        )
-        params: list[Any] = [now, user_id]
-        if except_token_hash is not None:
-            sql += " AND token_hash != ?"
-            params.append(except_token_hash)
-        return len(await self._execute_output(sql, tuple(params)))
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+                if except_token_hash is None:
+                    await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+                else:
+                    await cur.execute(
+                        _MSSQL_REVOKE_USER_SESSIONS_SQL + " AND token_hash != ?",
+                        (now, user_id, except_token_hash),
+                    )
+                revoked = len(await cur.fetchall())
+                if except_token_hash is not None:
+                    await cur.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
+                    epoch_rows = await cur.fetchall()
+                    epoch = int(epoch_rows[0][0]) if epoch_rows else 0
+                    await self._write_session(
+                        cur,
+                        except_token_hash,
+                        lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
+                    )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return revoked
 
     async def enforce_session_cap(
         self,
@@ -12984,7 +13378,7 @@ class SqlServerStore:
         per_group = (keep, user_id, *_session_live_params(now, idle_seconds), now)
         groups = len(_session_cap_groups(split_mfa_pending))
         rows = await self._execute_output(
-            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+            "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
             " WHERE user_id=? AND revoked_at IS NULL"
             f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
             f"{_mssql_session_cap_keep_sql(split_mfa_pending)}",

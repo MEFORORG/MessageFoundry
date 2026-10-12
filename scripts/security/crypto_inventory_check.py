@@ -498,6 +498,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     # under a per-process AES-256-GCM key built through store.crypto._install_key (lock + wipe of the
     # key buffer). Memory hygiene for decoded cache values, not at-rest protection.
     "messagefoundry/store/sealed_cache.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #2592: row integrity seals. hmac = HMAC-SHA256 over a typed row encoding under a key
+    # derived (HKDF, through the store.crypto seam) from the store key's authorization root; hashlib =
+    # the SHA-256 the HMAC runs over; compare_digest for the constant-time verify.
+    "messagefoundry/store/row_seal.py": frozenset(
+        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+    ),
+    # BACKLOG #2593: builds the AES-GCM associated data a queue payload cell is sealed under (the
+    # row's routing fields) and opens the cell through the store cipher seam. No key of its own.
+    "messagefoundry/store/queue_tag.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -940,6 +949,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # secret from the CSPRNG, the code by HMAC and a constant-time compare), before any store write.
     "messagefoundry/__main__.py": frozenset(
         {
+            "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
             "csprng:via messagefoundry.auth.totp",
@@ -968,6 +978,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # so no operation row names it; the import row above records the dependency.
     "messagefoundry/api/app.py": frozenset(
         {
+            "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
@@ -978,6 +989,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/api/tls.py": frozenset(
         {
+            "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "key_cert:via messagefoundry.keywrap",
@@ -1007,6 +1019,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # loads those checked bytes, as auth/oidc_http.py does for the IdP anchor.
     "messagefoundry/auth/ldap.py": frozenset(
         {
+            "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.auth.trust_anchors",
         }
@@ -1034,6 +1047,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/auth/oidc_http.py": frozenset(
         {
+            "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "tls_context:.check_hostname = True",
@@ -1047,9 +1061,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/policy.py": frozenset({"hash:hashlib.sha1"}),
     "messagefoundry/auth/service.py": frozenset(
         {
-            "compare:via messagefoundry.credential",  # BACKLOG #1167: the passkey credential match
+            # BACKLOG #1167: the passkey credential match and _rekey_token_state's grant walk.
+            "compare:via messagefoundry.credential",
             "compare:via messagefoundry.auth.oidc.claims",
             "compare:via messagefoundry.auth.oidc.flow",
+            "compare:via messagefoundry.auth.oidc_http",  # BACKLOG #1167: the anchor pin compare
             "compare:via messagefoundry.auth.totp",
             "csprng:secrets.token_urlsafe",
             "csprng:via messagefoundry.auth.oidc.flow",
@@ -1064,6 +1080,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:via messagefoundry.auth.totp",
             "sign_verify:via messagefoundry.auth.oidc.claims",
             "sign_verify:via messagefoundry.auth.webauthn",
+            # BACKLOG #2592: the session loader checks each session row's integrity seal.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:via messagefoundry.auth.oidc_http",
         }
     ),
@@ -1080,6 +1098,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/auth/trust_anchors.py": frozenset(
         {
+            "compare:via messagefoundry.credential",  # BACKLOG #1167: evaluate_anchor's pin compare
             "hash:hashlib.sha256",
             # BACKLOG #2025: the throwaway cadata= trial load in anchor_cadata.
             "tls_context:.load_verify_locations()",
@@ -1210,6 +1229,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt()",
             "cipher:via messagefoundry.store.backup_codec",
             "compare:hmac.compare_digest",
+            "compare:via messagefoundry.store.backup_codec",  # BACKLOG #1167: the key_id match
             "csprng:via messagefoundry.store.backup_codec",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.config.fingerprint",
@@ -1267,6 +1287,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
             "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "compare:via messagefoundry.credential",  # BACKLOG #1167: decrypt_stream's key_id match
             "csprng:os.urandom",
             "hash:hashlib.sha256",
             "kdf:via messagefoundry.store.crypto",  # ADR 0196: the archive's sub-key
@@ -1304,6 +1325,19 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
+    # BACKLOG #2592: HMAC-SHA256 row seals and their constant-time verify, under a key the
+    # store.crypto seam derives (HKDF) and names by a SHA-256 digest.
+    "messagefoundry/store/row_seal.py": frozenset(
+        {
+            "compare:hmac.compare_digest",
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:hmac.new[sha256]",
+        }
+    ),
+    # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
+    # tag its row's routing fields build.
+    "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()"}),
     # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
     # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
     # sha256) by store.crypto._install_key.
@@ -1329,12 +1363,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
             "cipher:via messagefoundry.store.crypto",
+            # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
+            "cipher:via messagefoundry.store.queue_tag",
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
             "kdf:via messagefoundry.store.crypto",
             "key_cert:via messagefoundry.config.tls_policy",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
             "tls_context:.check_hostname = False",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
@@ -1346,11 +1384,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
             "cipher:via messagefoundry.store.crypto",
+            # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
+            "cipher:via messagefoundry.store.queue_tag",
             "compare:via messagefoundry.store.store",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
             "kdf:via messagefoundry.store.crypto",
             "mac:via messagefoundry.store.store",
+            # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
+            "sign_verify:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/store/store.py": frozenset(
@@ -1358,11 +1400,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
             "cipher:via messagefoundry.store.crypto",
+            # BACKLOG #2593: queue payload cells open under their routing tag (store.queue_tag).
+            "cipher:via messagefoundry.store.queue_tag",
             "compare:hmac.compare_digest",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
+            "sign_verify:.verify()",
         }
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)
@@ -1374,6 +1420,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/dicom.py": frozenset(
         {
             # BACKLOG #1142, slice 3: the SCP's mTLS CA is hashed (pin, audit) before it loads.
+            "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "key_cert:via messagefoundry.keywrap",
@@ -1433,6 +1480,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/http_listener.py": frozenset(
         {
             "compare:via messagefoundry.credential",
+            "compare:via messagefoundry.transports.mllp",  # BACKLOG #1167: the anchor pin compare
             "hash:via messagefoundry.credential",
             # BACKLOG #1142, slice 3: the listener's mTLS CA goes through mllp's context builder.
             "hash:via messagefoundry.transports.mllp",
@@ -1443,6 +1491,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/mllp.py": frozenset(
         {
             # BACKLOG #1142, slice 3: the listener's mTLS CA is hashed (pin, audit) before it loads.
+            "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "key_cert:via messagefoundry.keywrap",
@@ -1640,11 +1689,18 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # context its CALLER builds and passes in (non-prod, loopback only). It imports no crypto module,
     # owns no key and decides no TLS policy: the test that mints the throwaway certificate does.
     "harness/sinks/email.py": frozenset({"tls_context:.wrap_socket()"}),
-    "messagefoundry/api/auth_routes.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
+    # BACKLOG #1167 (ASVS 11.2.4): both session-list routes flag the caller's own session by a
+    # constant-time compare of two token hashes.
+    "messagefoundry/api/auth_routes.py": frozenset(
+        {"compare:via messagefoundry.credential", "hash:via messagefoundry.auth.tokens"}
+    ),
     "messagefoundry/tray/poller.py": frozenset({"tls_context:via messagefoundry.tray.probe"}),
     "messagefoundry/verify/federation.py": frozenset(
         {
             "compare:via messagefoundry.auth.oidc.claims",
+            # BACKLOG #1167: evaluate_anchor's pin compare, reached directly and through oidc_http.
+            "compare:via messagefoundry.auth.oidc_http",
+            "compare:via messagefoundry.auth.trust_anchors",
             "hash:via messagefoundry.auth.oidc_http",
             # BACKLOG #1142: the fed.idp_tls row reports the anchor's evaluate_anchor verdict, which
             # fingerprints the anchor with SHA-256.
@@ -1668,7 +1724,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # (hash_token), so the table never holds a raw token. A lookup key, not a credential check.
     "messagefoundry_webconsole/_auth.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
     "messagefoundry_webconsole/routes/account.py": frozenset(
-        {"hash:via messagefoundry.auth.tokens"}
+        {"compare:via messagefoundry.credential", "hash:via messagefoundry.auth.tokens"}
     ),
     "messagefoundry_webconsole/routes/core.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
     "scripts/security/dast_auth_sweep.py": frozenset({"csprng:via scripts.security.dast_target"}),

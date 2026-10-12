@@ -167,6 +167,7 @@ _EVIDENCE_ARTIFACT_MARKERS = (
 #: Settings names the rewritten §2/§3/§8 text depends on; a rename must red the doc, not rot it.
 _CITED_SETTINGS = (
     ("store", "aad_bind"),
+    ("store", "secure_delete"),
     ("store", "cipher_provider"),
     ("store", "key_provider"),
     ("store", "uploads_dir"),
@@ -505,6 +506,10 @@ def test_documented_defaults_match_the_shipped_defaults() -> None:
         "§8 says the raw [retention] windows still default to 0"
     )
     assert settings.retention.max_pass_seconds == 0.0, "§8 says the pass cap defaults to off"
+    assert settings.store.secure_delete is True, "§8 says secure_delete is on by default"
+    assert settings.retention.wal_checkpoint_seconds == 3600.0, (
+        "§2 and §8 say the WAL truncate is tried hourly by default"
+    )
     assert settings.store.uploads_retention_days == 30, (
         "§8 says [store].uploads_dir blobs auto-prune after uploads_retention_days (default 30)"
     )
@@ -709,6 +714,13 @@ def _per_backend_cipher_counts() -> dict[str, int]:
                 and node.args[0].value.lower() in tables  # type: ignore[attr-defined]
             ):
                 pairs.add((node.args[0].value, node.args[1].value))  # type: ignore[attr-defined]
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("queue_payload_aad", "queue_row_aad")
+            ):
+                # BACKLOG #2593: the queue payload's tag has its own builder, not a cell_aad literal.
+                pairs.add(("queue", "payload"))
         # The doc counts CELLS THAT CAN HOLD A ROW. `shared_body` is created by every backend's DDL
         # and declared cipher-covered, but the server backends never INSERT into it (the ADR 0100
         # body-dedup path is SQLite-only), so §2 states the count "minus shared_body.body". Asserted,

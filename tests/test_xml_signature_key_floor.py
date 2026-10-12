@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""XML-DSig ``verify()`` refuses a signature made with an RSA key under 2048 bits (BACKLOG #1166).
+"""XML-DSig ``verify()`` refuses a signature made with a key under the strength floor (BACKLOG #1166):
+RSA under 2048 bits, EC on a curve outside P-256/P-384/P-521, and DSA at any size.
 
 The measurement that found the defect, and the ruling that sets the number, are recorded once, on
-``_MIN_RSA_BITS`` and ``_signing_key_refusal`` in ``messagefoundry/parsing/xml/signature.py``.
+``_MIN_RSA_BITS``, ``_APPROVED_EC_CURVES`` and ``_signing_key_refusal`` in
+``messagefoundry/parsing/xml/signature.py``.
 
-THE RSA-1024 AND RSA-2047 KEYS HERE ARE NEGATIVE CONTROLS. They exist only to be refused. None is offered to a
-peer, written outside ``tmp_path``, or used for anything but the refusal this file asserts. A
-static "weak cryptographic key" alert against them is right about the code and wrong about the risk;
-deleting them would delete the only proof the floor fires.
+THE RSA-1024, RSA-2047, P-192 AND DSA KEYS HERE ARE NEGATIVE CONTROLS. They exist only to be refused.
+None is offered to a peer, written outside ``tmp_path``, or used for anything but the refusal this
+file asserts. A static "weak cryptographic key" alert against them is right about the code and wrong
+about the risk; deleting them would delete the only proof the floor fires.
 
 All material is minted at run time. No certificate or key is embedded in this file.
 """
@@ -16,7 +18,8 @@ All material is minted at run time. No certificate or key is embedded in this fi
 from __future__ import annotations
 
 import datetime as dt
-from functools import cache
+from collections.abc import Callable
+from functools import cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +29,7 @@ pytest.importorskip("signxml")
 
 from cryptography import x509  # noqa: E402 - after the [xml]-extra skip on purpose
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import ec, rsa  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa  # noqa: E402
 from cryptography.x509.oid import NameOID  # noqa: E402
 
 # The reason constants are read off the module at call time, not imported, so this file COLLECTS
@@ -35,7 +38,7 @@ from messagefoundry.parsing.xml import signature as sigmod  # noqa: E402
 from messagefoundry.parsing.xml.signature import verify  # noqa: E402
 
 _BODY = b"<Order><Item>SYNTHETIC-WIDGET</Item><Qty>1</Qty></Order>"
-_SignerKey = rsa.RSAPrivateKey | ec.EllipticCurvePrivateKey
+_SignerKey = rsa.RSAPrivateKey | ec.EllipticCurvePrivateKey | dsa.DSAPrivateKey
 
 
 @cache
@@ -44,14 +47,25 @@ def _rsa(bits: int) -> rsa.RSAPrivateKey:
 
 
 @cache
-def _ca_rsa(bits: int) -> rsa.RSAPrivateKey:
-    """A CA key distinct from every leaf key, so no chain here is a same-key degenerate one."""
-    return rsa.generate_private_key(public_exponent=65537, key_size=bits)
+def _ec(curve_name: str) -> ec.EllipticCurvePrivateKey:
+    curve: ec.EllipticCurve = {
+        "secp192r1": ec.SECP192R1(),
+        "secp256r1": ec.SECP256R1(),
+        "secp384r1": ec.SECP384R1(),
+        "secp521r1": ec.SECP521R1(),
+    }[curve_name]
+    return ec.generate_private_key(curve)
 
 
 @cache
-def _p256() -> ec.EllipticCurvePrivateKey:
-    return ec.generate_private_key(ec.SECP256R1())
+def _dsa(bits: int) -> dsa.DSAPrivateKey:
+    return dsa.generate_private_key(key_size=bits)
+
+
+@cache
+def _ca_rsa(bits: int) -> rsa.RSAPrivateKey:
+    """A CA key distinct from every leaf key, so no chain here is a same-key degenerate one."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=bits)
 
 
 def _cert(
@@ -104,7 +118,12 @@ def _sign(key: _SignerKey, cert: x509.Certificate) -> bytes:
     from lxml import etree
     from signxml.signer import XMLSigner
 
-    alg = "ecdsa-sha256" if isinstance(key, ec.EllipticCurvePrivateKey) else "rsa-sha256"
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        alg = "ecdsa-sha256"
+    elif isinstance(key, dsa.DSAPrivateKey):
+        alg = "dsa-sha256"
+    else:
+        alg = "rsa-sha256"
     key_pem = key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
@@ -174,12 +193,61 @@ def test_a_tampered_body_still_fails_on_its_digest(bits: int, anchor: str, tmp_p
 
 
 @pytest.mark.parametrize("anchor", _ANCHORS)
-def test_an_ec_p256_signature_is_untouched_by_the_rsa_floor(anchor: str, tmp_path: Path) -> None:
-    """The floor is RSA-only. A P-256 key (about 128 bits) must still verify on both paths."""
-    doc, kwargs = _signed_and_anchor(_p256(), anchor, tmp_path)
+@pytest.mark.parametrize("curve", ["secp256r1", "secp384r1", "secp521r1"])
+def test_an_ec_signature_on_an_approved_curve_verifies(
+    curve: str, anchor: str, tmp_path: Path
+) -> None:
+    """POSITIVE CONTROL for the EC arm: without it, a floor that refused every EC key would pass the
+    P-192 test below. All three curves are at or above 128-bit security."""
+    doc, kwargs = _signed_and_anchor(_ec(curve), anchor, tmp_path)
     result = verify(doc, **kwargs)
-    assert result.verified, f"P-256 on the {anchor} path was refused: {result.reason}"
+    assert result.verified, f"{curve} on the {anchor} path was refused: {result.reason}"
     assert result.reason is None
+
+
+@pytest.mark.parametrize("anchor", _ANCHORS)
+@pytest.mark.parametrize(
+    "make",
+    [
+        # The two keys ``_signing_key_refusal`` names as measured verifying before this floor.
+        pytest.param(partial(_ec, "secp192r1"), id="p192"),
+        pytest.param(partial(_dsa, 1024), id="dsa1024"),
+        # Pins that DSA is refused outright, not floored at RSA's 2048.
+        pytest.param(partial(_dsa, 2048), id="dsa2048"),
+    ],
+)
+def test_a_p192_or_dsa_signature_is_refused_as_data(
+    make: Callable[[], _SignerKey], anchor: str, tmp_path: Path
+) -> None:
+    """Each signature is cryptographically valid, so only the key floor can refuse it."""
+    doc, kwargs = _signed_and_anchor(make(), anchor, tmp_path)
+    result = verify(doc, **kwargs)
+    assert result.verified is False, f"the key verified on the {anchor} path"
+    assert result.reason == sigmod.WEAK_SIGNING_KEY
+
+
+def _reported_key(public_key: Any) -> Any:
+    """A stand-in for signxml's ``VerifyResult`` that reports ``public_key`` as the signing key."""
+
+    class _R:
+        signature_key = public_key.public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+    return _R()
+
+
+@pytest.mark.parametrize(
+    "make",
+    [ed25519.Ed25519PrivateKey.generate, ed448.Ed448PrivateKey.generate],
+    ids=["ed25519", "ed448"],
+)
+def test_an_eddsa_signing_key_meets_the_floor(
+    make: Callable[[], ed25519.Ed25519PrivateKey | ed448.Ed448PrivateKey],
+) -> None:
+    """Ed25519 and Ed448 are at or above 128-bit security, so the floor passes them. signxml offers
+    no EdDSA signature method, so the key goes straight to the floor rather than through a signature."""
+    assert sigmod._signing_key_refusal(_reported_key(make().public_key())) is None
 
 
 def test_a_weak_ca_key_is_refused_by_the_chain_check(tmp_path: Path) -> None:
@@ -210,15 +278,11 @@ def test_a_list_result_is_checked_whole(shape: str, monkeypatch: pytest.MonkeyPa
     and must not pass; a list is refused if ANY entry's key is under the floor."""
     from signxml.verifier import XMLVerifier
 
-    def _result(key: rsa.RSAPrivateKey) -> Any:
-        class _R:
-            signature_key = key.public_key().public_bytes(
-                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-
-        return _R()
-
-    listed: list[Any] = [] if shape == "empty" else [_result(_rsa(2048)), _result(_rsa(1024))]
+    listed: list[Any] = (
+        []
+        if shape == "empty"
+        else [_reported_key(_rsa(2048).public_key()), _reported_key(_rsa(1024).public_key())]
+    )
     expected = sigmod.UNREADABLE_SIGNING_KEY if shape == "empty" else sigmod.WEAK_SIGNING_KEY
     monkeypatch.setattr(XMLVerifier, "verify", lambda self, *a, **k: listed)
     result = verify(b"<root/>", x509_cert=b"unit-test-anchor-sentinel")

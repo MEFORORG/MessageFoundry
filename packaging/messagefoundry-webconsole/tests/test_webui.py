@@ -4107,7 +4107,9 @@ async def test_cannot_disable_self_rerenders_error(engine: Engine) -> None:
         assert user is not None and not user.disabled
 
 
-async def test_set_roles_roundtrip_and_last_admin_guard(engine: Engine) -> None:
+async def test_set_roles_roundtrip_and_last_admin_guard(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = await _service(engine)
     await _add(service, "u1", Role.VIEWER)
     async with _boss_client(engine, service) as c:
@@ -4116,9 +4118,20 @@ async def test_set_roles_roundtrip_and_last_admin_guard(engine: Engine) -> None:
         assert r.status_code == 303
         assert await service.store.get_user_role_ids(uid) == ["operator"]
         # boss IS the last enabled administrator: initialize() creates no account of its own (ADR
-        # 0183 Amendment A), so nothing else in this store holds the role.
+        # 0183 Amendment A), so nothing else in this store holds the role. The handler refuses a
+        # self-target first (BACKLOG #1149), so the last-administrator refusal is mapped from a
+        # viewer the guard is made to refuse, as tests/test_last_admin_guard.py does on the JSON
+        # plane.
         boss_id = await _uid(service, "boss")
         r = await _post_pairs(c, f"/ui/users/{boss_id}/roles", [("roles", "viewer")])
+        assert r.status_code == 400
+        assert "another administrator must change your own roles" in r.text
+
+        async def refuse(*_a: object, **_k: object) -> bool:
+            return False
+
+        monkeypatch.setattr(service.store, "remove_unless_last_admin", refuse)
+        r = await _post_pairs(c, f"/ui/users/{uid}/roles", [("roles", "viewer")])
         assert r.status_code == 400
         assert "cannot remove the last administrator" in r.text
 
@@ -6949,6 +6962,33 @@ async def test_sessions_page_lists_and_flags_current(engine: Engine) -> None:
         # The nav highlights "My account" (active= is on page(), not the wrapper div).
         assert '<a href="/ui/account" class="active"' in r.text
         assert "<div active=" not in r.text
+
+
+async def test_sessions_page_flags_current_in_constant_time(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 11.2.4 (BACKLOG #1167). RED when: the sessions page goes back to
+    `s.token_hash == current`. Every listed session is compared through the helper, and exactly one
+    (the cookie's own) matches."""
+    from messagefoundry.credential import constant_time_equal as real
+    from messagefoundry_webconsole.routes import account as account_routes
+
+    results: list[bool] = []
+
+    def spy(a: str | bytes, b: str | bytes) -> bool:
+        results.append(real(a, b))
+        return results[-1]
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    assert (await service.login("op", PW)).ok  # a second session, which must not match
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        monkeypatch.setattr(account_routes, "constant_time_equal", spy)
+        r = await c.get("/ui/account/sessions")
+        assert r.status_code == 200
+        assert r.text.count("(this session)") == 1
+    assert sorted(results) == [False, True]
 
 
 async def test_sessions_revoke_others(engine: Engine) -> None:

@@ -32,7 +32,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import RetryPolicy
-from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
 from tests.test_sqlserver_store import _seed_lease_epoch
 
 pytestmark = pytest.mark.skipif(
@@ -257,7 +257,9 @@ async def test_mark_failed_dead_branch_fenced_retry_branch_lands(store: Any) -> 
     claimed_a = await _claim_one(store)
     await _superseded(store)
 
-    assert await store.mark_failed(claimed_a.id, "boom", RetryPolicy(max_attempts=1)) is None
+    assert (
+        await store.mark_failed(claimed_a.id, "boom", RetryPolicy(max_attempts=1))
+    ) == FailOutcome()
     assert (await store.outbox_for(mid_a))[0]["status"] == OutboxStatus.PENDING.value
     assert store.fenced_writes == 1
 
@@ -267,7 +269,9 @@ async def test_mark_failed_dead_branch_fenced_retry_branch_lands(store: Any) -> 
     assert claimed_b is not None
     await _superseded(store, 7)
 
-    next_at = await store.mark_failed(claimed_b.id, "transient", RetryPolicy(max_attempts=None))
+    next_at = (
+        await store.mark_failed(claimed_b.id, "transient", RetryPolicy(max_attempts=None))
+    ).retry_at
     assert isinstance(next_at, float)  # rescheduled, not dead-lettered
     assert (await store.outbox_for(mid_b))[0]["status"] == OutboxStatus.PENDING.value
     assert store.fenced_writes == 1  # UNCHANGED — the retry branch is never fenced
@@ -391,7 +395,7 @@ async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(
     await store.mark_done(claimed.id)
     store.set_leader_epoch(5, lease_key=_LEASE_KEY)  # back to the stale ex-leader
 
-    next_at = await store.mark_failed(claimed.id, "late", RetryPolicy(max_attempts=None))
+    next_at = (await store.mark_failed(claimed.id, "late", RetryPolicy(max_attempts=None))).retry_at
 
     assert isinstance(next_at, float)
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
@@ -402,7 +406,9 @@ async def test_a_stalled_ex_leader_cannot_re_pend_a_row_its_successor_finished(
     # The positive control: an INFLIGHT row still re-pends, with its event, in the same NOCOUNT state.
     mid2 = await _enqueue(store, ("OB2", "p"))
     live = await _claim_one(store, "OB2", epoch=6)
-    assert isinstance(await store.mark_failed(live.id, "x", RetryPolicy(max_attempts=None)), float)
+    assert isinstance(
+        (await store.mark_failed(live.id, "x", RetryPolicy(max_attempts=None))).retry_at, float
+    )
     assert (await store.outbox_for(mid2))[0]["status"] == OutboxStatus.PENDING.value
     assert (await _events(store, mid2)).count("failed") == 1
 
@@ -430,7 +436,7 @@ async def test_a_retry_on_a_row_already_re_pended_still_lands(
     assert row["status"] == OutboxStatus.PENDING.value and row["attempts"] == 1  # premise
 
     retry = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=2)
-    next_at = await store.mark_failed(claimed.id, "late", retry, now=202.0)
+    next_at = (await store.mark_failed(claimed.id, "late", retry, now=202.0)).retry_at
 
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value

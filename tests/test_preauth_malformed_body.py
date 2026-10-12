@@ -10,8 +10,16 @@ written down, so a change to what a class of route answers now reds a test and h
 
 WHAT IS NOT PINNED IS WHICH ROUTES ARE IN A CLASS. A new gated JSON route that declares a body
 joins the class below and answers as that class does, with every case here green. Only a floor
-holds each class's size. Pinning the membership would red every change that adds such a route. The
-owner has not ruled on whether that is wanted.
+holds each class's size. Pinning the membership would red every change that adds such a route.
+
+THAT IS DECIDED: MEMBERSHIP STAYS UNPINNED (2026-10-10, recorded on vault BACKLOG #2739). The
+batch 290 Manager decided it under the owner's driver rule, and the owner may overturn it. Since
+engine PR 1944 each gated class gives one answer to all four probes, so a route that joins one
+shows a caller no parser answer. A new JSON route with a top-level API gate that the early check
+misses already turns ``test_every_gated_json_route_is_covered_with_no_list_kept_by_hand`` red, in
+``tests/test_auth_before_body.py``. That test reads only JSON API gates. A console route that
+declares a body would form a class with no pin, which fails the walk here. So a pin here would
+catch nothing new.
 
 ONE CLASS WAS RULED ON AND FIXED (vault BACKLOG #2739, owner ruling 2026-10-02). A JSON route behind
 an API gate that declares a body used to give an unauthenticated caller a parser answer: 422 from

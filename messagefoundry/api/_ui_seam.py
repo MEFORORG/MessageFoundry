@@ -387,6 +387,10 @@ from typing import Any
 #: still fit, so no console call changed. The digest moved because a signature on the discovered
 #: surface did. Re-derived on the tree merged with BACKLOG #2612, so the value below covers both.
 #:
+#: BACKLOG #1149: three more ``AdminHandlers`` take ``request`` for the same row:
+#: ``admin_revoke_user_sessions``, ``set_user_roles`` and ``set_channel_scope``. The digest did not
+#: move, for the same reason, and the same TypeError skew applies to those three calls.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

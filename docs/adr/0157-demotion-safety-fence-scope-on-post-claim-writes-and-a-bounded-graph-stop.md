@@ -1,6 +1,6 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling)
 
 > **Amendment A (2026-09-28, BACKLOG #2078, #2348):** `mark_failed`'s retry branch, and
 > `mark_batch_failed`'s, now carry a status term on all three backends, by owner ruling. It was
@@ -1109,6 +1109,12 @@ claim's own `attempts` as well as on status. That would still land on a swept ro
 value passed into `mark_failed`, which changes the `Store` protocol, the same cost *Why this and not
 the alternatives* gives for a per-claim token. The ruling chose a status term, so this is recorded,
 not built.
+
+*Amended 2026-10-11 (BACKLOG #2415): the per-claim term above is not built. If a per-claim fix is
+ever funded, file the per-claim token, not this term. A search of the vault ledger at `origin/main`
+that day found no row for the token, though "Why this and not the alternatives" says to file it. Seat
+decision under owner delegation 2026-10-08, not an owner ruling; vault
+`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section "#2415 (batch 240)".*
 
 **Tests.** `tests/test_mark_failed_status_term.py` adds the swept-PENDING retry, the batch with one
 swept member, items 1, 2 and 4 above, and a zero multiplier on a reset row. The DONE, DEAD and

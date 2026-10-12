@@ -513,7 +513,8 @@ _ONCE = (
 
 
 #: What the early check costs a signed-in caller on a route with a body: one more identity
-#: lookup, which reads the session, its user and the user's roles, and writes nothing.
+#: lookup, which reads the session, its user and the user's roles, and writes nothing for a session
+#: it accepts. A session it refuses it can revoke; ``docs/SECURITY.md`` says when.
 _SECOND_LOOKUP = {
     "identity_for_token": 1,
     "store.get_session": 1,

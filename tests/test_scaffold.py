@@ -549,6 +549,7 @@ def test_the_scaffold_names_one_loosening_and_it_is_the_state_acknowledgement(
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
+            service_env=None,
         )
     ]
     # The whole list, so this one line also says no other retention acknowledgement is set.

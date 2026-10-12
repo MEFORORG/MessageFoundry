@@ -325,14 +325,16 @@ async def test_a_wal_checkpoint_during_the_copy_runs_passive(
             assert seen == ["PRAGMA wal_checkpoint(TRUNCATE)"]
             assert store._snapshot_copies == 1
             seen.clear()
-            await store.wal_checkpoint()
+            # A PASSIVE does not truncate, so it reports the WAL as left behind (BACKLOG #2619).
+            assert await store.wal_checkpoint() is False
             assert seen == ["PRAGMA wal_checkpoint(PASSIVE)"]
         finally:
             gate.release.set()
             await snap
         seen.clear()
         assert store._snapshot_copies == 0
-        await store.wal_checkpoint()  # no copy running now, so the ordinary TRUNCATE is back
+        # No copy running now, so the ordinary TRUNCATE is back, and it finishes.
+        assert await store.wal_checkpoint() is True
         assert seen == ["PRAGMA wal_checkpoint(TRUNCATE)"]
     finally:
         monkeypatch.undo()

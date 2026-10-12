@@ -56,6 +56,7 @@ from messagefoundry.transports.base import (
     ReplyOutcome,
     SourceConnector,
     positive_cap,
+    positive_seconds,
     register_source,
     wait_for_intake,
 )
@@ -75,6 +76,7 @@ __all__ = [
     "HttpRequest",
     "HttpRequestError",
     "HttpSource",
+    "reply_seconds",
 ]
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,9 @@ DEFAULT_MAX_BODY_BYTES = (
 DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
+_HEADER_CAP_OFF_HINT = (
+    "this cap cannot be switched off; leave it unset or None for the 64 KiB default"
+)
 
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
@@ -611,16 +616,39 @@ def _header_cap(value: Any) -> int:
     Before that, a TOML ``0`` silently became the default while a string ``"0"`` became a cap of zero
     that refused every request, because no request has a head of zero bytes: one number, two outcomes,
     one of them a total outage. Both now refuse loudly, because an operator who writes 0 means "no cap",
-    and this listener does not offer one; silently substituting 64 KiB would hide that. Written
-    ``not ... >= 1`` so NaN and a sub-1 value that would truncate to zero are refused as well."""
+    and this listener does not offer one; silently substituting 64 KiB would hide that. This is the
+    ``max_decompressed_members`` rule on the File source, read the same way."""
     if value is None or value == "":
         return DEFAULT_MAX_HEADER_BYTES
-    if not float(value) >= 1:
+    cap = positive_cap(
+        value,
+        int,
+        knob="max_header_bytes",
+        transport="HTTP source",
+        off_hint=_HEADER_CAP_OFF_HINT,
+    )
+    if cap is None:  # zero, in some spelling
         raise ValueError(
-            f"HTTP source max_header_bytes={value!r} must be a positive number of bytes; this cap "
-            "cannot be switched off (leave it unset or None for the 64 KiB default)"
+            "HTTP source max_header_bytes must be above zero "
+            f"(value withheld; {_HEADER_CAP_OFF_HINT})"
         )
-    return int(value)
+    return cap
+
+
+def reply_seconds(s: Mapping[str, Any], key: str) -> float:
+    """Read ``reply_timeout`` or ``reply_write_timeout``: seconds above zero, or 30 when unset.
+
+    Unset, ``None`` and ``""`` take the 30-second default. Anything else is read by
+    :func:`~messagefoundry.transports.base.positive_seconds`, so it must be above zero, as
+    ``docs/CONNECTIONS.md`` says, because each bounds a blocked HTTP turn (BACKLOG #3432). The
+    ``float(s.get(key) or 30.0)`` this replaces read ``True`` as one second, took a NaN, and let
+    ``"0"`` through as a zero budget while a numeric ``0`` became the default. The runner reads
+    ``reply_timeout`` for its reply resolver through this function too, from the unresolved spec
+    settings; that agrees with this connector while the ``Http`` factory refuses a non-literal."""
+    value = s.get(key)
+    if value is None or value == "":
+        return 30.0
+    return positive_seconds(value, knob=key, transport="HTTP source")
 
 
 class HttpSource(SourceConnector):
@@ -720,11 +748,11 @@ class HttpSource(SourceConnector):
         # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
         # switch; absent, every path below is byte-identical to the shipped 202 slice (AC-8).
         self.reply_from: str | None = s.get("reply_from") or None
-        self.reply_timeout: float = float(s.get("reply_timeout") or 30.0)
+        self.reply_timeout: float = reply_seconds(s, "reply_timeout")
         self.reply_on_timeout: str = str(s.get("reply_on_timeout") or "504")
         self.reply_content_type: str = str(s.get("reply_content_type") or "passthrough")
         self.reply_on_empty: str = str(s.get("reply_on_empty") or "204")
-        self.reply_write_timeout: float = float(s.get("reply_write_timeout") or 30.0)
+        self.reply_write_timeout: float = reply_seconds(s, "reply_write_timeout")
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         # vault BACKLOG #2606: the per-host cap SHIPS OFF here, unlike on the MLLP, raw-TCP and X12
@@ -1306,8 +1334,9 @@ class HttpSource(SourceConnector):
         defaults to 30 s against a 5 s shutdown grace, so ``stop()`` clamps this to its own
         sub-budget rather than letting one drain outlive the entire teardown by 6x.
         """
-        if self.reply_from and self.reply_write_timeout:
-            return float(self.reply_write_timeout)
+        if self.reply_from:
+            # reply_seconds guarantees seconds above zero, so no falsy fallback is needed.
+            return self.reply_write_timeout
         return _CLIENT_SHUTDOWN_GRACE
 
     async def _write_safely(self, writer: asyncio.StreamWriter, data: bytes) -> None:

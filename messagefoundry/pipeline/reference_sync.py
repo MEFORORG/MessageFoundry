@@ -53,6 +53,7 @@ from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
 from messagefoundry.store.base import DEFAULT_STORE_ACQUIRE_TIMEOUT, acquire_pooled
+from messagefoundry.transports.base import count_setting, float_setting
 from messagefoundry.transports.egress import check_lookup_allowed
 
 __all__ = ["ReferenceSyncRunner", "ReferenceSyncError"]
@@ -110,6 +111,19 @@ def reference_connection_name(name: str) -> str:
     return f"reference:{name}"
 
 
+def reference_acquire_timeout(settings: Mapping[str, Any]) -> float:
+    """Read a DATABASE reference source's ``acquire_timeout`` by the rule in
+    :func:`~messagefoundry.transports.base.float_setting`, or refuse it (BACKLOG #3432).
+
+    One reader for the sync and for ``build_check_registry``, so an ``env()`` value the sync would
+    refuse fails ``messagefoundry check`` too. ``DatabaseRef`` reads a literal the same way."""
+    return float_setting(
+        settings.get("acquire_timeout", DEFAULT_STORE_ACQUIRE_TIMEOUT),
+        knob="acquire_timeout",
+        transport="DATABASE reference source",
+    )
+
+
 def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None = None) -> str:
     """Build a DATABASE reference source's DSN, refusing weakened TLS under the AMBIENT hop posture.
 
@@ -163,19 +177,22 @@ async def _load_database_source(
         dsn = database_source_dsn(
             settings, connection=None if name is None else reference_connection_name(name)
         )
-    pool = await _make_pool(
-        dsn,
-        int(settings.get("pool_max", 5)),
-        autocommit=True,
-        login_timeout=_login_timeout(settings, "DATABASE reference source", dialect="sqlserver"),
-    )
     # BACKLOG #1052: bound the borrow. This pool is throwaway (closed in the finally below), but the
     # acquire was unbounded, so an unresponsive server could hold the reference-sync runner's pass
     # open indefinitely — and the runner is a single sequential loop over every declared set, so one
     # wedged source would stall the sync of all the others. A StoreAcquireTimeout is an Exception, so
     # the runner's existing per-set source-failure handler catches it, keeps the last-good snapshot
     # and alerts, exactly as it does for any other source error.
-    acquire_timeout = float(settings.get("acquire_timeout", DEFAULT_STORE_ACQUIRE_TIMEOUT))
+    # Read before the pool is made, so a refused value leaves no pool unclosed (BACKLOG #3432).
+    acquire_timeout = reference_acquire_timeout(settings)
+    pool = await _make_pool(
+        dsn,
+        count_setting(
+            settings.get("pool_max", 5), knob="pool_max", transport="DATABASE reference source"
+        ),
+        autocommit=True,
+        login_timeout=_login_timeout(settings, "DATABASE reference source", dialect="sqlserver"),
+    )
     try:
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")
         try:

@@ -586,8 +586,9 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rule item 9. Two unreadable accounts are held while a bad search base makes ten others miss.
-    The breaker judges the ten (the held two are out of its count) and aborts. Both rows and both
-    alerts are written, each under its own type, and nothing is revoked."""
+    The breaker judges all twelve, the held two among them (ADR 0195 amendment 2026-10-11), and ten
+    of twelve still trips it. Both rows and both alerts are written, each under its own type, and
+    nothing is revoked."""
     names = ["u1", "u2"] + [f"gone{i}" for i in range(10)]
     async with _signed_in_estate(monkeypatch, names) as (directory, service, store, tokens):
         directory.uac.update({"u1": ABSENT, "u2": ABSENT})
@@ -600,8 +601,10 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
         assert [e[0] for e in sink.events] == ["ad_reconcile_aborted", "ad_reconcile_held"]
         assert sink.events[0][2]["probed"] == 12
         aborted = json.loads((await _audited(store, "auth.ad_reconcile_aborted"))[0]["detail"])
-        assert aborted["probed"] == 12  # the row keeps the probed count's meaning ...
-        assert aborted["judged"] == 10  # ... and the breaker judged the ten it could revoke
+        assert aborted["probed"] == 12 and "judged" not in aborted  # the held two are in it
+        assert "of the 12 signed-in directory principals it probed (2 of them held)" in (
+            service.directory_reconcile_alert or ""
+        )
         assert len(await _audited(store, "auth.ad_reconcile_held")) == 2
         assert await _alive(service, tokens) == set(names)
         assert service.directory_reconcile_hold is not None

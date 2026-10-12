@@ -653,6 +653,14 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
 > 2026-09-28 amendment states the deployment precondition and cites the pages read.
 
+> **Corrected 2026-10-10 (BACKLOG #1173).** The rotation precondition above still stands, and the
+> engine still counts no Transit encrypts. What changed is the record. Since BACKLOG #2337, an
+> operator attests to the precondition with `messagefoundry store attest-transit-bound`, and
+> `Engine.start` reads that record through `enforce_transit_bound_attestation`. So "documented"
+> now undersells it. The R3 ruling above judged the precondition before that record existed;
+> whether the record meets R3 is a scorecard call. ADR 0138's 2026-10-07 amendment says what the
+> check does under each enforcement level, and what it does not change.
+
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
 
@@ -771,8 +779,9 @@ above.
    2026-09-28) says it seeds and reseeds itself automatically from the operating system's trusted
    sources, and that reseeding can fail if those sources fail. The pages for 3.5 and 4.0 were not
    checked. The engine does not manage that state and
-   adds none of its own. Node's documentation was not read for this amendment, so it claims nothing
-   about the generator behind `randomBytes`. `cspNonce.ts` keeps no state of its own around it.
+   adds none of its own. The 2026-10-10 amendment below says what Node's documentation states about
+   blocking and failure in `randomBytes`. That page does not say whether Node's generator holds state
+   or how it reseeds. `cspNonce.ts` keeps no state of its own around it.
 3. **No generator state is copied by a fork.** The engine starts its children as fresh interpreters:
    engine shards through `asyncio.create_subprocess_exec` in `pipeline/supervisor.py` `_default_spawn`,
    and the sandbox worker through `subprocess.Popen` in `pipeline/sandbox.py`. Nothing in
@@ -783,14 +792,24 @@ above.
    when the sandbox is off.
 4. **Volume wears out a key, not the generator.** The one value whose safety falls with volume is the
    96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
-   counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path does
-   not. Its bound is a documented operator precondition, weaker than the counted one, recorded in
-   [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
-   2026-09-28 amendment.
+   counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path
+   counts nothing. In its place, `Engine.start` calls `enforce_transit_bound_attestation` in
+   `store/transit_attestation.py`, which checks for a recorded operator attestation naming the
+   configured Transit data key (BACKLOG #2337). Without one, the engine refuses to start under
+   `[security].enforcement = enforce` and only logs a warning under `warn`. An attestation is still
+   weaker than the counted bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+   2026-10-07 amendment records how that gate works and the forgery it does not catch. Its
+   2026-09-28 amendment states the rotation precondition the operator attests to.
 
-**What this statement does not cover.** How fast the operating system's generator runs, and whether it
-ever blocks, are properties of Windows and Linux. The platform pages for `os.urandom` and Node's
-`randomBytes` were not read for this amendment, so it restates neither.
+**What this statement does not cover.** How fast the operating system's generator runs is a property
+of Windows and Linux. The 2026-10-10 amendment below says what the platform pages state about
+blocking and failure, and where they say nothing.
+
+> **Corrected 2026-10-10 (BACKLOG #1173).** Point 2 and the paragraph above each said a page had
+> not been read for this amendment. They now point to the 2026-10-10 amendment, which reads them.
+> Point 4 described the Transit bound as a precondition the operator documents. It now names the
+> shipped attestation check. That check counts no invocations, and the
+> bound stays weaker than the counted one.
 
 **What stops a weak generator coming back, and where it stops short.** Bandit B311 now runs in both the
 CI scan and the pre-commit hook, with each seeded non-security `random` use marked per line. B311 is a
@@ -799,3 +818,63 @@ fixed list of call names, not an import check. It flags at least `random.random`
 the TypeScript and JavaScript roots, `scripts/security/crypto_inventory_check.py`
 `check_non_python_randomness` fails on `Math.random`. The extension's own
 `ide/src/test/suite/extension-hardening.test.ts` checks the same.
+
+## Amendment 2026-10-10 — what the Node and operating-system generators do under demand (ASVS 11.5.2, BACKLOG #1173)
+
+The 2026-09-28 amendment above left two kinds of generator unread. One is Node's, behind the IDE
+extension's `randomBytes`. The others are the operating-system generators behind Python's
+`os.urandom` and `secrets`. This amendment reads their documentation and claims no verdict. Every
+source below was read on 2026-10-10.
+
+**The IDE extension stays in scope.** `ide/src/cspNonce.ts` `nonce` calls `randomBytes(18)` in its
+synchronous form, from extension-host code. Every webview the extension builds takes its CSP nonce
+from it, at least for every webview that runs a script. The 2026-09-28 library table lists only
+those nonces. `ide/src/webviewMessaging.ts`
+`openChannel` also draws its channel token from `nonce`.
+
+**What each generator's documentation says about blocking and failure.**
+
+| Generator | Who reaches it | Can it block? | Can it fail? |
+|---|---|---|---|
+| Node `crypto.randomBytes` | `cspNonce.ts` `nonce`, for CSP nonces and channel tokens | Yes, until enough entropy exists. The page names only the period just after boot for a long wait. | Yes. The synchronous form throws "if there is a problem generating the bytes". |
+| Python `os.urandom` on Linux | every row of the 2026-09-28 amendment's first table, through `secrets` or directly | Yes, until the kernel's urandom pool is initialized. Python calls `getrandom()` in blocking mode. | The page names `NotImplementedError` when `/dev/urandom` is missing on the fallback path. |
+| Linux `getrandom(2)`, default flags | Python, as above | Before the urandom source is initialized. A read over 256 bytes also blocks until its bytes are generated. | After that, reads of up to 256 bytes "will always return as many bytes as requested". Larger reads may return fewer bytes or fail with `EINTR`. |
+| Python `os.urandom` on Windows | every row of the 2026-09-28 amendment's first table | The page does not say. | The page does not say. |
+| Windows `BCryptGenRandom` | Python, as above | The page does not say. | Yes. It returns a status code, and the listed codes are "not limited to" an invalid handle or parameter. |
+| Windows `ProcessPrng` | No page read here shows Python or Node calling it. That does not rule out the extension host's crypto library. | The page does not say. | No. The page says it "Always returns TRUE". |
+
+**Where each fact comes from.**
+
+- Node: <https://nodejs.org/docs/v26.11.1/api/crypto.html#cryptorandombytessize-callback>. The
+  extension runs on the Node that VS Code ships inside Electron. Neither that Node's version nor the
+  crypto library under its `randomBytes` was checked against this page.
+- Python `os.urandom`: <https://docs.python.org/3.14/library/os.html#os.urandom> (3.14.8). The `/3/`
+  page (3.15.0) reads the same for this entry. It names `BCryptGenRandom` as the Windows source.
+- Python `secrets`: <https://docs.python.org/3.14/library/secrets.html> (3.14.8). It draws from "the most secure
+  source of randomness that your operating system provides". The 2026-09-28 amendment ties that
+  source to `os.urandom`.
+- CPython source, 3.14 branch:
+  <https://github.com/python/cpython/blob/3.14/Python/bootstrap_hash.c>. On Windows it calls
+  `BCryptGenRandom` with a `NULL` handle and `BCRYPT_USE_SYSTEM_PREFERRED_RNG`, and raises on a
+  failed status. On Linux it loops until the full size is read, and retries `getrandom()` on
+  `EINTR`.
+- Linux: the `getrandom(2)` source in the man-pages project,
+  <https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/plain/man/man2/getrandom.2>, and its
+  man-pages 6.19 rendering at <https://man.archlinux.org/man/getrandom.2.en>. The usual copy at
+  <https://man7.org/linux/man-pages/man2/getrandom.2.html> could not be reached on 2026-10-10.
+- Windows: <https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptgenrandom>
+  and <https://learn.microsoft.com/en-us/windows/win32/seccng/processprng>.
+
+**What this means under demand, and where it stops.**
+
+1. **No page read here names the rate of requests as a cause of blocking or failure.** The size of
+   one request matters on Linux, as the table shows, and point 2 covers it. Node's page also warns
+   that the asynchronous form loads libuv's threadpool. `cspNonce.ts` uses the synchronous form.
+2. **The Linux guarantee covers small reads, and the draws in that table are small.** Each
+   fixed-size draw in the 2026-09-28 amendment's first table is 64 bytes or fewer. That table is
+   not a full census. The generated policy password draws bytes in step with the policy's minimum
+   length. It draws more than 256 bytes only when that minimum is above 341 characters. CPython's
+   loop still completes a larger read.
+3. **A reported failure raises.** Node's synchronous form throws, and `nonce` does not catch it.
+   CPython raises when `BCryptGenRandom` reports a failure. No source read here says whether a
+   generator can return weak bytes without reporting a failure, or how often a failure happens.

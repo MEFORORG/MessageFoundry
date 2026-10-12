@@ -9,13 +9,24 @@ then measures **drain time** after offered load stops. The :class:`~messagefound
 load engine's event loop is never blocked. The harness reaches the engine only through this API; it
 never touches the store.
 
-**A signed-in read is not free, and the poller's own reads are in the numbers.** A poller that
-signs in (``RIG_SESSION``) makes the engine do two store commits for every request: it stamps the
-session's last use, and it audits the authorization grant. A sample is three requests, so SIX
-commits and three audit rows. Measured 2026-10-02 on an idle engine on SQLite: 20 samples moved
-``committed_txns`` by 120, and the same 20 with sign-in off moved it by 0. So ``committed_txns``,
-``txn_per_message_measured`` and DB growth now carry that much per sample, and a figure banked
-before rigs signed in is not comparable with one taken after until that is taken off.
+**A signed-in read is not free, and the poller's own reads are in the numbers.** For every
+signed-in request the engine stamps the session's last use, one commit. With
+``[security].audit_all_authorization_decisions`` on, the shipped default, it also audits the
+grant: a second commit and an audit row. A sample is three requests to EACH shard, so its cost
+scales with the shard count. Measured 2026-10-10 on one idle SQLite engine: six commits a sample
+with the audit on, three with it off.
+
+So this poller measures its own cost rather than assuming one (vault BACKLOG #2794).
+:meth:`EnginePoller.calibrate` takes samples back to back at idle, before load. The cheapest
+pair's ``committed_txns`` delta is the cost of one sample on this engine, backend, shard count and
+audit setting. Every sample also carries ``poller_requests``: the requests each shard handled up to
+its ``/stats`` read. A renewal's sign-in is counted apart, as ``poller_renewals``, because
+calibration never measured one. The load report takes the poller's
+share off ``txn/msg`` and keeps the raw figure beside it.
+
+Subtraction fixes the COUNT, not the perturbation. Those commits take the same write lock as the
+pipeline's, so the pipeline still waited on them. Only a slower poll, or unaudited reads, shrinks
+that.
 
 **Cluster-wide aggregation.** A ``messagefoundry supervise`` cluster spreads inbounds across several
 shard subprocesses, each with its own API. The poller takes a **list** of engine base-URLs (the
@@ -32,10 +43,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
+
+import httpx
 
 from harness.load import rigadmin
 from harness.load.metrics import Counters
@@ -46,6 +59,29 @@ from messagefoundry.apiclient import ApiError, EngineClient
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 _T = TypeVar("_T")
+
+
+#: Samples the idle calibration takes, so it has this many minus one back-to-back pairs.
+_CALIBRATION_SAMPLES = 4
+
+
+def _engine_handled(exc: ApiError) -> bool:
+    """Whether a failed call reached the engine, so it is counted as a poller request.
+
+    The rule is "the engine got the request", because what a FAILED request committed is not
+    knowable from here: anywhere from none (a 503 before the sign-in gate) to three (a 403 that
+    stamps the session, then audits the denial). Each counted one is charged at the read rate, so
+    the poller-removed figure is approximate by that much on a run with failed requests.
+
+    - Any status means the engine replied.
+    - No status and nothing chained means the engine replied and the client could not decode the
+      reply ("invalid response from engine"); the client never chains that error (BACKLOG #2085).
+    - A chained connect failure means the request never arrived. Any other transport failure
+      came after the request was sent."""
+    if exc.status is not None:
+        return True
+    cause = exc.__cause__
+    return cause is None or not isinstance(cause, (httpx.ConnectError, httpx.ConnectTimeout))
 
 
 def _first_not_none[T](values: Iterable[_T | None]) -> _T | None:
@@ -160,10 +196,35 @@ class EngineSample:
     #: across-shard read, and it is the one :meth:`PoolStats.from_sample` uses.
     pool_wait_max_max_ms: float | None = None
     pool_shards_reporting: int = 0  # how many shards reported a pool at all (0 ⇒ SQLite / no pool)
+    # vault BACKLOG #2794: the poller's OWN traffic, cumulative like committed_txns, so a run's share
+    # is last - first. Each shard's count is taken at its /stats read, the same instant its
+    # committed_txns is, so the two deltas cover the same requests. Summed across shards.
+    poller_requests: int = 0  # requests the engine answered, renewal probes included
+    poller_renewals: int = 0  # sessions the poller signed in again after the engine ended one
 
     @property
     def backlog(self) -> int:
         return self.pending + self.inflight
+
+
+@dataclass(frozen=True)
+class PollerCalibration:
+    """What one poller sample costs the engine in commits, measured at idle (vault BACKLOG #2794).
+
+    Samples back to back, before any load: the cheapest pair's ``committed_txns`` delta between
+    their ``/stats`` reads is the cost of the ``requests_per_sample`` requests between them. That
+    is three per shard,
+    so the figure belongs to this engine, backend, shard count and grant-audit setting, and is never
+    carried to another run.
+
+    ``commits_per_sample`` is ``None`` when the calibration could not be taken, and ``note`` says
+    why. A measured 0 is real only on a counter that moves at all: on PostgreSQL ``committed_txns``
+    is unwired (vault BACKLOG #2643), so the report also refuses a 0 there rather than trusting it.
+    """
+
+    commits_per_sample: int | None
+    requests_per_sample: int = 0
+    note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +268,7 @@ class _ShardSample:
     pool_wait_max_ms: float | None = None
     #: The engine's OWN configured pool maximum (``status.pool.max_size``) — see EngineSample.pool_max_size.
     pool_max_size: int | None = None
+    poller_requests: int = 0  # this shard's poller request count at its /stats read (#2794)
 
 
 #: The pool ``acquire_wait`` MEAN measured on the STEP-2 rig at the ~16 msg/s broadcast plateau, where the
@@ -628,10 +690,17 @@ class EnginePoller:
         self._cacert = cacert
         self._clients: list[EngineClient] = []
         self._samples: list[EngineSample] = []
+        # vault BACKLOG #2794: requests each shard answered, by URL index, and renewals in all.
+        self._requests = [0] * len(deduped)
+        self._renewals = 0
+        self._calibration: PollerCalibration | None = None
 
     @property
     def client(self) -> EngineClient | None:
-        """The PRIMARY shard's client (set after :meth:`open`) — for one-off preflight reads."""
+        """The PRIMARY shard's client (set after :meth:`open`) — for one-off preflight reads.
+
+        A call through it is not in ``poller_requests``, so the load report would leave its commits
+        in. During a load run, read through a poller method such as :meth:`served_ports`."""
         return self._clients[0] if self._clients else None
 
     @property
@@ -645,6 +714,12 @@ class EnginePoller:
     @property
     def final(self) -> EngineSample | None:
         return self._samples[-1] if self._samples else None
+
+    @property
+    def calibration(self) -> PollerCalibration | None:
+        """The idle measurement of this poller's own cost, or ``None`` if :meth:`calibrate` never
+        ran. Only the load runner calibrates; every other bench leaves it ``None``."""
+        return self._calibration
 
     async def open(self) -> None:
         await asyncio.get_running_loop().run_in_executor(None, self._open_sync)
@@ -676,6 +751,76 @@ class EnginePoller:
             # once. The action id is spelled out: the harness does not import engine internals.
             client.set_token(rigadmin.sign_in(url, cacert=cacert))
             client.reauth(rigadmin.rig_admin().password, purpose="config_reload")
+
+    async def calibrate(self) -> PollerCalibration:
+        """Measure what one sample costs the engine, at idle and before load (vault BACKLOG #2794).
+
+        Call it before the baseline sample, so the calibration's own requests fall outside the
+        run. None of its samples joins :attr:`samples`."""
+        return await asyncio.get_running_loop().run_in_executor(None, self._calibrate_sync)
+
+    def _calibrate_sync(self) -> PollerCalibration:
+        self._calibration = self._measure_poller_cost()
+        return self._calibration
+
+    def _measure_poller_cost(self) -> PollerCalibration:
+        # Several back-to-back pairs, keeping the cheapest. The engine's own background work at
+        # idle (a delivery worker connecting, startup housekeeping) can only ADD commits to a pair,
+        # never take any away, so the minimum is the closest bound on the poller alone. Several
+        # pairs also mean one sample that fails does not cost the run its figure.
+        samples: list[EngineSample | None] = []
+        for _ in range(_CALIBRATION_SAMPLES):
+            samples.append(self._sample_sync())
+            if samples[-2:] == [None, None]:
+                break  # an engine that is down: leave it to the preflight to say so, quickly
+        pairs = [
+            (
+                later.committed_txns - earlier.committed_txns,
+                later.poller_requests - earlier.poller_requests,
+            )
+            for earlier, later in zip(samples, samples[1:], strict=False)
+            if earlier is not None and later is not None
+        ]
+        if not pairs:
+            return PollerCalibration(None, note="no two calibration samples in a row were answered")
+        # A counter that went backwards is an engine that restarted between the reads.
+        usable = [
+            (commits, requests) for commits, requests in pairs if commits >= 0 and requests > 0
+        ]
+        if not usable:
+            commits, requests = pairs[0]
+            return PollerCalibration(
+                None, requests, f"calibration read {commits} commits over {requests} requests"
+            )
+        commits, requests = min(usable, key=lambda pair: pair[0] / pair[1])
+        return PollerCalibration(commits, requests)
+
+    def served_ports(self) -> set[int]:
+        """The inbound ports the PRIMARY shard serves, or an empty set if it did not answer.
+
+        A run's one read outside the samples. It goes through here so the request is counted:
+        it falls between the baseline and the final ``/stats`` read, so its commits do too."""
+        if not self._clients:
+            return set()
+        try:
+            rows = self._counted(0, self._clients[0].connections)
+        except ApiError:
+            return set()
+        return {r.port for r in rows if r.port}
+
+    def _counted(self, index: int, call: Callable[[], _T]) -> _T:
+        """Make ``call`` against shard ``index``, and count it if it reached the engine.
+
+        The report charges each counted request at the calibrated rate, so a request that never
+        arrived must not count. See :func:`_engine_handled` for what a failed one counts as."""
+        try:
+            result = call()
+        except ApiError as exc:
+            if _engine_handled(exc):
+                self._requests[index] += 1
+            raise
+        self._requests[index] += 1
+        return result
 
     async def sample_once(self) -> EngineSample | None:
         sample = await asyncio.get_running_loop().run_in_executor(None, self._sample_sync)
@@ -768,10 +913,10 @@ class EnginePoller:
         if not self._clients:
             return None
         shard_samples: list[_ShardSample] = []
-        for client, url in zip(self._clients, self._urls, strict=True):
-            shard = self._sample_shard(client)
+        for index, (client, url) in enumerate(zip(self._clients, self._urls, strict=True)):
+            shard = self._sample_shard(index, client)
             if shard is None:
-                self._renew_if_signed_out(client, url)
+                self._renew_if_signed_out(index, client, url)
                 return None  # one shard unreachable → skip the aggregate (keep polling)
             shard_samples.append(shard)
         # Journal mode + synchronous are reported per shard; they share a backend in practice, so take
@@ -832,9 +977,11 @@ class EnginePoller:
             pool_wait_p99_max_ms=_max_not_none(s.pool_wait_p99_ms for s in shard_samples),
             pool_wait_max_max_ms=_max_not_none(s.pool_wait_max_ms for s in shard_samples),
             pool_shards_reporting=sum(1 for s in shard_samples if s.pool_size is not None),
+            poller_requests=sum(s.poller_requests for s in shard_samples),  # #2794
+            poller_renewals=self._renewals,  # #2794
         )
 
-    def _renew_if_signed_out(self, client: EngineClient, url: str) -> None:
+    def _renew_if_signed_out(self, index: int, client: EngineClient, url: str) -> None:
         """After a failed sample, sign a rig poller in again if the engine has ended its session.
 
         A session has an absolute lifetime, and a soak can outlast it. Without this the poller would
@@ -843,7 +990,7 @@ class EnginePoller:
         if not isinstance(self._token, rigadmin.RigSession):
             return
         try:
-            client.me()
+            self._counted(index, client.me)
         except ApiError as exc:
             if exc.status != 401:
                 return
@@ -853,13 +1000,19 @@ class EnginePoller:
             adopt_rig_session(client, url, self._cacert or self._cacert_for(url))
         except (ApiError, rigadmin.RigAdminError):
             return  # still not reachable, or refused: the next failed sample tries again
+        # A sign-in commits more than a read does, and calibration never measured one, so it is
+        # counted apart rather than charged at the read rate (vault BACKLOG #2794).
+        self._renewals += 1
 
-    @staticmethod
-    def _sample_shard(client: EngineClient) -> _ShardSample | None:
+    def _sample_shard(self, index: int, client: EngineClient) -> _ShardSample | None:
         try:
-            stats = client.stats()
-            conns = client.connections()
-            status = client.status()
+            stats = self._counted(index, client.stats)
+            # Taken here, at the /stats read, so it counts the same requests the committed_txns in
+            # that reply does: the engine commits a request's session stamp and grant audit before
+            # its handler reads the counter.
+            requests_at_stats = self._requests[index]
+            conns = self._counted(index, client.connections)
+            status = self._counted(index, client.status)
         except ApiError:
             return None  # transient unreachability — caller skips the whole sample
         ob = stats.outbox_by_status
@@ -909,4 +1062,5 @@ class EnginePoller:
             # The two PoolWaitInfo fields the poller never read (2026-07-13) — see the field comments.
             pool_acquire_wait_count=int(_pool_wait_attr(status, "count") or 0),
             pool_acquire_wait_mean_ms=float(_pool_wait_attr(status, "mean_ms") or 0.0),
+            poller_requests=requests_at_stats,
         )

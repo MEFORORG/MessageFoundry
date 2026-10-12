@@ -55,6 +55,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    cell_tag_failure_forwarder,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
@@ -894,8 +895,7 @@ class Engine:
         # DR decision is never a cluster-wide config bump.
         try:
             if rr is not None:
-                await self.preflight_settings()
-                await self.preflight_registry(rr.registry)
+                await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
                 await rr.reload()
@@ -932,6 +932,44 @@ class Engine:
                         "failed too; POST /config/reload closes them"
                     )
             raise
+
+    async def _dr_preflight(self, registry: Registry) -> None:
+        """The settings and registry preflights a DR activation runs before its reload, bounded by
+        ``[dr].takeover_timeout_seconds`` (vault BACKLOG #3094, item 3).
+
+        They read trust-anchor files, which may sit on a share at the failed site, and they run
+        under the coordinator's lock, so with no bound a share that stops answering held every
+        later activate and release too. A timeout cancels them and raises ``TimeoutError``, which
+        the caller rolls back like any refusal. The reload that follows is not bounded here.
+        Cancelling it partway rolls back a takeover the VIP has already moved for, and the runner
+        gives each lane's first build its own isolation (ADR 0048, the vault BACKLOG #3263
+        amendment).
+
+        The cancel frees the lock, not the read. A read blocked on a share that does not answer
+        sits in a default-executor thread, which a cancel cannot stop, so that thread may stay
+        stuck. Each retry against the same dead share can strand one more, and enough of them
+        could use up the default executor.
+
+        It tells the coordinator while it runs (:meth:`DrCoordinator.note_profile_preflight`), so
+        an abort here says the preflight stopped the activation and makes no claim that a listener
+        was bound (vault BACKLOG #3094)."""
+        coord = self._dr_coordinator
+        if coord is not None:
+            coord.note_profile_preflight(True)
+        timeout = self._dr_settings.takeover_timeout_seconds
+        bound = asyncio.timeout(timeout)
+        try:
+            async with bound:
+                await self.preflight_settings()
+                await self.preflight_registry(registry)
+        except TimeoutError as exc:
+            if not bound.expired():
+                raise  # a TimeoutError from inside the preflight is its own error
+            raise TimeoutError(
+                f"the trust-anchor preflight did not answer within {timeout:g}s"
+            ) from exc
+        if coord is not None:
+            coord.note_profile_preflight(False)
 
     async def _dr_config_drift(self) -> dict[str, object]:
         """The provenance fields a DR activation records: the activated graph's digest, and whether
@@ -1506,6 +1544,11 @@ class Engine:
             return
         sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
         setter(store_cipher_refusal_forwarder(sink, asyncio.get_running_loop()))
+        # BACKLOG #2593: a queue row whose payload fails its own tag is dead-lettered by the store,
+        # which reaches this sink the same way, through the cipher.
+        tag_setter = getattr(cipher, "set_tag_failure_hook", None)
+        if callable(tag_setter):
+            tag_setter(cell_tag_failure_forwarder(sink, asyncio.get_running_loop()))
         self._cipher_refusal_armed = cipher
 
     def _disarm_cipher_refusal_alert(self) -> None:
@@ -1514,6 +1557,9 @@ class Engine:
         setter = getattr(cipher, "set_refusal_hook", None)
         if callable(setter):
             setter(None)
+        tag_setter = getattr(cipher, "set_tag_failure_hook", None)
+        if callable(tag_setter):
+            tag_setter(None)
 
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed

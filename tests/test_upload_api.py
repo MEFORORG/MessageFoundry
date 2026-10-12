@@ -302,8 +302,11 @@ async def test_upload_rejects_disallowed_extension(engine: Engine, tmp_path: Pat
     rej = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject"]
     assert len(rej) == 1
     detail = rej[0]["detail"] or ""
-    assert "evil.png" in detail  # sanitized filename + reason (metadata only)
-    assert "MSH" not in detail and "MRN" not in detail  # never any body content
+    # Vault BACKLOG #2619: the reason only. The name is operator-chosen and the audit is plaintext.
+    assert json.loads(detail) == {
+        "reason": "has a disallowed extension; permitted: .hl7, .hl7v2, .txt, .xml"
+    }
+    assert "evil" not in detail
 
 
 async def test_upload_rejects_content_extension_mismatch(engine: Engine, tmp_path: Path) -> None:
@@ -379,8 +382,10 @@ async def test_upload_rejects_binary_container_415(engine: Engine, tmp_path: Pat
     rej = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject"]
     assert len(rej) == len(containers)
     joined = " ".join(str(a["detail"] or "") for a in rej)
-    assert "shot.txt" in joined and "doc.txt" in joined and "bundle.hl7" in joined  # names recorded
-    # Never any body bytes in the audit (only the sanitized filename + a MIME-family reason).
+    # Vault BACKLOG #2619: no file name is recorded, only the reason.
+    assert {k for a in rej for k in json.loads(str(a["detail"]))} == {"reason"}
+    assert "shot" not in joined and "doc.txt" not in joined and "bundle" not in joined
+    # Never any body bytes in the audit (only a MIME-family reason).
     assert "JFIF" not in joined and "endobj" not in joined and "Content_Types" not in joined
 
 
@@ -452,7 +457,8 @@ async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_pa
     rej = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject_quota"]
     assert len(rej) == 1
     detail = rej[0]["detail"] or ""
-    assert "b.hl7" in detail  # sanitized filename + reason (metadata only)
+    assert set(json.loads(detail)) == {"reason"}  # no file name (vault BACKLOG #2619)
+    assert "b.hl7" not in detail
     assert "MSH" not in detail and "MRN" not in detail  # never any body content
 
 
@@ -499,6 +505,43 @@ async def test_delete_confirm_audits(engine: Engine, tmp_path: Path) -> None:
         # gone from the listing
         assert (await c.get("/uploads", headers=h)).json()["files"] == []
     assert any(a["action"] == "upload.delete" for a in await engine.store.list_audit())
+
+
+async def test_no_upload_audit_row_carries_the_file_name(engine: Engine, tmp_path: Path) -> None:
+    """Vault BACKLOG #2619. ``audit_log.detail`` is plaintext and kept, so a name chosen to carry a
+    patient identifier must reach no upload row: not create, delete, or either reject. The listing
+    is the control: it still shows the name, so the name did reach the engine."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    name = "MRN_SYNTH_0001.hl7"
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        up = await c.post("/uploads", files={"file": (name, ADT, "text/plain")}, headers=h)
+        assert up.status_code == 200, up.text
+        fid = up.json()["file_id"]
+        listed = (await c.get("/uploads", headers=h)).json()["files"]
+        assert [f["filename"] for f in listed] == [name]
+        mismatch = await c.post(
+            "/uploads", files={"file": (name, b"plain text, not HL7\n", "text/plain")}, headers=h
+        )
+        assert (
+            mismatch.status_code == 400 and "MRN_SYNTH_0001" in mismatch.text
+        )  # told to the uploader
+        assert (await c.delete(f"/uploads/{fid}", headers=h)).status_code == 200
+    rows = [a for a in await engine.store.list_audit() if str(a["action"]).startswith("upload.")]
+    assert {a["action"] for a in rows} >= {"upload.create", "upload.reject", "upload.delete"}
+    for row in rows:
+        assert "MRN_SYNTH_0001" not in str(row["detail"] or ""), row
+    by_action = {a["action"]: json.loads(str(a["detail"])) for a in rows}
+    assert set(by_action["upload.create"]) == {"file_id", "size", "message_count"}
+    assert by_action["upload.reject"] == {
+        "reason": "is not HL7 (no MSH/FHS/BHS header) despite its extension"
+    }
+    assert set(by_action["upload.delete"]) == {"file_id", "size"}
 
 
 async def test_resend_injects_via_enqueue_ingress(engine: Engine, tmp_path: Path) -> None:
@@ -1309,5 +1352,6 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
     assert len(rows) == 1, rows
     assert rows[0]["actor"] == "root"
     detail = json.loads(str(rows[0]["detail"]))
-    assert detail["file_id"] == fid and detail["filename"] == ""
+    assert detail["file_id"] == fid
+    assert set(detail) == {"file_id", "size"}  # no file name (vault BACKLOG #2619)
     assert "acme" not in str(rows[0]["detail"])

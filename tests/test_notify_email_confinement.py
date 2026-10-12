@@ -101,7 +101,9 @@ async def _flag_after_login(service: AuthService, username: str, password: str =
 # --- the three birth paths -------------------------------------------------------------------------
 # There were four. The fourth, the first-run bootstrap administrator, was retired by ADR 0183
 # Amendment A, Wave 2 (BACKLOG #1136), and its test went with it. The first administrator of an
-# install now comes from `provision-admin`, whose no-address arm is pinned below.
+# install now comes from `provision-admin`. That command requires `--email` since BACKLOG #1138,
+# so its no-address arm is gone; the service method below still accepts none, and an
+# Administrator with no address is still confined, which is what this pins.
 
 
 async def test_a_local_account_created_without_an_address_is_confined_and_one_with_is_not() -> None:
@@ -117,7 +119,7 @@ async def test_a_local_account_created_without_an_address_is_confined_and_one_wi
         await store.close()
 
 
-async def test_provision_admin_confines_only_when_email_was_left_out() -> None:
+async def test_an_administrator_provisioned_without_an_address_is_confined() -> None:
     for notify_email, expected in ((ADDRESS, False), (None, True)):
         store = await MessageStore.open(":memory:")
         try:

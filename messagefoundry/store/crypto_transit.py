@@ -48,7 +48,7 @@ import base64
 import contextlib
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.store.crypto import (
@@ -199,6 +199,16 @@ class TransitCipher(_UnmarkedPolicy):
     def audit_mac_keyring(self) -> Mapping[str, bytes]:
         """No in-heap audit keys. Transit versions its own audit key, so the engine sees one range."""
         return {}
+
+    def authz_root(self) -> None:
+        """No in-heap DEK, so no in-process authorization root (BACKLOG #2592). Row seals under this
+        provider are Transit's own HMAC, a separate piece of work; until it lands this cipher writes
+        and checks no row seals."""
+        return None
+
+    def retired_authz_roots(self) -> Sequence[bytes]:
+        """No in-heap DEK, so no retired roots either (BACKLOG #2592)."""
+        return ()
 
     def audit_hmac(self, data: bytes, *, key_version: int | None = None) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
