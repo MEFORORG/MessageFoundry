@@ -731,6 +731,15 @@ class FileSource(SourceConnector):
             knob="max_decompressed_bytes",
             transport="file source",
         )
+        if self.decompress is not None and self.max_decompressed_bytes is None:
+            # Turning the bomb guard off is documented, so it is allowed, but it is said once at build
+            # so it is never silent (BACKLOG #1129). Off without decompress changes nothing, so that
+            # case says nothing. The line names the setting, never its value.
+            logger.warning(
+                "file source %s: max_decompressed_bytes is off, so a compressed drop inflates with "
+                "no byte ceiling; set a positive value to bound it",
+                config.name or self.directory,
+            )
         # Caps the gzip members in one drop (BACKLOG #1129). Only consulted when `decompress` is set,
         # but read at build either way, like `max_decompressed_bytes`, so a typo fails early.
         self.max_decompressed_members: int = _member_cap(s.get("max_decompressed_members"))

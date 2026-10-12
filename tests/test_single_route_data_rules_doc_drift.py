@@ -2,14 +2,16 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1151 -- the single-route data rules, executed and documented.
 
-``docs/SECURITY.md`` carries a blockquote headed *Single-route data rules*. It states at least five
-data rules that each sit on one route, or one family of routes, and that the route rows themselves
-only point to. This file keeps that blockquote true in the same two halves as
+``docs/SECURITY.md`` carries a blockquote headed *Single-route data rules*. It states at least
+eleven data rules that each sit on one route, or one family of routes, and that the route rows
+themselves only point to. This file keeps that blockquote true in the same two halves as
 ``tests/test_monitoring_scope_doc_drift.py``, on the same seeded estate (inbounds ``IB_A`` and
 ``IB_B``, shared outbound ``OB_X``):
 
 * one measurement per rule EXECUTES the route against a channel-scoped operator, with an
-  all-channels operator in the same run as the positive control;
+  all-channels operator in the same run as the positive control. The security-event feed has no
+  channel axis: it is keyed on the caller's own account, and its control is the raw audit log. The
+  approval release narrows its REQUESTER's scope, and its control is a release that runs;
 * :func:`test_security_doc_states_each_single_route_rule` reads the blockquote and requires each
   rule's routes and key facts in that rule's own bullet, every bullet to belong to a rule, and each
   route's row in the route map to point at the blockquote.
@@ -26,6 +28,7 @@ of the bullet. The console paragraph of the blockquote is read from the code and
 from __future__ import annotations
 
 import functools
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,20 +38,34 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_CONNECTION_PURGE,
+    STEP_UP_ACTION_MESSAGE_EXPORT,
+    AuthService,
+)
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from tests._doc_blockquote import blockquote_lines, plant_in_blockquote, route_tokens, unwrap
+from tests.test_approvals import ON, _add, _token
+from tests.test_approvals import _client as _approvals_client
 
 # The shared fixture and helpers, imported rather than copied, as
 # tests/test_route_channel_scope_classification.py does.
 from tests.test_monitoring_scope_doc_drift import (  # noqa: F401
+    PW,
     _login,
     _operator,
     engine,
 )
-from tests.test_route_channel_scope_classification import ROUTES, SCOPED
+from tests.test_route_channel_scope_classification import (
+    ADMINISTRATOR_ONLY,
+    NOT_CHANNEL_BEARING,
+    ROUTES,
+    SCOPED,
+)
 
 _DOC = Path(__file__).resolve().parent.parent / "docs" / "SECURITY.md"
 
@@ -73,12 +90,35 @@ class _Callers:
     scoped: dict[str, str]
     wide: dict[str, str]
     monkeypatch: pytest.MonkeyPatch
+    service: AuthService
+    scoped_id: str
+    wide_id: str
 
     async def denials(self) -> int:
         rows = await self.engine.store.list_audit(
             action="auth.channel_denied", actor="scoped", limit=500
         )
         return len(rows)
+
+    def prove(self, headers: dict[str, str], action: str) -> None:
+        """Mint the single-use step-up proof an action-bound route spends. These measurements are
+        about scope, so the proof is granted directly, as the classification probe does."""
+        self.service._grant_action_step_up(
+            hash_token(headers["Authorization"].removeprefix("Bearer ")), action
+        )
+
+    def quiesce_outbounds(self) -> None:
+        """Make every outbound read as stopped and drained, the purge precondition. The fixture never
+        starts the engine; the rule under test is the scope check, not the lane state."""
+        rr = self.engine.registry_runner
+        assert rr is not None
+        self.monkeypatch.setattr(rr, "outbound_quiesced", lambda name: True)
+
+    async def message_ids(self) -> dict[str, str]:
+        """``{channel_id: message_id}`` for the fixture's one message per inbound."""
+        r = await self.c.get("/messages", headers=self.wide)
+        assert r.status_code == 200, r.text
+        return {m["channel_id"]: m["id"] for m in r.json()["messages"]}
 
 
 async def _measure_layered_search_owner(k: _Callers) -> None:
@@ -202,6 +242,158 @@ async def _measure_events_connection_filter(k: _Callers) -> None:
     assert wide.status_code == 200 and {e["connection"] for e in wide.json()["events"]} == {"IB_B"}
 
 
+async def _purge(k: _Callers, name: str, headers: dict[str, str]) -> httpx.Response:
+    k.prove(headers, STEP_UP_ACTION_CONNECTION_PURGE)
+    return await k.c.post(f"/connections/{name}/purge", headers=headers)
+
+
+async def _measure_purge(k: _Callers) -> None:
+    k.quiesce_outbounds()
+    # A caller whose scope lists EVERY inbound that feeds OB_X is still a scoped caller.
+    both_id = await _operator(k.service, "both")
+    await k.service.set_channel_scope(both_id, ["IB_A", "IB_B"], actor="admin")
+    both = await _login(k.c, "both")
+    before = await k.denials()
+    for name in ("OB_X", "NO_SUCH_OUTBOUND"):
+        r = await _purge(k, name, k.scoped)
+        assert r.status_code == 403 and "cannot purge" in r.text, (name, r.text)
+    assert await k.denials() == before + 2
+    r = await _purge(k, "OB_X", both)
+    assert r.status_code == 403 and "cannot purge" in r.text, r.text
+    # Control: the all-channels caller purges the same outbound, and an unknown name is a 404.
+    wide = await _purge(k, "OB_X", k.wide)
+    assert wide.status_code == 200 and wide.json()["cancelled"] == 2, wide.text
+    assert (await _purge(k, "NO_SUCH_OUTBOUND", k.wide)).status_code == 404
+
+
+async def _measure_dead_letter_replay(k: _Callers) -> None:
+    before = await k.denials()
+    for body in ({}, {"channel_id": "IB_B"}, {"channel_id": None, "destination_name": "OB_X"}):
+        r = await k.c.post("/dead-letters/replay", json=body, headers=k.scoped)
+        assert r.status_code == 403, (body, r.text)
+    assert await k.denials() == before + 3
+    for body in ({"channel_id": "IB_A"}, {"channel_id": "IB_A", "destination_name": "OB_X"}):
+        r = await k.c.post("/dead-letters/replay", json=body, headers=k.scoped)
+        assert r.status_code == 200 and "requeued" in r.json(), (body, r.text)
+    # Control: the all-channels caller may replay every channel at once.
+    wide = await k.c.post("/dead-letters/replay", json={}, headers=k.wide)
+    assert wide.status_code == 200, wide.text
+
+
+async def _measure_export_skip(k: _Callers) -> None:
+    ids = await k.message_ids()
+    # A well-formed id that names no message: ids carry a 32-hex shape rule.
+    asked = [ids["IB_A"], ids["IB_B"], "0" * 32]
+
+    async def export(method: str, headers: dict[str, str]) -> list[str]:
+        k.prove(headers, STEP_UP_ACTION_MESSAGE_EXPORT)
+        if method == "GET":
+            r = await k.c.get("/messages/export", params={"ids": asked}, headers=headers)
+        else:
+            r = await k.c.post("/messages/export", json={"ids": asked}, headers=headers)
+        assert r.status_code == 200, (method, r.text)
+        return [json.loads(line)["id"] for line in r.text.splitlines() if line]
+
+    for method in ("GET", "POST"):
+        before = await k.denials()
+        # Skipped, not refused: IB_B's message is left out, and so is the unknown id.
+        assert await export(method, k.scoped) == [ids["IB_A"]], method
+        # One denial row for the out-of-scope message, none for the id that exists nowhere.
+        assert await k.denials() == before + 1, method
+        # Control: the all-channels caller gets both messages.
+        assert await export(method, k.wide) == [ids["IB_A"], ids["IB_B"]], method
+    # The export's own audit row counts every selected id, the skipped ones included.
+    rows = await k.engine.store.list_audit(action="messages_export", actor="scoped", limit=10)
+    assert rows and all(json.loads(str(r["detail"]))["selected"] == 3 for r in rows)
+
+
+async def _measure_approval_release_scope(k: _Callers) -> None:
+    k.quiesce_outbounds()
+    await _add(k.service, "checker", Role.ADMINISTRATOR)
+    async with _approvals_client(k.engine, k.service, ON) as c:
+        checker = await _token(c, "checker")  # _add provisions with its own module's password
+
+        async def held(r: httpx.Response) -> str:
+            assert r.status_code == 202, r.text
+            return str(r.json()["approval_id"])
+
+        async def approve(approval_id: str) -> httpx.Response:
+            return await c.post(f"/approvals/{approval_id}/approve", headers=checker)
+
+        async def refusal_reasons() -> list[str]:
+            rows = await k.engine.store.list_audit(action="approval.stale_requester", limit=50)
+            return [json.loads(str(r["detail"]))["reason"] for r in rows]
+
+        replay = "/dead-letters/replay"
+        scoped_replay = await held(
+            await c.post(replay, json={"channel_id": "IB_A"}, headers=k.scoped)
+        )
+        wide_replay = await held(await c.post(replay, json={"channel_id": "IB_B"}, headers=k.wide))
+        k.prove(k.wide, STEP_UP_ACTION_CONNECTION_PURGE)
+        wide_purge = await held(await c.post("/connections/OB_X/purge", headers=k.wide))
+        # Control: a release whose requester still holds the scope runs.
+        assert (await approve(wide_replay)).status_code == 200
+        # The scoped requester's scope moves off the channel its held replay names.
+        await k.service.set_channel_scope(k.scoped_id, ["IB_B"], actor="admin")
+        r = await approve(scoped_replay)
+        assert r.status_code == 409 and "no longer holds" in r.text, r.text
+        # The purge requester keeps every inbound that feeds OB_X, and is still no longer unscoped.
+        await k.service.set_channel_scope(k.wide_id, ["IB_A", "IB_B"], actor="admin")
+        r = await approve(wide_purge)
+        assert r.status_code == 409 and "no longer holds" in r.text, r.text
+        assert await refusal_reasons() == ["requester_out_of_scope"] * 2
+        for approval_id in (scoped_replay, wide_purge):
+            row = await k.engine.store.get_pending_approval(approval_id)
+            assert row is not None and str(row["status"]) == "pending", approval_id
+
+
+async def _measure_security_events_birth_bound(k: _Callers) -> None:
+    # A failed sign-in against a name no account holds yet is recorded under that name.
+    r = await k.c.post(
+        "/auth/login", json={"username": "latecomer", "password": "wrong", "provider": "local"}
+    )
+    assert r.status_code == 401, r.text
+    early = await k.engine.store.list_audit(actor="latecomer", limit=50)
+    assert early and all(str(row["action"]).startswith("auth.") for row in early)
+    early_ts = {float(row["ts"]) for row in early}
+    await _operator(k.service, "latecomer")
+    feed = await k.c.get("/me/security-events", headers=await _login(k.c, "latecomer"))
+    assert feed.status_code == 200, feed.text
+    shown = feed.json()["events"]
+    # The account's own sign-in shows, so the feed is not merely empty...
+    assert any(e["action"] == "auth.login_success" for e in shown), shown
+    # ...and the row written under its name before the account existed does not.
+    assert not early_ts & {float(e["ts"]) for e in shown}, shown
+    # Control: the raw audit log still holds that row; the feed bound is a read filter.
+    kept = await k.engine.store.list_audit(actor="latecomer", limit=50)
+    assert early_ts <= {float(row["ts"]) for row in kept}
+
+
+async def _measure_ui_connection_page(k: _Callers) -> None:
+    pytest.importorskip("messagefoundry_webconsole")
+    app = create_app(k.engine, auth=k.service, serve_ui=True, webauthn_rp_from_request=True)
+
+    async def page(username: str, names: tuple[str, ...]) -> list[int]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            r = await c.post("/ui/login", data={"username": username, "password": PW})
+            assert r.status_code == 303 and c.cookies.get("mf_session"), r.text
+            return [(await c.get(f"/ui/connection/{name}")).status_code for name in names]
+
+    # The page name is the dashboard row's display name: an inbound's source row, then the edge row
+    # from the in-scope IB_A into the shared outbound OB_X, then a name that exists nowhere.
+    # Built from its code point, so the source carries no glyph; the dashboard joins with U+25B8.
+    sep = f" {chr(0x25B8)} "
+    names = (f"IB_A{sep}in", f"IB_B{sep}in", f"IB_A{sep}OB_X", f"NOPE{sep}in")
+    before = await k.denials()
+    assert await page("scoped", names) == [200, 404, 404, 404]
+    # A 404, and no denial row: unlike the JSON per-name routes, nothing is audited.
+    assert await k.denials() == before
+    # Control: the all-channels caller opens both rows the scoped caller could not.
+    assert await page("allchannels", names) == [200, 200, 200, 404]
+
+
 class _Rule(NamedTuple):
     #: The routes its bullet must name, written as the doc backticks them, compared as exact tokens.
     routes: tuple[str, ...]
@@ -211,6 +403,8 @@ class _Rule(NamedTuple):
     #: What its bullet must NOT say. A presence check alone passes "answers 403 (it used to answer
     #: 404)", so the status code a bullet must not give is named here.
     forbidden: tuple[str, ...] = ()
+    #: The class ``tests/test_route_channel_scope_classification.py`` must give each JSON route.
+    scope_class: str = SCOPED
 
 
 _RULES: dict[str, _Rule] = {
@@ -262,6 +456,43 @@ _RULES: dict[str, _Rule] = {
         _measure_events_connection_filter,
         forbidden=("404",),
     ),
+    "purge": _Rule(
+        ("POST /connections/{name}/purge",),
+        ("403", "any outbound", "every inbound that feeds", "`auth.channel_denied`"),
+        _measure_purge,
+        forbidden=("404", "shared outbound"),
+    ),
+    "dead-letter-replay": _Rule(
+        ("POST /dead-letters/replay",),
+        ("`channel_id`", "no `channel_id`", "403", "`destination_name`", "`auth.channel_denied`"),
+        _measure_dead_letter_replay,
+        forbidden=("404",),
+    ),
+    "export-skip": _Rule(
+        ("GET /messages/export", "POST /messages/export"),
+        ("skipped, not refused", "200", "`auth.channel_denied`", "unknown id", "`selected`"),
+        _measure_export_skip,
+        forbidden=("404", "403"),
+    ),
+    "approval-release-scope": _Rule(
+        ("POST /approvals/{approval_id}/approve",),
+        ("`channel_id`", "all-channels", "409", "pending", "`requester_out_of_scope`"),
+        _measure_approval_release_scope,
+        scope_class=ADMINISTRATOR_ONLY,
+    ),
+    "security-events-birth-bound": _Rule(
+        ("GET /me/security-events",),
+        ("`auth.*`", "username", "`created_at`"),
+        _measure_security_events_birth_bound,
+        scope_class=NOT_CHANNEL_BEARING,
+    ),
+    "ui-connection-page": _Rule(
+        ("GET /ui/connection/{name}",),
+        ("404", "any outbound", "writes no", "`auth.channel_denied`"),
+        _measure_ui_connection_page,
+        # The bullet names the JSON routes' 403 to contrast with, so the contradiction is the verb.
+        forbidden=("answers 403",),
+    ),
 }
 
 
@@ -289,16 +520,29 @@ async def test_single_route_rule_is_measured_against_a_live_app(
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         callers = _Callers(
-            engine, c, await _login(c, "scoped"), await _login(c, "allchannels"), monkeypatch
+            engine=engine,
+            c=c,
+            scoped=await _login(c, "scoped"),
+            wide=await _login(c, "allchannels"),
+            monkeypatch=monkeypatch,
+            service=service,
+            scoped_id=scoped_id,
+            wide_id=wide_id,
         )
         await _RULES[rule].measure(callers)
 
 
-def test_every_rule_route_is_classified_scoped() -> None:
-    """The channel-scope classification table must agree that each route here is scoped."""
+def test_every_rule_route_carries_its_channel_scope_class() -> None:
+    """The channel-scope classification table must agree with each rule's class: scoped for a
+    channel rule, and the two owner and administrator rules as that table files them. A ``/ui``
+    route is left out because that table covers the JSON API only."""
     for rule in _RULES.values():
         for route in rule.routes:
-            assert ROUTES[route][0] == SCOPED, f"{route} carries a data rule but is not SCOPED"
+            if route.split(" ", 1)[1].startswith("/ui"):
+                continue
+            assert ROUTES[route][0] == rule.scope_class, (
+                f"{route} is classified {ROUTES[route][0]}, not {rule.scope_class}"
+            )
 
 
 # =====================================================================================================

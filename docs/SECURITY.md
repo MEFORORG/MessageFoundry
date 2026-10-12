@@ -1015,7 +1015,8 @@ route handler only when all of them pass.
 4. **A second axis: per-channel scope** — `users.channel_scope` narrows operational routes to a set of
    connections, and it **denies by default**: a new non-administrator is granted no channel until
    somebody grants one (BACKLOG #1152; the full rule is *Per-channel scoping (DLQ-SCOPE)* below).
-   Out-of-scope *message* access returns **404** (existence-hiding); connection control and inbound
+   Out-of-scope *message* access returns **404** (existence-hiding) on every by-id JSON route; the bulk
+   export skips such a row instead (*Single-route data rules* below). Connection control and inbound
    injection return **403**. Denials are audited `auth.channel_denied`.
 
 The table below has **seven** rows. `require` is the ladder itself; five wrappers extend it
@@ -1213,7 +1214,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
 | `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **Refuses (400) whenever `[security].require_mfa` covers your local account and TOTP is on, passkeys or not**, because in this release TOTP is the only factor with a way past the sign-in lock; an administrator's factor reset is the recovery (`AuthService.disable_mfa`, ADR 0197 Amendment A). A directory account is refused only when TOTP is its last second factor and the requirement's scope covers it (BACKLOG #1022), and a local account the requirement does not cover is not refused. The passkey removal path refuses only that last-factor case (ADR 0068 decision 5), so the two routes no longer refuse on the same condition |
 | `GET` | `/me/sessions` | `require` | |
-| `GET` | `/me/security-events` | `require` | |
+| `GET` | `/me/security-events` | `require` | data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate |
 | `DELETE` | `/me/sessions` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2) |
 
@@ -1297,10 +1298,10 @@ tuple: they act only on the caller's own account.
 | `POST` | `/connections/{name}/test` | `connections:test` | `require_paced` — reachability probe; honors `[egress]`, sends no real data, audited |
 | `POST` | `/connections/{name}/test-credential` | `connections:test` | `require_paced` |
 | `POST` | `/connections/{name}/flag` | `config:deploy` | `require_paced` |
-| `POST` | `/connections/{name}/purge` | `messages:purge` | `require_step_up_action` (action `connection_purge`, vault BACKLOG #2625) — may return **202 + `approval_id`** under dual control |
+| `POST` | `/connections/{name}/purge` | `messages:purge` | `require_step_up_action` (action `connection_purge`, vault BACKLOG #2625) — may return **202 + `approval_id`** under dual control; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/config/reload` | `config:deploy` | `require_step_up_action` (action `config_reload`, vault BACKLOG #2625; a `dry_run` takes it too, because the loader executes the config's Python either way) — the target dir must resolve within an allowed root (see below) |
 | `GET` | `/approvals` | `approvals:approve` | `require` |
-| `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request |
+| `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
@@ -1313,9 +1314,9 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|---|
 | `GET` | `/messages` | `messages:read` | `require_phi_read` | per-property redaction; `messages:view_summary` unlocks `summary`/`error`/`metadata`; per-channel scope |
 | `GET` | `/messages/search` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (a bulk-selecting GET) |
-| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`, vault BACKLOG #2625) | one of the two-permission routes **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
+| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`, vault BACKLOG #2625) | one of the two-permission routes **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/messages/search` | `messages:read` | `require_step_up` | the needle-bearing sibling of the GET above (BACKLOG #1184): `content`/`field_value` travel in the BODY so they never reach a URL, access log or browser history. Same gate, same shared implementation, so the PHI-read hop and budget are charged identically |
-| `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`) | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs |
+| `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`) | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/messages/{message_id}` | `messages:view_raw` | `require_phi_read` | per-property redaction of the wrapper **and** each nested `OutboxInfo`/`EventInfo`; returns **no body** (BACKLOG #2345); `summary` and `metadata` come back display-masked unless the request passes `reveal_summary=true`, and the `message_view` audit row lists the properties returned complete in `revealed` (BACKLOG #2346); the error text (`error`, each `outbox[].last_error`, each `events[].detail`) comes back as a fixed `****` mask unless the request passes `reveal_errors=true`, a separate act, recorded in `revealed` as `error`, `outbox.last_error` and `events.detail` (BACKLOG #2436) |
 | `GET` | `/messages/{message_id}/raw` | `messages:view_raw` | `require_phi_read` | the raw body, as its own act: writes a `message_body_view` audit row carrying a `surface`. An HTTP caller declares `harness`, `apiclient` or `api` (the default); the engine records `console` itself for the web console's in-process call, and the query parameter does not accept it (BACKLOG #2345) |
 | `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes, audited `attachment_download`; the handler's two 422 refusals (an undecodable stored value, an SVG it cannot sanitize) serve nothing and are audited `attachment_download_refused` with a `reason`; a request-validation 422 never reaches the handler and is not (BACKLOG #2387) |
@@ -1325,7 +1326,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/messages/{message_id}/resend` | `messages:resend` | `require_step_up_action` (action `message_resend`, vault BACKLOG #2625) | per-channel access to **both** the origin's and the alternate outbound's channel |
 | `POST` | `/messages/{message_id}/edit-resend` | `messages:edit` | `require_step_up_action` (action `message_edit_resend`, vault BACKLOG #2625) | implies `messages:view_raw`; the DIRECT `to` power-path additionally requires per-channel access to the alternate outbound's channel |
 | `GET` | `/dead-letters` | `messages:read` | `require_phi_read` | per-property redaction; per-channel scope |
-| `POST` | `/dead-letters/replay` | `messages:replay` | `require_step_up` | may return **202 + `approval_id`** under dual control |
+| `POST` | `/dead-letters/replay` | `messages:replay` | `require_step_up` | may return **202 + `approval_id`** under dual control; data rule: *Single-route data rules* below (BACKLOG #1151) |
 
 #### Search presets & layered search (PHI)
 
@@ -1457,6 +1458,13 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 `GET /ui/messages/{message_id}/parse-tree`, `GET /ui/messages/{message_id}/edit`,
 `GET /ui/uploaded-logs/file/{file_id}` and the three `/ui/account/webauthn/*` routes among them.
 
+**A `/ui` route that reads or changes engine data calls the engine's handler for it in-process,
+so it carries the same data rule as that handler's JSON route (BACKLOG #1151).** At least
+these do: the dashboard (`/ui`, `/ui/connections`), connection start, stop, restart, bulk control
+and flag, the message list, search and by-id pages, single-message replay and resend, and the
+dead-letter, alerts, events and monitoring pages. *Single-route data rules* below names more, and
+the console routes with a rule of their own.
+
 | Method | Path | Permission | Gate |
 |---|---|---|---|
 | `GET` | `/ui` | `monitoring:read` | `require_ui` |
@@ -1498,8 +1506,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/cluster/stepdown-confirm` | `cluster:control`**+**`monitoring:read` | `require_ui_step_up` |
 | `GET` | `/ui/config` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/config/reload` | `config:deploy` | `require_ui_step_up_action` |
-| `GET` | `/ui/connection/{name}` | `monitoring:read` | `require_ui` |
-| `GET` | `/ui/connection/{name}/events/{event_id}/reason` | `monitoring:read`**+**`messages:view_summary` | `require_ui` |
+| `GET` | `/ui/connection/{name}` | `monitoring:read` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `GET` | `/ui/connection/{name}/events/{event_id}/reason` | `monitoring:read`**+**`messages:view_summary` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/ui/connections` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/connections/bulk-control` | `connections:control` | `require_ui` |
 | `POST` | `/ui/connections/purge-bulk` | `messages:purge` | `require_ui_step_up_action` |
@@ -1740,7 +1748,7 @@ the same permission set on the same method reds CI until it is listed here.
 > scope sees an empty console, and the landing page says so in a sentence rather than leaving it to
 > read as broken RBAC; that is deliberately a page banner and not a start-time refusal, which would
 > make a fresh single-operator install unbootable for the same condition. A channel-scoped user
-> **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit
+> **cannot purge any outbound** (*Single-route data rules* below). **AD users** inherit
 > their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all; a
 > group is keyed by its full DN only, as the [AD-group to role map](#ad-group--role-mapping) says): on
 > login the group-derived scope is persisted — a wildcard row persists the explicit `["*"]` grant —
@@ -1837,16 +1845,51 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /events` with a `connection=` filter outside the scope answers 403 and is audited
 >   `auth.channel_denied`. Without the filter it returns only the caller's own connections, as the
 >   monitoring paragraph above says.
+> - `POST /connections/{name}/purge` answers 403 to every scoped caller, for any outbound and for a
+>   well-formed name that names none. That holds even when the scope lists every inbound that feeds the
+>   outbound, because a purge spans every inbound feeding it. Only an all-channels caller can
+>   purge. The refusal is audited `auth.channel_denied`.
+> - `POST /dead-letters/replay` from a scoped caller must name a `channel_id` in its scope. A
+>   replay with no `channel_id`, which would replay every channel, answers 403, and so does a
+>   `channel_id` outside the scope. Both refusals are audited `auth.channel_denied`. A
+>   `destination_name` only narrows a replay inside the channel it names.
+> - `GET /messages/export` and `POST /messages/export` read each selected message through the
+>   caller's scope before they stream it. An id in `ids` that is outside the scope is skipped, not
+>   refused: the export still answers 200 and leaves that row out. Each skipped row writes one
+>   `auth.channel_denied` row. An unknown id is skipped with no denial row. The `selected` count
+>   in the `messages_export` audit row still counts the skipped ids. How a scope change stops a
+>   running export is in *A revoked privilege reaches the next request* below.
+> - `POST /approvals/{approval_id}/approve` checks the requester's channel scope again before it
+>   releases a held request, by the rule the request route used. A held dead-letter replay needs
+>   a scope that still covers its `channel_id`, and a held replay of every channel needs an
+>   all-channels requester. A held purge needs a requester who is still all-channels. Otherwise
+>   the release answers 409, the request stays pending, and an `approval.stale_requester` row
+>   records the reason `requester_out_of_scope`.
+> - `GET /me/security-events` returns the `auth.*` rows recorded under the caller's username, and
+>   only those at or after the account's `created_at`. So an account does not see rows written
+>   under its name before it existed, such as a failed sign-in or a deleted account's history. The
+>   bound does not help when an account keeps its `created_at` while its name or holder changes.
+>   At least a directory rename onto the name does that.
+> - `GET /ui/connection/{name}` answers 404 for any name that is not a row on the caller's own
+>   dashboard. For a scoped caller that is an inbound outside its scope, any outbound, and a name
+>   that exists nowhere. That differs from the 403 the JSON per-name routes give, and it writes no
+>   `auth.channel_denied` row. Its reason page, `/ui/connection/{name}/events/{event_id}/reason`,
+>   shares the rule. On an in-scope page, a refused event read shows an empty event list.
 >
 > The console reaches the same rules, because its routes call these handlers in-process. That
 > covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
-> `/ui/alerts/{alert_id}/*` writes, `/ui/status` and `/ui/nav-status`. The console's preset
-> list, save and delete call the `/search/presets` handlers, so they carry those rows' owner rule.
-> One console difference: `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404
-> and redirects, so another user's preset id looks like one already deleted.
+> `/ui/alerts/{alert_id}/*` writes, `/ui/status`, `/ui/nav-status`, the two `/ui` purge POSTs, the
+> three `/ui/dead-letters` replay routes, the `/ui` approve route and `/ui/security-events`. The
+> console's preset list, save and delete call the `/search/presets` handlers, so they carry those
+> rows' owner rule. The console differs in at least these ways.
+> `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404 and redirects, so another
+> user's preset id looks like one already deleted. `/ui/connections/purge-confirm` checks the
+> purge rule itself, before any purge: a scoped caller gets its own 403 and denial row. The
+> `/ui/nav-status` alert bell is null without `monitoring:diagnose`.
 >
 > `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
-> all-channels caller as the control. It reds if a bullet loses its route, a named fact, or its
+> all-channels caller as the control. The security-event feed has no channel axis, so its control
+> is the raw audit log. It reds if a bullet loses its route, a named fact, or its
 > route-map pointer, or names a route nothing executes. It does not execute this console paragraph,
 > the outbound-by-name case, or the administrator case; those are read from the code.
 
@@ -3766,9 +3809,9 @@ The dual-control release re-checks the requester's standing too.
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235) describes that
 check and its directory gap.
 
-Two long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
+Three long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
 the route's permissions, no pending password change, a met second factor and a notification address
-on file. Neither asks again for a fresh step-up, the client-network check or the new-address check;
+on file. None asks again for a fresh step-up, the client-network check or the new-address check;
 those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
@@ -3803,6 +3846,15 @@ on that session, for example) ends it as a revocation would.
   stops reading or a store read is slow, the session sits idle. A single stall of about three
   quarters of the idle window can be enough. The next row's check then ends the session and the
   export.
+- The audit export (`GET /audit/export`, and the console's `/ui/audit/export`, which passes its
+  cookie session) asks before every page of up to 1,000 rows, not every row. A page is one store
+  read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the
+  bulk export bullet above says, with the reason `standing_changed`. The pages are read with the
+  identity the export started with. A caller that may now read fewer rows, as after losing
+  `users:manage`, would still receive the lock rows. So that stops it too, with the reason
+  `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  the reason, then aborts the transfer. The idle clock moves as the bulk export's does, at most
+  every quarter of the window.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
