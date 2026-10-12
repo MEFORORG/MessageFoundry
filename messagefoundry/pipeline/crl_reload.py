@@ -475,12 +475,16 @@ def _reload_path(
         clear_reload_refusal(key)
         return None
     prior = reload_refusal(key, fingerprint)
-    shown = next((h.configured_path for _, h in stale if h.configured_path), path)
-    # The setting, only when every stale holder recorded the same one. Several listeners can share
-    # one CRL now that each records its connection's tls_crl_file (vault BACKLOG #1997), and naming
+    # The label is read from every holder of the file, never from the stale ones alone. The stale
+    # set shrinks as contexts take the file, so a label read from it turned from the path into one
+    # holder's setting between two passes over the same bytes. Every reason leads with the label,
+    # so the refusal was then logged a second time (vault BACKLOG #3099).
+    shown = next((h.configured_path for _, h in pairs if h.configured_path), path)
+    # The setting, only when every holder recorded the same one. Several listeners can share one
+    # CRL now that each records its connection's tls_crl_file (vault BACKLOG #1997), and naming
     # whichever the pass met first sent the operator to one hop of several. The path alone is
     # never wrong, and it does not grow with the number of holders.
-    held_by = {h.setting for _, h in stale}
+    held_by = {h.setting for _, h in pairs}
     label = crl_label(shown, held_by.pop() if len(held_by) == 1 else None)
     refusals = _Refusals()
     reloaded = 0

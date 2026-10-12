@@ -1373,3 +1373,46 @@ def test_only_a_refusal_that_stops_a_context_or_is_reported_keeps_a_pass_open() 
     assert not sticky((RESTART, False), (NO_ISSUER, True))
     # The refusal reported is one time can lift, though a restart is what stops the context.
     assert not sticky((LAPSES_FIRST, False), (RESTART, True))
+
+
+# --- vault BACKLOG #3099 item 2: a retried refusal keeps its label --------------------------------
+
+
+@pytest.mark.parametrize("held_back_by", [RETRY, NO_ISSUER], ids=["a-defect", "unlisted-issuer"])
+def test_a_retried_refusal_keeps_its_label_once_another_holder_takes_the_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, held_back_by: str
+) -> None:
+    """Two hops with different settings share one CRL. The first pass brings one current and
+    refuses the other, and names the file by its path, since the two settings differ. Red before
+    the fix: the second pass read the label from the one hop still stale, so it led with that
+    hop's setting, the reason changed, and the refusal was logged again."""
+    pki, both = _make_intermediate_pki(tmp_path)
+
+    def holder(ca_file: Path, name: str) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cafile=str(ca_file))
+        harden_crl_check(ctx, str(pki.crl), setting=f"outbound connection '{name}' tls_crl_file")
+        return ctx
+
+    taker = holder(both, "takes-it")
+    # The root alone cannot verify the intermediate's CRL, which the reload retries every pass.
+    refused = holder(pki.ca_file if held_back_by == NO_ISSUER else both, "refused")
+    if held_back_by == RETRY:
+
+        def boom(binary_form: bool = False) -> list[bytes]:
+            raise RuntimeError("a defect in one context")
+
+        refused.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+    pki.crl.write_bytes(_fresher(pki))
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first, second = _reload(pki), _reload(pki)
+
+    assert first is not None and first.reloaded == 1 and first.refusal is not None
+    assert first.refusal.remedy == held_back_by and not first.refusal.sticky
+    assert f"CRL file {str(pki.crl)!r}" in first.refusal.reason, first.refusal.reason
+    assert "takes-it" not in first.refusal.reason and "'refused'" not in first.refusal.reason
+    # The same bytes, judged again with one holder now current: the same refusal, logged once.
+    assert second is not None and (second.reloaded, second.refusal) == (0, first.refusal)
+    assert _refusals_logged(caplog) == 1
+    assert taker.verify_flags & refused.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
