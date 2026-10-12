@@ -337,8 +337,9 @@ async def test_a_kept_failure_whose_settings_stop_resolving_says_so_in_the_log(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The lane is rebuilt, and that used to happen with no line saying why the reload read a CA
-    it had been leaving alone. Red under: the ``log.info`` call removed."""
+    """The kept failure is not compared, and that used to happen with no line saying so. The
+    arm is a backstop, so the test calls it directly. Red under: the ``log.info`` call lowered
+    to ``log.debug``, which leaves no line at INFO."""
     reg = _poller_graph(_ca(tmp_path), _WRONG_PIN)
     runner = _runner(store, reg)
     await runner.start()

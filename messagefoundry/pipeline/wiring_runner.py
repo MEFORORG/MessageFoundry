@@ -3552,7 +3552,10 @@ class RegistryRunner:
         text names the CA's path, the folders above it and its SHA-256, so it goes to the server
         log only, as the connection-test route keeps it from API callers (BACKLOG #1142). The lane
         status and the ``connection_stopped`` alert carry the fixed line. A ``ValueError`` is a
-        refused setting, not a refused file, and its line says so (vault BACKLOG #3224)."""
+        refused setting, not a refused file, and its line says so (vault BACKLOG #3224). The
+        reverse does not hold: a pin that is not a SHA-256 raises ``TrustAnchorError`` and still
+        takes the file's line. The exception type cannot tell those two apart; the check that
+        raises would have to say which it is."""
         if self._lane_anchor_check is None:
             return
         try:
@@ -3646,12 +3649,12 @@ class RegistryRunner:
         try:
             settings = self._anchor_lane_settings(new)
         except Exception as exc:  # noqa: BLE001 - an unresolvable value is a change
-            # A reload's build check resolves the same settings first and refuses on them, so
-            # this arm is a backstop. It no longer ends a kept failure with no line saying so
-            # (vault BACKLOG #3224).
+            # The line says only what happened here (vault BACKLOG #3224). The reload that
+            # asked resolves the same settings again and is refused on them, so the lane's
+            # record and mark stay as they were.
             log.info(
-                "%s connection %r: its settings no longer resolve, so its trust-anchor failure "
-                "is not kept: %s",
+                "%s connection %r: its kept trust-anchor failure could not be compared, because "
+                "its settings no longer resolve: %s",
                 direction,
                 name,
                 safe_exc(exc),

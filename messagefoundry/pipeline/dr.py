@@ -99,9 +99,13 @@ def _vip_note(cause: str) -> str:
 
 
 #: What a step-4 abort says in place of a trust-anchor refusal's own text (vault BACKLOG #3224).
-#: That text names the CA's path, the folders above it and its SHA-256. It points at the server
-#: log alone: a refused setting, such as a blank ``tls_ca_pin``, writes no audit row.
-_ANCHOR_REFUSED = "a trust anchor was refused; the server log says which one and why"
+#: That text names the CA's path, the folders above it and its SHA-256. The server log comes
+#: first because it always has the refusal: a refused setting, such as a blank ``tls_ca_pin``,
+#: writes no audit row. The connection's name is lost with the text, which is where it lives.
+_ANCHOR_REFUSED = (
+    "a trust anchor was refused; the server log says which one and why, and a refused file has "
+    "auth.trust_anchor audit rows too"
+)
 
 
 def _caused_by_trust_anchor(exc: BaseException) -> bool:
