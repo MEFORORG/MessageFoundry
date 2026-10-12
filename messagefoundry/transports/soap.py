@@ -78,6 +78,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    count_setting,
     encode_wire_body,
     register_destination,
 )
@@ -356,7 +357,11 @@ class SoapDestination(DestinationConnector):
         self.ws_username: str | None = s.get("ws_username") or s.get("basic_user") or None
         self.ws_password: str | None = s.get("ws_password") or s.get("basic_password") or None
         self.ws_password_type: str = str(s.get("ws_password_type", "text"))
-        self.ws_timestamp_ttl_seconds: int = int(s.get("ws_timestamp_ttl_seconds", 300))
+        self.ws_timestamp_ttl_seconds: int = count_setting(
+            s.get("ws_timestamp_ttl_seconds", 300),
+            knob="ws_timestamp_ttl_seconds",
+            transport="SOAP destination",
+        )
         self._ws_mode: bool = self.ws_addressing or self.ws_security
 
         # Non-deterministic generators — instance attributes so tests can inject a fixed clock / UUID /
