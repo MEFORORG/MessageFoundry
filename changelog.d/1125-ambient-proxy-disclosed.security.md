@@ -1,8 +1,7 @@
-- **`serve` names a web proxy it picked up from the environment.** With `http_proxy`,
-  `https_proxy` or `all_proxy` (in either case) or the Windows or macOS system proxy set, `serve`
-  and `supervise` each log one WARNING at start. It names each proxy's host and port, never a user
-  or password from its URL, and which engine hops use it or refuse it. With no proxy set it logs
-  nothing. Which hops, and what reaches the proxy, is in
+- **`serve` names a web proxy it may pick up from the environment.** With an environment or
+  system proxy set, `serve` and `supervise` each log one WARNING at start. It names each proxy in
+  force, never a user or password from its URL, and the hops that may read one. What it says, and
+  what reaches the proxy, is in
   [CONFIGURATION.md](../docs/CONFIGURATION.md#serve-names-an-environment-proxy-at-start).
   ([BACKLOG #1125](../docs/BACKLOG.md))
 - **The deployment documents now state what a proxy in front of the engine must do about request

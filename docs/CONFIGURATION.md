@@ -1445,21 +1445,24 @@ engine setting** (BACKLOG #1125). The sources include at least `http_proxy`, `ht
 
 - **The urllib hops.** Each HTTP-family connection, and its OAuth2 or SMART token request, uses the
   proxy for the target's scheme wherever no explicit `proxy_url` applies to the host. That is no
-  proxy set at all, `proxy_url = "default"`, or a host that `proxy_no_proxy` bypasses. The alert
-  webhook, the OIDC sign-in requests and the AI broker use the same proxies, because they have no
-  proxy setting of their own. None of these reads `all_proxy`.
+  proxy set at all, `proxy_url = "default"`, or a host that `proxy_no_proxy` bypasses. Other urllib
+  hops with no proxy setting of their own use the same proxies. They include at least the alert
+  webhook, the OIDC token and JWKS requests, and the AI broker. No urllib hop reads `all_proxy`.
 - **The Vault and OpenBao clients** (see `[secrets]`). They use the proxy for the Vault address's
   scheme, or the `all` proxy when that scheme has none. They refuse an `http://` Vault behind any
   proxy.
 
 So `serve` and `supervise` each log one WARNING at start when such a proxy is set. Under
-`supervise`, every engine shard logs its own. For each proxy, the WARNING names its scheme, host
-and port, never a user or password from its URL. It then says which of these hops use it and which
-refuse it, and for which target scheme. The engine works that out by running a request to a
-reserved host through each family's own proxy code, stopped before anything is sent. It logs
-nothing with no proxy set, with a `NO_PROXY` of exactly `*`, or when no hop reads any proxy that is
-set, such as an `all` proxy without the `[vault]` extra. Other commands that reach these hops, such
-as `check-privileges` and `verify`, do not log this warning.
+`supervise`, every engine shard logs its own. The WARNING lists each `http`, `https` and `all`
+proxy in force, by scheme, host and port, never a user or password from its URL. A value it cannot
+read is named "an unreadable value". It then names the hops that may read an environment proxy,
+and says they include at least those. It names the Vault and OpenBao clients only when the
+`[vault]` extra is installed. It does not say which hop uses which proxy, or what reaches the
+proxy. This section says that, and the WARNING points here.
+
+It logs nothing with no proxy set, or with a `NO_PROXY` of exactly `*`. It does not read any other
+`NO_PROXY` entry, so it still logs when a bypass list covers every host the engine reaches. Other
+commands that reach these hops, such as `check-privileges` and `verify`, do not log this warning.
 
 **Some hosts go direct.** Both families send a host on `NO_PROXY` or the system bypass list
 direct. The urllib hops also dial a loopback host direct. The Vault clients have no loopback rule,
@@ -1470,8 +1473,8 @@ it on each request. The Vault clients refuse it when they are built and again on
 credentialed proxy written `https://` is not refused, so whether its credentials cross in cleartext
 depends on the leg below.
 
-**The leg to the proxy is not always TLS, even for a proxy written `https://`.** This is where the
-WARNING points, and the other documents link here rather than restate it.
+**The leg to the proxy is not always TLS, even for a proxy written `https://`.** The other
+documents link here rather than restate it.
 
 - The urllib hops reach at least the `https` proxy over plain TCP. For an `https` target they send
   `CONNECT`, with any credential header from the proxy URL, before any TLS.
