@@ -54,6 +54,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    cell_tag_failure_forwarder,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
@@ -1503,6 +1504,11 @@ class Engine:
             return
         sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
         setter(store_cipher_refusal_forwarder(sink, asyncio.get_running_loop()))
+        # BACKLOG #2593: a queue row whose payload fails its own tag is dead-lettered by the store,
+        # which reaches this sink the same way, through the cipher.
+        tag_setter = getattr(cipher, "set_tag_failure_hook", None)
+        if callable(tag_setter):
+            tag_setter(cell_tag_failure_forwarder(sink, asyncio.get_running_loop()))
         self._cipher_refusal_armed = cipher
 
     def _disarm_cipher_refusal_alert(self) -> None:
@@ -1511,6 +1517,9 @@ class Engine:
         setter = getattr(cipher, "set_refusal_hook", None)
         if callable(setter):
             setter(None)
+        tag_setter = getattr(cipher, "set_tag_failure_hook", None)
+        if callable(tag_setter):
+            tag_setter(None)
 
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
@@ -2528,7 +2537,9 @@ class Engine:
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             try:
-                self._env_values = dict(self._env_values_provider())
+                # Off the event loop: the CLI provider reads the value file and, before that, its
+                # owner and access list (vault BACKLOG #2626), like every other file the engine reads.
+                self._env_values = dict(await asyncio.to_thread(self._env_values_provider))
             except WiringError:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.

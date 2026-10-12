@@ -20,9 +20,11 @@ the real store writer, proves the AAD here opens it, and proves a flipped byte f
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from messagefoundry.store.crypto import cell_aad
+from messagefoundry.store.queue_tag import QUEUE_TAG_COLUMNS, queue_row_aad
 from messagefoundry.store.store import MessageStore
 
 __all__ = ["COMPOSITE_CIPHER_CELLS", "SQLITE_CIPHER_CELLS", "CipherCell"]
@@ -37,15 +39,21 @@ class CipherCell:
     ``rowid``, which a VACUUM may have renumbered, so it locates the row in the snapshot and not
     necessarily in the live store. A key column is never a locator when it can itself be PHI: a
     ``state`` or ``reference`` key is whatever the transform chose, and ``shared_body.hash`` and
-    ``attachment_chunk.attachment_id`` are digests of the plaintext."""
+    ``attachment_chunk.attachment_id`` are digests of the plaintext.
+
+    ``builder`` is for a cell whose AAD is not ``cell_aad(table, column, *key)``: it takes the
+    ``aad_columns`` values in order and returns the AAD (the queue payload's routing tag)."""
 
     table: str
     column: str
     aad_columns: tuple[str, ...]
     locator: tuple[str, ...] = ("rowid",)
+    builder: Callable[..., bytes] | None = None
 
     def aad(self, *key: object) -> bytes:
         """The AAD the writer bound for this cell, given the ``aad_columns`` values in order."""
+        if self.builder is not None:
+            return self.builder(*key)
         return cell_aad(self.table, self.column, *key)
 
     def locate(self, *values: object) -> str:
@@ -54,6 +62,12 @@ class CipherCell:
 
 
 _RESPONSE_KEY = ("message_id", "destination_name", "response_seq")
+
+
+def _queue_payload_aad(*values: object) -> bytes:
+    """The queue payload's routing tag from the :data:`QUEUE_TAG_COLUMNS` values (BACKLOG #2593)."""
+    return queue_row_aad(dict(zip(QUEUE_TAG_COLUMNS, values, strict=True)))
+
 
 #: Every literal ``cell_aad`` cell in ``store.py`` that ``_CIPHER_COLUMNS`` does not carry. The AAD columns
 #: are copied from each cell's writer, and the round-trip test proves they match it.
@@ -66,6 +80,8 @@ COMPOSITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
     CipherCell("reference", "value", ("name", "version", "key")),
     CipherCell("shared_body", "body", ("hash",)),
     CipherCell("attachment_chunk", "ciphertext", ("attachment_id", "seq")),
+    # The queue payload binds the row's routing fields, not its id alone (BACKLOG #2593).
+    CipherCell("queue", "payload", QUEUE_TAG_COLUMNS, locator=("id",), builder=_queue_payload_aad),
     # These three have an AUTOINCREMENT id the encrypting INSERT cannot know, so their AAD binds the
     # natural columns the writer has in hand instead. alert_instance binds only its de-dup grain, which
     # its resolved and open rows can share, so a reason moved between those rows still opens.

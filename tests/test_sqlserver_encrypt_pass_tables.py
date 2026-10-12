@@ -66,6 +66,19 @@ def _swept_pairs(source: str) -> list[tuple[str, str, int]]:
         if node.name not in _SWEEP_FUNCTIONS:
             continue
         for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "_seal_surface"
+                and len(inner.args) >= 2
+                and isinstance(inner.args[0], ast.Constant)
+                and isinstance(inner.args[0].value, str)
+            ):
+                # A surface sealed by its own call, outside the loop: queue.payload since BACKLOG
+                # #2593, whose tag binds the row's routing fields rather than its id alone.
+                col = inner.args[1].value if isinstance(inner.args[1], ast.Constant) else "?"
+                found.append((inner.args[0].value, str(col), inner.lineno))
+                continue
             if not isinstance(inner, ast.For | ast.AsyncFor):
                 continue
             target = inner.target
@@ -142,6 +155,23 @@ class S:
     assert ("outbox", "payload", 6) in [(t, c, ln) for t, c, ln in pairs], pairs
     unknown = [t for t, _c, _ln in pairs if t not in created]
     assert unknown == ["outbox"], f"the detector did not flag the unknown table: {unknown}"
+
+
+def test_the_guard_sees_a_surface_sealed_by_its_own_call() -> None:
+    """A surface sealed by a direct ``_seal_surface("table", ...)`` call is checked too, so moving a
+    pair out of the loop cannot take it out of this guard's sight."""
+    synthetic = """
+_SCHEMA = ["IF OBJECT_ID('queue','U') IS NULL CREATE TABLE queue (id INT)"]
+
+class S:
+    async def _encrypt_existing_rows(self) -> None:
+        await self._seal_surface("queue", "payload", like, aad_cols=("id",))
+        await self._seal_surface("gone", "payload", like, aad_cols=("id",))
+"""
+    pairs = [(t, c) for t, c, _ln in _swept_pairs(synthetic)]
+    assert ("queue", "payload") in pairs and ("gone", "payload") in pairs, pairs
+    unknown = [t for t, _c in pairs if t not in _created_tables(synthetic)]
+    assert unknown == ["gone"], unknown
 
 
 @pytest.mark.parametrize("wrapped_across_lines", [True, False])

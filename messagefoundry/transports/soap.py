@@ -80,6 +80,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     count_setting,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -331,7 +332,9 @@ class SoapDestination(DestinationConnector):
         self.url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("SOAP", config.name)
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="SOAP destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         self.version: str = str(s.get("soap_version", "1.1"))
         if self.version not in ("1.1", "1.2"):
@@ -392,8 +395,7 @@ class SoapDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        dest_host = urllib.parse.urlsplit(self.url).hostname or ""
-        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)

@@ -7451,10 +7451,11 @@ class AuthService:
         new handshake carries the NEW cookie, so the live push survives the rotation. That is a
         client reconnect, never a server-side grace window for the old token.
 
-        **A rotation also stops a running bulk export, with no reconnect** (BACKLOG #1154). The
-        export re-resolves its captured token before every row, so a step-up on the same session
-        mid-export ends it and records ``messages_export.stopped``. The client starts the export
-        again with the new token. Same fail-closed direction, same reason.
+        **A rotation also stops a running export, with no reconnect** (BACKLOG #1154). At least
+        the bulk message export and the audit export, the console's cookie download included,
+        re-resolve their captured token as they stream. A step-up on the same session mid-export
+        ends it and records ``messages_export.stopped`` or ``audit.export.stopped``. The client
+        starts the export again with the new token. Same fail-closed direction, same reason.
         """
         return await self._elevated_hash(
             hash_token(token),

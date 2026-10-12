@@ -22,6 +22,7 @@ from harness._spreadsheet import (
 )
 from harness.acceptance.matrix import SECTIONS, Status
 from harness.acceptance.runner import RowResult
+from messagefoundry.terminal_text import escape_for_markdown_cell
 
 #: A run is a failure if any executed row failed or errored; MANUAL/SKIP never fail the run.
 _FAILING = (Status.FAIL, Status.ERROR)
@@ -64,7 +65,8 @@ def render_console(results: Sequence[RowResult]) -> str:
 
 
 def render_markdown(results: Sequence[RowResult]) -> str:
-    """A sectioned Markdown report mirroring the matrix layout."""
+    """A sectioned Markdown report mirroring the matrix layout, every table cell escaped by
+    :func:`~messagefoundry.terminal_text.escape_for_markdown_cell` (ASVS 1.1.2)."""
     counts = summarize(results)
     out: list[str] = ["# WIN2025 Acceptance — Results", ""]
     out.append(
@@ -84,11 +86,10 @@ def render_markdown(results: Sequence[RowResult]) -> str:
         out.append("| ID | Test | Per-DB? | Status | Detail |")
         out.append("|---|---|---|---|---|")
         for r in rows:
-            detail = (r.detail or "").replace("|", "\\|")
-            out.append(
-                f"| {r.row.id} | {r.row.title.replace('|', chr(92) + '|')} "
-                f"| {r.row.per_db} | {r.status.value} | {detail} |"
-            )
+            # Every cell by the verify report's rule (BACKLOG #2897). A detail can carry a peer's
+            # text, and escaping only the pipe let its newline end the row and start a forged one.
+            cells = (r.row.id, r.row.title, r.row.per_db, r.status.value, r.detail or "")
+            out.append("| " + " | ".join(escape_for_markdown_cell(c) for c in cells) + " |")
         out.append("")
     return "\n".join(out)
 

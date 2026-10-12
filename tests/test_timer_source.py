@@ -254,7 +254,7 @@ def test_timer_requires_a_schedule() -> None:
 
 
 def test_timer_rejects_nonpositive_interval() -> None:
-    with pytest.raises(ValueError, match="must be > 0"):
+    with pytest.raises(ValueError, match="interval_seconds must be a number of seconds above zero"):
         TimerSource(Source(type=ConnectorType.TIMER, settings={"body": "X", "interval_seconds": 0}))
 
 

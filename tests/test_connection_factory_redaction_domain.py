@@ -167,6 +167,17 @@ def _takes_a_spec(fn: Any) -> bool:
     return bool(params) and params[0].name == "spec"
 
 
+#: ``(factory, setting)`` containers whose items follow a grammar ``["X-Probe"]`` does not fit. Each
+#: has a value that fits and the settings that must come with it, so the factory builds and the
+#: container is still populated for the surface walk. Keyed by factory, so another factory's setting
+#: of the same name keeps the generic probe. vault BACKLOG #2804: FHIR's Bundle entry lists take
+#: FHIR verbs and type names, and apply only to a transaction or batch connection.
+GRAMMAR_BOUND_CONTAINERS: dict[tuple[str, str], tuple[list[str], dict[str, Any]]] = {
+    ("FHIR", "allowed_entry_methods"): (["POST"], {"interaction": "transaction"}),
+    ("FHIR", "allowed_entry_types"): (["Patient"], {"interaction": "transaction"}),
+}
+
+
 def _call_with_sentinels(fn: Any) -> Any:
     """Invoke the factory with SENTINEL in every credential-shaped parameter.
 
@@ -202,6 +213,11 @@ def _call_with_sentinels(fn: Any) -> Any:
             # it examined nothing and passed vacuously. A guard that passes because it looked at
             # nothing is the defect this file exists for, and it nearly shipped inside the
             # generalisation of it.
+            if (fn.__name__, p.name) in GRAMMAR_BOUND_CONTAINERS:
+                value, companions = GRAMMAR_BOUND_CONTAINERS[fn.__name__, p.name]
+                kwargs[p.name] = value
+                kwargs.update(companions)
+                continue
             kwargs[p.name] = (
                 {"PWD": SENTINEL, "Encrypt": "yes"}
                 if "odbc" in p.name
@@ -386,6 +402,14 @@ HANDLED_CONTAINERS: dict[str, str] = {
     ),
     "capture_response_headers": "a list of header NAMES to capture; names are not values",
     "proxy_no_proxy": "hostname exclusions, public by nature",
+    "allowed_entry_methods": (
+        "FHIR Bundle entry HTTP verbs a connection may send (vault BACKLOG #2804) -- a fixed "
+        "vocabulary of six words, refused at construction if anything else"
+    ),
+    "allowed_entry_types": (
+        "FHIR resource TYPE names a Bundle entry may name (vault BACKLOG #2804) -- ASCII letters "
+        "only by construction, public by nature"
+    ),
 }
 
 

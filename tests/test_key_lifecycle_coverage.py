@@ -126,6 +126,8 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/store/crypto.py": frozenset({_DEK}),
     # BACKLOG #2592: the row-seal key is HKDF-derived from the DEK's authorization root.
     "messagefoundry/store/row_seal.py": frozenset({_DEK}),
+    # BACKLOG #2593: opens queue payload cells, sealed under the DEK, under their routing tag.
+    "messagefoundry/store/queue_tag.py": frozenset({_DEK}),
     "messagefoundry/store/backup_codec.py": frozenset({_DEK}),
     "messagefoundry/store/keyprovider_vault.py": frozenset({_DEK}),
     "messagefoundry/store/crypto_transit.py": frozenset({_DEK}),

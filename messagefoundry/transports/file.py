@@ -62,6 +62,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    float_setting,
     intake_open,
     poll_interval,
     positive_cap,
@@ -360,8 +361,8 @@ def _member_cap(value: object) -> int:
     )
     if cap is None:  # zero, in some spelling
         raise ValueError(
-            f"file source max_decompressed_members={value!r} must be above zero "
-            f"({_MEMBER_CAP_OFF_HINT})"
+            "file source max_decompressed_members must be above zero "
+            f"(value withheld; {_MEMBER_CAP_OFF_HINT})"
         )
     return cap
 
@@ -673,7 +674,9 @@ class FileSource(SourceConnector):
         self._root_real = self.directory.resolve()
         self.pattern: str = s.get("pattern", "*")
         self.poll_seconds: float = poll_interval(s, default=1.0, transport="file source")
-        self.min_age_seconds: float = float(s.get("min_age_seconds", 0.0))
+        self.min_age_seconds: float = float_setting(
+            s.get("min_age_seconds", 0.0), knob="min_age_seconds", transport="file source"
+        )
         self.after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self.after_read not in ("move", "delete", "leave"):
             raise ValueError(
@@ -728,6 +731,15 @@ class FileSource(SourceConnector):
             knob="max_decompressed_bytes",
             transport="file source",
         )
+        if self.decompress is not None and self.max_decompressed_bytes is None:
+            # Turning the bomb guard off is documented, so it is allowed, but it is said once at build
+            # so it is never silent (BACKLOG #1129). Off without decompress changes nothing, so that
+            # case says nothing. The line names the setting, never its value.
+            logger.warning(
+                "file source %s: max_decompressed_bytes is off, so a compressed drop inflates with "
+                "no byte ceiling; set a positive value to bound it",
+                config.name or self.directory,
+            )
         # Caps the gzip members in one drop (BACKLOG #1129). Only consulted when `decompress` is set,
         # but read at build either way, like `max_decompressed_bytes`, so a typo fails early.
         self.max_decompressed_members: int = _member_cap(s.get("max_decompressed_members"))

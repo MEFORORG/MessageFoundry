@@ -74,6 +74,7 @@ from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
+    ExportStopped,
     RepeatedCredentialError,
     alert_administrator_granted,
     alert_directory_administrator_granted,
@@ -86,6 +87,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     pending_credential_deadline_for,
     public_route,
+    recheck_standing,
     record_repeated_credential,
     require,
     require_reauth_only_action,
@@ -1964,6 +1966,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         until: EpochSeconds | None = Query(
             None, description="inclusive upper bound on the epoch-float ts"
         ),
+        token: str | None = Depends(bearer_token_dependency),
     ) -> StreamingResponse:
         """Stream the filtered audit trail as a downloadable CSV report (BACKLOG #170), so a compliance
         officer can produce a scoped, offline audit report without a downstream SIEM.
@@ -1991,7 +1994,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The later pages are read after the 200 status and the ``audit.export`` row, so a body that
         ends before ``count`` rows -- a store failure, a disconnect, a page that comes back short --
-        cannot change either. The engine log records how many of ``count`` rows were sent."""
+        cannot change either. The engine log records how many of ``count`` rows were sent.
+
+        The caller is resolved again from ``token`` before each page is sent (BACKLOG #1154). A
+        failed standing stops the stream. So does a caller who may now read fewer rows than the
+        export started with. A stop records ``audit.export.stopped`` and aborts. The JSON route
+        reads ``token`` from the bearer, and the console's ``/ui/audit/export`` passes its cookie
+        session."""
+        # A direct caller that passed no token hands on the Depends marker. Refuse it here, before
+        # the audit.export row, so a wiring fault never reads as a revoked grant in the trail.
+        if not isinstance(token, str):
+            raise TypeError("export_audit needs the caller's session token")
         page_size = min(limit, _AUDIT_EXPORT_PAGE)
 
         async def _page(size: int, before_id: int | None) -> Sequence[Any]:
@@ -2044,14 +2057,68 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             client=client_ip(request),
         )
 
+        touch_every = service.session_idle_seconds / 4
+        start_exclusion = audit_exclusion_for(identity)
+
+        async def _stop_reason(touch: bool) -> str | None:
+            """Why the export must stop before its next page, or ``None`` to send it. Asked per
+            page rather than per row. A page is one store read and one chunk, so a change lands
+            within one page. Per row would add a session lookup for each of up to 1,000,000 rows."""
+            current = await recheck_standing(
+                service, token, Permission.AUDIT_EXPORT, activity=touch
+            )
+            if current is None:
+                return "standing_changed"
+            # The pages are read with the starting identity's exclusion. If the caller may now
+            # read fewer rows, as after losing users:manage, the export stops. If it may read the
+            # same rows or more, it goes on: the start already hid at least as much.
+            exclusion = audit_exclusion_for(current)
+            if exclusion is not None and exclusion != start_exclusion:
+                return "scope_changed"
+            return None
+
         async def _iter_csv() -> AsyncIterator[str]:
             buf = io.StringIO()
             writer = csv.writer(buf)
             writer.writerow(["ts", "actor", "action", "channel_id", "client", "detail"])
             page, remaining = first, count
+            stopped: str | None = None
+            # A flowing download is the caller's own act, so it moves the idle clock at most every
+            # quarter of the idle window, as the message export does. The clock starts now because
+            # the gate has just moved it. A stall of about three quarters of the window can still
+            # idle the session, and the next page's re-check then ends both.
+            last_touch = time.monotonic()
             try:
                 yield buf.getvalue()
                 while page:
+                    touch = time.monotonic() - last_touch >= touch_every
+                    if touch:
+                        last_touch = time.monotonic()
+                    stopped = await _stop_reason(touch)
+                    if stopped is not None:
+                        # Counts only, never a row.
+                        _log.warning(
+                            "audit export by %s stopped after %d of %d rows: %s",
+                            identity.username,
+                            count - remaining,
+                            count,
+                            stopped,
+                        )
+                        await service.store.record_audit(
+                            "audit.export.stopped",
+                            actor=identity.username,
+                            detail=json.dumps(
+                                {
+                                    "count": count,
+                                    "streamed": count - remaining,
+                                    "reason": stopped,
+                                }
+                            ),
+                            client=client_ip(request),
+                        )
+                        raise ExportStopped(
+                            f"audit export stopped after {count - remaining} of {count} rows"
+                        )
                     # One chunk per page, not per row. Neutralize spreadsheet formula injection
                     # (CWE-1236) in every string cell before it reaches the CSV a compliance officer
                     # may open in Excel/Sheets.
@@ -2080,8 +2147,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             finally:
                 # The 200 and the audit.export row are already out, so an early end -- an
                 # exception, a cancel, a closed generator, a short page -- can only be logged. The
-                # row count is metadata, never a body.
-                if remaining > 0:
+                # row count is metadata, never a body. A stop has logged its own line.
+                if remaining > 0 and stopped is None:
                     _log.warning(
                         "audit export by %s ended early: %d of %d rows sent",
                         identity.username,

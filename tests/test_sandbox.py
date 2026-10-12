@@ -21,7 +21,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -50,6 +50,7 @@ from messagefoundry.pipeline.sandbox import (
     _StderrRelay,
 )
 from messagefoundry.store.store import MessageStore
+from tests.test_db_lookup import sandbox_run_one  # noqa: F401 - a fixture
 
 # A minimal, conformant synthetic ADT^A01 (no PHI — fabricated ids/names).
 RAW = "MSH|^~\\&|SEND|F|RECV|F|20240101120000||ADT^A01|MSG00001|P|2.3\rPID|1||900001||DOE^JANE\r"
@@ -221,6 +222,12 @@ def h_spin(msg):
 def h_lookup(msg):
     db_lookup("SOME_DB", "select 1", ())  # live bridge — forbidden in the sandbox
     return Send("OB_T", str(msg))
+
+
+@handler("h_oom")
+def h_oom(msg):
+    # Stands in for a call that ran out of memory, on a platform with no memory cap to hit.
+    raise MemoryError
 """
 
 
@@ -365,6 +372,326 @@ def test_a_reused_worker_has_no_lifetime_cpu_budget(graph: tuple[Registry, str])
         session.close()
 
 
+# --- the memory cap: headroom above the loaded graph, and a worker that hits it is recycled ------
+# Vault BACKLOG #3133 part 2, owner ruling 2026-10-11. The worker used to set RLIMIT_AS to mem_mb once
+# after load_config, so the cap covered the graph it had already loaded, and every thread's glibc
+# arena reserved about 64 MiB of address space that stayed mapped after the thread exited.
+
+_MEM_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_M", MLLP(port=19321), router="r")
+outbound("OB_T", MLLP(host="127.0.0.1", port=19322))
+
+# Held for the worker's whole life, so the loaded graph is bigger than the cap the tests set. bytes(n)
+# is calloc'd and never touched, so it costs address space and VmData, not resident memory.
+_BALLAST = bytes(__BALLAST__ * 1024 * 1024)
+
+
+@router("r")
+def r(msg):
+    return "h_alloc"
+
+
+@handler("h_alloc")
+def h_alloc(msg):
+    # An innocent call: about 100 MiB, then released. RLIMIT_DATA counts it whether or not it is
+    # touched, so it is not written.
+    block = bytes(100 * 1024 * 1024)
+    del block
+    return Send("OB_T", "ALLOCATED")
+
+
+@handler("h_runaway")
+def h_runaway(msg):
+    hoard = []
+    while True:
+        hoard.append(bytes(16 * 1024 * 1024))
+
+
+@handler("h_threads")
+def h_threads(msg):
+    # Four threads, all alive until the barrier, so with no arena limit each gets its own malloc
+    # arena. Each in turn holds 2000 x 32 KiB, about 62.5 MiB, and then lets it go. 32 KiB is under
+    # glibc's 128 KiB mmap threshold, so the blocks come from the thread's arena and grow it. Taking
+    # turns keeps the memory live at any moment to one thread's worth, so only what the arenas KEEP
+    # can add up. Stacks are pinned at 2 MiB so the host's RLIMIT_STACK does not move the sums. The
+    # reply counts the threads that failed.
+    import threading
+
+    turn = threading.Lock()
+    barrier = threading.Barrier(4)
+    failed = []
+
+    def work():
+        try:
+            with turn:
+                blocks = [bytearray(32 * 1024) for _ in range(2000)]
+                del blocks
+            barrier.wait(timeout=20)
+        except (MemoryError, threading.BrokenBarrierError):
+            failed.append(1)
+
+    previous = threading.stack_size(2 * 1024 * 1024)
+    try:
+        threads = [threading.Thread(target=work) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        threading.stack_size(previous)
+    return Send("OB_T", f"JOINED:{len(failed)}")
+"""
+
+
+def _mem_graph(tmp_path: Path, ballast_mib: int) -> tuple[Registry, str]:
+    graph = tmp_path / "graph.py"
+    graph.write_text(_MEM_GRAPH.replace("__BALLAST__", "0"), encoding="utf-8")
+    registry = load_config(tmp_path)
+    # Only the worker needs the ballast. It loads the graph when it is first spawned, after this
+    # rewrite, so the test process never holds it.
+    graph.write_text(_MEM_GRAPH.replace("__BALLAST__", str(ballast_mib)), encoding="utf-8")
+    return registry, str(tmp_path)
+
+
+def _mem_session(
+    config_dir: str, mem_mb: int, pass_environment: tuple[str, ...] = ()
+) -> SandboxSession:
+    return _session(
+        config_dir,
+        "IB_M",
+        SandboxPolicy(
+            mode=SandboxMode.SUBPROCESS,
+            wall_seconds=30.0,
+            mem_mb=mem_mb,
+            pass_environment=pass_environment,
+        ),
+    )
+
+
+def _alloc(registry: Registry, session: SandboxSession) -> list[tuple[str, str]]:
+    return _deliveries(registry, "h_alloc", sandbox=session, run_context=RunContext())
+
+
+#: The platform predicate behind :data:`_LINUX_ONLY`, shared with the GitHub Actions guard below.
+_ON_LINUX = sys.platform.startswith("linux")
+
+_LINUX_ONLY = pytest.mark.skipif(
+    not _ON_LINUX,
+    reason="mem_mb is headroom above the loaded graph only on Linux, which has /proc/self/status",
+)
+
+
+@_LINUX_ONLY
+def test_a_graph_larger_than_mem_mb_does_not_fail_an_innocent_call(tmp_path: Path) -> None:
+    # The graph holds 192 MiB and the cap is 128 MiB. An absolute cap would leave no room at all.
+    registry, config_dir = _mem_graph(tmp_path, ballast_mib=192)
+    session = _mem_session(config_dir, mem_mb=128)
+    try:
+        assert _alloc(registry, session) == [("OB_T", "ALLOCATED")]
+    finally:
+        session.close()
+
+
+@_LINUX_ONLY
+def test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker(tmp_path: Path) -> None:
+    registry, config_dir = _mem_graph(tmp_path, ballast_mib=0)
+    session = _mem_session(config_dir, mem_mb=128)
+    try:
+        with pytest.raises(SandboxError, match="ran out of memory") as caught:
+            _deliveries(registry, "h_runaway", sandbox=session, run_context=RunContext())
+        assert "128 MiB above the loaded graph" in str(caught.value)
+        # The worker exited and was reaped, so the next message gets a fresh one and succeeds.
+        assert session._proc is None
+        assert _alloc(registry, session) == [("OB_T", "ALLOCATED")]
+    finally:
+        session.close()
+
+
+#: The cap for the two thread tests below; the first one's docstring gives the arithmetic.
+_THREADS_MEM_MB = 320
+
+
+def _run_threads(
+    tmp_path: Path, pass_environment: tuple[str, ...] = ()
+) -> tuple[Registry, list[tuple[str, str]], SandboxSession]:
+    """Run ``h_threads`` on a fresh worker capped at :data:`_THREADS_MEM_MB`; return the registry,
+    what the call delivered, and the still-open session, whose worker is the one that ran it."""
+    registry, config_dir = _mem_graph(tmp_path, ballast_mib=0)
+    session = _mem_session(config_dir, _THREADS_MEM_MB, pass_environment)
+    try:
+        delivered = _deliveries(registry, "h_threads", sandbox=session, run_context=RunContext())
+    except BaseException:
+        session.close()
+        raise
+    return registry, delivered, session
+
+
+def _is_glibc() -> bool:
+    import platform
+
+    return platform.libc_ver()[0] == "glibc"
+
+
+def _is_gil_build() -> bool:
+    import sysconfig
+
+    return not sysconfig.get_config_var("Py_GIL_DISABLED")
+
+
+def _overcommit_not_mode_2() -> bool:
+    try:
+        return Path("/proc/sys/vm/overcommit_memory").read_text(encoding="ascii").strip() != "2"
+    except OSError:
+        return False
+
+
+def _glibc_arenas_keep_their_peak() -> bool:
+    """Whether the control below can see the defect: glibc malloc reached through the GIL build's
+    ``PyMem_Malloc``, with overcommit not in mode 2, where glibc gives a trimmed arena back instead."""
+    return _is_glibc() and _is_gil_build() and _overcommit_not_mode_2()
+
+
+@_LINUX_ONLY
+def test_threads_a_call_joined_do_not_spend_the_memory_cap(tmp_path: Path) -> None:
+    """Four threads each grow a malloc arena by about 62.5 MiB, in turn, and are joined. Then the
+    same worker serves an innocent 100 MiB call.
+
+    The cap is 320 MiB of headroom. The arithmetic, by reasoning; it was not measured before this
+    test was written (vault BACKLOG #3133 part 2). Stacks are 2 MiB, so four live stacks are 8 MiB,
+    and glibc's cache of about 40 MiB keeps all four after the join.
+
+    - With the worker's ``MALLOC_ARENA_MAX=2``, the threads share the main arena and one thread
+      arena. The thread arena keeps at most its first heap, 64 MiB; the main arena is the ``brk``
+      heap, which glibc trims, so it adds at most a further 64 MiB and usually far less. So at most
+      about 136 MiB is held after the join, and the 100 MiB call needs at most about 236 of the 320.
+    - Without it, each thread gets its own arena. glibc trims an arena with ``MADV_DONTNEED``, which
+      leaves its peak writable and counted in ``VmData``. Four arenas keep about 250 MiB, which with
+      the stacks is about 258 MiB during the call, under the cap. After the join the same 258 MiB is
+      still held, so the 100 MiB call needs about 358 MiB and fails. The test below runs that case.
+
+    Under the old ``RLIMIT_AS`` cap the four arenas' 64 MiB reservations, 256 MiB, would have spent
+    it as well."""
+    registry, delivered, session = _run_threads(tmp_path)
+    try:
+        assert delivered == [("OB_T", "JOINED:0")]
+        assert session._proc is not None
+        pid = session._proc.pid
+        assert _alloc(registry, session) == [("OB_T", "ALLOCATED")]
+        # The same worker served both calls: the second was not rescued by a respawn.
+        assert session._proc is not None and session._proc.pid == pid
+    finally:
+        session.close()
+
+
+@_LINUX_ONLY
+@pytest.mark.skipif(
+    _ON_LINUX and not _glibc_arenas_keep_their_peak(),
+    reason="needs glibc arenas that keep their peak: glibc, the GIL build, overcommit not mode 2",
+)
+def test_without_the_arena_limit_threads_do_spend_the_memory_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The positive control for the test above: the same calls, with ``MALLOC_ARENA_MAX=64`` passed
+    through ``[sandbox].pass_environment``, which the worker's own default does not override. Each
+    thread gets its own arena, the four arenas keep about 250 MiB counted after the join, and the
+    innocent 100 MiB call on the same worker runs out of memory. No thread fails during the call, so
+    it is what the arenas KEPT that fails the next one. Setting the variable in this test process
+    changes nothing here: glibc reads it only when a process starts."""
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "64")
+    registry, delivered, session = _run_threads(tmp_path, pass_environment=("MALLOC_ARENA_MAX",))
+    try:
+        assert delivered == [("OB_T", "JOINED:0")]
+        with pytest.raises(SandboxError, match="ran out of memory"):
+            _alloc(registry, session)
+    finally:
+        session.close()
+
+
+@pytest.mark.skipif(
+    not (_ON_LINUX and os.environ.get("GITHUB_ACTIONS") == "true"),
+    reason="asserts the thread tests' preconditions only on a GitHub Actions Linux runner",
+)
+def test_on_github_actions_linux_both_thread_tests_run(
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    """Evidence that the two thread tests above RAN on the hosted Linux leg, not skipped.
+
+    That leg runs ``pytest -q`` and uploads no per-test report, so a green run cannot tell a pass
+    from a skip. This test fails, rather than skips, if any condition either test skips on is false
+    there. It calls the same predicate functions their decorators call, so a change to one of
+    those predicates reaches both. A NEW skip condition on either test does not: add it here too.
+    It also asserts what the worker needs to take its ``RLIMIT_DATA`` path rather than the absolute
+    ``RLIMIT_AS`` fallback: Linux 4.7 or later, and a ``VmData`` line in ``/proc/self/status``. It
+    reads those through the worker's own functions, in this process, on the kernel the worker
+    shares. So a green ubuntu leg with this test passing proves both decisive tests ran (vault
+    BACKLOG #3133 part 2). The cost is deliberate: if a runner image ever sets overcommit mode 2
+    or hides ``/proc``, this test reds every ubuntu leg with no code change, and that is the signal
+    that the decisive tests stopped running, not a flake."""
+    from messagefoundry.pipeline import _sandbox_worker
+
+    preconditions = {
+        "Linux": _ON_LINUX,
+        "glibc": _is_glibc(),
+        "the GIL build": _is_gil_build(),
+        "overcommit not in mode 2": _overcommit_not_mode_2(),
+        "Linux 4.7 or later": _sandbox_worker._rlimit_data_counts_mmap(),
+        "VmData in /proc/self/status": _sandbox_worker._proc_status_kib("VmData") is not None,
+    }
+    assert all(preconditions.values()), (
+        "the thread memory-cap tests would skip or misfire here; unmet: "
+        f"{[name for name, met in preconditions.items() if not met]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("release", "counts"),
+    [
+        ("6.8.0-1017-azure", True),
+        ("5.15.0-91-generic", True),
+        ("4.7.0", True),
+        ("4.4.0-210-generic", False),
+        ("3.10.0-1160.el7.x86_64", False),
+        ("unparseable", False),
+    ],
+)
+def test_rlimit_data_is_trusted_only_from_linux_4_7(
+    release: str,
+    counts: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    # Before 4.7 RLIMIT_DATA counted only the brk heap, so the worker keeps the absolute RLIMIT_AS cap.
+    from messagefoundry.pipeline import _sandbox_worker
+
+    # The worker's own `os` is this module; raising=False because Windows has no os.uname.
+    monkeypatch.setattr(os, "uname", lambda: SimpleNamespace(release=release), raising=False)
+    assert _sandbox_worker._rlimit_data_counts_mmap() is counts
+
+
+def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
+    graph: tuple[Registry, str],
+) -> None:
+    # Runs on every platform: the Handler raises MemoryError itself, so no cap is needed to reach the
+    # reporting and recycling path.
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is not None
+        first = session._proc.pid
+        with pytest.raises(SandboxError, match="ran out of memory, and its worker was recycled"):
+            _deliveries(registry, "h_oom", sandbox=session, run_context=RunContext())
+        assert session._proc is None
+        assert _deliveries(
+            registry, "h_ok", sandbox=session, run_context=RunContext()
+        ) == _deliveries(registry, "h_ok")
+        assert session._proc is not None and session._proc.pid != first
+    finally:
+        session.close()
+
+
 # --- (d) db_lookup / fhir_lookup are forbidden in the sandbox, fail-closed -----
 
 
@@ -494,11 +821,16 @@ def test_run_context_codec_snapshots_mappingproxy_views() -> None:
 # --- the IPC boundary itself (MFW2 codec) -------------------------------------
 
 
-def _session(config_dir: str, inbound: str = "IB_T", **kw: object) -> SandboxSession:
+def _session(
+    config_dir: str,
+    inbound: str = "IB_T",
+    policy: SandboxPolicy | None = None,
+    **kw: object,
+) -> SandboxSession:
     # The default lives in this TEST helper only, never in the production constructor, where a default
     # would silently reinstate the unattributable relay ADR 0176 exists to close.
     return SandboxSession(
-        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        policy or SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
         inbound=inbound,
         config_dir=config_dir,
         env=None,

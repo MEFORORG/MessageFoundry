@@ -318,7 +318,7 @@ Per ASVS's guidance, stated as what **is** included rather than what is excluded
 **Included:** the MessageFoundry engine, the web console, the IDE extension, the test harness
 (`harness/`, distributed separately as the harness wheel), and the operator-run scripts, assessed as
 source, at a named commit, against **all 345 ASVS 5.0.0 requirements** at **Level 3**. The
-operator-run scripts are `scripts/service/`, less the one file named below, and any script the
+operator-run scripts are `scripts/service/` and any script the
 operator documentation tells a deployer to run; the rest of `scripts/` (CI, development, ASVS, benchmark, coordination and release
 tooling) is not included, and neither is `tee/`, the tee relay.
 
@@ -333,13 +333,27 @@ Each part of that rests on an owner ruling of 2026-10-02, recorded in the vault 
 * **R4** answered *"No"* for `tee/`, the tee relay. It ships in no wheel, and it is outside the
   scope although `docs/TEE-RELAY.md` tells a site to run it.
 
-**Two files are classified by a Manager's reading, not by the owner, and the owner may overrule
-it.** That reading is recorded in the same vault file, under R3. Both are out:
+`samples/config`, the example site configuration, is out of the scope, by owner ruling of
+2026-10-12. That ruling is R5 of `docs/security/ASVS-OWNER-RULINGS-2026-10-12-3050.md`, in the
+vault. R8 of the same file confirms it, asked with the code defaults below in its premise. The
+directory ships in no wheel. The ruling names that directory only; the scope sentence above
+classifies the rest of `samples/`. In-scope code still points at `samples/config` by default: at
+least the engine CLI's `--config` default, the IDE extension's config directory setting, and
+`scripts/service/install-service.ps1`. That code is graded as in-scope code. The samples it loads
+are not assessed as shipped code, because R8 declined the option that would have made them so.
 
-* `scripts/service/measure-store-access.ps1` sits under `scripts/service/`, but
-  `docs/DANGEROUS-FUNCTIONALITY.md` calls it *"A CI measurement, not a deployment step"*. That
-  document also says how to run it, on a disposable host, which a later reading may weigh
-  differently.
+**`scripts/service/measure-store-access.ps1` is in, by owner ruling of 2026-10-05.** That ruling is
+R1 of `docs/security/ASVS-OWNER-RULINGS-2026-10-05-112.md`, in the vault. It replaced a Manager's
+reading under R3 of the 2026-10-02 file, and that file's R3 text still puts the script out. The
+earlier reading rested on `docs/DANGEROUS-FUNCTIONALITY.md`, which calls the script *"A CI
+measurement, not a deployment step"*. The option the owner chose said its writer had not read that
+reason. The ruling governs all the same, and reopening it is the owner's call. The script sits
+under `scripts/service/`, so the scope sentence above covers it with no exception. A cell graded
+while the script was read as out is stale on this point until someone re-reads it.
+
+**One file is classified by a Manager's reading, not by the owner, and the owner may overrule
+it.** That reading is recorded in the 2026-10-02 vault file, under R3. The file is out:
+
 * `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
   `messagefoundry/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
   engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
@@ -630,10 +644,11 @@ and the table prints the date in its own column either way.
 - No ruling says what the stamps hold for a cell that never had a full read.
 
 **Tools written before these rulings may read the stamps differently.** This section governs what an
-assessor writes, and the tools follow it. At least two do not yet. The writer,
-`scripts/asvs/apply.py`, dates an anchor repair from the payload's `last_verified`. The rendered
-page's `Verdict bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing
-the tools into line is unfiled work.
+assessor writes, and the tools follow it. At least one does not yet. The rendered page's `Verdict
+bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing it into line is
+unfiled work. The writer, `scripts/asvs/apply.py`, dated an anchor repair from the payload's
+`last_verified` until BACKLOG #2865. A repair payload now states its own `anchor_repaired_at`, and
+the writer refuses one that does not, or one dated before the repair the record already holds.
 
 The first ruling was given in session on 2026-10-08, after adversarial review, and the other two on
 2026-10-09. All are recorded on pull requests in the `MessageFoundry-vault` repository, and a

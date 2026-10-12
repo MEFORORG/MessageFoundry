@@ -88,6 +88,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     count_setting,
+    float_setting,
     intake_open,
     poll_interval,
     register_destination,
@@ -1304,7 +1305,11 @@ class DatabaseDestination(DestinationConnector):
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE destination"
         )
-        self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
+        self._acquire_timeout = float_setting(
+            s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
+            knob="acquire_timeout",
+            transport="DATABASE destination",
+        )
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
         # ADR 0013: capture the statement's result-set (its RETURNING/OUTPUT rows). Default False →
@@ -1619,7 +1624,11 @@ class DatabaseSource(SourceConnector):
         self._pool_max = count_setting(
             s.get("pool_max", 5), knob="pool_max", transport="DATABASE source"
         )
-        self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
+        self._acquire_timeout = float_setting(
+            s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
+            knob="acquire_timeout",
+            transport="DATABASE source",
+        )
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
         self._handler: InboundHandler | None = None
@@ -2049,8 +2058,10 @@ class DatabaseLookupExecutor:
             self._login_timeout[cname] = _login_timeout(
                 s, f"DatabaseLookup {cname!r}", dialect="sqlserver"
             )
-            self._acquire_timeout[cname] = float(
-                s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)
+            self._acquire_timeout[cname] = float_setting(
+                s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
+                knob="acquire_timeout",
+                transport=f"DatabaseLookup {cname!r}",
             )
             self._max_rows[cname] = _lookup_max_rows(s.get("max_rows"), cname)
         self._pools: dict[str, Any] = {}

@@ -1749,6 +1749,44 @@ def test_file_source_member_cap_refuses_zero_and_bad_values(bad: object) -> None
         FileSource(Source(type=ConnectorType.FILE, settings=settings))
 
 
+def _decompressed_cap_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "max_decompressed_bytes is off" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("off", [0, None, "0"], ids=["zero", "none", "zero-text"])
+def test_file_source_warns_once_when_the_decompressed_byte_cap_is_off(
+    off: object, caplog: pytest.LogCaptureFixture
+) -> None:  # #1129
+    # Off is documented and allowed, but never silent. The line names the connection and the setting.
+    settings = {"directory": "x", "decompress": "gzip", "max_decompressed_bytes": off}
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        src = FileSource(Source(type=ConnectorType.FILE, name="IB_DEMO_ADT", settings=settings))
+    assert src.max_decompressed_bytes is None
+    [record] = _decompressed_cap_warnings(caplog)
+    assert "IB_DEMO_ADT" in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        pytest.param({"decompress": "gzip", "max_decompressed_bytes": 1024}, id="positive-cap"),
+        pytest.param({"decompress": "gzip"}, id="default-cap"),
+        pytest.param({"max_decompressed_bytes": 0}, id="off-without-decompress"),
+    ],
+)
+def test_file_source_does_not_warn_while_the_decompressed_byte_cap_holds(
+    settings: dict[str, object], caplog: pytest.LogCaptureFixture
+) -> None:  # #1129
+    # Without decompress the cap is never read, so turning it off changes nothing to warn about.
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        FileSource(Source(type=ConnectorType.FILE, settings={"directory": "x", **settings}))
+    assert _decompressed_cap_warnings(caplog) == []
+
+
 async def test_file_source_quarantines_corrupt_archive(tmp_path: Path) -> None:
     # A file that isn't a valid gzip stream is quarantined to .error, never crashes the poller.
     inbox = tmp_path / "in"

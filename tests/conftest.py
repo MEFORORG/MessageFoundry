@@ -23,9 +23,9 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -35,7 +35,7 @@ from tests._qt_cycles import collect_qobjects_in_cycles
 from tests._root_logging import root_logging_restored
 
 if TYPE_CHECKING:
-    from messagefoundry.config.wiring import _WinConfigSourceProbes
+    from messagefoundry.config.wiring import _WinConfigSourceProbes, _WinPathSecurity
 
 # A helper module holding the content-free asserts several connector tests share. pytest rewrites
 # asserts only in test modules unless told, and an unrewritten assert vanishes under `python -O`.
@@ -208,7 +208,7 @@ def _clean_config_source_probes() -> _WinConfigSourceProbes:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[[Path], None] | None]:
+def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[..., None] | None]:
     """The suite loads sample/harness configs from the repo checkout, which is intentionally
     user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``
     write, so the SEC-003 config-source trust guard would fail-closed on every config load.
@@ -254,9 +254,11 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[[Path], N
         )
     probes = _clean_config_source_probes()
 
+    # The one Windows seam: the config load and the serve start check (vault BACKLOG #2626) both
+    # read through it, so replacing it covers the settings file, the value file and the install.
     @functools.wraps(real)
-    def check_over_clean_readers(directory: Path) -> None:
-        wiring._enforce_windows_config_source(directory, probes)
+    def check_over_clean_readers(paths: Sequence[Path], **options: Any) -> None:
+        wiring._enforce_windows_paths(paths, probes, **options)
 
     patch = pytest.MonkeyPatch()
     patch.setattr(wiring, "_assert_safe_config_source_windows", check_over_clean_readers)
@@ -269,16 +271,57 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[[Path], N
 @pytest.fixture
 def real_config_source_readers(
     monkeypatch: pytest.MonkeyPatch,
-    _read_the_checkout_as_a_clean_config_source: Callable[[Path], None] | None,
+    _read_the_checkout_as_a_clean_config_source: Callable[..., None] | None,
 ) -> None:
     """Put the gate's real Windows call back for one test, so it reads through
     ``_win32_config_source_probes``: the real access list, or the readers a test hands it. A no-op
     off win32, where the session fixture above installs nothing."""
     if _read_the_checkout_as_a_clean_config_source is not None:
+        import messagefoundry.config.wiring as wiring
+
         monkeypatch.setattr(
-            "messagefoundry.config.wiring._assert_safe_config_source_windows",
+            wiring,
+            "_assert_safe_config_source_windows",
             _read_the_checkout_as_a_clean_config_source,
         )
+
+
+#: Everyone, the broad principal ``fake_windows_readers`` grants write to.
+_EVERYONE_SID = "S-1-1-0"
+
+
+@pytest.fixture
+def fake_windows_readers(
+    monkeypatch: pytest.MonkeyPatch, real_config_source_readers: None
+) -> Callable[[Callable[[Path], bool]], list[Path]]:
+    """Route the config-source policy down its Windows branch over fake readers, on every host.
+
+    Call the result with a predicate: a path it accepts grants Everyone write, and every other path
+    reads clean, owned by the engine's own account. It returns the list of paths read, in order."""
+    import messagefoundry.config.wiring as wiring
+
+    full = 0x10000000 | 0x40000000 | 0x1FF
+    modify = 0x00000002 | 0x00000004 | 0x00000010 | 0x00010000
+    clean = wiring._WinPathSecurity(owner_sid=_SUITE_SID, aces=((0x00, full, _SUITE_SID),))
+    open_to_all = wiring._WinPathSecurity(
+        owner_sid=_SUITE_SID, aces=((0x00, modify, _EVERYONE_SID),)
+    )
+
+    def install(writable: Callable[[Path], bool]) -> list[Path]:
+        seen: list[Path] = []
+
+        def read_path(path: Path) -> _WinPathSecurity:
+            seen.append(path)
+            return open_to_all if writable(path) else clean
+
+        probes = wiring._WinConfigSourceProbes(
+            self_sid=_SUITE_SID, read_path=read_path, owner_in_admins=lambda _sid: False
+        )
+        monkeypatch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
+        monkeypatch.setattr("messagefoundry.config.wiring.sys.platform", "win32")
+        return seen
+
+    return install
 
 
 #: The env gates that put a session against a live server-DB container. CI sets one of them together

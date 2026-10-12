@@ -169,7 +169,11 @@ from messagefoundry.pipeline.phase_timing import (
     DeliveryPhaseTiming,
     delivery_phase_timing_enabled,
 )
-from messagefoundry.pipeline.reference_sync import database_source_dsn, reference_connection_name
+from messagefoundry.pipeline.reference_sync import (
+    database_source_dsn,
+    reference_acquire_timeout,
+    reference_connection_name,
+)
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import (
     GraphShape,
@@ -218,6 +222,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
 
 __all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
@@ -2071,7 +2076,7 @@ class RegistryRunner:
             self.store,
             self._reply_rendezvous,
             destination=str(settings["reply_from"]),
-            timeout=float(settings.get("reply_timeout") or 30.0),
+            timeout=reply_seconds(settings, "reply_timeout"),
             content_type=str(settings.get("reply_content_type") or "passthrough"),
             on_timeout=str(settings.get("reply_on_timeout") or "504"),
             metrics=metrics,
@@ -10848,6 +10853,9 @@ def _build_check_connectors(
         except WiringError:
             continue
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
+        # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
+        # refuse fails check here rather than as a failed sync after start.
+        reference_acquire_timeout(rsettings)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         resolved_fhir_lookups[fname] = _fhir_lookup_settings(fspec, env_values, egress)

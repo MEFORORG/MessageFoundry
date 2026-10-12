@@ -481,6 +481,16 @@ _HOSTILE: list[tuple[str, bytes]] = [
 ]
 
 
+@pytest.mark.parametrize("kind", ["denied", "error", codec.FAIL_MEMORY])
+def test_every_fail_kind_round_trips(kind: str) -> None:
+    # The closed fail-kind grammar, pinned kind by kind. "memory" tells the parent to reap the worker
+    # (vault BACKLOG #3133 part 2), so dropping it would turn every out-of-memory call into an
+    # "invalid frame" rejection.
+    body = codec.encode_fail(request_id="r:1", phase="transform", name=NAME, kind=kind, error="why")
+    resp = _decode(body)
+    assert (resp.ok, resp.kind, resp.error) == (False, kind, "why")
+
+
 @pytest.mark.parametrize(("case", "body"), _HOSTILE, ids=[c for c, _ in _HOSTILE])
 def test_hostile_frames_fail_closed(case: str, body: bytes) -> None:
     with pytest.raises(SandboxCodecError):

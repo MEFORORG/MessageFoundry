@@ -131,6 +131,7 @@ __all__ = [
     "narrow_tls13_suites",
     "narrow_to_approved_suites",
     "relax_verify_expiry",
+    "verifies_peer_fully",
     "warn_hostname_check_off",
     "requests_verify_from_anchor",
     "vault_client_verify_kwargs",
@@ -681,6 +682,23 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
 #: through an ``SSLContext`` — ftplib / httpx-style urllib openers / pynetdicom — with no per-transport
 #: post-handshake re-verification).
 _X509_V_FLAG_NO_CHECK_TIME = 0x200000
+
+
+def verifies_peer_fully(ctx: object) -> bool:
+    """Whether ``ctx`` is a client context that verifies its peer with nothing relaxed.
+
+    True only for an :class:`ssl.SSLContext` that requires a certificate, matches it to the host,
+    and still checks its validity period. So ``verify_tls=false`` (``CERT_NONE``),
+    ``tls_check_hostname=false`` and ``tls_allow_expired`` (:func:`relax_verify_expiry`) each answer
+    False, and so does anything that is not a context. The proxy-credential check in
+    ``transports.bounded_read`` asks it before a credential crosses a TLS leg (vault BACKLOG #3418).
+    """
+    return (
+        isinstance(ctx, ssl.SSLContext)
+        and ctx.verify_mode == ssl.CERT_REQUIRED
+        and ctx.check_hostname
+        and not ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME
+    )
 
 
 def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:

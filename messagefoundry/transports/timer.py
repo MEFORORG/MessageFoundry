@@ -29,6 +29,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     SourceConnector,
     intake_open,
+    positive_seconds,
     register_source,
 )
 
@@ -196,9 +197,11 @@ class TimerSource(SourceConnector):
         self._body_bytes = self.body.encode(self.encoding)
         self.run_once = bool(s.get("run_once", False))
         iv = s.get("interval_seconds")
-        self.interval_seconds: float | None = float(iv) if iv is not None else None
-        if self.interval_seconds is not None and self.interval_seconds <= 0:
-            raise ValueError("timer source 'interval_seconds' must be > 0")
+        self.interval_seconds: float | None = (
+            None
+            if iv is None
+            else positive_seconds(iv, knob="interval_seconds", transport="timer source")
+        )
         # Cron / calendar schedule (ADR 0011 amendment, BACKLOG #160). Exclusive with interval/run_once;
         # DST is driven by the optional `timezone` (an IANA name → aware wall clock) or, by default, the
         # system-local wall clock (the OS handles local DST, no tzdata needed).

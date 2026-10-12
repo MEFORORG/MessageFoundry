@@ -203,6 +203,7 @@ def test_fhir_conditional_incompatible_with_transaction() -> None:
     with pytest.raises(ValueError, match="incompatible"):
         _dest(
             interaction="transaction",
+            allowed_entry_methods=["POST"],
             conditional="if-none-exist",
             conditional_query="identifier=x|y",
         )
@@ -235,7 +236,8 @@ def test_resolve_update() -> None:
 
 
 def test_resolve_transaction_posts_to_base() -> None:
-    r = _dest(interaction="transaction")._resolve_request(as_json(BUNDLE_TRANSACTION))
+    dest = _dest(interaction="transaction", allowed_entry_methods=["POST", "DELETE"])
+    r = dest._resolve_request(as_json(BUNDLE_TRANSACTION))
     assert r == ("POST", BASE, {}, False)
 
 
@@ -1143,7 +1145,7 @@ def test_path_form_warns_at_construction_naming_the_connection(
     "over",
     [
         {"interaction": "create"},
-        {"interaction": "transaction"},
+        {"interaction": "transaction", "allowed_entry_methods": ["POST"]},
         {"conditional": "if-none-exist", "conditional_query": "identifier=s|v"},
         {"conditional": "conditional-update", "conditional_query": "identifier=s|v"},
     ],
@@ -1196,3 +1198,411 @@ def test_check_says_none_when_no_connection_takes_the_path_form(tmp_path: Any) -
     cfg = _write_feed(tmp_path, f'outbound("OB", FHIR(url="{BASE}", interaction="update"))\n')
     [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
     assert "no FHIR connection sets update_url_form='path'" in r.detail
+
+
+# --- the Bundle entry screen on transaction/batch (vault BACKLOG #2804) ---------------------------
+
+#: A canary in a query. A refusal must never echo a request.url or any part of it: a query can carry
+#: identifiers, which are PHI.
+URL_CANARY = "mf2804-url-canary"
+
+#: A transaction Bundle every screen below lets through: a create and a conditional update. Its own
+#: fixture, because the shared BUNDLE_TRANSACTION holds a conditional DELETE and feeds parsing tests.
+BUNDLE_SCREENED: dict[str, Any] = {
+    "resourceType": "Bundle",
+    "type": "transaction",
+    "entry": [
+        {
+            "resource": {"resourceType": "Patient", "name": [{"family": "Synthetic"}]},
+            "request": {"method": "POST", "url": "Patient"},
+        },
+        {
+            "resource": {"resourceType": "Patient", "active": True},
+            "request": {"method": "PUT", "url": "Patient?identifier=synthetic|2804"},
+        },
+    ],
+}
+
+
+def _bundle(*entries: object, bundle_type: str = "transaction") -> str:
+    return json.dumps({"resourceType": "Bundle", "type": bundle_type, "entry": list(entries)})
+
+
+def _entry(method: str, url: str, **extra: object) -> dict[str, object]:
+    return {"request": {"method": method, "url": url}, **extra}
+
+
+def _screened(
+    *methods: str, interaction: str = "transaction", **over: object
+) -> tuple[FhirDestination, _FakeOpener]:
+    dest = _dest(interaction=interaction, allowed_entry_methods=list(methods), **over)
+    opener = _FakeOpener(body=b"{}")
+    dest._opener = opener  # type: ignore[assignment]
+    return dest, opener
+
+
+async def _refused(dest: FhirDestination, opener: _FakeOpener, payload: str) -> str:
+    """Send ``payload``, assert it was refused unsent and permanently, and return the text."""
+    sent = len(opener.requests)
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(payload)
+    assert ei.value.permanent is True
+    assert ei.value.code == "bundle-entry-refused"
+    assert len(opener.requests) == sent  # never a partial send
+    # The parse error holds the body, so nothing is chained to the refusal.
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+    return str(ei.value)
+
+
+async def test_a_default_shaped_connection_refuses_a_delete_entry() -> None:
+    # THE ITEM: a Handler forwards an inbound Bundle, and its DELETE entry is not on the list.
+    dest, opener = _screened("POST", "PUT")
+    text = await _refused(
+        dest, opener, _bundle(_entry("DELETE", f"Patient?identifier={URL_CANARY}"))
+    )
+    assert "entry 0 (DELETE)" in text and "allowed_entry_methods" in text
+    assert URL_CANARY not in text and "Patient" not in text
+    # Control: the same connection sends the fixture, byte for byte, as the Handler gave it.
+    payload = as_json(BUNDLE_SCREENED)
+    await dest.send(payload)
+    [req] = opener.requests
+    assert (req.method, req.full_url) == ("POST", BASE)
+    assert req.data == payload.encode()
+
+
+@pytest.mark.parametrize("interaction", ["transaction", "batch"])
+def test_a_bundle_connection_without_the_method_list_is_refused(interaction: str) -> None:
+    with pytest.raises(ValueError, match="requires an 'allowed_entry_methods'"):
+        FHIR(url=BASE, interaction=interaction)  # type: ignore[arg-type]
+    # The connector refuses it too, for settings that did not come through the factory.
+    settings = {"url": BASE, "interaction": interaction}
+    with pytest.raises(ValueError, match="requires an 'allowed_entry_methods'"):
+        build_destination(
+            Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
+@pytest.mark.parametrize("setting", ["allowed_entry_methods", "allowed_entry_types"])
+@pytest.mark.parametrize(
+    "over",
+    [{}, {"interaction": "update"}, {"conditional": "if-match"}],
+    ids=["create", "update", "if-match"],
+)
+def test_the_entry_lists_are_refused_where_no_bundle_is_screened(
+    setting: str, over: dict[str, str]
+) -> None:
+    value = ["POST"] if setting == "allowed_entry_methods" else ["Patient"]
+    with pytest.raises(ValueError, match=f"{setting} applies only to interaction='transaction'"):
+        FHIR(url=BASE, **{setting: value}, **over)  # type: ignore[arg-type]
+    settings = {**FHIR(url=BASE, **over).settings, setting: value}  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=f"{setting} applies only"):
+        build_destination(
+            Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "match"),
+    [
+        ("allowed_entry_methods", [], "must not be empty"),
+        ("allowed_entry_methods", "POST", "must be a list"),
+        ("allowed_entry_methods", ["post"], "must each be one of"),
+        ("allowed_entry_methods", ["TRACE"], "must each be one of"),
+        ("allowed_entry_methods", ["POST", 1], "must each be one of"),
+        ("allowed_entry_types", [], "must not be empty"),
+        ("allowed_entry_types", ["Patient/1"], "must each be a FHIR resource type"),
+        ("allowed_entry_types", ["$expunge"], "must each be a FHIR resource type"),
+    ],
+)
+def test_a_malformed_entry_list_is_refused(setting: str, value: object, match: str) -> None:
+    over: dict[str, object] = {"allowed_entry_methods": ["POST"], setting: value}
+    with pytest.raises(ValueError, match=match):
+        FHIR(url=BASE, interaction="transaction", **over)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "$expunge",
+        "%24expunge",
+        "Patient/_search",
+        "Patient/$validate",
+        "Patient?x=1",
+        "https://elsewhere.example.org/fhir/Patient",
+        "/Patient",
+        "Patient\n",
+    ],
+)
+async def test_a_post_entry_must_name_a_bare_type(url: str) -> None:
+    dest, opener = _screened("POST")
+    text = await _refused(dest, opener, _bundle(_entry("POST", url)))
+    assert "entry 0 (POST) has a request.url that is not of the form 'Type'" in text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "Patient",  # a DELETE of the whole type
+        "Patient/",
+        "Patient/1/_history/2",
+        "Patient/_history",
+        "Patient/..",
+        "Patient/1#x",
+        "Patient\\1",
+        # A query with no criteria a lenient server would read can match every resource of the type.
+        "Patient?",
+        "Patient?&",
+        "Patient? ",
+        "Patient?identifier",
+        "Patient?identifier=",
+        "Patient?=x",
+        f"Patient?identifier={URL_CANARY}&",
+        f"Patient?identifier={URL_CANARY} x",
+        # A percent-encoded control character, which the server decodes back into one.
+        f"Patient?identifier={URL_CANARY}%0D%0AX-Injected:1",
+        "Patient?identifier=%00",
+        "Patient?identifier=%7f",
+        f"Patient?identifier={URL_CANARY}#x",
+        f"Patient?identifier=a\\{URL_CANARY}",
+        f"Patient?identifier={URL_CANARY}\r\nX-Injected: 1",
+        "$expunge?x=1",
+        "Patient/1?x=1",
+    ],
+)
+async def test_other_entries_must_name_type_and_id_or_type_and_query(url: str) -> None:
+    dest, opener = _screened("DELETE")
+    text = await _refused(dest, opener, _bundle(_entry("DELETE", url)))
+    assert "entry 0 (DELETE) has a request.url that is not of the form" in text
+    assert URL_CANARY not in text
+
+
+async def test_put_takes_a_conditional_url() -> None:
+    # The construction error for a connection-level conditional points authors at per-entry
+    # conditional URLs, so Type?query must stay allowed for PUT.
+    dest, opener = _screened("PUT")
+    payload = _bundle(
+        _entry("PUT", "Patient?identifier=x", resource={"resourceType": "Patient"}),
+        _entry("PUT", "Patient/p-1", resource={"resourceType": "Patient", "id": "p-1"}),
+        # Percent-encoding that is not a control character stays: a system URL needs it.
+        _entry(
+            "PUT",
+            "Patient?identifier=http%3A%2F%2Fsys.example.org%7Cp-2&_count=1",
+            resource={"resourceType": "Patient"},
+        ),
+    )
+    await dest.send(payload)
+    assert len(opener.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"resourceType":"Bundle","type":"transaction","entry":[{"request":'
+        '{"method":"POST","method":"DELETE","url":"Patient/1"}}]}',
+        '{"resourceType":"Bundle","type":"transaction","entry":[{"request":'
+        '{"method":"DELETE","method":"POST","url":"Patient"}}]}',
+        '{"resourceType":"Bundle","type":"transaction","type":"transaction","entry":[]}',
+        '{"resourceType":"Bundle","type":"transaction","entry":[{"resource":'
+        '{"resourceType":"Patient","id":"a","id":"b"},"request":{"method":"POST","url":"Patient"}}]}',
+    ],
+    ids=["post-then-delete", "delete-then-post", "bundle-level", "inside-a-resource"],
+)
+async def test_a_repeated_json_key_anywhere_is_refused(body: str) -> None:
+    # json.loads keeps the last of two equal keys and a server may keep the first, so the screen
+    # and the server could read different entries out of one body. Either order is refused.
+    dest, opener = _screened("POST", "DELETE")
+    assert "repeats a key" in await _refused(dest, opener, body)
+
+
+@pytest.mark.parametrize(
+    ("entry", "rule"),
+    [
+        ({"resource": {"resourceType": "Patient"}}, "has no request object"),
+        ({"request": "POST Patient"}, "has no request object"),
+        ("an entry", "is not a JSON object"),
+        (
+            {"request": {"method": "POST"}},
+            "has a request.method or request.url that is not a string",
+        ),
+        (
+            {"request": {"method": ["POST"], "url": "Patient"}},
+            "has a request.method or request.url that is not a string",
+        ),
+        (_entry("post", "Patient"), "has a request.method that is not a FHIR verb in upper case"),
+        (
+            _entry(f"X-{URL_CANARY}", "Patient"),
+            "has a request.method that is not a FHIR verb in upper case",
+        ),
+        (
+            _entry("POST", "Patient", resource={"resourceType": "Observation"}),
+            "(POST) carries a resource whose resourceType is not the request.url type",
+        ),
+        (
+            _entry("PUT", "Patient/1", resource={"resourceType": "Observation"}),
+            "(PUT) carries a resource whose resourceType is not the request.url type",
+        ),
+        (_entry("POST", "Patient", resource=None), "(POST) carries a resource"),
+    ],
+)
+async def test_a_malformed_entry_is_refused_not_skipped(entry: object, rule: str) -> None:
+    dest, opener = _screened("POST", "PUT")
+    # A good entry first, so the refusal is not just "the first entry is bad".
+    text = await _refused(dest, opener, _bundle(_entry("POST", "Patient"), entry))
+    assert f"entry 1 {rule}" in text
+    assert URL_CANARY not in text
+
+
+@pytest.mark.parametrize(
+    ("body", "rule"),
+    [
+        (
+            _bundle(_entry("POST", "Patient"), bundle_type="batch"),
+            "Bundle.type is not 'transaction'",
+        ),
+        (json.dumps({"resourceType": "Bundle", "entry": []}), "Bundle.type is not 'transaction'"),
+        (
+            json.dumps({"resourceType": "Patient", "type": "transaction"}),
+            "resourceType is not Bundle",
+        ),
+        ("[]", "resourceType is not Bundle"),
+        (json.dumps({"resourceType": "Bundle", "type": "transaction"}), "missing or not a list"),
+        (
+            json.dumps({"resourceType": "Bundle", "type": "transaction", "entry": {}}),
+            "missing or not a list",
+        ),
+        (f'{{"resourceType": "Bundle", "note": "{URL_CANARY}"', "not parseable JSON"),
+        ("<Bundle/>", "not parseable JSON"),
+    ],
+)
+async def test_the_bundle_itself_must_match_the_connection(body: str, rule: str) -> None:
+    dest, opener = _screened("POST")
+    text = await _refused(dest, opener, body)
+    assert rule in text and URL_CANARY not in text
+
+
+async def test_a_batch_connection_takes_a_batch_bundle_only() -> None:
+    dest, opener = _screened("POST", interaction="batch")
+    await _refused(dest, opener, _bundle(_entry("POST", "Patient")))
+    await dest.send(_bundle(_entry("POST", "Patient"), bundle_type="batch"))
+    assert len(opener.requests) == 1
+
+
+async def test_the_type_list_narrows_the_entries() -> None:
+    dest, opener = _screened("POST", "DELETE", allowed_entry_types=["Patient", "Observation"])
+    text = await _refused(
+        dest,
+        opener,
+        _bundle(_entry("POST", "Patient"), _entry("DELETE", f"Practitioner?name={URL_CANARY}")),
+    )
+    assert "entry 1 (DELETE) names a resource type allowed_entry_types does not list" in text
+    assert "Practitioner" not in text and URL_CANARY not in text
+    # Control: the listed types go out.
+    await dest.send(_bundle(_entry("POST", "Observation"), _entry("DELETE", "Patient/p-1")))
+    assert len(opener.requests) == 1
+    # The list is read exactly, not case-folded.
+    assert "allowed_entry_types" in await _refused(dest, opener, _bundle(_entry("POST", "patient")))
+
+
+async def test_the_sent_bytes_are_the_payload_not_a_reserialization() -> None:
+    # The screen parses for the check only. A round-trip would rewrite 1.50 to 1.5, and FHIR
+    # requires a decimal's precision to be kept.
+    dest, opener = _screened("POST")
+    payload = (
+        '﻿{"resourceType": "Bundle", "type": "transaction", "entry": [{"resource": '
+        '{"resourceType": "Observation", "valueQuantity": {"value": 1.50}}, '
+        '"request": {"method": "POST", "url": "Observation"}}]}'
+    )
+    await dest.send(payload)
+    [req] = opener.requests
+    assert req.data == payload.encode()
+
+
+@pytest.mark.parametrize(
+    ("over", "extra"),
+    [({"interaction": "update"}, {}), ({"conditional": "if-match"}, {"ifMatch": 'W/"7"'})],
+    ids=["update", "if-match"],
+)
+async def test_the_engines_own_update_wrap_is_not_screened(
+    over: dict[str, str], extra: dict[str, str]
+) -> None:
+    # The screen keys on the connection's interaction, not on "any outgoing Bundle": the one-entry
+    # transaction the engine builds around an update goes out exactly as before.
+    dest = _dest(**over)
+    assert dest._entry_screen is None
+    opener = _FakeOpener(body=_transaction_response("200 OK"))
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965)
+    [entry] = _sent_bundle(opener.requests[0])["entry"]
+    assert entry["request"] == {"method": "PUT", "url": f"Patient/{ID_1965}", **extra}
+
+
+def test_a_feed_without_the_method_list_does_not_load(tmp_path: Any) -> None:
+    from messagefoundry.config.wiring import load_config
+
+    cfg = _write_feed(tmp_path, f'outbound("OB_TXN", FHIR(url="{BASE}", interaction="batch"))\n')
+    with pytest.raises((WiringError, ValueError), match="allowed_entry_methods"):
+        load_config(cfg)
+
+
+@pytest.mark.parametrize("setting", ["allowed_entry_methods", "allowed_entry_types"])
+def test_a_whole_list_env_ref_is_checked_once_it_resolves(setting: str) -> None:
+    # The factory cannot see the items of an env() that stands for the whole list, so it lets the
+    # reference through and the connector checks the resolved list. A bad resolved item is refused.
+    from messagefoundry.config.wiring import env, resolve_env_settings
+
+    over: dict[str, object] = {"allowed_entry_methods": ["POST"], setting: env("entry_list")}
+    spec = FHIR(url=BASE, interaction="transaction", **over)  # type: ignore[arg-type]
+    good = "POST" if setting == "allowed_entry_methods" else "Patient"
+
+    def build(items: list[str]) -> object:
+        return build_destination(
+            Destination(
+                name="OB_FHIR",
+                type=ConnectorType.FHIR,
+                settings=resolve_env_settings(spec.settings, {"entry_list": items}),
+            ),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+    assert isinstance(build([good]), FhirDestination)
+    with pytest.raises(ValueError, match=f"{setting} items must each be") as ei:
+        build([good, f"Patient/{URL_CANARY}"])
+    # An environment value is withheld from the error; the item is named by its index.
+    assert "item 1 is not" in str(ei.value) and URL_CANARY not in str(ei.value)
+
+
+@pytest.mark.parametrize("setting", ["allowed_entry_methods", "allowed_entry_types"])
+@pytest.mark.parametrize(
+    ("default", "match"),
+    [
+        (["post/1"], "items must each be"),
+        ([], "must not be empty"),
+        ("POST", "must be a list"),
+    ],
+)
+def test_a_whole_list_env_ref_default_is_checked_at_load(
+    setting: str, default: object, match: str
+) -> None:
+    # The default is what an unset key resolves to, so the factory checks it at load.
+    from messagefoundry.config.wiring import env, resolve_env_settings
+
+    over: dict[str, object] = {
+        "allowed_entry_methods": ["POST"],
+        setting: env("entry_list", default=default),
+    }
+    with pytest.raises(ValueError, match=f"{setting} {match}"):
+        FHIR(url=BASE, interaction="transaction", **over)  # type: ignore[arg-type]
+    # Control: a good default loads, and an unset key resolves to it.
+    good = ["POST"] if setting == "allowed_entry_methods" else ["Patient"]
+    over[setting] = env("entry_list", default=good)
+    spec = FHIR(url=BASE, interaction="transaction", **over)  # type: ignore[arg-type]
+    assert resolve_env_settings(spec.settings, {})[setting] == good
+
+
+def test_a_method_list_env_ref_defaulting_to_none_is_a_missing_list() -> None:
+    from messagefoundry.config.wiring import env
+
+    with pytest.raises(ValueError, match="requires an 'allowed_entry_methods'"):
+        FHIR(url=BASE, interaction="batch", allowed_entry_methods=env("m", default=None))  # type: ignore[arg-type]

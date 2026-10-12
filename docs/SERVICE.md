@@ -20,20 +20,10 @@ venv interpreter) and the per-connection firewall openings the service needs.
 
 ## Prerequisites
 
-1. **Python venv with the package installed.** From the repo root:
-   ```powershell
-   python -m venv .venv
-   .venv\Scripts\python.exe -m pip install -e .
-   ```
-   This puts `messagefoundry.exe` and `python.exe` in `.venv\Scripts\`. The service runs that
-   `python.exe`, in isolated mode; see [The service launch](#the-service-launch).
-   For a **reproducible, pinned** deployment, install the locked, hash-verified dependency set
-   first, then the package itself:
-   ```powershell
-   .venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
-   .venv\Scripts\python.exe -m pip install -e . --no-deps
-   ```
-   `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
+1. **The engine, installed where only administrators can write.** The installer's default is
+   `C:\Program Files\MessageFoundry\engine`, built from the engine wheel and never editable.
+   [Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
+   builds it. The installer checks that folder and does not build it.
 2. **NSSM** — provisioned automatically. `install-service.ps1` keeps the `nssm.exe` the service
    runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
    anyone but administrators can write to or owns, because it runs that file as administrator. It
@@ -48,18 +38,58 @@ venv interpreter) and the per-connection firewall openings the service needs.
    skipped this way. On a host with no internet access, pass `-NssmPath` with the win64 `nssm.exe`
    from `nssm-2.24.zip`. The uninstaller runs no `nssm.exe` at all.
 3. **An elevated PowerShell** (Run as Administrator) — required to register a service.
-   `messagefoundry service install --env <name>` elevates for you (a UAC prompt) and runs the
-   install script below in a visible window so you can read its output.
+   `messagefoundry service install --env <name> --config <dir>` elevates for you (a UAC prompt)
+   and runs the install script below in a visible window so you can read its output. It passes
+   `--config` as `-Config` and, when you give it, `--service-config` as `-ServiceConfig`, each made
+   absolute first. Run the script yourself for any other option.
 4. **A synchronized host clock.** The engine trusts the host's wall clock and does not set it.
    [SYSTEM-REQUIREMENTS.md, *Host clock*](SYSTEM-REQUIREMENTS.md#host-clock) states the
    requirement and how to check it with `w32tm`.
+
+## Install the engine where only administrators can write
+
+The service runs as its own account, and a PHI engine should run code only administrators can
+change. So the installer's default engine is a virtual environment under Program Files, built from
+the engine wheel (vault BACKLOG #2626). An editable install in a checkout is code its developers can
+change, and the service would run their next edit.
+
+1. Get the engine wheel. Take a release wheel and verify it as
+   [INSTALL-GUIDE.md](INSTALL-GUIDE.md) shows, or build one from a checkout as yourself, not
+   elevated: `python -m pip wheel --no-deps -w dist .`
+2. In an elevated PowerShell, in the folder that holds the wheel and the release's
+   `requirements.lock`, build the install:
+   ```powershell
+   $Root = "$env:ProgramFiles\MessageFoundry\engine"
+   python -m venv $Root
+   & "$Root\Scripts\python.exe" -m pip install --require-hashes -r requirements.lock
+   & "$Root\Scripts\python.exe" -m pip install --no-deps (Get-Item .\messagefoundry-*.whl).FullName
+   ```
+   `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
+   Install the web console wheel the same way if the service serves `/ui`.
+3. Make the folder administrator-only, owner included:
+   ```powershell
+   icacls $Root /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
+       "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
+   icacls $Root /setowner "*S-1-5-32-544" /T /C
+   ```
+   A new folder under Program Files can be owned by the administrator who made it, with full
+   control through `CREATOR OWNER`. The installer refuses the default folder unless only
+   administrators can write the launcher and every folder above it.
+
+**A service on a checkout still installs**: pass `-AppExe` with the checkout venv's
+`messagefoundry.exe`. The installer does not check that folder. Whether it should refuse one a broad
+principal can write is an open owner question. `serve` reports such an install at every start
+(see *Lock down the config directory* below).
 
 ## Install
 
 ```powershell
 # from repo root, elevated PowerShell
-.\scripts\service\install-service.ps1 -Environment prod
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config
 ```
+
+`-Config` is required: the config directory the service loads. It used to default to the checkout's
+`samples\config`, a demo graph.
 
 `-Environment` is **required** (ADR 0017): it selects which `environments/<name>.toml` value file the
 engine resolves and the instance's production tier. `serve` refuses to start without it (no silent
@@ -82,15 +112,31 @@ Defaults:
 | Setting | Default |
 |---|---|
 | Service name | `MessageFoundry` |
-| Engine launcher (`-AppExe`) | `<repo>\.venv\Scripts\messagefoundry.exe`. It names the install; the service does not run it |
+| Engine launcher (`-AppExe`) | `C:\Program Files\MessageFoundry\engine\Scripts\messagefoundry.exe`. It names the install; the service does not run it. The installer refuses the default root when another account can write the launcher, the venv's `python.exe` or the package's `__init__.py`, or a folder above them. It reads no other file, such as the base interpreter a venv's `python.exe` starts; `serve` reports the interpreter and package at start |
 | Interpreter the service runs (`-PythonExe`) | the `python.exe` beside the launcher, or one folder up |
-| Config dir | `<repo>\samples\config` |
+| Config dir (`-Config`) | *(required)* |
+| Working directory | the install root; the repository for a passed `-AppExe` |
+| Project root (`-ProjectRoot`, registered as `--project-root`) | the folder above `-Config` for the default install; none for a passed `-AppExe` |
+| Service settings (`-ServiceConfig`, registered as an absolute `--service-config`) | `messagefoundry.toml` under the project root, or else the working directory, when it exists; otherwise none |
 | Active environment | *(required — `-Environment`)* |
 | Data dir | `C:\ProgramData\MessageFoundry` |
 | Message store | `<DataDir>\messagefoundry.db` |
 | Logs | `<DataDir>\logs\service.out.log`, `service.err.log` |
 | Bind | `127.0.0.1:8765` |
 | Log level | `INFO` |
+
+**A registered `--project-root` wins over `[environments].base_dir` in the settings file.** The
+default install registers the folder above `-Config`, which is a drive root when `-Config` is a
+top-level folder such as `D:\config`. It registers none only when `-Config` is itself a drive root.
+The installer does not read the settings. So if your settings file sets `base_dir`, pass the same
+folder as `-ProjectRoot`, or the service reads its value file from the folder above `-Config`.
+
+**`-ListenHost` must be an IP address or a host name**, and no path may contain a double quote.
+Each goes on the service's command line, so the installer refuses anything else before it acts.
+No path the service is registered with may contain `%`, including `-NssmDir`, and `-ListenHost`
+takes it only before a numeric IPv6 zone, such as `fe80::1%12`. nssm and the service manager
+expand `%NAME%` when the service starts, so the service would read something other than what the
+installer checked.
 
 Override any of them, e.g.:
 
@@ -168,29 +214,29 @@ the service account and the operator can both open the store, in either order. T
 
 ## Update to a new build (restart vs reinstall)
 
-The service runs `<repo>\.venv\Scripts\python.exe -I -X disable-remote-debug -m messagefoundry
-serve ...`. With the documented **editable**
-install (`pip install -e .`), that interpreter imports straight from the repo source — so a running
-service keeps the code it loaded **at process start**. To pick up new code (a pull, a branch
-switch, a merge), just **restart** it (elevated):
+The service runs `<install>\Scripts\python.exe -I -X disable-remote-debug -m messagefoundry
+serve ...`. The default install is a **non-editable** wheel, as
+[INSTALL-GUIDE.md](INSTALL-GUIDE.md) says, so a restart runs the same build. To update, install the
+new wheel into the install root, then **restart** (elevated):
 
 ```powershell
+& "$env:ProgramFiles\MessageFoundry\engine\Scripts\python.exe" -m pip install --no-deps `
+    (Get-Item .\messagefoundry-*.whl).FullName
 Restart-Service MessageFoundry
 curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
-Because the install is editable, a restart runs **whatever branch is checked out** in the repo.
+Install the release's `requirements.lock` first when its dependencies changed. A service on a
+checkout's **editable** venv (a passed `-AppExe`) is different: a restart there runs whatever branch
+is checked out. That is a development setup, and `serve` reports it at start.
 
 **Reinstall** instead when paths or flags change (port, config dir, data dir) or the service
 definition drifted — the install script is idempotent (it stops and reconfigures in place):
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod   # elevated; re-points the exe + AppParameters
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config   # elevated; re-points the exe + AppParameters
 Start-Service MessageFoundry
 ```
-
-If the package was installed **non-editable** (a plain `pip install .`), the venv holds a
-snapshot of the old code — run `.venv\Scripts\python.exe -m pip install -e .` first, then restart.
 
 > **WARNING: Upgrading from ≤ 0.2.5 → ≥ 0.2.6: tighten the config-dir ACLs first.** The config-directory
 > permission guard (SEC-003 / ADR 0036) did **not** exist in 0.2.5. From 0.2.6 on, `serve` refuses to
@@ -248,7 +294,7 @@ By default the service now installs under a **least-privilege per-service virtua
 bare install therefore lands on the least-privilege posture with nothing extra to configure:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod   # runs as NT SERVICE\MessageFoundry
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config   # runs as NT SERVICE\MessageFoundry
 ```
 
 The engine needs only **read** on the config directory and **read/write** on the data directory, so
@@ -261,14 +307,14 @@ most privileged local account — widens the blast radius of any compromise (a c
 in-process — see *Lock down the config directory* below), so it is now an explicit opt-out:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod -AllowLocalSystem   # opt out to LocalSystem
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -AllowLocalSystem   # opt out to LocalSystem
 ```
 
 To run under a **different** account (a domain gMSA, a dedicated local user, or another virtual
 account), pass `-ServiceAccount` — it always wins over the default:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod -ServiceAccount "NT SERVICE\MessageFoundry"
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
 
 ```powershell
@@ -397,7 +443,8 @@ A launcher cannot pass an option to the interpreter it starts, and both options 
   `PYTHONPATH` or `PYTHONHOME` in the service's environment cannot decide what the engine imports.
   Another product's installer can leave one behind, machine-wide. It also keeps the working
   directory and the user's own site directory off the import path. The service's working
-  directory is the repository, and `python -m` would otherwise search it first.
+  directory is the install root, or the repository for a passed `-AppExe`, and `python -m` would
+  otherwise search it first.
 - **`-X disable-remote-debug` turns off the interpreter's remote debugging** (PEP 768), which
   would let another process running as the service account run Python inside the engine. The
   environment variable for it is one of those `-I` ignores, so the option is the only form that
@@ -552,7 +599,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   ```
 - The loader **actively enforces** this at load time (and on `/config/reload`), not just as a
   documented recommendation (ADR 0036, SEC-003):
-  - On **Windows** the loader now parses the directory's and each `*.py`'s NTFS owner + DACL and
+  - On **Windows** the loader now parses the NTFS owner + DACL of the directory, each `*.py`, the
+    `__pycache__` folder and each file in it, `connections.toml`, and `codesets\` with each table
+    the loader reads, and
     **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
     `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
     (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). A `NULL` DACL (everyone allowed)
@@ -592,11 +641,33 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
     is the safest layout, because the engine's own account cannot rewrite it, provided the engine
-    can still read every file. The loader checks only the directory and its `*.py`, following links,
-    so the layout also depends on at least these, which it does not check: every directory above the
-    config directory is writable only by root; a `*.py` that is a link points into such a directory;
-    the file system reports real owners and modes (a network mount may synthesize them); and the
-    other config inputs, such as `connections.toml` and `codesets/`, are locked down the same way.
+    can still read every file. The loader checks the same paths as on Windows, following links, so
+    the layout also depends on at least these, which it does not check: every directory above the
+    config directory is writable only by root; a file that is a link points into such a directory;
+    and the file system reports real owners and modes (a network mount may synthesize them).
+  - **The cache folder is checked because it runs.** Python's source loader runs a matching
+    `__pycache__\*.pyc` in place of the `.py` beside it and never compares the two. A cache file
+    the check did not read could run under a source it passed (vault BACKLOG #2596).
+  - **At start, `serve` checks two more files the same way, each with the folder it sits in**: the
+    service settings file it read (`--service-config`, else `.\messagefoundry.toml`) and the value
+    file `environments\<env>.toml`. It refuses to start when another account can write either one
+    (*"refusing to start from writable-by-others path ..."*), because each one steers the service.
+    `supervise` makes the same check before it starts any engine shard. Every reload reads the
+    value file again, so it checks it again first and refuses the reload the same way. The dev/test
+    escape below downgrades these refusals too. `install-service.ps1 -LockConfigDir` locks the
+    value file's folder with the config directory. Locking reaches every folder below, so it locks
+    the settings file's folder only when that folder holds no folder but `-Config` and the value
+    folder, and passes at least the checks below for `-Config`; it must also not be this checkout
+    or a folder in it. A config repo with drop folders or a `.git` folder beside `-Config` is left
+    alone. Any folder it leaves is named in a warning, and you restrict that folder yourself. It
+    refuses outright a `-Config` that is, at least, a volume root, a junction, a folder under the
+    Windows folder, or one holding the data directory, the checkout, the install, Program Files,
+    ProgramData or the user profiles. These checks compare paths as written, so an 8.3 short name
+    or a `subst` drive gets past them.
+  - **It also reads the interpreter and the engine package, and only reports them.** A start whose
+    interpreter or `messagefoundry` package folder another account can write logs a WARNING,
+    *"the engine runs code from writable-by-others path ..."*, and goes on. Refusing would end every
+    service run from such a checkout, and that is an open owner question.
   - **Dev/test escape (never set in production).** Because a default Windows checkout grants
     `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **and**
     `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment to downgrade the refusal to a
@@ -629,7 +700,7 @@ can set, so a LocalDumps-configured host still dumps a process that suppressed e
 it. Close it at install time:
 
 ```powershell
-.\install-service.ps1 -Environment prod -SuppressCrashDumps
+.\install-service.ps1 -Environment prod -Config D:\hl7\config -SuppressCrashDumps
 ```
 
 It is **opt-in** because it writes `HKLM` keys **by image name**, which affects every process of that

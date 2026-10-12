@@ -114,6 +114,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    float_setting,
     intake_open,
     poll_interval,
     positive_cap,
@@ -935,7 +936,11 @@ class _FtpClient(_RemoteClient):
         self._user = settings.get("username")
         self._password = settings.get("password")
         self._tls = tls
-        self._timeout = float(settings.get("connect_timeout", 30.0))
+        self._timeout = float_setting(
+            settings.get("connect_timeout", 30.0),
+            knob="connect_timeout",
+            transport="REMOTEFILE ftp",
+        )
         # Build the verifying TLS context once, fail-fast (build_check) — mirrors the SFTP host-key
         # posture: a verify-disabled ftps without the escape is refused here, not silently insecure.
         # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy (verify path only).
@@ -1604,7 +1609,11 @@ class _SftpClient(_RemoteClient):
         # Read only to refuse it: a key_password never reaches paramiko (BACKLOG #2423).
         _refuse_sftp_key_wrap(self._private_key, settings.get("key_password"))
         self._known_hosts = settings.get("known_hosts")
-        self._timeout = float(settings.get("connect_timeout", 30.0))
+        self._timeout = float_setting(
+            settings.get("connect_timeout", 30.0),
+            knob="connect_timeout",
+            transport="REMOTEFILE sftp",
+        )
         # Fail fast at construction (build_check time): an unknown-host-key posture without the escape
         # must never silently weaken to auto-accept. #329: read the escape through the ADR-0092 clamp
         # (weakened_tls_escape_permitted_here consults the active construction posture, exactly like the
