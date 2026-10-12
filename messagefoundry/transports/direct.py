@@ -325,7 +325,6 @@ class DirectDestination(DestinationConnector):
         password = s.get("password")
         self.username: str | None = str(username) if username else None
         self.password: str | None = str(password) if password else None
-        # An explicit None takes each default, not off (vault BACKLOG #3230).
         self.use_tls = bool_setting(s, "use_tls", default=True)
         # #323: server-certificate verification on the TLS hop, kept byte-identical to
         # EmailDestination's spelling. This connector's TLS and AUTH handling is a copy of that

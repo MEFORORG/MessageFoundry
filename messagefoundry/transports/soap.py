@@ -111,12 +111,12 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
-    refuse_credential_over_unverified_tls,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
@@ -436,7 +436,6 @@ class SoapDestination(DestinationConnector):
         anchor = http_family_trust_anchor(
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
-        # An explicit None takes the default, not off (vault BACKLOG #3230).
         verify = bool_setting(s, "verify_tls", default=True)
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
@@ -465,19 +464,12 @@ class SoapDestination(DestinationConnector):
                 self._opener = _NO_REDIRECT_OPENER
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
-            refuse_credential_over_unverified_tls(
-                ConnectorType.SOAP,
-                s,
-                self._headers,
-                scheme=scheme,
-                connector="SOAP destination",
-                connection=config.name,
-            )
             guard = refuse_verify_off(
                 scheme,
                 self.url,
                 connector="SOAP destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.SOAP, s),
                 attested=attested,
             )
             if guard is not None:

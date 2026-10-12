@@ -80,6 +80,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
     _check_hop_attestation,
     _check_revocation_attestation,
+    bool_setting,
     check_db_connect_timeout,
     flag_from_settings,
     require_hop_reason,
@@ -752,10 +753,11 @@ def refuse_resolved_verify_off(
     connector refuses a client cert with verification off when it is built."""
     if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
         return
-    if not settings["verify_tls"] and settings.get("tls_ca_file"):
+    # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
+    if not bool_setting(settings, "verify_tls", default=True) and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false, empty "
-            "or unset value, which verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false or "
+            "empty value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 
@@ -3427,8 +3429,9 @@ def DICOMweb(
         "DICOMweb",
         tls_ca_file,
         # Unlike REST/FHIR/SOAP there is no token hop here that would still read it.
+        # A Python None is the default, on, as the connector reads it (vault BACKLOG #3230).
         unread=None
-        if verify_tls
+        if verify_tls is None or verify_tls
         else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
     )
     _check_tls_ca_pin("DICOMweb", tls_ca_pin, tls_ca_file)
@@ -5607,8 +5610,11 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    value = settings.get("tls_check_hostname", True)
-    return isinstance(value, EnvRef) or not value
+    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
+    value = settings.get("tls_check_hostname")
+    return isinstance(value, EnvRef) or not bool_setting(
+        settings, "tls_check_hostname", default=True
+    )
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:

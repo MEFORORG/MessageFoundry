@@ -329,7 +329,6 @@ class EmailDestination(DestinationConnector):
         password = s.get("password")
         self.username: str | None = str(username) if username else None
         self.password: str | None = str(password) if password else None
-        # An explicit None takes each default, not off (vault BACKLOG #3230).
         self.use_tls = bool_setting(s, "use_tls", default=True)
         # #323: server-certificate verification on the TLS hop. Defaults ON — smtplib's own default is
         # an UNVERIFIED context, so before this the encrypted session was unauthenticated.

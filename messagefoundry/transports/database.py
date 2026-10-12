@@ -197,7 +197,7 @@ def _build_dsn(
     only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
     shape test on text. The control that actually refuses a write is the privilege of the account this
     DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
-    encrypt = bool_setting(s, "encrypt", default=True)  # None is the default (vault BACKLOG #3230)
+    encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
         attested=attested, posture=current_hop_posture()

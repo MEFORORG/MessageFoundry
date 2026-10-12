@@ -144,6 +144,7 @@ from messagefoundry.auth.anchor_path import (
     PathVerdict,
     anchor_path_verdict,
 )
+from messagefoundry.config.models import bool_setting
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.redaction import codec_safe_str
@@ -1155,16 +1156,18 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     loopback and verifies the server itself (ADR 0139). An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
     file there: a pin nothing checks reads as pinned while nothing is."""
-    for key in ("tls", "use_tls"):
-        if key in settings and not settings[key]:
+    # Each flag is read as its connector reads it: an explicit None is the default (vault BACKLOG
+    # #3230), so a None that turns nothing off does not make a read CA look unread.
+    for key, default in (("tls", False), ("use_tls", True)):
+        if key in settings and not bool_setting(settings, key, default=default):
             return f"{key} is off, so the hop builds no TLS context"
-    if "tls_verify" in settings and not settings["tls_verify"]:
+    if not bool_setting(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
     if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
         return "ech_egress sends both hops to an http:// sidecar, which does the TLS itself"
     if _token_hop_reads_ca(settings):
         return None
-    if "verify_tls" in settings and not settings["verify_tls"]:
+    if not bool_setting(settings, "verify_tls", default=True):
         return "verify_tls=False verifies no server certificate, and no token hop reads it"
     if _is_http_url(settings.get("url")):
         return "the url is http://, so the hop has no TLS, and no token hop reads it"

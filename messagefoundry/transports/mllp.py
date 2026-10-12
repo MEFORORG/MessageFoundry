@@ -661,8 +661,7 @@ def _mllp_ssl_context(
     # 0092 decision 2): the escape is CLAMPED to non production-PHI (weakened_tls_escape_permitted_here),
     # so tls_verify=false can no longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance —
     # matching the plaintext-MLLP InsecureHopGuard. Off the construction gate (unstamped) the escape is
-    # refused since vault BACKLOG #2354; it used to be honoured there unclamped. An explicit None takes
-    # the default, not off (vault BACKLOG #3230).
+    # refused since vault BACKLOG #2354; it used to be honoured there unclamped.
     verify = bool_setting(s, "tls_verify", default=True)
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(

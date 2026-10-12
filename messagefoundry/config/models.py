@@ -230,7 +230,12 @@ def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> boo
 
     ``bool(settings.get(key, True))`` reads an explicit ``None`` as ``False``, which turns a
     default-on check such as ``tls_verify`` OFF (vault BACKLOG #3230). Any other value is read with
-    ``bool()``, as before; this changes only what ``None`` means."""
+    ``bool()``, as before; this changes only what ``None`` means.
+
+    Use it for a transport setting with a default, such as a TLS check, and read it the same way in
+    every connector and every reader that reports on it, so the two cannot disagree. Use
+    :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin),
+    which defaults off and must refuse a value that is not a real ``bool``."""
     value = settings.get(key)
     return default if value is None else bool(value)
 

@@ -140,6 +140,34 @@ def test_an_explicit_none_takes_the_default_on_mllp_ftps_and_email() -> None:
     assert (email.use_tls, email.tls_verify, email.tls_check_hostname) == (True, True, True)
 
 
+def test_an_explicit_none_is_read_alike_by_the_reports_and_the_ca_checks() -> None:
+    """Vault BACKLOG #3230: the readers that report a loosening or refuse an unread CA read ``None``
+    as the connectors do, as the default. Before, ``None`` was reported as a hostname-check-off
+    loosening, and made a CA the connector reads look unread."""
+    from messagefoundry.auth.trust_anchors import unread_ca_reason
+    from messagefoundry.config.wiring import refuse_resolved_verify_off
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_M",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={"host": "a.example.invalid", "port": 7, "tls_check_hostname": None},
+            ),
+        )
+    )
+    assert hostname_unchecked_hops(reg) == []
+    assert unread_ca_reason({"tls": True, "tls_verify": None}) is None
+    assert unread_ca_reason({"use_tls": None}) is None
+    assert unread_ca_reason({"url": "https://h.example.invalid/x", "verify_tls": None}) is None
+    refuse_resolved_verify_off(
+        ConnectorType.DICOMWEB, {"verify_tls": None, "tls_ca_file": "ca.pem"}, "OB_D"
+    )
+    # Control: an explicit False is still reported and still makes the CA unread.
+    assert unread_ca_reason({"tls": True, "tls_verify": False}) is not None
+
+
 def test_mllp_verify_off_does_not_add_a_hostname_line(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

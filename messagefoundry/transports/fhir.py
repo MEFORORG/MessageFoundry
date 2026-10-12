@@ -112,12 +112,12 @@ from messagefoundry.transports.rest import (
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
     find_outbound_length_violation,
+    http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
-    refuse_credential_over_unverified_tls,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
     refuse_verify_off,
@@ -892,7 +892,6 @@ class FhirDestination(DestinationConnector):
                 connection=config.name,
             )
 
-        # An explicit None takes the default, not off (vault BACKLOG #3230).
         verify = bool_setting(s, "verify_tls", default=True)
         if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
@@ -915,19 +914,12 @@ class FhirDestination(DestinationConnector):
                 self._opener = _NO_REDIRECT_OPENER
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
-            refuse_credential_over_unverified_tls(
-                ConnectorType.FHIR,
-                s,
-                self._headers,
-                scheme=scheme,
-                connector="FHIR destination",
-                connection=config.name,
-            )
             guard = refuse_verify_off(
                 scheme,
                 self.base_url,
                 connector="FHIR destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.FHIR, s),
                 attested=attested,
             )
             if guard is not None:
@@ -1620,20 +1612,7 @@ class FhirLookupExecutor:
             enforce_outbound_length_limits(url, headers)
             self._headers[cname] = headers
             self._token[cname] = token
-            # An explicit None takes the default, not off (vault BACKLOG #3230).
-            verify = bool_setting(s, "verify_tls", default=True)
-            if not verify:
-                # Ahead of the verify-off arm's escape check, as on the destinations.
-                refuse_credential_over_unverified_tls(
-                    ConnectorType.FHIR,
-                    s,
-                    headers,
-                    scheme=scheme,
-                    connector=f"FhirLookup {cname!r}",
-                    connection=label,
-                    lookup=True,
-                )
-            if verify:
+            if bool_setting(s, "verify_tls", default=True):
                 # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
                 # server is the most on-point instance of 12.3.4's condition in the product, and it
                 # could not name an anchor at all.
@@ -1673,6 +1652,7 @@ class FhirLookupExecutor:
                     url,
                     connector=f"FhirLookup {cname!r}",
                     connection=label,
+                    credentials=http_credentials_sent(ConnectorType.FHIR, s, lookup=True),
                     attested=attested,
                 )
                 if guard is not None:

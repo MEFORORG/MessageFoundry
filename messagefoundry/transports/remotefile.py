@@ -649,7 +649,6 @@ def _ftps_ssl_context(
     A ``username`` or ``password`` with either check off is refused (vault BACKLOG #2636). The rule
     is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified
     peer*."""
-    # An explicit None takes the default, not off (vault BACKLOG #3230).
     verify = bool_setting(settings, "tls_verify", default=True)
     # Keyed on either half, as the plain-ftp credential guard is. Checked BEFORE the escape arm, so a
     # credentialed hop is never told to set an escape that cannot unlock it.

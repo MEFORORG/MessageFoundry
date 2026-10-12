@@ -406,26 +406,33 @@ def test_a_fhir_lookup_credential_over_verify_off_is_refused(
     assert ex.connections == frozenset({"L"})
 
 
-def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> None:
-    """A Proxy-Authorization goes to the proxy inside the CONNECT, never across this hop, and an
-    http url has no TLS to verify (refuse_cleartext_credentials governs it). Neither raises here."""
-    from messagefoundry.transports.rest import refuse_credential_over_unverified_tls
+@pytest.mark.parametrize("cell", _CELLS)
+def test_a_static_api_key_header_over_verify_off_is_refused(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential header need not be called Authorization: the redaction screen's reading of a
+    static header decides, so an API key counts too."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    extra = {"verify_tls": False, "headers": {"X-API-Key": _SECRET}}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, extra)
+    assert "X-API-Key header" in str(exc.value)
+    _assert_credential_refusal(exc)
 
-    refuse_credential_over_unverified_tls(
-        ConnectorType.REST,
-        {},
-        {"Proxy-Authorization": "Basic x"},
-        scheme="https",
-        connector="REST destination",
-        connection="OB",
-    )
-    refuse_credential_over_unverified_tls(
-        ConnectorType.REST,
-        {"bearer_token": _SECRET},
-        {"Authorization": "Bearer x"},
-        scheme="http",
-        connector="REST destination",
-        connection="OB",
+
+def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> None:
+    """The proxy credential goes to the proxy inside the CONNECT, never across this hop, so the
+    credential list does not name it. An http url has no TLS to verify (refuse_cleartext_credentials
+    governs it), so refuse_verify_off returns before the credential check."""
+    from messagefoundry.transports.rest import http_credentials_sent
+
+    proxy = {"proxy_url": "http://proxy.example.com:3128", "proxy_user": "u", "proxy_password": "p"}
+    assert http_credentials_sent(ConnectorType.REST, proxy) == []
+    assert (
+        refuse_verify_off(
+            "http", "http://x/y", connector="REST", connection="OB", credentials=["bearer"]
+        )
+        is None
     )
 
 
@@ -632,7 +639,10 @@ def test_refuse_cleartext_egress_no_guard_for_loopback_or_https(
             refuse_cleartext_egress("https", "https://api.example.com/x", connection=None) is None
         )  # not cleartext
         assert (
-            refuse_verify_off("http", "http://x/y", connector="REST", connection=None) is None
+            refuse_verify_off(
+                "http", "http://x/y", connector="REST", connection=None, credentials=()
+            )
+            is None
         )  # http has no TLS
 
 
@@ -659,7 +669,9 @@ def _verify_off(scheme: str, url: str, **declared: Any) -> object:
     # verify-off takes no ADR 0153 acceptance (see refuse_verify_off), so only the attestation.
     declared.pop("cleartext_accepted", None)
     declared.pop("cleartext_reason", None)
-    return refuse_verify_off(scheme, url, connector="REST destination", connection=None, **declared)
+    return refuse_verify_off(
+        scheme, url, connector="REST destination", connection=None, credentials=(), **declared
+    )
 
 
 _HOST_GUARDS = {
