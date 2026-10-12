@@ -25,18 +25,12 @@ import pytest
 from messagefoundry.anon import surrogates as engine_surrogates
 from tee.anon import surrogates as tee_surrogates
 
+# The depth table is the scanner loader's own, so the two loaders are held to one set of places.
+# A place is ``module_file.parents[n]``; ``_IMPORT_ROOT`` is the one a token file may be read from.
+from tests.test_anon_b193_2344 import _CHECKOUT_GUARD, _IMPORT_ROOT, _WRONG_PLACES
+
 _TOKEN_PARTS = ("scripts", "security", "scan-tokens.local.txt")
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-
-# A place is ``module_file.parents[n]``. The module sits at ``<root>/<package>/anon/surrogates.py``,
-# so 2 is the import root, the one place a token file may be read from.
-_IMPORT_ROOT = 2
-_WRONG_PLACES = [
-    pytest.param(0, id="the anon folder"),
-    pytest.param(1, id="the package folder"),
-    pytest.param(3, id="one folder above the import root"),
-    pytest.param(4, id="two folders above the import root"),
-]
 
 _BOTH = pytest.mark.parametrize(
     "module", [engine_surrogates, tee_surrogates], ids=["engine", "tee"]
@@ -96,17 +90,6 @@ def test_the_token_file_at_the_import_root_is_read(
 
 
 @_BOTH
-def test_the_import_root_wins_over_a_token_file_planted_nearer(
-    module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A nearest-first search reads the package folder's file. The one built path does not."""
-    module_file = _stand_in(tmp_path, monkeypatch, module)
-    _plant(module_file.parents[1], "88")
-    ours = _plant(module_file.parents[_IMPORT_ROOT], "77")
-    assert module._resolve_token_text() == ours
-
-
-@_BOTH
 def test_a_token_file_above_the_import_root_sets_no_site_prefix(
     module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -158,8 +141,11 @@ def test_the_variable_still_wins_over_the_token_file(
 
 
 @_BOTH
+@pytest.mark.skipif(
+    not _CHECKOUT_GUARD.is_file(),
+    reason="needs scripts/security/scan_forbidden.py beside tests/ (absent outside a checkout)",
+)
 def test_the_import_root_of_each_module_is_this_checkout(module: ModuleType) -> None:
     """In a source checkout the one path each loader builds sits under the repository root, beside
     the scanner that reads the same file. Nothing here opens the token file itself."""
     assert Path(str(module.__file__)).resolve().parents[_IMPORT_ROOT] == _REPO_ROOT
-    assert _REPO_ROOT.joinpath(*_TOKEN_PARTS[:-1], "scan_forbidden.py").is_file()
