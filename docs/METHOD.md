@@ -1068,9 +1068,10 @@ fleet, so never take them*.
   made out of date, and one overstated docstring sentence. Under the old rule each waited for an
   owner ruling, and two of them waited more than thirteen hours with green checks.
 
-  On 2026-10-12, korus `origin/main` (`189eb42`) still carried the earlier row in
-  `roles/LANDER.md` *4a-quinquies*. A korus branch, `lander/filed-findings-ruling`, carried this
-  ruling that day and was not yet merged.
+  On 2026-10-12, korus `origin/main` (`189eb42`) still carried the earlier rule in
+  `roles/LANDER.md`, in at least *4a-quinquies* and *Filing never holds a green pull request*. A
+  korus branch, `lander/filed-findings-ruling`, carried this ruling that day and was not yet
+  merged.
 
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
