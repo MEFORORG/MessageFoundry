@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import inspect
 import json
 import logging
 import threading
@@ -48,7 +49,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Registry
+from messagefoundry.config.wiring import FHIR, Registry, build_outbound_connection
 from messagefoundry.parsing import RawMessage
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.redaction import safe_exc, safe_text
@@ -62,7 +63,12 @@ from messagefoundry.transports.bounded_read import (
     read_2xx_reply_text,
 )
 from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp
-from tests.test_digest_refusal_classification import _FACTORY, _LABEL, _build, _Stops
+from tests.test_digest_refusal_classification import (
+    _FACTORY,
+    _LABEL,
+    _build,
+    _Stops,
+)
 
 #: The name ``_build`` gives every destination, and so the name a WARNING or refusal carries.
 CONNECTION = "OB"
@@ -75,6 +81,8 @@ _URL_MARKER = "SITE-QUERY-MARKER"
 _PAYLOAD_MARKER = "PAYLOAD-MARKER-7f3a"
 #: The byte an over-cap reply is made of on the wire. A run of it must never reach a log line.
 _REPLY_FILL = b"Z"
+#: The end of the delivered arm's WARNING: the words that say the 2xx stands.
+_TAKEN_AS_ANSWER = "the 2xx is taken as the partner's answer"
 
 
 # --- the helper -----------------------------------------------------------------------------------
@@ -97,7 +105,9 @@ def test_an_unused_over_cap_body_reads_as_empty_and_warns(
     message = record.getMessage()
     assert message.startswith("REST connection 'OB_X' answered with status 201 and")
     assert "64-byte bound" in message
-    assert "recorded as delivered" in message
+    assert message.endswith(_TAKEN_AS_ANSWER)
+    # vault BACKLOG #3040 item 2: the line is logged before the caller's store write, so it claims no record.
+    assert "recorded" not in message
     assert _REPLY_FILL.decode() * 4 not in message
 
 
@@ -115,8 +125,8 @@ def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
     # Not a credential or configuration fault: those stop the lane, and this is one reply.
     assert (err.permanent, err.credential_fault, err.config_fault) == (True, False, False)
     assert str(err) == (
-        "SOAP connection 'OB_X': reply-too-large, not sent again. A 2xx reply body is over the "
-        "64-byte bound and is needed here. Check the partner before a replay"
+        "reply-too-large, not sent again. A 2xx reply body is over the 64-byte bound and is "
+        "needed here. Check the partner before a replay (SOAP connection 'OB_X')"
     )
     assert _REPLY_FILL.decode() * 4 not in str(err)
     # Neither chain reaches the frame that holds the bytes read so far.
@@ -231,9 +241,11 @@ def test_the_status_guard_lets_every_2xx_through(
     assert f"answered with status {status} and" in record.getMessage()
 
 
-def test_the_stored_refusal_keeps_its_code_under_a_long_connection_name() -> None:
+def test_the_stored_refusal_keeps_its_code_and_advice_under_a_long_connection_name() -> None:
     """A dead-lettered row keeps the error text, cut at 200 characters, and not the code. So the
-    code and "not sent again" come first, where a long connection name cannot push them out."""
+    code, "not sent again" and the advice come first, and the connection last, where a long name
+    can push out only itself (vault BACKLOG #3040 items 4 and 6). DICOMweb has the longest label, so with the
+    connection first the advice went there first, from about 23 characters of name."""
     name = "OB_" + "LONGPARTNER_" * 5 + "ADT"
     assert len(name) > 60
     with pytest.raises(NegativeAckError) as ei:
@@ -246,10 +258,11 @@ def test_the_stored_refusal_keeps_its_code_under_a_long_connection_name() -> Non
         )
     # What the worker does with it: safe_exc, then the store's own safe_text.
     stored = safe_text(safe_exc(ei.value))
-    # The control: the text really was cut, and what the cut took is the advice at the end.
-    assert "Check the partner before a replay" in str(ei.value)
-    assert "Check the partner before a replay" not in stored
-    assert f"{name!r}: {REPLY_TOO_LARGE_CODE}, not sent again" in stored
+    # The control: the text really was cut, and what the cut took is the name at the end.
+    assert name in str(ei.value)
+    assert name not in stored
+    assert f"{REPLY_TOO_LARGE_CODE}, not sent again" in stored
+    assert "Check the partner before a replay (DICOMweb connection" in stored
 
 
 # --- each destination's _post, against a body that never ends -------------------------------------
@@ -263,10 +276,11 @@ def _payload(ctype: ConnectorType, over: dict[str, Any] | None = None) -> str:
             "meta": {"versionId": "3"},  # if-match sends it; the other forms ignore it
             "note": _PAYLOAD_MARKER,
         }
-        if (over or {}).get("interaction") == "transaction":
+        interaction = (over or {}).get("interaction")
+        if interaction in ("transaction", "batch"):
             # What a Handler hands over for this interaction: its own Bundle, sent as it is.
             entry = {"resource": patient, "request": {"method": "POST", "url": "Patient"}}
-            return json.dumps({"resourceType": "Bundle", "type": "transaction", "entry": [entry]})
+            return json.dumps({"resourceType": "Bundle", "type": interaction, "entry": [entry]})
         return json.dumps(patient)
     if ctype is ConnectorType.DICOMWEB:
         return RawMessage.from_bytes(
@@ -277,8 +291,18 @@ def _payload(ctype: ConnectorType, over: dict[str, Any] | None = None) -> str:
     return json.dumps({"note": _PAYLOAD_MARKER})
 
 
+#: vault #2804 (engine PR 2244, open when these rows were added) makes a FHIR ``transaction`` or
+#: ``batch`` connection list the methods its entries may use, and refuses one that does not. Until
+#: it lands the setting does not exist, so it is passed only where ``FHIR()`` takes it. Once
+#: that PR is on main, pass the setting outright and drop this probe.
+_ENTRY_SCREEN: dict[str, Any] = (
+    {"allowed_entry_methods": ["POST"]}
+    if "allowed_entry_methods" in inspect.signature(FHIR).parameters
+    else {}
+)
+
 #: At least these destinations and modes, as (connector, extra settings) -> the delivered or the
-#: refused side. Not here: ``interaction="batch"``, which takes the path ``"transaction"`` takes.
+#: refused side.
 _DELIVERED = "delivered"
 _REFUSED = "refused"
 _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
@@ -327,7 +351,69 @@ _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
         },
         _DELIVERED,
     ),
+    # vault BACKLOG #3040 item 3: the cells engine PR 2041 left without a row. Capture off, the last forms that
+    # are not wrapped: a conditional create, and a batch Bundle the Handler built.
+    (
+        ConnectorType.FHIR,
+        {
+            "capture_response": False,
+            "conditional": "if-none-exist",
+            "conditional_query": "identifier=synthetic-1",
+        },
+        _DELIVERED,
+    ),
+    (
+        ConnectorType.FHIR,
+        {"capture_response": False, "interaction": "batch", **_ENTRY_SCREEN},
+        _DELIVERED,
+    ),
+    # Capture on refuses every FHIR form, wrapped or not, because the reply is passed on.
+    (
+        ConnectorType.FHIR,
+        {"capture_response": True, "interaction": "transaction", **_ENTRY_SCREEN},
+        _REFUSED,
+    ),
+    (ConnectorType.FHIR, {"capture_response": True, "conditional": "if-match"}, _REFUSED),
+    (
+        ConnectorType.FHIR,
+        {"capture_response": True, "interaction": "update", "update_url_form": "path"},
+        _REFUSED,
+    ),
+    (
+        ConnectorType.FHIR,
+        {
+            "capture_response": True,
+            "interaction": "update",
+            "conditional": "conditional-update",
+            "conditional_query": "identifier=synthetic-1",
+        },
+        _REFUSED,
+    ),
+    # REST decides by capture alone, whatever the method.
+    (ConnectorType.REST, {"capture_response": False, "method": "PATCH"}, _DELIVERED),
+    # reingress_to forces capture on at wiring, over an explicit capture_response=False. So the
+    # reply is passed on and the refusal holds. See _dest for why this row is wired first.
+    (ConnectorType.REST, {"capture_response": False, "reingress_to": "LB_REPLY"}, _REFUSED),
 ]
+
+
+def _dest(ctype: ConnectorType, url: str, over: dict[str, Any]) -> Any:
+    """``_build``, after the wiring step a real config passes through, where a case needs it.
+
+    ``_build`` hands the factory's settings straight to the connector. ``reingress_to`` forces
+    ``capture_response`` on in ``build_outbound_connection``, a step ``_build`` skips, so the
+    re-ingress row takes its capture setting from that step."""
+    if "reingress_to" not in over:
+        return _build(ctype, url, **over)
+    wired = build_outbound_connection(
+        "OB",
+        _FACTORY[ctype](url=url, **over),
+        cleartext_accepted=url.startswith("http://"),
+        cleartext_reason="test peer has no TLS" if url.startswith("http://") else None,
+    )
+    forced = wired.spec.settings["capture_response"]
+    assert forced is True  # the wiring step this row is about
+    return _build(ctype, url, **{**over, "capture_response": forced})
 
 
 def _case_id(case: tuple[ConnectorType, dict[str, Any], str]) -> str:
@@ -336,7 +422,19 @@ def _case_id(case: tuple[ConnectorType, dict[str, Any], str]) -> str:
     interaction = f"-{over['interaction']}" if "interaction" in over else ""
     form = f"-{over['update_url_form']}" if "update_url_form" in over else ""
     conditional = f"-{over['conditional']}" if "conditional" in over else ""
-    return f"{ctype.value}-{capture}{interaction}{form}{conditional}"
+    method = f"-{over['method']}" if "method" in over else ""
+    reingress = "-reingress" if "reingress_to" in over else ""
+    return f"{ctype.value}-{capture}{interaction}{form}{conditional}{method}{reingress}"
+
+
+def test_every_ruled_case_has_its_own_id() -> None:
+    """A repeated id would let pytest run two cases under one name, and a later edit could drop
+    one unseen."""
+    ids = [_case_id(case) for case in _RULED]
+    assert len(ids) >= 20
+    assert len(set(ids)) == len(ids)
+    # The framing test's rows: the plain capture pair of REST, one delivered and one refused.
+    assert [side for _, _, side in _FRAMING_ROWS] == [_DELIVERED, _REFUSED]
 
 
 @pytest.mark.parametrize("case", _RULED, ids=_case_id)
@@ -344,7 +442,7 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     case: tuple[ConnectorType, dict[str, Any], str], caplog: pytest.LogCaptureFixture
 ) -> None:
     ctype, over, side = case
-    dest = _build(ctype, f"https://partner.example.com/x?site={_URL_MARKER}", **over)
+    dest = _dest(ctype, f"https://partner.example.com/x?site={_URL_MARKER}", over)
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     dest._opener = opener
@@ -358,7 +456,8 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
             assert ei.value.permanent is True
             refusal = str(ei.value)
             identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
-            assert refusal.startswith(f"{identity}: {REPLY_TOO_LARGE_CODE}, not sent again")
+            assert refusal.startswith(f"{REPLY_TOO_LARGE_CODE}, not sent again")
+            assert refusal.endswith(f"Check the partner before a replay ({identity})")
             assert _URL_MARKER not in refusal
             assert "partner.example.com" not in refusal
     # The bound is still enforced on the read: one byte past it, and never the whole body.
@@ -372,7 +471,7 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     else:
         # A refusal is not also logged as a delivery. The delivered cases of this same test show
         # the capture sees that WARNING when it is logged.
-        assert "recorded as delivered" not in caplog.text
+        assert _TAKEN_AS_ANSWER not in caplog.text
 
 
 # --- the delivery worker, on the wire -------------------------------------------------------------
@@ -386,26 +485,41 @@ def over_cap_body() -> Iterator[bytes]:
 
 
 class _Partner:
-    """A loopback partner that answers every request with ``status`` and ``body``, and counts them."""
+    """A loopback partner that answers every request with ``status`` and ``body``, and counts them.
 
-    def __init__(self, status: int, body: bytes) -> None:
+    ``framing`` is how the body's end is marked: ``"length"`` (``Content-Length``), ``"chunked"``
+    (an HTTP/1.1 chunked body) or ``"close"`` (no length; the partner closes after the body)."""
+
+    def __init__(self, status: int, body: bytes, framing: str = "length") -> None:
         self.requests: list[str] = []
         outer = self
+        wire = body
+        if framing == "chunked":
+            step = 1 << 20
+            pieces = [body[at : at + step] for at in range(0, len(body), step)]
+            wire = b"".join(b"%x\r\n%s\r\n" % (len(p), p) for p in pieces) + b"0\r\n\r\n"
 
         class _Handler(http.server.BaseHTTPRequestHandler):
+            # HTTP/1.1 only for chunked: the engine refuses Transfer-Encoding on an HTTP/1.0 reply.
+            protocol_version = "HTTP/1.1" if framing == "chunked" else "HTTP/1.0"
+
             def _serve(self) -> None:
                 self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 outer.requests.append(self.command)
                 self.send_response(status)
-                self.send_header("Content-Length", str(len(body)))
+                if framing == "length":
+                    self.send_header("Content-Length", str(len(body)))
+                elif framing == "chunked":
+                    self.send_header("Transfer-Encoding", "chunked")
                 self.send_header("Connection", "close")
                 self.end_headers()
                 # A destination that classifies a non-2xx on the status alone closes without
                 # reading the body, so the rest of the write has nowhere to go.
                 with contextlib.suppress(OSError):
-                    self.wfile.write(body)
+                    self.wfile.write(wire)
 
-            do_POST = do_PUT = _serve
+            # PATCH for the REST method row, which needs a verb other than POST.
+            do_POST = do_PUT = do_PATCH = _serve
 
             def log_message(self, format: str, *args: object) -> None:  # noqa: A002
                 return
@@ -513,11 +627,14 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
 ) -> None:
     ctype, over, side = case
     with _Partner(200, over_cap_body) as partner:
-        dest = _build(ctype, f"{partner.url}/x?site={_URL_MARKER}", **over)
+        dest = _dest(ctype, f"{partner.url}/x?site={_URL_MARKER}", over)
         with caplog.at_level(logging.WARNING):
             got = await _deliver(tmp_path, dest, _payload(ctype, over))
     # THE ITEM: the partner answered 2xx, so it must never see the request twice.
     assert len(partner.requests) == 1, partner.requests
+    if "method" in over:
+        # The row is about the verb, so show the verb reached the wire.
+        assert partner.requests == [over["method"]]
     assert got.outcomes == [_ItemOutcome.PROCESSED]
     assert got.stopped == [], "one over-cap reply must not stop the lane"
     assert got.captured == []
@@ -525,22 +642,55 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
         assert got.row_status == OutboxStatus.DONE.value
         assert got.message_status == MessageStatus.PROCESSED.value
         assert got.last_error == ""
-        assert any("recorded as delivered" in r.getMessage() for r in caplog.records)
+        assert any(_TAKEN_AS_ANSWER in r.getMessage() for r in caplog.records)
     else:
         assert got.row_status == OutboxStatus.DEAD.value
         assert got.message_status == MessageStatus.ERROR.value
         # The stored error is the fixed text: the connection, the bound, and nothing of the URL,
         # the payload or the reply.
         identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
-        # The code is in the text, because the row keeps the text and not the code. The advice
-        # is the last thing in it, so seeing it shows the 200-character cut took nothing.
-        assert f"{identity}: {REPLY_TOO_LARGE_CODE}, not sent again" in got.last_error
-        assert got.last_error.endswith("Check the partner before a replay")
+        # The code is in the text, because the row keeps the text and not the code. The
+        # connection is the last thing in it, so seeing it whole shows the 200-character cut
+        # took nothing.
+        assert f"{REPLY_TOO_LARGE_CODE}, not sent again" in got.last_error
+        assert got.last_error.endswith(f"Check the partner before a replay ({identity})")
         for leaked in (_URL_MARKER, "127.0.0.1", _PAYLOAD_MARKER, "ZZZZ"):
             assert leaked not in got.last_error
     for record in caplog.records:
         for leaked in (_URL_MARKER, _PAYLOAD_MARKER, "ZZZZ"):
             assert leaked not in record.getMessage()
+
+
+#: The framing is read by shared code, not by each destination, so one delivered and one
+#: refused row cover it.
+_FRAMING_ROWS = [
+    case
+    for case in _RULED
+    if case[0] is ConnectorType.REST and set(case[1]) == {"capture_response"}
+]
+
+
+@pytest.mark.parametrize("framing", ["chunked", "close"])
+@pytest.mark.parametrize("case", _FRAMING_ROWS, ids=_case_id)
+async def test_an_over_cap_2xx_in_another_framing_is_sent_once(
+    case: tuple[ConnectorType, dict[str, Any], str],
+    framing: str,
+    tmp_path: Path,
+    over_cap_body: bytes,
+) -> None:
+    """vault BACKLOG #3040 item 7: the wire layer above frames each reply with ``Content-Length``. A chunked or
+    close-framed over-cap body after a 2xx takes the same arm, with one request."""
+    ctype, over, side = case
+    with _Partner(200, over_cap_body, framing=framing) as partner:
+        dest = _build(ctype, f"{partner.url}/x", **over)
+        got = await _deliver(tmp_path, dest, _payload(ctype, over))
+    assert len(partner.requests) == 1, partner.requests
+    assert got.outcomes == [_ItemOutcome.PROCESSED]
+    if side == _DELIVERED:
+        assert (got.row_status, got.last_error) == (OutboxStatus.DONE.value, "")
+    else:
+        assert got.row_status == OutboxStatus.DEAD.value
+        assert f"{REPLY_TOO_LARGE_CODE}, not sent again" in got.last_error
 
 
 #: A reply each destination takes as a plain success.
@@ -565,10 +715,11 @@ async def test_an_in_cap_2xx_is_delivered_as_before(
     included, and with capture on its body is stored whole. No new WARNING is logged for it.
     So what refuses a case above is the size of its reply, and not the case."""
     ctype, over, _ = case
-    capture = bool(over["capture_response"])
     body = _IN_CAP_BODY[ctype]
     with _Partner(200, body) as partner:
-        dest = _build(ctype, f"{partner.url}/x", **over)
+        dest = _dest(ctype, f"{partner.url}/x", over)
+        # Read off the connector, so a reingress_to that forced capture on counts.
+        capture = bool(dest.capture_response)
         with caplog.at_level(logging.WARNING):
             got = await _deliver(tmp_path, dest, _payload(ctype, over))
     assert len(partner.requests) == 1
