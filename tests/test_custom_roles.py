@@ -22,6 +22,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import (
+    BUILTIN_ROLE_PERMISSIONS,
     CUSTOM_ROLE_ID_PREFIX,
     CustomRoleError,
     decode_custom_role_permissions,
@@ -144,8 +145,6 @@ def test_decode_drops_view_raw_from_a_stored_row_without_view_summary() -> None:
 
 
 def test_no_builtin_role_has_the_refused_shape() -> None:
-    from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, raw_body_without_summary
-
     assert not [
         r for r, perms in BUILTIN_ROLE_PERMISSIONS.items() if raw_body_without_summary(perms)
     ]
@@ -154,8 +153,9 @@ def test_no_builtin_role_has_the_refused_shape() -> None:
 
 
 def test_the_predicate_answers_an_iterator_correctly() -> None:
-    # ORDER MATTERS: view_summary first. Two `in` tests on an iterator consume it on the way to
-    # view_raw, so the second test misses it; the reverse order would hide that defect.
+    # view_summary comes first on purpose. A predicate written as two `in` tests on the argument
+    # would use up an iterator while finding view_raw, then report view_summary missing. With
+    # view_raw first that defect would not show.
     pair = [Permission.MESSAGES_VIEW_SUMMARY, Permission.MESSAGES_VIEW_RAW]
     assert not raw_body_without_summary(iter(pair))
     assert raw_body_without_summary(iter([Permission.MESSAGES_VIEW_RAW]))
@@ -480,38 +480,40 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
+async def _onboarded(service: AuthService, username: str, role: Role) -> None:
+    """A user who can sign in over HTTP. Admin-created accounts force a password change at first
+    login (WP-L3-12), so clear that flag and keep the hash."""
+    user_id = await _make_user(service, username, role.value)
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
+    )
+
+
+def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+async def _bearer(client: httpx.AsyncClient, username: str) -> dict[str, str]:
+    login = await client.post(
+        "/auth/login", json={"username": username, "password": PW, "provider": "local"}
+    )
+    assert login.status_code == 200, login.text
+    return {"Authorization": f"Bearer {login.json()['token']}"}
+
+
 async def test_crud_requires_users_manage(engine: Engine) -> None:
     service = AuthService(engine.store, AuthSettings())
     await service.initialize()
     # a VIEWER has neither USERS_MANAGE nor USERS_READ
-    viewer_id = await create_local_user_chosen(
-        service,
-        username="viewer",
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=[Role.VIEWER.value],
-        actor="test",
-    )
-    # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this
-    # fixture still stands for an operator who has been provisioned; the channel axis itself
-    # is exercised in tests/test_channel_rbac.py.
-    await service.set_channel_scope(viewer_id, [ALL_CHANNELS], actor="test")
-    u = await engine.store.get_user(viewer_id)
-    assert u is not None and u.password_hash is not None
-    await engine.store.set_password(
-        viewer_id,
-        password_hash=u.password_hash,
-        must_change_password=False,
-        password_generated=False,
-    )
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        login = await c.post(
-            "/auth/login", json={"username": "viewer", "password": PW, "provider": "local"}
-        )
-        token = login.json()["token"]
-        h = {"Authorization": f"Bearer {token}"}
+    await _onboarded(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        h = await _bearer(c, "viewer")
         # create / update / delete are all denied for a non-USERS_MANAGE caller
         r = await c.post(
             "/roles/custom",
@@ -529,6 +531,51 @@ async def test_crud_requires_users_manage(engine: Engine) -> None:
         assert r.status_code == 403
         # listing custom roles needs USERS_READ — also denied for VIEWER
         assert (await c.get("/roles/custom", headers=h)).status_code == 403
+
+
+async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:
+    """vault BACKLOG #1187: the admin's own surface, POST and PUT /roles/custom, answers 400 with the
+    pairing message. Controls: a POST and a PUT keeping view_summary are accepted. A final listing
+    shows neither refusal wrote anything, name included.
+
+    Moved here from tests/test_api_auth.py (vault BACKLOG #2727), beside the other custom-role
+    route test."""
+    # require_mfa=False and no write interval: this is a role-rule test. The administrator makes
+    # four writes in a row, and neither the MFA gate nor the admin write limiter is its subject.
+    service = AuthService(
+        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    )
+    await service.initialize()
+    await _onboarded(service, "adm", Role.ADMINISTRATOR)
+    both = ["messages:read", "messages:view_raw", "messages:view_summary"]
+    raw_only = ["messages:read", "messages:view_raw"]
+    async with _client(engine, service) as c:
+        h = await _bearer(c, "adm")  # a fresh login is step-up fresh
+        refused = await c.post(
+            "/roles/custom", headers=h, json={"display_name": "Raw", "permissions": raw_only}
+        )
+        assert refused.status_code == 400, refused.text
+        assert "messages:view_raw needs messages:view_summary" in refused.json()["detail"]
+        made = await c.post(
+            "/roles/custom",
+            headers=h,
+            json={"display_name": "Raw and summary", "permissions": both},
+        )
+        assert made.status_code == 201, made.text
+        role_url = f"/roles/custom/{made.json()['id']}"
+        # PUT control: the same edit keeping view_summary is accepted.
+        kept = await c.put(role_url, headers=h, json={"display_name": "R", "permissions": both})
+        assert kept.status_code == 200, kept.text
+        # The refused edit drops view_summary and also renames; the 400's detail ties it to the
+        # pairing rule, and the listing below shows the rename did not land either.
+        edited = await c.put(
+            role_url, headers=h, json={"display_name": "Changed", "permissions": raw_only}
+        )
+        assert edited.status_code == 400, edited.text
+        assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
+        # Neither refusal wrote anything: one role, with the accepted name and permissions.
+        listed = (await c.get("/roles/custom", headers=h)).json()
+        assert [(r["display_name"], r["permissions"]) for r in listed] == [("R", sorted(both))]
 
 
 # --- store: backend migration + CRUD parity (AC-8) ---------------------------

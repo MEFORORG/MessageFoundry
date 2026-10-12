@@ -426,7 +426,8 @@ async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identi
             body = response.json()
             returned = {prop: body[prop] for prop in gated if body[prop] is not None}
             assert not returned, f"{mid}: a view_raw-only caller was returned {returned}"
-            # Positive control: the administrator gets each property the row carries, as a mask.
+            # Positive control: the administrator is returned each property the row carries. The
+            # value may be a display mask; only its presence is asserted here.
             control = await client.get(f"/messages/{mid}", headers=boss)
             assert control.status_code == 200, control.text
             seen = control.json()
