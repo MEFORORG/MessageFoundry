@@ -3,12 +3,14 @@
 """An environment web proxy is disclosed at start, never silent (BACKLOG #1125, ASVS 4.2.1).
 
 Owner ruling 2026-10-11: an ambient proxy must not attach silently, or must be disclosed. The
-engine's urllib openers follow ``HTTP_PROXY``, ``HTTPS_PROXY`` and the system proxy. Its Vault
-clients reach an ``https://`` Vault through ``HTTPS_PROXY`` or ``ALL_PROXY``, and refuse an
-``http://`` Vault that ``HTTP_PROXY`` or ``ALL_PROXY`` would carry. So ``serve`` and ``supervise``
-name that proxy, and the hops it affects, in one WARNING per process.
-Both polarities are tested: with a proxy in the environment the warning names its host and no
-credential; with none, nothing is logged.
+engine's urllib openers follow ``HTTP_PROXY``, ``HTTPS_PROXY`` and the system proxy, and its Vault
+clients follow those and ``ALL_PROXY``. So ``serve`` and ``supervise`` name each proxy, and the
+hops that use it or refuse it, in one WARNING per process.
+
+The warning discloses and does not reason about what the leg to the proxy protects; that is in
+``docs/CONFIGURATION.md``. So the hop table below is the expected disclosure for each proxy set,
+and no warning may use a word that claims or denies protection. Both polarities are tested: with a
+proxy in the environment the warning names its host and no credential; with none, nothing logs.
 """
 
 from __future__ import annotations
@@ -16,18 +18,24 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import socket
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from requests.utils import get_environ_proxies, select_proxy
+from requests.utils import select_proxy
 
 from messagefoundry.transports.ambient_proxy import ambient_proxy_warning, environment_proxy_hosts
 
 _SECRET = "s3cretpw"
 _PROXY = f"http://alice:{_SECRET}@proxy.example:3128"
-_VAULT_TLS = "The Vault and OpenBao clients do open TLS to an https:// proxy."
+_P = "http://proxy.example:3128"
+_Q = "http://other.example:8080"
+_URLLIB = "the urllib hops"
+_VAULT = "the Vault and OpenBao clients"
+#: Words that would make the warning reason about protection rather than disclose (SDS-3.5).
+_NO_SAFETY_WORDS = ("tls", "encrypt", "secure", "safe", "protected")
 
 
 @pytest.fixture
@@ -44,6 +52,189 @@ def no_ambient_proxy(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return monkeypatch
 
 
+def _line(key: str, address: str, *clauses: str) -> str:
+    return f"The {key} proxy is {address}: " + "; ".join(clauses) + "."
+
+
+@pytest.mark.parametrize(
+    ("proxies", "lines"),
+    [
+        pytest.param(
+            {"https": _P},
+            [
+                _line(
+                    "https",
+                    _P,
+                    f"{_URLLIB} use it for https targets",
+                    f"{_VAULT} use it for an https:// Vault",
+                )
+            ],
+            id="https",
+        ),
+        pytest.param(
+            {"http": _P},
+            [
+                _line(
+                    "http",
+                    _P,
+                    f"{_URLLIB} use it for http targets",
+                    f"{_VAULT} refuse it for an http:// Vault",
+                )
+            ],
+            id="http",
+        ),
+        pytest.param(
+            {"all": _P},
+            [
+                _line(
+                    "all",
+                    _P,
+                    f"{_VAULT} use it for an https:// Vault and refuse it for an http:// Vault",
+                )
+            ],
+            id="all",
+        ),
+        pytest.param(
+            {"http": _P, "all": _Q},
+            [
+                _line("all", _Q, f"{_VAULT} use it for an https:// Vault"),
+                _line(
+                    "http",
+                    _P,
+                    f"{_URLLIB} use it for http targets",
+                    f"{_VAULT} refuse it for an http:// Vault",
+                ),
+            ],
+            id="http-and-all",
+        ),
+        pytest.param(
+            {"https": _P, "all": _Q},
+            [
+                _line("all", _Q, f"{_VAULT} refuse it for an http:// Vault"),
+                _line(
+                    "https",
+                    _P,
+                    f"{_URLLIB} use it for https targets",
+                    f"{_VAULT} use it for an https:// Vault",
+                ),
+            ],
+            id="https-and-all",
+        ),
+        pytest.param(
+            {"all": _PROXY},
+            [_line("all", _P, f"{_VAULT} refuse it for an http:// or https:// Vault")],
+            id="all-with-credentials",
+        ),
+        pytest.param(
+            {"https": _PROXY},
+            [
+                _line(
+                    "https",
+                    _P,
+                    f"{_URLLIB} refuse it for https targets",
+                    f"{_VAULT} refuse it for an https:// Vault",
+                )
+            ],
+            id="https-with-credentials-over-http",
+        ),
+        pytest.param(
+            {"http": _P, "https": _Q},
+            [
+                _line(
+                    "http",
+                    _P,
+                    f"{_URLLIB} use it for http targets",
+                    f"{_VAULT} refuse it for an http:// Vault",
+                ),
+                _line(
+                    "https",
+                    _Q,
+                    f"{_URLLIB} use it for https targets",
+                    f"{_VAULT} use it for an https:// Vault",
+                ),
+            ],
+            id="two-hosts",
+        ),
+        pytest.param(
+            # urllib re-sends an http target whose proxy is written https:// through the https
+            # entry, so that entry carries http targets too.
+            {"http": "https://proxy.example:443", "https": _Q},
+            [
+                _line(
+                    "http",
+                    "https://proxy.example:443",
+                    f"{_URLLIB} use it for http targets",
+                    f"{_VAULT} refuse it for an http:// Vault",
+                ),
+                _line(
+                    "https",
+                    _Q,
+                    f"{_URLLIB} use it for http and https targets",
+                    f"{_VAULT} use it for an https:// Vault",
+                ),
+            ],
+            id="two-hosts-http-entry-written-https",
+        ),
+    ],
+)
+def test_the_warning_lists_the_hops_the_code_would_send_through_each_proxy(
+    proxies: dict[str, str], lines: list[str]
+) -> None:
+    text = ambient_proxy_warning(proxies=proxies)
+    assert text is not None
+    for line in lines:
+        assert line in text, (line, text)
+    assert text.count(" proxy is ") == len(lines), text
+    assert ("The urllib hops are" in text) == any(_URLLIB in line for line in lines)
+    assert _SECRET not in text and "alice" not in text and "@" not in text
+    for word in _NO_SAFETY_WORDS:
+        assert word not in text.lower(), word
+
+
+@pytest.mark.parametrize("vault", ["https://vault.example:8200", "http://vault.example:8200"])
+@pytest.mark.parametrize(
+    "proxies", [{"https": _P}, {"http": _P}, {"all": _P}, {"http": _P, "all": _Q}]
+)
+def test_the_vault_clients_are_named_for_the_entry_requests_selects(
+    proxies: dict[str, str], vault: str
+) -> None:
+    """The control for the table: requests' own selection names the same entry the warning does."""
+    scheme = vault.split(":", 1)[0]
+    text = ambient_proxy_warning(proxies=proxies)
+    assert text is not None
+    # requests' selection run on a map of each key to itself returns the key it would pick.
+    key = select_proxy(vault, {k: k for k in proxies})
+    naming = [s for s in text.split(". ") if f"{scheme}:// " in s and "Vault" in s]
+    assert [s.split(" proxy is ")[0] for s in naming] == ([f"The {key}"] if key else []), text
+
+
+def test_without_the_vault_extra_the_vault_clients_are_not_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Vault clients cannot run without hvac, so no proxy reaches them."""
+    import importlib.util
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *a: None if name == "hvac" else real(name, *a)
+    )
+    text = ambient_proxy_warning(proxies={"all": _P})
+    assert text is not None and "Vault" not in text
+    assert _line("all", _P, "no engine hop reads it") in text
+
+
+def test_the_probe_dials_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hops are found by running the real handlers, which must stop before any socket."""
+
+    def _refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the probe opened a socket")
+
+    monkeypatch.setattr(socket, "create_connection", _refuse)
+    monkeypatch.setattr(socket.socket, "connect", _refuse)
+    proxies = {"http": "https://proxy.example:443", "https": _Q, "all": _PROXY}
+    assert ambient_proxy_warning(proxies=proxies) is not None
+
+
 def test_hosts_drop_credentials_and_keys_no_http_hop_reads() -> None:
     hosts = environment_proxy_hosts(
         {
@@ -58,21 +249,6 @@ def test_hosts_drop_credentials_and_keys_no_http_hop_reads() -> None:
     assert hosts == {"http": "http://proxy.example:3128", "https": "http://proxy.example:3129"}
 
 
-def test_only_requests_reads_an_all_proxy() -> None:
-    """The premise behind listing only the Vault clients for ``ALL_PROXY``: urllib's handler
-    gets no opener method for it, and requests selects it for any scheme."""
-    handler = urllib.request.ProxyHandler({"all": "http://p.example:1"})
-    assert not hasattr(handler, "http_open") and not hasattr(handler, "https_open")
-    assert select_proxy("https://vault.example", {"all": "http://p.example:1"}) == (
-        "http://p.example:1"
-    )
-    text = ambient_proxy_warning(proxies={"all": _PROXY})
-    assert text is not None and "all targets via http://proxy.example:3128" in text
-    assert "Vault and OpenBao" in text
-    for hop in ("HTTP-family", "alert webhook", "OIDC", "AI broker"):
-        assert hop not in text, hop
-
-
 @pytest.mark.parametrize(
     "value",
     [
@@ -85,6 +261,9 @@ def test_only_requests_reads_an_all_proxy() -> None:
 )
 def test_an_unreadable_proxy_value_is_not_echoed(value: str) -> None:
     assert environment_proxy_hosts({"http": value}) == {"http": "an unreadable value"}
+    text = ambient_proxy_warning(proxies={"http": value})
+    assert text is not None and "The http proxy is an unreadable value: " in text
+    assert _SECRET not in text and "forged" not in text and "pro xy" not in text
 
 
 def test_an_ipv6_proxy_is_named_with_its_brackets() -> None:
@@ -96,23 +275,15 @@ def test_an_ipv6_proxy_is_named_with_its_brackets() -> None:
 def test_no_proxy_means_no_warning() -> None:
     assert ambient_proxy_warning(proxies={}) is None
     assert ambient_proxy_warning(proxies={"no": "localhost"}) is None
-
-
-def test_the_warning_names_every_hop_and_no_credential() -> None:
-    text = ambient_proxy_warning(proxies={"https": _PROXY})
-    assert text is not None
-    assert "https targets via http://proxy.example:3128" in text
-    assert _SECRET not in text and "alice" not in text
-    for hop in ("HTTP-family", "alert webhook", "OIDC", "AI broker", "Vault and OpenBao"):
-        assert hop in text, hop
+    assert ambient_proxy_warning(proxies={"ftp": _P, "https": "  "}) is None
 
 
 def test_a_no_proxy_of_star_means_no_warning() -> None:
     """``NO_PROXY=*`` sends every hop direct in urllib and in requests, so nothing is disclosed."""
-    assert ambient_proxy_warning(proxies={"https": _PROXY, "no": "*"}) is None
-    assert ambient_proxy_warning(proxies={"https": _PROXY, "no": "intranet.example"}) is not None
+    assert ambient_proxy_warning(proxies={"https": _P, "no": "*"}) is None
+    assert ambient_proxy_warning(proxies={"https": _P, "no": "intranet.example"}) is not None
     # urllib compares the raw value, so a padded star bypasses nothing and must still warn.
-    assert ambient_proxy_warning(proxies={"https": _PROXY, "no": " *"}) is not None
+    assert ambient_proxy_warning(proxies={"https": _P, "no": " *"}) is not None
 
 
 def test_the_proxy_scheme_is_named_as_the_libraries_read_it() -> None:
@@ -125,79 +296,17 @@ def test_the_proxy_scheme_is_named_as_the_libraries_read_it() -> None:
     }
 
 
-def test_the_warning_does_not_claim_a_tls_proxy_leg_for_the_urllib_hops() -> None:
-    """Naming ``https://proxy`` must not read as an encrypted leg (SDS-3.7).
-
-    For an https target, urllib reaches even an ``https://`` proxy over plain TCP, and sends
-    ``CONNECT`` and any proxy credential in cleartext. ``tests/test_proxy_url_credentials_refused.py``
-    measures that on the wire. Only the Vault clients get a TLS leg, so only they are said to."""
-    text = ambient_proxy_warning(proxies={"https": "https://u:pw@proxy.example:443"})
-    assert text is not None and "https targets via https://proxy.example:443" in text
-    assert "An https:// one is not refused, and is not safe either." in text
-    assert "the urllib hops reach every proxy over plain TCP, even one written https://" in text
-    assert "and any credential from the proxy URL, in cleartext" in text
-    # TLS is named only in the Vault clients' sentence: nothing else may claim a TLS leg.
-    assert _VAULT_TLS in text
-    rest = text.replace(_VAULT_TLS, "").lower()
-    for claim in ("tls", "encrypt", "secure", "is safe", "protected"):
-        assert claim not in rest, claim
-
-
-def test_with_no_https_proxy_only_an_https_written_http_proxy_gets_tls() -> None:
-    """The one shape the measurement found a TLS leg in: an ``http`` target, no ``https`` proxy."""
-    text = ambient_proxy_warning(proxies={"http": "https://proxy.example:443"})
-    assert text is not None
-    assert "With no https proxy set, an https target goes direct" in text
-    assert "only an http proxy written https:// gets a TLS leg" in text
-    assert "not safe either" not in text and "plain TCP" not in text and _VAULT_TLS not in text
-
-
-def test_an_http_only_proxy_does_not_list_the_vault_clients_but_says_it_refuses_them() -> None:
-    """requests picks no ``http`` entry for an ``https://`` Vault, so that entry carries no Vault
-    hop. It does pick it for an ``http://`` Vault, which ``strict_requests`` then refuses even on
-    loopback, so the warning says that instead of listing the Vault among the hops that follow."""
-    assert select_proxy("https://vault.example:8200", {"http": "http://p.example:1"}) is None
-    assert select_proxy("http://127.0.0.1:8200", {"http": "http://p.example:1"}) == (
-        "http://p.example:1"
-    )
-    text = ambient_proxy_warning(proxies={"http": _PROXY})
-    assert text is not None and "http targets via http://proxy.example:3128" in text
-    assert "Vault and OpenBao clients, loopback addresses included" not in text
-    assert "refuse an http:// Vault address that an http or all proxy would carry" in text
-    for hop in ("HTTP-family", "alert webhook", "OIDC", "AI broker"):
-        assert hop in text, hop
-    # An https-only proxy is never picked for an http:// Vault, so it makes no refusal claim.
-    https_only = ambient_proxy_warning(proxies={"https": _PROXY})
-    assert https_only is not None and "refuse an http:// Vault" not in https_only
-
-
-def test_the_remedy_says_proxy_url_does_not_stop_the_warning() -> None:
-    """``[egress].proxy_url`` moves only the HTTP family, and the warning reads no settings."""
-    text = ambient_proxy_warning(proxies={"https": _PROXY})
-    assert text is not None
-    assert "[egress].proxy_url to an address names a proxy for the HTTP family only" in text
-    assert "The other hops keep this proxy, and this warning still logs" in text
-    # No HTTP-family hop follows an all-only proxy, so proxy_url is no remedy to offer there.
-    all_only = ambient_proxy_warning(proxies={"all": _PROXY})
-    assert all_only is not None and "proxy_url" not in all_only and "urllib" not in all_only
-    assert "To stop it, clear http_proxy" in all_only
-
-
-def test_the_warning_does_not_promise_the_vault_a_loopback_bypass(
-    no_ambient_proxy: pytest.MonkeyPatch,
-) -> None:
-    """requests has no loopback-direct rule, so an https Vault on 127.0.0.1 is proxied.
-
-    ``get_environ_proxies`` runs requests' own bypass check, which ``select_proxy`` never does."""
-    no_ambient_proxy.setenv("HTTPS_PROXY", "http://p.example:1")
-    assert get_environ_proxies("https://127.0.0.1:8200").get("https") == "http://p.example:1"
-    # Control: the same call does honour a bypass rule when one names the host.
-    no_ambient_proxy.setenv("NO_PROXY", "127.0.0.1")
-    assert "https" not in get_environ_proxies("https://127.0.0.1:8200")
-    text = ambient_proxy_warning(proxies={"https": _PROXY})
-    assert text is not None
-    assert "Vault and OpenBao clients, loopback addresses included" in text
-    assert "The urllib hops dial a loopback host direct" in text
+def test_the_warning_points_at_one_doc_section_and_gives_the_remedy() -> None:
+    """``[egress].proxy_url`` changes only the HTTP family, and the warning reads no settings."""
+    for proxies in ({"https": _P}, {"all": _P}):
+        text = ambient_proxy_warning(proxies=proxies)
+        assert text is not None
+        assert '[egress], "serve names an environment proxy at start"' in text
+        assert "To stop it, clear http_proxy, https_proxy and all_proxy" in text
+        assert "[egress].proxy_url to an address changes only the HTTP-family connections" in text
+        assert "Every other hop keeps this proxy, and this warning still logs" in text
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md").read_text("utf-8")
+    assert "#### `serve` names an environment proxy at start" in doc
 
 
 class _Keep(logging.Handler):
@@ -244,7 +353,7 @@ def test_serve_discloses_an_environment_proxy(
     no_ambient_proxy.setenv("HTTPS_PROXY", _PROXY)
     warnings = _serve_warnings(tmp_path, no_ambient_proxy)
     assert len(warnings) == 1, warnings
-    assert "https targets via http://proxy.example:3128" in warnings[0], warnings
+    assert "The https proxy is http://proxy.example:3128: " in warnings[0], warnings
     assert _SECRET not in warnings[0]
 
 
@@ -254,10 +363,18 @@ def test_serve_without_an_environment_proxy_warns_of_none(
     assert _serve_warnings(tmp_path, no_ambient_proxy) == []
 
 
+def test_serve_with_no_proxy_star_warns_of_none(
+    tmp_path: Path, no_ambient_proxy: pytest.MonkeyPatch
+) -> None:
+    no_ambient_proxy.setenv("HTTPS_PROXY", _P)
+    no_ambient_proxy.setenv("NO_PROXY", "*")
+    assert _serve_warnings(tmp_path, no_ambient_proxy) == []
+
+
 def test_supervise_discloses_an_environment_proxy_before_spawning(
     tmp_path: Path, no_ambient_proxy: pytest.MonkeyPatch
 ) -> None:
-    """The supervisor's own store open and TLS pair renewal can use the proxy, so it names it too."""
+    """The supervisor's own store open and pair renewal can use the proxy, so it names it too."""
 
     async def _no_fleet(*args: object, **kwargs: object) -> int:
         return 0
@@ -266,4 +383,4 @@ def test_supervise_discloses_an_environment_proxy_before_spawning(
     no_ambient_proxy.setenv("HTTPS_PROXY", _PROXY)
     warnings = _serve_warnings(tmp_path, no_ambient_proxy, command="supervise")
     assert len(warnings) == 1, warnings
-    assert "https targets via http://proxy.example:3128" in warnings[0], warnings
+    assert "The https proxy is http://proxy.example:3128: " in warnings[0], warnings
