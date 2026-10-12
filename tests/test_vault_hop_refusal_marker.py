@@ -57,8 +57,11 @@ def _lines_building(path: Path, name: str) -> list[int]:
 
 def test_only_the_strict_reader_module_builds_the_marked_refusal() -> None:
     modules = sorted(_PACKAGE.rglob("*.py"))
-    # 337 modules when this floor was set. A moved package or a changed glob leaves none to scan.
+    # 337 modules when this floor was set. A moved package or a changed glob leaves few or none
+    # to scan. Lower the floor only if the package really shrank.
     assert len(modules) >= 300, f"the walk found only {len(modules)} module(s) under {_PACKAGE}"
+    # The same scan sees the name where it is built, so finding none elsewhere means something.
+    assert _lines_building(_HOME, _MARKER), f"the scan sees no {_MARKER} call in {_HOME.name}"
     elsewhere = {
         str(path.relative_to(_PACKAGE)): lines
         for path in modules
@@ -142,7 +145,8 @@ def test_every_marked_refusal_is_built_from_fixed_text() -> None:
     tree = parse_source(_HOME.read_text(encoding="utf-8"))
     constants = _string_constants(tree)
     sites = call_sites(tree, _MARKER)
-    # 8 marked refusals when this floor was set. A scan that finds none has checked nothing.
+    # 8 marked refusals when this floor was set. A scan that sees few of them, or none, leaves the
+    # rest unchecked. Lower the floor only if refusals were really merged or removed.
     assert len(sites) >= 6, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
     loose = [site.lineno for site in sites if not _is_fixed_text(site, constants)]
     assert loose == [], f"a marked refusal interpolates something at lines {loose}"
