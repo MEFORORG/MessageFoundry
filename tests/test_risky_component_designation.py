@@ -1184,6 +1184,10 @@ _CRITERION = (
     "A wheel that carries only another project's data is listed below with what it carries.",
     "It is owed no route, because data holds another project's tables and none of its logic.",
     "A wheel whose answer is not established, for any form, is treated as carrying code.",
+    "That a data-only wheel owes no route rests on owner ruling R1 of 2026-10-06, recorded in "
+    "the vault.",
+    "It does not name tables kept as generated Python modules.",
+    "This page counts them as data.",
 )
 #: The page's unit, held the same way: what counts as a bundled copy, and what does not.
 _UNIT = (
