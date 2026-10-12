@@ -16,8 +16,8 @@
   address is refused unless `--email` is given (BACKLOG #2288).
 - **Amended 2026-10-10:** Amendment D below. `--email` is required on every run, by owner ruling
   (BACKLOG #1138). It reverses Option 5.
-- **Amended 2026-10-11:** open item (a) is decided: `provision-admin` and the #1236 recovery stay
-  separate (BACKLOG #2304). Seat decision under owner delegation 2026-10-08, not an owner ruling;
+- **Amended 2026-10-11:** open item (a) is decided: `provision-admin` and the #1236
+  sole-administrator recovery stay separate (BACKLOG #2304). Seat decision under owner delegation 2026-10-08, not an owner ruling;
   see the note under *To resolve on acceptance* and vault
   `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`.
 - **Date:** 2026-09-05
@@ -235,10 +235,10 @@ ticked. Its premise, that the method names three artifacts, no longer holds: see
 Amendment A. This note says nothing about the first item.*
 
 *Amended 2026-10-11 (BACKLOG #2304): the first item is decided, so its box is ticked. Amendment A's
-recommendation on item (a) is adopted: `provision-admin` and the #1236 lockout recovery stay separate
-commands. Amendment A's item (a) paragraph is the record of the overlap. No build follows. Seat decision under owner delegation
-2026-10-08, not an owner ruling; vault `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section
-"#2304 (batch 240)".*
+recommendation on item (a) is adopted: `provision-admin` and the #1236 sole-administrator recovery
+stay separate commands. Amendment A's item (a) paragraph is the record of the overlap. No build
+follows. Seat decision under owner delegation 2026-10-08, not an owner ruling; vault
+`docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section "#2304 (batch 240)".*
 
 ## Amendment A (2026-09-23) — the default account is retired, by owner ruling
 
@@ -592,6 +592,10 @@ one. It does not reach the other two, and it should not:
 The retirement changes #1236 in one way only. Its "re-bootstrap fires only on an EMPTY users table"
 leg goes, because nothing re-bootstraps. The wider predicate here replaces it. The Wave 1c address
 setter sits on the same host gate and is a neighbour of #1236, not part of it.
+
+*Amended 2026-10-11 (BACKLOG #2304): this recommendation on item (a) is adopted, and its box under
+"To resolve on acceptance" is ticked. Seat decision under owner delegation 2026-10-08, not an owner
+ruling; vault `docs/security/OWNER-RULINGS-2026-10-08-RUNBOOK.md`, section "#2304 (batch 240)".*
 
 **(b) Is `scripts/` inside cell 6.3.2's corpus? Recommendation: no. Confidence: medium.** The
 assessment method, `docs/ASVS-ASSESSMENT-METHOD.md` section 2, declares scope positively: the engine,
