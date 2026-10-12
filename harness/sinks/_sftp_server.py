@@ -26,7 +26,9 @@ fails without it. A missing extra or an unset password is a :class:`RemoteFileSe
 :class:`OSError`, which the scenario CLI reports as a SETUP error (exit 2), never as a pass.
 
 Every path a client names is confined to the served directory: it is normalized against ``/`` first
-(so ``..`` cannot climb out), and a path that resolves outside through a symlink is refused. A write
+(so ``..`` cannot climb out), and a path that resolves outside through a symlink is refused. A path
+holding a control or Windows-reserved character, a name Windows would open as another (a trailing dot
+or space, a device name), or a name or path past its length bound is refused first. A write
 past the engine's per-message cap is refused. The server never logs what it is sent, and keeps it only
 in its own temporary directory, which :meth:`SftpShare.stop` deletes.
 """
@@ -36,8 +38,10 @@ from __future__ import annotations
 import contextlib
 import errno
 import logging
+import ntpath
 import os
 import posixpath
+import re
 import shutil
 import socket
 import stat
@@ -123,10 +127,50 @@ def known_hosts_name(host: str, port: int) -> str:
     return host if port == 22 else f"[{host}]:{port}"
 
 
+#: The longest single name the share accepts, in UTF-8 bytes. The common per-name limit is 255:
+#: bytes on ext4 and XFS, UTF-16 units on NTFS, and a UTF-8 byte count is never below the UTF-16
+#: unit count, so one byte cap holds on both. The engine's own output-name cap (vault BACKLOG #2562,
+#: ``FILENAME_MAX_BYTES`` in ``messagefoundry/transports/file.py``) is 200, and its upload temp adds
+#: 39, so every name the engine sends fits. It is restated, not imported: the harness may not import
+#: ``transports/`` (``tests/test_dependency_boundaries.py``).
+_NAME_MAX_BYTES = 255
+#: The longest whole remote path the share accepts, in UTF-8 bytes. The share's deepest real path is
+#: one directory and one name, far below this.
+_PATH_MAX_BYTES = 1024
+
+#: Characters the share refuses anywhere in a remote path: every control character (C0, DEL and C1),
+#: the characters Windows reserves in a name (``:`` also opens an NTFS stream, an alias for the
+#: file), the backslash Windows reads as a separator, and the lone surrogates no encoding holds.
+#: NUL is among them; ``os.open`` raises ValueError on it, not OSError. It is a superset of the
+#: single-name class ``_UNSAFE`` in ``harness/drivers/file.py``, less ``/`` and plus DEL and C1.
+_REFUSED_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f<>:"\\|?*\ud800-\udfff]')
+
+
+def _screen(remote: str) -> None:
+    """Refuse a remote path the share would open under another name or not at all, as an
+    :class:`OSError`, so every caller's ``except OSError`` answers the client with a failure status.
+
+    Each name is tested as sent, before normalizing, so a ``..`` cannot drop a bad name unseen.
+    Windows strips a trailing dot or space when it opens a name, so ``a.hl7.`` would open
+    ``a.hl7``, and it opens a device for a reserved name such as ``NUL``. :func:`ntpath.isreserved`
+    knows both, passes ``.``, ``..`` and the empty name, and is pure Python, so the share refuses
+    the same names on every platform. Nothing here logs the path."""
+    if _REFUSED_CHARS.search(remote):
+        raise PermissionError(errno.EACCES, "a character the share refuses", remote)
+    if len(remote.encode()) > _PATH_MAX_BYTES:
+        raise OSError(errno.ENAMETOOLONG, "a remote path longer than the share accepts", remote)
+    for name in remote.split("/"):
+        if ntpath.isreserved(name):
+            raise PermissionError(errno.EACCES, "a name Windows would open as another", remote)
+        if len(name.encode()) > _NAME_MAX_BYTES:
+            raise OSError(errno.ENAMETOOLONG, "a name longer than the share accepts", remote)
+
+
 def _confined(root: Path, remote: str) -> str:
-    """The local path for ``remote``, kept inside ``root`` (already resolved). Normalizing against
-    ``/`` first collapses every ``..`` at the top, so no spelling climbs out; a symlink that resolves
-    outside is refused."""
+    """The local path for ``remote``, kept inside ``root`` (already resolved). :func:`_screen`
+    refuses a bad name first. Normalizing against ``/`` then collapses every ``..`` at the top, so no
+    spelling climbs out; a symlink that resolves outside is refused."""
+    _screen(remote)
     relative = posixpath.normpath(posixpath.join("/", remote)).lstrip("/")
     local = root.joinpath(*relative.split("/")) if relative else root
     if not Path(os.path.realpath(local)).is_relative_to(root):

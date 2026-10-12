@@ -16,6 +16,7 @@ extra is a SETUP error, never a pass.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import time
@@ -28,6 +29,7 @@ import pytest
 
 from harness import drivers, sinks
 from harness.__main__ import main
+from harness.drivers.file import MAX_DROP_NAME_BYTES
 from harness.drivers.remotefile import RemoteFileDriver
 from harness.endpoints import Endpoints
 from harness.scenarios import SCENARIOS, run_scenario
@@ -40,6 +42,7 @@ from harness.sinks._sftp_server import (
     USERNAME,
     RemoteFileSetupError,
     SftpShare,
+    _confined,
     known_hosts_name,
 )
 from harness.sinks.remotefile import RemoteFileSink
@@ -263,6 +266,105 @@ def test_the_share_confines_every_path_and_refuses_to_replace_on_rename(
             sftp.close()
         finally:
             ssh.close()
+
+
+# --- the share's name screen (vault BACKLOG #2932, ASVS 1.3.3 ground S) --------------------------
+
+#: One refused name per path. Most sit in a MIDDLE component, so a screen of the last name alone
+#: misses them. Each is refused as a PermissionError (EACCES).
+_REFUSED_NAMES = {
+    "nul-middle": "/inbox/a\x00b/x.hl7",
+    "nul-last": "/inbox/x\x00.hl7",
+    "c0-middle": "/inbox/a\x01b/x.hl7",
+    "newline-middle": "/inbox/a\nb/x.hl7",
+    "del-middle": "/inbox/a\x7fb/x.hl7",
+    "c1-middle": "/inbox/a\x85b/x.hl7",
+    "trailing-dot-middle": "/inbox/dir./x.hl7",
+    "trailing-dot-last": "/inbox/x.hl7.",
+    "trailing-space-middle": "/inbox/dir /x.hl7",
+    "trailing-space-last": "/inbox/x.hl7 ",
+    "dot-before-dotdot": "/inbox/dir./../x.hl7",
+    "stream-colon-middle": "/inbox/ab:c/x.hl7",
+    "stream-colon-last": "/inbox/x.hl7:stream",
+    "backslash-middle": "/inbox/a\\b/x.hl7",
+    "reserved-char-middle": "/inbox/a?b/x.hl7",
+    "device-middle": "/inbox/NUL/x.hl7",
+    "device-last": "/inbox/con.hl7",
+    "surrogate-middle": "/inbox/\ud800/x.hl7",
+}
+
+#: Over-long paths, each refused as ENAMETOOLONG. 128 two-byte characters are 256 UTF-8 bytes but
+#: only 128 UTF-16 units, so NTFS alone would take that name.
+_OVER_LONG = {
+    "name-middle": "/inbox/" + "a" * 256 + "/x.hl7",
+    "name-last": "/inbox/" + "a" * 256,
+    "multibyte-name-middle": "/inbox/" + "é" * 128 + "/x.hl7",
+    "whole-path": "/inbox/" + "a/" * 600 + "x.hl7",
+}
+
+#: Names the share must keep accepting: the engine's longest output name (vault BACKLOG #2562, pinned
+#: in the harness as MAX_DROP_NAME_BYTES) inside its 39-byte upload temp, the driver's temp, a name at
+#: the cap, and dot segments.
+_ACCEPTED = {
+    "engine-upload-temp": f"/outbox/.{'n' * (MAX_DROP_NAME_BYTES - 4)}.hl7.{'0' * 32}.part",
+    "driver-upload-temp": "/inbox/.0123abcd.hl7.part",
+    "name-at-cap": "/inbox/" + "a" * 255,
+    "dot-segments": "/../inbox/./x.hl7",
+    "root": "/",
+    "empty": "",
+}
+
+
+@pytest.fixture
+def root(tmp_path: Path) -> Path:
+    return Path(os.path.realpath(tmp_path))
+
+
+@pytest.mark.parametrize("remote", _REFUSED_NAMES.values(), ids=_REFUSED_NAMES.keys())
+def test_the_share_refuses_a_name_it_would_open_as_another(root: Path, remote: str) -> None:
+    with pytest.raises(PermissionError) as raised:
+        _confined(root, remote)
+    assert raised.value.errno == errno.EACCES
+
+
+@pytest.mark.parametrize("remote", _OVER_LONG.values(), ids=_OVER_LONG.keys())
+def test_the_share_bounds_a_name_and_a_path(root: Path, remote: str) -> None:
+    with pytest.raises(OSError) as raised:
+        _confined(root, remote)
+    assert raised.value.errno == errno.ENAMETOOLONG
+
+
+@pytest.mark.parametrize("remote", _ACCEPTED.values(), ids=_ACCEPTED.keys())
+def test_the_share_keeps_every_name_the_engine_and_driver_send(root: Path, remote: str) -> None:
+    assert Path(_confined(root, remote)).is_relative_to(root)
+
+
+def test_the_share_answers_a_refused_name_with_a_status_and_keeps_serving(
+    tmp_path: Path, password: str
+) -> None:
+    """Over the wire. Unscreened, paramiko's catch-all answers a NUL's ValueError with a bare
+    failure, a missing ``dir.`` with no-such-file, and Windows opens ``x.hl7.`` as ``x.hl7``; so
+    each PermissionError here, and the one file left, is the screen's doing."""
+    paramiko = _paramiko()
+    with RemoteFileSink(0, known_hosts=tmp_path / "known_hosts") as sink:
+        share = sink.share
+        assert share is not None and share.root is not None
+        ssh = _client(paramiko, share, password)
+        try:
+            sftp = ssh.open_sftp()
+            for remote in ("/inbox/x\x00.hl7", "/inbox/x.hl7.", "/inbox/dir./x.hl7"):
+                with pytest.raises(PermissionError):
+                    sftp.open(remote, "wb")
+            with pytest.raises(PermissionError):
+                sftp.stat("/inbox/a\x00b/x.hl7")
+            with pytest.raises(OSError):
+                sftp.open(_OVER_LONG["multibyte-name-middle"], "wb")
+            with sftp.open("/inbox/ok.hl7", "wb") as fh:
+                fh.write(b"ok")
+            sftp.close()
+        finally:
+            ssh.close()
+        assert [p.name for p in (share.root / "inbox").iterdir()] == ["ok.hl7"]
 
 
 def test_a_sink_binds_loopback_and_pins_the_host_the_engine_dials(
