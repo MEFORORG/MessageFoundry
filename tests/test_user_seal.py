@@ -32,8 +32,11 @@ from messagefoundry.store.store import (
     PASSKEY_DIGEST_EXCLUDED,
     USER_SEAL_EXCLUDED,
     MessageStore,
+    RoleGrant,
+    UnknownRoleError,
     UserAuthzRecord,
     UserRow,
+    existing_roles_only,
     user_seal_ok,
 )
 from tests._user_seal_contract import (
@@ -128,6 +131,32 @@ def _sample(annotation: object) -> Any:
     if "float" in text:
         return 0.0
     return "x"
+
+
+def _with_roles(*role_ids: str) -> UserAuthzRecord:
+    row = UserRow(**{f.name: _sample(f.type) for f in fields(UserRow)})
+    return UserAuthzRecord.of(row, [RoleGrant(r, 1.0, "t") for r in role_ids])
+
+
+def test_a_role_write_refuses_an_added_role_with_no_roles_row() -> None:
+    """BACKLOG #2592: an id the write adds, with no ``roles`` row, is refused before anything is
+    sealed. Control: the same write with the row present passes unchanged."""
+    current = _with_roles("viewer")
+    changed = _with_roles("viewer", "custom:gone")
+    with pytest.raises(UnknownRoleError) as refused:
+        existing_roles_only(current, changed, ["viewer", "operator"])
+    assert refused.value.role_ids == ("custom:gone",)
+    assert existing_roles_only(current, changed, ["viewer", "custom:gone"]) is changed
+
+
+def test_a_role_row_left_behind_by_a_deleted_role_is_dropped_not_written_back() -> None:
+    """BACKLOG #2592: a held id with no ``roles`` row grants nothing, so the next role write drops
+    it rather than refusing the account's every role change. The added id still goes through."""
+    current = _with_roles("viewer", "custom:gone")
+    changed = _with_roles("viewer", "custom:gone", "operator")
+    kept = existing_roles_only(current, changed, ["viewer", "operator"])
+    assert kept.role_ids == ("operator", "viewer")
+    assert kept.row == changed.row
 
 
 async def test_the_user_row_matches_the_users_table(keyed: tuple[MessageStore, Path]) -> None:

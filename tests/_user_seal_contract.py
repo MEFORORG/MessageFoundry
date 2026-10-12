@@ -31,6 +31,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.row_seal import SEAL_PREFIX, RowSealError
 from messagefoundry.store.store import (
     RoleGrant,
+    UnknownRoleError,
     UserAuthzRecord,
     UserRow,
     WebAuthnCredential,
@@ -323,6 +324,87 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     assert await store.delete_custom_role(custom.id)
     kept = await h.service._load_user(holder)
     assert kept is not None and kept.role_ids == (Role.VIEWER.value,)
+
+    # --- a grant of a role deleted before the write is refused, and seals nothing --------------
+    # A caller that checked the role, then lost it to a delete, reaches the store with a stale id.
+    gone = await _custom_role(h, "contract-gone")
+    assert await store.delete_custom_role(gone)
+    late = await h.account("late")
+    before_late = await _record(store, late)
+    try:
+        await store.set_user_roles(late, [Role.VIEWER.value, gone], assigned_by="contract")
+    except UnknownRoleError as exc:
+        assert exc.role_ids == (gone,)
+    else:
+        raise AssertionError("a grant of a role with no roles row was not refused")
+    assert await _record(store, late) == before_late  # nothing written, seal and all
+    assert await h.service._load_user(late) is not None
+    # Control: the same write naming a role that exists grants it, sealed.
+    live = await _custom_role(h, "contract-live")
+    await store.set_user_roles(late, [Role.VIEWER.value, live], assigned_by="contract")
+    granted_late = await h.service._load_user(late)
+    assert granted_late is not None
+    assert granted_late.role_ids == tuple(sorted((Role.VIEWER.value, live)))
+
+
+async def _custom_role(h: _Harness, name: str) -> str:
+    role = await h.service.create_custom_role(
+        display_name=name, description=None, permissions=["monitoring:read"], actor="contract"
+    )
+    return role.id
+
+
+async def assert_role_delete_race_refused(
+    store: Any, foreign_key_error: type[BaseException]
+) -> None:
+    """A grant that commits while its custom role is being deleted leaves no role row with no role
+    behind it (BACKLOG #2592). Server backends only: SQLite runs one writer at a time, so the grant
+    cannot land inside the delete there.
+
+    The grant is made on a second connection after the delete has read the role's holders and
+    before it deletes the role, which is the order a holder read cannot see. The ``user_roles``
+    foreign key then fails the delete, which rolls back whole; ``foreign_key_error`` is what the
+    backend's driver raises for it."""
+    h = _Harness(store, _no_raw)
+    await h.service.initialize()
+    role = await _custom_role(h, "contract-race")
+    holder = await h.account("race-holder", roles=(Role.VIEWER.value, role))
+    granted = await h.account("race-granted")
+
+    real_write = store._write_user
+    fired = False
+
+    async def grant_mid_delete(*args: Any, **kwargs: Any) -> Any:
+        nonlocal fired
+        if not fired:
+            fired = True
+            await store.set_user_roles(granted, [Role.VIEWER.value, role], assigned_by="contract")
+        return await real_write(*args, **kwargs)
+
+    store._write_user = grant_mid_delete
+    try:
+        await store.delete_custom_role(role)
+    except foreign_key_error:
+        pass
+    else:
+        raise AssertionError("a role delete that raced a committed grant was not refused")
+    finally:
+        del store._write_user  # back to the class's method
+    assert fired, "the grant never ran inside the delete, so nothing was raced"
+    # The delete rolled back whole: the role stands, and both holders keep it, sealed.
+    assert await store.get_role(role) is not None
+    for user_id in (holder, granted):
+        user = await h.service._load_user(user_id)
+        assert user is not None and role in user.role_ids, user_id
+    # Control: run again with no grant in flight, the delete takes the role from both, re-sealed.
+    assert await store.delete_custom_role(role)
+    for user_id in (holder, granted):
+        user = await h.service._load_user(user_id)
+        assert user is not None and user.role_ids == (Role.VIEWER.value,), user_id
+
+
+async def _no_raw(sql: str, params: tuple[Any, ...]) -> None:
+    raise AssertionError("the race contract runs no raw SQL")
 
 
 async def assert_user_record_round_trips(store: Any) -> None:

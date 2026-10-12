@@ -2817,6 +2817,37 @@ def without_role(role_id: str) -> UserChange:
     return apply
 
 
+class UnknownRoleError(LookupError):
+    """A role write named a role id with no ``roles`` row; nothing was written (BACKLOG #2592).
+
+    Raised by each backend's ``_write_user`` for an id the write ADDS, the way the ``user_roles``
+    foreign key refuses it on every backend: so a role deleted between a caller's check and the
+    write is not granted, and its id is never sealed into a record."""
+
+    def __init__(self, role_ids: Sequence[str]) -> None:
+        self.role_ids = tuple(role_ids)
+        super().__init__(f"no such role: {', '.join(self.role_ids)}")
+
+
+def existing_roles_only(
+    current: UserAuthzRecord, changed: UserAuthzRecord, present: Iterable[str]
+) -> UserAuthzRecord:
+    """``changed`` with every role id that has no ``roles`` row handled, given the ids that have
+    one (BACKLOG #2592). Each backend's ``_write_user`` calls it, inside its transaction, before it
+    seals a record whose roles changed.
+
+    An id the write adds raises :class:`UnknownRoleError`. An id the account already held is
+    dropped instead: it is a row its deleted role left behind, which grants nothing, and keeping it
+    would write it back, sealed, on every later role change."""
+    held = set(present)
+    added = [r for r in changed.role_ids if r not in held and r not in current.role_ids]
+    if added:
+        raise UnknownRoleError(added)
+    if all(r in held for r in changed.role_ids):
+        return changed
+    return replace(changed, roles=tuple(g for g in changed.roles if g.role_id in held))
+
+
 # PHI-at-rest encryption is the store's `_cipher` (messagefoundry.store.crypto): identity when no
 # key is configured, AES-256-GCM when MEFOR_STORE_ENCRYPTION_KEY is set. See STORE-1.
 
@@ -13386,7 +13417,9 @@ class MessageStore:
         changed. Returns the new record, or ``None`` when there is no row, ``change`` declined, or
         the compare lost to a concurrent write; nothing is written then. Raises
         :class:`RowSealError`, and writes nothing, when the record it read does not verify:
-        re-sealing it would turn a change made outside this helper into a sealed record."""
+        re-sealing it would turn a change made outside this helper into a sealed record. A change to
+        the roles passes :func:`existing_roles_only` first, so it raises :class:`UnknownRoleError`,
+        writing nothing, for an added role id with no ``roles`` row."""
         current = await self._read_user_record(user_id)
         if current is None:
             return None
@@ -13395,6 +13428,11 @@ class MessageStore:
         changed = change(current)
         if changed is None:
             return None
+        if changed.roles != current.roles:
+            cur = await self._db.execute("SELECT id FROM roles")
+            changed = existing_roles_only(
+                current, changed, [str(r["id"]) for r in await cur.fetchall()]
+            )
         updated = seal_user(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
@@ -14092,9 +14130,10 @@ class MessageStore:
                 return False
             # BACKLOG #2592: each holder's record is re-sealed without the role. A holder whose
             # record fails its seal is refused on every read already; only its own row of this role
-            # is deleted, which needs no key and re-seals nothing. No bulk delete: a holder that
-            # appeared after the read keeps its row, sealed and granting nothing once the role is
-            # gone (the server backends' foreign key, where there is one, refuses that order).
+            # is deleted, which needs no key and re-seals nothing. No bulk delete: it would leave a
+            # sealed record naming a row it no longer has. A holder that appears after the read is
+            # not possible here, where one writer runs at a time; on the server backends the
+            # `user_roles` foreign key makes the role delete below fail instead.
             cur = await self._db.execute(
                 "SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)
             )

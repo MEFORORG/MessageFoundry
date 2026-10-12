@@ -229,6 +229,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    existing_roles_only,
     federated_bind,
     federated_unbind,
     full_authentication_clear,
@@ -8109,6 +8110,9 @@ class PostgresStore:
         changed = change(current)
         if changed is None:
             return None
+        if changed.roles != current.roles:
+            roles = await conn.fetch("SELECT id FROM roles")
+            changed = existing_roles_only(current, changed, [str(r["id"]) for r in roles])
         updated = seal_user(self._row_sealer, changed)
         status = await conn.execute(_PG_USER_RESEAL, *user_reseal_params(updated, current))
         if _rowcount(status) != 1:

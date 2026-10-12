@@ -2425,7 +2425,11 @@ class AuthStore(Protocol):
         *,
         assigned_by: str | None = None,
         now: float | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Replace the account's roles with ``role_ids``. Raises ``UnknownRoleError``, writing
+        nothing, when an id the account does not already hold has no ``roles`` row; a held id with
+        no row is dropped (BACKLOG #2592, ``store.existing_roles_only``)."""
+        ...
 
     async def remove_unless_last_admin(
         self,

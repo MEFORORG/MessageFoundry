@@ -5121,8 +5121,8 @@ async def test_session_seal_contract(store) -> None:
 async def test_user_seal_contract(store) -> None:
     """BACKLOG #2592: the sealed user record, the same contract the SQLite suite runs, on a keyed
     handle, with the round trip that pins the canonical bytes (AC-19). ``raw`` runs each statement
-    on a pooled connection, outside the store's helpers. The fixture truncates the user tables on
-    the next entry; the contract deletes the one custom role it makes."""
+    on a pooled connection, outside the store's helpers. The fixture truncates the user and role
+    tables on the next entry."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
     from tests._session_seal_contract import dollar_placeholders
@@ -5149,6 +5149,25 @@ async def test_user_seal_contract(store) -> None:
         assert_user_columns({str(r["column_name"]) for r in rows})
         await assert_user_record_round_trips(keyed)
         await assert_user_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
+    """BACKLOG #2592: a grant that commits while its custom role is deleted fails the delete on the
+    ``user_roles`` role foreign key, rather than leaving a sealed role row with no role behind it.
+    The SQL Server suite runs the same race; ``tests/_user_seal_contract.py`` makes it."""
+    import asyncpg
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._user_seal_contract import assert_role_delete_race_refused
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+        await assert_role_delete_race_refused(keyed, asyncpg.exceptions.ForeignKeyViolationError)
     finally:
         await keyed.close()
 

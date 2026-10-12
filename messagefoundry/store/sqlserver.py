@@ -222,6 +222,7 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    existing_roles_only,
     federated_bind,
     federated_unbind,
     full_authentication_clear,
@@ -2170,6 +2171,13 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('user_roles','U') IS NULL CREATE TABLE user_roles (
         user_id NVARCHAR(64) NOT NULL, role_id NVARCHAR(64) NOT NULL, assigned_at FLOAT NOT NULL,
         assigned_by NVARCHAR(256) NULL, CONSTRAINT pk_user_roles PRIMARY KEY (user_id, role_id))""",
+    # BACKLOG #2592: the role foreign key SQLite and Postgres already have, so a grant that commits
+    # while its custom role is deleted fails one of the two writes instead of leaving a sealed role
+    # row with no role behind it. WITH NOCHECK so a store already holding such a row still opens;
+    # the key still refuses every later write, and the user write path drops a left-behind row.
+    """IF OBJECT_ID('fk_user_roles_role','F') IS NULL
+        ALTER TABLE user_roles WITH NOCHECK
+            ADD CONSTRAINT fk_user_roles_role FOREIGN KEY (role_id) REFERENCES roles(id)""",
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
         ad_group NVARCHAR(256) NOT NULL, role_id NVARCHAR(64) NOT NULL,
         CONSTRAINT pk_ad_group_role_map PRIMARY KEY (ad_group, role_id))""",
@@ -11971,6 +11979,10 @@ class SqlServerStore:
         changed = change(current)
         if changed is None:
             return None
+        if changed.roles != current.roles:
+            await cur.execute("SELECT id FROM roles")
+            present = [str(r[0]) for r in await cur.fetchall()]
+            changed = existing_roles_only(current, changed, present)
         updated = seal_user(self._row_sealer, changed)
         await cur.execute(_MSSQL_USER_RESEAL, user_reseal_params(updated, current))
         if not await cur.fetchall():
@@ -12627,7 +12639,9 @@ class SqlServerStore:
                     await conn.rollback()
                     return False
                 # BACKLOG #2592: each holder re-sealed without the role, and only a refused holder's
-                # own row deleted; store.py says why there is no bulk delete.
+                # own row deleted; store.py says why there is no bulk delete. A grant committed
+                # after the holder read keeps its row, so the role delete below then fails the
+                # foreign key, fk_user_roles_role. No role-row lock is taken here.
                 await cur.execute("SELECT user_id FROM user_roles WHERE role_id=?", (role_id,))
                 holders = [str(h[0]) for h in await cur.fetchall()]
                 for holder in holders:
