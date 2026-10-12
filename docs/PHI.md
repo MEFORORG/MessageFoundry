@@ -826,10 +826,19 @@ per tier which of those its code provides, and an operator carries the rest
   held back. When its own input is over its 64 KiB scan window, it also appends a
   `[redaction bound: dropped N more chars unscanned]` marker. So a stored value can be longer than
   200 characters, by the length of those notes. Each column is `TEXT` on SQLite and Postgres and
-  `NVARCHAR(MAX)` on SQL Server, so no declared width can overflow. The count is per call. Text an
-  earlier call already bounded, such as an emit site's `safe_exc()`, is cut again here. An earlier
-  note or marker is then kept whole when the cut falls before it, or dropped whole and counted inside
-  N, so a stored value ends in one count. A note the scrubber itself rewrote, the BACKLOG #2079 case
+  `NVARCHAR(MAX)` on SQL Server, so no declared width can overflow. The count is per call. It
+  covers the text that call was handed, earlier notes included. Text an earlier call already
+  bounded, such as an emit site's `safe_exc()`, is cut again here, so on such a value N is not how
+  much of the original text the stored value lacks. An earlier note or marker that ends before the
+  new cut is kept whole, so a stored value can hold two counts. The one exception is a count note
+  the kept text would end on: it is dropped. A note or marker the cut would split, or one past
+  the cut, is dropped whole too. Each dropped one is counted inside N as plain characters, and
+  neither earlier number is carried forward. So a dropped marker takes its unscanned figure with
+  it, and a stored value with no marker does not show that every character was scanned. The
+  opening text of a count or marker with no closing text before the cut is read as a split note,
+  whoever wrote it. So text a peer writes can end a stored value early, at least by quoting such an
+  opening. Everything after it is dropped and counted. That drops more text and never keeps more
+  (vault BACKLOG #3034). A note the scrubber itself rewrote, the BACKLOG #2079 case
   `safe_text` names, is not recognised and can still be kept in part. Other `safe_text()`
   columns, such as `message_events.detail`, get the same default limit of 200; these three pass it
   explicitly. Until BACKLOG #1797 the store sliced `safe_text(x)[:200]` instead. Once `safe_text`
@@ -1432,8 +1441,10 @@ heuristic** — date/DOB runs and multi-token name runs (e.g. `DOE JANE`) are sc
 delimiters — so the prior free-text residual is **narrowed** to an adversarially-crafted *single-token*
 or non-name-shaped identifier, still governed by the "never put PHI in an exception message" convention.
 The HL7 delimiters are **read from the message's MSH header** rather than assumed to be `| ^ ~ &`
-(BACKLOG #1572), so a feed declaring its own separators is covered; before that fix a custom-delimiter
-message matched nothing and a deploying site would have logged its identifiers in full.
+(BACKLOG #1572), so a feed declaring its own separators is covered wherever the scan reads that
+header; before that fix a custom-delimiter message matched nothing and a deploying site would have
+logged its identifiers in full. At least two cases leave the scan no header to read. Both are
+residuals, stated below as the second and the third.
 
 Since vault BACKLOG #2784 the heuristic also takes, at least: a full HL7 DTM after an eight-digit
 date (`19800505123000-0500`, fraction included), an ISO date-time in either form (`1980-05-05T12:30`,
@@ -1562,6 +1573,17 @@ it.
 MSH-2, so a **headerless** custom-delimiter fragment declares nothing and passes through — `mrn
 MRN123$$$H$MR here` still survives. So does a message whose MSH-2 is shorter than its conformant width.
 Neither is a completeness claim; the convention above remains the control for both.
+
+**A third residual, accepted and not fixed (BACKLOG #1848):** the bounded scrubbers read at most the
+first 64 KiB of a text, and the delimiter sniff reads only what they read. Those are at least
+`safe_text()`, `safe_exc()` and `redact_untrusted()`. When that bound drops the MSH that declares a
+feed's delimiters, a custom-delimiter run in the kept text is not scrubbed. An unbounded `redact()`
+over the same text would scrub it. So on a first deployment, a diagnostic over 64 KiB that quotes
+such a feed, with the header past the bound, would keep those field values in the log or the store.
+Text in the default `| ^ ~ &` delimiters is not affected, because the scan matches those with no
+header. Reading the header from the whole text would close the gap. It would also undo the scan
+bound of BACKLOG #1576, which is why the gap is accepted. The convention above remains the control
+here too.
 
 **Residual, stated honestly:** `redact()` does **not** scrub a *single-token* identifier. An access line
 carrying `?content=1234567` or `?field_value=MRN12345` would survive the whole filter chain unredacted:

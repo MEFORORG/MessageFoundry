@@ -712,6 +712,7 @@ _REDACT_WINDOW = 64 * 1024
 #: real one behind decoys. Keeping the first segment whatever the cut would special-case a register
 #: that has none. Strict xfails in ``tests/test_redaction.py`` assert the fragment IS scrubbed, so they
 #: fail loudly the day someone closes the gap; the corpus arm there cannot reach the shape at all.
+#: The operator's statement of this residual is in ``docs/PHI.md`` section 7, *A third residual*.
 #:
 #: **The structured passes (BACKLOG #1711) mostly answer "yes", and need no walk.** Each is
 #: label-anchored and treats a region that never closes as running to the end of the text, so a cut
@@ -1922,8 +1923,15 @@ def _clear_of_own_notes(text: str, kept: int) -> int:
     end in this module's notes. The whole-token cut sees the space inside a note as a boundary, so it
     kept ``…(+150`` and then wrote its own note after it: ``…(+150…(+7 chars)``, two counts glued
     together. So a bound note the cut would split goes whole. Then a count note the cut would split,
-    or that the head would end on, goes whole too, so the result ends in one count. That count still
-    covers every character held back. No opener holds whitespace, so a cut never splits an opener.
+    or that the head would end on, goes whole too, so no count is glued to the new one. The new count
+    covers every character of ``text`` held back, dropped notes included. No opener holds whitespace,
+    so a cut never splits an opener.
+
+    **The result does not always hold one count (vault BACKLOG #3034).** This sentence read "so the
+    result ends in one count", and that was false. A note that closes before the cut, with other text
+    after it, is not touched here. It stays in the kept head, and the result then holds that count and
+    the new one. ``tests/test_redaction.py`` pins both halves under *what a second cut does to an
+    earlier note*.
 
     Residuals, at least these. Only the last opener of each kind before the cut is read. One a peer
     wrote, with no closer after it, moves the cut back as far as itself, possibly to nothing. That
@@ -1964,6 +1972,15 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     held back, every character of it, and the bound note is raw characters no pattern ever looked at. One total would add a
     redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
     ordinary case, so the ordinary result is byte-identical to its pre-#1576 self.
+
+    **Both counts describe the text THIS call was handed, earlier notes included (vault BACKLOG
+    #3034).** The store calls this again on a value an emit site already bounded. ``N`` is then how
+    much of that bounded value this call held back, and an earlier note it dropped is counted as plain
+    characters. It is NOT how much of the original text the result lacks. An earlier bound note the
+    cut drops takes its unscanned figure with it, and this call writes none of its own unless its own
+    input passed the window. Measured: a first result ending ``(+65334 chars) [redaction bound:
+    dropped 4_468 more chars unscanned]``, cut again at 200, ends ``(+81 chars)``. Neither earlier
+    number is carried forward, because that would mean parsing a number out of text a peer can write.
 
     **It is not strictly idempotent, and the known exceptions all only add redaction or shorten the
     text.** At least these: a truncated result re-truncates with a new ``(+N chars)`` count; the
