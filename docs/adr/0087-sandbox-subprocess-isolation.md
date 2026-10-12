@@ -149,7 +149,8 @@ memory rose about 8 MiB.
    alone is not enough. Once an arena has grown, glibc trims it with `MADV_DONTNEED`, which leaves
    the pages writable, so each arena's peak stays counted after its threads exit. So the parent
    also starts the worker with `MALLOC_ARENA_MAX=2`: the main arena, which can give memory back, and
-   at most one thread arena, whose first heap holds at most 64 MiB. An operator value named in
+   at most one thread arena, whose first heap holds at most 64 MiB. It is set only on Linux with
+   a cap configured. An operator value named in
    `[sandbox].pass_environment` wins. A live thread's stack also counts, and glibc keeps up to
    about 40 MiB of exited threads' stacks mapped for reuse. So threads can still hold about
    100 MiB of the headroom, but no more, however many a worker starts.
@@ -161,8 +162,8 @@ memory rose about 8 MiB.
    build's mimalloc ignores. The engine ships on the GIL build
    (`.github/workflows/freethread-smoke.yml`). **The choice was not measured again on Linux before
    it was built.** The three tests below pin it on the hosted Linux leg.
-3. Elsewhere on POSIX there is no `/proc/self/status`, so `mem_mb` stays an absolute `RLIMIT_AS`
-   cap, and the worker logs a line saying so. Resident memory is never the baseline: it would leave
+3. Elsewhere on POSIX, and on Linux before 4.7, `mem_mb` stays an absolute `RLIMIT_AS` cap, and
+   the worker logs a line saying so. Resident memory is never the baseline: it would leave
    out memory the graph holds but has not touched.
 4. A `MemoryError` while the worker runs a call or encodes its result is answered with a `fail`
    frame of kind `memory`, which names the cap. The worker then exits, and the parent reaps it, so
@@ -171,13 +172,15 @@ memory rose about 8 MiB.
 
 **What this gives up.** `RLIMIT_DATA` does not count a shared mapping. Python's `mmap.mmap(-1, n)`
 makes one, so a call can allocate around the cap that way. It was never a bound against admin code
-that sets out to evade it; it is a backstop against a runaway. On Linux before 4.7, `RLIMIT_DATA`
-counted only the `brk` heap, so most large allocations would escape it there. The free-threaded
+that sets out to evade it; it is a backstop against a runaway. Linux before 4.7 counted only the
+`brk` heap against `RLIMIT_DATA`, so on those kernels the worker keeps the absolute `RLIMIT_AS`
+cap. A kernel booted with `ignore_rlimit_data` does not enforce it either, and the worker does not
+detect that. The free-threaded
 build was not measured: if its allocator maps memory writable before use, its reservations would
 count. Only a `MemoryError` recycles the worker. A call that fails in another way near the cap, such
 as a thread that cannot start, or a Handler that catches the `MemoryError` itself, keeps its worker.
 
-`tests/test_sandbox.py` pins the change on POSIX:
+`tests/test_sandbox.py` pins the change on Linux; the absolute `RLIMIT_AS` arm has no test:
 `test_a_graph_larger_than_mem_mb_does_not_fail_an_innocent_call`,
 `test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker` and
 `test_threads_a_call_joined_do_not_spend_the_memory_cap`.

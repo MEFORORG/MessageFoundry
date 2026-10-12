@@ -631,11 +631,13 @@ class SandboxSession:
                 *self.policy.pass_environment,
             )
         )
-        # At most one glibc malloc arena besides the main one. An arena keeps its peak writable size
-        # counted in VmData after its threads exit, so with one per thread, the threads a Handler
-        # starts would spend [sandbox].mem_mb for the worker's whole life (vault BACKLOG #3133 part
-        # 2). Ignored by other allocators. An operator's own value, named in pass_environment, wins.
-        env.setdefault("MALLOC_ARENA_MAX", "2")
+        # At most one glibc malloc arena besides the main one, where the worker's memory cap is
+        # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
+        # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
+        # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
+        # operator's own value, named in pass_environment, wins.
+        if self.policy.mem_mb is not None and sys.platform.startswith("linux"):
+            env.setdefault("MALLOC_ARENA_MAX", "2")
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a

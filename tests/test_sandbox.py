@@ -21,7 +21,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -50,6 +50,7 @@ from messagefoundry.pipeline.sandbox import (
     _StderrRelay,
 )
 from messagefoundry.store.store import MessageStore
+from tests.test_db_lookup import sandbox_run_one  # noqa: F401 - a fixture
 
 # A minimal, conformant synthetic ADT^A01 (no PHI — fabricated ids/names).
 RAW = "MSH|^~\\&|SEND|F|RECV|F|20240101120000||ADT^A01|MSG00001|P|2.3\rPID|1||900001||DOE^JANE\r"
@@ -500,6 +501,31 @@ def test_threads_a_call_joined_do_not_spend_the_memory_cap(tmp_path: Path) -> No
         assert session._proc is not None and session._proc.pid == pid
     finally:
         session.close()
+
+
+@pytest.mark.parametrize(
+    ("release", "counts"),
+    [
+        ("6.8.0-1017-azure", True),
+        ("5.15.0-91-generic", True),
+        ("4.7.0", True),
+        ("4.4.0-210-generic", False),
+        ("3.10.0-1160.el7.x86_64", False),
+        ("unparseable", False),
+    ],
+)
+def test_rlimit_data_is_trusted_only_from_linux_4_7(
+    release: str,
+    counts: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    # Before 4.7 RLIMIT_DATA counted only the brk heap, so the worker keeps the absolute RLIMIT_AS cap.
+    from messagefoundry.pipeline import _sandbox_worker
+
+    # The worker's own `os` is this module; raising=False because Windows has no os.uname.
+    monkeypatch.setattr(os, "uname", lambda: SimpleNamespace(release=release), raising=False)
+    assert _sandbox_worker._rlimit_data_counts_mmap() is counts
 
 
 def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(

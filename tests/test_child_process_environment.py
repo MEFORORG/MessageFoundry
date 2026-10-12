@@ -228,8 +228,10 @@ def test_the_sandbox_hands_its_worker_one_engine_switch_and_no_other_engine_vari
 
     engine_names = {n for n in captured["env"] if n.startswith(childenv.ENGINE_ENV_PREFIX)}
     assert engine_names == {settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV}
-    # One thread arena at most, so threads cannot spend [sandbox].mem_mb (vault BACKLOG #3133).
-    assert captured["env"]["MALLOC_ARENA_MAX"] == "2"
+    # One thread arena at most on Linux, so threads cannot spend [sandbox].mem_mb (vault BACKLOG
+    # #3133). Elsewhere the cap is not RLIMIT_DATA, so the worker's allocator is left alone.
+    expected = "2" if sys.platform.startswith("linux") else None
+    assert captured["env"].get("MALLOC_ARENA_MAX") == expected
     assert captured["argv"] == childenv.python_child_argv(sandbox_mod.WORKER_MODULE)
 
 

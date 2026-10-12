@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import sys
 from dataclasses import replace
 from typing import Any
@@ -121,6 +122,18 @@ def _proc_status_kib(field: str) -> int | None:
     return None
 
 
+def _rlimit_data_counts_mmap() -> bool:
+    """Whether this kernel counts private writable ``mmap`` memory against ``RLIMIT_DATA``. Linux
+    4.7 and later do; earlier kernels count only the ``brk`` heap, which would leave most large
+    allocations outside the cap, so the caller falls back to ``RLIMIT_AS`` there."""
+    try:
+        release = os.uname().release  # type: ignore[attr-defined,unused-ignore]
+        major, minor = (int(part) for part in release.split(".")[:2])
+    except (AttributeError, ValueError):
+        return False
+    return (major, minor) >= (4, 7)
+
+
 def _apply_resource_caps(mem_mb: int | None) -> str:
     """Best-effort POSIX memory backstop (a no-op on Windows); return the cap in words, for the reply
     to a call that runs out of memory. The parent's wall-clock cap is the authoritative bound on every
@@ -148,21 +161,21 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # type: ignore[attr-defined,unused-ignore]
     if mem_mb is None:
         return _NO_MEMORY_CAP
-    headroom = int(mem_mb) * 1024 * 1024
-    baseline_kib = _proc_status_kib("VmData")
+    mib = 1024 * 1024
+    baseline_kib = _proc_status_kib("VmData") if _rlimit_data_counts_mmap() else None
     if baseline_kib is not None:
-        rlimit = resource.RLIMIT_DATA  # type: ignore[attr-defined,unused-ignore]
-        limit = baseline_kib * 1024 + headroom
-        cap = f"[sandbox].mem_mb allows {mem_mb} MiB above the loaded graph (RLIMIT_DATA)"
+        rlimit, name = resource.RLIMIT_DATA, "RLIMIT_DATA"  # type: ignore[attr-defined,unused-ignore]
+        baseline = baseline_kib * 1024
     else:
-        rlimit = resource.RLIMIT_AS  # type: ignore[attr-defined,unused-ignore]
-        limit = headroom
-        cap = f"[sandbox].mem_mb allows {mem_mb} MiB of address space in all (RLIMIT_AS)"
+        rlimit, name = resource.RLIMIT_AS, "RLIMIT_AS"  # type: ignore[attr-defined,unused-ignore]
+        baseline = 0
         log.warning(
-            "sandbox worker: no VmData in /proc/self/status here, so [sandbox].mem_mb is an "
-            "absolute RLIMIT_AS cap of %d MiB on this platform, not headroom above the loaded graph",
+            "sandbox worker: no VmData in /proc/self/status, or a kernel older than Linux 4.7, so "
+            "[sandbox].mem_mb is an absolute RLIMIT_AS cap of %d MiB here, not headroom above the "
+            "loaded graph",
             mem_mb,
         )
+    limit = baseline + int(mem_mb) * mib
     try:
         hard = resource.getrlimit(rlimit)[1]  # type: ignore[attr-defined,unused-ignore]
         if hard != resource.RLIM_INFINITY:  # type: ignore[attr-defined,unused-ignore]
@@ -173,7 +186,11 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     except (ValueError, OSError) as exc:
         log.warning("sandbox worker: could not set the memory cap (%s)", exc)
         return _NO_MEMORY_CAP
-    return cap
+    # From the limit actually set, so a hard-limit clamp is not reported as the larger mem_mb.
+    allowed = max(0, limit - baseline) // mib
+    if baseline:
+        return f"[sandbox].mem_mb allows {allowed} MiB above the loaded graph ({name})"
+    return f"[sandbox].mem_mb allows {allowed} MiB of address space in all ({name})"
 
 
 def _install_import_guard(forbidden: tuple[str, ...]) -> None:
@@ -369,11 +386,12 @@ def main() -> int:
             return 1
         try:
             resp: bytes | None = _respond(registry, req, boot.code_sets)
-        except MemoryError:
+        except MemoryError as exc:
             # Caught here rather than around the Handler alone, so a result too big to encode is
-            # answered the same way. The reply is built AFTER this block: until it ends, the
-            # traceback keeps the Handler's frames, and the memory their locals hold, alive.
-            resp = None
+            # answered the same way. Only the text is kept: the reply is built AFTER this block,
+            # because until it ends the traceback keeps the Handler's frames, and the memory their
+            # locals hold, alive.
+            resp, detail = None, _error_text(exc)
         if resp is None:
             # A call that ran out of memory may leave memory held (a module global, a cache, a
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so
@@ -386,7 +404,7 @@ def main() -> int:
                         phase=req.phase,
                         name=req.name,
                         kind=codec.FAIL_MEMORY,
-                        error=f"MemoryError; {memory_cap}",
+                        error=f"{detail}; {memory_cap}",
                     ),
                 )
             return 1  # with no reply sent, the parent reads EOF and reports a crash instead
