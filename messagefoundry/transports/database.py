@@ -87,6 +87,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    count_setting,
     intake_open,
     poll_interval,
     register_destination,
@@ -1300,7 +1301,9 @@ class DatabaseDestination(DestinationConnector):
         self._login_timeout = _login_timeout(
             s, f"DATABASE connection {config.name!r}", dialect=self._dialect
         )
-        self._pool_max = int(s.get("pool_max", 5))
+        self._pool_max = count_setting(
+            s.get("pool_max", 5), knob="pool_max", transport="DATABASE destination"
+        )
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
@@ -1320,8 +1323,16 @@ class DatabaseDestination(DestinationConnector):
         self.capture_response: bool = (
             bool(s.get("capture_response", False)) or self.capture_out_params
         )
-        self._capture_max_rows = int(s.get("capture_max_rows", 100))
-        self._capture_max_bytes = int(s.get("capture_max_bytes", 256 * 1024))
+        self._capture_max_rows = count_setting(
+            s.get("capture_max_rows", 100),
+            knob="capture_max_rows",
+            transport="DATABASE destination",
+        )
+        self._capture_max_bytes = count_setting(
+            s.get("capture_max_bytes", 256 * 1024),
+            knob="capture_max_bytes",
+            transport="DATABASE destination",
+        )
 
     async def _get_pool(self) -> Any:
         if self._pool is not None:
@@ -1605,7 +1616,9 @@ class DatabaseSource(SourceConnector):
             f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
             dialect=self._dialect,
         )
-        self._pool_max = int(s.get("pool_max", 5))
+        self._pool_max = count_setting(
+            s.get("pool_max", 5), knob="pool_max", transport="DATABASE source"
+        )
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
@@ -2030,7 +2043,9 @@ class DatabaseLookupExecutor:
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
             self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
-            self._pool_max[cname] = int(s.get("pool_max", 5))
+            self._pool_max[cname] = count_setting(
+                s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
+            )
             self._login_timeout[cname] = _login_timeout(
                 s, f"DatabaseLookup {cname!r}", dialect="sqlserver"
             )

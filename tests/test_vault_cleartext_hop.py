@@ -35,6 +35,7 @@ from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.store.keyprovider import KeyProviderError
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+from tests._wire_proxy import _WireProxy
 
 pytestmark = pytest.mark.skipif(
     not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
@@ -790,6 +791,67 @@ def test_a_configured_credentialed_proxy_is_refused_before_sending(
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
         client.adapter.get("v1/secret/data/mefor/ad")
     assert listener.connections == 0, "a socket reached the proxy"
+
+
+# --- vault BACKLOG #3410: two DIFFERENT proxies ----------------------------------------------------
+#
+# The urllib egress leaked one proxy's credential to a second proxy, because urllib hands an http
+# request on and keeps the header. requests picks ONE proxy per request (select_proxy) and builds
+# its header from that proxy's URL alone, so the Vault hop has no second leg. These pin that on the
+# wire, with the urllib test's recording socket at both proxies.
+
+
+@pytest.fixture(params=["HTTP_PROXY", "HTTPS_PROXY"])
+def two_proxies(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[str, _WireProxy, _WireProxy]]:
+    """Proxy A, written ``https://`` with the credential, in the variable the param names; proxy
+    B, plain ``http://`` with none, in the other. Yields the credentialed variable, A and B."""
+    credentialed: str = request.param
+    other = "HTTPS_PROXY" if credentialed == "HTTP_PROXY" else "HTTP_PROXY"
+    with _WireProxy() as a, _WireProxy() as b:
+        monkeypatch.setenv(credentialed, f"https://{_PROXY_AUTH}@{a.address}")
+        monkeypatch.setenv(other, f"http://{b.address}")
+        yield credentialed, a, b
+
+
+def test_two_proxies_an_https_vault_never_sends_a_proxy_credential_in_the_clear(
+    two_proxies: tuple[str, _WireProxy, _WireProxy],
+) -> None:
+    """Both orders. requests sends the https:// Vault through the ``https`` entry's proxy only: A
+    gets TLS first, or B gets a ``CONNECT`` with no header."""
+    import requests
+
+    from messagefoundry.config import secretprovider_vault
+
+    credentialed, a, b = two_proxies
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    with pytest.raises(requests.exceptions.RequestException):
+        client.adapter.get("v1/secret/data/mefor/ad")
+    if credentialed == "HTTPS_PROXY":
+        assert a.tls_first >= 1 and a.cleartext == [], "A got something before TLS"
+        assert b.connections == 0
+    else:
+        assert a.connections == 0
+        assert len(b.cleartext) == 1
+        assert b.cleartext[0].startswith(b"CONNECT vault.synthetic.test:8200 ")
+        assert b"Proxy-Authorization" not in b.cleartext[0]
+        assert _PROXY_USER.encode() not in b.cleartext[0]
+
+
+def test_two_proxies_an_http_vault_is_refused_and_reaches_neither(
+    two_proxies: tuple[str, _WireProxy, _WireProxy],
+) -> None:
+    """An http:// Vault behind any proxy is refused at construction (BACKLOG #2317, #300), so
+    neither proxy is dialled, whichever one carries the credential."""
+    from messagefoundry.config import secretprovider_vault
+
+    _, a, b = two_proxies
+    with pytest.raises(_FAIL_CLOSED) as caught:
+        secretprovider_vault._build_client(_REMOTE_HTTP, _TOKEN)
+    _assert_refused(caught)
+    _assert_names_no_proxy_part(str(caught.value), int(a.address.rsplit(":", 1)[1]))
+    assert a.connections == 0 and b.connections == 0
 
 
 @pytest.mark.parametrize(

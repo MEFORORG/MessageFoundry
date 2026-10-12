@@ -53,6 +53,7 @@ from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
 from messagefoundry.store.base import DEFAULT_STORE_ACQUIRE_TIMEOUT, acquire_pooled
+from messagefoundry.transports.base import count_setting
 from messagefoundry.transports.egress import check_lookup_allowed
 
 __all__ = ["ReferenceSyncRunner", "ReferenceSyncError"]
@@ -165,7 +166,9 @@ async def _load_database_source(
         )
     pool = await _make_pool(
         dsn,
-        int(settings.get("pool_max", 5)),
+        count_setting(
+            settings.get("pool_max", 5), knob="pool_max", transport="DATABASE reference source"
+        ),
         autocommit=True,
         login_timeout=_login_timeout(settings, "DATABASE reference source", dialect="sqlserver"),
     )

@@ -1478,19 +1478,23 @@ these hops, such as `check-privileges` and `verify`, do not log this warning.
 direct. The urllib hops also dial a loopback host direct. The Vault clients have no loopback rule,
 so an `https://` Vault on a loopback address is proxied.
 
-**A proxy URL that carries credentials and is not `https://` is refused.** The urllib hops refuse
-it on each request. The Vault clients refuse it when they are built and again on each send. A
-credentialed proxy written `https://` is not refused, so whether its credentials cross in cleartext
-depends on the leg below.
+**A credential in a proxy URL is refused where it would reach a proxy in cleartext.** The urllib
+hops refuse it on each request, on any leg with no TLS to a proxy. Writing the proxy `https://`
+does not by itself exempt the credential. The rule, an example of a leg it lets through, and what
+it does not check are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). The Vault clients
+refuse a credentialed proxy not written `https://`, when they are built and again on each send.
 
 **The leg to the proxy is not always TLS, even for a proxy written `https://`.** The other
 documents link here rather than restate it.
 
 - The urllib hops reach at least the `https` proxy over plain TCP. For an `https` target they send
-  `CONNECT`, with any credential header from the proxy URL, before any TLS.
+  `CONNECT` before any TLS.
 - With an `https` proxy set, an `http` target whose `http` proxy is written `https://` is re-sent
-  through the `https` proxy the same way.
-- Only an `http` target, with no `https` proxy set, opens TLS to a proxy written `https://`.
+  through the `https` proxy the same way, unless urllib's bypass list names the `http` proxy's own
+  host.
+- An `http` target opens TLS to a proxy written `https://` when no `https` proxy is set, and in
+  that bypass case.
 - The Vault clients do open TLS to an `https://` proxy. `[secrets]` says how they verify it.
 
 `tests/test_proxy_url_credentials_refused.py` measures the urllib legs on the wire.

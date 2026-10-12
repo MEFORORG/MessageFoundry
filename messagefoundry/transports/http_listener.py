@@ -87,6 +87,9 @@ DEFAULT_MAX_BODY_BYTES = (
 DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
+_HEADER_CAP_OFF_HINT = (
+    "this cap cannot be switched off; leave it unset or None for the 64 KiB default"
+)
 
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
@@ -611,16 +614,22 @@ def _header_cap(value: Any) -> int:
     Before that, a TOML ``0`` silently became the default while a string ``"0"`` became a cap of zero
     that refused every request, because no request has a head of zero bytes: one number, two outcomes,
     one of them a total outage. Both now refuse loudly, because an operator who writes 0 means "no cap",
-    and this listener does not offer one; silently substituting 64 KiB would hide that. Written
-    ``not ... >= 1`` so NaN and a sub-1 value that would truncate to zero are refused as well."""
+    and this listener does not offer one; silently substituting 64 KiB would hide that. This is the
+    ``max_decompressed_members`` rule on the File source, read the same way."""
     if value is None or value == "":
         return DEFAULT_MAX_HEADER_BYTES
-    if not float(value) >= 1:
+    cap = positive_cap(
+        value,
+        int,
+        knob="max_header_bytes",
+        transport="HTTP source",
+        off_hint=_HEADER_CAP_OFF_HINT,
+    )
+    if cap is None:  # zero, in some spelling
         raise ValueError(
-            f"HTTP source max_header_bytes={value!r} must be a positive number of bytes; this cap "
-            "cannot be switched off (leave it unset or None for the 64 KiB default)"
+            f"HTTP source max_header_bytes={value!r} must be above zero ({_HEADER_CAP_OFF_HINT})"
         )
-    return int(value)
+    return cap
 
 
 class HttpSource(SourceConnector):
