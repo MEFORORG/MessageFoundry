@@ -634,8 +634,12 @@ _TIME_OF_DAY = r"""
       (?:[0-5][0-9]                         # second
         (?:\.[0-9]{1,4})?                   # fraction, only after the seconds
       )?)?
-    (?:[+-](?:0[0-9]|1[0-4])[0-5][0-9])?    # offset, -1200 to +1400 at the widest
+    (?:[+-](?:(?:0[0-9]|1[0-3])[0-5][0-9]|1400))?  # offset, no wider than 1400 either way
 """
+#: Every character the three grammars are written in. A message that declares one of them as a
+#: separator is not preserved at all: under a repetition separator of ``-``, ``000-12-3456`` splits
+#: into three valid numbers.
+_NUMERIC_GRAMMAR_CHARS = frozenset("0123456789+-.:/<>=")
 #: What each COMPONENT of a preserved numeric value must match, by position. A value with more
 #: components than its type has is refused. ``NM`` takes a leading comparator because ``<5`` under
 #: ``NM`` is a common sender habit and carries no identifier. ``SN`` is comparator, number,
@@ -667,9 +671,11 @@ def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
 
 def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps: Seps) -> bool:
     """True if every repetition of ``value`` fits ``grammar``, component by component. An empty
-    component is legal, because an ``SN`` leaves out the parts it does not use. A subcomponent
-    separator is refused outright: no numeric type has subcomponents, and under a message that
-    declares an odd separator the patterns alone would not see one."""
+    component is legal, because an ``SN`` leaves out the parts it does not use. No numeric type has
+    subcomponents, and the patterns refuse that separator like any other stray character. Nothing
+    is kept under a separator the grammars themselves use, because the split would hide it."""
+    if not _NUMERIC_GRAMMAR_CHARS.isdisjoint((seps.component, seps.repetition, seps.subcomponent)):
+        return False
     for rep in value.split(seps.repetition):
         comps = _components(rep, seps)
         if len(comps) > len(grammar):
@@ -677,7 +683,7 @@ def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps
         # Not strict: a value may stop short of its type's last component (``>^100`` has two).
         for comp, pattern in zip(comps, grammar, strict=False):
             part = comp.strip()
-            if seps.subcomponent in comp or (part and pattern.fullmatch(part) is None):
+            if part and pattern.fullmatch(part) is None:
                 return False
     return True
 

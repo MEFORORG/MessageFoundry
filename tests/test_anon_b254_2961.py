@@ -4,7 +4,7 @@
 
 One character class used to serve ``NM``, ``SN`` and ``TM``, and any run of digits and marks fitted
 it. So an identifier written with dashes or dots under a numeric label was kept whole, in a field
-the leak check does not scan. Each type now has its own grammar.
+the leak check's shape detectors do not scan. Each type now has its own grammar.
 
 Every value here is synthetic (CLAUDE.md section 9). ``000-12-3456`` has the shape of a Social
 Security number in an area that is never issued, and ``555-555-0100`` is in the range reserved for
@@ -84,6 +84,9 @@ _REFUSED: dict[str, tuple[str, str]] = {
     "TM fraction before the seconds": ("TM", "1200.5"),
     "TM five fraction digits": ("TM", "120000.12345"),
     "TM offset out of range": ("TM", "1200+9900"),
+    "TM offset past the widest": ("TM", "1200+1459"),
+    "TM colons": ("TM", "12:30"),
+    "SN unsplit comparator and number": ("SN", "<5"),
     "TM comparator": ("TM", ">1200"),
 }
 
@@ -138,22 +141,36 @@ def test_the_checked_run_no_longer_returns_the_shape_whole(
     checked: Callable[..., str], value: str, value_type: str
 ) -> None:
     """The row's closing step: the end-to-end run. It used to return clean with the value whole,
-    because OBX-5 is a mapped field and the leak check does not scan a mapped field."""
+    because OBX-5 is a mapped field and the shape detectors do not scan a mapped field."""
     out = checked(_message(value_type, value), salt=_SALT)
     assert _obx5_of(out) == "[REDACTED]"
     assert value not in out
 
 
-@pytest.mark.parametrize("value_type", ("NM", "SN", "TM"))
+@pytest.mark.parametrize(
+    ("mark", "value"), (("-", _SSN_SHAPE), (".", _PHONE_DOTTED)), ids=("dash", "point")
+)
+@pytest.mark.parametrize("value_type", ("NM", "TM"))
 @_EACH_MODULE
-def test_a_subcomponent_separator_is_refused_under_a_numeric_type(
-    module: Any, value_type: str
+def test_nothing_is_kept_under_a_repetition_separator_the_grammar_uses(
+    module: Any, value_type: str, mark: str, value: str
 ) -> None:
-    """A message may declare any subcomponent separator. Under ``-`` the old code split the value
-    first and matched ``000``, ``12`` and ``3456`` one by one, so the whole value was kept."""
-    odd = module.Seps(subcomponent="-")
-    value = _SSN_SHAPE if value_type != "SN" else f"^{_SSN_SHAPE}"
-    assert module.preserve_obx5_value(value_type, value, odd) is False
+    """A message may declare any separators. Under a repetition separator of ``-`` the value splits
+    into ``000``, ``12`` and ``3456``, and each is a valid number, so the grammar alone keeps it."""
+    assert module.preserve_obx5_value(value_type, value, module.Seps(repetition=mark)) is False
+    # Control: the same call keeps a plain value under the usual separators.
+    assert module.preserve_obx5_value(value_type, "12", module.Seps()) is True
+
+
+@_EACH_CHECKED
+def test_the_checked_run_redacts_under_a_dash_repetition_separator(
+    checked: Callable[..., str],
+) -> None:
+    """The same case end to end, read from the message's own MSH-2."""
+    message = _message("NM", _SSN_SHAPE).replace(r"|^~\&|", r"|^-\&|")
+    assert r"|^-\&|" in message
+    # The redact is written once per repetition, and here the dashes are the repetition marks.
+    assert set(_obx5_of(checked(message, salt=_SALT)).split("-")) == {"[REDACTED]"}
 
 
 @_EACH_MODULE
@@ -175,6 +192,7 @@ _STILL_KEPT_BY_DESIGN: dict[str, tuple[str, str]] = {
     "NM signed eleven digits": ("NM", "+15555550100"),
     "SN undashed nine digits": ("SN", "^900000001"),
     "NM identifier split across repetitions": ("NM", "000~12~3456"),
+    "TM six digits that read as a date": ("TM", "150312"),
 }
 
 

@@ -2155,8 +2155,10 @@ What the `date` kind does to a value:
   `NM`, and in a number part of an `SN`: an undashed nine-digit number, which is the shape of an
   SSN; an undashed ten-digit number, or eleven digits after a `+`, which is the shape of a phone
   number; an eight-digit number that reads as a date; and an identifier split across repetitions.
-  The leak-check does not scan `OBX-5`, because a rule maps it, so nothing refuses these. The
-  coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word under one of them, such as
+  Under `TM`, at least a six-digit date whose parts are in range for a time would still leave
+  whole: `150312` reads as 15:03:12. The leak-check's shape detectors do not scan `OBX-5`,
+  because a rule maps it, so nothing refuses these. A message that declares a digit or one of
+  `+ - . : / < > =` as a separator keeps no numeric value at all. The coded types `ID`, `IS`, `CE` and `CWE` are not changed: a single word under one of them, such as
   a surname, would still leave whole.
 - When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
   site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
