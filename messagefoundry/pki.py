@@ -500,8 +500,8 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
         elif signature.state != "verified":
             return (
                 f"{signature.where} does not verify against the key of the CA certificate this "
-                "hop trusts for that issuer. Loaded, it would make every handshake it judges fail "
-                "with 'CRL signature failure'",
+                "hop trusts for that issuer. A handshake that OpenSSL checks against that CA's "
+                "key by this CRL fails with 'CRL signature failure'",
                 True,
             )
     return None if unlisted is None else (unlisted, False)

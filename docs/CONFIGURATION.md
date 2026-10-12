@@ -1802,9 +1802,9 @@ issuer. The engine applies a replaced file only when all three of these hold:
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
 what to do. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
-CRL fails its signature check under rule 2 needs fixing too, and a restart is not the fix. A start
-refuses it when the CRL names the CA's key and that key did not sign it. Otherwise a start loads it
-with a warning, and the handshakes that CRL judges can fail. The next paragraphs say which is which.
+CRL fails its signature check under rule 2 is held back too. A start refuses it when the CRL names
+the CA's key and that key did not sign it, so fix that file. Otherwise a start loads it with a
+warning, and each handshake then decides. The next paragraphs say which is which.
 A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
 a file that drops an issuer, and a CRL signed under a new key. When the hops holding one file need
 different things, the ERROR names the strongest: fix the file, then restart, then wait. When it names
@@ -1832,7 +1832,7 @@ three cases warn:
   shape, where the peer sends the renewed CA certified by the old key.
 - The engine cannot check the signature with the listed CA's key.
 
-If the check itself fails, the engine logs a WARNING that says so, and loads the file.
+If the check itself fails, the engine logs an ERROR that says so, and loads the file.
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. The
 WARNING is logged once per engine process for each version of the file. A hop whose CA list gives a
@@ -1841,7 +1841,8 @@ root the hop has loaded counts as a listed CA. So a CRL that names a system root
 root did not sign, refuses the start too.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL that a listed CA of that
-name does not verify, whether or not the CRL names a key.
+name does not verify, whether or not the CRL names a key. Its ERROR says to fix the file. After a
+CA renews its key the file can be right, and a restart then loads it with the WARNING above.
 
 **What a signature refusal stops.** It has the reach of the expired-CRL refusal, because one check
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound
@@ -1851,6 +1852,11 @@ anything, so one refusal there blocks the whole change. `[tls].crl_file` is shar
 CRL in it refuses each hop that loads the file and lists the CA whose key the CRL names. At least
 two kinds of hop are not refused. A loopback hop loads no CRL. A hop whose own CA list lacks that CA
 only warns.
+
+**It is not only a start-time check for the Postgres store.** That store builds a TLS context for
+each new connection, so `[store].ssl_crl_file` is checked again at every new store connection. A
+file replaced on a running engine with one that refuses fails each new store connection from then
+on, as an expired one does.
 
 **A CRL that is not in effect yet is the exception: wait.** The engine applies it once it takes effect.
 Do not restart before then. A start refuses a file whose only CRL for some issuer is not in effect yet,

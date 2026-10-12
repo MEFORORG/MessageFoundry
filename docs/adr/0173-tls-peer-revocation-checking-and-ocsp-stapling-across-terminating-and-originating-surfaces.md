@@ -1213,8 +1213,8 @@ only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are un
 badly signed CRL "would load and then fail every handshake". That described a start as well as
 OpenSSL, and a start has changed. `harden_crl_check` now checks each CRL's signature against the
 hop's own CA list. It refuses one case only: the CRL names a listed CA's key by key identifier, and
-that key did not sign it. Anything short of that proof loads with a WARNING: an issuer the hop does
-not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
+that key did not sign it. Anything short of that proof loads with a WARNING, at least an issuer the
+hop does not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
 under "CRL files", is the one place that says how often it is logged and what a refusal stops.
 So the reload refuses more than a start does, on purpose. The ruling's reason is a CA that
 renewed its key: its CRL can fail the engine's check while handshakes still pass, because OpenSSL

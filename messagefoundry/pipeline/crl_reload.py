@@ -171,11 +171,14 @@ LAPSES_FIRST = (
 )
 #: True of both things a start does with such a file (vault BACKLOG #2905). A start refuses a CRL
 #: that names the CA's key and is not signed by it. It loads any other with a warning, and the
-#: handshake then decides.
+#: handshake then decides. The reload gives this one remedy for all of those cases, because
+#: :func:`~messagefoundry.pki.crl_signature_refusal` folds them into one flag. So it cannot
+#: tell a renewed CA key, where a restart is enough, from a forged CRL. That is unfiled.
 BAD_SIGNATURE = (
-    "Fix the file: give a CRL the hop's CA signed. A restart is not the fix. Where the CRL names "
-    "that CA's key, a start refuses the file too. Otherwise a start loads it with a warning, and "
-    "the handshakes that CRL judges can then fail"
+    "If the file is wrong, fix it: give a CRL the hop's CA signed. Where the CRL names that "
+    "CA's key, a start refuses the file too. Otherwise a start loads it with a warning, and each "
+    "handshake then decides. It passes where the peer's chain carries the CA that signed the "
+    "CRL, as after a CA renews its key, and fails where it does not"
 )
 NO_ISSUER = (
     "Restart the engine to apply the file. The reload checks a CRL's signature against the hop's "

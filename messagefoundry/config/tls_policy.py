@@ -576,13 +576,14 @@ def _check_crl_signatures(
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
 
-    **Everything short of proof loads, with one warning.** That covers a CRL that names no key, a
-    key the engine cannot check with, and an issuer the hop does not list. The last is the usual
+    **Everything short of proof loads, with one warning.** That covers at least a CRL that names
+    no key, a key the engine cannot check with, and an issuer the hop does not list. The last is the usual
     case in a two-tier PKI, where the peer sends the intermediate that issued the CRL, so it must
     not log per hop. The warning is one line for the file, and
     :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` says how often it is
-    logged. A judgment that fails for any other reason warns the same way: this is a diagnosis,
-    and a certificate in the hop's store that ``cryptography`` cannot read must not stop a start.
+    logged. A judgment that fails for any other reason is logged at ERROR, once, and the file
+    loads: this is a diagnosis, and a defect in it must not stop a start. That failure discards
+    the whole judgment, a proven bad CRL in the same file included.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
@@ -606,7 +607,7 @@ def _check_crl_signatures(
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
         # that with exception types of its own. The handshake still checks every signature.
         if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
-            logger.warning(
+            logger.error(
                 "%s: the engine could not check the signatures of the CRL(s) in this file at "
                 "start (%s). That is not a verdict on the file. It is loaded and revocation "
                 "checking is on, and OpenSSL checks each signature at the handshake",
