@@ -37,16 +37,20 @@ section reference.
 
 ## No escape sends a credential to an unverified peer
 
-The engine will not send a credential to a peer whose identity it has not checked. This section is
-the one statement of that rule; other pages link here.
+On the hops in the table below, the engine will not send a credential to a peer whose identity it
+has not checked. The rule does not yet reach every hop or every kind of credential: at least the
+cases in *The rule does not reach every hop yet*, below, still cross. This section is the one
+statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
 or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
 or starts the service, except SFTP: the host key is known only once the server answers, so that
 refusal comes at connect, before the password is sent. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
-`tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection and
-the settings that do fix it.
+`tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
+the `[auth]` setting for the AD bind, and offers only settings that do fix it. `Email` and `Direct`
+check the credential before the cleartext and verify-off checks, so a credentialed hop is never
+pointed at one of those levers.
 
 | Hop | Refused when it carries a credential and | What fixes it |
 |---|---|---|
@@ -72,7 +76,11 @@ An AD bind always carries a credential, because the service account must bind fi
 **The rule does not reach every hop yet.** At least these still send a credential to a peer the
 engine has not verified, when the lever named beside each is set:
 
-- an HTTP-family credential over plain `http`, under `cleartext_accepted`;
+- an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
+- an HTTP-family secret the refusal cannot see as a credential, on a `verify_tls = false` hop or
+  over plain `http`, under that hop's own levers. That covers at least a static header with a
+  neutral name, such as `X-Session`, and a secret in the path of the `url`. The test for a
+  credential header reads the header's name, and the `url` test reads only its query;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
   `encrypt = false`;

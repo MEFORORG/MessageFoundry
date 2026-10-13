@@ -601,10 +601,12 @@ REST obey the authority does not settle these:
   the keyword's **value**, so `SSLmode=disable` is reported rather than mistaken for TLS ownership. TLS
   here is operator-owned: set the driver's keyword in `odbc_params` (`SSLmode=verify-full`,
   `SSLMODE=VERIFY_IDENTITY`, …) and treat it as a deployment requirement.
-- **Direct (S/MIME) cleartext SMTP** — `use_tls=false` consults the **raw** `MEFOR_ALLOW_INSECURE_TLS`
-  directly rather than the authority, which is why the escape-hatch list below marks it *Not clamped*.
-  `[security].enforcement` does not reach it. (SMTP AUTH credentials are refused over cleartext either
-  way, and the Direct body is S/MIME-encrypted — but the SMTP envelope metadata is not.)
+- **Direct (S/MIME) cleartext SMTP** — `use_tls=false` reads the clamped `MEFOR_ALLOW_INSECURE_TLS`
+  escape directly rather than the authority. So `[security].enforcement` reaches it only through the
+  clamp: the escape lifts the refusal at `warn` and does nothing at `enforce`. No per-hop declaration
+  is read (`tls_hop_attested` and `cleartext_accepted` change nothing here), and no loopback or PHI
+  distinction is drawn. (SMTP AUTH credentials are refused over cleartext either way, and the Direct
+  body is S/MIME-encrypted — but the SMTP envelope metadata is not.)
 
 ### `tls_allow_expired` — the weakening with no posture gate at all
 
@@ -713,7 +715,8 @@ loud warning):
   database login, and the credential rule does not reach them yet.)*
 - RemoteFile SFTP: accepting an unknown host key on a login with no `password`. *(Clamped since
   #329.)*
-- Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Not clamped.)*
+- Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
+  rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
   forwarder and the API PHI-read serve hop, plus the webhook alert sink and the AI-broker endpoint.
   *(All clamped — the webhook sink and the AI broker since #329. The AI broker hop carries
