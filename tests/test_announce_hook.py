@@ -184,6 +184,7 @@ def run(
     env: dict[str, str] | None = None,
     extra: tuple[str, ...] = (),
     stdin: bool = True,
+    payload_cwd: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if presence is None:
         presence = presence_stub(tmp_path, rows, body=body)
@@ -199,6 +200,8 @@ def run(
     payload: dict[str, Any] = {"hook_event_name": "UserPromptSubmit", "prompt": "do a thing"}
     if session_id is not None:
         payload["session_id"] = session_id
+    if payload_cwd is not None:
+        payload["cwd"] = payload_cwd
     # ISOLATE THE SESSION REGISTRY. The hook resolves its own login from the records under
     # $env:USERPROFILE\.claude*, so without this every test reads the DEVELOPER'S real registry and its
     # result depends on which sessions happen to be running on the machine. Default to a fixture home
@@ -1408,3 +1411,64 @@ def test_the_self_test_reports_the_mail_split_under_a_stated_login(
     assert "2 of 2 unreachable peer(s) are mailable" in p.stdout, p.stdout
     assert "STATED via -AsLogin" in p.stdout, p.stdout
     assert sends(_) == [], "a read-only diagnostic sent mail"
+
+
+# --------------------------------------------------------------------------------------------------
+# Which worktree the announcement names.
+#
+# Measured 2026-10-12: the desktop app starts a worktree session's CLI with `--project-config-root
+# <primary checkout>`, and a hook then runs in the PRIMARY. This hook announced every such session as
+# "[SESSION-ANNOUNCE] <primary> (main)". Only the hook input's `cwd` names the worktree. These tests run
+# the hook IN the primary, as the app does, and vary only that field.
+# --------------------------------------------------------------------------------------------------
+
+
+def _top(path: Path) -> str:
+    """The toplevel exactly as the hook asks git for it."""
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def linked(repo: Path, tmp_path: Path) -> Path:
+    """A worktree linked to ``repo``, so ``repo`` plays the primary checkout."""
+    wt = Path(os.path.realpath(tmp_path)) / "linked"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "linked", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    return wt
+
+
+def test_the_announcement_names_the_worktree_the_hook_input_names(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=str(linked))
+    assert f"[SESSION-ANNOUNCE] {_top(linked)} (linked)" in p.stdout, p.stdout
+    assert _top(repo) not in p.stdout, p.stdout
+
+
+def test_without_a_cwd_the_announcement_names_where_the_hook_runs(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """The control. With no `cwd` the same call names the primary, so the arm above can fail."""
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert f"[SESSION-ANNOUNCE] {_top(repo)} (" in p.stdout, p.stdout
+    assert _top(linked) not in p.stdout, p.stdout
+    assert "could not read this session's worktree" not in p.stdout
+
+
+def test_a_cwd_that_does_not_exist_is_said_aloud(repo: Path, linked: Path, tmp_path: Path) -> None:
+    sd = tmp_path / "state"
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert "[announce] could not read this session's worktree" in p.stdout, p.stdout
+    assert "deleted-worktree, which does not exist" in p.stdout, p.stdout
+    assert f"[SESSION-ANNOUNCE] {_top(repo)} (" in p.stdout, "the fallback is the old behaviour"

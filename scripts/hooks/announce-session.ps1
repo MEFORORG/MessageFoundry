@@ -62,6 +62,18 @@
     the presence scoping below therefore serve a caller the OPERATOR wires. Do not read their existence
     as the container gap being closed.
 
+    IT ANNOUNCES THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
+    worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
+    hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY,
+    so this hook announced every worktree session as "[SESSION-ANNOUNCE] <primary> (main)". It also
+    keyed the /clear cooldown and the claim lookup on the primary, and mail.ps1 stamped the primary as
+    the sender. Only the `cwd` field of the JSON on stdin names the worktree.
+
+    So stdin is read FIRST, before any git call, and the hook moves into that `cwd`
+    (scripts/hooks/_hookinput.ps1). Every git call, and the mail.ps1 child, then answers for the
+    session. Input with no `cwd` leaves the hook where it started, as before. A `cwd` it cannot use
+    prints one `[announce]` line, and the hook goes on for the checkout it runs in.
+
     OUTCOME CODES: ANNOUNCED, ANNOUNCED_MAIL, NO_PEERS, NO_SESSION_ID, NO_LOGIN, LOOKUP_FAILED, LOOKUP_KILLED,
     UNATTENDED, DISABLED, BUDGET_EXHAUSTED, SETTLED, RECENT_CWD, ERROR. There is deliberately NO code for the
     suppressed path: that is the hot path and it must stay free. The log records DECISIONS, not
@@ -311,6 +323,24 @@ function Write-Receipt {
 # $script:MarkerKey and $script:SelfId are read defensively in Write-Receipt, so $null is fine.
 
 try {
+    # --- 0. HOOK INPUT, THEN THE SESSION'S OWN DIRECTORY ---------------------------------------------
+    # BEFORE ANY GIT CALL. Under the desktop app this process starts in the PRIMARY checkout, and only
+    # the input's `cwd` names the worktree; see the header. A helper that fails to load leaves the read
+    # and the location exactly as they were before the helper existed.
+    #
+    # '-not $SelfTest' is UNCONDITIONAL, not conditional on redirection: measured on this host,
+    # [Console]::IsInputRedirected is True from an agent shell with NO pipe at all, so a read guarded
+    # only on redirection turns the diagnostic switch into a hang.
+    try { . (Join-Path $PSScriptRoot '_hookinput.ps1') } catch { }
+    $hasHelper = [bool](Get-Command Enter-CcxHookCwd -ErrorAction SilentlyContinue)
+    $raw = $PayloadOverride
+    if (-not $raw -and -not $SelfTest) {
+        if ($hasHelper) { $raw = Read-CcxHookInput }
+        elseif ([Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() }
+    }
+    $cwdFault = ''
+    if ($hasHelper -and $raw) { $cwdFault = Enter-CcxHookCwd -Text $raw }
+
     # --- 1. COMMON DIR -------------------------------------------------------------------------------
     # MANDATORY inert-outside-a-repo guarantee: this entry is user-global and runs in every unrelated
     # project on the machine.
@@ -342,6 +372,14 @@ try {
 
     if (-not $isMf) { exit 0 }
 
+    # LOUD, because a silent fallback is the defect section 0 fixes: the announce below would name the
+    # checkout this hook runs in, and a peer reading it would take that for this session's worktree.
+    if ($cwdFault) {
+        $where = if ($top) { $top } else { '(no checkout)' }
+        Write-Output ("[announce] could not read this session's worktree: {0}. Anything announced below names {1}, where this hook runs." -f `
+            ((Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?'), ((Get-Clean $where 150) -replace '[^\x20-\x7E]', '?'))
+    }
+
     # The login lookup lives in the shared registry library, one definition with the liveness fence.
     #
     # RESOLVED FROM $PSScriptRoot, NOT FROM $repoRoot, for the same reason -PresenceScript defaults
@@ -365,11 +403,7 @@ try {
     $script:StateDir = $StateDir
 
     # --- 4. PAYLOAD ---------------------------------------------------------------------------------
-    # '-not $SelfTest' is UNCONDITIONAL, not conditional on redirection: measured on this host,
-    # [Console]::IsInputRedirected is True from an agent shell with NO pipe at all, so a read guarded
-    # only on redirection turns the diagnostic switch into a hang.
-    $raw = $PayloadOverride
-    if (-not $raw -and -not $SelfTest -and [Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() }
+    # $raw was read in section 0, because the `cwd` in it has to move the hook before any git call.
     $selfId = ''
     if ($raw) {
         try {
