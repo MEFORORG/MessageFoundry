@@ -193,15 +193,21 @@ _MOUNTERS = {
     "config/secretprovider_vault.py": "secrets",
     "store/keyprovider_vault.py": "store",
 }
-#: Every function that builds a Vault client, by module, with what it may pass as the flag:
-#: ``setting`` is its own section's ``vault_revocation_attested``, and ``False`` fails closed.
-_BUILDERS = {
-    ("config/secretprovider_vault.py", "resolve"): "setting",
-    ("config/secretprovider_vault.py", "secrets_vault_client"): "False",
-    ("store/keyprovider_vault.py", "active_key"): "setting",
-    ("store/keyprovider_vault.py", "store_vault_client"): "False",
-    ("store/crypto_transit.py", "build_transit_cipher"): "setting",
-}
+#: Every call that builds a Vault client: module, enclosing function, and what it passes as the
+#: flag. ``setting`` is the ``vault_revocation_attested`` of the settings object that function
+#: holds, and ``False`` fails closed. A list, so a second call in one function is a second row.
+_BUILDERS = sorted(
+    [
+        ("config/secretprovider_vault.py", "resolve", "setting"),
+        ("config/secretprovider_vault.py", "secrets_vault_client", "False"),
+        ("store/crypto_transit.py", "build_transit_cipher", "setting"),
+        ("store/keyprovider_vault.py", "active_key", "setting"),
+        ("store/keyprovider_vault.py", "store_vault_client", "False"),
+    ]
+)
+#: The two spellings of "the settings object this function holds". Each module holds only its own
+#: section's settings, so one of these names that section's pair.
+_OWN_SETTING = ("self._settings.vault_revocation_attested", "settings.vault_revocation_attested")
 
 
 def _keyword(call: ast.Call, name: str) -> ast.expr | None:
@@ -227,22 +233,29 @@ def _build_shape(call: ast.Call) -> str:
     flag = _keyword(call, _FLAG)
     if flag is None:
         return "MISSING"
-    if isinstance(flag, ast.Attribute) and flag.attr == _SETTING:
+    if ast.unparse(flag) in _OWN_SETTING:
         return "setting"
     if isinstance(flag, ast.Constant) and flag.value is False:
         return "False"
     return f"UNEXPECTED {ast.unparse(flag)}"
 
 
-def _builders(path: Path) -> dict[tuple[str, str], str]:
-    tree = parse_source(path.read_text(encoding="utf-8"))
-    relative = path.relative_to(_PACKAGE).as_posix()
-    return {
-        (relative, func.name): _build_shape(call)
+def _builders(source: str, relative: str) -> list[tuple[str, str, str]]:
+    """One row per client build in ``source``: where it is, and the shape it passes.
+
+    Every call is a row. A call outside any function is listed under ``<module>``, and two calls
+    in one function are two rows, so neither can hide behind a listed one."""
+    tree = parse_source(source)
+    inside = {
+        id(call): func.name
         for func in ast.walk(tree)
         if isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef)
         for call in call_sites(func, _BUILD)
     }
+    return [
+        (relative, inside.get(id(call), "<module>"), _build_shape(call))
+        for call in call_sites(tree, _BUILD)
+    ]
 
 
 def _modules() -> list[Path]:
@@ -310,11 +323,32 @@ def test_every_vault_client_build_is_listed_and_none_is_a_no_op() -> None:
     build could skip the guard is by what it passes as the flag: each passes its own section's
     setting, or ``False`` where no settings are in scope, which fails closed. Never a literal
     ``True``, and never nothing."""
-    found: dict[tuple[str, str], str] = {}
+    found: list[tuple[str, str, str]] = []
     for path in _modules():
-        if _BUILD in path.read_text(encoding="utf-8"):
-            found.update(_builders(path))
-    assert found == _BUILDERS
+        source = path.read_text(encoding="utf-8")
+        if _BUILD in source:
+            found.extend(_builders(source, path.relative_to(_PACKAGE).as_posix()))
+    assert sorted(found) == _BUILDERS
+
+
+def test_the_build_census_sees_a_call_a_listed_one_could_hide() -> None:
+    """The control for the census, from the second review round. Three plants that a census keyed
+    by function name would have missed: a build outside any function, a literal ``True`` ahead of
+    the real build in a listed function, and another object's setting."""
+    planted = (
+        "client = _build_client(a, t, revocation_attested=True)\n"
+        "def active_key(self):\n"
+        "    _build_client(a, t, revocation_attested=True)\n"
+        "    return _build_client(a, t, revocation_attested=self._settings.vault_revocation_attested)\n"
+        "def resolve(self, ref):\n"
+        "    return _build_client(a, t, revocation_attested=other.vault_revocation_attested)\n"
+    )
+    assert sorted(_builders(planted, "planted.py")) == [
+        ("planted.py", "<module>", "UNEXPECTED True"),
+        ("planted.py", "active_key", "UNEXPECTED True"),
+        ("planted.py", "active_key", "setting"),
+        ("planted.py", "resolve", "UNEXPECTED other.vault_revocation_attested"),
+    ]
 
 
 @pytest.mark.parametrize(

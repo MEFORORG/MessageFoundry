@@ -1139,9 +1139,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   that lifetime in the reason.
 - **Know which CA the hop trusts before you attest.** With `MEFOR_STORE_VAULT_CA_FILE` or
   `MEFOR_SECRETS_VAULT_CA_FILE` set, the hop trusts only that file. With it unset, hvac and
-  requests choose the anchor: it may come from `VAULT_CACERT`, from `REQUESTS_CA_BUNDLE`, or from
-  the public certifi bundle. Then there is no single PKI to review, and a reason that names
-  "our PKI" may not describe the certificate the hop accepts. Set the CA file first.
+  requests choose the anchor. It may come from at least `VAULT_CACERT` or `VAULT_CAPATH`,
+  `REQUESTS_CA_BUNDLE` or `CURL_CA_BUNDLE`, or the public certifi bundle. Then there is no single
+  PKI to review, and a reason that names "our PKI" may not describe the certificate the hop
+  accepts. Set the CA file first.
 - **What it cannot do:** it never lifts the hop's other refusals: an `http://` Vault off the
   box, proxy credentials sent in cleartext, or a hop that verifies no peer. It is also not the
   process-wide `MEFOR_TLS_REVOCATION_ATTESTED`. That variable does **not** cross an enforcing
@@ -1161,10 +1162,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   The entry is named whenever the flag is set, whether or not a Vault provider is selected.
   `messagefoundry check` has no line for it.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
-  holding a control character or a lone surrogate is refused, on every command that loads the
-  settings.
-- **Reversible:** yes. Delete both lines and restart. Under `enforce` an off-box Vault hop then
-  refuses again.
+  holding a control character or a lone surrogate is refused when the settings load.
+  `messagefoundry security show` does not stop on a file that will not load: it marks its report
+  partial and lists no attestation from that file.
+- **Reversible:** yes. Delete both lines and restart. An off-box Vault hop then refuses again.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**

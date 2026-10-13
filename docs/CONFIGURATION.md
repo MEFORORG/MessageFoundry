@@ -1485,7 +1485,9 @@ environment variable holding a value, they also send a host on the Windows or ma
 list direct. A value in any `*_proxy` variable, even `NO_PROXY`, makes both families ignore the
 system proxy settings, bypass list included. The urllib hops also dial a loopback host direct. The
 Vault clients have no loopback rule, so an `https://` Vault on a loopback address is proxied
-unless a bypass list names it.
+unless a bypass list names it. A proxied Vault is then off the box, and the client build refuses
+it without `vault_revocation_attested`; `[secrets]`
+says why.
 
 **A credential in a proxy URL is refused at least where it would reach a proxy in cleartext.** The
 urllib hops refuse it on each request, on any leg with no TLS to a proxy. Writing the proxy
@@ -1976,7 +1978,13 @@ a loopback IP literal, and no other name, whatever it resolves to. An address th
 one well-formed URL is refused too. The refusal comes when the client is built, as the provider's
 own fail-closed error, and again before each send in case a proxy appeared since. Its text names no
 part of the address, and `[security].enforcement` does not relax it. An `https://` Vault behind an
-`http://` proxy is still allowed: the token rides inside the TLS tunnel to Vault.
+`http://` proxy is still allowed by this rule: the token rides inside the TLS tunnel to Vault.
+**Every proxied Vault hop needs the revocation attestation, though** (vault BACKLOG #2983). An
+`https://` Vault is on the box only when it is a loopback host reached with no proxy. Any other
+`https://` Vault, a loopback one behind a proxy included, is refused when the client is built
+unless that Vault's `vault_revocation_attested` pair is set: the row above for this provider,
+and [`[store]`](#store) for the key provider and the Transit cipher. So a proxy that reaches a
+Vault client from the environment can turn a hop that worked into one that is refused.
 **A proxy URL that carries credentials must be `https://`** (BACKLOG #2547). requests sends a
 `user:password@` from the proxy URL to the proxy itself. Through any proxy that is not `https://`,
 those credentials cross the network in cleartext. So the Vault clients refuse such a proxy,
