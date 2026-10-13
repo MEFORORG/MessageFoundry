@@ -1756,19 +1756,13 @@ def read_2xx_reply_text(
         # Only fixed text leaves the handler. A 2xx is handled below, outside it. The traceback
         # reaches the frame that holds the bytes read so far, and an error raised in here would
         # keep that frame alive on its __context__ until the worker let go of it.
-        # ``dropped_fault`` is None for an over-cap body, so a ReplyBodyDropped says "over the
-        # bound" in the words it had before truncated and misframed bodies were dropped too.
-        dropped_fault: str | None
         if isinstance(exc, ResponseTooLargeError):
             code, fault = REPLY_TOO_LARGE_CODE, f"is over the {limit}-byte bound"
-            dropped_fault = None
         elif isinstance(exc, TruncatedResponseError):
             code, fault = REPLY_TRUNCATED_CODE, "ended before its declared length"
-            dropped_fault = fault
         else:
             # The reason is fixed text from this module, never a byte the peer sent.
             code, fault = REPLY_MISFRAMED_CODE, f"is misframed ({exc.reason})"
-            dropped_fault = fault
     if body_is_needed:
         # The row keeps only 200 characters of this, so the code and the advice come first and
         # the connection name, which has no length cap, comes last (vault BACKLOG #3040 items
@@ -1780,7 +1774,10 @@ def read_2xx_reply_text(
             code=code,
             permanent=True,
         )
-    return ReplyBodyDropped(status=status, limit=limit, fault=dropped_fault)
+    # An over-cap drop carries no fault: ReplyBodyDropped words that case from its own bound.
+    return ReplyBodyDropped(
+        status=status, limit=limit, fault=None if code == REPLY_TOO_LARGE_CODE else fault
+    )
 
 
 def drain_2xx_reply(

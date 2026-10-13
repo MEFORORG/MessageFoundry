@@ -393,8 +393,9 @@ called.
 change, but the review of engine PR 2013 left it open in the same row. Owner ruling R5 of
 2026-10-05 decided an over-size body after a 2xx by who reads it. A body cut short of its declared
 length, or a misframed one, now follows the same rule, with its own code: `reply-truncated` or
-`reply-misframed`. Where nothing reads the body, the message is delivered, the body is dropped and
-a WARNING is logged. Where the engine reads it to know the outcome or passes it on, the delivery is
+`reply-misframed`. Where nothing reads the body, the message is delivered, the body is dropped,
+the message gets a `reply_dropped` event that says what was wrong with it, and then a WARNING is
+logged. Where the engine reads it to know the outcome or passes it on, the delivery is
 a permanent refusal that is not sent again. Either way the request is sent once.
 `bounded_read.read_2xx_reply_text` states the rule, and the table under REST in
 `docs/CONNECTIONS.md` says which destination does which. **Provenance: decided 2026-10-11 by the
