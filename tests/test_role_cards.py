@@ -26,6 +26,7 @@ Each of those is a class, not an instance, which is why each gets a test rather 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -712,6 +713,115 @@ class TheHookNeverGuessesASeat(unittest.TestCase):
         self.assertIn("KORUS_SEAT", source)
 
 
+def _run_hook(*args: str, cwd: Path, stdin: str) -> subprocess.CompletedProcess[str]:
+    """Run the hook the way the harness does, with `stdin` as the hook input."""
+    env = {k: v for k, v in os.environ.items() if k not in ("KORUS_SEAT", "KORUS_AGENT")}
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK), *args],
+        cwd=cwd,
+        env=env,
+        input=stdin,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        timeout=60,
+    )
+
+
+class TheHookReadsTheSessionsOwnWorktree(unittest.TestCase):
+    """THE DESKTOP APP STARTS A WORKTREE SESSION WITH ITS PROJECT ROOT SET TO THE PRIMARY CHECKOUT.
+
+    Measured 2026-10-12. A desktop worktree session's CLI carries `--project-config-root <primary>`.
+    In a fixture repository launched with that flag from a worktree, a SessionStart hook ran with
+    its working directory, `CLAUDE_PROJECT_DIR` and `git rev-parse --show-toplevel` all naming the
+    PRIMARY. Only the hook input's `cwd` named the worktree.
+
+    So the wiring's `-WorktreeRoot ${CLAUDE_PROJECT_DIR}` and the `$PWD` default both read the
+    primary's marker. Session 07991bb9 declared Lander and was handed the Builder card at all five
+    of its compactions, because the primary's marker read `builder`.
+
+    The hook now takes the worktree from the input's `cwd`. `-WorktreeRoot` is the fallback for a
+    caller that sends no input, which is what every other test in this file does.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        # A primary checkout carries a `.git` DIRECTORY and a worktree a `.git` FILE. The hook
+        # tells neither apart, and must not need to.
+        self.primary = base / "primary"
+        (self.primary / ".git").mkdir(parents=True)
+        (self.primary / ".claude").mkdir()
+        (self.primary / MARKER_RELPATH).write_text("builder", encoding="utf-8")
+        self.worktree = self.primary / ".claude" / "worktrees" / "wt"
+        (self.worktree / ".claude").mkdir(parents=True)
+        (self.worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        (self.worktree / MARKER_RELPATH).write_text("lander", encoding="utf-8")
+        self.subdir = self.worktree / "messagefoundry" / "config"
+        self.subdir.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _as_the_desktop_app_runs_it(self, stdin: str) -> str:
+        # The shape of the failing compactions: cwd and the argument both name the primary.
+        done = _run_hook("-WorktreeRoot", str(self.primary), cwd=self.primary, stdin=stdin)
+        self.assertEqual(0, done.returncode, done.stderr)
+        return done.stdout
+
+    def test_the_input_cwd_wins_over_the_primary(self):
+        out = self._as_the_desktop_app_runs_it(
+            json.dumps({"cwd": str(self.subdir), "source": "compact"})
+        )
+        self.assertIn("SEAT: lander", out)
+        self.assertNotIn("SEAT: builder", out)
+
+    def test_the_copy_lands_in_the_worktree_and_not_in_the_primary(self):
+        self._as_the_desktop_app_runs_it(json.dumps({"cwd": str(self.worktree)}))
+        self.assertTrue((self.worktree / ROLE_COPY_RELPATH).is_file())
+        self.assertFalse(
+            (self.primary / ROLE_COPY_RELPATH).exists(),
+            "the hook wrote the primary's ROLE.local.md, the rewrite seen there on 2026-10-12 "
+            "from sessions that were not running in the primary",
+        )
+
+    def test_the_fixture_reproduces_the_fault_without_the_input(self):
+        """The control. With no input the same call reads the primary, so the arms here can fail."""
+        self.assertIn("SEAT: builder", self._as_the_desktop_app_runs_it(""))
+
+    def test_an_input_cwd_that_does_not_exist_falls_back_and_says_so(self):
+        out = self._as_the_desktop_app_runs_it(json.dumps({"cwd": str(self.primary / "gone")}))
+        self.assertIn("SEAT: builder", out)
+        self.assertIn("names a cwd that is missing or inside no checkout", out)
+
+    def test_an_input_that_is_not_json_falls_back(self):
+        self.assertIn("SEAT: builder", self._as_the_desktop_app_runs_it("not json {"))
+
+    def test_a_non_ascii_cwd_survives_the_read(self):
+        """The input is read as UTF-8 bytes. A console-code-page read mangles this name and falls back."""
+        wt = self.primary / ".claude" / "worktrees" / "caf\u00e9"
+        (wt / ".claude").mkdir(parents=True)
+        (wt / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        (wt / MARKER_RELPATH).write_text("lander", encoding="utf-8")
+        self.assertIn(
+            "SEAT: lander",
+            self._as_the_desktop_app_runs_it(json.dumps({"cwd": str(wt)}, ensure_ascii=False)),
+        )
+
+    def test_the_worktrees_own_roster_is_read_when_it_has_one(self):
+        """A worktree ahead of the primary gets its own card, not the primary's older copy."""
+        roles = self.worktree / "docs" / "roles"
+        roles.mkdir(parents=True)
+        (roles / "seats.json").write_text(read(SEATS_PATH), encoding="utf-8")
+        (roles / "lander.card.md").write_text(
+            "# Lander\n\nWORKTREE-OWN-CARD-SENTINEL\n", encoding="utf-8"
+        )
+        out = self._as_the_desktop_app_runs_it(json.dumps({"cwd": str(self.worktree)}))
+        self.assertIn("WORKTREE-OWN-CARD-SENTINEL", out)
+
+
 # ------------------------------------------------- the same rule, over every hook rather than one
 
 HOOKS_DIR = _REPO / "scripts" / "hooks"
@@ -1328,12 +1438,24 @@ if __name__ == "__main__":
 # AGREE WITH EACH OTHER and that each still carries the warning branch. A hand-edit to one root
 # fails; an identical edit to all of them does not, and that limit is stated rather than papered
 # over.
+#
+# THE WRAPPER AND THE PROJECT ROW BOTH FIRED HERE, so every card was injected twice. Measured
+# 2026-10-12 over session 07991bb9: each of its five compactions carries two `[role-card] SEAT:` rows,
+# one per status message. The wrapper MUST stand down when `$env:CLAUDE_PROJECT_DIR`'s settings
+# already name role-card-inject.ps1. That is the directory the harness loads project settings from,
+# so a stale worktree with no project row still gets the wrapper's card. The installed copies did
+# not carry the stand-down when this was written, so the arm below is red on a box until they do.
+#
+# "The project wiring names a path inside the worktree", above, is true for a CLI session only. A
+# desktop session's project directory is the PRIMARY checkout: see TheHookReadsTheSessionsOwnWorktree.
 
 
 USER_SCOPE_MARKER = "korus-role-card"
 #: The branch whose absence is the silent failure. Matched on the emitted text, not on the code
 #: around it, so reformatting the wrapper does not red this while a deleted warning would.
 WARNING_SUBSTRING = "is absent from this worktree"
+#: The stand-down. Without it the wrapper injects a second copy of every card the project row injects.
+STAND_DOWN_SUBSTRING = "-SimpleMatch -Quiet -Pattern 'role-card-inject.ps1'"
 
 
 def user_scope_role_card_wrappers() -> list[tuple[Path, str]]:
@@ -1387,6 +1509,14 @@ def wrapper_disagreements(wrappers: list[tuple[Path, str]]) -> list[str]:
             + " -- these roots go back to exiting 0 in silence when neither the worktree nor the "
             "primary has role-card-inject.ps1, which is the failure that hid this for two weeks"
         )
+    doubled = sorted(str(p) for p, command in wrappers if STAND_DOWN_SUBSTRING not in command)
+    if doubled:
+        findings.append(
+            "the stand-down is GONE from: "
+            + ", ".join(doubled)
+            + " -- these roots inject a second copy of every card where the project row already "
+            "injects one"
+        )
     return findings
 
 
@@ -1407,14 +1537,23 @@ def test_the_user_scope_wrappers_agree_and_still_warn() -> None:
     ("bodies", "expect"),
     [
         ([], 0),  # nothing installed -- not a finding, the caller skips
-        (["A warns: is absent from this worktree"], 0),
-        (["A warns: is absent from this worktree"] * 6, 0),
-        (["A warns: is absent from this worktree", "B differs: is absent from this worktree"], 1),
-        (["silent wrapper with no warning"], 1),
-        (["silent one", "another silent one"], 2),  # both disagreement AND missing warning
+        ([f"A warns: is absent from this worktree {STAND_DOWN_SUBSTRING}"], 0),
+        ([f"A warns: is absent from this worktree {STAND_DOWN_SUBSTRING}"] * 6, 0),
+        (
+            [
+                f"A warns: is absent from this worktree {STAND_DOWN_SUBSTRING}",
+                f"B differs: is absent from this worktree {STAND_DOWN_SUBSTRING}",
+            ],
+            1,
+        ),
+        ([f"silent wrapper with no warning {STAND_DOWN_SUBSTRING}"], 1),
+        ([f"silent one {STAND_DOWN_SUBSTRING}", f"another silent one {STAND_DOWN_SUBSTRING}"], 2),
+        # The wrapper as it stood until 2026-10-12: it warned, and it doubled the project row's card.
+        (["A warns: is absent from this worktree"], 1),
+        (["silent one", "another silent one"], 3),  # disagreement, no warning, and no stand-down
     ],
 )
 def test_the_wrapper_probe_reports_each_failure_shape(bodies: list[str], expect: int) -> None:
-    """Exhaustive over the decision, because five of these six cannot occur on a healthy box."""
+    """Exhaustive over the decision, because most of these cannot occur on a healthy box."""
     made = [(Path(f"root{i}/settings.json"), b) for i, b in enumerate(bodies)]
     assert len(wrapper_disagreements(made)) == expect, wrapper_disagreements(made)

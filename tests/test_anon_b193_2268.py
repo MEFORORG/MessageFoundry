@@ -113,11 +113,13 @@ def test_a_keep_written_as_a_field_kind_warns_too(rules: ModuleType, tmp_path: P
 
 
 @_BOTH
-def test_an_overlay_with_no_keep_on_a_default_does_not_warn(
+def test_an_overlay_with_no_keep_on_a_default_gives_no_keep_warning(
     rules: ModuleType, tmp_path: Path
 ) -> None:
-    # A retarget and a drop are not keeps, and a drop beats a keep on one path. A retarget to a
-    # narrower kind can still leave part of a field: that is not this warning's subject.
+    # A retarget and a drop are not keeps, and a drop beats a keep on one path. This test used to
+    # assert no line at all, which pinned the silent retarget. The retarget of PID-5 to a kind
+    # that leaves the given name now has a warning of its own (BACKLOG #3000), pinned in
+    # tests/test_anon_overlay_retarget_warning.py.
     overlay = _overlay(
         tmp_path,
         '[hl7]\nkeep = ["PID-13"]\ndrop = ["PID-13", "PID-11"]\n[hl7.fields]\n"PID-5" = "id"\n',
@@ -125,7 +127,9 @@ def test_an_overlay_with_no_keep_on_a_default_does_not_warn(
     with _warnings(rules) as lines:
         loaded = rules.load_rules(overlay)
 
-    assert lines == []
+    (line,) = lines
+    assert "retargets PID-5 from its default name scrub to id" in line
+    assert "keeps" not in line
     assert rules.kept_defaults(loaded) == ()
 
 
