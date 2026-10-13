@@ -23,13 +23,16 @@ The scan reads source, so it holds with no Vault extra installed.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
+import functools
+from collections import Counter
+from collections.abc import Iterable
 
 import pytest
 
 from tests._ast_sites import callee_name, parse_source
 
-_PACKAGE = Path(__file__).resolve().parent.parent / "messagefoundry"
+# One walk of the package, and one floor on how many modules it must find, for both censuses.
+from tests.test_vault_revocation_attestation import _PACKAGE, _modules
 
 #: Passed where a call names no posture at all.
 _NONE = "-"
@@ -163,18 +166,16 @@ def _scan(source: str, relative: str) -> list[Row]:
     return scan.rows
 
 
-def _found() -> list[Row]:
-    modules = sorted(_PACKAGE.rglob("*.py"))
-    # 337 modules when tests/test_vault_hop_refusal_marker.py set this floor. A moved package or
-    # a changed glob leaves few or none to scan.
-    assert len(modules) >= 300, f"the walk found only {len(modules)} module(s) under {_PACKAGE}"
+@functools.cache
+def _found() -> tuple[Row, ...]:
+    """Every row under ``messagefoundry/``, sorted. Scanned once for the whole file."""
     rows: list[Row] = []
-    for path in modules:
+    for path in _modules():
         source = path.read_text(encoding="utf-8")
         # Code that calls a link has to spell its name, so a file that spells none is not parsed.
         if any(name in source for name in _LINKS):
             rows.extend(_scan(source, path.relative_to(_PACKAGE).as_posix()))
-    return sorted(rows)
+    return tuple(sorted(rows))
 
 
 #: Every call to a link, at the commit that last changed this list. Sorted, and a list, so two
@@ -288,17 +289,11 @@ _CENSUS: list[Row] = sorted(
 )
 
 
-def _difference(found: list[Row]) -> tuple[list[Row], list[Row]]:
+def _difference(found: Iterable[Row]) -> tuple[list[Row], list[Row]]:
     """The rows found and not listed, and the rows listed and not found. Counted, not as sets, so a
     second identical call is a difference."""
-    unlisted, listed = list(found), list(_CENSUS)
-    for row in _CENSUS:
-        if row in unlisted:
-            unlisted.remove(row)
-    for row in found:
-        if row in listed:
-            listed.remove(row)
-    return unlisted, listed
+    have, want = Counter(found), Counter(_CENSUS)
+    return sorted((have - want).elements()), sorted((want - have).elements())
 
 
 def test_every_link_of_the_posture_chain_is_listed() -> None:
