@@ -1101,10 +1101,10 @@ class _ClaimsToBeAnyName(str):
 
 
 def test_a_name_that_claims_to_be_a_headers_twin_cannot_hide_it() -> None:
-    """``do_open`` drops a header whose name an unredirected header already holds, and asks the
-    names themselves. The opener's reading used to copy that merge. A name object that answered
-    yes to the reading and no to ``do_open`` hid the header beside it from the rule, and
-    ``do_open`` then sent it. The reading asks no name object now."""
+    """``do_open`` merges the two header stores by name, and asks the names themselves. The
+    opener's reading used to copy that merge. A name object that answered yes to the reading
+    and no to ``do_open`` hid the header beside it from the rule, and ``do_open`` then sent it.
+    The reading asks no name object now."""
     odd = _NAME + " "
     twin = _ClaimsToBeAnyName("X-Made-Up", odd, lies=2)
     with _WireProxy() as peer:
@@ -1116,25 +1116,48 @@ def test_a_name_that_claims_to_be_a_headers_twin_cannot_hide_it() -> None:
     assert twin.asked == 0
 
 
-def test_control_an_unredirected_header_still_wins_over_its_twin() -> None:
-    """The other polarity. ``do_open`` sends an unredirected header and drops its twin in
-    ``headers``, so the rule judges that one alone. The twin here holds what the other proxy's
-    URL would make, and the request would be refused if the rule judged it."""
+def _held_in_both_stores(
+    peer: _WireProxy, unredirected: str, in_headers: str
+) -> tuple[urllib.request.OpenerDirector, urllib.request.Request]:
+    """An admitting opener with two proxies, and a request that holds the plain name in both
+    header stores. The second proxy's URL carries a credential, which makes ``_URL_VALUE``."""
+    handler = LoopbackDirectProxyHandler(
+        {
+            "http": f"http://{peer.address}",
+            "https": f"http://{_URL_CRED}@other.example.test:3128",
+        },
+        caller_header_admitted=True,
+    )
+    request = urllib.request.Request(_HTTP_TARGET)
+    request.add_unredirected_header(_NAME, unredirected)
+    request.add_header(_NAME, in_headers)
+    return build_strict_opener(handler), request
+
+
+@pytest.mark.parametrize(
+    ("unredirected", "in_headers"),
+    [(_VALUE, _URL_VALUE), (_URL_VALUE, _VALUE)],
+    ids=["url-credential-in-headers", "url-credential-unredirected"],
+)
+def test_a_name_held_in_both_stores_is_judged_in_both(unredirected: str, in_headers: str) -> None:
+    """``do_open`` sends one of the two values, and which one depends on the Python release:
+    3.14.6 sends the unredirected one, and 3.14.8 the one in ``headers``. One value here is
+    what a proxy URL makes, which no admission covers. A reading that judged one store only
+    would let it cross to the other proxy in cleartext on one of those releases. Both are
+    judged, so the request is refused on either."""
     with _WireProxy() as peer:
-        handler = LoopbackDirectProxyHandler(
-            {
-                "http": f"http://{peer.address}",
-                "https": f"http://{_URL_CRED}@other.example.test:3128",
-            },
-            caller_header_admitted=True,
-        )
-        request = urllib.request.Request(_HTTP_TARGET)
-        request.add_unredirected_header(_NAME, _VALUE)
-        request.add_header(_NAME, _URL_VALUE)
-        _attempt(build_strict_opener(handler), request)
+        opener, request = _held_in_both_stores(peer, unredirected, in_headers)
+        _refused(opener, request, "#3410")
+    assert peer.connections == 0
+
+
+def test_control_a_name_held_in_both_stores_crosses_when_neither_value_is_refused() -> None:
+    """The other polarity: the same request with the admitted value in both stores is sent."""
+    with _WireProxy() as peer:
+        opener, request = _held_in_both_stores(peer, _VALUE, _VALUE)
+        _attempt(opener, request)
     assert len(peer.cleartext) == 1
     assert f"{_NAME}: {_VALUE}\r\n".encode() in peer.cleartext[0]
-    assert _URL_VALUE.encode() not in peer.cleartext[0]
 
 
 class _Undecoded(bytes):
@@ -1194,14 +1217,14 @@ def test_http_client_is_asked_once_about_each_of_two_headers(asked: list[tuple[A
     assert asked == [(" " + _NAME, _VALUE), (_NAME + " ", None)]
 
 
-def test_a_bytes_twin_of_an_unredirected_header_is_not_judged(
+def test_a_bytes_name_held_in_both_stores_is_judged_in_both(
     asked: list[tuple[Any, Any]],
 ) -> None:
-    """``do_open`` drops a ``bytes`` twin as it drops a ``str`` one, so the walk does too: one
-    question, about the header that would be sent."""
+    """The same for a ``bytes`` name: one question about each of the two headers."""
     name = _NAME.encode() + b" "
     twin = bytes(bytearray(name))
-    assert twin == name and twin is not name
+    assert twin == name
+    assert twin is not name
     with _WireProxy() as peer:
         opener, url = _on_leg("direct", peer)
         request = urllib.request.Request(url)
@@ -1209,7 +1232,7 @@ def test_a_bytes_twin_of_an_unredirected_header_is_not_judged(
         request.headers[twin] = "made up"  # type: ignore[index]
         _refused(opener, request, "#3417")
     assert peer.connections == 0
-    assert asked == [(name, _VALUE)]
+    assert asked == [(name, _VALUE), (twin, "made up")]
 
 
 def test_control_http_client_is_never_asked_about_the_plain_name(

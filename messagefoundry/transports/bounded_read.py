@@ -1031,29 +1031,25 @@ def _is_spelled_plainly(name: str | bytes) -> bool:
     return type(name) is str and name.lower() == _PLAIN_NAME
 
 
-def _is_exactly_text(name: object) -> bool:
-    """Whether ``name`` is a ``str`` or a ``bytes``, and no subclass of either."""
-    return type(name) is str or type(name) is bytes
-
-
 def _proxy_header_items(req: urllib.request.Request) -> list[tuple[str | bytes, Any]]:
     """Each header on ``req`` that :func:`is_proxy_credential_header_name` accepts: the name it
     is stored under, and its value as stored. urllib annotates a name as ``str``, but nothing
-    stops a caller storing ``bytes``, and ``http.client`` sends either. They come in the order
-    ``do_open`` sends them: the unredirected ones first, which win over a header of the same
-    name.
+    stops a caller storing ``bytes``, and ``http.client`` sends either. The unredirected ones
+    come first, as ``do_open`` sends them, and then the ones in ``headers``.
 
-    Only a name that is a ``str`` or a ``bytes`` exactly is dropped as the twin of an
-    unredirected one. Any other name object is kept, because its own ``__eq__`` would decide
-    whether ``do_open`` drops it. No name is used as a dictionary key here, for the same reason.
+    **A name held in both stores is read from both.** ``do_open`` sends one of the two values,
+    and which one has changed between Python releases. Measured: 3.14.6 sends the unredirected
+    one, and 3.14.8 sends the one in ``headers``. A reading that dropped either would judge the
+    value that stays behind on one of them. So neither is dropped, and no name is compared
+    with another or used as a dictionary key here: a name object's own ``__eq__`` decides
+    nothing.
     """
-    unredirected = cast("dict[str | bytes, Any]", req.unredirected_hdrs)
-    sent_first = {(type(name), name) for name in unredirected if _is_exactly_text(name)}
-    items = list(unredirected.items())
-    for name, value in cast("dict[str | bytes, Any]", req.headers).items():
-        if not (_is_exactly_text(name) and (type(name), name) in sent_first):
-            items.append((name, value))
-    return [(name, value) for name, value in items if is_proxy_credential_header_name(name)]
+    items = [*req.unredirected_hdrs.items(), *req.headers.items()]
+    return [
+        (name, value)
+        for name, value in cast("list[tuple[str | bytes, Any]]", items)
+        if is_proxy_credential_header_name(name)
+    ]
 
 
 def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | None:
@@ -1193,6 +1189,8 @@ def _refuse_a_proxy_header_that_can_never_be_sent(
     The error has the class ``http.client`` raises for the first such header in the order
     ``do_open`` sends them: a ``ValueError``, or a ``TypeError`` for a value that is ``None``,
     for one. Its text is fixed, because that library's own would quote the name or the value.
+    Where a name is held in both stores, the unredirected header counts first here, whichever
+    of the two ``do_open`` would send.
 
     It reads the verdicts and asks ``http.client`` nothing. So a header judged unsendable is
     refused here even where a second question would have found it sendable by then.
