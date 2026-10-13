@@ -74,6 +74,11 @@ def test_the_pair_loads_and_the_default_is_off(
             {"vault_revocation_attested": True, "vault_revocation_attested_reason": "a\r\nb"},
             "[{s}].vault_revocation_attested_reason must not contain control characters",
         ),
+        # A lone surrogate cannot be encoded as UTF-8, so the posture route could not answer.
+        (
+            {"vault_revocation_attested": True, "vault_revocation_attested_reason": "a\udce9b"},
+            "[{s}].vault_revocation_attested_reason must not contain control characters or lone",
+        ),
         # The string "false" is truthy to a lax reader. Here it reads as false, so the reason
         # beside it is a reason without the flag.
         (

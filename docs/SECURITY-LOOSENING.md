@@ -1124,9 +1124,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   address the client will really dial, hvac's `VAULT_ADDR` fallback included. A loopback Vault
   behind a proxy is not on the box. The refusal applies under `[security].enforcement = enforce`,
   and wherever a client is built without a known posture, which counts as enforcing.
-  **Known gap in this build:** no Vault client build is handed the posture yet, so every build
-  counts as enforcing, also on an `enforcement = warn` instance. Vault BACKLOG #2983 tracks the
-  threading.
+  **Known gaps in this build**, both tracked by vault BACKLOG #2983. No Vault client build is
+  handed the posture yet, so every build counts as enforcing, also on an `enforcement = warn`
+  instance. And `messagefoundry check-privileges` builds its two Vault clients with no settings in
+  scope, so it refuses an off-box Vault even with the flag set, and reports that token as not
+  observed.
 - **What you lose:** that refusal. A revoked but unexpired Vault certificate is then accepted
   unless something outside the engine stops it. These hops carry the key that unwraps the store
   DEK, every at-rest cell under `vault_transit`, and connector credentials.
@@ -1143,9 +1145,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What it cannot do:** it never lifts the hop's other refusals: an `http://` Vault off the
   box, proxy credentials sent in cleartext, or a hop that verifies no peer. It is also not the
   process-wide `MEFOR_TLS_REVOCATION_ATTESTED`. That variable does **not** cross an enforcing
-  Vault hop, because it cannot say which hop's certificate was reviewed (BACKLOG #299). Where a
-  client is built with a known `warn` posture, the hop is warned and not refused, and that
-  variable then turns the warning into a silent allow.
+  Vault hop, because it cannot say which hop's certificate was reviewed (BACKLOG #299). In this
+  build it changes nothing on these hops, since every client build counts as enforcing. The
+  shared rule these hops decide by ranks it so: under a posture known to be `warn`, it turns the
+  warning into a silent allow. That holds here once a client build is handed the posture.
 - **Named gap, the proxy leg:** through an `https://` proxy the hop has a second TLS leg, to the
   proxy. Nothing checks revocation of the proxy's certificate, and this attestation does not
   claim it. The Vault leg's own TLS, inside the tunnel, is what protects the token.
@@ -1158,7 +1161,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   The entry is named whenever the flag is set, whether or not a Vault provider is selected.
   `messagefoundry check` has no line for it.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
-  holding a control character is refused, on every command that loads the settings.
+  holding a control character or a lone surrogate is refused, on every command that loads the
+  settings.
 - **Reversible:** yes. Delete both lines and restart. Under `enforce` an off-box Vault hop then
   refuses again.
 

@@ -628,9 +628,12 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
     three rules every flag-plus-reason pair shares (``models._check_flag_with_reason``): a reason
     without the flag, the flag without a reason, and a blank reason each refuse at load.
 
-    The reason is also refused when it holds a control character. It is written into the loosening
-    report and so into the serve-time WARNING, where a CR or LF could forge a line; this is the rule
-    ``models.require_hop_reason`` holds a connection's reason to."""
+    The reason is also refused when it holds a control character or a lone surrogate. It is
+    written into the loosening report, and so into the serve-time WARNING and the JSON of
+    ``GET /security/posture``. A CR or LF could forge a log line there, which is the rule
+    ``models.require_hop_reason`` holds a connection's reason to. A lone surrogate cannot be
+    encoded as UTF-8, so the route could not serialize its answer; an environment value with a
+    byte that is not UTF-8 decodes to one."""
     flag_name = f"[{section}].vault_revocation_attested"
     reason_name = f"[{section}].vault_revocation_attested_reason"
     _check_flag_with_reason(
@@ -642,8 +645,8 @@ def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, secti
         why="say what covers revocation of the Vault server certificate (for example, that the "
         "certificate is short-lived, with its lifetime), so the record says what was relied on",
     )
-    if reason is not None and has_control_char(reason):
-        raise ValueError(f"{reason_name} must not contain control characters")
+    if reason is not None and (has_control_char(reason) or has_lone_surrogate(reason)):
+        raise ValueError(f"{reason_name} must not contain control characters or lone surrogates")
 
 
 class StoreSettings(_Section):
@@ -813,12 +816,12 @@ class StoreSettings(_Section):
     # (vault BACKLOG #2983, owner ruling 2026-10-13). It covers both store hops to that Vault: the
     # `vault` key provider and the `vault_transit` cipher, which read one address
     # (MEFOR_STORE_VAULT_ADDR). The engine verifies that certificate and checks no CRL and no OCSP, so
-    # an off-box Vault hop is REFUSED under [security].enforcement = enforce unless this is set. It is
-    # the only way across: no CRL lever is built for these hops, and the process-wide
-    # MEFOR_TLS_REVOCATION_ATTESTED does not cross an enforcing hop. A loopback Vault reached with no
-    # proxy needs neither. Setting it adds no check on the wire. The reason is MANDATORY; a flag
-    # without one, a blank one, or a reason without the flag refuses at load. It is a LOOSENING:
-    # security_loosenings() names it, with the reason. Not a secret.
+    # an off-box Vault hop is REFUSED unless this is set. What the refusal keys on, and what the
+    # attestation can and cannot do, is stated once, on
+    # transports.strict_requests._refuse_an_unrevoked_vault_hop. Setting it adds no check on the
+    # wire. The reason is MANDATORY; a flag without one, a blank one, or a reason without the flag
+    # refuses at load. It is a LOOSENING: security_loosenings() names it, with the reason. Not a
+    # secret.
     vault_revocation_attested: bool = False
     vault_revocation_attested_reason: str | None = None
 
