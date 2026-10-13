@@ -17,7 +17,8 @@ Standard library only (``urllib.request``) — no new dependency (ADR 0003). Red
 the alert-webhook hardening (ASVS 15.3.2 / 1.3.6); the `[egress].allowed_http` allowlist is the
 fail-closed host gate (enforced by the runner at load/reload/start). Per-connection
 ``verify_tls=False`` is honored only when the dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set, exactly
-like LDAPS / the SQL Server backend.
+like the SQL Server backend, and only on a hop that carries no credential
+(:func:`refuse_verify_off`).
 
 There is **no REST source yet** — a non-HL7 source needs the payload-agnostic ingress decided in
 ADR 0003 (its own follow-up ADR). This is the first non-HL7 connector.
@@ -37,11 +38,16 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from messagefoundry.config.models import ConnectorType, Destination, flag_from_settings
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    bool_setting,
+    flag_from_settings,
+)
 from messagefoundry.config.settings import hop_insecure_escape_downgrades
 from messagefoundry.config.tls_policy import (
     MIRRORED_CONNECTION_SETTING,
@@ -69,6 +75,7 @@ from messagefoundry.config.tls_policy import (
     urllib_handler_context,
 )
 from messagefoundry.controlchars import strip_control_chars
+from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
     DeliveryError,
@@ -1045,8 +1052,51 @@ def refuse_cleartext_egress(
     )
 
 
+def http_credentials_sent(
+    ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
+) -> list[str]:
+    """The credentials an HTTP-family hop sends, by name, for :func:`refuse_verify_off` (vault
+    BACKLOG #3230). Empty when it sends none.
+
+    The settings half is :func:`~messagefoundry.config.static_credentials.http_hop_credentials`, the
+    static-credential inventory's own reader, so the two agree on every auth setting. The two
+    additions below are this refusal's alone; the inventory does not count them yet. A
+    static ``headers`` entry is a credential when the redaction screen
+    (``config.wiring._is_secret_header``) would mask it, so an API-key header counts too. That
+    screen leans toward a false positive, which here refuses a verify-off hop that a header name
+    such as ``X-Routing-Key`` merely resembles; on a hop that already turned verification off, that
+    is the cheaper error. A credential-looking query parameter in ``url`` counts too, by the reader
+    ``query_credential_hops`` uses. A ``Proxy-Authorization`` from the proxy settings is not one: it
+    goes to the proxy, inside the CONNECT, not across this hop.
+
+    It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
+    not seen here; docs/SECURITY-LOOSENING.md lists that among the hops the rule does not reach."""
+    # Lazy: both import config.wiring, which this module does not otherwise load.
+    from messagefoundry.config.static_credentials import http_hop_credentials
+    from messagefoundry.config.wiring import _is_secret_header
+
+    sent = http_hop_credentials(ctype, settings, lookup=lookup)
+    static = settings.get("headers")
+    if isinstance(static, Mapping):
+        sent += [
+            f"{name} header"
+            for name, value in static.items()
+            if _is_secret_header(str(name), value)
+        ]
+    url = settings.get("url")
+    if isinstance(url, str) and (names := credential_query_params(url)):
+        sent.append(f"url query parameter {', '.join(names)}")
+    return sent
+
+
 def refuse_verify_off(
-    scheme: str, url: str, *, connector: str, connection: str | None, attested: bool = False
+    scheme: str,
+    url: str,
+    *,
+    connector: str,
+    connection: str | None,
+    credentials: Sequence[str],
+    attested: bool = False,
 ) -> InsecureHopGuard | None:
     """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (posture-keyed, #200).
 
@@ -1065,10 +1115,25 @@ def refuse_verify_off(
     cells, which decide the same question through ``weakened_tls_escape_permitted_here()``. The one
     0153 change that does reach here is the deleted ``not is_phi`` ALLOW arm — a tightening.
 
+    **A hop that sends ``credentials`` is refused first, and nothing lifts that** (vault BACKLOG
+    #3230): not the escape, not the posture, not ``tls_hop_attested``, not a loopback host. The
+    argument is required, so no caller can skip the question; pass :func:`http_credentials_sent`.
+    The rule is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
+    unverified peer*. It runs before the escape check, so a credentialed hop is never told to set an
+    escape that cannot unlock it.
+
     A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
     BACKLOG #1924)."""
     if scheme != "https":
         return None
+    if credentials:
+        raise ValueError(
+            f"{hop_name_prefix(connection)}{connector} would send its credentials "
+            f"({', '.join(credentials)}) to a peer whose certificate it does not verify "
+            "(verify_tls=false); refused, with no escape. Leave verify_tls on (the default). For a "
+            "server whose certificate comes from a private or self-signed CA, pin that CA with "
+            "tls_ca_file."
+        )
     cell = f"{connector} verify_tls=false"
     host = _hop_guard_host(url, cell=cell)
     _, posture = _enforce_shipped_hop(
@@ -2208,7 +2273,8 @@ class RestDestination(DestinationConnector):
                 cleartext_reason=accept_reason,
                 connection=config.name,
             )
-        if bool(s.get("verify_tls", True)):
+        verify = bool_setting(s, "verify_tls", default=True)
+        if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
@@ -2240,6 +2306,7 @@ class RestDestination(DestinationConnector):
                 self.url,
                 connector="REST destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.REST, s),
                 attested=attested,
             )
             if guard is not None:
@@ -2276,7 +2343,7 @@ class RestDestination(DestinationConnector):
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
             # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
-        if bool(s.get("verify_tls", True)):
+        if verify:
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
             # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
             # hop unless revocation is attested or this hop's own opener checks a CRL. Composes with

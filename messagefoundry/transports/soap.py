@@ -63,7 +63,7 @@ from xml.sax.handler import (  # nosec B406 — see _assert_well_formed_fragment
 from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string escaper, not a parser
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.config.tls_policy import (
     SYSTEM_TRUST_ANCHOR,
     TrustAnchor,
@@ -111,6 +111,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
@@ -435,6 +436,7 @@ class SoapDestination(DestinationConnector):
         anchor = http_family_trust_anchor(
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
+        verify = bool_setting(s, "verify_tls", default=True)
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -445,7 +447,7 @@ class SoapDestination(DestinationConnector):
                 host=urllib.parse.urlsplit(self.url).hostname or "",
                 trust_anchor=anchor,
             )
-        elif bool(s.get("verify_tls", True)):
+        elif verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
@@ -467,6 +469,7 @@ class SoapDestination(DestinationConnector):
                 self.url,
                 connector="SOAP destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.SOAP, s),
                 attested=attested,
             )
             if guard is not None:
@@ -523,7 +526,7 @@ class SoapDestination(DestinationConnector):
         #
         # Below every statement that builds or replaces `self._opener`, and no opener with
         # tls_allow_expired: see refuse_unrevoked_verified_hop.
-        if bool(s.get("verify_tls", True)):
+        if verify:
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.url,
@@ -660,7 +663,7 @@ class SoapDestination(DestinationConnector):
         if self.client_cert_file:
             if scheme != "https":
                 raise ValueError("SOAP client certificate requires an https url (ADR 0015)")
-            if not bool(s.get("verify_tls", True)):
+            if not bool_setting(s, "verify_tls", default=True):
                 raise ValueError(
                     "SOAP client cert is incompatible with verify_tls=false — the peer must be "
                     "verified (ADR 0015)"

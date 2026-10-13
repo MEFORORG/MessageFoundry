@@ -2358,9 +2358,10 @@ class AuthService:
             self._ldap: LdapAuthenticator | None = ldap
         elif settings.ad_enabled:
             # Thread the connector SecretProvider (ADR 0019 §5) so an ad_bind_password_secret reference
-            # resolves the bind password from the external backend (fail-closed) at construction. #329:
-            # thread the instance hop posture too — LDAPS is built out of the connector-construction gate,
-            # so its ad_tls_verify=false escape clamp is inert unless the posture arrives explicitly here.
+            # resolves the bind password from the external backend (fail-closed) at construction. Thread
+            # the instance hop posture too: the bind is built out of the connector-construction gate,
+            # and its plain ldap:// refusal reads it (vault BACKLOG #2354). It used to clamp the
+            # ad_tls_verify=false escape too (#329), until vault BACKLOG #3230 removed that escape.
             # BACKLOG #2034: the enforcement dial too, since the authenticator now checks its CA anchor.
             # Vault BACKLOG #2354: the same dial decides whether a plain ldap:// bind is refused, so it
             # is a transport control here and not only an anchor-ACL knob. Pass the real dial.

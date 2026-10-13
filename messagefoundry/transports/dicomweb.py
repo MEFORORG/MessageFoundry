@@ -45,7 +45,7 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -79,6 +79,7 @@ from messagefoundry.transports.rest import (
     auth_challenge_refused,
     egress_route_from_settings,
     enforce_outbound_length_limits,
+    http_credentials_sent,
     http_family_trust_anchor,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
@@ -269,7 +270,7 @@ class DicomWebDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        if bool(s.get("verify_tls", True)):
+        if bool_setting(s, "verify_tls", default=True):
             # #1180 (ADR 0093): the client trust anchor for this STOW-RS hop.
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
@@ -303,6 +304,7 @@ class DicomWebDestination(DestinationConnector):
                 self.base_url,
                 connector="DICOMweb destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.DICOMWEB, s),
                 attested=attested,
             )
             if guard is not None:

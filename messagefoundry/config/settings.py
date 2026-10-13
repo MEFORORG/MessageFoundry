@@ -445,9 +445,8 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 def insecure_tls_allowed() -> bool:
     """Whether the explicit dev escape to permit insecure TLS overrides is set (ASVS 12.3.2).
 
-    Certificate-validation overrides (``ad_tls_verify=false`` for LDAPS, ``trust_server_certificate
-    =true`` for SQL Server) are MITM-able, so they now **refuse** at startup unless
-    ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
+    Certificate-validation overrides (``trust_server_certificate=true`` for SQL Server, for one) are
+    MITM-able, so they now **refuse** at startup unless ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
     server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -480,11 +479,11 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
     ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and the anonymous FTPS ``tls_verify=false`` context (a credential on FTPS verify-off or on plain
-    ``ftp`` is refused outright, vault BACKLOG #2636), **and — since #329 —**
-    the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
-    acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
-    cleartext-``http`` hops. Pass the construction-time
+    and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
+    unknown-host-key acceptance for a login with no ``password``
+    (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
+    cleartext-``http`` hops. The credential hops it no longer reaches are named once, in
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
