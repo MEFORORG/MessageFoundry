@@ -263,7 +263,7 @@ _CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
 #: The refusal reason when no probe slot freed in time. Not a directory answer.
 CERT_PROBE_SATURATED = "probe_capacity_saturated"
 #: The refusal reason when the certificate path's probe raised past every catch below it: an engine
-#: fault, so it must not read as a directory outage (BACKLOG #3115). Logged by the outage rules.
+#: fault, so it is not a directory outage (BACKLOG #3115). Logged once per process, by reason.
 CERT_PROBE_FAULT = "probe_fault"
 #: Refusals that say the directory could not be asked, not what it said about the account. The
 #: certificate path logs these once per outage rather than once per request.
@@ -272,7 +272,6 @@ _CERT_DIRECTORY_OUTAGES = frozenset(
         reconcile.ProbeOutcome.UNAVAILABLE.value,
         reconcile.ProbeOutcome.REFERRED.value,
         CERT_PROBE_SATURATED,
-        CERT_PROBE_FAULT,
     }
 )
 #: The least time between two certificate-path outage WARNINGs, so a flapping outage cannot log
@@ -1911,7 +1910,8 @@ async def lockable_account_census(
         if (
             user.password_generated
             or user.password_hash is None
-            or _is_directory_account(user)
+            # Only a LOCAL row can sign in by password, so only it can be locked (#3117).
+            or user.auth_provider != AuthProvider.LOCAL.value
             or not settings.require_mfa
         ):
             continue
@@ -7752,8 +7752,7 @@ class AuthService:
         """Log the certificate path's directory refusals without logging one line per request.
 
         An outage is a refusal that says the directory could not be asked: unreachable, referring,
-        a fault reading the entry, the probe cap full, or a fault in the engine's own probe
-        (:data:`CERT_PROBE_FAULT`). It logs one WARNING per outage and, if that
+        a fault reading the entry, or the probe cap full. It logs one WARNING per outage and, if that
         WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
         said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
         apart, so an outage that flaps (a full cap turning over, or one referring account beside a
@@ -7763,7 +7762,8 @@ class AuthService:
         interval, and the closing INFO names the latest reason.
 
         A configuration refusal (no directory wired, a row with no immutable id) asks nothing and
-        moves neither way. It logs one WARNING per reason per process instead.
+        moves neither way. Nor does :data:`CERT_PROBE_FAULT`, which says nothing about the
+        directory. Each logs one WARNING per reason per process instead.
 
         The lines name no account. Every service request during an outage is refused the same way,
         and the username is not the useful fact."""
@@ -9257,8 +9257,8 @@ class AuthService:
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
     def _covered_by_requirement(self, user: UserRecord, roles: frozenset[Role]) -> bool:
-        """Whether ``user`` is a LOCAL account that ``[security].require_mfa`` covers, enrolled or not
-        (ADR 0197 Amendment A). The gates of N-B2 part 4 key on this and on
+        """Whether ``[security].require_mfa`` covers ``user``, enrolled or not: any account that is
+        not a directory account, an unrecognised provider included (ADR 0197 Amendment A). The gates of N-B2 part 4 key on this and on
         :meth:`_has_way_past`, never on ``must_change_password``: a site that ran with the requirement
         off and then turned it on holds accounts with a chosen password, no factor and no must-change
         flag, and the gates must reach those too."""

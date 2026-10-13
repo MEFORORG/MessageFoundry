@@ -204,13 +204,14 @@ or group removal never reached the certificate path at all.
   slot within 2 seconds is refused. A slot is held until the probe's worker thread ends, even when
   the request was cancelled, so the threads cannot outnumber the cap.
 - **Refusals do not log one line per request.** An outage (unreachable, referring, a fault reading
-  the entry, a full cap, or an engine fault in the probe itself) logs one WARNING and one INFO
-  when it ends, naming no account. The engine fault logs as `probe_fault`, not as `unavailable`,
-  so it does not read as a directory outage (BACKLOG #3115). An outage logs at most one WARNING a
-  minute while it flaps. An outage that starts within a minute of the last
+  the entry, or a full cap) logs one WARNING and one INFO when it ends, naming no account, and at
+  most one WARNING a minute while it flaps. An outage that starts within a minute of the last
   WARNING logs its own on its first refusal after that minute, so a long one is never silent. A
   change of reason during a logged outage logs one INFO, at most once a minute. A configuration
   refusal (no directory wired, no `directory_object_id`) logs one WARNING per reason per process.
+  So does `probe_fault`: an engine fault raised past the directory layer's own catch, which is not
+  a directory outage (BACKLOG #3115). A fault the directory layer raises still reads as
+  `unavailable`.
 - **The answer vouches for one account.** The row read after the probe must still carry the
   `directory_object_id` and provider the probe asked about, or the request is refused.
 

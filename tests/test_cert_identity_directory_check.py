@@ -334,10 +334,17 @@ async def test_an_engine_fault_in_the_probe_has_its_own_reason_not_unavailable(
     for _ in range(3):
         assert await service.identity_for_cert_user_id(user_id) is None
 
-    warnings = _outage_records(caplog, logging.WARNING)
-    assert len(warnings) == 1  # by the outage rules: once, not once per request
-    assert "returned probe_fault" in warnings[0].getMessage()
-    assert "jdoe" not in warnings[0].getMessage()
+    # Once per process, like a configuration refusal, and never as a directory outage.
+    assert _outage_records(caplog, logging.WARNING) == []
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOGGER
+        and r.levelno == logging.WARNING
+        and "mTLS certificate identity" in r.getMessage()
+    ]
+    assert len(warnings) == 1 and "was refused: probe_fault" in warnings[0]
+    assert "jdoe" not in warnings[0]
 
 
 @pytest.mark.parametrize(

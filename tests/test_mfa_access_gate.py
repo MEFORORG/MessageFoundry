@@ -1185,28 +1185,32 @@ def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
 async def test_an_unrecognized_provider_row_is_covered_by_the_gates_and_the_census(
     engine: Engine,
 ) -> None:
-    """RED when: ``_requirement_covers`` or the census allow-lists ``LOCAL`` again (BACKLOG #3117).
+    """RED when: ``_requirement_covers`` allow-lists ``LOCAL`` again (BACKLOG #3117).
 
     A local account with a chosen password and no factor is covered. Planting an unknown provider
-    on its row must leave it covered: AC-A3a's helper says so, the enrol-first gate still sends it
-    to enrolment, and the census still names it. ``ad`` is the one value that leaves it out, which
-    is the control that the plant reaches all three."""
+    on its row must leave it covered: AC-A3a's helper says so, and the enrol-first gate still sends
+    it to enrolment. ``ad`` is the one value that leaves it out. The census names only the local
+    row: password sign-in refuses every other provider before it counts a failure, so no other row
+    can be locked, and naming one would ask for a reset that issues it nothing."""
     service = await _service(engine)
     user_id = await _add(service, "rogue", Role.VIEWER)
     identity = await service.identity_for_user_id(user_id)
     assert identity is not None
-    for provider, covered in (("local", True), ("saml-from-the-future", True), ("ad", False)):
-        await engine.store._db.execute(
-            "UPDATE users SET auth_provider = ? WHERE id = ?", (provider, user_id)
-        )
-        await engine.store._db.commit()
+    db = cast(MessageStore, engine.store)._db
+    for provider, covered, censused in (
+        ("local", True, True),
+        ("saml-from-the-future", True, False),
+        ("ad", False, False),
+    ):
+        await db.execute("UPDATE users SET auth_provider = ? WHERE id = ?", (provider, user_id))
+        await db.commit()
         row = await engine.store.get_user(user_id)
         assert row is not None and not row.totp_enabled and row.password_hash is not None
         roles = frozenset({Role.VIEWER})
         assert _requirement_covers(service._settings, row, roles) is covered, provider
         assert await service.must_enrol_before_rotating(identity) is covered, provider
         census = await service.lockable_account_census()
-        assert ("rogue" in census.no_way_past) is covered, provider
+        assert ("rogue" in census.no_way_past) is censused, provider
 
 
 # --- 6.8.4: the directory legs assert nothing, so the engine assumes nothing --
