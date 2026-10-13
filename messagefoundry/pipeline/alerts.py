@@ -424,6 +424,21 @@ class AlertSink(Protocol):
         ``auth/``."""
         ...
 
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        """A directory-driven role change took the built-in Administrator role from its last
+        enabled holder, so no enabled Administrator remains (vault BACKLOG #3229). The same event
+        as the ``auth.no_enabled_administrator`` audit row. ``name`` is ``user:<username>``, the
+        demoted account; ``via`` is ``ad-sync`` (a directory sign-in's role sync) or
+        ``ad-reconcile`` (the session reconciler).
+
+        The change was applied, not refused: by owner ruling 2026-10-13 (#3229) the directory
+        stays authoritative. This alert is how the operators learn the instance has no enabled
+        Administrator; ``provision-admin`` at the host runs again once none exists (vault BACKLOG
+        #2711 is the open recovery row). Nothing resolves it automatically. No PHI. Raised through
+        the callable :func:`no_enabled_administrator_alert` builds, which the API lifespan hands to
+        the auth service, so ``auth/`` never imports a sink."""
+        ...
+
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         """A directory reconciliation pass revoked nothing for some or all signed-in accounts and
         needs an operator (ADR 0079 mechanism 2). Either the mass-revoke circuit breaker tripped
@@ -912,6 +927,15 @@ class LoggingAlertSink:
             scrub_log_argument(repr(granted_by)),
         )
 
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        # Scrubbed as administrator_granted's line above is, and for the same reason.
+        log.warning(
+            "ALERT no_enabled_administrator: a directory role change (%s) took Administrator from "
+            "%s, and no enabled Administrator remains",
+            scrub_log_argument(via),
+            scrub_log_argument(repr(name)),
+        )
+
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked in a pass of %d principal(s) "
@@ -1093,6 +1117,22 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
             sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning("authority-seal integrity alert could not be delivered")
+
+    return _raise
+
+
+def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
+    username and a ``via``, raises :meth:`AlertSink.no_enabled_administrator` keyed
+    ``user:<username>`` (vault BACKLOG #3229).
+
+    Never raises: an alert failure must not change what a sign-in or a reconcile pass does."""
+
+    def _raise(username: str, via: str) -> None:
+        try:
+            sink.no_enabled_administrator(f"user:{username}", via=via)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning("the no_enabled_administrator alert could not be delivered")
 
     return _raise
 

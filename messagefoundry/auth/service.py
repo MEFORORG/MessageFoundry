@@ -2253,6 +2253,10 @@ _SEAL_FAILURE_TRACK_MAX: Final = 1024
 #: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
 #: the ``auth.session_revoked`` rows already record.
 _SESSION_REF_LEN: Final = 12
+#: Vault BACKLOG #3229: the row written when a directory-driven role change (the sign-in role sync
+#: or the reconciler) leaves no enabled Administrator. Its actor is the demoted account and its
+#: detail is ``{"via": ...}``, the role write's ``assigned_by``: ``ad-sync`` or ``ad-reconcile``.
+NO_ENABLED_ADMINISTRATOR_ACTION: Final = "auth.no_enabled_administrator"
 
 
 @dataclass
@@ -2282,12 +2286,16 @@ class AuthService:
         enforcing: bool = True,
         hop_posture: HopPosture | None = None,
         integrity_alert: Callable[[str], None] | None = None,
+        admin_loss_alert: Callable[[str, str], None] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         # BACKLOG #2592: raises the integrity alert when an authority row fails its seal. Injected by
         # the API lifespan (the service never imports the alert sinks). None logs only.
         self._integrity_alert = integrity_alert
+        # Vault BACKLOG #3229: called with (username, via) when a directory-driven role change leaves
+        # no enabled Administrator. Injected by the API lifespan, as above. None logs only.
+        self._admin_loss_alert = admin_loss_alert
         # Session token-hash prefix -> monotonic time its seal failure was last reported, so one
         # bad row presented on every request writes one audit row and one alert per interval.
         self._seal_failures_reported: dict[str, float] = {}
@@ -5221,6 +5229,12 @@ class AuthService:
                 detail=_json({"from": sorted(previous), "to": role_ids}),
                 client=client,
             )
+            # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that
+            # takes Administrator from its last enabled holder is applied, never refused. It alerts
+            # and audits instead. The ruling accepts the cost, noted with vault BACKLOG #2711.
+            await self._report_directory_admin_loss(
+                user, before=previous, after=role_ids, via="ad-sync", client=client
+            )
             # A directory-pushed privilege change is the same privilege change to the same user as a
             # local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching set_roles().
             # Best-effort; the change is also visible in the audited /me/security-events feed.
@@ -7093,7 +7107,9 @@ class AuthService:
                 revocation.username,
             )
             return False
+        held: list[str] = []
         if revocation.role_ids is not None:
+            held = await self._store.get_user_role_ids(revocation.user_id)
             await self._store.set_user_roles(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
             )
@@ -7132,6 +7148,13 @@ class AuthService:
             revocation.username,
             revocation.reason,
         )
+        if revocation.role_ids is not None:
+            # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a demotion of
+            # the last enabled Administrator is applied above, never refused. It alerts and audits
+            # instead. The ruling accepts the cost, noted with vault BACKLOG #2711.
+            await self._report_directory_admin_loss(
+                user, before=held, after=revocation.role_ids, via="ad-reconcile"
+            )
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
         #
@@ -7158,6 +7181,49 @@ class AuthService:
                 detail={"reason": revocation.reason},
             )
         return True
+
+    async def _report_directory_admin_loss(
+        self,
+        user: UserRecord | None,
+        *,
+        before: Iterable[str],
+        after: Iterable[str],
+        via: str,
+        client: str | None = None,
+    ) -> None:
+        """Alert and audit when a directory-driven role write left no enabled Administrator.
+
+        Vault BACKLOG #3229, owner ruling 2026-10-13 (#3229). The directory stays authoritative, so
+        the write was applied and is never refused here: a removed or compromised Administrator loses
+        the role at once. This adds the ``no_enabled_administrator`` alert and a
+        :data:`NO_ENABLED_ADMINISTRATOR_ACTION` row, so the operators learn of it. The cost the
+        ruling accepts: an all-directory Administrator set can end up with no Administrator, noted
+        with vault BACKLOG #2711, the open recovery row for such a set. Until the directory grants
+        the role again at a sign-in, the way back is ``provision-admin`` at the host, which runs
+        once no enabled Administrator exists (docs/SECURITY.md, *Keep a local Administrator*).
+
+        It fires only when this write took Administrator from an enabled account and none is left.
+        The count is read after the write, so when two directory demotions race, the later read
+        sees both writes and reports.
+        """
+        admin = Role.ADMINISTRATOR.value
+        if user is None or user.disabled or admin not in set(before) or admin in set(after):
+            return
+        if await self.has_enabled_administrator():
+            return
+        _log.error(
+            "a directory role change (%s) took Administrator from its last enabled holder; "
+            "no enabled Administrator remains",
+            via,
+        )
+        if self._admin_loss_alert is not None:
+            self._admin_loss_alert(user.username, via)
+        await self._audit(
+            NO_ENABLED_ADMINISTRATOR_ACTION,
+            actor=user.username,
+            detail=_json({"via": via}),
+            client=client,
+        )
 
     # --- sessions ------------------------------------------------------------
 
