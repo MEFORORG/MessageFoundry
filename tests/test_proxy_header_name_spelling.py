@@ -1116,11 +1116,9 @@ def test_a_name_that_claims_to_be_a_headers_twin_cannot_hide_it() -> None:
     assert twin.asked == 0
 
 
-def _held_in_both_stores(
-    peer: _WireProxy, unredirected: str, in_headers: str
-) -> tuple[urllib.request.OpenerDirector, urllib.request.Request]:
-    """An admitting opener with two proxies, and a request that holds the plain name in both
-    header stores. The second proxy's URL carries a credential, which makes ``_URL_VALUE``."""
+def _admitting_with_a_second_proxy(peer: _WireProxy) -> urllib.request.OpenerDirector:
+    """An admitting opener with two proxies. ``http`` goes to ``peer`` in cleartext. The second
+    proxy's URL carries a credential, which makes ``_URL_VALUE``."""
     handler = LoopbackDirectProxyHandler(
         {
             "http": f"http://{peer.address}",
@@ -1128,10 +1126,17 @@ def _held_in_both_stores(
         },
         caller_header_admitted=True,
     )
+    return build_strict_opener(handler)
+
+
+def _held_in_both_stores(
+    peer: _WireProxy, unredirected: str, in_headers: str
+) -> tuple[urllib.request.OpenerDirector, urllib.request.Request]:
+    """That opener, and a request that holds the plain name in both header stores."""
     request = urllib.request.Request(_HTTP_TARGET)
     request.add_unredirected_header(_NAME, unredirected)
     request.add_header(_NAME, in_headers)
-    return build_strict_opener(handler), request
+    return _admitting_with_a_second_proxy(peer), request
 
 
 @pytest.mark.parametrize(
@@ -1158,6 +1163,61 @@ def test_control_a_name_held_in_both_stores_crosses_when_neither_value_is_refuse
         _attempt(opener, request)
     assert len(peer.cleartext) == 1
     assert f"{_NAME}: {_VALUE}\r\n".encode() in peer.cleartext[0]
+
+
+class _Rewritable:
+    """A header value that is no ``str``, whose text can be changed in place. ``str()`` and
+    ``encode`` give the same text, so the rule reads what ``http.client`` would send."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+    def encode(self, encoding: str) -> bytes:
+        return self.text.encode(encoding)
+
+
+def test_a_value_changed_in_place_is_judged_as_it_reads_at_the_next_open() -> None:
+    """The plain name, an admission, and a value object. The first open sends it to the proxy
+    on the admission. The object's text is then changed in place to what the second proxy's
+    URL makes, which no admission covers, and the same request is opened again. The verdict is
+    kept, because the header is the same two objects, but the text judged is read from the
+    value at each check. So the second open is refused and sends nothing. A check that judged
+    the text it read at the first open would send the new text to the proxy in cleartext."""
+    value = _Rewritable(_VALUE)
+    with _WireProxy() as peer:
+        opener = _admitting_with_a_second_proxy(peer)
+        request = _held(_NAME, value, _HTTP_TARGET)
+        first = _attempt(opener, request)
+        sent_at_first = list(peer.cleartext)
+        value.text = _URL_VALUE
+        second = _attempt(opener, request)
+        on_a_new_request = _attempt(opener, _held(_NAME, value, _HTTP_TARGET))
+    assert first is None
+    assert len(sent_at_first) == 1
+    assert f"{_NAME}: {_VALUE}\r\n".encode() in sent_at_first[0]
+    assert peer.connections == 1
+    for raised in (second, on_a_new_request):
+        assert isinstance(raised, ProxyCredentialsRefusedError)
+        assert "#3410" in str(raised)
+        assert _URL_VALUE not in f"{raised!s} {raised!r}"
+
+
+def test_control_a_value_left_as_it_was_crosses_at_a_second_open() -> None:
+    """The other polarity: the same request, opened twice with the value unchanged, is sent
+    twice. So the refusal above comes from the changed text, not from the second open."""
+    value = _Rewritable(_VALUE)
+    with _WireProxy() as peer:
+        opener = _admitting_with_a_second_proxy(peer)
+        request = _held(_NAME, value, _HTTP_TARGET)
+        first = _attempt(opener, request)
+        second = _attempt(opener, request)
+    assert first is None
+    assert second is None
+    assert len(peer.cleartext) == 2
+    assert all(f"{_NAME}: {_VALUE}\r\n".encode() in head for head in peer.cleartext)
 
 
 class _Undecoded(bytes):

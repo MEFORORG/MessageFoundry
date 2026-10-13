@@ -940,7 +940,9 @@ def _sends_cleartext_proxy_credentials(
     # tunnel, and the destination would read it. So no other spelling is ever admitted.
     oddly_spelled = not all(verdict.plain for verdict in carried)
     admitted = caller_header_admitted and not oddly_spelled
-    values = [verdict.text for verdict in carried]
+    # Read from each value now, at every check, and never kept. A kept verdict says which header
+    # the rule judges, not what its value reads as: a value object can change its text in place.
+    values = [str(verdict.value) for verdict in carried]
     if not _is_from_a_proxy_url(values, user, password, proxies) and (not carried or admitted):
         return False
     # urllib dials a host on its own bypass list direct, and adds no proxy header to that request.
@@ -1097,8 +1099,6 @@ class _ProxyHeaderVerdict:
     #: The class of error ``http.client`` raises for the header, when it is a spelling other
     #: than the plain one that can never be sent. ``None`` for every header the rule judges.
     refusal: type[Exception] | None
-    #: ``str()`` of the value, read once, for a header the rule judges. Empty for any other.
-    text: str
 
     @property
     def judged(self) -> bool:
@@ -1110,11 +1110,14 @@ class _ProxyHeaderVerdict:
 
 def _verdict_on(name: str | bytes, value: Any) -> _ProxyHeaderVerdict:
     """Judge one header. Nothing else asks ``http.client`` about one."""
-    if _is_spelled_plainly(name):
-        return _ProxyHeaderVerdict(name, value, plain=True, refusal=None, text=str(value))
-    refusal = _refusal_by_http_client(name, value)
-    text = str(value) if refusal is None else ""
-    return _ProxyHeaderVerdict(name, value, plain=False, refusal=refusal, text=text)
+    plain = _is_spelled_plainly(name)
+    refusal = None if plain else _refusal_by_http_client(name, value)
+    if refusal is None:
+        # The rule matches a judged header by the text of its value. A value whose text cannot
+        # be read cannot be judged, so its error stops the request here, on every leg, and no
+        # verdict is kept. The text is not kept either: each check that needs it reads it then.
+        str(value)
+    return _ProxyHeaderVerdict(name, value, plain=plain, refusal=refusal)
 
 
 #: The attribute a request keeps its verdicts under, from one check to the next.
