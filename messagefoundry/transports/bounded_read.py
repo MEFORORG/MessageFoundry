@@ -33,8 +33,10 @@ refused for good with code :data:`REPLY_TOO_LARGE_CODE`, which is a dead-letter 
 did not have before. Each destination's ``_post`` says which, and ``docs/CONNECTIONS.md`` has
 the table. The four HTTP destinations all read their 2xx reply through it.
 
-**Only the byte bound is covered.** At least a reply that is truncated or misframed after a 2xx
-still retries, and so sends the request again.
+The same helper handles a 2xx body that is truncated or misframed, under the same rule and with
+codes of its own (BACKLOG #2989). A peer that closes cleanly part-way is a truncated reply. At least
+a read that times out, or that a connection reset (an error, not a clean close) cuts off part-way
+through a 2xx body is not covered: those still retry, and so send the request again.
 
 **A ceiling is not a completeness check, and this module once carried only the ceiling** (BACKLOG
 #1575). Bounding the read answered "did the peer send too much?" and nothing answered "did the peer
@@ -136,7 +138,9 @@ from messagefoundry.transports.base import DeliveryError, NegativeAckError, Repl
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
     "MAX_TOKEN_RESPONSE_BYTES",
+    "REPLY_MISFRAMED_CODE",
     "REPLY_TOO_LARGE_CODE",
+    "REPLY_TRUNCATED_CODE",
     "AmbiguousFramingError",
     "EgressReplyError",
     "LoopbackDirectProxyHandler",
@@ -236,9 +240,13 @@ class TruncatedResponseError(EgressReplyError):
 
     A :class:`~messagefoundry.transports.base.DeliveryError`, therefore transient and retryable,
     for the same reason :class:`ResponseTooLargeError` is: a connection cut mid-body is a peer-side
-    or network fault, and the next attempt may well complete. Promoting it to a permanent
-    :class:`~messagefoundry.transports.base.NegativeAckError` would dead-letter a message on a
-    dropped socket.
+    or network fault, and the next attempt may well complete.
+
+    **Except after a 2xx on a delivery** (BACKLOG #2989). There a retry would re-send a request
+    the partner answered 2xx, so :func:`read_2xx_reply_text` stops it. Where the engine needs the
+    body, that is a permanent refusal: a peer or a middlebox that closes the socket cleanly
+    before the declared length dead-letters the message once, by design, rather than re-sending
+    it. Only a read that fails with an error, such as a reset or a timeout, is still retried.
     """
 
 
@@ -262,6 +270,9 @@ class AmbiguousFramingError(EgressReplyError):
     dead-letters it when the policy runs out. It is not a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError`, because a misframed reply may come
     from an intermediary on one path rather than from the partner itself.
+
+    A destination that reads its 2xx reply through :func:`read_2xx_reply_text` does not let a
+    misframed body travel that far, because a retry would re-send the request (BACKLOG #2989).
     """
 
     def __init__(self, message: str, *, reason: str) -> None:
@@ -1646,14 +1657,18 @@ def read_bounded_text(
     return read_bounded(reader, limit=limit, connector=connector).decode(encoding, errors="replace")
 
 
-#: The ``code`` of the permanent refusal :func:`read_2xx_reply_text` raises.
+#: The ``code`` of the permanent refusal :func:`read_2xx_reply_text` raises for a body over the bound.
 REPLY_TOO_LARGE_CODE = "reply-too-large"
+#: The ``code`` it raises for a body that stopped short of the length the peer declared.
+REPLY_TRUNCATED_CODE = "reply-truncated"
+#: The ``code`` it raises for a body framed in a way RFC 9112 does not allow.
+REPLY_MISFRAMED_CODE = "reply-misframed"
 
 
 def _shown_2xx_status(reader: object) -> int | None:
     """``reader.status`` when it is an integer from 200 to 299, else ``None``.
 
-    The guard an over-cap body after a 2xx passes before it is dropped rather than raised. It
+    The guard a body after a 2xx passes before it is dropped rather than raised. It
     fails closed: a reader with no status, or one it cannot show as an integer, is not taken for a
     2xx. Shared by :func:`read_2xx_reply_text` and :func:`drain_2xx_reply`.
     """
@@ -1696,51 +1711,73 @@ def read_2xx_reply_text(
     Call it where the status is already known to be 2xx. In a destination's ``_post`` that is
     inside ``with opener.open(...)``, because urllib raises every other status as an ``HTTPError``.
     The helper checks this itself, and fails closed: unless ``reader.status`` is an integer from
-    200 to 299, an over-cap body raises as :func:`read_bounded_text` raises it. So an over-cap
+    200 to 299, a body it cannot read raises as :func:`read_bounded_text` raises it. So such a
     body from a reader with another status, or with none it can show, is never recorded as
-    delivered here. An in-cap body is returned whatever the status: that is the caller's to judge.
+    delivered here. An in-cap, complete body is returned whatever the status: that is the
+    caller's to judge.
 
-    The partner answered 2xx, so an over-cap body must not cause a re-send (vault BACKLOG #2180).
-    What it does cause depends on ``body_is_needed``, which says who reads the body. This is the
-    one place in code that states the rule:
+    The partner answered 2xx, so a body the engine cannot read must not cause a re-send. Three
+    kinds are handled, and each has its own code: a body over the bound (:data:`REPLY_TOO_LARGE_CODE`,
+    vault BACKLOG #2180), a body cut short of its declared length (:data:`REPLY_TRUNCATED_CODE`),
+    and a misframed body (:data:`REPLY_MISFRAMED_CODE`), the last two since BACKLOG #2989. What
+    each causes depends on ``body_is_needed``, which says who reads the body. This is the one
+    place in code that states the rule:
 
     * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
       without it. Returns a :class:`~messagefoundry.transports.base.ReplyBodyDropped` with the
-      status and the bound, and no byte of the reply. Nothing is logged here: the destination
-      hands it back from ``send``, and the delivery worker logs the WARNING after the store write
-      that records the delivery and the drop (vault BACKLOG #3040 items 2 and 5).
+      status, the bound and, for a truncated or misframed body, what was wrong with it, and no
+      byte of the reply. Nothing is logged here: the destination hands it back from ``send``, and
+      the delivery worker logs the WARNING after the store write that records the delivery and
+      the drop (vault BACKLOG #3040 items 2 and 5).
     * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
-      permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
-      :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
-      the engine could not read is not recorded as delivered.
+      permanent :class:`~messagefoundry.transports.base.NegativeAckError` with the code, so the
+      row dead-letters once and is not sent again. A reply the engine could not read is not
+      recorded as delivered.
+
+    Who decided the rule for each kind, and on what authority, is recorded once, in ADR 0095
+    Amendment B.1.
 
     Which FHIR writes need the body is stated at the call in ``transports/fhir.py``.
 
-    Only the byte bound is handled here. A truncated or misframed reply still raises as
-    :func:`read_bounded_text` raises it, and is still retried.
+    A peer that closes cleanly before its declared length is a truncated body. At least a read
+    that times out, or one a connection reset cuts off, is not handled here. Those raise as they
+    did, and are still retried.
     """
     try:
         return read_bounded_text(reader, limit=limit, connector=connector, encoding=encoding)
-    except ResponseTooLargeError:
+    except MalformedReplyHeadError:
+        # A bad head leaves no status worth trusting. It is refused inside opener.open() today,
+        # and this arm keeps it off the 2xx path if a reader ever raises it later.
+        raise
+    except (ResponseTooLargeError, TruncatedResponseError, AmbiguousFramingError) as exc:
         status = _shown_2xx_status(reader)
         if status is None:
             raise
-        # A 2xx is handled below, outside the handler. The traceback reaches the frame that holds
-        # the bytes read so far, a whole bound of them, and an error raised in here would keep
-        # that frame alive on its __context__ until the worker let go of it.
+        # Only fixed text leaves the handler. A 2xx is handled below, outside it. The traceback
+        # reaches the frame that holds the bytes read so far, and an error raised in here would
+        # keep that frame alive on its __context__ until the worker let go of it.
+        if isinstance(exc, ResponseTooLargeError):
+            code, fault = REPLY_TOO_LARGE_CODE, f"is over the {limit}-byte bound"
+        elif isinstance(exc, TruncatedResponseError):
+            code, fault = REPLY_TRUNCATED_CODE, "ended before its declared length"
+        else:
+            # The reason is fixed text from this module, never a byte the peer sent.
+            code, fault = REPLY_MISFRAMED_CODE, f"is misframed ({exc.reason})"
     if body_is_needed:
         # The row keeps only 200 characters of this, so the code and the advice come first and
         # the connection name, which has no length cap, comes last (vault BACKLOG #3040 items
-        # 4 and 6). It
-        # does not say the partner accepted the request: the body that could not be read is
-        # where a Fault, a failed-instance list or a failed entry status would be.
+        # 4 and 6). It does not say the partner accepted the request: the body that could not
+        # be read is where a Fault, a failed-instance list or a failed entry status would be.
         raise NegativeAckError(
-            f"{REPLY_TOO_LARGE_CODE}, not sent again. A 2xx reply body is over the {limit}-byte "
-            f"bound and is needed here. Check the partner before a replay ({connector})",
-            code=REPLY_TOO_LARGE_CODE,
+            f"{code}, not sent again. A 2xx reply body {fault} and is needed here. Check the "
+            f"partner before a replay ({connector})",
+            code=code,
             permanent=True,
         )
-    return ReplyBodyDropped(status=status, limit=limit)
+    # An over-cap drop carries no fault: ReplyBodyDropped words that case from its own bound.
+    return ReplyBodyDropped(
+        status=status, limit=limit, fault=None if code == REPLY_TOO_LARGE_CODE else fault
+    )
 
 
 def drain_2xx_reply(
