@@ -41,9 +41,9 @@ def _resolve_token_text() -> str | None:
     """The active token content, or ``None`` if no source is configured — the SAME source
     ``scripts/security/scan_forbidden.py`` reads, so the site-code authority is externalized in one
     place (never committed). ``MEFOR_FORBIDDEN_TOKENS`` wins: an existing file path is read; any other
-    non-empty value is inline content; an explicitly-empty value means "no source". Otherwise the
-    git-ignored ``scripts/security/scan-tokens.local.txt`` is located by walking up from this file
-    (a dev checkout); an installed wheel without it degrades to no-op.
+    non-empty value is inline content; an explicitly-empty value means "no source". Otherwise ONE
+    path is built, never searched for (BACKLOG #2995): the git-ignored ``scan-tokens.local.txt`` in
+    ``scripts/security/`` under the folder that holds this package. No file there means no source.
     """
     env = os.environ.get("MEFOR_FORBIDDEN_TOKENS")
     if env is not None:
@@ -57,13 +57,13 @@ def _resolve_token_text() -> str | None:
         except OSError:
             pass
         return env
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / "scripts" / "security" / "scan-tokens.local.txt"
-        try:
-            if candidate.is_file():
-                return candidate.read_text(encoding="utf-8")
-        except OSError:
-            pass
+    try:  # parents[2]: the repository root in a checkout. A shorter path has none (IndexError).
+        root = Path(__file__).resolve().parents[2]
+        candidate = root / "scripts" / "security" / "scan-tokens.local.txt"
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    except (OSError, IndexError):
+        pass
     return None
 
 
@@ -605,7 +605,7 @@ def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ..
 #: nobody thought of: an embedded document (``ED``, an OBX-5 base64 payload — ADR 0028 §7), a
 #: reference pointer (``RP``), a vendor Z-type, or an OBX with no OBX-2 at all. Under a blocklist an
 #: ED document would reach a fixture un-redacted on first use; under the allowlist it is redacted.
-_NUMERIC_OBX_TYPES = frozenset({"NM", "SN", "TM"})
+#: The numeric types are the keys of ``_NUMERIC_OBX_GRAMMAR`` below: ``NM``, ``SN`` and ``TM``.
 #: A date-typed OBX-5 (a last menstrual period, a collection time) is a date like any other, so it
 #: is NOT preserved: it takes the ``DATE`` kind, which keeps the year only (BACKLOG #2330). ``DTM``
 #: is not listed, so a value declared ``DTM`` stays redacted whole.
@@ -619,11 +619,42 @@ _CODED_ELEMENT_OBX_TYPES = frozenset({"CE", "CWE"})
 #: and fails closed on one that is not conformant.
 _CODED_ELEMENT_TEXT_COMPONENTS = (2, 5, 9)
 
-#: The characters a conformant NM/SN/TM subcomponent is drawn from: digits, sign, decimal point,
-#: and the comparator / range / timezone-offset punctuation. No letters and no whitespace, so prose
-#: cannot pass. Separators are excluded because the value is split on the message's OWN separators
-#: (read from MSH) before a part is matched — this class never sees one.
-_NUMERIC_OBX_VALUE: re.Pattern[str] = re.compile(r"[0-9+\-.:/<>=]*")
+#: One grammar per numeric value type (BACKLOG #2961). One character class used to serve all three,
+#: and any run of digits and marks fitted it, so ``123-45-6789`` under ``NM`` was kept whole. A
+#: grammar says what the type IS, so a shape nobody listed is refused too. ASCII ``[0-9]``, never
+#: ``\d``, which also matches the digits of other scripts.
+_COMPARATOR = r"(?:<=|>=|<>|[<>=])"
+#: An HL7 NM: an optional sign, digits, and at most one decimal point.
+_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+#: An HL7 TM, ``HH[MM[SS[.S[S[S[S]]]]]][+/-ZZZZ]``, with every group in range. The ranges matter: an
+#: eight-digit date is not a time of day, and it does not fit.
+_TIME_OF_DAY = r"""
+    (?:[01][0-9]|2[0-3])                    # hour
+    (?:[0-5][0-9]                           # minute
+      (?:[0-5][0-9]                         # second
+        (?:\.[0-9]{1,4})?                   # fraction, only after the seconds
+      )?)?
+    (?:[+-](?:(?:0[0-9]|1[0-3])[0-5][0-9]|1400))?  # offset, no wider than 1400 either way
+"""
+#: Every character the three grammars are written in. A message that declares one of them as a
+#: separator is not preserved at all: under a repetition separator of ``-``, ``000-12-3456`` splits
+#: into three valid numbers.
+_NUMERIC_GRAMMAR_CHARS = frozenset("0123456789+-.:/<>=")
+#: What each COMPONENT of a preserved numeric value must match, by position. A value with more
+#: components than its type has is refused. ``NM`` takes a leading comparator because ``<5`` under
+#: ``NM`` is a common sender habit and carries no identifier. ``SN`` is comparator, number,
+#: separator or suffix, number, so ``>^100`` and ``^1^:^128`` fit and a bare ``123-45-6789`` in the
+#: comparator's place does not.
+_NUMERIC_OBX_GRAMMAR: dict[str, tuple[re.Pattern[str], ...]] = {
+    "NM": (re.compile(_COMPARATOR + "?" + _NUMBER),),
+    "SN": (
+        re.compile(_COMPARATOR),
+        re.compile(_NUMBER),
+        re.compile(r"[-+/.:]"),
+        re.compile(_NUMBER),
+    ),
+    "TM": (re.compile(_TIME_OF_DAY, re.VERBOSE),),
+}
 
 
 def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
@@ -636,6 +667,25 @@ def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
         for comp in _components(rep, seps)
         for sub in comp.split(seps.subcomponent)
     )
+
+
+def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps: Seps) -> bool:
+    """True if every repetition of ``value`` fits ``grammar``, component by component. An empty
+    component is legal, because an ``SN`` leaves out the parts it does not use. No numeric type has
+    subcomponents, and the patterns refuse that separator like any other stray character. Nothing
+    is kept under a separator the grammars themselves use, because the split would hide it."""
+    if not _NUMERIC_GRAMMAR_CHARS.isdisjoint((seps.component, seps.repetition, seps.subcomponent)):
+        return False
+    for rep in value.split(seps.repetition):
+        comps = _components(rep, seps)
+        if len(comps) > len(grammar):
+            return False
+        # Not strict: a value may stop short of its type's last component (``>^100`` has two).
+        for comp, pattern in zip(comps, grammar, strict=False):
+            part = comp.strip()
+            if part and pattern.fullmatch(part) is None:
+                return False
+    return True
 
 
 def _is_bare_token(part: str) -> bool:
@@ -667,19 +717,19 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
       falls straight through to ``False``; and
     * the value must LOOK like the type it claims. A declared type is never taken on trust, because
       an OBX labelled ``NM`` whose OBX-5 carries a sentence is exactly the narrative the ``FREETEXT``
-      rule exists to redact. Numeric and time-of-day values are matched against their character
-      class; a coded value must be a bare token; a coded ELEMENT must additionally carry no text
-      component.
+      rule exists to redact. A numeric or time-of-day value must fit the grammar of its own type,
+      so an identifier written with dashes or dots is refused (BACKLOG #2961); a coded value must be
+      a bare token; a coded ELEMENT must additionally carry no text component.
+
+    A grammar cannot tell a number from an identifier written as a number: an undashed nine or ten
+    digit run is a valid ``NM`` and is kept. ``docs/PHI.md`` section 9 names that gap.
 
     A date type (``DT``, ``TS``) is never preserved. :func:`obx5_kind` says what it gets instead.
     """
     declared = (value_type or "").strip().upper()
     text = value or ""
-    if declared in _NUMERIC_OBX_TYPES:
-        return all(
-            _NUMERIC_OBX_VALUE.fullmatch(part.strip()) is not None
-            for part in _obx5_parts(text, seps)
-        )
+    if (grammar := _NUMERIC_OBX_GRAMMAR.get(declared)) is not None:
+        return _fits_numeric_grammar(grammar, text, seps)
     if declared in _CODED_OBX_TYPES:
         return all(_is_bare_token(part) for part in _obx5_parts(text, seps))
     if declared in _CODED_ELEMENT_OBX_TYPES:
