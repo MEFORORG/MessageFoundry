@@ -41,6 +41,15 @@
     seat-record.ps1 does. A hook that can break a session is a worse fault than an undeclared seat,
     and this one runs in every worktree of a repo with a live fleet in it.
 
+    IT STAMPS THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
+    worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
+    hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
+    seat.ps1 -Prompt reads no payload and finds its worktree from its own directory, so every worktree
+    session's goalPromptedAt landed on the PRIMARY's record. Only the `cwd` field of the JSON on stdin
+    names the worktree, so the hook moves there (scripts/hooks/_hookinput.ps1) before it starts
+    seat.ps1, which inherits the location. Input with no `cwd` leaves it where it started, as before.
+    A `cwd` it cannot use is reported on the `[seat]` line.
+
 .NOTES
     Wired at SessionStart. Emits at most one line so it cannot crowd a session's context.
 #>
@@ -52,12 +61,21 @@ $ErrorActionPreference = 'Continue'
 
 try {
     # Read stdin if a payload is there. SessionStart delivers session_id, and without it seat.ps1
-    # keys the record by a fallback rather than by the session that is actually starting.
+    # keys the record by a fallback rather than by the session that is actually starting. It also
+    # delivers cwd, the session's own directory, which this process may not be in.
     $raw = ''
+    $cwdFault = ''
+    $helper = $false
+    try { . (Join-Path $PSScriptRoot '_hookinput.ps1'); $helper = [bool](Get-Command Enter-CcxHookCwd -EA SilentlyContinue) } catch { }
     try {
-        if (-not [Console]::IsInputRedirected) { $raw = '' }
+        if ($helper) { $raw = Read-CcxHookInput }
+        elseif (-not [Console]::IsInputRedirected) { $raw = '' }
         else { $raw = [Console]::In.ReadToEnd() }
     } catch { $raw = '' }
+    if ($helper -and $raw) { $cwdFault = Enter-CcxHookCwd -Text $raw }
+    if ($cwdFault) {
+        Write-Output "[seat] could not read this session's worktree: $cwdFault. The declaration prompt below is stamped on $((Get-Location).Path), where this hook runs."
+    }
 
     $sessionId = ''
     $sessionName = ''

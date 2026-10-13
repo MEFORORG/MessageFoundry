@@ -232,3 +232,66 @@ class TestTheHookCannotBreakATurn:
         )
         assert "-Declare" in proc.stdout
         assert "-Goal" in proc.stdout
+
+
+# --------------------------------------------------------------------------------------------------
+# Which worktree the prompt is stamped on.
+#
+# seat.ps1 -Prompt reads no payload and finds its worktree from its own directory. Measured
+# 2026-10-12: the desktop app starts a worktree session's CLI with `--project-config-root <primary
+# checkout>`, and a hook then runs in the PRIMARY, so every worktree session's goalPromptedAt landed
+# on the primary's record. Only the hook input's `cwd` names the worktree. These tests run the hook IN
+# the primary, as the app does, and vary only that field.
+# --------------------------------------------------------------------------------------------------
+
+
+def _same_dir(a: str, b: Path) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+@pytest.fixture
+def linked(repo: Path, tmp_path: Path) -> Path:
+    """A worktree linked to ``repo``, so ``repo`` plays the primary checkout."""
+    wt = Path(os.path.realpath(tmp_path)) / "linked"
+    git(repo, "worktree", "add", "-q", "-b", "linked", str(wt))
+    return wt
+
+
+def _prompt_in_primary(repo: Path, payload: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        input=json.dumps(payload),
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc
+
+
+class TestThePromptLandsOnTheSessionsWorktree:
+    def test_the_record_names_the_worktree_the_hook_input_names(
+        self, repo: Path, linked: Path
+    ) -> None:
+        _prompt_in_primary(repo, {"session_id": "s1", "cwd": str(linked)})
+        rec = record(repo)
+        assert _same_dir(rec["worktree"], linked), rec["worktree"]
+        assert rec["goalPromptedAt"]
+
+    def test_without_a_cwd_the_record_names_where_the_hook_runs(
+        self, repo: Path, linked: Path
+    ) -> None:
+        """The control. With no `cwd` the same call stamps the primary, so the arm above can fail."""
+        _prompt_in_primary(repo, {"session_id": "s1"})
+        assert _same_dir(record(repo)["worktree"], repo), record(repo)["worktree"]
+
+    def test_a_cwd_that_does_not_exist_is_said_aloud(
+        self, repo: Path, linked: Path, tmp_path: Path
+    ) -> None:
+        gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+        proc = _prompt_in_primary(repo, {"session_id": "s1", "cwd": gone})
+        assert "[seat] could not read this session's worktree" in proc.stdout, proc.stdout
+        assert "deleted-worktree, which does not exist" in proc.stdout, proc.stdout
+        assert _same_dir(record(repo)["worktree"], repo), "the fallback is the old behaviour"
