@@ -128,7 +128,7 @@ from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
-from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import SESSION_KIND, USER_KIND, RowSealer, RowSealError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -139,12 +139,16 @@ from messagefoundry.store.store import (
     LockoutCounter,
     LockoutIncrement,
     SessionRecord,
+    UserAuthzRecord,
     UserRecord,
+    VerifiedUser,
     WebAuthnCredential,
+    passkey_digest,
     require_notify_email,
     seed_notify_email,
     session_seal_ok,
     session_sealed_by_retired_key,
+    user_seal_ok,
 )
 from messagefoundry.transports.bounded_read import EgressReplyError
 from messagefoundry.transports.email import envelope_address_problem
@@ -615,6 +619,10 @@ DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 #: The closed-set reason a directory answer is refused with when it names another directory object
 #: than the row's own (BACKLOG #1471 at sign-in, #2027 at the step-up re-bind).
 DIRECTORY_IDENTITY_CONFLICT = "directory_identity_conflict"
+
+#: The closed-set reason a directory sign-in is refused with when the row it resolves to fails its
+#: integrity seal (BACKLOG #2592). Such a row is never adopted, completed or created over.
+ACCOUNT_REFUSED = "account_refused"
 
 #: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
 #: tell that refusal from the other 409 on the federated-identity routes without matching prose.
@@ -2038,9 +2046,9 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     return channel_scope.scope_channels(user.channel_scope)
 
 
-def _cert_narrowed_scope(
-    user: UserRecord, mapped: frozenset[str], *, administrator: bool
-) -> UserRecord:
+def _cert_narrowed_scope[U: UserRecord](
+    user: U, mapped: frozenset[str], *, administrator: bool
+) -> U:
     """``user`` with the channel scope its current directory groups leave it, for one certificate
     request (BACKLOG #2316). Writes nothing.
 
@@ -2253,6 +2261,39 @@ _SEAL_FAILURE_TRACK_MAX: Final = 1024
 #: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
 #: the ``auth.session_revoked`` rows already record.
 _SESSION_REF_LEN: Final = 12
+#: ``provision-admin``'s refusal for a name a row holds whose record fails its integrity seal
+#: (BACKLOG #2592). Such a row is never completed or repaired: the store will not re-seal it.
+_UNSEALED_NAME_REFUSAL: Final = (
+    "the account named {username!r} fails its integrity seal, so it is refused and cannot be"
+    " repaired -- provision under a different username"
+)
+
+
+def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
+    """Every value a loader may find an account by (BACKLOG #2592), so a re-read in
+    ``AuthService._verified`` can tell it still names the account the caller looked up."""
+    return (
+        user.id,
+        user.username,
+        user.oidc_issuer,
+        user.oidc_subject,
+        user.directory_object_id,
+    )
+
+
+@dataclass(frozen=True)
+class _UserLookup:
+    """What one user read found (BACKLOG #2592): the account with its seal checked, or ``None``,
+    and whether any row was there at all. ``held`` without ``user`` is a row that fails its seal:
+    it is refused, and nothing may be created over it or beside it."""
+
+    user: VerifiedUser | None
+    held: bool
+
+    @property
+    def refused(self) -> bool:
+        """A row is there and fails its seal."""
+        return self.held and self.user is None
 
 
 @dataclass
@@ -2824,10 +2865,10 @@ class AuthService:
         ``exclude_id`` is optional so :meth:`has_enabled_administrator` can ask the unrestricted
         question without a sentinel value.
         """
-        for user in await self._store.list_users():
+        for user in await self._load_users():
             if user.disabled or user.id == exclude_id:
                 continue
-            if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
+            if Role.ADMINISTRATOR.value in user.role_ids:
                 return True
         return False
 
@@ -2965,7 +3006,10 @@ class AuthService:
                     "the authenticator code did not match; nothing was written"
                 )
 
-        existing = await self._store.get_user_by_username(username)
+        lookup = await self._lookup_by_username(username)
+        existing = lookup.user
+        if lookup.refused:
+            raise FirstAdministratorRefused(_UNSEALED_NAME_REFUSAL.format(username=username))
         repaired = existing is not None
         # BACKLOG #2019: read BEFORE any write, because `--email` below may replace it and the new
         # address belongs to the operator running this command, not to the holder being told.
@@ -3012,7 +3056,7 @@ class AuthService:
                 # repair branch, so `_existing_row_refusal`'s rules (#2288) stay in one place. This
                 # INSERT was the run's first account write, so no account row was written. A
                 # refusal with no row holding the name is some other fault and re-raises untouched.
-                if await self._store.get_user_by_username(username) is None:
+                if not await self._username_held(username):
                     raise
                 raise FirstAdministratorRefused(
                     "an account with that username was created while this command ran, so this run "
@@ -3128,7 +3172,7 @@ class AuthService:
         )
 
     async def _existing_row_refusal(
-        self, existing: UserRecord, username: str, *, notify_email: str | None
+        self, existing: VerifiedUser, username: str, *, notify_email: str | None
     ) -> str | None:
         """Why ``provision_first_administrator`` would refuse to complete ``existing``, or ``None``.
 
@@ -3155,7 +3199,7 @@ class AuthService:
                 f"the account named {username!r} is disabled -- re-enable it from the web "
                 "console, or provision under a different username"
             )
-        if await self._store.get_user_role_ids(existing.id):
+        if existing.role_ids:
             return (
                 f"an account named {username!r} already exists and holds roles -- choose "
                 "another username"
@@ -3188,9 +3232,10 @@ class AuthService:
                 "-- create further accounts from the web console, and use `admin-unlock` if the "
                 "administrator is locked out"
             )
-        existing = await self._store.get_user_by_username(name)
+        lookup = await self._lookup_by_username(name)
+        existing = lookup.user
         if existing is None:
-            return None
+            return _UNSEALED_NAME_REFUSAL.format(username=name) if lookup.refused else None
         return await self._existing_row_refusal(existing, name, notify_email=notify_email)
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
@@ -3273,7 +3318,7 @@ class AuthService:
         session = await self._load_session(token_hash)
         if session is None:
             return False
-        user = await self._store.get_user(session.user_id)
+        user = await self._load_user(session.user_id)
         if user is None or not self._credential_lapsed(user, time.time()):
             return False
         await self._end_lapsed_session(token_hash, user.username, at=ceremony, client=client)
@@ -3598,7 +3643,7 @@ class AuthService:
             else:
                 after_pad.append(write)
 
-        user = await self._store.get_user_by_username(username)
+        user = await self._load_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).
@@ -3814,7 +3859,7 @@ class AuthService:
         )
 
     async def _check_both_factors(
-        self, user: UserRecord, password: str, code: str, *, arrived: float | None = None
+        self, user: VerifiedUser, password: str, code: str, *, arrived: float | None = None
     ) -> tuple[bool, bool]:
         """The combined sign-in's verify: ``(password_ok, code_ok)``, with BOTH always checked.
 
@@ -4332,7 +4377,7 @@ class AuthService:
         # So `federated_subject_conflict` is no longer emitted. A reassigned username that presents a
         # new subject now meets the refusal below, because the new subject is bound to nothing.
         presented = (principal_claims.issuer, principal_claims.subject)
-        bound = await self._store.get_user_by_federated_subject(*presented)
+        bound = await self._load_user_by_federated_subject(*presented)
         if bound is not None and (bound.oidc_issuer, bound.oidc_subject) != presented:
             # BYTE-EXACT, whatever the backend's collation. SQL Server compares these columns under
             # the database default, usually case-insensitive, so `abc` can find the row bound to `ABC`.
@@ -4767,7 +4812,7 @@ class AuthService:
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
             )
-        user = await self._store.get_user(session.user_id)
+        user = await self._load_user(session.user_id)
         if user is None or user.disabled or user.auth_provider != AuthProvider.AD.value:
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
@@ -4849,9 +4894,14 @@ class AuthService:
         # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
         # (#2240). Inline rather than through that helper, because its probe would change this
         # leg's not_in_directory reason. Only a LOST role refuses; refusing writes nothing, and the
-        # reconciler or the next sign-in re-syncs the roles.
-        held = set(await self._store.get_user_role_ids(user.id))
-        if not held <= await self._store.roles_for_ad_groups(principal.groups):
+        # reconciler or the next sign-in re-syncs the roles. Read after the directory round trip,
+        # as before, through the loader (BACKLOG #2592).
+        fresh = await self._load_user(user.id)
+        if fresh is None:
+            return await self._step_up_refused(
+                "session_gone", actor=actor, client=client, return_to=return_to, lost=True
+            )
+        if not set(fresh.role_ids) <= await self._store.roles_for_ad_groups(principal.groups):
             return await self._step_up_refused(
                 DIRECTORY_ROLES_DEMOTED, actor=actor, client=client, return_to=return_to
             )
@@ -4914,7 +4964,7 @@ class AuthService:
         if flow.step_up_session_hash is None:
             return "<oidc>"
         session = await self._load_session(flow.step_up_session_hash)
-        user = await self._store.get_user(session.user_id) if session is not None else None
+        user = await self._load_user(session.user_id) if session is not None else None
         return user.username if user is not None else "<oidc>"
 
     async def _step_up_refused(
@@ -5023,7 +5073,14 @@ class AuthService:
             # BACKLOG #2143, also a programming error. An OIDC session minted with no IdP auth_time
             # stores NULL, and every IdP step-up on it is then refused. Fail at the mint instead.
             raise ValueError("a federated login needs the verified IdP auth_time")
-        existing = await self._store.get_user_by_username(principal.username)
+        lookup = await self._lookup_by_username(principal.username)
+        existing = lookup.user
+        if lookup.refused:
+            # BACKLOG #2592: the name's row fails its integrity seal. It is refused, and never
+            # adopted or re-created over: the store will not re-seal it.
+            return await self._refuse_directory_row(
+                principal.username, ACCOUNT_REFUSED, client=client
+            )
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
             await self._audit(
@@ -5178,14 +5235,14 @@ class AuthService:
             # owner's 2026-09-06 ruling forbids. The only way the pair can be unheld here is an
             # admin unbind or rebind landing after the caller's read, so it is refused as first
             # contact is (ADR 0184 AC-4), and nothing is written.
-            holder = await self._store.get_user_by_federated_subject(*federated_subject)
+            holder = await self._load_user_by_federated_subject(*federated_subject)
             reason = (
                 FEDERATED_SUBJECT_NOT_BOUND if holder is None else "federated_subject_already_bound"
             )
             await self._directory_reject_audit(principal.username, "oidc", reason, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
-        previous = set(await self._store.get_user_role_ids(user.id))
+        previous = set(user.role_ids)
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
         # vault BACKLOG #2610: only a role this sync ADDED is reported, so an account that already
         # held Administrator pages nobody on each sign-in.
@@ -5346,12 +5403,12 @@ class AuthService:
 
     async def _sync_ad_channel_scope(
         self,
-        user: UserRecord,
+        user: VerifiedUser,
         roles: frozenset[Role],
         groups: Iterable[str],
         *,
         client: str | None = None,
-    ) -> UserRecord:
+    ) -> VerifiedUser:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
         requests (mirrors role sync). Returns the (possibly refreshed) user record.
 
@@ -5386,7 +5443,7 @@ class AuthService:
             # Compare-and-set against the value read: an administrator or a concurrent login may
             # have written the scope since ``user`` was read.
             if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
-                return await self._store.get_user(user.id) or user
+                return await self._load_user(user.id) or user
             await self._store.revoke_user_sessions(user.id)
             # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
             await self._audit(
@@ -5395,7 +5452,7 @@ class AuthService:
                 detail=_json({"channels": None, "withdrawn": user.channel_scope}),
                 client=client,
             )
-            return await self._store.get_user(user.id) or user
+            return await self._load_user(user.id) or user
         await self._store.set_user_channel_scope(
             user.id, decision.scope_json, source=SCOPE_SOURCE_AD
         )
@@ -5412,16 +5469,16 @@ class AuthService:
             ),
             client=client,
         )
-        return await self._store.get_user(user.id) or user
+        return await self._load_user(user.id) or user
 
     async def _upsert_ad_user(
         self,
         principal: AdPrincipal,
         *,
-        by_name: UserRecord | None,
+        by_name: VerifiedUser | None,
         federated: bool,
         client: str | None = None,
-    ) -> UserRecord:
+    ) -> VerifiedUser:
         """Resolve the mirror row for a directory principal, creating it on first sight.
 
         **IDENTIFIES BY THE DIRECTORY'S IMMUTABLE ID, NOT BY THE NAME (BACKLOG #1471).** A
@@ -5489,9 +5546,14 @@ class AuthService:
             raise ValueError(
                 "a directory principal with no immutable id cannot be resolved to a row"
             )
-        existing = by_name or await self._store.get_user_by_directory_object_id(
-            principal.directory_object_id
-        )
+        existing = by_name
+        if existing is None:
+            by_id = await self._lookup_by_directory_object_id(principal.directory_object_id)
+            if by_id.refused:
+                # BACKLOG #2592: the id's row fails its integrity seal. It is refused, and no second
+                # row is minted beside it for the same directory account.
+                raise _DirectoryLoginRefused(ACCOUNT_REFUSED)
+            existing = by_id.user
         # BACKLOG #1637 / #1638. THE ELIGIBILITY GATE THAT ACTUALLY CLOSES THE DEFECT, and its
         # POSITION is the whole of it: immediately after the id-keyed read, BEFORE the first write.
         #
@@ -5515,7 +5577,10 @@ class AuthService:
                 # winner's row rather than failing. The username index is the only one that can fire
                 # here: `directory_object_id` carries no UNIQUE index on any backend. So the name is
                 # what is re-read, and a refusal with no row holding it is some other fault.
-                winner = await self._store.get_user_by_username(principal.username)
+                found = await self._lookup_by_username(principal.username)
+                winner = found.user
+                if found.refused:
+                    raise _DirectoryLoginRefused(ACCOUNT_REFUSED) from exc
                 if winner is None:
                     raise
                 # The checks `_complete_ad_login` makes on a row it read by name, in its order. That
@@ -5657,8 +5722,10 @@ class AuthService:
                     client=client,
                     detail={"new_email": email, "source": "directory"},
                 )
-        user = await self._store.get_user(user_id)
-        assert user is not None  # just upserted
+        user = await self._load_user(user_id)
+        if user is None:
+            # Just upserted, so gone or failing its seal only through a write outside the store.
+            raise _DirectoryLoginRefused(ACCOUNT_REFUSED)
         return user
 
     async def _create_directory_row(
@@ -5796,12 +5863,9 @@ class AuthService:
                 " this account, so an account created from it could never take a federated binding."
                 " Make the directory return objectGUID to the service account, then retry"
             )
-        if await self._store.get_user_by_username(principal.username) is not None:
+        if await self._username_held(principal.username):
             raise UsernameTaken(USERNAME_TAKEN)
-        if (
-            await self._store.get_user_by_directory_object_id(principal.directory_object_id)
-            is not None
-        ):
+        if await self._directory_object_id_held(principal.directory_object_id):
             # A row already mirrors this directory account under an older name (a rename its
             # holder has not signed in since). Its next sign-in or reconciler pass refreshes it.
             raise UsernameTaken("an account already mirrors that directory account")
@@ -5843,7 +5907,7 @@ class AuthService:
             if not _is_integrity_refusal(exc):
                 raise
             # Re-read rather than assume the name index fired, as create_local_user does.
-            if await self._store.get_user_by_username(principal.username) is None:
+            if not await self._username_held(principal.username):
                 raise
             raise UsernameTaken(USERNAME_TAKEN) from exc
         await self._notify_security(
@@ -6035,10 +6099,10 @@ class AuthService:
         # one live session. Nobody signed in => zero binds. Derived from list_users + list_sessions
         # rather than a new store method, so this control needs no schema change on any backend.
         candidates: list[tuple[str, str]] = []
-        users: dict[str, UserRecord] = {}
-        unkeyed: list[UserRecord] = []
+        users: dict[str, VerifiedUser] = {}
+        unkeyed: list[VerifiedUser] = []
         still_unkeyed: set[str] = set()
-        for user in await self._store.list_users():
+        for user in await self._load_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
             is_unkeyed = _holds_unkeyed_federated_binding(user)
@@ -6113,17 +6177,16 @@ class AuthService:
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
-            current_roles[probe.user_id] = frozenset(
-                await self._store.get_user_role_ids(probe.user_id)
-            )
+            # RE-READ, after the probes, the roles and the row alike. The row listed at the top of
+            # the pass can be up to a whole pass of LDAP round trips old, and a login that landed
+            # in that time has already written the new scope: judging the old one would revoke the
+            # session that login just minted. A login landing after this read can still be revoked
+            # once; the next pass reads the row it wrote and finds nothing to do. One read through
+            # the loader, so the roles judged are the ones the account's seal covers (#2592).
+            row = await self._load_user(probe.user_id)
+            current_roles[probe.user_id] = frozenset(() if row is None else row.role_ids)
             target = frozenset(await self._store.roles_for_ad_groups(probe.groups))
             target_roles[probe.user_id] = target
-            # RE-READ, after the probes, like the roles above. The row listed at the top of the
-            # pass can be up to a whole pass of LDAP round trips old, and a login that landed in
-            # that time has already written the new scope: judging the old one would revoke the
-            # session that login just minted. A login landing after this read can still be revoked
-            # once; the next pass reads the row it wrote and finds nothing to do.
-            row = await self._store.get_user(probe.user_id)
             if row is None:
                 continue  # deleted mid-pass: nothing to decide, and the role re-diff still runs
             # The TARGET roles decide the Administrator short-circuit, as they do at login, which
@@ -6250,7 +6313,7 @@ class AuthService:
                 user_id=refresh.user_id,
                 old_username=refresh.old_username,
                 new_username=refresh.new_username,
-                held=await self._store.get_user_by_username(refresh.new_username),
+                held=await self._load_user_by_username(refresh.new_username),
             )
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
@@ -6659,7 +6722,7 @@ class AuthService:
         # new name, so about once per directory rename, not once per sign-in. Keeping one read site
         # for both callers keeps them on one path, which is the point of this method; the
         # post-write read-back the item also counted went with BACKLOG #2290.
-        before = await self._store.get_user(user_id)
+        before = await self._load_user(user_id)
         if before is None:
             # Deleted between the plan and the apply. Refused as a write that finds the row gone is
             # refused below, without an UPDATE that can only match nothing. With no row there is
@@ -6732,7 +6795,7 @@ class AuthService:
                 raise
             # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
             # audit row naming the holder is what makes the collision actionable.
-            winner = await self._store.get_user_by_username(new_username)
+            winner = await self._load_user_by_username(new_username)
             await _refuse(winner.id if winner is not None else None, "write_race", before.username)
             return
         # AUDIT SUCCESS ONLY ON A WRITE THAT LANDED. The UPDATE can match zero rows and raise
@@ -6755,11 +6818,11 @@ class AuthService:
         #     be the older of the two until the next sign-in or pass copies the directory's name
         #     down again. Logged at INFO so the skipped write is visible without paging anyone.
         if not written:
-            after = await self._store.get_user(user_id)
+            after = await self._load_user(user_id)
             if after is None:
                 await _refuse(None, "row_gone", before.username)
             elif after.username == before.username:
-                holder = await self._store.get_user_by_username(new_username)
+                holder = await self._load_user_by_username(new_username)
                 await _refuse(
                     holder.id if holder is not None else None, "write_noop", before.username
                 )
@@ -7060,7 +7123,7 @@ class AuthService:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
         revocation writes no scope (ADR 0198): the next login does. Returns whether it applied."""
-        user = await self._store.get_user(revocation.user_id)
+        user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
         ):
@@ -7074,7 +7137,9 @@ class AuthService:
                 revocation.username,
             )
             return False
-        if revocation.role_ids is not None:
+        # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
+        # refuse it, and ending the sessions below needs no write to the account.
+        if revocation.role_ids is not None and user is not None:
             await self._store.set_user_roles(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
             )
@@ -7253,7 +7318,7 @@ class AuthService:
         cap = self._settings.max_sessions_per_user
         if not cap or cap <= 0:
             return
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
         # can only protect full sessions.
         split = True if user is None else await self._unverified_session_owes_factor(user)
@@ -7386,10 +7451,11 @@ class AuthService:
         new handshake carries the NEW cookie, so the live push survives the rotation. That is a
         client reconnect, never a server-side grace window for the old token.
 
-        **A rotation also stops a running bulk export, with no reconnect** (BACKLOG #1154). The
-        export re-resolves its captured token before every row, so a step-up on the same session
-        mid-export ends it and records ``messages_export.stopped``. The client starts the export
-        again with the new token. Same fail-closed direction, same reason.
+        **A rotation also stops a running export, with no reconnect** (BACKLOG #1154). At least
+        the bulk message export and the audit export, the console's cookie download included,
+        re-resolve their captured token as they stream. A step-up on the same session mid-export
+        ends it and records ``messages_export.stopped`` or ``audit.export.stopped``. The client
+        starts the export again with the new token. Same fail-closed direction, same reason.
         """
         return await self._elevated_hash(
             hash_token(token),
@@ -7500,7 +7566,7 @@ class AuthService:
         if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
             await self._store.revoke_session(session.token_hash, now=now)
             return None
-        user = await self._store.get_user(session.user_id)
+        user = await self._load_user(session.user_id)
         # A disabled account is refused below for that reason, not audited as a lapse.
         if user is not None and not user.disabled and self._credential_lapsed(user, now):
             # Asked before the touch below, so a session about to end is not first marked used.
@@ -7575,23 +7641,32 @@ class AuthService:
                 ref,
             )
             return
+        await self._report_seal_failure(
+            ref,
+            f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})",
+            {"kind": SESSION_KIND, "session": ref},
+        )
+
+    async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
+        """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
+        :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row carrying ``detail``, and an
+        ``integrity_drift`` alert, at most once per :data:`_SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
+        per ``key``. ``reason`` and ``detail`` name the row by an id, never a row value. A store
+        refusal of the audit write is logged, not raised, so it does not turn a denial into an
+        error."""
         now = time.monotonic()
-        last = self._seal_failures_reported.get(ref)
+        last = self._seal_failures_reported.get(key)
         if last is not None and now - last < _SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
             return
-        self._seal_failures_reported.pop(ref, None)
+        self._seal_failures_reported.pop(key, None)
         if len(self._seal_failures_reported) >= _SEAL_FAILURE_TRACK_MAX:
             self._seal_failures_reported.pop(next(iter(self._seal_failures_reported)))
-        self._seal_failures_reported[ref] = now
-        reason = f"a {SESSION_KIND} row failed its integrity check and was ended (session {ref})"
+        self._seal_failures_reported[key] = now
         _log.warning("%s", reason)
         await write_audit_soft(
-            lambda: self._audit(
-                AUTHORITY_SEAL_FAILED_ACTION,
-                detail=_json({"kind": SESSION_KIND, "session": ref}),
-            ),
+            lambda: self._audit(AUTHORITY_SEAL_FAILED_ACTION, detail=_json(detail)),
             log=_log,
-            message="the %s audit row for a refused session could not be written",
+            message="the %s audit row for a refused authority row could not be written",
             args=(AUTHORITY_SEAL_FAILED_ACTION,),
             errors=_audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
@@ -7613,6 +7688,118 @@ class AuthService:
         except RowSealError:
             outcome.refused = True
             await self._session_seal_failed(token_hash)
+
+    # --- the user loader (BACKLOG #2592) -----------------------------------------------------------
+
+    async def _load_user(self, user_id: str) -> VerifiedUser | None:
+        """The account ``user_id`` names, its integrity seal checked, or ``None``. With
+        :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
+        :meth:`_load_user_by_federated_subject`, :meth:`_load_users` and :meth:`_verified`, the
+        ONLY readers of the store's user readers in this service, beside the two existence
+        questions; ``tests/test_user_seal.py`` holds that. See
+        :meth:`_verified` for what ``None`` covers."""
+        return await self._verified(await self._store.get_user(user_id))
+
+    async def _load_user_by_username(self, username: str) -> VerifiedUser | None:
+        """:meth:`_load_user`, by username."""
+        return (await self._lookup_by_username(username)).user
+
+    async def _lookup_by_username(self, username: str) -> _UserLookup:
+        """:meth:`_load_user_by_username`, also saying whether a row holds the name at all, from
+        the same read: a row that fails its seal still holds its name."""
+        raw = await self._store.get_user_by_username(username)
+        return _UserLookup(await self._verified(raw), raw is not None)
+
+    async def _lookup_by_directory_object_id(self, object_id: str) -> _UserLookup:
+        """:meth:`_lookup_by_username`, by the directory's immutable id."""
+        raw = await self._store.get_user_by_directory_object_id(object_id)
+        return _UserLookup(await self._verified(raw), raw is not None)
+
+    async def _load_user_by_federated_subject(
+        self, issuer: str, subject: str
+    ) -> VerifiedUser | None:
+        """:meth:`_load_user`, by the federated ``(issuer, sub)`` pair."""
+        return await self._verified(
+            await self._store.get_user_by_federated_subject(issuer, subject)
+        )
+
+    async def _load_users(self) -> list[VerifiedUser]:
+        """Every account whose record passes its seal, in the store's order. An account that fails
+        is reported by :meth:`_verified` and left out, so a scan never counts it."""
+        loaded = [await self._verified(user) for user in await self._store.list_users()]
+        return [user for user in loaded if user is not None]
+
+    async def _username_held(self, username: str) -> bool:
+        """Whether any row holds ``username``, sealed or not (BACKLOG #2592). A name question, not
+        an authority one: a row that fails its seal still holds its name against a new account, and
+        only a ``bool`` leaves here, never the unchecked row."""
+        return await self._store.get_user_by_username(username) is not None
+
+    async def _directory_object_id_held(self, object_id: str) -> bool:
+        """:meth:`_username_held`, for the directory's immutable id."""
+        return await self._store.get_user_by_directory_object_id(object_id) is not None
+
+    async def _verified(self, user: UserRecord | None) -> VerifiedUser | None:
+        """``user`` with its whole authorization record checked against its seal (BACKLOG #2592):
+        the ``users`` row, the account's role rows and its passkey digest. The ONLY place a
+        :class:`VerifiedUser` is built.
+
+        ``None`` for no account, and for an account whose record fails its seal, which is handed
+        to :meth:`_user_seal_failed`. A failing account is denied, never written: the store's write
+        helper refuses to re-seal it. On a keyless store there is no seal to check. One statement
+        more than the row read, for the role rows; the identity build reads them from the result
+        instead of reading them again.
+
+        The row and the role rows are two reads, so an honest role write committing between them
+        can make one pair disagree. A failing pair is therefore read once more, by id, before it is
+        reported: a record changed outside the store fails both times, a raced honest write passes
+        the second."""
+        if user is None:
+            return None
+        sealer = self._store.row_sealer()
+        for attempt in range(2):
+            grants = await self._store.get_user_role_grants(user.id)
+            record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
+            if sealer is None or (record is not None and user_seal_ok(sealer, record)):
+                return VerifiedUser.of(user, sorted(g.role_id for g in grants))
+            if attempt == 0:
+                reread = await self._store.get_user(user.id)
+                if reread is None:
+                    return None  # deleted meanwhile: nothing to report
+                if _lookup_keys(reread) != _lookup_keys(user):
+                    # The account was renamed, rebound or re-keyed meanwhile, so it may no longer be
+                    # the one the caller looked up. Not reported, and the next request reads afresh.
+                    return None
+                user = reread
+        await self._user_seal_failed(user.id)
+        return None
+
+    async def _verified_passkeys(self, user: VerifiedUser) -> list[WebAuthnCredential] | None:
+        """The account's passkeys, or ``None`` when they do not match the digest its seal covers
+        (BACKLOG #2592), which is reported like a failing record and denies every passkey
+        ceremony. On a keyless store there is no digest to check. A mismatch is read once more,
+        account and passkeys, before it is reported, for the reason :meth:`_verified` gives."""
+        creds = await self._store.list_webauthn_credentials(user.id)
+        if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
+            return creds
+        fresh = await self._load_user(user.id)
+        if fresh is None:
+            return None  # gone, or failing its own seal, which _verified has reported
+        creds = await self._store.list_webauthn_credentials(user.id)
+        if passkey_digest(creds) == fresh.cred_digest:
+            return creds
+        await self._user_seal_failed(user.id, part="passkeys")
+        return None
+
+    async def _user_seal_failed(self, user_id: str, *, part: str = USER_KIND) -> None:
+        """Report an account whose record (or, with ``part="passkeys"``, whose passkey set) failed
+        its integrity seal (BACKLOG #2592), through :meth:`_report_seal_failure`, keyed per account.
+        The caller denies; the engine keeps running."""
+        await self._report_seal_failure(
+            f"{part}:{user_id}",
+            f"a {part} record failed its integrity check and was refused (account {user_id})",
+            {"kind": part, "user_id": user_id},
+        )
 
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
@@ -7648,7 +7835,7 @@ class AuthService:
         closes. Concurrent probes are capped at :data:`_CERT_PROBE_MAX_CONCURRENCY`; a request that
         cannot get a slot within :data:`_CERT_PROBE_SLOT_WAIT_SECONDS` is refused. Refusals do not
         log one line per request; :meth:`_note_cert_directory_answer` says what they log."""
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         if user is None or user.disabled:
             return None
         if user.auth_provider != AuthProvider.AD.value:
@@ -7662,7 +7849,7 @@ class AuthService:
         # The answer vouches only for the account it asked about, so a row whose immutable id or
         # provider moved during the round trip is refused rather than judged on another's answer.
         asked = user
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         if (
             user is None
             or user.disabled
@@ -7671,8 +7858,7 @@ class AuthService:
         ):
             return None
         granted = await self._store.roles_for_ad_groups(answer.groups)
-        held = await self._store.get_user_role_ids(user.id)
-        kept = [role_id for role_id in held if role_id in granted]
+        kept = [role_id for role_id in user.role_ids if role_id in granted]
         if not kept:
             return None
         # The scope narrows on the same groups, by the rule login and the reconciler share. Its
@@ -7818,7 +8004,7 @@ class AuthService:
         same :meth:`Identity.build` path :meth:`identity_for_token` uses for the caller. Unlike the
         token / username auth paths, a *disabled* user still resolves here — the point is to inspect a
         user's grants for troubleshooting (including a locked-out account), not to authenticate them."""
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         if user is None:
             return None
         return await self._build_identity(user)
@@ -7878,7 +8064,7 @@ class AuthService:
         moment = min(max(before, prior.last_used_at), after)
         if not prior.is_live(now=moment, idle_seconds=self.session_idle_seconds):
             return False
-        owner = await self._store.get_user(prior.user_id)
+        owner = await self._load_user(prior.user_id)
         await self._audit(
             "auth.session_revoked",
             actor=owner.username if owner is not None else None,
@@ -7898,7 +8084,7 @@ class AuthService:
         rows = await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
         if not rows:
             return []
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         epoch = None if user is None else user.session_epoch
         sealer = self._store.row_sealer()
         kept: list[SessionRecord] = []
@@ -7978,14 +8164,15 @@ class AuthService:
         return frozenset(granted)
 
     async def _build_identity(
-        self, user: UserRecord, *, role_ids: Iterable[str] | None = None
+        self, user: VerifiedUser, *, role_ids: Iterable[str] | None = None
     ) -> Identity:
         """The account's :class:`Identity`. ``role_ids`` replaces the stored role ids when given, so
         a caller that narrowed them (:meth:`identity_for_cert_user_id`) gets the same built-in,
-        custom-role and channel treatment as every other path."""
-        if role_ids is None:
-            role_ids = await self._store.get_user_role_ids(user.id)
-        role_ids = list(role_ids)
+        custom-role and channel treatment as every other path.
+
+        ``user`` is a :class:`VerifiedUser`, so its roles, scope and flags are the ones its seal
+        covered, and its role ids come from that record rather than a second read (BACKLOG #2592)."""
+        role_ids = list(user.role_ids if role_ids is None else role_ids)
         roles = _roles_from_ids(role_ids)
         custom_permissions = await self._custom_permissions_for_ids(role_ids)
         provider = (
@@ -8073,7 +8260,7 @@ class AuthService:
         same account can both pass it; the later write wins and both are audited.
         """
         address = _require_single_mailbox(email)
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such account")
         if user.notify_email == address:
@@ -8185,7 +8372,7 @@ class AuthService:
         no second row."""
         if not identity.must_change_password:
             return False
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None or not self._credential_lapsed(user, time.time()):
             return False
         await self._end_lapsed_session(
@@ -8305,7 +8492,7 @@ class AuthService:
         clear: bool,
     ) -> _Reproof:
         """The body of :meth:`_reproof`, run under its per-account lock."""
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             return _Reproof(ok=False)
         token_hash = hash_token(token)
@@ -8354,7 +8541,7 @@ class AuthService:
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
         now = time.time()
-        current = await self._store.get_user(user.id)
+        current = await self._load_user(user.id)
         locked = current is not None and _live_lock(current, now)
         if not verdict:
             attempts, just_locked, cycles = 0, False, 0
@@ -8635,7 +8822,7 @@ class AuthService:
         session = await self._load_session(token_hash)
         if session is None:
             return True  # no session to act on, so fail closed
-        user = await self._store.get_user(session.user_id)
+        user = await self._load_user(session.user_id)
         if user is None:
             return True
         if local_only and user.auth_provider == AuthProvider.AD.value:
@@ -8985,7 +9172,7 @@ class AuthService:
             if len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX:
                 return
             if step_up:
-                user = await self._store.get_user(user_id)
+                user = await self._load_user(user_id)
                 if user is None or await self._unverified_session_owes_factor(user):
                     return
             if enrolment is not None and (
@@ -9165,7 +9352,7 @@ class AuthService:
             detail["cap_reached"] = _NEW_IP_PER_SESSION_MAX
         written = False
         try:
-            user = await self._store.get_user(session.user_id)
+            user = await self._load_user(session.user_id)
             username = user.username if user is not None else session.user_id
             await self._audit("auth.admin_action_new_ip", actor=username, detail=_json(detail))
             written = True
@@ -9215,7 +9402,7 @@ class AuthService:
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
         if covered and user is not None and not self._has_way_past(user):
             raise FactorEnrolmentRequired()
@@ -9230,7 +9417,7 @@ class AuthService:
             raise FactorEnrolmentRequired()
         await self._store.revoke_user_sessions(identity.user_id)
         await self._audit("auth.password_changed", actor=identity.username, client=client)
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         await self._notify_security(
             PASSWORD_CHANGED,
             username=identity.username,
@@ -9264,7 +9451,7 @@ class AuthService:
         :class:`FactorEnrolmentRequired` right now. The route and the console ask it FIRST, so they
         send the holder to enrolment before asking for a password the service would then refuse.
         The service still refuses on its own; this is a courtesy, not the control."""
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         return (
             user is not None
             and self._covered_by_requirement(user, identity.roles)
@@ -9305,10 +9492,10 @@ class AuthService:
         the first-run notices of ADR 0183 cover that case."""
         now = time.time()
         admins: list[str] = []
-        for user in await self._store.list_users():
+        for user in await self._load_users():
             if user.disabled:
                 continue
-            if Role.ADMINISTRATOR.value not in await self._store.get_user_role_ids(user.id):
+            if Role.ADMINISTRATOR.value not in user.role_ids:
                 continue
             if user.auth_provider == AuthProvider.LOCAL.value and user.password_hash is not None:
                 deadline = self.initial_credential_deadline(user.password_changed_at)
@@ -9384,10 +9571,16 @@ class AuthService:
         )
         return census
 
-    async def _second_factor_enrolled(self, user: UserRecord) -> bool:
+    async def _second_factor_enrolled(self, user: VerifiedUser) -> bool:
         """Any second factor enrolled — TOTP **or** ≥1 WebAuthn passkey (ADR 0068 decision 5). The
-        store round-trip only runs when TOTP alone doesn't already answer."""
-        return user.totp_enabled or await self._store.has_webauthn_credentials(user.id)
+        store round-trip only runs when neither TOTP nor the sealed passkey digest already answers.
+        Each term can only add a factor (BACKLOG #2592): a passkey row deleted outside the store
+        does not make a sealed record that names one read as unenrolled."""
+        return (
+            user.totp_enabled
+            or user.has_passkeys
+            or await self._store.has_webauthn_credentials(user.id)
+        )
 
     def _mfa_required_for(
         self, user: UserRecord, roles: frozenset[Role], *, second_factor_enrolled: bool
@@ -9425,14 +9618,14 @@ class AuthService:
             return False
         if session.mfa_verified_at is not None:
             return True
-        user = await self._store.get_user(session.user_id)
+        user = await self._load_user(session.user_id)
         if user is None:
             return False
         # The extra store reads only execute for sessions not already MFA-verified (the
         # mfa_verified_at early-return above short-circuits the common case).
         return not await self._unverified_session_owes_factor(user)
 
-    async def _unverified_session_owes_factor(self, user: UserRecord) -> bool:
+    async def _unverified_session_owes_factor(self, user: VerifiedUser) -> bool:
         """Whether a session of ``user`` with no ``mfa_verified_at`` stamp still owes a second
         factor. Every unstamped session of one user gets the same answer at one moment, so the
         session cap can ask it once per user (BACKLOG #2076); :meth:`_mfa_satisfied_hash` asks it
@@ -9454,7 +9647,7 @@ class AuthService:
             # exempt" for mfa_status and the last-factor-delete guard, and only an UNSTAMPED session
             # (what this helper is asked about) carries the fact that nothing was proven at mint.
             return True
-        roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
+        roles = _roles_from_ids(user.role_ids)
         enrolled = await self._second_factor_enrolled(user)
         return self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
 
@@ -9470,7 +9663,7 @@ class AuthService:
         own user row, which a directory account already has (``_upsert_ad_user``); nothing here reads
         or writes the directory. The step-up in front of this ceremony re-proves a directory
         credential by a live bind (:meth:`_reauth_ad`), so the proof is real on both providers."""
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
         if user.totp_enabled:
@@ -9505,7 +9698,7 @@ class AuthService:
         :meth:`_enrolment_too_early`. A confirm that would satisfy a pending session too soon after
         sign-in is refused as a wrong code, before the code is checked, so no TOTP step is spent."""
         arrived_at = time.time()  # the floor's clock, read before any await
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
         secret = await self._store.get_totp_secret(identity.user_id)
@@ -9573,7 +9766,7 @@ class AuthService:
             await self._store.revoke_session(hash_token(elevation.token))
             # The reason is the row's state read AFTER the refusal, not the write's own verdict,
             # so a later write can blur it; it is a pointer for an operator, not a proof.
-            after = await self._store.get_user(identity.user_id)
+            after = await self._load_user(identity.user_id)
             if after is None:
                 reason = "account_gone"
             elif after.totp_enabled:
@@ -9663,7 +9856,7 @@ class AuthService:
         session = await self._load_session(hash_token(token))
         if session is None or session.revoked_at is not None:
             return Elevation()
-        user = await self._store.get_user(session.user_id)
+        user = await self._load_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
             return Elevation()
         # Asked before the lock, the floor and the directory check, and not again inside the queue.
@@ -9704,7 +9897,7 @@ class AuthService:
             session = await self._load_session(hash_token(token))
             if session is None or session.revoked_at is not None:
                 return Elevation()
-            user = await self._store.get_user(session.user_id)
+            user = await self._load_user(session.user_id)
             if user is None or user.disabled or not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
@@ -9719,14 +9912,18 @@ class AuthService:
                 # deadline to pass, so no other account pays the read. A row gone meanwhile fails
                 # closed.
                 if user.must_change_password:
-                    fresh = await self._store.get_user(user.id)
+                    fresh = await self._load_user(user.id)
                     if fresh is None or await self._mfa_lapsed(
                         token, fresh, client=client, factor_checked=True
                     ):
                         return Elevation(session_lost=True)
                 # ORDER-CRITICAL: this whole write group lands against the OLD hash, and only then
                 # does the session rotate. Moving any of them after the rotation writes NOTHING and
-                # reports success — every session stamp UPDATE is rowcount-blind.
+                # reports success — every session stamp UPDATE is rowcount-blind. The group is not
+                # all-or-nothing: a stamp whose seal is refused ends the session (BACKLOG #2592),
+                # and a factor stamp written before a refused reauth stamp stays on the revoked row.
+                # So each refusal check must stay ahead of record_login_success, the
+                # auth.mfa_verified row, the rotation and the address record below it.
                 # The 2nd factor is now satisfied; clear the failure counter, and on any session but
                 # an OIDC one also seed the step-up window (the session has completed password +
                 # MFA). (Initial enrollment has no factor to verify, so this never fires there —
@@ -9836,7 +10033,7 @@ class AuthService:
     async def _enrolment_too_early(
         self,
         token: str,
-        user: UserRecord,
+        user: VerifiedUser,
         now: float,
         *,
         event: str,
@@ -9961,8 +10158,11 @@ class AuthService:
             return answer
         # The groups came back with the probe, so this costs store reads only. Read after the probe,
         # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
-        held = set(await self._store.get_user_role_ids(user.id))
-        if not held <= await self._store.roles_for_ad_groups(answer.groups):
+        # Through the loader, so the roles judged are the ones the account's seal covers (#2592).
+        fresh = await self._load_user(user.id)
+        if fresh is None:
+            return ACCOUNT_REFUSED
+        if not set(fresh.role_ids) <= await self._store.roles_for_ad_groups(answer.groups):
             return DIRECTORY_ROLES_DEMOTED
         return None
 
@@ -9990,7 +10190,7 @@ class AuthService:
 
     async def _verify_second_factor(
         self,
-        user: UserRecord,
+        user: VerifiedUser,
         code: str,
         *,
         client: str | None = None,
@@ -10042,7 +10242,9 @@ class AuthService:
                 # it. A success stays fast: it already reveals its outcome.
                 totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
-        real = list(await self._store.get_recovery_code_hashes(user.id))
+        # The hashes the account's seal covered, not a second read nobody checked (BACKLOG #2592).
+        # Spending one below goes through the store's write helper, which checks the seal again.
+        real = user.recovery_code_hashes()
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
         # first argon2id match, so the NUMBER of ~64 MiB verifications was a function of which code
         # was presented -- and, on the failure path, of how many codes REMAINED. Timing a single
@@ -10116,7 +10318,7 @@ class AuthService:
         This is NOT the admin escape hatch — that is :meth:`admin_reset_mfa`, which clears TOTP and
         every passkey and is deliberately unguarded. Nothing here narrows it.
         """
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         # ADR 0197 Amendment A, AC-A3a: removing TOTP removes the account's way past the sign-in lock
         # (wave 1: nothing else is one), so a covered account may not remove it, passkeys or not.
         if (
@@ -10125,18 +10327,20 @@ class AuthService:
             and self._covered_by_requirement(user, identity.roles)
         ):
             raise ValueError(TOTP_REMOVAL_REFUSED)
-        if user is not None and user.totp_enabled:
-            creds = await self._store.list_webauthn_credentials(identity.user_id)
-            # Dropping to zero factors while MFA is required is not a lockout — it lands the user in
-            # the enroll-required flow. So NEITHER self-service path is a recovery path, which is
-            # precisely why both must refuse identically rather than one being an escape hatch.
-            if not creds and self._mfa_required_for(
-                user, identity.roles, second_factor_enrolled=False
-            ):
-                raise ValueError(
-                    "this is your last second factor and MFA is required for your account — "
-                    "enroll another factor first"
-                )
+        # Dropping to zero factors while MFA is required is not a lockout — it lands the user in the
+        # enroll-required flow. So NEITHER self-service path is a recovery path, which is precisely
+        # why both must refuse identically rather than one being an escape hatch. The passkeys
+        # counted are the ones the account's seal names (BACKLOG #2592).
+        if (
+            user is not None
+            and user.totp_enabled
+            and not user.has_passkeys
+            and self._mfa_required_for(user, identity.roles, second_factor_enrolled=False)
+        ):
+            raise ValueError(
+                "this is your last second factor and MFA is required for your account — "
+                "enroll another factor first"
+            )
         await self._store.disable_totp(identity.user_id)
         await self._audit(
             "auth.mfa_disabled",
@@ -10170,7 +10374,7 @@ class AuthService:
         and the passkeys are cleared, so a crash between the writes leaves a generated credential
         with factors, never a chosen password without them. A directory account has no engine
         password and gets ``None``."""
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
         issued: IssuedCredential | None = None
@@ -10200,7 +10404,7 @@ class AuthService:
                 must_change_password=True,
                 password_generated=True,
             )
-            stamped = await self._store.get_user(user_id)
+            stamped = await self._load_user(user_id)
             issued = IssuedCredential(
                 password=temp,
                 expires_at=self.initial_credential_deadline(
@@ -10240,17 +10444,17 @@ class AuthService:
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
         """The caller's current MFA posture for ``GET /me/mfa``."""
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             return MfaStatus(
                 enabled=False, enrolled_at=None, recovery_codes_remaining=0, required=False
             )
-        remaining = (
-            len(await self._store.get_recovery_code_hashes(identity.user_id))
-            if user.totp_enabled
-            else 0
+        # The values the account's seal covered (BACKLOG #2592), the store read only when the sealed
+        # digest names no passkey, as _second_factor_enrolled reads it.
+        remaining = len(user.recovery_code_hashes()) if user.totp_enabled else 0
+        webauthn_enrolled = user.has_passkeys or await self._store.has_webauthn_credentials(
+            identity.user_id
         )
-        webauthn_enrolled = await self._store.has_webauthn_credentials(identity.user_id)
         return MfaStatus(
             enabled=user.totp_enabled,
             enrolled_at=user.totp_enrolled_at,
@@ -10295,14 +10499,16 @@ class AuthService:
         for an unknown account; a full challenge cache raises
         :class:`webauthn.ChallengeCacheFullError` (cause-naming, rendered legibly). Accepts a
         directory account, in parity with :meth:`begin_mfa_enrollment` and for its stated reason."""
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
         # ADR 0197 Amendment A, AC-A3: a covered account's FIRST factor must be one with a way past
         # the sign-in lock, and in wave 1 a passkey is not, so registration waits for TOTP.
         if self._covered_by_requirement(user, identity.roles) and not self._has_way_past(user):
             raise FactorEnrolmentRequired()
-        existing = await self._store.list_webauthn_credentials(identity.user_id)
+        existing = await self._verified_passkeys(user)
+        if existing is None:
+            raise ValueError("no such user")
         challenge = webauthn.new_challenge()
         options = webauthn.registration_options(
             rp_id=rp_id,
@@ -10344,7 +10550,7 @@ class AuthService:
         after sign-in fails as a failed verification, before the challenge is popped, so the
         ceremony stays in flight."""
         arrived_at = time.time()  # the floor's clock, read before any await
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
         label = label.strip()
@@ -10409,7 +10615,7 @@ class AuthService:
             # BACKLOG #1807: the same classes carry the user_id foreign-key refusal, raised when the
             # account is deleted mid-enrolment. Told apart by re-reading the account, never by the
             # driver's message: that text can echo the operator-chosen label.
-            if await self._store.get_user(user.id) is None:
+            if await self._load_user(user.id) is None:
                 raise ValueError("no such user") from exc
             raise ValueError("label already in use") from exc
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
@@ -10444,11 +10650,10 @@ class AuthService:
         session = await self._load_session(hash_token(token))
         if session is None or session.revoked_at is not None:
             return None
-        creds = [
-            c
-            for c in await self._store.list_webauthn_credentials(session.user_id)
-            if c.rp_id == rp_id
-        ]
+        # Only passkeys the account's seal names are offered (BACKLOG #2592).
+        user = await self._load_user(session.user_id)
+        held = None if user is None else await self._verified_passkeys(user)
+        creds = [c for c in held or () if c.rp_id == rp_id]
         if not creds:
             return None
         challenge = webauthn.new_challenge()
@@ -10492,7 +10697,7 @@ class AuthService:
         session = await self._load_session(hash_token(token))
         if session is None or session.revoked_at is not None:
             return Elevation()
-        user = await self._store.get_user(session.user_id)
+        user = await self._load_user(session.user_id)
         if user is None or user.disabled:
             return Elevation()
         now = time.time()
@@ -10537,7 +10742,7 @@ class AuthService:
             session = await self._load_session(hash_token(token))
             if session is None or session.revoked_at is not None:
                 return Elevation(session_lost=True)
-            user = await self._store.get_user(session.user_id)
+            user = await self._load_user(session.user_id)
             if user is None or user.disabled:
                 return Elevation(session_lost=True)
             now = time.time()
@@ -10568,7 +10773,11 @@ class AuthService:
                 client=client,
             )
             return Elevation()
-        cred = await self._store.get_webauthn_credential(hash_bytes(raw_id))
+        # The account's passkeys, checked against the digest its seal covers (BACKLOG #2592): a
+        # passkey row the store did not write fails the whole set, so none of them signs in.
+        held = await self._verified_passkeys(user)
+        wanted = hash_bytes(raw_id)
+        cred = next((c for c in held or () if c.credential_id_hash == wanted), None)
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
             # refusal either way (no oracle distinguishing the three).
@@ -10669,10 +10878,14 @@ class AuthService:
         EVERY successful removal notifies out of band (ASVS 6.3.7, BACKLOG #1139), on the event type
         that describes the resulting state: MFA_DISABLED where this was the last factor and MFA was
         not required, MFA_CREDENTIAL_REMOVED where at least one other factor remains."""
-        user = await self._store.get_user(identity.user_id)
+        user = await self._load_user(identity.user_id)
         if user is None:
             return False
-        creds = await self._store.list_webauthn_credentials(identity.user_id)
+        # BACKLOG #2592: a set that fails its digest removes nothing here; the store would refuse
+        # it, and ``admin_reset_mfa`` clears such a set.
+        creds = await self._verified_passkeys(user)
+        if creds is None:
+            return False
         # ASVS 11.2.4 (BACKLOG #1167). Every credential is compared, and each compare is constant-time:
         # a `next(... == ...)` search stopped at the matching slot and its `==` stopped at the first
         # differing character. The store delete below still matches the row by SQL equality.
@@ -10720,10 +10933,9 @@ class AuthService:
         # flag comes from the read above, so two concurrent removals of an account's only two
         # passkeys would each see one left and each send the "another factor remains" wording to an
         # account that now has none. The flag still gates the refusal above, which is about intent.
-        after = await self._store.get_user(identity.user_id)
-        factor_remains = bool(
-            await self._store.list_webauthn_credentials(identity.user_id)
-        ) or bool(after is not None and after.totp_enabled)
+        # The re-read account's sealed passkey digest says whether a passkey remains (#2592).
+        after = await self._load_user(identity.user_id)
+        factor_remains = after is not None and (after.has_passkeys or after.totp_enabled)
         if not factor_remains:
             await self._notify_security(
                 MFA_DISABLED,
@@ -10886,7 +11098,7 @@ class AuthService:
                 raise
             # Re-read rather than assume the name index fired: only a row now holding the name
             # makes this a username conflict. Anything else re-raises untouched.
-            if await self._store.get_user_by_username(username) is None:
+            if not await self._username_held(username):
                 raise
             raise UsernameTaken(USERNAME_TAKEN) from exc
         await self._store.set_user_roles(user_id, roles, assigned_by=actor)
@@ -10909,7 +11121,7 @@ class AuthService:
                 # notice sends the administrator's address to the account's mailbox.
                 detail={"roles": list(roles)},
             )
-        stamped = await self._store.get_user(user_id)
+        stamped = await self._load_user(user_id)
         return CreatedLocalAccount(
             user_id=user_id,
             credential=IssuedCredential(
@@ -10953,7 +11165,7 @@ class AuthService:
         still audited and announced, with ``disable_refused`` on the audit row, and the refusal is
         raised after that.
         """
-        before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
+        before = await self._load_user(user_id)  # capture old email/disabled for notifications
         if before is not None:
             # The stored spelling of the id. A store whose id column compares case-insensitively
             # (SQL Server) finds the row from a different spelling, and the early read below
@@ -11065,7 +11277,7 @@ class AuthService:
         This method does not refuse a self-target; ``PUT /users/{id}/roles`` does (BACKLOG #1149),
         so behind that route the last-administrator check is a second line, as on disable and
         delete."""
-        user = await self._store.get_user(user_id)  # for the notification address
+        user = await self._load_user(user_id)  # for the notification address
         if not await self._store.remove_unless_last_admin(
             user_id,
             AdminRemoval.SET_ROLES,
@@ -11195,8 +11407,8 @@ class AuthService:
     async def _revoke_sessions_for_role(self, role_id: str) -> None:
         """Revoke the live sessions of every user currently holding ``role_id`` so a permission
         reduction / role deletion re-resolves on their next request (ADR 0045 D3)."""
-        for user in await self._store.list_users():
-            if role_id in await self._store.get_user_role_ids(user.id):
+        for user in await self._load_users():
+            if role_id in user.role_ids:
                 await self._store.revoke_user_sessions(user.id)
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
@@ -11213,7 +11425,7 @@ class AuthService:
         ``expires_at`` is read back from the STORED ``password_changed_at`` the write above just
         stamped rather than from a fresh clock, so the surfaced instant is the one the login gate will actually refuse on.
         """
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
         if user.auth_provider != AuthProvider.LOCAL.value:
@@ -11233,7 +11445,7 @@ class AuthService:
             actor=actor,
             detail=_json({"user_id": user_id, "username": user.username}),
         )
-        stamped = await self._store.get_user(user_id)
+        stamped = await self._load_user(user_id)
         expires_at = self.initial_credential_deadline(
             None if stamped is None else stamped.password_changed_at
         )
@@ -11276,7 +11488,7 @@ class AuthService:
 
         ``user`` comes from a pass that read every account first, so the row is read again here. A
         credential claimed, replaced or disabled since that read is not reminded about."""
-        fresh = await self._store.get_user(user.id)
+        fresh = await self._load_user(user.id)
         if (
             fresh is None
             or fresh.disabled
@@ -11407,7 +11619,7 @@ class AuthService:
             if len(actors) != 1:
                 return None, "more than one administrator could have issued it"
             (actor,) = actors
-            issuer = await self._store.get_user_by_username(actor)
+            issuer = await self._load_user_by_username(actor)
             if issuer is None or issuer.created_at > issued_at:
                 # The second test: the name was freed and taken again after the row was written.
                 return None, "the issuing actor names no current account"
@@ -11547,7 +11759,7 @@ class AuthService:
                 }
             ),
         )
-        holder = await self._store.get_user(user_id)
+        holder = await self._load_user(user_id)
         await self._notify_security(
             FEDERATED_IDENTITY_UNBOUND,
             username=outcome.username,
@@ -11630,7 +11842,7 @@ class AuthService:
             raise ValueError(
                 "the subject must be the IdP's exact sub: printable ASCII, no surrounding spaces"
             )
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
         # First, and whatever pair the caller expected: a retried bind whose first try landed
@@ -11680,7 +11892,7 @@ class AuthService:
                 " this account, create it again one of those two ways, then bind the new account."
                 " Removing the account discards its user_id and what is keyed on it"
             )
-        holder = await self._store.get_user_by_federated_subject(issuer, subject)
+        holder = await self._load_user_by_federated_subject(issuer, subject)
         if holder is not None and holder.id != user_id:
             raise FederatedSubjectHeld(
                 "that identity is already bound to another account; unbind it there first"
@@ -11730,7 +11942,7 @@ class AuthService:
             # The set also matches no row when the account was deleted after the clear. That is the
             # unknown-user answer, 404 at the route, not a conflict to retry (BACKLOG #2331). The
             # clear's own removal of a previous binding is still recorded first.
-            if await self._store.get_user(user_id) is None:
+            if await self._load_user(user_id) is None:
                 if rebind:
                     await self._record_federated_unbind(user_id, cleared, actor=actor)
                 raise ValueError("no such user")
@@ -11817,7 +12029,7 @@ class AuthService:
         compare-and-set still expects the raw stored value, which is what the row holds.
 
         Raises ``ValueError("no such user")`` when the account does not exist."""
-        user = await self._store.get_user(user_id)
+        user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
         stored = user.channel_scope_source
@@ -11851,7 +12063,7 @@ class AuthService:
         if not await self._store.set_user_channel_scope_if_source(
             user_id, scope_json, source=SCOPE_SOURCE_MANUAL, expected_source=stored
         ):
-            now = await self._store.get_user(user_id)
+            now = await self._load_user(user_id)
             if now is None:
                 raise ValueError("no such user")
             # The re-read row, so ``owner`` names who holds the scope now, not what this write saw.
@@ -11925,10 +12137,10 @@ class AuthService:
         refusal comes before its profile write; never let it stand in for the guarded write.
         """
         admins: set[str] = set()
-        for user in await self._store.list_users():
+        for user in await self._load_users():
             if user.disabled:
                 continue
-            if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
+            if Role.ADMINISTRATOR.value in user.role_ids:
                 admins.add(user.id)
         return admins == {user_id}
 
@@ -11963,10 +12175,10 @@ class AuthService:
         silently. Extracting a shared enumeration is worth its own item; it is deliberately not done
         here, because it would rewrite two guards this change has no business touching.
         """
-        for user in await self._store.list_users():
+        for user in await self._load_users():
             if user.disabled or not user.notify_email:
                 continue
-            if Role.ADMINISTRATOR.value in await self._store.get_user_role_ids(user.id):
+            if Role.ADMINISTRATOR.value in user.role_ids:
                 return True
         return False
 
@@ -11996,7 +12208,7 @@ class AuthService:
         a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
         """
         revoked = 0
-        for user in await self._store.list_users():
+        for user in await self._load_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
             # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a

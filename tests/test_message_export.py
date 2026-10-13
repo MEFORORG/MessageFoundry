@@ -21,7 +21,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import ExportStopped
+from messagefoundry.api.security import ExportStopped
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS

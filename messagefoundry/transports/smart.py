@@ -337,9 +337,7 @@ class _TokenEndpointProvider(abc.ABC):
         # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical).
-        token_proxy = (
-            proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
-        )
+        token_proxy = proxy.for_host(token_url) if proxy else None
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
         # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift

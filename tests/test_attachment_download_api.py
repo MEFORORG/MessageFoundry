@@ -13,7 +13,8 @@ crux: never pull a shared content-addressed blob unlinked to an in-scope message
 attacker-influenced OBX-5.2 label. The serve-time control is *neutralize at serve*, never a sanitizing
 rewrite of the stored clinical bytes (ADR 0105 Approach B keeps the OBX-5.5 value verbatim): the label is
 DECLARED only when it exactly names one of the inert types on ``_INERT_ATTACHMENT_TYPES``, and everything
-else — browser-active, unknown or malformed — is declared ``application/octet-stream``. The match is
+else — browser-active, unknown or malformed — is declared ``application/octet-stream``. One label is
+neither: ``text/csv`` is declared ``text/plain`` and named ``.txt`` (vault BACKLOG #2802). The match is
 case-folded, so ``Image/SVG+XML`` is treated exactly like ``image/svg+xml``. The same table supplies the
 download-name extension (default ``.bin``), so no ``.svg``/``.html``/``.hta`` name is produced and the
 served filename no longer depends on ``mimetypes``, which reads the Windows registry. Every download
@@ -45,6 +46,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.api.app import (
     _ATTACHMENT_CSP,
+    _ATTACHMENT_SERVED_AS,
     _DEFAULT_ATTACHMENT_EXT,
     _INERT_ATTACHMENT_TYPES,
     _safe_attachment_content_type,
@@ -114,6 +116,7 @@ _BROWSER_ACTIVE_LABELS = (
 _MALFORMED_LABELS = (
     "image/svg+xml; charset=utf-8",
     "text/plain; charset=utf-8",
+    "text/csv; charset=utf-8",  # the text/csv alias does not reach a parameterized label either
     "text/html\r\nX-Evil: 1",
 )
 
@@ -129,7 +132,6 @@ _PASS_THROUGH_LABELS = (
     "application/dicom",
     "application/json",
     "text/plain",
-    "text/csv",
 )
 #: Leading magic so a CORRECTLY-labelled inert attachment agrees with its declared MIME (ASVS 5.2.2):
 #: the download-side MIME-vs-magic check downgrades a sniffable label whose bytes contradict it.
@@ -156,7 +158,6 @@ _SERVED_EXT: dict[str, str] = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/tiff": ".tif",
-    "text/csv": ".csv",
     "text/plain": ".txt",
 }
 #: Wraps a marker text as a well-formed SVG drawing, for a case that needs an SVG the route can parse.
@@ -438,6 +439,10 @@ def test_allowlisted_types_are_declared_verbatim(label: str) -> None:
         "application/pdf+xml",
         "text/plain-html",
         "image/png2",
+        # The text/csv alias is exact too (vault BACKLOG #2802). These passed before it existed.
+        "text/csv2",
+        "text/x-csv",
+        "application/csv",
     ],
 )
 def test_allowlist_match_is_exact_not_substring(label: str) -> None:
@@ -544,6 +549,49 @@ def test_pdf_stays_on_the_allowlist_by_recorded_decision() -> None:
     assert _INERT_ATTACHMENT_TYPES["application/pdf"] == ".pdf"
     doc = _safe_attachment_content_type.__doc__ or ""
     assert "never whether the file is served" in doc
+
+
+# --- vault BACKLOG #2802: a text/csv label is served as plain text, by recorded decision ------------
+
+#: A synthetic CSV whose cells start with ``=``, ``+``, ``-`` and ``@``.
+_FORMULA_CSV = b"name,value\r\n=1+1,+2\r\n-3,@SUM(A1)\r\n"
+
+
+async def test_csv_label_is_served_as_plain_text_with_a_txt_name(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """A ``text/csv`` label is declared ``text/plain`` and the download is named ``.txt``. The
+    reasoning is beside ``_INERT_ATTACHMENT_TYPES``. Before that decision the route served
+    ``text/csv`` and ``attachment-<ref>.csv``, and the type and name assertions below each fail on that.
+
+    What this does NOT assert is which program opens either name."""
+    mid, ref = await _seed_labelled(engine, "text/csv", marker="csv", prefix=_FORMULA_CSV)
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert _base_media_type(r) == "text/plain"
+    assert r.headers["content-disposition"] == _disposition(ref, ".txt")
+    # The served bytes are the stored document, formula cells included. Only the label moved.
+    assert r.content == _FORMULA_CSV + b"synthetic document csv not real PHI"
+    # The stored label is untouched, so the console's attachment list still names the sender's type.
+    (att,) = (await client.get(f"/messages/{mid}")).json()["attachments"]
+    assert att["content_type"] == "text/csv"
+
+
+def test_csv_is_off_the_allowlist_by_recorded_decision() -> None:
+    """``text/csv`` is served as ``text/plain`` on purpose, and the reasoning lives beside the table.
+
+    This pins the decision the way the PDF test above pins the opposite one. A later lane that puts
+    ``text/csv`` back on the allow-list, or empties the alias table, fails here and has to answer the
+    recorded argument. The alias table is pinned as a literal, so a new entry needs its own decision.
+    The alias reuses the case-folded key, so a mixed-case label lands on the same type."""
+    assert "text/csv" not in _INERT_ATTACHMENT_TYPES
+    assert _ATTACHMENT_SERVED_AS == {"text/csv": "text/plain"}
+    # The table's two rules, in general form, so a later entry that only updates the literal above
+    # still has to keep them. A target off the allow-list would silently serve as the generic type.
+    assert set(_ATTACHMENT_SERVED_AS.values()) <= set(_INERT_ATTACHMENT_TYPES)
+    assert not set(_ATTACHMENT_SERVED_AS) & set(_INERT_ATTACHMENT_TYPES)
+    for label in ("text/csv", "Text/CSV", "TEXT/CSV"):
+        assert _safe_attachment_content_type(label) == "text/plain"
 
 
 async def test_download_carries_sandbox_csp(engine: Engine, client: httpx.AsyncClient) -> None:

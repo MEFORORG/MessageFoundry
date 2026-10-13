@@ -52,7 +52,8 @@ this line.**
   of its list, count and export, and never which. `/ui/security-events` says that a change an
   administrator made to the account is not listed there, and that it is emailed when it can be.
   Seam change: `AuditList` carries `withheld`, and `AdminHandlers` gains `export_audit`.
-  (BACKLOG #2446)
+  (BACKLOG #2446) The route passes its cookie session to `export_audit`, which resolves it again
+  before each page and stops a download whose session or permission is gone. (BACKLOG #1154)
 - **The approvals page resolves an interrupted release, and shows what each hold captured.** An
   `interrupted` release offers the resolve, *Effects applied* or *Effects not applied*, behind a
   required "I checked its effects" box, through `POST /ui/approvals/{id}/resolve/{outcome}`. It

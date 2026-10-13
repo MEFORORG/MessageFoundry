@@ -48,6 +48,9 @@ re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
 **The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
 required contexts, nothing else.
 
+**A relayed owner stop gets a confirmation in your own chat, and you keep merging** (owner ruling
+2026-10-11, korus `LANDER.md`). Ask in your end-of-turn owner table; merge until the owner answers.
+
 A new authority grant ADDS to what you already hold; it never narrows it. Ask whether you already
 hold more, not what the message covers.
 

@@ -6,10 +6,11 @@ At least these callers drive a :func:`zlib.decompressobj` against a byte ceiling
 :func:`messagefoundry.parsing.compression.deflate_decompress` (zlib-wrapped),
 :func:`messagefoundry.parsing.compression.gzip_decompress` (one gzip member per call; BACKLOG
 #1129) and :func:`messagefoundry.parsing.dicom._inflate.bounded_inflate_or_error` (raw DEFLATE,
-discards the output). The codec's trial pass discards it too (BACKLOG #1129). They used to carry
-copies of this loop, so a fix could reach one and
-not the other. The end-of-stream hang (BACKLOG #1964) was fixed in one copy first for exactly that
-reason.
+discards the output). The codec's trial pass discards it too (BACKLOG #1129). So do the SVGZ trial
+passes in :mod:`messagefoundry.api.svg_sanitize`, which walk a gzip attachment's members before
+the pass that keeps the document. The codec and the DICOM guard used to carry copies of this loop,
+so a fix could reach one and not the other. The end-of-stream hang (BACKLOG #1964) was fixed in one
+copy first for exactly that reason.
 
 The loop keeps these guarantees for every caller:
 

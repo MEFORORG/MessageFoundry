@@ -1221,7 +1221,8 @@ rules are recorded once, in
 [ADR 0105's 2026-09-28 amendment](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md). The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
 which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
 reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
-`text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served
+and the raster image types), matched case-folded and length-bounded. A `text/csv` label is served as
+`text/plain`, for the reason given below. Everything else is served
 as `application/octet-stream` -- every **browser-active** type (`text/html`, `image/svg+xml`,
 `application/hta`), every type nobody listed, and every non-clean or over-long value. The direction
 matters: the earlier control listed the browser-active subtypes to refuse, which asked a reviewer to prove
@@ -1245,6 +1246,22 @@ oversight: a PDF can carry script that runs in a viewer once a saved file is ope
 against the document rather than against the serving origin, and the declared type stops governing the
 moment the file is on disk. The instrument for the local-open threat would be content scanning, which this
 route does not do.
+
+`text/csv` gets the other answer, by a decision recorded beside the same table. A document the sender
+labelled `text/csv` downloads as `text/plain` with a `.txt` name. A sender can start a cell with `=`, and
+a spreadsheet evaluates that cell when it opens the file. The route serves a CSV's stored bytes as they
+are, so the `.txt` name is what keeps a double-click away from a spreadsheet. The comment beside the
+table holds the reasoning and the limits. At least these limits matter to an operator:
+
+- **Do not give a downloaded attachment a `.csv` name to open it.** Renaming it, or importing it into a
+  spreadsheet, still evaluates its cells.
+- The message page's attachment list still shows the sender's `text/csv` label, so the `.txt` name is
+  expected. The page carries no note that says so.
+- Which program opens a `.txt` file is set by your own host. Nobody has tested this route against a
+  browser or a spreadsheet.
+- Only the exact label `text/csv` is covered. Another spelling, such as `application/csv` or
+  `text/csv; charset=utf-8`, downloads as `application/octet-stream` with a `.bin` name, like any
+  unlisted type. The first limit applies to that file too.
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
@@ -1479,12 +1496,12 @@ the four HTTP destinations, and their own sections point here.
 
 | Destination | Write | `capture_response` | An over-size body after a 2xx |
 |---|---|---|---|
-| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped. The message gets a `reply_dropped` event, and then a WARNING names the connection and the message |
 | REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
 | SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
 | DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
 | FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
-| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | off | **delivered**, with the same event and WARNING |
 | FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
 
 **Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
@@ -1507,7 +1524,8 @@ body may instead have held a rejection. Its stored error carries the code `reply
 
 **A 2xx reply cut short or misframed (BACKLOG #2989).** A body that ends before the length the
 partner declared, or one framed in a way RFC 9112 does not allow, follows the same table. Where the
-table says delivered, the body is dropped and a WARNING says what was wrong with it. Where it says
+table says delivered, the body is dropped, the message gets a `reply_dropped` event that says
+what was wrong with it, and then a WARNING says the same. Where it says
 permanent refusal, the code is `reply-truncated` or `reply-misframed` instead of `reply-too-large`.
 Either way the request is sent once. A partner or a middlebox that closes the connection cleanly
 before the declared length counts as cut short, so where the body is needed that message
@@ -1547,6 +1565,15 @@ on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`
 follows the posture, so under `[security].enforcement = warn` it logs a WARNING and the connection
 builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
 connection's `proxy_url` and still follows a proxy from the environment.
+
+A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
+proxy override list) sends direct with no proxy credential, and logs a WARNING (vault BACKLOG
+#3442). A connection that sets `proxy_user` and also writes a `Proxy-Authorization` into `headers`
+fails to build (vault BACKLOG #3443). Its proxy handler admits a caller-set `Proxy-Authorization`
+in the plain spelling once the `proxy_user` credential passes, so it could not tell a static
+header spelled that way from its own. A static header in any other spelling of that name fails
+the build too, and the opener never admits one. The rule is on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
 
 Which legs reach the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
@@ -2025,7 +2052,7 @@ unrecognized fault is treated as permanent (so a rejected request can't loop the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
 + HTTP status. A 2xx whose body is over the byte bound cannot be inspected, so it is a permanent refusal
-and is not sent again: see *A 2xx reply over the byte bound* under REST.
+and is not sent again: see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, secrets via `env()`). Delivery is **at-least-once**, so a retry **re-sends** —
@@ -2426,7 +2453,7 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
-  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under REST.
+  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
@@ -2504,7 +2531,7 @@ never an error). On an error status the HTTP code decides, refined by the `Opera
 `incomplete`), or `408`/`429` → retry; any other 4xx / refused 3xx → **dead-letter**. The HTTP status wins
 when in doubt (a 5xx stays transient). `OperationOutcome`/reply bodies are **not** echoed into errors/logs
 (they may carry PHI) — only the HTTP status + a redacted URL. For a 2xx whose body is over the byte bound,
-see *A 2xx reply over the byte bound* under REST.
+see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, cleartext-credential refusal, optional detached-JWS signing, secrets via `env()`).
@@ -2850,7 +2877,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
 a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
 over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
-again: see *A 2xx reply over the byte bound* under REST. **PHI:** the response can
+again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python

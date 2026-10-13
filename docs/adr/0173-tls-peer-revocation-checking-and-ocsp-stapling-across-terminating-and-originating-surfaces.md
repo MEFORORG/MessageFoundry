@@ -1198,7 +1198,8 @@ the peer, refuses the peer in either load order. Locate it by symbol: `reload_re
 **It fails closed.** A replacement must pass the start rules (`judge_crl_bytes`), carry no certificate
 the hop does not already trust (proved on a scratch context first, because a load cannot be undone),
 have each CRL's signature verify against a CA certificate the hop lists for its issuer (OpenSSL
-checks it only at the handshake, so a badly signed CRL would load and then fail every handshake), and
+checks it only at the handshake, so without this a badly signed CRL would be applied and then fail
+every handshake), and
 supersede every CRL the hop holds. Otherwise the hop keeps its copy, an ERROR names the reason, and
 the expiry monitor keeps judging the held copy. The start rules now also refuse a file whose only CRL
 for some issuer is not in effect yet, at a start and at a reload, because OpenSSL would pick it and
@@ -1207,6 +1208,18 @@ check sees only the hop's own trust store, so a CRL issued by an intermediate th
 refused, retried every pass, and applied by a restart. A context only gains CRLs, so `[cert_monitor].crl_max_reloads` (default 10,000)
 caps the reloads one context takes for one file; past it, a restart applies the file. Nothing is fetched: this reads the configured file
 only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are untouched.
+
+**CORRECTED 2026-10-12 (vault BACKLOG #2905, owner ruling 2026-10-05).** The paragraph above said a
+badly signed CRL "would load and then fail every handshake". That described a start as well as
+OpenSSL, and a start has changed. `harden_crl_check` now checks each CRL's signature against the
+hop's own CA list. It refuses one case only: the CRL names a listed CA's key by key identifier, and
+that key did not sign it. Anything short of that proof loads with a WARNING, at least an issuer the
+hop does not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
+under "CRL files", is the one place that says how often it is logged and what a refusal stops.
+So the reload refuses more than a start does, on purpose. The ruling's reason is a CA that
+renewed its key: its CRL can fail the engine's check while handshakes still pass, because OpenSSL
+takes a CRL's issuer from the peer's chain. That was measured for one chain shape, not for every one.
+There is no setting for this check. Locate it by symbol: `_check_crl_signatures`.
 
 **What this does to §6 trigger 4.** Its second clause names *"an in-engine CRL refresh that does not
 fetch"*. A reload from the configured file is that, for every hop whose load is recorded. This note
