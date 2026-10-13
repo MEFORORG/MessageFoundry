@@ -30,6 +30,7 @@ gets carried, and the value is exactly what is wrong here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -78,8 +79,12 @@ def _repo(root: Path, name: str) -> Path:
 
 
 def _cache_path(repo: Path) -> Path:
+    """One cache file per querying root, named as overlap.ps1 names it."""
     common = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-    return Path(common) / "mefor-coord" / "overlap-cache.json"
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
+    norm = top.replace("\\", "/").rstrip("/").lower()
+    key = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:8]
+    return Path(common) / "mefor-coord" / "overlap-cache" / f"{key}.json"
 
 
 def _run(repo: Path, sandbox: Path, *args: str) -> subprocess.CompletedProcess[str]:
