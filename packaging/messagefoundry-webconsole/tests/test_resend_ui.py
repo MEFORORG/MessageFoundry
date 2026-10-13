@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import create_local_user_chosen, issue_continuation
 
 from messagefoundry.api import create_app
 from messagefoundry.api.models import EventInfo, MessageDetail, OutboxInfo
@@ -316,6 +316,9 @@ async def _mint(c: httpx.AsyncClient, mid: str) -> None:
     continues to the confirm page. The grant names the action, not the target, so one selection
     serves every target a test posts."""
     nxt = f"/ui/messages/{mid}/resend-confirm?" + urlencode({"to": "OB2", "source": "archive"})
+    # Issued first, as the gate's refusal issues it: /ui/reauth mints only for an issued
+    # continuation (owner ruling 2026-10-13, #3241 R3).
+    issue_continuation(c, nxt)
     r = await c.post(
         "/ui/reauth",
         data={"next": nxt, "password": PW},

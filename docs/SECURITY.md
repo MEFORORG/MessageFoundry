@@ -1649,7 +1649,10 @@ else would need its own authorization rule stated here.
    browser cannot act on. The page names the action, and after the re-authentication it
    auto-submits a body-less action **only when a step-up gate issued that continuation to this
    session**, once; any other `next` ends on a page saying nothing ran (vault BACKLOG #2764,
-   [ADR 0065](adr/0065-web-ops-dashboard.md) amendment of 2026-10-06).
+   [ADR 0065](adr/0065-web-ops-dashboard.md) amendment of 2026-10-06). An unlock page (a confirm
+   page or the editor) follows the same rule for its action-bound grant: the re-auth mints it only
+   when a gate issued that page to this session, once. A crafted `/ui/reauth?next=<unlock page>`
+   still lands on the page, which then asks again (owner ruling 2026-10-13, #3241 R3).
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
@@ -2406,7 +2409,8 @@ grant that a step-up mints for that action instead:
 
 A JSON client answers the 403 with `POST /me/reauth`, setting `purpose` to the action the 403 named
 in `X-Step-Up-Action`; the engine client does this itself. The console's re-auth page mints the grant
-when it continues to the action's confirm page, editor or auto-retry. The message editor asks for the
+when it continues to the action's confirm page, editor or auto-retry, and only for a continuation a
+gate issued to this session (owner ruling 2026-10-13, #3241 R3). The message editor asks for the
 grant before it opens and the resubmit spends it after its own input checks, so a re-auth no longer
 drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
 The purge and upload-resend confirm pages hold their proof the same way, so the window alone no
