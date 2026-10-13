@@ -20,6 +20,7 @@ Synthetic HL7 only.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import math
 import sqlite3
@@ -30,14 +31,15 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config.models import BatchConfig, RetryPolicy
+from messagefoundry.config.models import BatchConfig, InternalErrorPolicy, RetryPolicy
 from messagefoundry.config.settings import DeliverySettings, EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.binary import DOC_REF_MARKER, chunk_b64, make_doc_ref
 from messagefoundry.pipeline.stage_dispatcher import LaneResultKind
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
-from messagefoundry.store import MessageStore, OutboxStatus
-from messagefoundry.store.crypto import CipherError
+from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from messagefoundry.store.cell_tag import MESSAGE_TAG_FAILED_ACTION
+from messagefoundry.store.crypto import AesGcmCipher, CipherError, generate_key, make_cipher
 from messagefoundry.transports.base import DeliveryError
 
 DEST = "OB_TEST_ORU"
@@ -361,6 +363,62 @@ async def test_control_a_metadata_cell_that_fails_decryption_still_dead_letters(
     assert outcome is _ItemOutcome.PROCESSED and retry_until is None
     assert await _status(store, mid) == OutboxStatus.DEAD.value
     assert sender.sent == []
+
+
+async def test_a_metadata_cell_that_fails_its_tag_dead_letters_under_the_stop_policy(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #2593: the dynamic_headers metadata read of a message moved to another channel
+    dead-letters the outbound row, audits it and alerts once, even under ``internal_error=stop``,
+    instead of halting the lane. Control: an intact message delivers its headers."""
+    db = tmp_path / "tagged.db"
+    cipher = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(cipher, AesGcmCipher)
+    store = await MessageStore.open(db, cipher=cipher)
+    alerts: list[tuple[str, str]] = []
+    cipher.set_tag_failure_hook(lambda table, reason: alerts.append((table, reason)))
+    side = sqlite3.connect(db, timeout=30)  # a writer with no key, outside the store
+    try:
+        sender = _Sender(consumes_metadata=True)
+        runner = _runner(store, sender)
+        runner._internal_error_default = InternalErrorPolicy.STOP
+        raw = _hl7("plain")
+        meta = json.dumps({"user": {"X-Synth": "v1"}})
+
+        ctl = await store.enqueue_message(
+            channel_id="IB", raw=raw, deliveries=[(DEST, raw)], metadata=meta, now=100.0
+        )
+        item = await store.claim_next_fifo(DEST)
+        assert item is not None
+        outcome, _ = await runner._process_delivery_item(DEST, item)
+        assert outcome is _ItemOutcome.PROCESSED  # control: the intact cell delivers
+        assert sender.metadata == [{"X-Synth": "v1"}]
+        assert await _status(store, ctl) == OutboxStatus.DONE.value
+
+        mid = await store.enqueue_message(
+            channel_id="IB", raw=raw, deliveries=[(DEST, raw)], metadata=meta, now=101.0
+        )
+        side.execute("UPDATE messages SET channel_id='IB_ELSE' WHERE id=?", (mid,))
+        side.commit()
+        item = await store.claim_next_fifo(DEST)
+        assert item is not None and item.message_id == mid
+        outcome, retry_until = await runner._process_delivery_item(DEST, item)
+
+        assert outcome is _ItemOutcome.PROCESSED and retry_until is None  # not STOPPED
+        assert await _status(store, mid) == OutboxStatus.DEAD.value
+        assert len(sender.sent) == 1  # nothing more was sent
+        status = side.execute("SELECT status FROM messages WHERE id=?", (mid,)).fetchone()[0]
+        assert status == MessageStatus.ERROR.value
+        audited = [
+            r
+            for r in await store.list_audit(action=MESSAGE_TAG_FAILED_ACTION)
+            if mid[:12] in str(r["detail"])
+        ]
+        assert len(audited) == 1
+        assert [t for t, r in alerts if mid[:12] in r] == ["messages"]
+    finally:
+        side.close()
+        await store.close()
 
 
 async def test_control_a_batch_member_that_will_not_parse_still_dead_letters(

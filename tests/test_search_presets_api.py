@@ -18,6 +18,8 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from messagefoundry.store.cell_tag import PRESET_TAG_FAILED_ACTION
+from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -258,6 +260,60 @@ async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored:
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     assert r.status_code == 400, r.text
     assert r.json()["detail"] == f"preset {pid} has malformed criteria"
+
+
+async def test_a_preset_moved_to_another_owner_answers_423(tmp_path: Path) -> None:
+    """BACKLOG #2593: criteria bind their owner. A preset moved to another account outside the store
+    is refused on the layered recall with a 423, audited and alerted once, never a 500. Control: the
+    caller's own intact preset recalls."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    cipher = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(cipher, AesGcmCipher)
+    store = await MessageStore.open(tmp_path / "keyed.db", cipher=cipher)
+    keyed = Engine(store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False))
+    try:
+        service = await _user(keyed, Role.OPERATOR, "op")
+        other = await _user(keyed, Role.OPERATOR, "op2")
+        me = await other.store.get_user_by_username("op")
+        assert me is not None
+        alerts: list[tuple[str, str]] = []
+        cipher.set_tag_failure_hook(lambda table, reason: alerts.append((table, reason)))
+        transport = httpx.ASGITransport(app=create_app(keyed, auth=service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            h, h2 = await _login(c, "op"), await _login(c, "op2")
+
+            async def mk(headers: dict[str, str], name: str) -> str:
+                r = await c.post(
+                    "/search/presets",
+                    json={"name": name, "criteria": {"content": "MRN999"}},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+                return str(r.json()["id"])
+
+            mine = await mk(h, "mine")
+            r = await c.get("/search/layered", params={"presets": mine}, headers=h)
+            assert r.status_code == 200, r.text  # control: an intact preset recalls
+
+            moved = await mk(h2, "theirs")
+            await store._db.execute(
+                "UPDATE search_presets SET owner_user_id=? WHERE id=?", (me.id, moved)
+            )
+            await store._db.commit()
+            r = await c.get("/search/layered", params={"presets": moved}, headers=h)
+            assert r.status_code == 423, r.text
+            assert "MRN999" not in r.text
+        audited = [
+            a
+            for a in await store.list_audit(action=PRESET_TAG_FAILED_ACTION)
+            if moved[:12] in str(a["detail"])
+        ]
+        assert len(audited) == 1
+        assert [t for t, reason in alerts if moved[:12] in reason] == ["search_presets"]
+    finally:
+        await keyed.stop()
 
 
 async def test_layered_requires_read_permission(engine: Engine) -> None:
