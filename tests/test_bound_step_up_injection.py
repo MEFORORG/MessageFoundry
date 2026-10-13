@@ -40,7 +40,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.config.settings import AuthSettings, EgressSettings, StoreSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, ResendKeyConflict
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
@@ -212,7 +212,12 @@ async def test_a_bound_route_admits_its_own_proof_once(
         first = await _call(c, token, method, path, body, query)
         assert _past_the_step_up(first), (first.status_code, dict(first.headers), first.text)
         again = await _call(c, token, method, path, body, query)
-        assert _refused_for(again, action), "the grant must be single-use"
+        if action == STEP_UP_ACTION_MESSAGE_EDIT_RESEND:
+            # The id names nothing, so the 404 came before the store write and the proof was given
+            # back (owner ruling 2026-10-13, #3241 R1). Single use after a write is pinned below.
+            assert _past_the_step_up(again), (again.status_code, dict(again.headers))
+        else:
+            assert _refused_for(again, action), "the grant must be single-use"
 
 
 @pytest.mark.parametrize(("action", "method", "path", "body", "query"), BOUND, ids=_IDS)
@@ -350,3 +355,84 @@ def test_the_bound_route_suites_run_with_the_proof_on() -> None:
         source = (here / name).read_text(encoding="utf-8")
         assert "require_action_step_up=False" not in source, f"{name} switches the bound proof off"
         assert "reproving_transport" in source, f"{name} no longer re-proves as a client does"
+
+
+# --- edit-resend refunds a proof its refusal never used (owner ruling 2026-10-13, #3241 R1) -------
+
+
+async def _edit_resend_engine(tmp_path: Path) -> Engine:
+    from tests.test_edit_resend import _registry
+
+    engine = await Engine.create(
+        tmp_path / "refund.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    return engine
+
+
+async def _edit_resend(c: httpx.AsyncClient, token: str, mid: str, **extra: Any) -> httpx.Response:
+    return await c.post(
+        f"/messages/{mid}/edit-resend",
+        json={"raw": ADT, "idempotency_key": extra.pop("key", "k1"), **extra},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+async def test_an_edit_resend_refused_before_its_store_write_gives_the_proof_back(
+    tmp_path: Path,
+) -> None:
+    """Each refusal raised before the store write (an unknown message 404, an unknown target 404, an
+    origin inbound this engine does not own 409) gives the proof back. The edit that follows then
+    runs on the SAME proof, and spends it: the write is what single use counts."""
+    pytest.importorskip("psutil")
+    engine = await _edit_resend_engine(tmp_path)
+    try:
+        service = await _service(engine)
+        await _add(service, "adm", [Role.ADMINISTRATOR.value])
+        mid = await engine.store.enqueue_message(
+            channel_id="in1", raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG1"
+        )
+        stray = await engine.store.enqueue_message(
+            channel_id="IB_NOT_HERE", raw=ADT, deliveries=[], message_type="ADT^A01"
+        )
+        async with _client(engine, service, tmp_path) as c:
+            token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            assert (await _edit_resend(c, token, NO_SUCH, reroute=True)).status_code == 404
+            assert (await _edit_resend(c, token, mid, to="OB_NOPE")).status_code == 404
+            assert (await _edit_resend(c, token, stray, reroute=True)).status_code == 409
+            done = await _edit_resend(c, token, mid, reroute=True)
+            assert done.status_code == 200 and done.json()["status"] == "resubmitted", done.text
+            # CONTROL: the write spent it, so the next edit asks again.
+            again = await _edit_resend(c, token, mid, reroute=True, key="k2")
+            assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), again.status_code
+    finally:
+        await engine.stop()
+
+
+async def test_an_edit_resend_refused_at_its_store_write_keeps_the_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal from the store call itself may follow a commit, so it gives nothing back."""
+    pytest.importorskip("psutil")
+    engine = await _edit_resend_engine(tmp_path)
+    try:
+        service = await _service(engine)
+        await _add(service, "adm", [Role.ADMINISTRATOR.value])
+        mid = await engine.store.enqueue_message(
+            channel_id="in1", raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG1"
+        )
+
+        async def refused_at_the_store(*_a: Any, **_k: Any) -> Any:
+            raise ResendKeyConflict("idempotency key already used for another target")
+
+        monkeypatch.setattr(engine, "edit_resend_reroute", refused_at_the_store)
+        async with _client(engine, service, tmp_path) as c:
+            token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            assert (await _edit_resend(c, token, mid, reroute=True)).status_code == 409
+            again = await _edit_resend(c, token, mid, reroute=True, key="k2")
+            assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), again.status_code
+    finally:
+        await engine.stop()

@@ -6538,55 +6538,138 @@ def create_app(
         message records its origin as ``operator_edit`` with the acting user, so the edited body can
         be proved after retention has blanked both bodies (vault BACKLOG #2615,
         :func:`_edit_resend_provenance`)."""
-        # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
-        row = await get_scoped_message(engine, identity, message_id, request)
+        # Owner ruling 2026-10-13 (#3241 R1): a refusal raised BEFORE the store write gives back the
+        # proof the gate spent (ADR 0197 Amendment C), so an edit the engine refused costs the
+        # operator no password and the console can re-open the editor without a re-auth. `written`
+        # turns true just before the store call: a refusal from there on keeps the spend, because the
+        # store may have committed. The console calls this handler in-process after its own spend,
+        # so the refund reaches both planes.
+        written = False
+        try:
+            # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
+            row = await get_scoped_message(engine, identity, message_id, request)
 
-        if body.to is not None:
-            # DIRECT power-path: deliver the edited body straight to an alternate outbound. Same cross-
-            # channel authorization + target validation as #123's resend (registered/owned/running).
-            if not identity.can_access_channel(body.to):
-                await _audit_channel_denied(engine, identity, body.to, client_ip(request))
-                raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+            if body.to is not None:
+                # DIRECT power-path: deliver the edited body straight to an alternate outbound. Same cross-
+                # channel authorization + target validation as #123's resend (registered/owned/running).
+                if not identity.can_access_channel(body.to):
+                    await _audit_channel_denied(engine, identity, body.to, client_ip(request))
+                    raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+                rr = engine.registry_runner
+                if rr is None or body.to not in rr.registry.outbound:
+                    raise HTTPException(404, f"no such outbound connection: {body.to}")
+                # THE BACK DOOR (#233, ADR 0111): the direct path reuses #123's resend seam, which inserts an
+                # outbound-stage row DIRECTLY (store.resend_to) without transform_one — so, exactly like
+                # /resend above, the transform-time not-deployed decline does not cover it. Refuse a
+                # not-deployed target so an operator can't hand-queue a row into a lane with no connector.
+                if not rr.registry.outbound[body.to].deployed:
+                    raise HTTPException(409, str(NotDeployedError(body.to)))
+                owner = rr.destination_owner(body.to)
+                if owner is not None and owner != rr.registry.shard_id:
+                    raise HTTPException(
+                        409,
+                        f"outbound {body.to!r} is owned by engine shard {owner!r} —"
+                        " resend on that shard's API",
+                    )
+                try:
+                    if not rr.outbound_running(body.to):
+                        raise HTTPException(409, _outbound_down_detail(rr, body.to))
+                except KeyError:
+                    raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
+                admitted = await _guard_resubmission(
+                    engine,
+                    identity,
+                    request,
+                    raw=body.raw,
+                    inbound=None,
+                    action="message_edit_resend_reject",
+                    channel_id=row["channel_id"],
+                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                )
+                client = client_ip(request)
+
+                direct_provenance = await _edit_resend_provenance(engine, row, admitted)
+
+                def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
+                    # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
+                    if direct.status != "resent":
+                        return None
+                    return AuditAppend(
+                        "message_edit_resend",
+                        actor=identity.username,
+                        channel_id=row["channel_id"],
+                        detail=json.dumps(
+                            {
+                                "message_id": message_id,
+                                "mode": "direct",
+                                "to": direct.to_destination,
+                                "outbox_id": direct.outbox_id,
+                                "new_message_id": direct.new_message_id,
+                                **direct_provenance,
+                            }
+                        ),
+                        client=client,
+                    )
+
+                written = True  # from here a refusal may follow the store write
+                try:
+                    direct = await engine.edit_resend_direct(
+                        message_id,
+                        to=body.to,
+                        raw=admitted,
+                        idempotency_key=body.idempotency_key,
+                        audit=_direct_audit,
+                        actor=identity.username,
+                    )
+                except ResendError as exc:
+                    # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
+                    # carries ids only (never the body — the messages don't interpolate ``raw``).
+                    raise HTTPException(409, str(exc)) from None
+                return EditResendResult(
+                    message_id=message_id,
+                    status=direct.status,
+                    reroute=False,
+                    to=direct.to_destination,
+                    outbox_id=direct.outbox_id,
+                )
+
+            # RE-ROUTE (default): re-ingress the edited body on the origin channel. `reroute` must be set
+            # (guards against a request that supplied neither a target nor an explicit reroute intent).
+            if not body.reroute:
+                raise HTTPException(
+                    400,
+                    "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
+                )
+            # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
+            # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
+            # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
+            # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
             rr = engine.registry_runner
-            if rr is None or body.to not in rr.registry.outbound:
-                raise HTTPException(404, f"no such outbound connection: {body.to}")
-            # THE BACK DOOR (#233, ADR 0111): the direct path reuses #123's resend seam, which inserts an
-            # outbound-stage row DIRECTLY (store.resend_to) without transform_one — so, exactly like
-            # /resend above, the transform-time not-deployed decline does not cover it. Refuse a
-            # not-deployed target so an operator can't hand-queue a row into a lane with no connector.
-            if not rr.registry.outbound[body.to].deployed:
-                raise HTTPException(409, str(NotDeployedError(body.to)))
-            owner = rr.destination_owner(body.to)
-            if owner is not None and owner != rr.registry.shard_id:
+            origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
+            if origin is None:
                 raise HTTPException(
                     409,
-                    f"outbound {body.to!r} is owned by engine shard {owner!r} —"
-                    " resend on that shard's API",
+                    f"origin inbound {row['channel_id']!r} is not registered on this engine; "
+                    "re-route on the engine shard that owns it",
                 )
-            try:
-                if not rr.outbound_running(body.to):
-                    raise HTTPException(409, _outbound_down_detail(rr, body.to))
-            except KeyError:
-                raise HTTPException(404, f"no such outbound connection: {body.to}") from None
-            # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-            # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
             admitted = await _guard_resubmission(
                 engine,
                 identity,
                 request,
                 raw=body.raw,
-                inbound=None,
+                inbound=origin,
                 action="message_edit_resend_reject",
                 channel_id=row["channel_id"],
-                detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                detail={"message_id": message_id, "mode": "reroute"},
             )
             client = client_ip(request)
+            reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
 
-            direct_provenance = await _edit_resend_provenance(engine, row, admitted)
-
-            def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
-                # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
-                if direct.status != "resent":
+            def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
+                # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
+                if outcome.status != "resubmitted":
                     return None
                 return AuditAppend(
                     "message_edit_resend",
@@ -6595,105 +6678,37 @@ def create_app(
                     detail=json.dumps(
                         {
                             "message_id": message_id,
-                            "mode": "direct",
-                            "to": direct.to_destination,
-                            "outbox_id": direct.outbox_id,
-                            "new_message_id": direct.new_message_id,
-                            **direct_provenance,
+                            "mode": "reroute",
+                            "new_message_id": outcome.new_message_id,
+                            "channel_id": outcome.channel_id,
+                            **reroute_provenance,
                         }
                     ),
                     client=client,
                 )
 
+            written = True  # from here a refusal may follow the store write
             try:
-                direct = await engine.edit_resend_direct(
+                outcome = await engine.edit_resend_reroute(
                     message_id,
-                    to=body.to,
                     raw=admitted,
                     idempotency_key=body.idempotency_key,
-                    audit=_direct_audit,
+                    audit=_reroute_audit,
                     actor=identity.username,
                 )
             except ResendError as exc:
-                # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
-                # carries ids only (never the body — the messages don't interpolate ``raw``).
                 raise HTTPException(409, str(exc)) from None
             return EditResendResult(
                 message_id=message_id,
-                status=direct.status,
-                reroute=False,
-                to=direct.to_destination,
-                outbox_id=direct.outbox_id,
+                status=outcome.status,
+                reroute=True,
+                new_message_id=outcome.new_message_id,
             )
-
-        # RE-ROUTE (default): re-ingress the edited body on the origin channel. `reroute` must be set
-        # (guards against a request that supplied neither a target nor an explicit reroute intent).
-        if not body.reroute:
-            raise HTTPException(
-                400,
-                "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
-            )
-        # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
-        # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
-        # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
-        # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
-        rr = engine.registry_runner
-        origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
-        if origin is None:
-            raise HTTPException(
-                409,
-                f"origin inbound {row['channel_id']!r} is not registered on this engine; "
-                "re-route on the engine shard that owns it",
-            )
-        admitted = await _guard_resubmission(
-            engine,
-            identity,
-            request,
-            raw=body.raw,
-            inbound=origin,
-            action="message_edit_resend_reject",
-            channel_id=row["channel_id"],
-            detail={"message_id": message_id, "mode": "reroute"},
-        )
-        client = client_ip(request)
-        reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
-
-        def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
-            # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
-            if outcome.status != "resubmitted":
-                return None
-            return AuditAppend(
-                "message_edit_resend",
-                actor=identity.username,
-                channel_id=row["channel_id"],
-                detail=json.dumps(
-                    {
-                        "message_id": message_id,
-                        "mode": "reroute",
-                        "new_message_id": outcome.new_message_id,
-                        "channel_id": outcome.channel_id,
-                        **reroute_provenance,
-                    }
-                ),
-                client=client,
-            )
-
-        try:
-            outcome = await engine.edit_resend_reroute(
-                message_id,
-                raw=admitted,
-                idempotency_key=body.idempotency_key,
-                audit=_reroute_audit,
-                actor=identity.username,
-            )
-        except ResendError as exc:
-            raise HTTPException(409, str(exc)) from None
-        return EditResendResult(
-            message_id=message_id,
-            status=outcome.status,
-            reroute=True,
-            new_message_id=outcome.new_message_id,
-        )
+        except HTTPException:
+            auth = get_auth(request)
+            if not written and auth is not None:
+                auth.refund_action_step_up(STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            raise
 
     # --- offline uploaded logs (BACKLOG #125/#126, ADR 0134) -----------------
 

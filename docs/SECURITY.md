@@ -2408,8 +2408,11 @@ in `X-Step-Up-Action`; the engine client does this itself. The console's re-auth
 when it continues to the action's confirm page, editor or auto-retry. The message editor asks for the
 grant before it opens and the resubmit spends it after its own input checks, so a re-auth no longer
 drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
-A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
-editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
+A refusal the engine handler raises before its store write gives the proof back (owner ruling
+2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
+refusal from the store call on keeps the spend, because the store may have committed: the next
+submit asks again and re-opens the editor from the stored body, as an expired grant (300 s by
+default) does. The console resend checks
 its own input before it spends the proof too. On both, a double-click asks for no second proof.
 The console marks each request it spends a proof on. Only an identical request rides on that mark.
 For a resend that means the same key, target and source. For an edit-resend it means the same key,
