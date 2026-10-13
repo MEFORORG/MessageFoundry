@@ -756,8 +756,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     cert_import = cert_sub.add_parser(
         "import",
         help="import a PKCS#12/.pfx bundle into cert.pem / key.pem / ca-chain.pem. The passphrase is "
-        "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written 0600 and refuses to "
-        "overwrite an existing key",
+        "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written owner-only (mode 0600 "
+        "on POSIX, a restrictive access list on Windows) and refuses to overwrite an existing key",
     )
     cert_import.add_argument(
         "--pfx", required=True, help="path to the PKCS#12/.pfx bundle to import"
@@ -802,13 +802,21 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "self-signed",
         help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
         "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
-        "it); key.pem is written 0600 and refuses to overwrite an existing key",
+        "it); key.pem is written owner-only (mode 0600 on POSIX, a restrictive access list on "
+        "Windows). It refuses to overwrite an existing cert.pem or key.pem, and removes the key it "
+        "wrote if cert.pem cannot be written",
     )
     cert_self_signed.add_argument(
-        "--cn", required=True, help="certificate common name (also added as a DNS SAN)"
+        "--cn",
+        required=True,
+        help="certificate common name (also added as a SAN: an IP SAN for an IP address, else DNS)",
     )
     cert_self_signed.add_argument(
-        "--san", action="append", default=None, metavar="DNS", help="an extra DNS SAN (repeatable)"
+        "--san",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="an extra SAN, a hostname or an IP address (repeatable)",
     )
     cert_self_signed.add_argument(
         "--days", type=int, default=365, help="validity in days (default 365)"
@@ -5836,7 +5844,7 @@ def _cert_import(args: argparse.Namespace) -> int:
     else:
         _safe_print(f"Imported .pfx into {out_dir}:")
         _safe_print(f"  cert:     {cert_path}")
-        _safe_print(f"  key:      {key_path} (private; 0600)")
+        _safe_print(f"  key:      {key_path} (private; {_key_protection()})")
         if wrote_ca:
             _safe_print(f"  ca-chain: {ca_path} ({len(cas)} CA cert(s))")
         else:
@@ -6036,44 +6044,120 @@ _SELF_SIGNED_PLACEHOLDER_NOTE = (
 )
 
 
+def _key_protection() -> str:
+    """How :func:`_write_private_key` restricts key.pem on THIS platform, for the console line."""
+    if sys.platform == "win32":
+        return "restricted to SYSTEM, Administrators and this account"
+    return "mode 0600"
+
+
+def _san_labels(names: list[str]) -> str:
+    """Label each SAN as the certificate holds it, ``IP:`` or ``DNS:``. It asks the minting
+    classifier, ``pki._general_names``, so the console cannot disagree with the minted file."""
+    import ipaddress
+
+    from messagefoundry import pki
+
+    # An iPAddress entry's value is an ipaddress object and a DNSName's a str. Testing the value
+    # keeps `cryptography` out of this module, which the crypto inventory gate holds it to.
+    ip_types = (ipaddress.IPv4Address, ipaddress.IPv6Address)
+    return ", ".join(
+        f"IP:{gn.value}" if isinstance(gn.value, ip_types) else f"DNS:{gn.value}"
+        for gn in pki._general_names(names)
+    )
+
+
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
-    Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
-    which refuses to overwrite it (cert.pem has no such guard). Prints
-    :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
+    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem or key.pem before
+    it mints, and both writes are exclusive, so a file that appears meanwhile is still never
+    replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
+    line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
+
+    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
+    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
+    from messagefoundry.api.tls import _unlink_generated
 
     if args.days <= 0:
         return _cert_fail("--days must be a positive integer", as_json=args.json)
     out_dir = Path(args.out_dir)
+    cert_path = out_dir / "cert.pem"
+    key_path = out_dir / "key.pem"
+    refuse_cert = (
+        f"refusing to overwrite an existing certificate file: {cert_path} (remove it first)"
+    )
+    refuse_key = f"refusing to overwrite an existing key file: {key_path} (remove it first)"
+    if cert_path.exists():
+        return _cert_fail(refuse_cert, as_json=args.json)
+    if key_path.exists():
+        return _cert_fail(refuse_key, as_json=args.json)
+
     sans = args.san or []
-    cert_pem, key_pem = pki.make_self_signed(args.cn, sans, args.days)
+    try:
+        cert_pem, key_pem = pki.make_self_signed(args.cn, sans, args.days)
+    except OverflowError:
+        # The validity end falls past the last date a datetime can hold.
+        return _cert_fail(
+            f"cannot mint the certificate: --days {args.days} is too large, it ends after the "
+            "year 9999",
+            as_json=args.json,
+        )
+    except ValueError as exc:
+        # A common name over 64 characters, or a common name or --san not in ASCII. The text
+        # names the rejected value and never carries key material.
+        return _cert_fail(f"cannot mint the certificate: {exc}", as_json=args.json)
 
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
 
-    cert_path = out_dir / "cert.pem"
-    key_path = out_dir / "key.pem"
     try:
         _write_private_key(key_path, key_pem)
     except FileExistsError:
-        return _cert_fail(
-            f"refusing to overwrite an existing key file: {key_path} (remove it first)",
-            as_json=args.json,
-        )
+        return _cert_fail(refuse_key, as_json=args.json)
     except OSError as exc:
         return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
-    cert_path.write_bytes(cert_pem)
 
-    dns = list(dict.fromkeys([args.cn, *sans]))
+    # Exclusive create: a cert.pem that appeared after the check above is still never replaced.
+    cert_created = False
+    try:
+        with cert_path.open("xb") as fh:
+            cert_created = True
+            fh.write(cert_pem)
+    except BaseException as exc:
+        # BaseException, so an interrupt between the two writes still cleans up; it is re-raised.
+        # Remove only what THIS run wrote, never a file that was already there.
+        removed: list[str] = []
+        left: list[str] = []
+        for path in (key_path, cert_path) if cert_created else (key_path,):
+            try:
+                _unlink_generated(path)
+            except FileNotFoundError:
+                continue  # already gone, so nothing is left to remove
+            except OSError:
+                left.append(str(path))
+            else:
+                removed.append(str(path))
+        if not isinstance(exc, OSError):
+            raise
+        reason = (
+            refuse_cert if isinstance(exc, FileExistsError) else f"cannot write {cert_path}: {exc}"
+        )
+        if removed:
+            reason += f"; removed {', '.join(removed)}, which this run wrote"
+        if left:
+            reason += f"; could not remove {', '.join(left)}, so remove it before running again"
+        return _cert_fail(reason, as_json=args.json)
+
+    names = list(dict.fromkeys([args.cn, *sans]))
     result: dict[str, object] = {
         "cert": str(cert_path),
         "key": str(key_path),
         "cn": args.cn,
-        "sans": dns,
+        "sans": names,
         "days": args.days,
         "note": _SELF_SIGNED_PLACEHOLDER_NOTE,
     }
@@ -6082,8 +6166,8 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
     else:
         _safe_print(f"Wrote a self-signed PLACEHOLDER certificate to {out_dir}:")
         _safe_print(f"  cert: {cert_path}")
-        _safe_print(f"  key:  {key_path} (private; 0600)")
-        _safe_print(f"  CN={args.cn}  SAN(DNS)={', '.join(dns)}  valid {args.days} day(s)")
+        _safe_print(f"  key:  {key_path} (private; {_key_protection()})")
+        _safe_print(f"  CN={args.cn}  SAN={_san_labels(names)}  valid {args.days} day(s)")
         _safe_print(f"  NOTE: {_SELF_SIGNED_PLACEHOLDER_NOTE}.")
     return 0
 

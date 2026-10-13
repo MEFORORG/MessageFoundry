@@ -1696,9 +1696,9 @@ class ApiSettings(_Section):
 class TlsSettings(_Section):
     """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
-    A small, shared fallback for outbound connectors that verify a downstream *server* certificate
-    (MLLP/DICOM/FTPS today), and the inbound FTPS poller, which dials out too (vault BACKLOG
-    #2370). By default the OS trust store roots verify the peer; a hospital estate
+    A small, shared fallback read by at least these: the outbound connectors that verify a downstream
+    *server* certificate, such as MLLP, DICOM and FTPS, and the inbound FTPS poller, which dials out
+    too (vault BACKLOG #2370). By default the OS trust store roots verify the peer; a hospital estate
     whose internal endpoints present a PRIVATE / internal-CA cert can pin that CA here once instead of
     installing it box-globally or repeating a per-connection ``tls_ca_file``. This is a CLIENT trust
     anchor — it selects WHICH roots verify the peer, it NEVER disables verification — so it composes
@@ -1717,9 +1717,10 @@ class TlsSettings(_Section):
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
     # PEM path to a file of CRLs for OUTBOUND hops and the FTPS poller (BACKLOG #299, #2370). NOT a
-    # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
-    # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
-    # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
+    # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
+    # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
+    # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
+    # context and sets VERIFY_CRL_CHECK_LEAF.
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the

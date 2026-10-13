@@ -31,7 +31,7 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 | Role id | A lowercase word, or a custom role id | Each entry of a `roles` list |
 | Permission id | `area:action`, lowercase letters and underscores | Each entry of a `permissions` list |
 | Connection name | A letter, then letters, digits, `_` and `-`, up to 256 characters | `{name}` in a path, and `channel_id`, `destination_name`, `to`, `source`, `connection` |
-| Channel-scope entry | A connection name, or the all-channels token `*` on its own | Each entry of the `channels` list on `PUT /users/{user_id}/channel-scope` |
+| Channel-scope entry | A connection name, or the all-channels token `*` on its own | Each entry of the `channels` list on `PUT /users/{user_id}/channel-scope`, and each entry's `channel` on `PUT /ad-group-scope-map` |
 | Time bound | A finite number from 0 up to 4102444800 (2100-01-01 UTC) | `received_from`, `received_to`, `since`, `until` |
 | Free text | Printable text, no control characters, up to 512 characters | `content`, `field_value` |
 | Vocabulary token | Letters and underscores, up to 64 characters | `status`, and each `kind` on the event routes |

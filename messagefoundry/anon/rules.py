@@ -62,15 +62,37 @@ class RuleError(ValueError):
     a :class:`FieldRule` built in code with an unknown kind or a path that is not a whole field."""
 
 
+#: The most characters of rule or overlay text a :class:`RuleError` quotes for ONE thing it names:
+#: a path, a value that is not a kind, or the whole sorted list of unknown keys. No message quotes
+#: more than two, and the words around them are fixed, so every schema refusal is bounded however
+#: long the overlay is (BACKLOG #3000). A real path or kind is far shorter than this.
+_QUOTE_LIMIT = 80
+
+
+def _quoted(value: object) -> str:
+    """``repr(value)`` for a :class:`RuleError`, cut to :data:`_QUOTE_LIMIT` characters.
+
+    A cut is marked with the number of characters left out, so a reader can tell a long key from
+    a short one that happens to end there. The bound is on the WHOLE repr, so a list of many
+    short keys and a value that is not a string are cut the way one long string is."""
+    text = repr(value)
+    if len(text) <= _QUOTE_LIMIT:
+        return text
+    return f"{text[:_QUOTE_LIMIT]}... ({len(text) - _QUOTE_LIMIT} more characters not shown)"
+
+
 def _coerce_kind(path: str, raw: object) -> SurrogateKind:
     if not isinstance(raw, str):
-        raise RuleError(f"rule for {path!r} must name a surrogate kind as a string, got {raw!r}")
+        raise RuleError(
+            f"rule for {_quoted(path)} must name a surrogate kind as a string, got {_quoted(raw)}"
+        )
     try:
         return SurrogateKind(raw)
     except ValueError:
         allowed = ", ".join(k.value for k in SurrogateKind)
         raise RuleError(
-            f"rule for {path!r} names unknown surrogate kind {raw!r}; allowed: {allowed}. "
+            f"rule for {_quoted(path)} names unknown surrogate kind {_quoted(raw)}; "
+            f"allowed: {allowed}. "
             "A new kind is a code change in surrogates.py, never an overlay value."
         ) from None
 
@@ -81,7 +103,7 @@ def _check_field_path(path: object) -> None:
     overlay key alike."""
     if not isinstance(path, str) or _FIELD_PATH_RE.fullmatch(path) is None:
         raise RuleError(
-            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
+            f"rule path {_quoted(path)} is not a whole-field HL7 address like 'PID-5' "
             "(component paths and free text are rejected — selection is field-level only)"
         )
 
@@ -217,6 +239,86 @@ class AnonError(ValueError):
 
 _LOG = logging.getLogger(__name__)
 
+#: The overlay warnings this process has already logged. One entry is every line ONE load
+#: produced. :func:`load_rules` runs again for every message when a caller hands the anonymizer a
+#: path, and without this each message repeated every line (BACKLOG #3000). The key is the
+#: warnings' own text and not the file alone, so an overlay edited to keep or retarget a
+#: different field warns again in a process that stays up.
+_warned: set[tuple[str, ...]] = set()
+
+#: ``_warned`` is emptied when it holds this many entries. A caller that writes a new overlay
+#: file per message would otherwise grow it without limit. Emptying it costs a repeated warning.
+_WARNED_LIMIT = 256
+
+
+def _warn_once(lines: tuple[str, ...]) -> None:
+    """Log ``lines`` at WARNING unless this process already logged exactly these lines.
+
+    Nothing is remembered while WARNING is switched off, so a caller that turns it on later still
+    gets the lines once."""
+    if not lines or lines in _warned or not _LOG.isEnabledFor(logging.WARNING):
+        return
+    if len(_warned) >= _WARNED_LIMIT:
+        _warned.clear()
+    _warned.add(lines)
+    for line in lines:
+        _LOG.warning("%s", line)
+
+
+def _forget_warnings() -> None:
+    """Empty the record of warnings already logged, so the next load warns again. For tests."""
+    _warned.clear()
+
+
+#: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
+#: id, and 3 in MSH, because MSH-1 and MSH-2 hold the message's own delimiters. With either of
+#: those rewritten the output has no readable header, and the leak-check has no separators to
+#: walk it with.
+_FIRST_REWRITABLE_FIELD = 1
+_FIRST_REWRITABLE_MSH_FIELD = 3
+
+
+def _unwritable_fields(rules: tuple[FieldRule, ...]) -> tuple[str, ...]:
+    """The fields ``rules`` would rewrite and no rule can: a segment id, MSH-1 or MSH-2. Sorted,
+    and empty when the rule set is fine.
+
+    The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
+    path with a stray space or newline are named like ``MSH-2``. A path whose number ``int()``
+    cannot read is not a whole-field address, and it is not this check's to name.
+    ``FieldRule`` refuses every path that is not a whole-field address when the rule is built,
+    field 0 and ``MSH-02`` included (BACKLOG #2330). So for those spellings this check is a
+    second line, and for ``MSH-1`` and ``MSH-2`` it is the only one. A ``KEEP`` rewrites
+    nothing, so it is allowed (BACKLOG #2265).
+    """
+    named: set[str] = set()
+    for rule in rules:
+        if rule.kind == SurrogateKind.KEEP:
+            continue
+        segment, _, number = rule.path.partition("-")
+        try:
+            field = int(number)
+        except ValueError:
+            continue
+        is_msh = segment.upper() == "MSH"
+        if field < (_FIRST_REWRITABLE_MSH_FIELD if is_msh else _FIRST_REWRITABLE_FIELD):
+            named.add(f"{segment}-{field}")
+    return tuple(sorted(named))
+
+
+def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
+    """Refuse a rule set that would rewrite a segment id, MSH-1 or MSH-2 (a body-free
+    :class:`AnonError`).
+
+    Both adapters call this for every message, so a rule set built in code meets the refusal
+    too. :func:`load_rules` runs the same check once, on the overlay (BACKLOG #2997)."""
+    named = _unwritable_fields(rules)
+    if named:
+        raise AnonError(
+            f"a rule names {', '.join(named)}, which no rule can rewrite: field 0 is the "
+            "segment id, and MSH-1 and MSH-2 hold the message's delimiters. Repair or remove a "
+            "later MSH line that carries data there. Refusing to emit"
+        )
+
 
 def _validate_path(path: str) -> str:
     _check_field_path(path)
@@ -239,7 +341,11 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
     an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
-    and column. It quotes nothing from the file, and it chains no other exception.
+    and column. TOML that runs out after a final newline names the last line. A path the system refuses to open is
+    reported as the path's fault. It quotes nothing from the file, and it chains no other exception.
+
+    An overlay whose final rule set would rewrite ``MSH-1`` or ``MSH-2`` is refused here too, once,
+    with the field named (BACKLOG #2997). A ``keep`` on either still loads.
 
     A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
     it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
@@ -247,26 +353,44 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     A keep on a :data:`DEFAULT_RULES` path turns that default scrub off. Each one is logged at
     WARNING, by field address and kind only; :func:`kept_defaults` lists them (BACKLOG #2268).
+
+    An overlay that points a :data:`DEFAULT_RULES` path at a DIFFERENT kind is logged at WARNING
+    too, by field address, default kind and new kind; :func:`retargeted_defaults` lists them. A
+    different kind can leave part of the field as captured: ``id``, ``mrn`` and ``ssn`` rewrite
+    the first component only, so on ``PID-5`` they leave the given name. A retarget to the same
+    kind changes nothing and a ``drop`` blanks the field, so neither warns (BACKLOG #3000).
+
+    Both warnings are logged once per process for one set of lines, not once per call, so a
+    caller that passes ``overlay=`` for every message does not repeat them.
+
+    A schema refusal quotes at most :data:`_QUOTE_LIMIT` characters of any one overlay key or
+    value, and of the whole list of unknown keys.
     """
-    effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     if overlay is None:
         return DEFAULT_RULES
 
     # Each arm keeps one content-free fact. A TOMLDecodeError holds the whole file on ``.doc`` and
     # a UnicodeDecodeError holds its bytes on ``.object``, so neither may reach the refusal's chain.
+    # The read and the parse are two steps, so an error about the PATH is never reported as one
+    # about the file's content (BACKLOG #3003).
     refusal: str | None = None
     try:
-        data = tomllib.loads(overlay.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        refusal = f"invalid TOML at line {exc.lineno}, column {exc.colno}"
-    except UnicodeDecodeError:  # a ValueError, not an OSError
+        text = overlay.read_text(encoding="utf-8")
+    except UnicodeDecodeError:  # a ValueError, not an OSError, so it goes before the plain arm
         refusal = "the file is not UTF-8 text"
-    except RecursionError:  # tomllib recurses on nested arrays and tables
-        refusal = "the file nests too deeply to parse"
-    except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
-        refusal = "the file holds a value the TOML parser refused"
     except OSError as exc:
         refusal = exc.strerror or type(exc).__name__
+    except ValueError:  # the path was refused before any byte was read: at least an embedded NUL
+        refusal = "the path is not one the system can open"
+    if refusal is None:
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:  # a ValueError, so it goes before the plain arm
+            refusal = _toml_refusal(exc)
+        except RecursionError:  # tomllib recurses on nested arrays and tables
+            refusal = "the file nests too deeply to parse"
+        except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
+            refusal = "the file holds a value the TOML parser refused"
     if refusal is not None:
         # Raised AFTER the handler, so neither __cause__ nor __context__ is set. ``from None``
         # would not do: it leaves __context__ populated (BACKLOG #2310).
@@ -275,7 +399,7 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     unknown_top = set(data) - {"hl7"}
     if unknown_top:
         raise RuleError(
-            f"anon overlay has unexpected top-level key(s) {sorted(unknown_top)}; "
+            f"anon overlay has unexpected top-level key(s) {_quoted(sorted(unknown_top))}; "
             "only an [hl7] section (fields/keep/drop) is allowed"
         )
     hl7 = data.get("hl7", {})
@@ -284,13 +408,14 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     unknown_hl7 = set(hl7) - {"fields", "keep", "drop"}
     if unknown_hl7:
         raise RuleError(
-            f"anon overlay [hl7] has unexpected key(s) {sorted(unknown_hl7)}; "
+            f"anon overlay [hl7] has unexpected key(s) {_quoted(sorted(unknown_hl7))}; "
             "only 'fields', 'keep', 'drop' are allowed"
         )
 
     fields = hl7.get("fields", {})
     if not isinstance(fields, dict):
         raise RuleError("anon overlay [hl7.fields] must be a table of path = kind")
+    effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     for path, raw_kind in fields.items():
         effective[_validate_path(path)] = _coerce_kind(path, raw_kind)
     for path in _as_path_list(hl7, "keep"):
@@ -300,15 +425,45 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
 
     # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
     rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
-    for cancelled in kept_defaults(rules):
-        _LOG.warning(
-            "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
-            "as captured",
-            overlay,
-            cancelled.path,
-            cancelled.kind.value,
+    # Checked on the final rule set, so a later keep on the same path lifts the refusal. Left to
+    # the adapters alone, this rule would fail every message and the tee would report a count.
+    # Field 0 never gets this far: the path check above refuses it, so only MSH-1 and MSH-2 can.
+    unwritable = _unwritable_fields(rules)
+    if unwritable:
+        raise RuleError(
+            f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, which no rule can "
+            "rewrite: MSH-1 and MSH-2 hold the message's delimiters. Remove the rule"
         )
+    # Field addresses and kinds only, never a value.
+    _warn_once(
+        (
+            *(
+                f"anon overlay {overlay} keeps {cancelled.path}, which turns off its default "
+                f"{cancelled.kind.value} scrub: the field is left as captured"
+                for cancelled in kept_defaults(rules)
+            ),
+            *(
+                f"anon overlay {overlay} retargets {default.path} from its default "
+                f"{default.kind.value} scrub to {now.kind.value}: a different kind can leave "
+                "part of the field as captured"
+                for default, now in retargeted_defaults(rules)
+            ),
+        )
+    )
     return rules
+
+
+def _toml_refusal(exc: tomllib.TOMLDecodeError) -> str:
+    """Where the TOML went wrong, as a line and column. Nothing from the file is quoted.
+
+    When the parser runs off the end of text that ends in a newline, it reports column 1 of the
+    line AFTER the last one, which no editor shows. That one case names the last line instead
+    (BACKLOG #3003). With no final newline the parser's own line and column exist, so they stand:
+    it reports the end position for at least a repeated key there too, not only for cut-off text.
+    """
+    if exc.pos >= len(exc.doc) and exc.doc.endswith("\n"):
+        return f"invalid TOML at the end of the file, line {exc.lineno - 1}"
+    return f"invalid TOML at line {exc.lineno}, column {exc.colno}"
 
 
 def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
@@ -321,6 +476,36 @@ def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
     """
     kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP}
     return tuple(r for r in DEFAULT_RULES if r.path in kept)
+
+
+def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, FieldRule], ...]:
+    """The :data:`DEFAULT_RULES` entries that ``rules`` scrubs with a DIFFERENT kind, each as
+    ``(default rule, last rule on that path)``, in :data:`DEFAULT_RULES` order.
+
+    The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
+    value behind while the leak-check still counts the field as scrubbed. ``id``, ``mrn`` and
+    ``ssn`` rewrite the first component only: on ``PID-5`` that leaves the given name, on
+    ``PID-11`` the city and postal code, on ``PV1-7`` the clinician's name. ``date`` keeps the
+    year, so on ``PID-7`` it keeps the birth year. No ordering of the kinds says which retarget is
+    safe, because what ``date`` leaves depends on the value. So every change of kind is listed,
+    with two exceptions: a ``drop``, which blanks the field, and a ``keep``, which
+    :func:`kept_defaults` lists. A rule that names the default's own kind changed nothing and is
+    not listed. :func:`load_rules` logs each entry, and a caller with a console of its own can
+    repeat them there.
+    """
+    # Every rule on a path runs, in order, so a set built in code may hold several. The default
+    # scrub is replaced only when none of them is the default's kind and none is a drop.
+    on_path: dict[str, list[FieldRule]] = {}
+    for rule in rules:
+        if rule.kind != SurrogateKind.KEEP:
+            on_path.setdefault(rule.path, []).append(rule)
+    listed: list[tuple[FieldRule, FieldRule]] = []
+    for default in DEFAULT_RULES:
+        rewrites = on_path.get(default.path, [])
+        kinds = [rule.kind for rule in rewrites]  # a list: kinds compare by value, see FieldRule
+        if rewrites and default.kind not in kinds and SurrogateKind.DROP not in kinds:
+            listed.append((default, rewrites[-1]))
+    return tuple(listed)
 
 
 def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:

@@ -116,6 +116,7 @@ async def store() -> AsyncIterator[object]:
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "user_roles",
                 "ad_group_role_map",
+                "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it
                 "users",
                 "roles",
             ):
@@ -794,6 +795,13 @@ async def test_auth_users_roles_sessions(store) -> None:
     await store.delete_user("u1")
     assert await store.get_user("u1") is None
     assert await store.get_user_role_ids("u1") == []
+
+
+async def test_group_map_keys_at_the_api_widths_store(store) -> None:
+    """BACKLOG #3187: the contract is in ``tests/_ad_group_map_store_contract.py``."""
+    from tests._ad_group_map_store_contract import assert_group_map_keys_at_width_store
+
+    await assert_group_map_keys_at_width_store(store)
 
 
 async def test_last_admin_guard_contract(store) -> None:

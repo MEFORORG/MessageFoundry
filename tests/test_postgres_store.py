@@ -998,6 +998,13 @@ async def test_auth_users_roles_sessions(store) -> None:
     assert await store.get_user_role_ids("u1") == []
 
 
+async def test_group_map_keys_at_the_api_widths_store(store) -> None:
+    """BACKLOG #3187: the contract is in ``tests/_ad_group_map_store_contract.py``."""
+    from tests._ad_group_map_store_contract import assert_group_map_keys_at_width_store
+
+    await assert_group_map_keys_at_width_store(store)
+
+
 async def test_last_admin_guard_contract(store) -> None:
     """Vault BACKLOG #2779 on Postgres: the guarded removal refuses only the last administrator."""
     from tests._last_admin_store_contract import assert_last_admin_contract

@@ -39,9 +39,29 @@
     deliberately TRACKED and machine-local files are named `.local.`. Do not carry that reasoning
     across; the outcome matches and the reason does not.
 
+    WHICH WORKTREE: THE ONE THE HOOK INPUT NAMES. The harness sends a JSON payload on stdin, and its
+    `cwd` is the session's own directory. The hook walks up from it to the nearest `.git` and reads
+    that root. Nothing else here can be trusted for this under the desktop app.
+
+    Measured 2026-10-12: the desktop app starts a worktree session's CLI with
+    `--project-config-root <primary checkout>`. Reproduced in a fixture repository, a SessionStart
+    hook then ran with its working directory, `$env:CLAUDE_PROJECT_DIR` and git's own top-level
+    answer all naming the PRIMARY; only the payload `cwd` named the worktree. The wiring passed
+    `-WorktreeRoot ${CLAUDE_PROJECT_DIR}`, so every desktop worktree
+    session read the primary's marker. MessageFoundry session 07991bb9 declared Lander and got the
+    Builder card at five compactions running, and every one rewrote the primary's ROLE.local.md.
+    `TheHookReadsTheSessionsOwnWorktree` pins it.
+
+    THE ROSTER AND THE CARD COME FROM THAT WORKTREE TOO, when it carries docs/roles/seats.json, and
+    from this script's own checkout otherwise. Under the desktop app this script is the PRIMARY's
+    copy, which may be days behind the worktree it is serving.
+
 .PARAMETER WorktreeRoot
-    The worktree to resolve the seat for. Defaults to the current directory. Tests pass a
-    temporary root; a real session never passes this.
+    The worktree to resolve the seat for when the hook input carries no usable `cwd`. Defaults to
+    the current directory. Tests pass a temporary root and no input.
+
+    It said "a real session never passes this" until 2026-10-12, and the project wiring passed
+    `-WorktreeRoot ${CLAUDE_PROJECT_DIR}` at the time. That value was the primary checkout.
 #>
 
 [CmdletBinding()]
@@ -79,9 +99,58 @@ function Get-RosterMapKeys {
 }
 
 
-# The hook reads stdin because the harness sends a JSON payload. Nothing here needs it, but a hook
-# that leaves stdin unread can make the caller block on the write.
-try { $null = [Console]::In.ReadToEnd() } catch { }
+function Get-InputWorktree {
+    <#
+      .SYNOPSIS
+        The worktree root the hook input's `cwd` sits in, or $null when the input names none.
+
+      .DESCRIPTION
+        Walks up from `cwd` to the first directory holding `.git`. A worktree carries a `.git` FILE
+        and a primary checkout a `.git` DIRECTORY, and either marks a root. It calls no git: the
+        hook carries no git read at all, and `TheHookNeverGuessesASeat` pins that.
+    #>
+    param([string] $Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    try { $payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    if ($null -eq $payload -or -not $payload.PSObject.Properties['cwd']) { return $null }
+    $dir = [string]$payload.cwd
+    if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) {
+        return $null
+    }
+    $at = (Resolve-Path -LiteralPath $dir).ProviderPath
+    while ($at) {
+        if (Test-Path -LiteralPath (Join-Path $at '.git')) { return $at }
+        $parent = Split-Path -Parent $at
+        if (-not $parent -or $parent -eq $at) { break }
+        $at = $parent
+    }
+    return $null
+}
+
+# The harness sends a JSON payload on stdin, and its `cwd` is the only reliable name for this
+# session's worktree. See WHICH WORKTREE above. Reading it also keeps the caller from blocking on
+# the write.
+$hookInput = ''
+try {
+    # As UTF-8 bytes, not through [Console]::In: that decodes with the console code page, which
+    # would mangle a non-ASCII cwd and send the hook quietly back to -WorktreeRoot.
+    if ([Console]::IsInputRedirected) {
+        $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
+        $hookInput = $reader.ReadToEnd()
+    }
+}
+catch { }
+try {
+    $fromInput = Get-InputWorktree $hookInput
+    if ($fromInput) { $WorktreeRoot = $fromInput }
+    elseif ($hookInput -match '"cwd"\s*:\s*"[^"]') {
+        Write-Output "[role-card] The hook input names a cwd that is missing or inside no checkout, so the seat below comes from $WorktreeRoot."
+    }
+}
+catch {
+    # Said aloud, because falling back in silence is the fault this read exists to fix.
+    Write-Output "[role-card] Could not read the hook input's cwd ($($_.Exception.Message)), so the seat below comes from $WorktreeRoot."
+}
 
 $MarkerRelPath = '.claude/seat.local.txt'
 $RoleCopyRelPath = '.claude/ROLE.local.md'
@@ -109,6 +178,9 @@ function Write-Note {
 
 try {
     $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    if (Test-Path -LiteralPath (Join-Path $WorktreeRoot 'docs/roles/seats.json') -PathType Leaf) {
+        $repoRoot = $WorktreeRoot
+    }
     $seatsPath = Join-Path $repoRoot 'docs/roles/seats.json'
 
     if (-not (Test-Path -LiteralPath $seatsPath)) {

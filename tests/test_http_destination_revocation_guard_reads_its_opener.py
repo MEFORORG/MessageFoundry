@@ -35,6 +35,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
+    CaFileUnreadable,
     HopPosture,
     InsecureHopRefused,
     TrustAnchorPolicy,
@@ -321,8 +322,8 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
 
 
 def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[str, str]) -> None:
-    """The default refusal offers ``[tls].crl_file`` and an egress proxy. Neither can cross an ECH
-    hop, so its refusal names the attestation alone, in fixed text."""
+    """The default refusal offers ``[tls].crl_file``, which cannot cross an ECH hop, so its refusal
+    names the attestation alone, in fixed text."""
     text = _refused("REST", crl=pki["crl"], extra=_ECH)
     assert ECH_HOP_WAYS_ACROSS in text
     assert "tls_revocation_attested=true" in text and "tls_revocation_attested_reason" in text
@@ -333,8 +334,11 @@ def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[st
     default = _refused("REST")
     assert ECH_HOP_WAYS_ACROSS not in default
     assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in default
-    assert "egress proxy" in default
+    # BACKLOG #2987: the default no longer offers an egress proxy, a lever no call site can set.
+    assert "egress proxy" not in default
     assert "tls_revocation_attested=true" in default
+    # The destination wording the lookup's own description must not change (BACKLOG #2987).
+    assert "delivers over verified https" in default
 
 
 def test_opener_is_a_required_keyword() -> None:
@@ -432,14 +436,15 @@ def _config_error(
 def test_a_bad_ca_file_is_reported_before_the_revocation_refusal(
     cell: str, shape: str, tmp_path: Path
 ) -> None:
-    """A ``tls_ca_file`` the opener build cannot load raises ``OSError``, which is what ``ssl``
-    raises: ``FileNotFoundError`` for a missing file and ``ssl.SSLError`` for one with no
-    certificate. Neither is a ``ValueError``, so neither can be the posture refusal."""
+    """A ``tls_ca_file`` the opener build cannot load raises ``CaFileUnreadable``, missing or not
+    PEM (vault BACKLOG #2370, #2977 item 10). It is an ``OSError``, and the posture refusal is
+    not, so it cannot be the posture refusal."""
     ca = tmp_path / "ca.pem"
     if shape == "not-pem":
         ca.write_text("not a certificate\n", encoding="ascii")
-    with active_hop_posture(PROD_PHI), pytest.raises(OSError):
+    with active_hop_posture(PROD_PHI), pytest.raises(OSError) as caught:
         _build(cell, extra={"tls_ca_file": str(ca)})
+    assert isinstance(caught.value, CaFileUnreadable)
 
 
 @pytest.mark.parametrize("cell", list(_CELLS))

@@ -135,8 +135,8 @@ ConnectionName = Annotated[str, StringConstraints(pattern=CONNECTION_NAME_PATTER
 # The token is spelled as a literal rather than imported because this module depends on nothing but
 # pydantic and the standard library (see the header). ``tests/test_api_input_validation.py`` pins it
 # equal to :data:`messagefoundry.auth.identity.ALL_CHANNELS`, so the two cannot drift apart quietly.
-# ``AdGroupScopeEntry.channel`` carries the same wildcard for an AD group's estate-wide row and is
-# length-bounded only; narrowing it to this rule is a separate, unfiled tightening.
+# ``AdGroupScopeEntry.channel`` carries the same wildcard for an AD group's estate-wide row and
+# takes this rule too (BACKLOG #3187).
 
 #: One member of a stored per-channel scope: the all-channels token ``*``, or a connection name.
 CHANNEL_SCOPE_ENTRY_PATTERN = r"^\*$|" + CONNECTION_NAME_PATTERN

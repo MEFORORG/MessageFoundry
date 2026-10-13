@@ -437,7 +437,7 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     "messagefoundry/transports/mllp.py::_mllp_ssl_context::'MLLP destination'": lambda k: (
         mllp._mllp_ssl_context({"tls": True, "host": "localhost"}, server=False)
     ),
-    "messagefoundry/transports/dicom.py::_client_ssl_context::'DICOM destination'": lambda k: (
+    "messagefoundry/transports/dicom.py::_client_ssl_context::connector": lambda k: (
         dicom._client_ssl_context({"tls": True, "host": "localhost"})
     ),
     "messagefoundry/auth/oidc_http.py::build_idp_opener::"
@@ -1018,12 +1018,13 @@ def test_a_refused_sigalg_list_is_a_config_refusal_naming_openssl(wrapper: str) 
             return True
 
     ctx = _Refusing(ssl.PROTOCOL_TLS_SERVER)
-    with pytest.raises(tls_policy.EngineTlsListRefused) as caught:
+    # Caught as the base a seam catches, then checked for the class, so each half can fail.
+    with pytest.raises(ValueError) as caught:
         if wrapper == "default":
             tls_policy.narrow_to_approved_suites(ctx)
         else:
             tls_policy.apply_operator_tls_ciphers(ctx, "ECDHE-ECDSA-AES256-GCM-SHA384")
-    assert isinstance(caught.value, ValueError)
+    assert isinstance(caught.value, tls_policy.EngineTlsListRefused)
     message = str(caught.value)
     assert "without SHA-224" in message
     assert ssl.OPENSSL_VERSION in message
