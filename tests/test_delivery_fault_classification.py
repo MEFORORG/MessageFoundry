@@ -38,7 +38,7 @@ from messagefoundry.parsing.binary import DOC_REF_MARKER, chunk_b64, make_doc_re
 from messagefoundry.pipeline.stage_dispatcher import LaneResultKind
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
-from messagefoundry.store.cell_tag import MESSAGE_TAG_FAILED_ACTION
+from messagefoundry.store.cell_tag import MESSAGE_TAG_FAILED_ACTION, CellTagError
 from messagefoundry.store.crypto import AesGcmCipher, CipherError, generate_key, make_cipher
 from messagefoundry.transports.base import DeliveryError
 
@@ -94,9 +94,18 @@ class _Sender:
 
 
 def _runner(
-    store: MessageStore, sender: _Sender, *, retry: RetryPolicy | None = None
+    store: MessageStore,
+    sender: _Sender,
+    *,
+    retry: RetryPolicy | None = None,
+    internal_error: InternalErrorPolicy | None = None,
 ) -> RegistryRunner:
-    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        egress=EgressSettings(deny_by_default=False),
+        internal_error_default=internal_error,
+    )
     runner._destinations[DEST] = sender  # type: ignore[assignment]
     runner._retry[DEST] = retry or RetryPolicy()
     runner._simulate[DEST] = False
@@ -380,8 +389,7 @@ async def test_a_metadata_cell_that_fails_its_tag_dead_letters_under_the_stop_po
     side = sqlite3.connect(db, timeout=30)  # a writer with no key, outside the store
     try:
         sender = _Sender(consumes_metadata=True)
-        runner = _runner(store, sender)
-        runner._internal_error_default = InternalErrorPolicy.STOP
+        runner = _runner(store, sender, internal_error=InternalErrorPolicy.STOP)
         raw = _hl7("plain")
         meta = json.dumps({"user": {"X-Synth": "v1"}})
 
@@ -409,16 +417,42 @@ async def test_a_metadata_cell_that_fails_its_tag_dead_letters_under_the_stop_po
         assert len(sender.sent) == 1  # nothing more was sent
         status = side.execute("SELECT status FROM messages WHERE id=?", (mid,)).fetchone()[0]
         assert status == MessageStatus.ERROR.value
+        ref = CellTagError("messages", "metadata", mid, None).row_ref
         audited = [
             r
             for r in await store.list_audit(action=MESSAGE_TAG_FAILED_ACTION)
-            if mid[:12] in str(r["detail"])
+            if ref in str(r["detail"])
         ]
         assert len(audited) == 1
-        assert [t for t, r in alerts if mid[:12] in r] == ["messages"]
+        assert [t for t, r in alerts if ref in r] == ["messages"]
     finally:
         side.close()
         await store.close()
+
+
+async def test_control_a_metadata_read_error_that_is_not_a_tag_failure_still_stops_the_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2593's dead-letter arm takes a tag failure only. Any other cipher error on the
+    dynamic_headers read keeps the internal-error arm, so under ``internal_error=stop`` it still
+    stops the lane for an operator."""
+    raw = _hl7("plain")
+    mid = await store.enqueue_message(channel_id="IB", raw=raw, deliveries=[(DEST, raw)], now=100.0)
+    sender = _Sender(consumes_metadata=True)
+    runner = _runner(store, sender, internal_error=InternalErrorPolicy.STOP)
+
+    async def key_fault(message_id: str) -> str | None:
+        raise CipherError("no configured key decrypts this value")
+
+    monkeypatch.setattr(store, "message_metadata_json", key_fault)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+
+    outcome, _ = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is _ItemOutcome.STOPPED
+    assert await _status(store, mid) == OutboxStatus.PENDING.value
+    assert sender.sent == []
 
 
 async def test_control_a_batch_member_that_will_not_parse_still_dead_letters(

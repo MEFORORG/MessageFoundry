@@ -262,25 +262,32 @@ async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored:
     assert r.json()["detail"] == f"preset {pid} has malformed criteria"
 
 
-async def test_a_preset_moved_to_another_owner_answers_423(tmp_path: Path) -> None:
-    """BACKLOG #2593: criteria bind their owner. A preset moved to another account outside the store
-    is refused on the layered recall with a 423, audited and alerted once, never a 500. Control: the
-    caller's own intact preset recalls."""
+async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Path) -> None:
+    """BACKLOG #2593: criteria bind their owner. Another account's preset moved into the caller's
+    account outside the store is refused on the layered recall with a 423, audited and alerted once,
+    never a 500, and it is not stamped as used. The caller's own preset moved away answers the
+    usual 404, so the answer never says it exists. Control: an intact preset recalls."""
+    import sqlite3
+
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
+    from messagefoundry.store.cell_tag import CellTagError
 
+    db = tmp_path / "keyed.db"
     cipher = make_cipher(generate_key(), write_v2=True)
     assert isinstance(cipher, AesGcmCipher)
-    store = await MessageStore.open(tmp_path / "keyed.db", cipher=cipher)
+    store = await MessageStore.open(db, cipher=cipher)
     keyed = Engine(store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False))
+    side = sqlite3.connect(db, timeout=30)  # a writer with no key, outside the store
     try:
         service = await _user(keyed, Role.OPERATOR, "op")
-        other = await _user(keyed, Role.OPERATOR, "op2")
-        me = await other.store.get_user_by_username("op")
-        assert me is not None
+        await _user(keyed, Role.OPERATOR, "op2")
+        me = await service.store.get_user_by_username("op")
+        them = await service.store.get_user_by_username("op2")
+        assert me is not None and them is not None
+        transport = httpx.ASGITransport(app=create_app(keyed, auth=service))
         alerts: list[tuple[str, str]] = []
         cipher.set_tag_failure_hook(lambda table, reason: alerts.append((table, reason)))
-        transport = httpx.ASGITransport(app=create_app(keyed, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             h, h2 = await _login(c, "op"), await _login(c, "op2")
 
@@ -297,22 +304,31 @@ async def test_a_preset_moved_to_another_owner_answers_423(tmp_path: Path) -> No
             r = await c.get("/search/layered", params={"presets": mine}, headers=h)
             assert r.status_code == 200, r.text  # control: an intact preset recalls
 
-            moved = await mk(h2, "theirs")
-            await store._db.execute(
-                "UPDATE search_presets SET owner_user_id=? WHERE id=?", (me.id, moved)
-            )
-            await store._db.commit()
-            r = await c.get("/search/layered", params={"presets": moved}, headers=h)
+            planted = await mk(h2, "theirs")
+            side.execute("UPDATE search_presets SET owner_user_id=? WHERE id=?", (me.id, planted))
+            side.commit()
+            r = await c.get("/search/layered", params={"presets": planted}, headers=h)
             assert r.status_code == 423, r.text
-            assert "MRN999" not in r.text
+
+            gone = await mk(h, "moved away")
+            side.execute("UPDATE search_presets SET owner_user_id=? WHERE id=?", (them.id, gone))
+            side.commit()
+            r = await c.get("/search/layered", params={"presets": gone}, headers=h)
+            assert r.status_code == 404, r.text
+        stamped = side.execute(
+            "SELECT last_used_at FROM search_presets WHERE id=?", (planted,)
+        ).fetchone()
+        assert stamped == (None,)  # the refused recall was not recorded as a use
+        ref = CellTagError("search_presets", "criteria", planted, None).row_ref
         audited = [
             a
             for a in await store.list_audit(action=PRESET_TAG_FAILED_ACTION)
-            if moved[:12] in str(a["detail"])
+            if ref in str(a["detail"])
         ]
         assert len(audited) == 1
-        assert [t for t, reason in alerts if moved[:12] in reason] == ["search_presets"]
+        assert [t for t, reason in alerts if ref in reason] == ["search_presets"]
     finally:
+        side.close()
         await keyed.stop()
 
 
