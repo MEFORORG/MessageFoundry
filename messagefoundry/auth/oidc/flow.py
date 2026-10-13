@@ -205,8 +205,9 @@ class FlowCache:
     def peek(self, flow_id: str) -> PendingFlow | None:
         """The live flow for ``flow_id`` WITHOUT consuming it; None if absent or expired.
 
-        Used only to decide which completion runs (sign-in or step-up). The completion itself still
-        ``pop``s, so single use is unchanged, and it re-checks the kind of flow it popped.
+        Used to decide which completion runs (sign-in or step-up). Each completion then consumes
+        the flow through :meth:`pop_if_state_matches`, so single use is unchanged, and re-checks
+        the kind of flow it consumed.
         """
         entry = self._entries.get(self._key(flow_id))
         if entry is None or entry.deadline <= self._clock():
@@ -219,6 +220,24 @@ class FlowCache:
         if entry is None or entry.deadline <= self._clock():
             return None
         return entry
+
+    def pop_if_state_matches(
+        self, flow_id: str, state: str | None
+    ) -> tuple[PendingFlow | None, bool]:
+        """Consume the flow for ``flow_id`` only when ``state`` matches it (BACKLOG #3198).
+
+        Returns ``(flow, consumed)``: ``(None, False)`` for an absent or expired flow, ``(flow,
+        False)`` for a missing or wrong ``state``, which leaves the flow staged, and ``(flow, True)``
+        once it is consumed. The flow cookie is SameSite=Lax, so any page can send the browser to
+        the callback with it. Comparing first means such a forged callback cannot spend the flow
+        the real IdP return needs. Nothing here awaits, so two matching callbacks still spend it
+        once.
+        """
+        flow = self.peek(flow_id)
+        if flow is None or state is None or not state_matches(flow.state, state):
+            return flow, False
+        del self._entries[self._key(flow_id)]
+        return flow, True
 
 
 def new_flow_id() -> str:

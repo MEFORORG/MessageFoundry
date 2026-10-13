@@ -766,6 +766,10 @@ class LoginOutcome:
     #: the roles. Set on a refused outcome too: a bind landing between the sync and the mint refuses
     #: the session after the roles were written, and that grant happened all the same.
     roles_gained: RolesGained | None = None
+    #: False only when a federated callback was refused for its ``state`` and the staged flow is
+    #: still waiting for the real IdP return (BACKLOG #3198). The route then keeps the browser's
+    #: flow cookie. True on every other outcome, including one with no flow at all.
+    flow_consumed: bool = True
 
 
 @dataclass(frozen=True)
@@ -855,6 +859,9 @@ class OidcStepUp:
     return_to: str = "/ui"
     reason: str | None = None
     error: str | None = None
+    #: As :attr:`LoginOutcome.flow_consumed`: False only when the callback's ``state`` did not match
+    #: and the step-up flow still waits for the real IdP return.
+    flow_consumed: bool = True
 
     @property
     def ok(self) -> bool:
@@ -4134,19 +4141,9 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
-        # PEEKED, then popped only once `state` matches (BACKLOG #3198), as complete_oidc_step_up
-        # does. The flow cookie is SameSite=Lax, so any page can send the browser to the callback
-        # with it; popping first let such a forged callback use up the sign-in in flight. No await
-        # sits between the peek and the pop, so a matching callback still consumes it exactly once.
-        flow = self._oidc_flows.peek(flow_id)
-        if flow is not None and not oidc.state_matches(flow.state, state):
-            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch", client=client)
-            return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
-        if flow is None or self._oidc_flows.pop(flow_id) is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "state_unknown", client=client)
-            return LoginOutcome(
-                ok=False, error="federated sign-in expired; start again", reason="state_unknown"
-            )
+        flow = await self._redeem_sign_in_flow(self._oidc_flows, flow_id, state, client=client)
+        if isinstance(flow, LoginOutcome):
+            return flow
         # The INNER leg: the public wrapper would pad a second time inside this challenge's pad.
         return await self._authenticate_oidc(
             code,
@@ -4155,6 +4152,54 @@ class AuthService:
             client=client,
             clock=clock,
         )
+
+    async def _redeem_sign_in_flow(
+        self, flows: oidc.FlowCache, flow_id: str, state: str | None, *, client: str | None
+    ) -> PendingFlow | LoginOutcome:
+        """The staged flow, consumed because ``state`` matched, or the audited refusal.
+
+        A wrong or missing ``state`` consumes nothing (BACKLOG #3198), and its outcome says so in
+        ``flow_consumed``, so the route keeps the flow cookie for the real IdP return."""
+        flow, consumed = flows.pop_if_state_matches(flow_id, state)
+        if flow is None:
+            await self._directory_reject_audit("<oidc>", "oidc", "state_unknown", client=client)
+            return LoginOutcome(
+                ok=False, error="federated sign-in expired; start again", reason="state_unknown"
+            )
+        if not consumed:
+            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch", client=client)
+            return LoginOutcome(
+                ok=False,
+                error="federated sign-in failed",
+                reason="state_mismatch",
+                flow_consumed=False,
+            )
+        return flow
+
+    async def abandon_oidc_login(
+        self, flow_id: str, *, state: str | None, reason: str, client: str | None
+    ) -> bool:
+        """End a sign-in flow the IdP returned WITHOUT a usable code: an ``error`` on the callback
+        (the user cancelled at the IdP) or a malformed callback (BACKLOG #3198).
+
+        ``state`` must match before the flow is consumed, as in :meth:`abandon_oidc_step_up`. An
+        error redirect carries it (RFC 6749, the authorization error response), and without the
+        check any page could cancel a sign-in in flight by sending the browser to the callback with
+        ``error=``. A missing or wrong ``state`` is refused and the flow waits for the real return.
+        On a match the flow is consumed and the closed-set ``reason`` the route chose is audited,
+        never the IdP's own text. Not padded: like the route's other early refusals, it does no
+        work that depends on an account.
+
+        Returns whether the flow was consumed, so the route knows whether to keep the browser's
+        flow cookie. It returns no :class:`LoginOutcome` because it never signs anyone in."""
+        if not self.oidc_enabled or self._oidc_flows is None:
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
+            return True
+        flow = await self._redeem_sign_in_flow(self._oidc_flows, flow_id, state, client=client)
+        if isinstance(flow, LoginOutcome):
+            return flow.flow_consumed
+        await self._directory_reject_audit("<oidc>", "oidc", reason, client=client)
+        return True
 
     async def authenticate_oidc(
         self,
@@ -4626,17 +4671,22 @@ class AuthService:
         ``idp_error`` or ``malformed_callback``, never the IdP's own text), so the operator lands back
         on the step-up page they started from, still signed in."""
         flows = self._oidc_flows
-        flow = flows.peek(flow_id) if flows is not None else None
-        if flows is None or flow is None:
+        flow, consumed = (
+            flows.pop_if_state_matches(flow_id, state) if flows is not None else (None, False)
+        )
+        if flow is None:
             return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
-        if state is None or not oidc.state_matches(flow.state, state):
+        if not consumed:
             # Filed under the NEUTRAL actor: nothing has been verified, and any page can send this
             # callback, so naming the account would let a stranger fill that person's security
             # events with step-ups they never attempted. The sign-in leg does the same.
             return await self._step_up_refused(
-                "state_mismatch", actor="<oidc>", client=client, return_to=flow.return_to
+                "state_mismatch",
+                actor="<oidc>",
+                client=client,
+                return_to=flow.return_to,
+                flow_consumed=False,
             )
-        flows.pop(flow_id)
         actor = await self._step_up_actor(flow)
         if flow.step_up_session_hash is None:
             return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
@@ -4685,17 +4735,20 @@ class AuthService:
         """
         if not self.oidc_enabled or self._oidc_flows is None or self._oidc_jwks is None:
             return await self._step_up_refused("not_configured", actor="<oidc>", client=client)
-        flow = self._oidc_flows.peek(flow_id)
+        flow, consumed = self._oidc_flows.pop_if_state_matches(flow_id, state)
         if flow is None:
             return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
         return_to = flow.return_to
-        if not oidc.state_matches(flow.state, state):
-            # PEEKED, not popped: a forged callback carrying a code and a wrong state must not
-            # consume the step-up in flight. Neutral actor, as in abandon_oidc_step_up.
+        if not consumed:
+            # A forged callback carrying a code and a wrong state consumes nothing, so the step-up
+            # in flight survives it. Neutral actor, as in abandon_oidc_step_up.
             return await self._step_up_refused(
-                "state_mismatch", actor="<oidc>", client=client, return_to=return_to
+                "state_mismatch",
+                actor="<oidc>",
+                client=client,
+                return_to=return_to,
+                flow_consumed=False,
             )
-        self._oidc_flows.pop(flow_id)
         actor = await self._step_up_actor(flow)
         token_hash = flow.step_up_session_hash
         if token_hash is None:
@@ -4939,6 +4992,7 @@ class AuthService:
         return_to: str = "/ui",
         lost: bool = False,
         extra: Mapping[str, object] | None = None,
+        flow_consumed: bool = True,
     ) -> OidcStepUp:
         """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set.
 
@@ -4958,6 +5012,7 @@ class AuthService:
             return_to=return_to,
             reason=reason,
             error=_STEP_UP_ERRORS.get(reason, "The identity provider could not confirm it's you."),
+            flow_consumed=flow_consumed,
         )
 
     async def _refuse_directory_row(

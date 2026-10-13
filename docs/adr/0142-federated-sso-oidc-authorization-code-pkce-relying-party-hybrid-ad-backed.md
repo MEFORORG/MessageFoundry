@@ -179,7 +179,10 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
   (`expired`, `auth_time_stale`) instead of minting a dead session. The federated step-up in Amendment B
   never extends the cap. Local and AD session expiry are still unchanged.]*
 - **AC-7** — IF a callback arrives without a matching flow cookie, THEN THE SYSTEM SHALL refuse and
-  audit `flow_binding_missing`, even when `state` and `code` are otherwise valid.
+  audit `flow_binding_missing`, even when `state` and `code` are otherwise valid. IF a callback
+  carries the cookie but not the flow's own `state`, including an `error=` or malformed callback,
+  THEN THE SYSTEM SHALL refuse it and consume nothing, keeping the flow and its cookie for the real
+  IdP return (BACKLOG #3198).
   → `packaging/messagefoundry-webconsole/tests/test_webui.py` <!-- console-package suite -->
 
 - **AC-8** — WHILE the IdP is unreachable, THE SYSTEM SHALL continue to serve local, LDAPS, and Kerberos

@@ -151,9 +151,9 @@ def _step_up_landing(
             error=outcome.error,
             status_code=403,
         )
-        if outcome.reason != "state_mismatch":
-            # A state mismatch consumed nothing: the flow waits for the real IdP return, which
-            # needs this browser's flow cookie. Every other refusal ended the flow.
+        if outcome.flow_consumed:
+            # A refusal that consumed nothing (a state mismatch) leaves the flow waiting for the
+            # real IdP return, which needs this browser's flow cookie.
             clear_oidc_flow_cookie(resp, request)
         return resp
     if next_ == "/ui" or is_unlock_action(next_):
@@ -488,13 +488,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 )
             )
             return _step_up_landing(request, deps, auth, step_up)
-        if error is not None:
-            # The IdP reported a failure. Audit a fixed slug; never the IdP's own string.
-            await auth.audit_oidc_reject("idp_error", client=client)
-            return _fail(request, "oidc_failed")
-        if not code or not state:
-            await auth.audit_oidc_reject("malformed_callback", client=client)
-            return _fail(request, "oidc_failed")
+        if error is not None or not code or not state:
+            # The IdP reported a failure, or the callback is malformed. The service checks
+            # `state` before it ends the flow (BACKLOG #3198), so a forged `error=` cannot cancel
+            # a sign-in in flight. It audits a fixed slug, never the IdP's own string.
+            consumed = await auth.abandon_oidc_login(
+                flow_id,
+                state=state,
+                reason="idp_error" if error is not None else "malformed_callback",
+                client=client,
+            )
+            return _fail(request, "oidc_failed", keep_flow=not consumed)
 
         outcome = await auth.complete_oidc_login(
             flow_id=flow_id,
@@ -509,12 +513,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not outcome.ok or outcome.token is None:
             # complete_oidc_login already audited the closed-set reason; map it to an allow-listed
             # short code, defaulting to the generic one so an unrecognised slug is never reflected.
-            # A state mismatch consumed nothing (BACKLOG #3198): the flow waits for the real IdP
-            # return, which needs this browser's flow cookie, as in _step_up_landing.
             return _fail(
                 request,
                 _REASON_TO_CODE.get(outcome.reason or "", "oidc_failed"),
-                keep_flow=outcome.reason == "state_mismatch",
+                keep_flow=not outcome.flow_consumed,
             )
         resp = HTMLResponse(pages.oidc_landing(), status_code=200)
         set_session_cookie(resp, outcome.token, request=request)

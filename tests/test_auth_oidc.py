@@ -566,6 +566,19 @@ def test_flow_round_trip_binds_and_is_single_use() -> None:
     assert cache.pop(flow_id) is None  # single-use
 
 
+def test_a_flow_is_consumed_only_by_its_own_state() -> None:
+    """BACKLOG #3198. A missing or wrong ``state`` leaves the flow staged, so a forged callback
+    cannot spend the one the real IdP return needs. The matching state consumes it once."""
+    cache = oidc.FlowCache(clock=lambda: 0.0)
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
+    for forged in (None, "", "forged-" + flow.state, "café"):
+        got, consumed = cache.pop_if_state_matches(flow_id, forged)
+        assert got is not None and not consumed, forged
+    got, consumed = cache.pop_if_state_matches(flow_id, flow.state)
+    assert got is not None and got.state == flow.state and consumed
+    assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)  # single-use
+
+
 def test_flow_expires() -> None:
     clock = [0.0]
     cache = oidc.FlowCache(ttl_seconds=100.0, clock=lambda: clock[0])

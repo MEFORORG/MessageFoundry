@@ -3690,7 +3690,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   step-up page with a plain message, except one that finds the session gone, which sends the operator to sign in. A refusal after the `state`
   check is filed under the staged session's account. A cancel at the IdP returns to the same page.
   A callback without the flow's own `state` consumes nothing, and the flow waits for the real
-  return. A password is
+  return. The sign-in callback follows the same rule, an `error=` or malformed one included
+  (BACKLOG #3198). A password is
   **never** checked for an `oidc` session. `POST /me/reauth` (through `AuthService.reauth`)
   refuses it before any verify, audited with `reason=idp_step_up_required`, and charges nothing to
   the lockout or the session's re-proof budget. `POST /ui/reauth` sends it to the IdP page without
