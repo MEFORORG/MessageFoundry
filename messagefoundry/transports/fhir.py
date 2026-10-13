@@ -57,7 +57,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple, overload
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -76,6 +76,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    ReplyBodyDropped,
     encode_wire_body,
     float_setting,
     register_destination,
@@ -1074,7 +1075,7 @@ class FhirDestination(DestinationConnector):
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
-    ) -> DeliveryResponse | None:
+    ) -> DeliveryResponse | ReplyBodyDropped | None:
         request = self._resolve_request(payload)
         # #68: fold this message's dynamic http.header.* entries into the per-request headers, MERGED
         # OVER the static ones but UNDER the connector's interaction headers (If-Match/If-None-Exist),
@@ -1087,6 +1088,10 @@ class FhirDestination(DestinationConnector):
         )
         # A non-2xx already raised inside _post (transient retry / permanent dead-letter). Here status is
         # 2xx: FHIR treats a 2xx as delivered (a returned OperationOutcome is captured, not an error).
+        if isinstance(body, ReplyBodyDropped):
+            # A plain write with capture off: delivered, and the worker records the drop on the
+            # message (vault BACKLOG #3040 item 5).
+            return body
         if not self.capture_response:
             return None
         if not body:
@@ -1100,7 +1105,7 @@ class FhirDestination(DestinationConnector):
 
     def _exchange(
         self, payload: str, request: _FhirRequest, extra_headers: dict[str, str]
-    ) -> tuple[str, int, dict[str, str], str | None]:
+    ) -> tuple[str | ReplyBodyDropped, int, dict[str, str], str | None]:
         """Send one resolved request; the last element is the capture outcome of a wrapped update's
         reply, or ``None``. An update goes out as a one-entry ``transaction`` (vault BACKLOG #1965)
         and its reply is unwrapped; everything else goes to ``_post`` as resolved. A ``transaction``
@@ -1198,6 +1203,18 @@ class FhirDestination(DestinationConnector):
                 f"({type(exc).__name__})"
             ) from exc
 
+    @overload
+    def _post(
+        self,
+        payload: str,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str],
+        *,
+        wrapped: Literal[True],
+    ) -> tuple[str, int, dict[str, str]]: ...
+
+    @overload
     def _post(
         self,
         payload: str,
@@ -1206,7 +1223,17 @@ class FhirDestination(DestinationConnector):
         extra_headers: dict[str, str],
         *,
         wrapped: bool = False,
-    ) -> tuple[str, int, dict[str, str]]:
+    ) -> tuple[str | ReplyBodyDropped, int, dict[str, str]]: ...
+
+    def _post(
+        self,
+        payload: str,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str],
+        *,
+        wrapped: bool = False,
+    ) -> tuple[str | ReplyBodyDropped, int, dict[str, str]]:
         # ``wrapped``: the payload is the one-entry transaction _exchange built around an update,
         # so the caller reads the reply for the entry status (vault BACKLOG #2180).
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before

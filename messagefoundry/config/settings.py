@@ -746,8 +746,9 @@ class StoreSettings(_Section):
     aad_bind: bool = True
     # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
     # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
-    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
-    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # seals legacy plaintext only on a (table, column) surface that is still unsealed: not yet
+    # recorded in `keyed_surface` and holding no ciphertext (BACKLOG #3383). So a non-blank unmarked
+    # value on a sealed surface is a stripped marker or a planted row -- the cipher
     # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
     # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
     # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
@@ -2197,8 +2198,10 @@ class DiagnosticsSettings(_Section):
     #   "all"    — record every event (the default; unchanged behavior).
     #   "errors" — drop routine success events (received/delivered/replayed); keep the compliance floor.
     #   "off"    — keep ONLY the compliance floor.
-    # COMPLIANCE FLOOR (retained at EVERY level, even "off"): `viewed` (a PHI-access record — the HIPAA
-    # message-view trail must never be dropped) and the terminal failure events `dead`/`error`/`failed`.
+    # COMPLIANCE FLOOR (retained at EVERY level, even "off"): at least `viewed` (a PHI-access record —
+    # the HIPAA message-view trail must never be dropped) and the terminal failure events
+    # `dead`/`error`/`failed`. The full set is `_AUDIT_FLOOR_EVENTS` in store/store.py, and
+    # docs/PHI.md section 7 row 6 lists it.
     message_events: Literal["all", "errors", "off"] = "all"
     # ASVS 16.3.2 (BACKLOG #244; default flipped ON by BACKLOG #1277). Audit EVERY authorization GRANT,
     # not just the sensitive/state-changing set. Setting it false narrows the trail back to that set

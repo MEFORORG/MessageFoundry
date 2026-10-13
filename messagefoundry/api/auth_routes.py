@@ -151,6 +151,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import SessionRecord, UserRecord
 
 _VALID_ROLE_IDS = {role.value for role in Role}
@@ -465,6 +466,26 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         return await http_exception_handler(request, exc)
 
     app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
+
+    async def _row_seal_refused(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2592: the store refused a write because the row it read fails its integrity
+        # seal, and wrote nothing. Any route that edits an account or a session can meet it; it is
+        # a refused change, so a 409 with a fixed text, never the row and never a 500. Logged with
+        # the row's kind, since this path does not pass the service loader that audits and alerts.
+        assert isinstance(exc, RowSealError)
+        _log.warning(
+            "a write to a %s row was refused: its integrity seal does not verify (BACKLOG #2592)",
+            exc.kind,
+        )
+        return await http_exception_handler(
+            request,
+            HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"the {exc.kind} record fails its integrity check, so the change was refused",
+            ),
+        )
+
+    app.add_exception_handler(RowSealError, _row_seal_refused)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)

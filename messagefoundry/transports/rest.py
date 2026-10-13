@@ -75,6 +75,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    ReplyBodyDropped,
     encode_wire_body,
     float_setting,
     register_destination,
@@ -87,6 +88,7 @@ from messagefoundry.transports.bounded_read import (
     drain_bounded,
     hop_identity,
     is_never_proxied_host,
+    is_proxy_credential_header_name,
     read_2xx_reply_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -258,7 +260,7 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        if name.lower() in ("authorization", "proxy-authorization"):
+        if name.lower() == "authorization" or is_proxy_credential_header_name(name):
             # Auth is connection-configured only: a message never sets or overrides it. A proxy
             # handler's admission covers the connection's own proxy_user header, so a message must
             # not be able to supply one (vault BACKLOG #3416).
@@ -1762,11 +1764,12 @@ def _refuse_a_static_proxy_header(headers: object) -> None:
     own header from a static one. Under Digest the connection sets no header of its own, so the
     static one would cross a cleartext proxy leg on the connection's admission. Under Basic it
     would be silently replaced. Refused rather than dropped, so the operator sees the conflict.
-    Names the key, never its value."""
+    Names the key, never its value. The key is read by the function the send-time rule uses, so
+    the two cannot differ on which spellings are this header."""
     if not isinstance(headers, Mapping):
         return
     for key in headers:
-        if str(key).strip().lower() == "proxy-authorization":
+        if is_proxy_credential_header_name(str(key)):
             raise ValueError(
                 f"headers sets {str(key)[:64]!r} and the connection also sets proxy_user and "
                 "proxy_password. Remove the static header: the proxy credential comes from "
@@ -2255,11 +2258,15 @@ class RestDestination(DestinationConnector):
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
-    ) -> DeliveryResponse | None:
+    ) -> DeliveryResponse | ReplyBodyDropped | None:
         # #68: build this message's dynamic headers from its user-metadata bag (pure; None → {} → byte-
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
         body, status, headers = await asyncio.to_thread(self._post, payload, dynamic_headers)
+        if isinstance(body, ReplyBodyDropped):
+            # Capture is off. Delivered; the worker records the drop on the message (vault
+            # BACKLOG #3040 item 5).
+            return body
         if not self.capture_response:
             return None
         if body == "":
@@ -2353,7 +2360,7 @@ class RestDestination(DestinationConnector):
 
     def _post(
         self, payload: str, dynamic_headers: dict[str, str] | None = None
-    ) -> tuple[str, int, dict[str, str]]:
+    ) -> tuple[str | ReplyBodyDropped, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop, before
         # a single byte crosses — defense against a reload / per-message target sneaking PHI past the
         # construction-only gate. A None guard (secure/loopback hop) is byte-identical.
@@ -2416,7 +2423,7 @@ class RestDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # Read the body (drains the connection for clean close; returned for capture). 2xx ⇒
                 # delivered. Decoding a drained body is cheap, so this stays byte-identical when capture
-                # is off (the worker just ignores the return).
+                # is off (send() returns None), except for an over-cap body: see below.
                 # ASVS 15.2.2: bounded on the socket read, so the drain cannot be turned into an
                 # unbounded buffer by a partner that answers a POST with an arbitrarily large body.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not re-send.
