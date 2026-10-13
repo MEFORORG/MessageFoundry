@@ -2907,6 +2907,12 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
         # secure_delete left this set when vault BACKLOG #2619 began naming it; the loop below now
         # pins that it is reported, and its own tests pin the file-backed condition.
+        #
+        # REPORTED, so not an owed gap (vault BACKLOG #2983): named as
+        # `store.vault_revocation_attested`, with its section, because [secrets] has a field of
+        # the same name. This loop's lone flip cannot build it: the flag refuses to load without
+        # its reason. tests/test_vault_revocation_attestation.py pins the entry.
+        "vault_revocation_attested",
     }
     exempt_auth = {
         # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three
