@@ -611,8 +611,11 @@ gates a merge**, and no seat has to clear one.
   of record for the reasoning and the traps; do not restate them here.
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file
-  instead of your diff. Name the diff too, so it matches what you committed. For example: `xhigh.
-  Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.`
+  instead of your diff. Name the diff too, so it matches what you committed. Write the level as a
+  bare first word, with no punctuation after it. `xhigh.` does not parse as a level. In two trials
+  the skill then ran at the previous call's level (measured 2026-10-13). For example: `xhigh Review
+  this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.` In
+  your QA line, quote the tag the skill prints, never the level you asked for.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
