@@ -277,7 +277,7 @@ async def test_a_probe_that_raises_after_its_caller_left_reports_nothing_to_the_
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A raise from an orphaned probe would reach the loop's exception handler through the shield,
-    one ERROR per cancelled request. The probe returns an outage instead, and fails closed."""
+    one ERROR per cancelled request. The probe returns a refusal reason instead, and fails closed."""
     service, _directory, user_id = await _directory_account(store, _VIEWERS)
     entered, gate = asyncio.Event(), asyncio.Event()
 

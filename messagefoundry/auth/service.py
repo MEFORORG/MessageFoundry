@@ -9258,10 +9258,11 @@ class AuthService:
 
     def _covered_by_requirement(self, user: UserRecord, roles: frozenset[Role]) -> bool:
         """Whether ``[security].require_mfa`` covers ``user``, enrolled or not: any account that is
-        not a directory account, an unrecognised provider included (ADR 0197 Amendment A). The gates of N-B2 part 4 key on this and on
-        :meth:`_has_way_past`, never on ``must_change_password``: a site that ran with the requirement
-        off and then turned it on holds accounts with a chosen password, no factor and no must-change
-        flag, and the gates must reach those too."""
+        not a directory account, an unrecognised provider included (ADR 0197 Amendment A). The
+        gates of N-B2 part 4 key on this and on :meth:`_has_way_past`, never on
+        ``must_change_password``: a site that ran with the requirement off and then turned it on
+        holds accounts with a chosen password, no factor and no must-change flag, and the gates
+        must reach those too."""
         return _requirement_covers(self._settings, user, roles)
 
     @staticmethod
@@ -11412,7 +11413,12 @@ class AuthService:
                             user.username,
                         )
                         continue
-                    if isinstance(detail, dict) and detail.get(key) == ids[key]:
+                    if (
+                        isinstance(detail, dict)
+                        and detail.get(key) == ids[key]
+                        # A factor reset on a directory account issues nothing (#3160).
+                        and detail.get("credential_issued") is not False
+                    ):
                         actors.add(str(row["actor"] or ""))
                         # The earliest matching row, so the account must predate all of them.
                         issued_at = min(issued_at, float(row["ts"]))
