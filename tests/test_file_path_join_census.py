@@ -579,6 +579,7 @@ SITES: dict[str, Site] = {
         OPERATOR,
         "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
     ),
+    "messagefoundry/config/fingerprint.py::_require_listable": Site(1, OPERATOR, _CONFIG_FIXED),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
     "messagefoundry/config/tls_policy.py::staged_crl": Site(
         1, INTERNAL, "A fixed name in a private temp directory this function made."

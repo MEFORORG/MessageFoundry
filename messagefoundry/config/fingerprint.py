@@ -115,11 +115,15 @@ def _require_listable(base: Path) -> None:
     bundle, and an unlistable ``codesets`` folder as a bundle without it. A missing ``base`` raises
     :class:`ConfigDirMissing`; any other fault raises its own ``OSError``. A sub-folder that does not
     exist is fine: there is nothing in it to leave out."""
+    missing = False
     try:
         with os.scandir(base):
             pass
     except (FileNotFoundError, NotADirectoryError):
-        raise ConfigDirMissing(errno.ENOENT, "config directory not found", str(base)) from None
+        missing = True
+    if missing:
+        # Raised after the handler, so the error it replaces does not ride __context__.
+        raise ConfigDirMissing(errno.ENOENT, "config directory not found", str(base))
     for folder in sorted({Path(pattern).parent for pattern in _FINGERPRINT_GLOBS} - {Path(".")}):
         try:
             with os.scandir(base / folder):

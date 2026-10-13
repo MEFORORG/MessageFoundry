@@ -1515,21 +1515,59 @@ def _unresolvable(_config_dir: object) -> Path:
     raise PermissionError(13, "Permission denied", "a parent of the config directory")
 
 
-async def test_a_request_made_while_a_file_is_unreadable_files_a_hold_that_names_no_digest(
+async def test_a_request_made_while_a_file_is_unreadable_is_refused_and_files_no_hold(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The request-time digest fails closed too. Before the round-3 review it skipped the file and
-    named the digest of the rest, so a release could load that file with no approval covering it."""
+    named the digest of the rest, so a release could load that file with no approval covering it.
+    With no digest, the release could only be refused, so no hold is filed."""
     unreadable = {"on": True}
     _unreadable(monkeypatch, "cfg.py", when=unreadable)
     service = await _service(engine)
-    approval_id, r = await _hold_then_release(
-        engine, service, {}, between=lambda: unreadable.update(on=False)
-    )
-    assert r.status_code == 422, r.text
-    assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] is None
-    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["no_approved_digest"]
-    assert await engine.store.list_audit(action="config_reload") == []
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        op = await _token(c, "op")
+        r = await c.post("/config/reload", json={}, headers=op)
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"] == (
+            "the engine could not read the config to take its digest for this request; "
+            "see the engine log"
+        )
+        unreadable["on"] = False
+        # The control: the same request, with the file readable, is held.
+        assert (await c.post("/config/reload", json={}, headers=op)).status_code == 202
+    assert len(await engine.store.list_pending_approvals(now=0.0, limit=10)) == 1
+    assert await _failed_reload_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "reason": "digest_unavailable",
+            "approved_fingerprint": None,
+            "current_fingerprint": None,
+        }
+    ]
+
+
+async def test_a_target_the_engine_cannot_stat_is_unreadable_not_missing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent the service account cannot traverse makes the target's stat fail with an access
+    error. ``is_dir`` answered False for that, so the request was audited as a missing directory."""
+    from messagefoundry.pipeline import ConfigDirUnreadable
+
+    cfg = (tmp_path / "cfg").resolve()
+    real_stat = Path.stat
+
+    def _stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == cfg:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with pytest.raises(ConfigDirUnreadable):
+        await engine._existing_reload_target(str(cfg))
+    monkeypatch.undo()
+    assert await engine._existing_reload_target(str(cfg)) == cfg  # the control
 
 
 async def test_a_file_added_during_the_load_and_left_unreadable_is_not_released(

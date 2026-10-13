@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import stat
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -176,11 +177,13 @@ class ConfigDigestMismatch(Exception):
 
 
 class ConfigDigestUnavailable(Exception):
-    """A released reload could not take the digest of its config, so nothing can be checked
-    against its approval (vault BACKLOG #2596). The cause is logged at WARNING where the digest
-    failed; ``approved`` is the digest the hold captured. Raised before anything is swapped."""
+    """The digest of a gated reload's config could not be taken (vault BACKLOG #2596). At release
+    nothing can then be checked against the approval, and at request there is nothing for an
+    approval to name, so no hold is filed. The cause is logged at WARNING where the digest failed;
+    ``approved`` is the digest the hold captured, or ``None`` at request time. Raised before
+    anything is swapped."""
 
-    def __init__(self, approved: str) -> None:
+    def __init__(self, approved: str | None) -> None:
         super().__init__("the config's digest could not be taken to check it against its approval")
         self.approved = approved
 
@@ -228,8 +231,10 @@ class ReloadOutcome:
     Three situations a caller must be able to tell apart, because they call for different operator
     action:
 
-    * **The reload did not happen.** The call RAISES (``ConfigReloadDenied``, ``FileNotFoundError``,
-      ``WiringError``, or a connector build failure) and returns no outcome at all. The previously
+    * **The reload did not happen.** The call RAISES (at least ``ConfigReloadDenied``,
+      ``FileNotFoundError``, ``ConfigDirUnreadable``, ``ConfigDigestMismatch``,
+      ``ConfigDigestUnavailable``, ``WiringError``, or a connector build failure) and returns no
+      outcome at all. The previously
       live graph is untouched, so the operator fixes the config and retries.
     * **The reload happened cleanly.** ``applied`` is True and ``failures`` is empty.
     * **The reload happened and a follow-on step failed.** ``applied`` is True and ``failures``
@@ -2474,20 +2479,22 @@ class Engine:
             log.warning("config fingerprint failed for %s: %s", path, reason)
             return None, reason
 
-    async def reload_target_digest(self, config_dir: str | Path | None) -> str | None:
-        """The content digest of the directory a reload of ``config_dir`` would load, or ``None``.
+    async def reload_target_digest(self, config_dir: str | Path | None) -> str:
+        """The content digest of the directory a reload of ``config_dir`` would load.
 
         A held reload's approval carries it, and the release passes it back to
         :meth:`reload_detail` in an :class:`ApprovedConfig` (vault BACKLOG #2596). The target is
         found by :meth:`_existing_reload_target`, as a reload finds it, so a path outside the reload
-        roots is never read, and its refusal propagates: a hold that release can only refuse is
-        never filed. That covers a missing directory, including one gone by the time the digest
-        reads it (``FileNotFoundError``), and one that cannot be resolved
-        (:class:`ConfigDirUnreadable`). ``None`` means the directory is there and no digest could be
-        taken, because a folder or a file the digest covers could not be read. The reason is logged
-        at WARNING, and the release refuses the hold that carries it."""
+        roots is never read. Every refusal propagates, so a hold that release can only refuse is
+        never filed: a missing directory, including one gone by the time the digest reads it
+        (``FileNotFoundError``), one that cannot be resolved (:class:`ConfigDirUnreadable`), and one
+        holding a folder or file the digest covers that cannot be read
+        (:class:`ConfigDigestUnavailable`, the cause logged at WARNING)."""
         path = await self._existing_reload_target(config_dir)
-        return await self._content_digest(path)
+        digest = await self._content_digest(path)
+        if digest is None:
+            raise ConfigDigestUnavailable(None)
+        return digest
 
     async def _content_digest(self, path: Path) -> str | None:
         """The ADR 0041 D1 content digest of ``path`` alone, for an approval to bind, or ``None``
@@ -2526,7 +2533,8 @@ class Engine:
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by
         :meth:`_resolve_reload_target`, and refused with ``FileNotFoundError`` when it is not a
-        directory, or :class:`ConfigDirUnreadable` when resolving it raises another ``OSError``.
+        directory, or :class:`ConfigDirUnreadable` when resolving or reading it raises another
+        ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
         #2581)."""
@@ -2543,7 +2551,18 @@ class Engine:
                 "config reload target could not be resolved: %s", scrub_log_argument(safe_exc(exc))
             )
             raise ConfigDirUnreadable() from exc
-        if not await asyncio.to_thread(path.is_dir):
+        try:
+            # stat, not is_dir: is_dir answers False for a target it cannot stat, which would
+            # report a parent the service account cannot traverse as a missing directory.
+            mode = (await asyncio.to_thread(path.stat)).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            mode = None
+        except OSError as exc:
+            log.warning(
+                "config reload target could not be read: %s", scrub_log_argument(safe_exc(exc))
+            )
+            raise ConfigDirUnreadable() from exc
+        if mode is None or not stat.S_ISDIR(mode):
             raise FileNotFoundError(f"config directory not found: {config_dir}")
         return path
 
@@ -2751,8 +2770,9 @@ class Engine:
             # TOMLDecodeError would keep a whole value file (BACKLOG #2307).
             try:
                 _require_approved(await self._content_digest(path), approval)
-            except (ConfigDigestMismatch, ConfigDigestUnavailable):
-                # The refusal names the digest, so the load error would otherwise go unlogged.
+            except (ConfigDigestMismatch, ConfigDigestUnavailable, FileNotFoundError):
+                # The refusal names the digest or the missing directory, so the load error would
+                # otherwise go unlogged.
                 log.warning(
                     "a released config reload also failed to load: %s",
                     scrub_log_argument(safe_exc(load_error)),

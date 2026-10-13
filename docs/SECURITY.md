@@ -2067,21 +2067,28 @@ approved one, nothing loads past that point and nothing swaps. The running graph
 environment values it had. A reload applies the values it re-read only with the swap, and a
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
-reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold that took
-no digest is refused the same way, with reason `no_approved_digest`. A release that cannot take
-the digest now is refused with reason `digest_unavailable`, and the engine logs the cause at
-WARNING. The requester asks again, and a second approver reviews the new bytes.
+reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
+params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
+cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
+cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 
 This digest fails closed, unlike the provenance fingerprint, which skips what it cannot read. A
 file or folder it covers that cannot be read gives no digest at all, never the digest of the rest.
 A directory gone by the time the digest reads it is refused as missing, never digested as an empty
-bundle.
+bundle. After the load the release checks this digest first, and then the one the row records.
 
-A request for a directory outside the reload roots, a missing one, or one that cannot be resolved
-files no hold. It gets the status and refusal row an inline reload gets. The last is refused with
-reason `unreadable`, and the engine logs the cause at WARNING. It writes no `config_reload_attempted` row, because
-nothing was attempted. A repeat request joins an open hold only while the digest is unchanged. An
-ungated reload takes no request-time digest. At least these limits remain:
+Some requests file no hold, because their release could only be refused. Each is answered and
+audited at once, as an inline reload's refusal is:
+
+- a directory outside the reload roots, or a missing one;
+- a directory the engine cannot resolve or read, such as one under a parent the service account
+  cannot traverse. Its reason is `unreadable`;
+- a directory holding a covered file or folder that cannot be read. Its reason is
+  `digest_unavailable`, with no `approved_fingerprint`.
+
+The engine logs the cause of the last two at WARNING. None writes a `config_reload_attempted` row,
+because nothing was attempted. A repeat request joins an open hold only while the digest is
+unchanged. An ungated reload takes no request-time digest. At least these limits remain:
 
 - the digest is not sealed. A writer to the `pending_approvals` table can replace it along with the
   rest of the params. Sealing that row is vault BACKLOG #2592;
@@ -2091,9 +2098,9 @@ ungated reload takes no request-time digest. At least these limits remain:
 - each check samples the files. An edit that lands after the first check runs its module code
   before the second check refuses it. An edit reverted while the release loads is not seen at all.
   Hashing, compiling and running the same bytes is that same step 1;
-- the request-time digest is taken before the route checks its step-up proof. A request still
-  files a hold with no digest when a file or folder the digest covers cannot be read. Its release
-  is certain to be refused, with reason `no_approved_digest`;
+- the request-time digest is taken before the route checks its step-up proof;
+- the digest checks that each folder it reads can be listed, and then lists it again. A folder
+  that becomes unlistable between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;

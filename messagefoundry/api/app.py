@@ -970,10 +970,10 @@ async def _reload_hold_params(
     """What a held reload captures; shared by the guard and the rejoin as for a purge.
 
     ``fingerprint`` is the content digest of the directory as it is now, so the approval names the
-    bytes it releases and the release refuses any others (vault BACKLOG #2596, step 3). It is
-    ``None`` when no digest could be taken. It is taken only when dual control gates the reload,
-    because an inline reload holds nothing and takes its own digest. A target the reload would
-    refuse raises one of :data:`_RELOAD_REFUSALS` here, so no hold is filed for it."""
+    bytes it releases and the release refuses any others (vault BACKLOG #2596, step 3). It is taken
+    only when dual control gates the reload, and is ``None`` otherwise, because an inline reload
+    holds nothing and takes its own digest. A target the reload would refuse, or one whose digest
+    cannot be taken, raises one of :data:`_RELOAD_REFUSALS` here, so no hold is filed for it."""
     gated = gate is not None and gate.gates("config_reload")
     digest = await engine.reload_target_digest(config_dir) if gated else None
     return {"config_dir": config_dir, "requester": requester, "fingerprint": digest}
@@ -1166,8 +1166,8 @@ def _build_approval_gate(
         # gate's compensation and record a reload that ran as 'failed'.
         actor = str(p["requester"])
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
-        # that captured no digest binds to None, which matches nothing, so it is refused as a
-        # mismatch once its directory resolves. The digest is not sealed: a writer to
+        # whose params carry no digest (none is filed that way now) binds to None, which matches
+        # nothing, so it is refused as a mismatch once its directory resolves. The digest is not sealed: a writer to
         # pending_approvals can replace it with the params (vault BACKLOG #2592).
         approved = p.get("fingerprint")
         approval = ApprovedConfig(approved if isinstance(approved, str) else None)
@@ -1710,7 +1710,8 @@ async def _audit_refused_reload(
     one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
-    reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A directory
+    reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
+    request whose digest cannot be taken is refused the same way, with no hold filed. A directory
     that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
     engine logged why at WARNING.
 
@@ -1772,8 +1773,11 @@ async def _audit_refused_reload(
         detail["current_fingerprint"] = None
         status = 422
         answer = (
-            "the engine could not read the config to check it against this request's approval; "
+            "the engine could not read the config to take its digest for this request; "
             "see the engine log"
+            if exc.approved is None
+            else "the engine could not read the config to check it against this request's "
+            "approval; see the engine log"
         )
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
