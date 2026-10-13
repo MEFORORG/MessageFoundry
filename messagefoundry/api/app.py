@@ -1339,6 +1339,9 @@ def _posture_loosenings(
             # managed lifespan stashed. The same stash-or-default rule: an app built without it
             # is read at the shipped default, which names nothing.
             backup=getattr(state, "backup_settings", None) or BackupSettings(),
+            # Vault BACKLOG #2983: the secret provider's Vault revocation attestation, off the
+            # [secrets] section the managed lifespan stashed. The same stash-or-default rule.
+            secrets=getattr(state, "secrets_settings", None) or SecretsSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -10163,6 +10166,10 @@ def create_managed_app(
             # None (direct create_app / embedding) leaves the route on the shipped [backup]
             # defaults, which report nothing.
             app.state.backup_settings = backup_settings
+            # Vault BACKLOG #2983: back GET /security/posture's secrets.vault_revocation_attested
+            # entry. None (direct create_app / embedding) leaves the route on the shipped
+            # [secrets] defaults, which report nothing.
+            app.state.secrets_settings = secrets_settings
             # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
             # None (direct create_app / embedding) leaves the route on shipped defaults, which report
             # nothing — correct, because an app built without [secret_rotation] has not opted out.

@@ -8561,6 +8561,7 @@ def security_loosenings(
     approvals: ApprovalsSettings,
     cert_monitor: CertMonitorSettings,
     backup: BackupSettings,
+    secrets: SecretsSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -8636,7 +8637,8 @@ def security_loosenings(
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489) and the
     held list (vault BACKLOG #3123).
     ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
-    ``[backup].allow_unencrypted`` (vault BACKLOG #2302).
+    ``[backup].allow_unencrypted`` (vault BACKLOG #2302). ``secrets`` joins them for
+    ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983).
 
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
