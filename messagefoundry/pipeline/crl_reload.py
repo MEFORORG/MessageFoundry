@@ -676,6 +676,10 @@ def _reload_path(
         and refusals.strongest[1] in _SAYS_RESTART
         and (unmet := crl_not_in_effect(blocks, now=now)) is not None
     ):
+        # For the alert, which carries no reason. The reopen below is what lets this flag live
+        # on the outcome and not on the recorded refusal: such a refusal is never final, so
+        # ``_pending`` never replays it without the flag.
+        refusals.start_refuses = True
         why, remedy = refusals.strongest
         refusals.strongest = (
             f"{why}. Not before {log_timestamp(unmet.this_update)}: a start until then refuses this "
@@ -684,9 +688,6 @@ def _reload_path(
         )
         # Judged again each pass, so the warning goes once its time has passed.
         refusals.reopen()
-        # The reopen above is also what lets the flag live on the outcome and not on the recorded
-        # refusal: such a refusal is never final, so ``_pending`` never replays it without the flag.
-        refusals.start_refuses = True
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
 
 
@@ -1002,6 +1003,14 @@ class CrlReloadRunner:
                 await task
         # Also with no task: a clear the sink refused at an earlier stop is retried by this one.
         self._resolve(list(self._alerted), "the reload has stopped")
+        if self._alerted:
+            # Said here every time, whatever streak is open: no later pass will try again.
+            log.warning(
+                "crl_reload: %d refused-reload alert(s) could not be resolved at stop; resolve "
+                "them in the alert list: %s",
+                len(self._alerted),
+                ", ".join(sorted(self._alerted)),
+            )
 
     async def _run(self) -> None:
         # Sleep first: every context was just built from the file as it is now.
@@ -1027,22 +1036,24 @@ class CrlReloadRunner:
                 return
             # After the await, so on the event loop: a notifier schedules its alert-state write
             # with the running loop, and off the loop that write is dropped without an error.
-            try:
-                self._report(outcomes)
-            except Exception:
-                # Broad on purpose, as for the pass: reporting must never end the loop that
-                # applies revocations. An injected ``reload`` can return an outcome of any shape.
-                log.exception("crl_reload: reporting a pass failed; will retry next interval")
+            self._report(outcomes)
 
     def _report(self, outcomes: object) -> None:
         """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet, then
         resolve the alerts whose refusal no longer stands.
 
         ``outcomes`` is whatever the pass returned. An injected ``reload`` may return anything,
-        and a pass that raised returns nothing, so only a list of :class:`ReloadOutcome` is read."""
+        and a pass that raised returns nothing, so only a list of :class:`ReloadOutcome` is read.
+        Each outcome is guarded on its own: one of an odd shape must not end the loop that
+        applies revocations, nor hold back the outcomes after it or the clears."""
         for outcome in outcomes if isinstance(outcomes, list) else ():
             if isinstance(outcome, ReloadOutcome) and outcome.refusal is not None:
-                self._raise_refused(outcome, outcome.refusal)
+                try:
+                    self._raise_refused(outcome, outcome.refusal)
+                except Exception:
+                    # Broad on purpose, as for the pass. A sink that raises is handled inside;
+                    # this is an outcome the report itself could not read.
+                    log.exception("crl_reload: could not report a refused file; will retry")
         self._resolve_cleared()
 
     def _resolve_cleared(self) -> None:
@@ -1056,14 +1067,15 @@ class CrlReloadRunner:
         if not self._alerted and not self._sink_failing:
             return
         standing = reload_refusals()
-        # A raise that kept failing for a refusal since cleared is moot. End its streak, so the
-        # next failure for that file is logged again.
+        cleared = [key for key in self._alerted if key not in standing]
+        # End a streak whose call is no longer owed, so the next failure for that file is logged
+        # again. A raise is owed while the refusal stands; a clear while its alert awaits one.
         self._sink_failing = {
-            (what, key) for what, key in self._sink_failing if what != "raised" or key in standing
+            (what, key)
+            for what, key in self._sink_failing
+            if (key in standing if what == "raised" else key in cleared)
         }
-        self._resolve(
-            [key for key in self._alerted if key not in standing], "the refusal no longer stands"
-        )
+        self._resolve(cleared, "the refusal no longer stands")
 
     def _resolve(self, keys: Sequence[str], why: str) -> None:
         """Raise ``crl_reload_applied`` for each alert in ``keys``, and forget the ones raised."""
@@ -1089,8 +1101,9 @@ class CrlReloadRunner:
         if (what, key) not in self._sink_failing:
             self._sink_failing.add((what, key))
             log.warning(
-                "crl_reload: the refused-reload alert could not be %s; the next pass, or the "
-                "stop, tries again",
+                "crl_reload: the refused-reload alert for %s could not be %s; the next pass, or "
+                "the stop, tries again",
+                key,
                 what,
                 exc_info=True,
             )

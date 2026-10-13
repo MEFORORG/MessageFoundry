@@ -491,26 +491,88 @@ async def test_a_pass_in_flight_at_stop_raises_nothing(pki: _Pki) -> None:
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
-async def test_a_report_that_fails_does_not_end_the_loop(
-    caplog: pytest.LogCaptureFixture,
+async def test_an_outcome_the_report_cannot_read_stops_nothing_else(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The pass is guarded, and so is its report: an outcome of an odd shape from an injected
-    ``reload`` must not end the loop that applies revocations."""
-    passes: list[int] = []
+    """The pass is guarded, and so is each outcome of its report. One of an odd shape, from an
+    injected ``reload``, must not end the loop, nor hold back the outcomes after it or the clears."""
+    good, cleared = str(tmp_path / "good.pem"), str(tmp_path / "cleared.pem")
     refusal = ReloadRefusal((1, 2), "why", RESTART)
+    for path in (good, cleared):
+        loaded_crls.record_reload_refusal(path, refusal)
+    passes: list[int] = []
+    sink = _Sink()
 
     def reload() -> list[ReloadOutcome]:
         passes.append(1)
-        return [ReloadOutcome(cast(Any, 123), 0, refusal, 1)]  # not a path
+        if len(passes) == 2:
+            loaded_crls.clear_reload_refusal(cleared)
+        return [
+            ReloadOutcome(cast(Any, 123), 0, refusal, 1),  # not a path
+            ReloadOutcome(good, 0, refusal, 1),
+            *([ReloadOutcome(cleared, 0, refusal, 1)] if len(passes) < 2 else []),
+        ]
 
-    runner = CrlReloadRunner(interval_seconds=0.01, reload=reload, skip_when_idle=False)
+    runner = _runner(sink, interval_seconds=0.01, reload=reload, skip_when_idle=False)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
         runner.start()
         try:
-            await until(lambda: len(passes) >= 3, "a third pass after two failed reports")
+            await until(lambda: len(passes) >= 4, "a fourth pass after three unreadable outcomes")
+            assert [(kind, name) for kind, name, _ in sink.events] == [
+                ("refused", reload_alert_subject(good)),
+                ("refused", reload_alert_subject(cleared)),
+                ("applied", reload_alert_subject(cleared)),
+            ]
         finally:
             await runner.stop()
-    assert any("reporting a pass failed" in r.getMessage() for r in caplog.records)
+    assert any("could not report a refused file" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_streak_ends_once_its_call_is_no_longer_owed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raise that kept failing for a refusal since cleared is moot. Its streak must end, or
+    the next failure for that file would be logged nowhere."""
+    path = str(tmp_path / "a.pem")
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    outcomes = [ReloadOutcome(path, 0, refusal, 1)]
+    sink = _Sink()
+    sink.down = True
+    runner = _runner(sink)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        for expected in (1, 2):
+            loaded_crls.record_reload_refusal(path, refusal)
+            runner._report(outcomes)
+            runner._report(outcomes)
+            failures = [r for r in caplog.records if "could not be raised" in r.getMessage()]
+            assert len(failures) == expected, "one WARNING per streak"
+            assert crl_path_key(path) in failures[-1].getMessage(), "and it names the file"
+            loaded_crls.clear_reload_refusal(path)
+            runner._report([])  # the refusal is gone, so the failed raise is no longer owed
+    assert sink.events == []
+
+
+async def test_a_clear_that_fails_at_stop_is_said_at_stop(
+    pki: _Pki, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No later pass will try again, so the stop names what an operator must resolve by hand."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    sink.down = True
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        await runner.stop()
+        await runner.stop()
+
+    said = [r for r in caplog.records if "could not be resolved at stop" in r.getMessage()]
+    assert len(said) == 2, "said at every stop that leaves one open, whatever streak is open"
+    assert crl_path_key(pki.crl) in said[0].getMessage()
+    assert sink.kinds() == ["refused"]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
 async def test_a_refusal_after_a_clear_is_not_held_back_by_the_cooldown() -> None:

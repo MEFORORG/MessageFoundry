@@ -1901,7 +1901,7 @@ reason, once the held copy nears its `nextUpdate`.
 | `remedy_class` | What to do |
 |---|---|
 | `fix_file` | Fix the file. A start would refuse it too. |
-| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. |
+| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
 | `bad_signature` | A CRL in the file fails its signature check under rule 2. The signature paragraphs above say when to fix the file and when a restart loads it. |
 | `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
 | `restart` | Restart the engine to apply the file. |
@@ -1916,8 +1916,13 @@ no remedy sentence.
 file. It raises it again only when the file's bytes change or the reason does, which is the rule the
 ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
 applies while the alert is open: a second refused version inside `[alerts].realert_seconds` of the
-first updates the open alert and does not page again. Resolving the alert ends that cooldown, so it
-does not hold back a refusal that follows a fix.
+first updates the open alert and does not page again. So a page can name an older class than the
+alert list shows. When the engine resolves the alert itself, that ends the cooldown, so it does not
+hold back a refusal that follows a fix. A resolve made by hand in the alert list does not end it.
+
+**Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
+the event carries no `start_refuses`. With any other class a start can refuse the file too, and
+then the engine does not come up.
 
 **The alert resolves itself.** Its inverse, `crl_reload_applied`, pages nobody and cannot be a
 rule's `event_type`. The engine raises it once the refusal no longer stands on that process:
