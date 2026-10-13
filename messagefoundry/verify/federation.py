@@ -218,6 +218,7 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
     from messagefoundry.auth.oidc.client_auth import ClientSecretPost
     from messagefoundry.auth.service import oidc_client_auth_from_settings
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
+    from messagefoundry.config.settings import hop_posture_from_ai
 
     auth = settings.auth
     if auth.oidc_private_key_jwt:
@@ -232,7 +233,12 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
         rid, title = "fed.client_secret", "OIDC client secret resolves"
         source = "[secrets] provider reference" if auth.oidc_client_secret_ref else "environment"
     try:
-        credential = oidc_client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
+        # The posture the serve lifespan derives, so a Vault-held credential is read under the
+        # revocation rule `serve` would apply to that hop (vault BACKLOG #2983).
+        posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+        credential = oidc_client_auth_from_settings(
+            auth, resolve_secret_provider(settings.secrets, posture=posture)
+        )
     # SigningError is a ValueError; catching the base keeps this module off the signing seam.
     except (SecretProviderError, ValueError) as exc:
         return CheckResult(rid, title, Status.FAIL, str(exc))

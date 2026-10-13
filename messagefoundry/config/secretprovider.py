@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
+    from messagefoundry.config.tls_policy import HopPosture
 
 __all__ = [
     "SecretProvider",
@@ -109,13 +110,19 @@ _EXTERNAL_PROVIDERS: dict[str, str] = {
 KNOWN_PROVIDERS: tuple[str, ...] = ("none", *_BUILTIN_PROVIDERS, *tuple(_EXTERNAL_PROVIDERS))
 
 
-def _load_external_provider(name: str, settings: SecretsSettings) -> SecretProvider:
+def _load_external_provider(
+    name: str, settings: SecretsSettings, posture: HopPosture | None
+) -> SecretProvider:
     """Lazy hook for an external secrets backend (mirrors ``keyprovider._load_external_provider``).
 
     The seam: a per-provider module ``messagefoundry/config/secretprovider_<name>.py`` exposes
-    ``build_provider(settings) -> SecretProvider`` behind an optional extra; this dispatch imports it by
-    name with **no edit here**. A missing provider module or a missing backend SDK **fails closed** naming
-    the extra — the base install pulls **zero** external SDK."""
+    ``build_provider(settings, *, posture) -> SecretProvider`` behind an optional extra; this
+    dispatch imports it by name with **no edit here**. A missing provider module or a missing
+    backend SDK **fails closed** naming the extra — the base install pulls **zero** external SDK.
+
+    ``posture`` is handed to every external provider, because each one dials a network hop that a
+    posture-keyed guard may judge (vault BACKLOG #2983). A provider must read ``None`` as
+    enforcing."""
     extra = _EXTERNAL_PROVIDERS[name]
     module_name = f"{__name__}_{name}"
     try:
@@ -131,23 +138,29 @@ def _load_external_provider(name: str, settings: SecretsSettings) -> SecretProvi
             f"[secrets].provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra ('messagefoundry[{extra}]')."
         ) from exc
-    provider: SecretProvider = module.build_provider(settings)
+    provider: SecretProvider = module.build_provider(settings, posture=posture)
     return provider
 
 
-def resolve_secret_provider(settings: SecretsSettings) -> SecretProvider | None:
+def resolve_secret_provider(
+    settings: SecretsSettings, *, posture: HopPosture | None = None
+) -> SecretProvider | None:
     """Build the :class:`SecretProvider` selected by ``[secrets].provider``, or ``None`` for ``none``.
 
     ``none`` (the default) returns ``None`` → the **env-sourced default path**, byte-identical to today
     (no provider is ever consulted). ``env`` is the built-in; ``vault`` is the lazy optional extra. An
-    unknown name **fails closed** with :class:`SecretProviderError`."""
+    unknown name **fails closed** with :class:`SecretProviderError`.
+
+    ``posture`` is the instance posture the caller holds. It reaches an external provider only,
+    which keeps it for every read it makes later (vault BACKLOG #2983). ``None`` counts as
+    enforcing there."""
     name = settings.provider
     if name in ("", "none"):
         return None
     if name == "env":
         return EnvSecretProvider()
     if name in _EXTERNAL_PROVIDERS:
-        return _load_external_provider(name, settings)
+        return _load_external_provider(name, settings, posture)
     raise SecretProviderError(
         f"unknown [secrets].provider {name!r}; valid values are {', '.join(KNOWN_PROVIDERS)}"
     )

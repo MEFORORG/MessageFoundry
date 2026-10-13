@@ -4,8 +4,9 @@
 
 Each hop verifies the Vault server's certificate and checks no revocation. The guard refuses the
 hop when the client is built, unless the Vault is on the box or the hop's own settings pair attests
-that revocation is covered outside the engine. No posture reaches the client build yet, and an
-unknown posture counts as enforcing, so every case here is the enforcing one.
+that revocation is covered outside the engine. The guard is keyed on the instance posture, which
+each caller hands down. A caller that holds none passes ``None``, and an unknown posture counts as
+enforcing.
 
 These tests drive the three shipped entry points with a real ``hvac`` client. Nothing reaches a
 network: the one function urllib3 dials through records the address and fails.
@@ -26,6 +27,7 @@ from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.settings import SecretsSettings, StoreSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
+    HopPosture,
     InsecureHopRefused,
     tls_revocation_attested,
 )
@@ -118,28 +120,54 @@ def _pair(attested: bool) -> dict[str, Any]:
     return {"vault_revocation_attested": True, "vault_revocation_attested_reason": _REASON}
 
 
-def _kv(monkeypatch: pytest.MonkeyPatch, addr: str | None, attested: bool = False) -> Any:
-    from messagefoundry.config.secretprovider_vault import VaultSecretProvider
+def _kv(
+    monkeypatch: pytest.MonkeyPatch,
+    addr: str | None,
+    attested: bool = False,
+    posture: HopPosture | None = None,
+) -> Any:
+    """The connector secret provider, from the dispatch every credential point calls."""
+    from messagefoundry.config.secretprovider import resolve_secret_provider
 
     if addr is not None:
         monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", addr)
-    return VaultSecretProvider(SecretsSettings(**_pair(attested))).resolve("mefor/ad")
+    provider = resolve_secret_provider(
+        SecretsSettings(provider="vault", **_pair(attested)), posture=posture
+    )
+    assert provider is not None
+    return provider.resolve("mefor/ad")
 
 
-def _kek(monkeypatch: pytest.MonkeyPatch, addr: str | None, attested: bool = False) -> Any:
-    from messagefoundry.store.keyprovider_vault import VaultKeyProvider
+def _kek(
+    monkeypatch: pytest.MonkeyPatch,
+    addr: str | None,
+    attested: bool = False,
+    posture: HopPosture | None = None,
+) -> Any:
+    """The store key provider, from the cipher build ``open_store`` runs."""
+    from messagefoundry.store.base import build_store_cipher
 
     if addr is not None:
         monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", addr)
-    return VaultKeyProvider(StoreSettings(**_pair(attested))).active_key()
+    return build_store_cipher(
+        StoreSettings(key_provider="vault", **_pair(attested)), posture=posture
+    )
 
 
-def _transit(monkeypatch: pytest.MonkeyPatch, addr: str | None, attested: bool = False) -> Any:
-    from messagefoundry.store.crypto_transit import build_transit_cipher
+def _transit(
+    monkeypatch: pytest.MonkeyPatch,
+    addr: str | None,
+    attested: bool = False,
+    posture: HopPosture | None = None,
+) -> Any:
+    """The Transit cipher, from the cipher build ``open_store`` runs."""
+    from messagefoundry.store.base import build_store_cipher
 
     if addr is not None:
         monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", addr)
-    return build_transit_cipher(StoreSettings(**_pair(attested)))
+    return build_store_cipher(
+        StoreSettings(cipher_provider="vault_transit", **_pair(attested)), posture=posture
+    )
 
 
 EntryPoint = Callable[..., Any]
@@ -263,6 +291,77 @@ def test_the_blanket_variable_does_not_cross_an_enforcing_hop(
         entry(monkeypatch, _OFF_BOX)
     _assert_refused(caught, entry)
     assert dials == []
+
+
+_ENFORCING = HopPosture(enforcing=True)
+_NOT_ENFORCING = HopPosture(enforcing=False)
+
+
+@_ENTRY_POINTS
+@pytest.mark.parametrize("posture", [None, _ENFORCING], ids=["unknown", "enforcing"])
+def test_an_unknown_posture_refuses_like_an_enforcing_one(
+    entry: EntryPoint,
+    posture: HopPosture | None,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+) -> None:
+    """A caller that holds no posture passes ``None``, and ``None`` must never be a way across.
+    The blanket variable is set here too, so this is also the clamp under both postures.
+    Mutation: ``enforcing=False if posture is None else posture.enforcing`` in the guard."""
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with pytest.raises(_FAIL_CLOSED) as caught:
+        entry(monkeypatch, _OFF_BOX, False, posture)
+    _assert_refused(caught, entry)
+    assert dials == []
+
+
+@_ENTRY_POINTS
+def test_the_blanket_variable_crosses_only_under_a_posture_that_is_not_enforcing(
+    entry: EntryPoint, monkeypatch: pytest.MonkeyPatch, dials: list[object]
+) -> None:
+    """The process-wide variable turns the warning into a silent crossing on an instance whose
+    ``[security].enforcement`` is not ``enforce``, as it does on every other revocation guard.
+    It reaches the guard only if every link hands the posture down, so this also proves the
+    chain from the dispatch to the guard on each hop.
+    Mutation: drop ``posture=posture`` from any link, such as ``build_store_cipher`` to
+    ``_build_store_cipher``, or ``_build_client`` to the mount."""
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with pytest.raises(_FAIL_CLOSED) as caught:
+        entry(monkeypatch, _OFF_BOX, False, _NOT_ENFORCING)
+    _assert_crossed(caught, entry)
+    assert dials == [(_HOST, 8200)]
+
+
+@pytest.mark.parametrize("provider", ["key_provider", "cipher_provider"])
+def test_open_store_hands_its_posture_to_the_cipher_build(
+    provider: str, monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
+) -> None:
+    """``open_store`` is where ``serve`` and the commands that hold a posture enter the chain.
+    Mutation: ``build_store_cipher(settings)`` in ``open_store``."""
+    import asyncio
+
+    from messagefoundry.store.base import open_store
+
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _OFF_BOX)
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    selected = (
+        {"key_provider": "vault"}
+        if provider == "key_provider"
+        else {"cipher_provider": "vault_transit"}
+    )
+    settings = StoreSettings(path=str(tmp_path / "s.db"), **selected)
+
+    async def opened(posture: HopPosture | None) -> None:
+        await open_store(settings, create=True, posture=posture)
+
+    with pytest.raises(KeyProviderError) as refused:
+        asyncio.run(opened(None))
+    assert "vault_revocation_attested" in str(refused.value)
+    assert dials == []
+    with pytest.raises(KeyProviderError) as crossed:
+        asyncio.run(opened(_NOT_ENFORCING))
+    assert "vault_revocation_attested" not in str(crossed.value)
+    assert dials == [(_HOST, 8200)]
 
 
 @_ENTRY_POINTS

@@ -9693,7 +9693,9 @@ def create_managed_app(
         # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
         # startup rather than degrading to a blank credential.
         secret_provider = (
-            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
+            resolve_secret_provider(secrets_settings, posture=_hop_posture)
+            if secrets_settings is not None
+            else None
         )
         notifier = (
             notifier_from_settings(

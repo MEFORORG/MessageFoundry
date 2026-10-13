@@ -420,6 +420,9 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
     ``revocation_attested`` and ``attestation_section`` are the hop's own revocation attestation and
     the settings section it came from (vault BACKLOG #2983). Both are REQUIRED, for the same reason.
     :func:`_refuse_an_unrevoked_vault_hop` reads them before each ``https://`` send.
+
+    ``posture`` is the instance posture the caller holds. It may be left out, because leaving it
+    out is the strict answer: ``None`` counts as enforcing.
     """
 
     #: requests copies an adapter's state through these names, then rebuilds its pool manager, so
@@ -433,6 +436,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         "_limit",
         "_revocation_attested",
         "_attestation_section",
+        "_posture",
     ]
 
     def __init__(
@@ -442,6 +446,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         ssl_context_factory: Callable[[], ssl.SSLContext],
         revocation_attested: bool,
         attestation_section: VaultAttestationSection,
+        posture: HopPosture | None = None,
         limit: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         # Set BEFORE super().__init__(), which builds the pool manager through init_poolmanager.
@@ -452,6 +457,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         self._limit = limit
         self._revocation_attested = revocation_attested
         self._attestation_section = attestation_section
+        self._posture = posture
 
     def init_poolmanager(
         self,
@@ -528,6 +534,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
             ssl_context_factory=self._ssl_context_factory,
             revocation_attested=self._revocation_attested,
             attestation_section=self._attestation_section,
+            posture=self._posture,
         )
         return pool
 
@@ -828,6 +835,7 @@ def _refuse_an_unrevoked_vault_hop(
     ssl_context_factory: Callable[[], ssl.SSLContext],
     revocation_attested: bool,
     attestation_section: VaultAttestationSection,
+    posture: HopPosture | None = None,
 ) -> None:
     """Refuse a verifying Vault hop that checks no revocation and carries no attestation (vault
     BACKLOG #2983, owner ruling 2026-10-13).
@@ -855,12 +863,11 @@ def _refuse_an_unrevoked_vault_hop(
     * ``crl_checked`` is read off a context the factory builds, never off a setting. No CRL
       lever is built for this hop, so it is ``False`` today. The context is built only when the
       answer could matter, since the two inputs above each allow without it.
-    * **The posture is unknown here, and unknown counts as enforcing.** The providers hold no
-      ``[security]`` section, as :func:`_refuse_a_cleartext_vault_hop` records. Threading the
-      posture to this call is the next slice of vault BACKLOG #2983. Until then the authority
-      answers ALLOW or REFUSE only, and anything but ALLOW refuses. When the posture arrives, the
-      WARN answer needs its own arm here. That arm would also build a context on every send of
-      an unattested off-box hop, so read the CRL flag once at mount then.
+    * ``posture`` is the instance posture the caller holds, or ``None``. **An unknown posture
+      counts as enforcing.** The providers hold no ``[security]`` section, so each caller hands
+      its own posture down, and a caller that holds none passes ``None``. That is at least every
+      command that opens a store with no posture, and it is refused like an enforcing instance,
+      on purpose. ``tests/test_vault_posture_census.py`` lists what each caller passes.
 
     Never ``RevocationHopGuard.enforce_construction`` or ``enforce_insecure_hop``: each raises
     the unmarked base type, and the guard's text echoes the host. Raises
@@ -876,7 +883,10 @@ def _refuse_an_unrevoked_vault_hop(
     on_box = _stays_on_the_box(host, proxy)
     attested = revocation_attested is True
     disposition = revocation_hop_disposition(
-        enforcing=HopPosture.fail_closed(enforcing=None).enforcing,
+        # An unknown posture is enforcing: `fail_closed` turns `None` into the strict value.
+        enforcing=HopPosture.fail_closed(
+            enforcing=None if posture is None else posture.enforcing
+        ).enforcing,
         is_loopback_hop=on_box,
         proxy_proven=False,
         attested=attested,
@@ -983,6 +993,7 @@ def mount_strict_reply_adapter(
     ssl_context_factory: Callable[[], ssl.SSLContext],
     revocation_attested: bool,
     attestation_section: VaultAttestationSection,
+    posture: HopPosture | None = None,
     limit: int = DEFAULT_MAX_RESPONSE_BYTES,
 ) -> None:
     """Mount :class:`StrictReplyAdapter` for both schemes on ``client``'s ``requests`` session.
@@ -1001,6 +1012,9 @@ def mount_strict_reply_adapter(
     so a caller cannot mount the reader and forget the revocation check. Pass the setting, never a
     literal ``True``. An ``https://`` Vault that is not on the box is refused without it, as
     :func:`_refuse_an_unrevoked_vault_hop` says.
+
+    ``posture`` is the instance posture the caller holds, or ``None`` where it holds none.
+    ``None`` counts as enforcing, so a caller that leaves it out gets the strict answer.
 
     ``limit`` is the reply ceiling. The Transit client passes :data:`MAX_VAULT_REPLY_BYTES`; the KV
     client reads small secrets and keeps the shared egress ceiling.
@@ -1038,6 +1052,7 @@ def mount_strict_reply_adapter(
         ssl_context_factory=ssl_context_factory,
         revocation_attested=revocation_attested,
         attestation_section=attestation_section,
+        posture=posture,
     )
     adapter = StrictReplyAdapter(
         connector=connector,
@@ -1045,6 +1060,7 @@ def mount_strict_reply_adapter(
         ssl_context_factory=ssl_context_factory,
         revocation_attested=revocation_attested,
         attestation_section=attestation_section,
+        posture=posture,
     )
     for prefix in ("https://", "http://"):
         session.mount(prefix, adapter)

@@ -1719,6 +1719,7 @@ class Engine:
                 instance=self._active_environment or "",
                 alert_sink=self._alert_sink,
                 coordinator=self._coordinator,
+                hop_posture=self._hop_posture,
             )
             self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent

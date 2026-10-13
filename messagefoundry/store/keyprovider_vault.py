@@ -41,6 +41,7 @@ from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.config.tls_policy import HopPosture
 
 #: The optional extra that carries ``hvac`` — named in every fail-closed message so the operator knows
 #: exactly what to install.
@@ -109,14 +110,23 @@ def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
     )
 
 
-def _build_client(addr: str | None, token: str | None, *, revocation_attested: bool) -> Any:
+def _build_client(
+    addr: str | None,
+    token: str | None,
+    *,
+    revocation_attested: bool,
+    posture: HopPosture | None = None,
+) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake Transit backend without
     a live Vault. ``addr``/``token`` are passed through; when ``None``, hvac falls back to its own
     ``VAULT_ADDR``/``VAULT_TOKEN`` environment conventions.
 
     ``revocation_attested`` is ``[store].vault_revocation_attested`` (vault BACKLOG #2983). It is
     REQUIRED, so no caller builds a store Vault client without saying whether the hop is attested.
-    Pass the setting, or ``False`` where no settings are in scope, which fails closed."""
+    Pass the setting, or ``False`` where no settings are in scope, which fails closed.
+
+    ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
+    enforcing, so leaving it out is the strict answer."""
     hvac = _import_hvac()
     # ASVS 4.2.5: ``token`` ships as an ``X-Vault-Token`` request header on EVERY Transit
     # encrypt/decrypt/HMAC call, and ``addr`` becomes the request URL -- both from MEFOR_* env, and
@@ -179,6 +189,7 @@ def _build_client(addr: str | None, token: str | None, *, revocation_attested: b
             ssl_context_factory=context_factory,
             revocation_attested=revocation_attested,
             attestation_section="store",
+            posture=posture,
             limit=MAX_VAULT_REPLY_BYTES,
         )
     except InsecureHopRefused as exc:
@@ -310,8 +321,11 @@ class VaultKeyProvider:
     retired keys), so a rotation still bridges old ``mfenc:v1`` rows exactly as the built-in providers do.
     """
 
-    def __init__(self, settings: StoreSettings) -> None:
+    def __init__(self, settings: StoreSettings, *, posture: HopPosture | None = None) -> None:
         self._settings = settings
+        # The instance posture the caller holds, for the revocation guard on this hop (vault
+        # BACKLOG #2983). `None` counts as enforcing.
+        self._posture = posture
 
     def active_key(self) -> str | None:
         transit_key = _kek_name()
@@ -339,7 +353,10 @@ class VaultKeyProvider:
         # the same mistake ADR 0180 records for the LDAPS site. Fail-closed is unchanged either way:
         # both paths propagate out of open_store and serve refuses to start.
         client = _build_client(
-            addr, token, revocation_attested=self._settings.vault_revocation_attested
+            addr,
+            token,
+            revocation_attested=self._settings.vault_revocation_attested,
+            posture=self._posture,
         )
         try:
             # BACKLOG #1166. Check the KEK's TYPE before unwrapping under it. Unlike the Transit
@@ -392,9 +409,11 @@ class VaultKeyProvider:
         return _split_retired(self._settings.encryption_keys_retired)
 
 
-def build_provider(settings: StoreSettings) -> VaultKeyProvider:
+def build_provider(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> VaultKeyProvider:
     """The dispatch entrypoint ``keyprovider._load_external_provider`` imports and calls by name."""
-    return VaultKeyProvider(settings)
+    return VaultKeyProvider(settings, posture=posture)
 
 
 # --- what this hop's token must be able to do (BACKLOG #305, ASVS 13.2.2) ---------------------------
@@ -445,7 +464,7 @@ def store_vault_address() -> str:
     return addr
 
 
-def store_vault_client(address: str, token: str) -> Any:
+def store_vault_client(address: str, token: str, *, posture: HopPosture | None = None) -> Any:
     """The store hop's Vault client, built by the same :func:`_build_client` the providers use:
     same TLS narrowing, same anchor, no redirects, and the same cleartext-address refusal (BACKLOG
     #2317). For ``check-privileges``, which reads the token's own grants through it and changes
@@ -457,7 +476,7 @@ def store_vault_client(address: str, token: str) -> Any:
     An ``https://`` Vault that is off the box is refused by this client even where
     ``[store].vault_revocation_attested`` is set. Handing the setting to this call is the next
     slice of that item."""
-    return _build_client(address, token, revocation_attested=False)
+    return _build_client(address, token, revocation_attested=False, posture=posture)
 
 
 def kek_required_capabilities() -> dict[str, frozenset[str]]:

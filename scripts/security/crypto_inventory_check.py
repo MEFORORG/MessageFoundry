@@ -457,8 +457,17 @@ INVENTORY: dict[str, frozenset[str]] = {
     # file opened. No primitive is implemented here — the cipher is built by build_store_cipher and the
     # AEAD runs inside it; this module holds only the marker prefix and the fail-closed
     # CipherError/StoreKeylessError verdicts. The AAD comes from store/cipher_cells.py (BACKLOG #1719).
+    # Vault BACKLOG #2983 adds the tls_policy import, for one name: HopPosture, a value type. The
+    # backup runner holds the instance posture and hands it to the key resolve and the full verify,
+    # so the Vault hop they can dial is judged as `serve` judges it. Builds no context.
     "messagefoundry/pipeline/dr_backup.py": frozenset(
-        {"hashlib", "hmac", "messagefoundry.store.backup_codec", "messagefoundry.store.crypto"}
+        {
+            "hashlib",
+            "hmac",
+            "messagefoundry.config.tls_policy",
+            "messagefoundry.store.backup_codec",
+            "messagefoundry.store.crypto",
+        }
     ),
     # ADR 0073: rendezvous (HRW) outbound-lane ownership for engine shards — sha256 as a STABLE,
     # process-independent hash (the salted builtin hash() differs per process, which would let two
@@ -674,6 +683,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/config/secretprovider_vault.py": frozenset(
         {"hvac", "messagefoundry.config.tls_policy"}
     ),
+    # Vault BACKLOG #2983: the two provider dispatches name HopPosture, a value type, only to hand
+    # the caller's instance posture to the external provider they load. The revocation guard that
+    # reads it is in transports/strict_requests.py. Neither builds a context or calls crypto.
+    "messagefoundry/config/secretprovider.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "messagefoundry/store/keyprovider.py": frozenset({"messagefoundry.config.tls_policy"}),
     # BACKLOG #31: the lazy [xml]-extra loader for signxml (which pulls cryptography for the XML-DSig
     # digest/signature primitives). The sibling parsing/xml/signature.py hashlib anchor already
     # documents the DSig primitives; this loader is where the signxml dependency actually enters.
@@ -694,8 +708,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # AuditMacFn / CipherError and keyprovider's errors. It imports NONE of the six stdlib crypto
     # modules, so the seam trigger is what makes this all-delegated at-rest crypto site visible at all
     # (the plaintext DEK never enters engine heap — ASVS 13.3.3). This is #282's canonical target.
+    # Vault BACKLOG #2983 adds the tls_policy import, for one name: HopPosture, a value type that
+    # build_transit_cipher hands to the shared client build.
     "messagefoundry/store/crypto_transit.py": frozenset(
         {
+            "messagefoundry.config.tls_policy",
             "messagefoundry.store.crypto",
             "messagefoundry.store.keyprovider",
             "messagefoundry.store.keyprovider_vault",
@@ -879,6 +896,14 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: limits, and they are the most useful lines in this table: each is a first-party crypto decision
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/config/secretprovider.py": (
+        "names HopPosture, a value type, to hand the caller's posture to the provider it loads; "
+        "the guard that reads it is in transports/strict_requests.py, which is inventoried"
+    ),
+    "messagefoundry/store/keyprovider.py": (
+        "names HopPosture, a value type, to hand the caller's posture to the provider it loads; "
+        "the guard that reads it is in transports/strict_requests.py, which is inventoried"
+    ),
     "messagefoundry/config/loaded_crls.py": (
         "keys a weak registry on ssl.SSLContext and stores public CRL metadata; the CRL load it "
         "records runs in config/tls_policy.py harden_crl_check, which is inventoried"

@@ -27,6 +27,7 @@ and the TLS-suite assertion raise those). It never carries a server's error body
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 from collections.abc import Callable, Mapping
@@ -237,9 +238,12 @@ def read_vault_token(
     )
 
 
-def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
+def probe_vault(consumer: VaultConsumer, *, posture: HopPosture | None = None) -> VaultTokenReading:
     """Read the token behind one Vault consumer, with the client and paths of the provider that
-    uses it. Imports lazily, as the providers do, so the command stays light without Vault."""
+    uses it. Imports lazily, as the providers do, so the command stays light without Vault.
+
+    ``posture`` is the instance posture, for the revocation guard on the client each probe builds
+    (vault BACKLOG #2983). ``None`` counts as enforcing."""
     kind = consumer.kind
     if kind == "kv":
         from messagefoundry.config.secretprovider_vault import (
@@ -252,7 +256,7 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
         return read_vault_token(
             secrets_vault_token,
             secrets_vault_address,
-            secrets_vault_client,
+            functools.partial(secrets_vault_client, posture=posture),
             lambda: kv_required_capabilities(consumer.refs),
         )
     from messagefoundry.store.keyprovider_vault import (
@@ -262,18 +266,19 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
         store_vault_token,
     )
 
+    store_client = functools.partial(store_vault_client, posture=posture)
     if kind == "transit":
         from messagefoundry.store.crypto_transit import transit_cipher_required_capabilities
 
         return read_vault_token(
             store_vault_token,
             store_vault_address,
-            store_vault_client,
+            store_client,
             transit_cipher_required_capabilities,
         )
     if kind == "kek":
         return read_vault_token(
-            store_vault_token, store_vault_address, store_vault_client, kek_required_capabilities
+            store_vault_token, store_vault_address, store_client, kek_required_capabilities
         )
     # Unreachable while VaultKind has three members; a fourth must be routed here, not defaulted.
     raise ValueError(f"no Vault probe for consumer kind {kind!r}")
@@ -307,7 +312,7 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
                 )
         authenticator = LdapAuthenticator(
             settings.auth,
-            secret_provider=resolve_secret_provider(settings.secrets),
+            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             posture=posture,
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
         )

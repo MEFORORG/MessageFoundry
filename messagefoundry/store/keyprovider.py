@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.config.tls_policy import HopPosture
 
 
 class KeyProviderError(RuntimeError):
@@ -224,13 +225,20 @@ def unread_key_refusal(settings: StoreSettings) -> str | None:
     )
 
 
-def _load_external_provider(name: str, settings: StoreSettings) -> KeyProvider:
+def _load_external_provider(
+    name: str, settings: StoreSettings, posture: HopPosture | None
+) -> KeyProvider:
     """Lazy hook for an external HSM/KMS/Vault envelope-decrypt provider (ADR 0019 §3).
 
     The seam: a future per-provider PR ships ``messagefoundry/store/keyprovider_<name>.py`` exposing
-    ``build_provider(settings) -> KeyProvider`` behind the optional ``<extra>`` extra; this dispatch
-    picks it up by import with **no edit here**. Until that module ships the import fails and we **fail
-    closed** — the base install pulls **zero** cloud SDKs (no dependency lands from ADR 0019)."""
+    ``build_provider(settings, *, posture) -> KeyProvider`` behind the optional ``<extra>`` extra;
+    this dispatch picks it up by import with **no edit here**. Until that module ships the import
+    fails and we **fail closed** — the base install pulls **zero** cloud SDKs (no dependency lands
+    from ADR 0019).
+
+    ``posture`` is handed to every external provider, because each one dials a network hop that
+    a posture-keyed guard may judge (vault BACKLOG #2983). It is ``None`` where the caller holds
+    none, and a provider must read ``None`` as enforcing."""
     extra = _EXTERNAL_PROVIDERS[name]
     module_name = f"{__name__}_{name}"
     try:
@@ -250,22 +258,27 @@ def _load_external_provider(name: str, settings: StoreSettings) -> KeyProvider:
             f"install the optional {extra!r} extra."
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
-    provider: KeyProvider = module.build_provider(settings)
+    provider: KeyProvider = module.build_provider(settings, posture=posture)
     return provider
 
 
-def resolve_key_provider(settings: StoreSettings) -> KeyProvider:
+def resolve_key_provider(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> KeyProvider:
     """Build the :class:`KeyProvider` selected by ``[store].key_provider`` (ADR 0019 §2).
 
     ``auto`` (default) / ``env`` / ``dpapi`` are the built-ins; the external HSM/KMS/Vault names are
     lazy optional extras (:func:`_load_external_provider`). An unknown name **fails closed** with
-    :class:`KeyProviderError` rather than silently falling back to the identity cipher."""
+    :class:`KeyProviderError` rather than silently falling back to the identity cipher.
+
+    ``posture`` reaches an external provider only; the built-ins dial nothing. ``None`` counts as
+    enforcing there."""
     name = settings.key_provider
     builtin = _BUILTIN_PROVIDER_CLASSES.get(name)
     if builtin is not None:
         return builtin(settings)
     if name in _EXTERNAL_PROVIDERS:
-        return _load_external_provider(name, settings)
+        return _load_external_provider(name, settings, posture)
     raise KeyProviderError(
         f"unknown [store].key_provider {name!r}; valid values are {', '.join(KNOWN_PROVIDERS)}"
     )

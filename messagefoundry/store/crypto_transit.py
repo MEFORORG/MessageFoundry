@@ -73,6 +73,7 @@ from messagefoundry.store.keyprovider_vault import (
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.config.tls_policy import HopPosture
 
 log = logging.getLogger(__name__)
 
@@ -298,8 +299,13 @@ def _key_names() -> tuple[str, str]:
     return key_name, os.environ.get(_ENV_AUDIT_KEY) or key_name
 
 
-def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
+def build_transit_cipher(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> TransitCipher:
     """Construct the Transit cipher from the environment, failing **closed** at startup.
+
+    ``posture`` is the instance posture the caller holds, for the revocation guard on this hop
+    (vault BACKLOG #2983). ``None`` counts as enforcing.
 
     ``settings`` is accepted for signature parity with ``make_cipher``/``build_store_cipher`` (the Vault
     address/token/key are env-only secrets/provisioning outputs, like the KEK-unwrap provider). A missing
@@ -313,7 +319,9 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
     # key", turning a configuration refusal into what reads as a connectivity failure. Fail-closed is
     # unchanged either way: both paths propagate and the cipher provider refuses to come up.
     # lazy hvac import; fails closed naming the [vault] extra
-    client = _build_client(addr, token, revocation_attested=settings.vault_revocation_attested)
+    client = _build_client(
+        addr, token, revocation_attested=settings.vault_revocation_attested, posture=posture
+    )
     try:
         # Startup connectivity + key-existence + key-TYPE check: read the key metadata (no crypto, no
         # secrets). This turns a mis-provisioned Vault into a refuse-to-start rather than a first-write

@@ -6974,7 +6974,9 @@ def _check_privileges(args: argparse.Namespace) -> int:
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     others = settings_hops(
-        settings, vault_probe=probe_vault, ldap_probe=lambda: read_ldap_bind(settings, posture)
+        settings,
+        vault_probe=functools.partial(probe_vault, posture=posture),
+        ldap_probe=lambda: read_ldap_bind(settings, posture),
     )
     hops = [store_hop(report, settings.store), *others]
     code = exit_code_for(hops)
@@ -7370,7 +7372,7 @@ def _build_provision_auth_service(
 
     refusal: str | None = None
     try:
-        secret_provider = resolve_secret_provider(settings.secrets)
+        secret_provider = resolve_secret_provider(settings.secrets, posture=posture)
     except SecretProviderError:
         refusal = _PROVISION_AUTH_REFUSALS["provider"]
     if refusal is not None:
@@ -7578,7 +7580,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # first fail at the write, after the prompt. Resolved now and discarded; the write
             # resolves it again, which costs a second Vault round trip. Nothing is created. A
             # server backend resolved it inside the open, before it found no store.
-            build_store_cipher(settings.store)
+            build_store_cipher(settings.store, posture=posture)
     except (StoreKeylessError, CipherError) as exc:
         # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
         # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
