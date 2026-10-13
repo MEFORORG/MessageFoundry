@@ -54,7 +54,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Rest
-from messagefoundry.transports import build_destination, rest
+from messagefoundry.transports import bounded_read, build_destination, rest
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
     LoopbackDirectProxyHandler,
@@ -857,3 +857,340 @@ def test_a_message_cannot_set_the_proxy_header_and_asks_through_the_shared_readi
         _NAME.lower(): _VALUE,
         "X-Other": "o1",
     }
+
+
+# --- one verdict for a header in a request ---------------------------------------------------------
+#
+# A request is checked more than once while it is opened, and ``http.client`` is asked again at
+# the send. Before this section's fix the opener put the same question about one header up to
+# three times, and acted on each answer as it came. A header whose answer changed was left out of
+# the rule on one answer, passed by the unsendable refusal on the next, and sent. Now a header is
+# judged once, the answer is kept on the request, and either verdict ends in a refusal.
+
+_LEGS = ("cleartext-proxy", "direct", "connect", "verified-tls-proxy")
+
+
+def _on_leg(
+    leg: str, peer: _WireProxy, *, admitted: bool = False
+) -> tuple[urllib.request.OpenerDirector, str]:
+    """An engine opener and a target that send a request down ``leg``. ``peer`` is the proxy, or
+    the destination itself on the direct leg."""
+    if leg == "direct":
+        return build_strict_opener(urllib.request.ProxyHandler({})), f"http://{peer.address}/x"
+    if leg == "verified-tls-proxy":
+        return _https_proxy_for_http_only(peer, admitted=admitted), _HTTP_TARGET
+    return _opener(peer, admitted=admitted), _HTTPS_TARGET if leg == "connect" else _HTTP_TARGET
+
+
+def _held(name: Any, value: Any, url: str) -> urllib.request.Request:
+    """A request that holds one header as the two objects given. ``add_header`` would store a
+    plain ``str`` copy of the name."""
+    request = urllib.request.Request(url)
+    request.headers[name] = value
+    return request
+
+
+def _attempt(
+    opener: urllib.request.OpenerDirector, request: urllib.request.Request
+) -> Exception | None:
+    """Open ``request`` and give back what that raised, or ``None`` if it was sent and answered.
+    The caller reads the wire first, so a request that was sent fails on what reached it."""
+    try:
+        with opener.open(request, timeout=5) as resp:
+            resp.read()
+    except Exception as raised:
+        return raised
+    return None
+
+
+@pytest.mark.parametrize("leg", _LEGS)
+def test_control_each_leg_reaches_the_wire_with_another_header(leg: str) -> None:
+    """The control for every ``connections == 0`` below: the same four legs, with a header the
+    rule does not read, each dial the recording socket."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer)
+        _attempt(opener, _held("X-Trace", _VALUE, url))
+    assert peer.connections == 1
+
+
+class _FailsAtFirst:
+    """A header value whose ``encode`` raises the first ``failures`` times it is called and
+    answers after that. Asked more than once, it is first a value ``http.client`` cannot send,
+    and then one it can."""
+
+    def __init__(self, failures: int, error: type[Exception]) -> None:
+        self.failures = failures
+        self.error = error
+        self.asked = 0
+
+    def encode(self, encoding: str) -> bytes:
+        self.asked += 1
+        if self.asked <= self.failures:
+            raise self.error("a refusal that will not last")
+        return _VALUE.encode(encoding)
+
+
+@pytest.mark.parametrize("leg", _LEGS)
+@pytest.mark.parametrize("error", [ValueError, TypeError])
+@pytest.mark.parametrize("failures", [1, 2])
+def test_a_value_that_fails_at_first_and_then_answers_is_never_sent(
+    failures: int, error: type[Exception], leg: str
+) -> None:
+    """A trailing-space spelling, no admission, and a value that ``http.client`` refuses once or
+    twice before it takes it. The first answer is the verdict: the header can never be sent, so
+    the request fails with the fixed error of that class, and nothing is dialled."""
+    value = _FailsAtFirst(failures, error)
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer)
+        raised = _attempt(opener, _held(_NAME + " ", value, url))
+    assert peer.connections == 0
+    assert type(raised) is error
+    assert "can never be sent" in str(raised)
+    assert "will not last" not in str(raised)
+
+
+@pytest.mark.parametrize("leg", _LEGS)
+def test_such_a_value_is_put_to_http_client_once(leg: str) -> None:
+    """Read at the value itself: one ``encode`` call for the whole request, on every leg."""
+    value = _FailsAtFirst(1, ValueError)
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer)
+        _attempt(opener, _held(_NAME + " ", value, url))
+    assert peer.connections == 0
+    assert value.asked == 1
+
+
+def test_the_verdict_stays_with_the_request_when_it_is_opened_again() -> None:
+    """The answer is kept on the request, so a second open of the same request is refused the
+    same way and asks nothing. The same value on a new request is a header not seen before. It
+    answers by then, so the rule judges it, and refuses it as a credential."""
+    value = _FailsAtFirst(1, ValueError)
+    with _WireProxy() as peer:
+        opener, url = _on_leg("direct", peer)
+        request = _held(_NAME + " ", value, url)
+        first = _attempt(opener, request)
+        second = _attempt(opener, request)
+        asked_by_then = value.asked
+        on_a_new_request = _attempt(opener, _held(_NAME + " ", value, url))
+    assert peer.connections == 0
+    assert type(first) is ValueError
+    assert type(second) is ValueError
+    assert asked_by_then == 1
+    assert isinstance(on_a_new_request, ProxyCredentialsRefusedError)
+    assert "#3417" in str(on_a_new_request)
+    assert value.asked == 2
+
+
+def test_an_error_over_a_later_header_does_not_lose_an_earlier_verdict() -> None:
+    """Two odd spellings. The first gets its verdict, and asking about the second raises an
+    error that is no verdict, which stops the request. The first header's answer is kept all
+    the same, so a second open asks about it no more."""
+    value = _FailsAtFirst(1, ValueError)
+    with _WireProxy() as peer:
+        opener, url = _on_leg("direct", peer)
+        request = _held(_NAME + " ", value, url)
+        request.headers[_NAME + "\t"] = _FaultyValue()  # type: ignore[assignment]
+        first = _attempt(opener, request)
+        second = _attempt(opener, request)
+    assert peer.connections == 0
+    assert type(first) is RuntimeError
+    assert type(second) is RuntimeError
+    assert value.asked == 1
+
+
+class _ShiftingName(str):
+    """A header name whose ``title()`` gives a name that cannot be sent the first ``lies`` times
+    it is called, and its real title after that. ``do_open`` sends a name by its ``title()``."""
+
+    lies: int
+    asked: int
+
+    def __new__(cls, text: str, lies: int) -> _ShiftingName:
+        made = super().__new__(cls, text)
+        made.lies = lies
+        made.asked = 0
+        return made
+
+    def title(self) -> str:
+        self.asked += 1
+        real = str(self).title()
+        return " " + real if self.asked <= self.lies else real
+
+
+@pytest.mark.parametrize("leg", _LEGS)
+@pytest.mark.parametrize("lies", [1, 2])
+def test_a_name_whose_title_changes_its_answer_is_never_sent(lies: int, leg: str) -> None:
+    """The same gap from the name's side. The first title is one ``http.client`` refuses, and
+    that is the verdict, whatever a later call would give."""
+    name = _ShiftingName(_NAME + " ", lies)
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer)
+        raised = _attempt(opener, _held(name, _VALUE, url))
+    assert peer.connections == 0
+    assert type(raised) is ValueError
+    assert "can never be sent" in str(raised)
+    assert name.asked == 1
+
+
+class _Retitled(str):
+    """A name that holds the plain spelling and answers ``title()`` with another name, which is
+    the one ``do_open`` would send."""
+
+    def title(self) -> str:
+        return "X-Made-Up"
+
+
+@pytest.mark.parametrize(
+    ("leg", "admitted"),
+    [
+        ("verified-tls-proxy", False),
+        ("connect", True),
+        ("cleartext-proxy", True),
+        ("direct", False),
+    ],
+)
+def test_a_str_subclass_is_never_taken_as_the_plain_spelling(leg: str, admitted: bool) -> None:
+    """The plain spelling may cross a verified TLS leg, and an admission covers it, because
+    urllib sends it as the proxy's own header. That is known of a ``str`` only. A subclass
+    answers ``title()`` itself, so it is judged like any other spelling, and refused."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer, admitted=admitted)
+        raised = _attempt(opener, _held(_Retitled(_NAME), _VALUE, url))
+    assert peer.connections == 0
+    assert isinstance(raised, ProxyCredentialsRefusedError)
+    assert "#3417" in str(raised) if leg == "direct" else "#3416" in str(raised)
+
+
+class _ClaimsToBeAnyName(str):
+    """A name that hashes like ``twin`` and says it equals any name, the first ``lies`` times it
+    is asked. Stored among the unredirected headers, it tells a dictionary lookup that ``twin``
+    is already there."""
+
+    lies: int
+    asked: int
+    _twin_hash: int
+
+    def __new__(cls, text: str, twin: str, lies: int) -> _ClaimsToBeAnyName:
+        made = super().__new__(cls, text)
+        made.lies = lies
+        made.asked = 0
+        made._twin_hash = hash(twin)
+        return made
+
+    def __hash__(self) -> int:
+        return self._twin_hash
+
+    def __eq__(self, other: object) -> bool:
+        self.asked += 1
+        return self.asked <= self.lies
+
+
+def test_a_name_that_claims_to_be_a_headers_twin_cannot_hide_it() -> None:
+    """``do_open`` drops a header whose name an unredirected header already holds, and asks the
+    names themselves. The opener's reading used to copy that merge. A name object that answered
+    yes to the reading and no to ``do_open`` hid the header beside it from the rule, and
+    ``do_open`` then sent it. The reading asks no name object now."""
+    odd = _NAME + " "
+    twin = _ClaimsToBeAnyName("X-Made-Up", odd, lies=2)
+    with _WireProxy() as peer:
+        opener, url = _on_leg("direct", peer)
+        request = _held(odd, _VALUE, url)
+        request.unredirected_hdrs[twin] = "made up"
+        _refused(opener, request, "#3417")
+    assert peer.connections == 0
+    assert twin.asked == 0
+
+
+class _Undecoded(bytes):
+    """A ``bytes`` name whose ``decode`` gives another name than the bytes it holds."""
+
+    def decode(self, *args: Any, **kwargs: Any) -> str:
+        return "X-Made-Up"
+
+
+def test_a_bytes_name_is_read_from_the_bytes_it_holds() -> None:
+    """``http.client`` sends a ``bytes`` name byte for byte and never calls ``decode``, so the
+    reading must not take the name's word for it either."""
+    name = _Undecoded(_NAME.encode() + b" ")
+    assert is_proxy_credential_header_name(name)
+    with _WireProxy() as peer:
+        opener, url = _on_leg("direct", peer)
+        _refused(opener, _held(name, _VALUE, url), "#3417")
+    assert peer.connections == 0
+
+
+@pytest.fixture
+def asked(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, Any]]:
+    """Each question put to ``http.client`` about a header, in order: the name and the value."""
+    calls: list[tuple[Any, Any]] = []
+    ask = bounded_read._refusal_by_http_client
+
+    def spy(name: Any, value: Any) -> type[Exception] | None:
+        calls.append((name, value))
+        return ask(name, value)
+
+    monkeypatch.setattr(bounded_read, "_refusal_by_http_client", spy)
+    return calls
+
+
+@pytest.mark.parametrize("leg", _LEGS)
+@pytest.mark.parametrize("name", [" " + _NAME, _NAME + " "], ids=["unsendable", "sendable"])
+def test_http_client_is_asked_about_a_header_once_in_a_request(
+    name: str, leg: str, asked: list[tuple[Any, Any]]
+) -> None:
+    """The pin against the repeated question coming back: one call for the header, however many
+    checks the leg makes. The verified TLS leg makes the most, because urllib hands the request
+    back to the opener."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg(leg, peer)
+        raised = _attempt(opener, _held(name, _VALUE, url))
+    assert peer.connections == 0
+    assert raised is not None
+    assert asked == [(name, _VALUE)]
+
+
+def test_http_client_is_asked_once_about_each_of_two_headers(asked: list[tuple[Any, Any]]) -> None:
+    with _WireProxy() as peer:
+        opener, _ = _on_leg("verified-tls-proxy", peer)
+        raised = _attempt(opener, _two_unsendable("name"))
+    assert peer.connections == 0
+    assert type(raised) is ValueError
+    assert asked == [(" " + _NAME, _VALUE), (_NAME + " ", None)]
+
+
+def test_control_http_client_is_never_asked_about_the_plain_name(
+    asked: list[tuple[Any, Any]],
+) -> None:
+    """The other polarity for the spy: the plain name is judged without a question."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg("cleartext-proxy", peer)
+        _refused(opener, _held(_NAME, _VALUE, url), "#3416")
+    assert peer.connections == 0
+    assert asked == []
+
+
+def _routed_by_hand(name: str, peer: _WireProxy, url: str) -> urllib.request.Request:
+    """A request sent to ``peer`` as its proxy by ``set_proxy``, on an opener that uses no proxy.
+    So no proxy handler judged it, and the strict handler's check is the only one it meets."""
+    request = _held(name, _VALUE, url)
+    request.set_proxy(peer.address, "http")
+    return request
+
+
+@pytest.mark.parametrize("url", [_HTTP_TARGET, _HTTPS_TARGET], ids=["http", "connect"])
+def test_an_odd_spelling_never_leaves_the_last_check_whoever_routed_the_request(url: str) -> None:
+    """A proxy handler refuses a sendable odd spelling on every leg it sets up. This request
+    reaches a proxy without one. The check that opens the connection refuses it there, in the
+    words the proxy handler uses."""
+    with _WireProxy() as peer:
+        opener = build_strict_opener(urllib.request.ProxyHandler({}))
+        _refused(opener, _routed_by_hand(_NAME + " ", peer, url), "#3416")
+    assert peer.connections == 0
+
+
+@pytest.mark.parametrize("url", [_HTTP_TARGET, _HTTPS_TARGET], ids=["http", "connect"])
+def test_control_a_request_routed_by_hand_reaches_the_proxy_with_another_header(url: str) -> None:
+    with _WireProxy() as peer:
+        opener = build_strict_opener(urllib.request.ProxyHandler({}))
+        _attempt(opener, _routed_by_hand("X-Trace", peer, url))
+    assert len(peer.cleartext) == 1
