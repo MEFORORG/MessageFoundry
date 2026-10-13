@@ -1762,7 +1762,7 @@ async def _audit_refused_reload(
         )
     elif isinstance(exc, ConfigDirUnreadable):
         # The engine logged the cause, scrubbed, where it raised this.
-        _log.warning("config reload refused: its config directory could not be resolved")
+        _log.warning("config reload refused: its config directory could not be resolved or listed")
         action, detail["reason"] = "config_reload_failed", "unreadable"
         status, answer = 422, "the engine could not read the config directory; see the engine log"
     elif isinstance(exc, ConfigDigestUnavailable):

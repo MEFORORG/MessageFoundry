@@ -2077,14 +2077,14 @@ file or folder it covers that cannot be read gives no digest at all, never the d
 A directory gone by the time the digest reads it is refused as missing, never digested as an empty
 bundle. After the load the release checks this digest first, and then the one the row records.
 
-Some requests file no hold, because their release could only be refused. Each is answered and
-audited at once, as an inline reload's refusal is:
+At least these requests file no hold, because their release could only be refused. Each is
+answered and audited at once, as an inline reload's refusal is:
 
 - a directory outside the reload roots, or a missing one;
-- a directory the engine cannot resolve or read, such as one under a parent the service account
+- a directory the engine cannot resolve or list, such as one under a parent the service account
   cannot traverse. Its reason is `unreadable`;
-- a directory holding a covered file or folder that cannot be read. Its reason is
-  `digest_unavailable`, with no `approved_fingerprint`.
+- a directory holding a covered file or sub-folder that cannot be read. Its reason is
+  `digest_unavailable`, with `approved_fingerprint` and `current_fingerprint` both null.
 
 The engine logs the cause of the last two at WARNING. None writes a `config_reload_attempted` row,
 because nothing was attempted. A repeat request joins an open hold only while the digest is

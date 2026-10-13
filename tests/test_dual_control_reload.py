@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1548,26 +1549,35 @@ async def test_a_request_made_while_a_file_is_unreadable_is_refused_and_files_no
     ]
 
 
-async def test_a_target_the_engine_cannot_stat_is_unreadable_not_missing(
-    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("approvals", [GATED, NOT_GATED], ids=["held", "inline"])
+async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approvals: ApprovalsSettings
 ) -> None:
-    """A parent the service account cannot traverse makes the target's stat fail with an access
-    error. ``is_dir`` answered False for that, so the request was audited as a missing directory."""
-    from messagefoundry.pipeline import ConfigDirUnreadable
-
+    """A parent the service account cannot traverse, or a directory it cannot list, fails the
+    listing with an access error. ``is_dir`` answered False for the first, so it was audited as a
+    missing directory, and an ungated reload of the second loaded an empty graph and was audited
+    as ``invalid_config``. Both are refused as ``unreadable``, with no hold filed."""
     cfg = (tmp_path / "cfg").resolve()
-    real_stat = Path.stat
+    real_scandir = os.scandir
 
-    def _stat(self: Path, *args: Any, **kwargs: Any) -> Any:
-        if self == cfg:
-            raise PermissionError(13, "Permission denied", str(self))
-        return real_stat(self, *args, **kwargs)
+    def _scandir(path: Any) -> Any:
+        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
 
-    monkeypatch.setattr(Path, "stat", _stat)
-    with pytest.raises(ConfigDirUnreadable):
-        await engine._existing_reload_target(str(cfg))
-    monkeypatch.undo()
-    assert await engine._existing_reload_target(str(cfg)) == cfg  # the control
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, approvals, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        monkeypatch.setattr(os, "scandir", _scandir)
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"] == (
+            "the engine could not read the config directory; see the engine log"
+        )
+    assert await engine.store.list_pending_approvals(now=0.0, limit=10) == []
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
 
 
 async def test_a_file_added_during_the_load_and_left_unreadable_is_not_released(

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import stat
+import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -153,14 +153,14 @@ class ConfigReloadDenied(Exception):
 
 
 class ConfigDirUnreadable(Exception):
-    """A reload target that could not be resolved for a reason other than its being missing, such
-    as a parent the service account cannot read. :meth:`Engine.reload_detail` and
+    """A reload target that could not be resolved or listed for a reason other than its being
+    missing, such as a parent the service account cannot traverse or a directory it cannot list. :meth:`Engine.reload_detail` and
     :meth:`Engine.reload_target_digest` raise it before anything is read or swapped, so the reload
     routes and the dual-control release refuse and audit it like any other refusal. The cause is
     logged at WARNING where it is raised; the message names no path."""
 
     def __init__(self) -> None:
-        super().__init__("the config directory could not be resolved")
+        super().__init__("the config directory could not be resolved or listed")
 
 
 class ConfigDigestMismatch(Exception):
@@ -184,7 +184,10 @@ class ConfigDigestUnavailable(Exception):
     anything is swapped."""
 
     def __init__(self, approved: str | None) -> None:
-        super().__init__("the config's digest could not be taken to check it against its approval")
+        super().__init__(
+            "the config's digest could not be taken"
+            + ("" if approved is None else " to check it against its approval")
+        )
         self.approved = approved
 
 
@@ -2533,36 +2536,40 @@ class Engine:
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by
         :meth:`_resolve_reload_target`, and refused with ``FileNotFoundError`` when it is not a
-        directory, or :class:`ConfigDirUnreadable` when resolving or reading it raises another
+        directory, or :class:`ConfigDirUnreadable` when resolving or listing it raises another
         ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
         #2581)."""
+        return await asyncio.to_thread(self._existing_reload_target_blocking, config_dir)
+
+    def _existing_reload_target_blocking(self, config_dir: str | Path | None) -> Path:
+        """:meth:`_existing_reload_target` on a worker thread, in one hop."""
         try:
-            path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
-        except FileNotFoundError:
-            raise
-        except OSError as exc:
-            # Not FileNotFoundError, so not a missing directory: a parent the service account cannot
-            # read, say. Refused as its own case, so the routes and the dual-control release audit it
-            # rather than answering a 500 with no row. The error can carry a client's config_dir, so
-            # it is scrubbed for py/log-injection.
-            log.warning(
-                "config reload target could not be resolved: %s", scrub_log_argument(safe_exc(exc))
-            )
-            raise ConfigDirUnreadable() from exc
-        try:
-            # stat, not is_dir: is_dir answers False for a target it cannot stat, which would
-            # report a parent the service account cannot traverse as a missing directory.
-            mode = (await asyncio.to_thread(path.stat)).st_mode
+            path = self._resolve_reload_target(config_dir)
+            # List it, not is_dir: is_dir answers False for a target it cannot stat, which would
+            # report a parent the service account cannot traverse as a missing directory, and a
+            # directory that can be stat'ed but not listed loads as an empty graph, because glob
+            # swallows the listing error.
+            with os.scandir(path):
+                pass
         except (FileNotFoundError, NotADirectoryError):
-            mode = None
+            missing = True
         except OSError as exc:
+            # Not a missing directory: a parent the service account cannot traverse, say, or a
+            # directory it cannot list. Refused as its own case, so the routes and the dual-control
+            # release audit it rather than answering a 500 with no row, or invalid_config for an
+            # empty listing. The error can carry a client's config_dir, so it is scrubbed for
+            # py/log-injection.
             log.warning(
-                "config reload target could not be read: %s", scrub_log_argument(safe_exc(exc))
+                "config reload target could not be resolved or listed: %s",
+                scrub_log_argument(safe_exc(exc)),
             )
             raise ConfigDirUnreadable() from exc
-        if mode is None or not stat.S_ISDIR(mode):
+        else:
+            missing = False
+        if missing:
+            # Outside the handler, so the error it replaces does not ride __context__.
             raise FileNotFoundError(f"config directory not found: {config_dir}")
         return path
 
