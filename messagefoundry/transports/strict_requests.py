@@ -274,11 +274,12 @@ def _narrowed_pool_classes(
 
             **The refusal is a** :class:`VaultHopRefused`, **like every other check on this hop.**
             urllib3 does not catch that type, so it reaches the caller as it is, and
-            :func:`vault_failure_text` keeps its text. The base ``InsecureHopRefused`` would reach
-            the caller too, but that function keeps the text of the marked type only (vault BACKLOG
-            #3247). A urllib3 ``SSLError`` raised here would not reach the caller as it is:
-            measured with urllib3 2.8.0, one raised before the proxy has connected comes out of
-            requests as a ``ProxyError``, and the providers would then report a type name only.
+            :func:`vault_failure_text` keeps its text. That text is fixed, and names no part of the
+            CA text it refuses. The base ``InsecureHopRefused`` would reach the caller too, but
+            with a type name for its text; :class:`VaultHopRefused` says why. A urllib3
+            ``SSLError`` raised here would not reach the caller as it is: measured with urllib3
+            2.8.0, one raised before the proxy has connected comes out of requests as a
+            ``ProxyError``, and the providers would then report a type name only.
 
             **A CA file is not checked, because the load itself refuses it.** ``ca_certs`` is a
             path. Measured, a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised

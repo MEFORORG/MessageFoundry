@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.tls_policy import InsecureHopRefused
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
@@ -127,9 +128,9 @@ def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: s
     ``_Stopped``. The refusal is the hop's marked type, ``VaultHopRefused``, with fixed text."""
     made, factory = _contexts(_NoTlsLoad)
     conn = _connection(factory, proxied=proxied, ca_cert_data=text)
-    with pytest.raises(_strict().VaultHopRefused, match="encryption header") as refusal:
+    with pytest.raises(InsecureHopRefused, match="encryption header") as refusal:
         conn.connect()
-    assert type(refusal.value) is _strict().VaultHopRefused
+    assert type(refusal.value) is _strict().VaultHopRefused, "not the hop's marked type"
     assert made == [], "a TLS context was built for CA text the hop refuses"
     assert "Vault test hop" in str(refusal.value)
     assert "SYNTHETICBODYMARKER" not in str(refusal.value), "the refusal echoed the CA text"
@@ -194,7 +195,7 @@ def test_the_refusal_reaches_the_caller_with_its_text(proxy: str | None) -> None
     then report a type name only. Red under: the refusal raised as ``urllib3.exceptions.SSLError``,
     which comes out as ``requests.exceptions.SSLError`` direct and ``ProxyError`` through a proxy.
     Red too under the refusal raised as the unmarked ``InsecureHopRefused``: it reaches the caller,
-    but ``vault_failure_text`` keeps the text of exactly ``VaultHopRefused`` (vault BACKLOG #3247)."""
+    and ``vault_failure_text`` then gives its type name (vault BACKLOG #3247)."""
     import requests
 
     made, factory = _contexts(_NoTlsLoad)
@@ -209,8 +210,7 @@ def test_the_refusal_reaches_the_caller_with_its_text(proxy: str | None) -> None
     session = requests.Session()
     session.trust_env = False
     session.mount("https://", adapter)
-    with pytest.raises(_strict().VaultHopRefused, match="encryption header") as refusal:
+    with pytest.raises(InsecureHopRefused, match="encryption header") as refusal:
         session.get("https://127.0.0.1:9/v1/sys/health", proxies=proxies, timeout=5)
-    assert type(refusal.value) is _strict().VaultHopRefused
     assert _strict().vault_failure_text(refusal.value) == str(refusal.value)
     assert made == [], "a TLS context was built for CA text the hop refuses"
