@@ -1152,6 +1152,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_held via _AUTO_RESOLVE.
         self._record_state({"type": "ad_reconcile_hold_released", "connection": name}, "info")
 
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        # Vault BACKLOG #3229: a directory role change left no enabled Administrator. `user:<username>`
+        # stands in for "connection", as on administrator_granted. `via` is the closed pair ad-sync /
+        # ad-reconcile. Never message content.
+        self._emit(
+            {
+                "type": "no_enabled_administrator",
+                "connection": name,
+                "via": via,
+                "reason": f"no enabled Administrator remains after {via}",
+            }
+        )
+
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         # ADR 0079 mechanism 2: a directory principal's sessions were revoked. Keyed on the username so
         # each revoked principal is its own instance. The username is an operator account name, the same

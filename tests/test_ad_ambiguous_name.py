@@ -15,6 +15,8 @@ two entries by construction; what this pins is that the engine refuses them. Syn
 from __future__ import annotations
 
 import logging
+import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -61,17 +63,20 @@ class _Conn:
         return True
 
 
-def _authenticator() -> LdapAuthenticator:
-    return LdapAuthenticator(
-        AuthSettings(
-            ad_enabled=True,
-            ad_server="ldaps://x",
-            ad_user_search_base="DC=x",
-            ad_bind_dn="CN=svc,DC=x",
-            ad_bind_password="x",
-            ad_domain="example.org",
-        )
+def _settings(**over: Any) -> AuthSettings:
+    return AuthSettings(
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+        ad_domain="example.org",
+        **over,
     )
+
+
+def _authenticator() -> LdapAuthenticator:
+    return LdapAuthenticator(_settings())
 
 
 @pytest.fixture(autouse=True)
@@ -126,8 +131,11 @@ def test_one_entry_for_the_name_still_resolves() -> None:
     assert found.info is not None and found.info["dn"] == "CN=X,DC=x"
 
 
-def _install_directory(monkeypatch: pytest.MonkeyPatch, binds: list[str]) -> None:
-    """Every search answers both entries; ``binds`` collects each bind's DN."""
+def _install_directory(
+    monkeypatch: pytest.MonkeyPatch, binds: list[str], answer: list[_Entry] | None = None
+) -> None:
+    """Every search answers ``answer`` (both entries by default); ``binds`` collects each bind's
+    DN. The list is read at each search, so a test may change it between sign-ins."""
     import ldap3
 
     class FakeServer:
@@ -145,7 +153,7 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, binds: list[str]) -> Non
             return None
 
         def search(self, **kwargs: Any) -> bool:
-            self.entries = [_X, _V]
+            self.entries = list(answer) if answer is not None else [_X, _V]
             return True
 
         def bind(self) -> bool:
@@ -178,3 +186,254 @@ def test_the_password_is_never_bound_as_either_entry(monkeypatch: pytest.MonkeyP
     assert bound.answer is DirectoryAnswer.AMBIGUOUS
     assert "CN=X,DC=x" not in binds and "CN=V,DC=x" not in binds
     assert any("mf-nonexistent-timing-equalizer" in dn for dn in binds)
+
+
+# --- vault BACKLOG #3228: the account's stored objectGUID picks among the matches ---------------
+
+_GUID_X = uuid.UUID("0b8f6c2e-1d3a-4c5b-9e7f-102030405060")
+_GUID_V = uuid.UUID("9a1b2c3d-4e5f-4a6b-8c7d-0e1f20314253")
+_GUID_NEITHER = uuid.UUID("5d6e7f80-9a0b-4c1d-8e2f-a0b1c2d3e4f5")
+
+
+def _carrying(entry: _Entry, guid: uuid.UUID, *groups: str) -> _Entry:
+    """A copy of ``entry`` carrying ``guid`` as the 16 little-endian bytes a directory sends.
+
+    Bytes rather than text, so a test that passes shows the stored text form and the wire form
+    compare through :func:`~messagefoundry.auth.ldap.normalise_object_guid`."""
+    out = _Entry(entry["sAMAccountName"].value, entry.entry_dn)
+    out._attrs["objectGUID"] = _Attr(guid.bytes_le)
+    out._attrs["memberOf"] = _Attr(list(groups))
+    return out
+
+
+def test_a_stored_object_id_picks_the_entry_that_carries_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """X, which holds the name, is chosen by its id in either result order and either spelling."""
+    x, v = _carrying(_X, _GUID_X), _carrying(_V, _GUID_V)
+    auth = _authenticator()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.ldap"):
+        for stored in (str(_GUID_X), "{" + str(_GUID_X).upper() + "}"):
+            for order in ([x, v], [v, x]):
+                found = auth._lookup_by_name(_Conn(order), "victor", tie_break_object_id=stored)
+                assert found.answer is DirectoryAnswer.FOUND, (stored, order)
+                assert found.info is not None and found.info["dn"] == "CN=X,DC=x"
+                assert found.info["object_id"] == str(_GUID_X)
+    # The collision is still reported, once per name, and still without the name or either DN.
+    records = [r for r in caplog.records if r.name == "messagefoundry.auth.ldap"]
+    assert len(records) == 1 and "using the one carrying" in records[0].getMessage()
+    message = records[0].getMessage().replace(safe_name("victor"), "")
+    for raw in ("victor", "vsmith", "CN=X", "CN=V", str(_GUID_X), str(_GUID_V)):
+        assert raw not in message
+
+
+def test_with_no_stored_object_id_two_entries_are_still_refused() -> None:
+    """The caller holds no id, so nothing tells the entries apart. The second case pins that an
+    entry with no readable id is not "matched" by a caller holding none."""
+    auth = _authenticator()
+    for entries in (
+        [_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)],
+        [_carrying(_X, _GUID_X), _V],
+    ):
+        found = auth._lookup_by_name(_Conn(entries), "victor")
+        assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_both_id_keys_at_once_are_refused() -> None:
+    """An id-keyed search has no tie to break, so a caller passing both made a mistake."""
+    with pytest.raises(ValueError, match="not both"):
+        _authenticator().probe_principal(
+            "victor", object_id=str(_GUID_X), tie_break_object_id=str(_GUID_X)
+        )
+
+
+def test_two_entries_carrying_the_stored_object_id_are_refused() -> None:
+    """An id is meant to name one object. Two entries reading it back prove neither is the account,
+    even when only one of them holds the name."""
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_X)])
+    found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_X))
+    assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_two_entries_holding_the_name_are_refused_whatever_the_stored_id() -> None:
+    """Same-named accounts in two domains under one search base. The ticket's realm is dropped
+    before the lookup, so it cannot say which one signed in, and the row's id must not choose."""
+    other_domain = _carrying(_Entry("victor", "CN=victor,DC=y"), _GUID_V)
+    conn = _Conn([_carrying(_X, _GUID_X), other_domain])
+    found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_X))
+    assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_a_stored_object_id_matching_neither_entry_is_refused() -> None:
+    """The account's own entry is not among the matches, so neither match may stand in for it. An
+    entry with no ``objectGUID`` at all matches no stored id either."""
+    auth = _authenticator()
+    for entries in (
+        [_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)],
+        [_carrying(_X, _GUID_X), _V],
+    ):
+        found = auth._lookup_by_name(
+            _Conn(entries), "victor", tie_break_object_id=str(_GUID_NEITHER)
+        )
+        assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_a_stored_object_id_on_an_entry_matched_only_by_its_upn_is_refused() -> None:
+    """The recycle case. V was ``victor``, was renamed ``vsmith`` and kept the UPN, and the name went
+    to X. The row still holds V's id, but X holds the ticket's name, so choosing V would sign X in as
+    V. Refused, as before #3228."""
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)])
+    found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_V))
+    assert found.answer is DirectoryAnswer.AMBIGUOUS and found.info is None
+
+
+def test_the_name_check_ignores_case() -> None:
+    """``sAMAccountName`` compares without case in AD, so a ticket's spelling does not matter."""
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)])
+    found = _authenticator()._lookup_by_name(conn, "VICTOR", tie_break_object_id=str(_GUID_X))
+    assert found.answer is DirectoryAnswer.FOUND
+    assert found.info is not None and found.info["dn"] == "CN=X,DC=x"
+
+
+def test_a_stored_object_id_that_cannot_be_read_breaks_no_tie() -> None:
+    conn = _Conn([_carrying(_X, _GUID_X), _carrying(_V, _GUID_V)])
+    found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id="not-a-guid")
+    assert found.answer is DirectoryAnswer.AMBIGUOUS
+
+
+def test_a_stored_object_id_does_not_change_a_single_match() -> None:
+    """Paired control: one match is answered as before. The sign-in's own identity check refuses
+    an entry whose id is not the row's (BACKLOG #1471); this lookup does not take that over."""
+    conn = _Conn([_carrying(_X, _GUID_X)])
+    found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_V))
+    assert found.answer is DirectoryAnswer.FOUND
+    assert found.info is not None and found.info["dn"] == "CN=X,DC=x"
+
+
+async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """RED without #3228: the sign-in after the collision is refused as ``not_in_directory``.
+
+    The real ``LdapAuthenticator`` over a faked ``ldap3``; only the SPNEGO acceptor is replaced. The
+    first sign-in finds X alone, and the row it creates is bound to X's id. Then V's UPN collides
+    with the name. The sign-in must land on X's row, the one the engine already holds, and a
+    ticket for a name with no row must still be refused."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store.store import MessageStore
+
+    async def _no_pad(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_pad)
+    ticket = {"name": "victor"}
+    monkeypatch.setattr(
+        "messagefoundry.auth.service.kerberos_principal", lambda _t, _s: ticket["name"]
+    )
+    group = "CN=mf-ops,DC=x"
+    answer = [_carrying(_X, _GUID_X, group)]
+    _install_directory(monkeypatch, [], answer)
+    store = await MessageStore.open(tmp_path / "tie-break.db")
+    try:
+        settings = _settings(kerberos_enabled=True)
+        service = AuthService(store, settings, ldap=LdapAuthenticator(settings))
+        await service.initialize()
+        await service.set_ad_group_map([(group.lower(), "operator")], actor="admin")
+
+        first = await service.authenticate_kerberos(b"spnego-token")
+        assert first.ok, first.error
+        row = await store.get_user_by_username("victor")
+        assert row is not None and row.directory_object_id == str(_GUID_X)
+
+        answer.append(_carrying(_V, _GUID_V, group))
+        again = await service.authenticate_kerberos(b"spnego-token")
+        assert again.ok, again.error
+        assert again.identity is not None and again.identity.user_id == row.id
+
+        # Control: the same two entries, for a name no row holds, are still refused.
+        ticket["name"] = "vsmith-alias"
+        refused = await service.authenticate_kerberos(b"spnego-token")
+        assert not refused.ok
+    finally:
+        await store.close()
+
+
+async def test_an_edited_row_on_a_keyed_store_breaks_no_tie(tmp_path: Path) -> None:
+    """BACKLOG #2592 with #3228: on a keyed store, a directory row whose objectGUID was edited
+    outside the engine fails its seal, so it gives the tie-break no id."""
+    import sqlite3
+
+    from messagefoundry.auth.identity import AuthProvider
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.store.store import MessageStore
+
+    path = tmp_path / "sealed.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        service = AuthService(store, _settings(kerberos_enabled=True), ldap=_authenticator())
+        await service.initialize()
+        await store.create_user(
+            user_id=uuid.uuid4().hex,
+            username="victor",
+            auth_provider=AuthProvider.AD.value,
+            directory_object_id=str(_GUID_V),
+            password_generated=False,
+        )
+        assert await service._stored_directory_object_id("victor") == str(_GUID_V)
+
+        # Point the row at another entry, on a connection that holds no store key.
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "UPDATE users SET directory_object_id = ? WHERE username = ?",
+                (str(_GUID_X), "victor"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert await service._stored_directory_object_id("victor") is None
+    finally:
+        await store.close()
+
+
+async def test_a_like_named_local_row_breaks_no_tie(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a directory row's id steers the lookup. A local row carrying an id is ignored, and
+    the id is read through the sealed loader (BACKLOG #2592), never the raw store reader. The
+    real seal check is the next test."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth.identity import AuthProvider
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "local-row.db")
+    try:
+        service = AuthService(store, _settings(kerberos_enabled=True), ldap=_authenticator())
+        await service.initialize()
+        current: SimpleNamespace | None = SimpleNamespace(
+            auth_provider=AuthProvider.AD.value, directory_object_id=str(_GUID_X)
+        )
+
+        async def _row(_name: str) -> Any:
+            return current
+
+        monkeypatch.setattr(service, "_load_user_by_username", _row)
+        assert await service._stored_directory_object_id("victor") == str(_GUID_X)
+        current = SimpleNamespace(
+            auth_provider=AuthProvider.LOCAL.value, directory_object_id=str(_GUID_X)
+        )
+        assert await service._stored_directory_object_id("victor") is None
+        # The loader answers None, so a row the raw store still holds gives no id.
+        current = None
+        raw = SimpleNamespace(auth_provider=AuthProvider.AD.value, directory_object_id=str(_GUID_X))
+
+        async def _raw_row(_name: str) -> Any:
+            return raw
+
+        monkeypatch.setattr(store, "get_user_by_username", _raw_row)
+        assert await service._stored_directory_object_id("victor") is None
+    finally:
+        await store.close()

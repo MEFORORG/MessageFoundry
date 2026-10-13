@@ -208,7 +208,7 @@ class _FakeLdap:
         return DirectoryBind(DirectoryAnswer.FOUND, self._principal)
 
     def resolve_principal(
-        self, username: str, *, object_id: str | None = None
+        self, username: str, *, object_id: str | None = None, **_: object
     ) -> AdPrincipal | None:
         # ``object_id`` is accepted because the federated path hands over the bound row's id, as the
         # reconciler does (ADR 0184 part 2). Every bound row carries one since BACKLOG #1143 slice C,
@@ -632,7 +632,7 @@ class _IdRecordingLdap(_FakeLdap):
         self.object_ids: list[str | None] = []
 
     def resolve_principal(
-        self, username: str, *, object_id: str | None = None
+        self, username: str, *, object_id: str | None = None, **_: object
     ) -> AdPrincipal | None:
         self.object_ids.append(object_id)
         return super().resolve_principal(username, object_id=object_id)

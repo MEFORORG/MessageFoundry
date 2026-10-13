@@ -406,6 +406,32 @@ gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #271
   old loopback mode could not repair an account anyway: with no auth service, creating
   an account, unbinding one and reading the audit log all answered 503.
 
+#### A directory role change can remove the last Administrator, and it alerts
+
+The engine refuses a console change that would leave no enabled Administrator. Disabling,
+deleting or changing the roles of the last one answers 400. A change the directory drives is not
+refused. When a directory sign-in's role sync, or the session reconciler, takes Administrator from
+its last enabled holder, the change applies at once (owner ruling 2026-10-13, vault BACKLOG #3229).
+So an Administrator taken out of the mapped group, or a compromised one, loses the role straight
+away.
+
+The engine then tells the operators in two ways:
+
+- the `no_enabled_administrator` alert, keyed `user:<username>`, with `via` set to `ad-sync` or
+  `ad-reconcile`;
+- an `auth.no_enabled_administrator` audit row, with the demoted account as its actor.
+
+Only a role change raises them. When the directory disables or deletes the account instead, the
+reconciler ends its sessions but leaves its stored role, so the account still counts as an enabled
+Administrator. No alert fires, and `provision-admin` still refuses. A console removal that races a
+directory one is not covered either: the console guard is one store transaction, and this check
+reads after the directory's write.
+
+The cost is that a site whose Administrators all come from the directory can end up with none
+(vault BACKLOG #2711). With no enabled Administrator left, `provision-admin` runs again at the host,
+or the directory can grant the role back at the next sign-in. A local Administrator, as above,
+keeps a site out of this state.
+
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
 An administrator (`users:manage`) recovers a locked-out or compromised **local** account with

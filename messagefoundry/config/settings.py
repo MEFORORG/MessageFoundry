@@ -4746,6 +4746,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # sign-in's role sync (granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
+        # vault BACKLOG #3229: a directory-driven role change left no enabled Administrator. Keyed
+        # `user:<username>`, which no connection can be named.
+        "no_enabled_administrator",
         # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
         # `approval:<id>`, which no connection can be named. Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
