@@ -399,3 +399,32 @@ async def test_the_purge_confirm_page_holds_the_purge_proof(engine: Engine) -> N
         ran = await c.post("/ui/connections/OB_X/purge/all", headers=SAME_ORIGIN)
         assert _reauth_next(ran) is None and ran.status_code == 404
         assert _reauth_next(await c.get(page)) == page  # the POST spent it
+
+
+async def test_a_crafted_reauth_toward_an_unlock_page_mints_nothing_bound(engine: Engine) -> None:
+    """Owner ruling 2026-10-13 (#3241 R3): /ui/reauth mints an unlock page's grant only when a gate
+    issued that page to this session. A link straight to /ui/reauth?next=<unlock page> still
+    re-authenticates and lands on the page, which then asks again, with nothing bound."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        crafted = await c.post(
+            "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert crafted.status_code == 303 and crafted.headers["location"] == page
+        assert _reauth_next(await c.get(page)) == page  # no grant: the page asks again
+        # CONTROL: the gate's own refusal issues the page, and the same re-auth then mints.
+        assert _reauth_next(await c.get(page)) == page
+        issued = await c.post(
+            "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert issued.status_code == 303
+        assert (await c.get(page)).status_code == 200
+        # One issue mints one grant: the purge spends it, and a second re-auth with no new refusal
+        # in between mints nothing.
+        ran = await c.post("/ui/connections/OB_X/purge/all", headers=SAME_ORIGIN)
+        assert _reauth_next(ran) is None
+        await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert _reauth_next(await c.get(page)) == page

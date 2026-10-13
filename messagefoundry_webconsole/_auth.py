@@ -988,7 +988,9 @@ _REAUTH_CONTINUATION_SESSIONS_MAX = 4096
 
 
 class _IssuedContinuations:
-    """The ``auto_retry`` continuations this process issued, each bound to ONE session (#2764).
+    """The continuations this process issued, each bound to ONE session (#2764): ``auto_retry``
+    actions, and since owner ruling 2026-10-13 (#3241 R3) ``unlock`` pages too, because the re-auth
+    toward an unlock page mints its action-bound grant only when the page was issued.
 
     ``/ui/reauth`` used to auto-submit whichever registered action its ``next`` named, and nothing
     recorded that the server had asked for it, so a typed, bookmarked or clicked link to
@@ -1076,10 +1078,14 @@ def consume_continuation(token: str | None, next_path: str) -> bool:
 
 
 def continues_after_reauth(action: UiWriteAction, token: str | None, next_path: str) -> bool:
-    """Whether a re-auth for ``next_path`` will hand control back to it: always for an ``unlock``
-    page (a GET the operator still submits from), and for an ``auto_retry`` action only when it was
-    issued to this session (vault BACKLOG #2764). Ask it of the CURRENT token; a ceremony rotates."""
-    return action.unlock or continuation_issued(token, next_path)
+    """Whether a re-auth for ``next_path`` continues to it, and so mints the grant its action names:
+    only when a gate issued it to this session, for an ``auto_retry`` action (vault BACKLOG #2764)
+    and for an ``unlock`` page alike (owner ruling 2026-10-13, #3241 R3). A crafted
+    ``/ui/reauth?next=<unlock page>`` therefore mints nothing bound; the re-auth still sends the
+    browser to the page, which then asks again. Ask it of the CURRENT token; a ceremony rotates.
+    ``action`` is kept for the callers' sake and decides nothing."""
+    del action
+    return continuation_issued(token, next_path)
 
 
 def rekey_continuations(old_token: str | None, new_token: str | None) -> None:
@@ -1097,20 +1103,28 @@ def _request_is_same_origin(request: Request) -> bool:
 
 
 def _issue_continuation(request: Request, next_path: str) -> None:
-    """Record ``next_path`` as a continuation this session may auto-submit after its re-auth.
+    """Record ``next_path`` as a continuation this session may continue to after its re-auth.
 
-    Only for an ``auto_retry`` target, only when the refused request was itself a same-origin POST,
-    and only for a request with a session. The POST condition is what ties the record to an action
-    the operator actually submitted from this console: a GET is what a link produces, and a
-    same-site POST from a sibling host carries the SameSite=Strict cookie but fails the origin check
-    (the MFA-pending refusal fires before ``require_ui`` asserts provenance, so it is checked here)."""
+    Only for a request with a session that passes the origin check, and then:
+
+    * an ``auto_retry`` target only when the refused request was itself a POST. That ties the record
+      to an action the operator actually submitted from this console: a GET is what a link produces,
+      and a same-site POST from a sibling host carries the SameSite=Strict cookie but fails the
+      origin check (the MFA-pending refusal fires before ``require_ui`` asserts provenance, so it is
+      checked here).
+    * an ``unlock`` page on either method (owner ruling 2026-10-13, #3241 R3). Opening the page is a
+      GET, and a gate refusing it is what issues it; the re-auth toward it then mints its grant. A
+      cross-site link carries no SameSite=Strict cookie, and the origin check refuses a cross-site or
+      same-site GET, so only the operator's own navigation issues one."""
     token = session_token(request)
     if (
         token
-        and request.method == "POST"
         # GET /ui/reauth answers 422 past its cap, so a longer entry could never be consumed.
         and len(next_path) <= _REAUTH_NEXT_MAX
-        and is_safe_ui_action(next_path)
+        and (
+            (request.method == "POST" and is_safe_ui_action(next_path))
+            or is_unlock_action(next_path)
+        )
         and _request_is_same_origin(request)
     ):
         _ISSUED_CONTINUATIONS.issue(token, next_path)

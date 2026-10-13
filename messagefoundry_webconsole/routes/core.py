@@ -1956,7 +1956,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # The issue is spent under the pre-rotation token, the key it still sits under, and then
         # the session's OTHER issued entries follow the rotation -- before any branch returns, so
         # an unlock re-auth in one tab does not strand an action another tab is confirming.
-        issued = not action.unlock and consume_continuation(pre_rotation, next_)
+        # An unlock page's issue is spent too (owner ruling 2026-10-13, #3241 R3), so one
+        # issue mints one grant.
+        issued = consume_continuation(pre_rotation, next_)
         rekey_continuations(pre_rotation, token)
         if is_unlock_action(next_):
             return _keep_session(RedirectResponse(next_, status_code=303), token)
