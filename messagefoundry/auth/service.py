@@ -263,12 +263,10 @@ _CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
 #: The refusal reason when no probe slot freed in time. Not a directory answer.
 CERT_PROBE_SATURATED = "probe_capacity_saturated"
 #: The refusal reason when the certificate path's probe raised past every catch below it: an engine
-#: fault, not a directory answer, so it must not read as ``unavailable`` (BACKLOG #3115). A fault
-#: the directory layer raised is still read as ``unavailable`` by ``_probe_principal``'s own catch.
+#: fault, so it must not read as a directory outage (BACKLOG #3115). Logged by the outage rules.
 CERT_PROBE_FAULT = "probe_fault"
 #: Refusals that say the directory could not be asked, not what it said about the account. The
-#: certificate path logs these once per outage rather than once per request. A probe fault repeats
-#: per request the same way, so it is logged by the same rules under its own reason.
+#: certificate path logs these once per outage rather than once per request.
 _CERT_DIRECTORY_OUTAGES = frozenset(
     {
         reconcile.ProbeOutcome.UNAVAILABLE.value,
@@ -1011,8 +1009,7 @@ def generate_policy_password(
     # or the username, and the suffix keeps either one. Read from the policy, not from four field
     # names, so a class rule added later is not skipped here (BACKLOG #2359). The suffix still
     # covers only the four classes today: a new class it misses needs the suffix extended too, and
-    # until then the screen refuses that candidate rather than issuing it. A test issues one under
-    # every ``require_*`` rule, so such a rule fails there before it refuses every reset (#3160).
+    # until then the screen refuses that candidate rather than issuing it (pinned by test, #3160).
     class_rules = policy.requires_character_class
     for _ in range(_RESET_GENERATION_ATTEMPTS):
         token = secrets.token_urlsafe(length)[:chars]
@@ -1832,15 +1829,16 @@ def _scope_covers(settings: AuthSettings, roles: frozenset[Role]) -> bool:
     return settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
 
 
+def _is_directory_account(user: UserRecord) -> bool:
+    """Whether ``user`` is a directory account. Any other provider, an unrecognised one included,
+    reads as local, as :meth:`AuthService._build_identity` reads it (BACKLOG #3117)."""
+    return user.auth_provider == AuthProvider.AD.value
+
+
 def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozenset[Role]) -> bool:
     """Whether the requirement covers ``user`` as a LOCAL account, enrolled or not (ADR 0197
-    Amendment A): :func:`_scope_covers`, restricted to local accounts.
-
-    **Only a directory account is left out, by a deny-list (BACKLOG #3117).** An allow-list of
-    ``LOCAL`` let a row with an unrecognised provider escape AC-A3a, the enrol-first gates and
-    :func:`lockable_account_census`, although :meth:`AuthService._build_identity` maps such a row
-    back to ``LOCAL`` and every other path treats it as local. So an unknown provider is covered."""
-    return user.auth_provider != AuthProvider.AD.value and _scope_covers(settings, roles)
+    Amendment A): :func:`_scope_covers`, restricted to accounts that are not directory accounts."""
+    return not _is_directory_account(user) and _scope_covers(settings, roles)
 
 
 class CensusNeedsTheStoreKey(RuntimeError):
@@ -1913,8 +1911,7 @@ async def lockable_account_census(
         if (
             user.password_generated
             or user.password_hash is None
-            # A deny-list, as in _requirement_covers: an unrecognised provider is read (#3117).
-            or user.auth_provider == AuthProvider.AD.value
+            or _is_directory_account(user)
             or not settings.require_mfa
         ):
             continue
@@ -1985,8 +1982,7 @@ _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 #: because every create and reset in it counts against the page. A page that comes back full may
 #: have dropped the row that matters, so a full page is treated as unresolved rather than read. Each
 #: action maps to the detail key that names the account: ``user.created`` carries only the username.
-#: ``auth.mfa_reset`` issues one too, on a local account (BACKLOG #3160): leaving it out meant the
-#: administrator who reset a factor was never sent the expiry reminder.
+#: ``auth.mfa_reset`` issues one too, on a local account (BACKLOG #3160).
 _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
     {"user.created": "username", "auth.password_reset": "user_id", "auth.mfa_reset": "user_id"}
 )
@@ -7737,9 +7733,8 @@ class AuthService:
         except Exception:
             # Returned, never raised: a raise from a probe whose caller was cancelled would reach
             # the loop's exception handler through the shield, one ERROR per orphaned request.
-            # Its own reason, not "unavailable", so an engine fault does not read as a directory
-            # outage (BACKLOG #3115). It fails closed and logs by the outage rules. The traceback
-            # can quote a directory value, so it goes to DEBUG and names no account.
+            # It fails closed under its own reason. The traceback can quote a directory value, so
+            # it goes to DEBUG and names no account.
             _log.debug("certificate-path directory probe raised", exc_info=True)
             return CERT_PROBE_FAULT
         finally:

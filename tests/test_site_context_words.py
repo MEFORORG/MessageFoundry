@@ -18,7 +18,6 @@ supplies them. These tests pin at least these properties:
 from __future__ import annotations
 
 import dataclasses
-import secrets
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -403,7 +402,7 @@ def test_the_generator_can_meet_every_class_rule_the_policy_has(
     prefix is reserved for class rules only by a docstring. A later ``require_*`` rule the suffix
     cannot meet would make every create and reset refuse. RED when one is added: this issues a
     credential under each rule, and the control below shows such a rule fails here."""
-    monkeypatch.setattr(secrets, "token_urlsafe", lambda n: "xq" * n)
+    _fake_tokens(monkeypatch, _tokens(["xq" * 16]))
     _issue_under_each_class_rule(PasswordPolicy)
 
     @dataclasses.dataclass(frozen=True)
