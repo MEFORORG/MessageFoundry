@@ -16,10 +16,32 @@
       - nudges cleanup by counting the <repo>-<name> siblings, pointing at prune-merged.ps1
         so finished worktrees don't pile up.
     See docs/WORKTREES.md and AI memory: mf-worktree-hygiene.
+
+    IT READS THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
+    worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, this
+    hook then ran with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
+    Across MessageFoundry worktree transcripts it printed "This chat's worktree: <primary>" 410 times
+    against 48 for a worktree, and told worktree sessions they sat in the shared trunk.
+
+    Only the `cwd` field of the JSON on stdin names the session's worktree. So the hook moves there
+    (scripts/hooks/_hookinput.ps1) before its first git call, and presence.ps1, overlap.ps1 and every
+    git call below answer for the session. Input with no `cwd` leaves it where it started, as before.
+    A `cwd` it cannot use becomes the banner's first line, and the banner then describes the checkout
+    the hook runs in.
 #>
 $ErrorActionPreference = "SilentlyContinue"
 
 $lines = @()
+
+# Into the session's own directory BEFORE any git call. A helper that fails to load leaves the hook
+# exactly as it was before the helper existed.
+try {
+    . (Join-Path $PSScriptRoot '../hooks/_hookinput.ps1')
+    $cwdFault = Enter-CcxHookCwd -Text (Read-CcxHookInput)
+    if ($cwdFault) {
+        $lines += "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. Everything below describes $((Get-Location).Path), where this hook runs, which may not be your worktree."
+    }
+} catch { }
 
 # Add parallel-session coordination only when 2+ worktrees share this .git (real collision risk).
 $root = (& git rev-parse --show-toplevel 2>$null)
