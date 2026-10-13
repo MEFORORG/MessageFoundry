@@ -1132,7 +1132,7 @@ def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None
         try:
             sink.no_enabled_administrator(f"user:{username}", via=via)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
-            log.warning("the no_enabled_administrator alert could not be delivered")
+            log.warning("the no_enabled_administrator alert could not be delivered", exc_info=True)
 
     return _raise
 

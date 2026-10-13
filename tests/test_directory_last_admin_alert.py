@@ -19,6 +19,7 @@ All directory data is synthetic.
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -195,6 +196,71 @@ async def test_a_demotion_that_never_held_administrator_is_quiet(rig: _Rig, via:
     """No enabled Administrator exists at all here, but this write did not take one away (#3229)."""
     rig.ldap.present["jdoe"] = _principal("jdoe", OPERATORS)
     await rig.sign_in("jdoe")
+
+    await rig.directory_change("jdoe", via=via)
+
+    assert await rig.roles("jdoe") == []
+    assert rig.alerts == []
+    assert await rig.rows() == []
+
+
+@pytest.mark.parametrize("via", PATHS)
+async def test_a_refused_audit_row_neither_raises_nor_drops_the_alert(
+    rig: _Rig, via: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The role write has happened, so a store fault in the report must not end the sign-in or the
+    reconcile pass (BACKLOG #2137), and the alert goes before the row (#3229)."""
+    rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
+    await rig.sign_in("jdoe")
+    real = rig.store.record_audit
+
+    async def refusing(action: str, **kwargs: Any) -> None:
+        if action == NO_ENABLED_ADMINISTRATOR_ACTION:
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        await real(action, **kwargs)
+
+    monkeypatch.setattr(rig.store, "record_audit", refusing)
+
+    await rig.directory_change("jdoe", via=via)  # completes: the sign-in or pass returns
+
+    assert await rig.roles("jdoe") == []
+    assert rig.alerts == [("jdoe", via)]
+    assert await rig.rows() == []
+    # The steps after the report still ran.
+    actions = [r["action"] for r in await rig.store.list_audit()]
+    after = "auth.ad_roles_resynced" if via == "ad-sync" else "auth.ad_session_revoked"
+    assert after in actions
+
+
+@pytest.mark.parametrize("via", PATHS)
+async def test_a_raising_alert_callable_still_writes_the_row(rig: _Rig, via: str) -> None:
+    """Only the production wrapper promises not to raise, so the service contains a raise (#3229)."""
+
+    def raising(username: str, via: str) -> None:
+        raise RuntimeError("synthetic: the alert path is down")
+
+    rig.service._admin_loss_alert = raising
+    rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
+    await rig.sign_in("jdoe")
+
+    await rig.directory_change("jdoe", via=via)
+
+    assert await rig.roles("jdoe") == []
+    assert len(await rig.rows()) == 1
+
+
+@pytest.mark.parametrize("via", PATHS)
+async def test_an_unreadable_count_raises_no_alert_and_no_error(
+    rig: _Rig, via: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the count cannot be read, no alert can be stated truly, and nothing raises (#3229)."""
+    rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
+    await rig.sign_in("jdoe")
+
+    async def unreadable() -> bool:
+        raise sqlite3.OperationalError("synthetic: database is locked")
+
+    monkeypatch.setattr(rig.service, "has_enabled_administrator", unreadable)
 
     await rig.directory_change("jdoe", via=via)
 

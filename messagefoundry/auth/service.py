@@ -5214,6 +5214,13 @@ class AuthService:
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
+        # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that takes
+        # Administrator from its last enabled holder is applied, never refused. It alerts and audits
+        # instead, right after the write, so no later step's failure can skip it. The ruling accepts
+        # the cost, noted with vault BACKLOG #2711.
+        await self._report_directory_admin_loss(
+            user, before=previous, after=role_ids, via="ad-sync", client=client
+        )
         # vault BACKLOG #2610: only a role this sync ADDED is reported, so an account that already
         # held Administrator pages nobody on each sign-in.
         gained = frozenset(role_ids) - previous
@@ -5228,12 +5235,6 @@ class AuthService:
                 actor=user.username,
                 detail=_json({"from": sorted(previous), "to": role_ids}),
                 client=client,
-            )
-            # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that
-            # takes Administrator from its last enabled holder is applied, never refused. It alerts
-            # and audits instead. The ruling accepts the cost, noted with vault BACKLOG #2711.
-            await self._report_directory_admin_loss(
-                user, before=previous, after=role_ids, via="ad-sync", client=client
             )
             # A directory-pushed privilege change is the same privilege change to the same user as a
             # local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching set_roles().
@@ -7107,11 +7108,23 @@ class AuthService:
                 revocation.username,
             )
             return False
-        held: list[str] = []
         if revocation.role_ids is not None:
-            held = await self._store.get_user_role_ids(revocation.user_id)
+            # Read now, not taken from the plan: the plan's roles can be a pass old, and the report
+            # below judges what THIS write took away. A target that keeps Administrator takes none.
+            held = (
+                []
+                if Role.ADMINISTRATOR.value in revocation.role_ids
+                else await self._store.get_user_role_ids(revocation.user_id)
+            )
             await self._store.set_user_roles(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
+            )
+            # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a demotion of
+            # the last enabled Administrator is applied, never refused. It alerts and audits
+            # instead, right after the write, so no later step's failure can skip it. The ruling
+            # accepts the cost, noted with vault BACKLOG #2711.
+            await self._report_directory_admin_loss(
+                user, before=held, after=revocation.role_ids, via="ad-reconcile"
             )
         revoked = await self._store.revoke_user_sessions(revocation.user_id)
         await self._audit(
@@ -7148,13 +7161,6 @@ class AuthService:
             revocation.username,
             revocation.reason,
         )
-        if revocation.role_ids is not None:
-            # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a demotion of
-            # the last enabled Administrator is applied above, never refused. It alerts and audits
-            # instead. The ruling accepts the cost, noted with vault BACKLOG #2711.
-            await self._report_directory_admin_loss(
-                user, before=held, after=revocation.role_ids, via="ad-reconcile"
-            )
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
         #
@@ -7204,12 +7210,29 @@ class AuthService:
 
         It fires only when this write took Administrator from an enabled account and none is left.
         The count is read after the write, so when two directory demotions race, the later read
-        sees both writes and reports.
+        sees both writes and reports. A console removal racing a directory one is not covered: the
+        console guard is one store transaction (vault BACKLOG #2779), and this read is not.
+
+        **Nothing here raises, a defect included.** It runs right after the role write and before
+        the caller's session revocation, its notice and, on the reconciler, the rest of the pass
+        (BACKLOG #2137 says why a raise there loses every later alert). A raise would skip those
+        for a report that comes after a write already made, so each step below logs its fault,
+        with the traceback, and goes on. A fault reading the count raises no alert, since none can
+        be stated truly; that log line is then the only record. A fault in the alert callable still
+        lets the row be written, and a fault writing the row comes after the alert.
         """
         admin = Role.ADMINISTRATOR.value
         if user is None or user.disabled or admin not in set(before) or admin in set(after):
             return
-        if await self.has_enabled_administrator():
+        try:
+            if await self.has_enabled_administrator():
+                return
+        except Exception:  # noqa: BLE001 -- logged with its traceback; see the docstring
+            _log.exception(
+                "a directory role change (%s) took Administrator from an account, and whether any "
+                "enabled Administrator remains could not be read; no alert was raised",
+                via,
+            )
             return
         _log.error(
             "a directory role change (%s) took Administrator from its last enabled holder; "
@@ -7217,12 +7240,24 @@ class AuthService:
             via,
         )
         if self._admin_loss_alert is not None:
-            self._admin_loss_alert(user.username, via)
-        await self._audit(
-            NO_ENABLED_ADMINISTRATOR_ACTION,
-            actor=user.username,
-            detail=_json({"via": via}),
-            client=client,
+            try:
+                self._admin_loss_alert(user.username, via)
+            except Exception:  # noqa: BLE001 -- logged with its traceback; see the docstring
+                _log.exception("the no_enabled_administrator alert callable raised")
+        await write_audit_soft(
+            lambda: self._audit(
+                NO_ENABLED_ADMINISTRATOR_ACTION,
+                actor=user.username,
+                detail=_json({"via": via}),
+                client=client,
+            ),
+            log=_log,
+            message="the %s audit row could not be written; any alert was raised before it",
+            args=(NO_ENABLED_ADMINISTRATOR_ACTION,),
+            # Every fault is logged and passed over, a defect too: a raise here would skip the
+            # caller's session revocation, which matters more than this row (see the docstring).
+            errors=(Exception,),
+            defects=(),
         )
 
     # --- sessions ------------------------------------------------------------
