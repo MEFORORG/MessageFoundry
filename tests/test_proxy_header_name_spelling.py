@@ -1220,6 +1220,69 @@ def test_control_a_value_left_as_it_was_crosses_at_a_second_open() -> None:
     assert all(f"{_NAME}: {_VALUE}\r\n".encode() in head for head in peer.cleartext)
 
 
+def _only_proxy_header(request: urllib.request.Request) -> tuple[str, Any]:
+    """The one header ``request.headers`` holds: the name object and the value object."""
+    ((name, value),) = request.headers.items()
+    return name, value
+
+
+def test_a_value_urllib_stores_under_a_judged_name_is_judged_as_a_new_header() -> None:
+    """A verdict is matched by the value object as well as the name object. A dictionary keeps
+    its first key, so a header set again keeps its name object and holds a new value.
+
+    urllib does that while a request is opened. The first proxy here is written ``https://``
+    with a credential, so its check lets the caller's admitted header go to it over TLS.
+    urllib then stores that proxy's own credential under the caller's name object, and hands
+    the request to the second proxy, which is cleartext. A verdict found by the name alone
+    would be the caller's, which the admission covers, and the first proxy's credential would
+    cross to the second in a cleartext ``CONNECT``. The new value is judged instead, so the
+    request is refused and neither proxy is dialled."""
+    with _WireProxy() as first, _WireProxy() as second:
+        handler = LoopbackDirectProxyHandler(
+            {
+                "http": f"https://{_URL_CRED}@{first.address}",
+                "https": f"http://{second.address}",
+            },
+            caller_header_admitted=True,
+        )
+        request = urllib.request.Request(_HTTP_TARGET)
+        request.add_header(_NAME, _VALUE)
+        name_at_first, value_at_first = _only_proxy_header(request)
+        raised = _attempt(build_strict_opener(handler), request)
+    # What the test rests on: urllib replaced the value and kept the caller's name object.
+    name_now, value_now = _only_proxy_header(request)
+    assert name_now is name_at_first
+    assert value_at_first == _VALUE
+    assert value_now == _URL_VALUE
+    assert second.cleartext == []
+    assert first.connections == 0
+    assert second.connections == 0
+    assert isinstance(raised, ProxyCredentialsRefusedError)
+    assert "#3410" in str(raised)
+
+
+def test_a_value_set_again_between_two_opens_is_judged_as_a_new_header() -> None:
+    """The same from a caller's side. The first open sends the admitted header. The caller
+    then sets the header again, to what the second proxy's URL makes, and opens the request
+    once more. ``add_header`` keeps the name object, so only the value object tells the two
+    headers apart. The second open is refused and sends nothing."""
+    with _WireProxy() as peer:
+        opener = _admitting_with_a_second_proxy(peer)
+        request = urllib.request.Request(_HTTP_TARGET)
+        request.add_header(_NAME, _VALUE)
+        name_at_first, _ = _only_proxy_header(request)
+        first = _attempt(opener, request)
+        request.add_header(_NAME, _URL_VALUE)
+        name_now, value_now = _only_proxy_header(request)
+        second = _attempt(opener, request)
+    assert name_now is name_at_first
+    assert value_now == _URL_VALUE
+    assert first is None
+    assert peer.connections == 1
+    assert isinstance(second, ProxyCredentialsRefusedError)
+    assert "#3410" in str(second)
+
+
 class _Undecoded(bytes):
     """A ``bytes`` name whose ``decode`` gives another name than the bytes it holds."""
 
