@@ -850,8 +850,7 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     says what happens to it. The exception never covers
     a request that goes direct. It never covers a header whose value reads, by ``str()``, as
     the credential a proxy URL in the handler's map makes, including one a request carries on to
-    a second proxy. That text is read from the value at each check and is never kept, so a
-    second open of the same request is judged by what the value reads as then. A value that is
+    a second proxy. :func:`_proxy_header_verdicts` says when that text is read. A value that is
     not a ``str`` may be sent as other text than it reads as, which the list below names as
     outside this check. **A TLS leg whose context does not fully verify the proxy is
     refused regardless**, admitted or not, because that guard never reads the TLS context.
@@ -944,9 +943,7 @@ def _sends_cleartext_proxy_credentials(
     # tunnel, and the destination would read it. So no other spelling is ever admitted.
     oddly_spelled = not all(verdict.plain for verdict in carried)
     admitted = caller_header_admitted and not oddly_spelled
-    # Read from each value now, at every check, and never kept. A kept verdict says which header
-    # the rule judges, not what its value reads as: a value object can change its text in place.
-    values = [str(verdict.value) for verdict in carried]
+    values = _judged_texts(carried)
     if not _is_from_a_proxy_url(values, user, password, proxies) and (not carried or admitted):
         return False
     # urllib dials a host on its own bypass list direct, and adds no proxy header to that request.
@@ -978,6 +975,8 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
     spelled header can leave here, as it could before the rule read any other spelling.
     """
     verdicts = _proxy_header_verdicts(req)
+    # This check matches no text, and reads each one all the same: :func:`_judged_texts` says why.
+    _judged_texts(verdicts)
     if any(verdict.judged for verdict in verdicts) and not getattr(req, "_tunnel_host", None):
         if not req.has_proxy():
             # Direct: no proxy rewrote this request, so the destination would read the header.
@@ -1073,12 +1072,11 @@ def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | 
     nothing about the header, so it stops the request where it is raised.
 
     **Only :func:`_verdict_on` asks this, and a header that got an answer is not asked about
-    again while its request holds the same name object and the same value object.** A header
-    stored again under another name object, or with another value object, is one not seen
-    before, and it is asked about. A second call could get another answer: from a value whose
-    ``encode`` fails once, or a name whose ``title()`` changes. An error that is no verdict
-    leaves nothing to keep, so that header is asked about again at the next check, and the
-    request stops there again.
+    again while its request keeps that verdict.** :func:`_proxy_header_verdicts` says how long
+    that is, and which header counts as one not seen before. A second call could get another
+    answer: from a value whose ``encode`` fails once, or a name whose ``title()`` changes. An
+    error that is no verdict leaves nothing to keep, so that header is asked about again at the
+    next check, and the request stops there again.
     """
     probe = _StrictHTTPConnection("localhost")
     probe.putrequest("GET", "/")
@@ -1117,14 +1115,21 @@ class _ProxyHeaderVerdict:
 
 def _verdict_on(name: str | bytes, value: Any) -> _ProxyHeaderVerdict:
     """Judge one header. Nothing else asks ``http.client`` about one."""
-    plain = _is_spelled_plainly(name)
-    refusal = None if plain else _refusal_by_http_client(name, value)
-    if refusal is None:
-        # The rule matches a judged header by the text of its value. A value whose text cannot
-        # be read cannot be judged, so its error stops the request here, on every leg, and no
-        # verdict is kept. The text is not kept either: each check that needs it reads it then.
-        str(value)
-    return _ProxyHeaderVerdict(name, value, plain=plain, refusal=refusal)
+    if _is_spelled_plainly(name):
+        return _ProxyHeaderVerdict(name, value, plain=True, refusal=None)
+    refusal = _refusal_by_http_client(name, value)
+    return _ProxyHeaderVerdict(name, value, plain=False, refusal=refusal)
+
+
+def _judged_texts(verdicts: Collection[_ProxyHeaderVerdict]) -> list[str]:
+    """``str()`` of the value of each header in ``verdicts`` that the rule judges, read now.
+
+    Every check on a request calls this, and no text is kept from one check to the next:
+    :func:`_proxy_header_verdicts` says why. The cleartext check matches the texts to the proxy
+    URLs. A value whose text cannot be read cannot be judged, so its own error stops the request
+    at whichever check reads it, before that check lets anything through.
+    """
+    return [str(verdict.value) for verdict in verdicts if verdict.judged]
 
 
 #: The attribute a request keeps its verdicts under, from one check to the next.
@@ -1147,9 +1152,10 @@ def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVer
     **What is kept, and what is not.** A verdict keeps two answers: whether the name is the
     plain spelling, and whether ``http.client`` would send the header. The first is read from
     an exact ``str``, which cannot change. The second is asked for another spelling only, and
-    either answer to it ends in a refusal. What the value reads as is never kept. The check
-    that matches a value to a proxy URL reads ``str()`` of it each time it runs, so a value
-    object whose text was changed in place is judged by its new text, at a second open too.
+    either answer to it ends in a refusal. What the value reads as is never kept, because a
+    value object can change its text in place. Every check reads ``str()`` of each judged
+    value when it runs, through :func:`_judged_texts`, so the check that matches a value to a
+    proxy URL matches the text the value has then, at a second open too.
 
     This closes a gap. Asked twice, a value whose ``encode`` fails once and then works was
     first a header that can never be sent, and then one that can. The rule left it out on the

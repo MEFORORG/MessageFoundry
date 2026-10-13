@@ -1116,17 +1116,18 @@ def test_a_name_that_claims_to_be_a_headers_twin_cannot_hide_it() -> None:
     assert twin.asked == 0
 
 
-def _admitting_with_a_second_proxy(peer: _WireProxy) -> urllib.request.OpenerDirector:
+def _admitting_with_a_second_proxy(
+    peer: _WireProxy, *, tunnelled: bool = False
+) -> urllib.request.OpenerDirector:
     """An admitting opener with two proxies. ``http`` goes to ``peer`` in cleartext. The second
-    proxy's URL carries a credential, which makes ``_URL_VALUE``."""
-    handler = LoopbackDirectProxyHandler(
-        {
-            "http": f"http://{peer.address}",
-            "https": f"http://{_URL_CRED}@other.example.test:3128",
-        },
-        caller_header_admitted=True,
+    proxy's URL carries a credential, which makes ``_URL_VALUE``. It takes ``https``, or with
+    ``tunnelled`` it takes ``ftp`` and ``https`` goes to ``peer`` as well, in a ``CONNECT``."""
+    first = f"http://{peer.address}"
+    second = f"http://{_URL_CRED}@other.example.test:3128"
+    proxies = {"http": first, "https": first, "ftp": second} if tunnelled else {"https": second}
+    return build_strict_opener(
+        LoopbackDirectProxyHandler({"http": first, **proxies}, caller_header_admitted=True)
     )
-    return build_strict_opener(handler)
 
 
 def _held_in_both_stores(
@@ -1179,23 +1180,33 @@ class _Rewritable:
         return self.text.encode(encoding)
 
 
-def test_a_value_changed_in_place_is_judged_as_it_reads_at_the_next_open() -> None:
+_TWICE_OPENED = pytest.mark.parametrize(
+    ("tunnelled", "target"), [(False, _HTTP_TARGET), (True, _HTTPS_TARGET)], ids=["http", "connect"]
+)
+
+
+@_TWICE_OPENED
+def test_a_value_changed_in_place_is_judged_as_it_reads_at_the_next_open(
+    tunnelled: bool, target: str
+) -> None:
     """The plain name, an admission, and a value object. The first open sends it to the proxy
-    on the admission. The object's text is then changed in place to what the second proxy's
-    URL makes, which no admission covers, and the same request is opened again. The verdict is
-    kept, because the header is the same two objects, but the text judged is read from the
-    value at each check. So the second open is refused and sends nothing. A check that judged
-    the text it read at the first open would send the new text to the proxy in cleartext."""
+    on the admission, in the request or in a ``CONNECT``. The object's text is then changed in
+    place to what the second proxy's URL makes, which no admission covers, and the same
+    request is opened again. The verdict is kept, because the header is the same two objects,
+    but the text judged is read from the value at each check. So the second open is refused
+    and sends nothing. A check that judged the text it read at the first open would send the
+    new text to the proxy in cleartext."""
     value = _Rewritable(_VALUE)
     with _WireProxy() as peer:
-        opener = _admitting_with_a_second_proxy(peer)
-        request = _held(_NAME, value, _HTTP_TARGET)
+        opener = _admitting_with_a_second_proxy(peer, tunnelled=tunnelled)
+        request = _held(_NAME, value, target)
         first = _attempt(opener, request)
         sent_at_first = list(peer.cleartext)
         value.text = _URL_VALUE
         second = _attempt(opener, request)
-        on_a_new_request = _attempt(opener, _held(_NAME, value, _HTTP_TARGET))
-    assert first is None
+        on_a_new_request = _attempt(opener, _held(_NAME, value, target))
+    # The proxy serves no TLS, so a tunnelled first open ends in a transport error.
+    assert not isinstance(first, ProxyCredentialsRefusedError)
     assert len(sent_at_first) == 1
     assert f"{_NAME}: {_VALUE}\r\n".encode() in sent_at_first[0]
     assert peer.connections == 1
@@ -1205,19 +1216,75 @@ def test_a_value_changed_in_place_is_judged_as_it_reads_at_the_next_open() -> No
         assert _URL_VALUE not in f"{raised!s} {raised!r}"
 
 
-def test_control_a_value_left_as_it_was_crosses_at_a_second_open() -> None:
+@_TWICE_OPENED
+def test_control_a_value_left_as_it_was_crosses_at_a_second_open(
+    tunnelled: bool, target: str
+) -> None:
     """The other polarity: the same request, opened twice with the value unchanged, is sent
     twice. So the refusal above comes from the changed text, not from the second open."""
     value = _Rewritable(_VALUE)
     with _WireProxy() as peer:
-        opener = _admitting_with_a_second_proxy(peer)
+        opener = _admitting_with_a_second_proxy(peer, tunnelled=tunnelled)
+        request = _held(_NAME, value, target)
+        _attempt(opener, request)
+        _attempt(opener, request)
+    assert len(peer.cleartext) == 2
+    assert all(f"{_NAME}: {_VALUE}\r\n".encode() in head for head in peer.cleartext)
+
+
+class _UnreadableLater:
+    """A header value whose ``str()`` answers the first ``readable`` times and raises after
+    that. ``encode`` always works, so ``http.client`` could send it."""
+
+    def __init__(self, readable: int) -> None:
+        self.readable = readable
+        self.read = 0
+        self.encoded = 0
+
+    def __str__(self) -> str:
+        self.read += 1
+        if self.read > self.readable:
+            raise RuntimeError("text that cannot be read")
+        return _VALUE
+
+    def encode(self, encoding: str) -> bytes:
+        self.encoded += 1
+        return _VALUE.encode(encoding)
+
+
+def test_a_value_that_can_no_longer_be_read_stops_a_second_open() -> None:
+    """A plain name on a request routed by hand, so the check that opens the connection is the
+    only one it meets, and that check matches no text. It reads the text all the same. So a
+    value that cannot be read at the second open stops the request there, kept verdict or
+    not, and the proxy hears from it once."""
+    value = _UnreadableLater(readable=1)
+    with _WireProxy() as peer:
+        opener = build_strict_opener(urllib.request.ProxyHandler({}))
         request = _held(_NAME, value, _HTTP_TARGET)
+        request.set_proxy(peer.address, "http")
         first = _attempt(opener, request)
         second = _attempt(opener, request)
     assert first is None
-    assert second is None
-    assert len(peer.cleartext) == 2
-    assert all(f"{_NAME}: {_VALUE}\r\n".encode() in head for head in peer.cleartext)
+    assert peer.connections == 1
+    assert type(second) is RuntimeError
+
+
+def test_a_value_that_cannot_be_read_at_first_does_not_cost_a_second_question() -> None:
+    """A trailing-space spelling whose value ``http.client`` would send, and whose text cannot
+    be read at the first open. Its verdict is kept all the same, so the second open asks
+    ``http.client`` nothing more. Neither open sends it."""
+    value = _UnreadableLater(readable=0)
+    with _WireProxy() as peer:
+        opener, url = _on_leg("cleartext-proxy", peer)
+        request = _held(_NAME + " ", value, url)
+        first = _attempt(opener, request)
+        asked_at_first = value.encoded
+        second = _attempt(opener, request)
+    assert peer.connections == 0
+    assert type(first) is RuntimeError
+    assert type(second) is RuntimeError
+    assert asked_at_first == 1
+    assert value.encoded == 1
 
 
 def _only_proxy_header(request: urllib.request.Request) -> tuple[str, Any]:
