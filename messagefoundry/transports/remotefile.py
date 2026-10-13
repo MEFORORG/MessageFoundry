@@ -6,16 +6,17 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
 
 - ``sftp`` — SSH file transfer (paramiko, the ``[sftp]`` extra — lazily imported, so installs that
   never use SFTP skip it). **Host-key verification is ON by default**; an unknown key is refused
-  unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and logged loudly when it is),
-  mirroring the SQL Server backend's weakened-TLS posture. The escape never reaches a ``password``
-  login.
+  unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+  ``[security].enforcement = warn`` (and logged loudly when it is), mirroring the SQL Server
+  backend's weakened-TLS posture. The escape never reaches a ``password`` login.
 - ``ftp`` — plain FTP (stdlib ``ftplib``). Cleartext: credentials over plain ``ftp`` are **refused**
   (use ``ftps``/``sftp``).
 - ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted. **The
   server certificate and hostname are verified by default** (a verifying :class:`ssl.SSLContext`, not
   ftplib's no-verify stdlib fallback); ``tls_verify=false`` drops verification only when the explicit
-  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture,
-  and only on an anonymous hop.
+  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn`` (and
+  is logged loudly), mirroring the MLLP outbound posture,
+  and only on an anonymous hop: with a credential it is refused outright (vault BACKLOG #2636).
 
 Each credential refusal above follows one rule, stated once in docs/SECURITY-LOOSENING.md, *No
 escape sends a credential to an unverified peer*.
@@ -633,8 +634,9 @@ def _ftps_ssl_context(
     silently accepted, so the encrypted FTPS channel is MITM-able. We verify the server certificate and
     hostname by default and only drop verification behind the explicit, loudly-logged dev escape.
 
-    Fail-fast (build time): ``tls_verify=false`` without ``MEFOR_ALLOW_INSECURE_TLS`` raises, exactly
-    like the MLLP path, so a misconfiguration is refused at construction rather than silently insecure.
+    Fail-fast (build time): ``tls_verify=false`` raises unless ``MEFOR_ALLOW_INSECURE_TLS`` is set on
+    an instance at ``[security].enforcement = warn``, exactly like the MLLP path, so a
+    misconfiguration is refused at construction rather than silently insecure.
     Optional mTLS via ``tls_cert_file``/``tls_key_file`` (passphrase ``tls_key_password``).
 
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when

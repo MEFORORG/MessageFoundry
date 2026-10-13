@@ -291,7 +291,7 @@ def test_control_two_proxies_without_the_header_check_the_second_proxy_gets_the_
 ) -> None:
     """Mutation control for the reproduction: with the header reading undone, the check sees only
     each proxy's own URL, and the old leak comes back on the wire."""
-    monkeypatch.setattr(bounded_read, "_proxy_credential_header", lambda req: None)
+    monkeypatch.setattr(bounded_read, "_proxy_credential_headers", lambda req: {})
     with _WireProxy() as a, _WireProxy() as b:
         _open_and_discard(_two_proxy_opener(a, b, credentialed="http"), _HTTP_TARGET)
     assert a.connections == 0

@@ -23,9 +23,10 @@ Direct destination import it (vault BACKLOG #2870).
 **STARTTLS by default** (``use_tls=True``): the connector issues ``STARTTLS`` before ``AUTH``/data on
 the ``587`` submission port; port ``465`` (implicit TLS) maps to ``smtplib.SMTP_SSL``. Disabling TLS
 (``use_tls=False``) is **refused unless** the project-wide dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is
-set — read through the CLAMPED ``weakened_tls_escape_permitted_here()`` (#200, ADR 0092), so the blunt
-global escape can no longer silence a cleartext hop on an enforcing production-PHI instance — or the
-connection attests the hop (``tls_hop_attested``). Credentials are **never** sent over a cleartext
+set on an instance at ``[security].enforcement = warn`` — read through the CLAMPED
+``weakened_tls_escape_permitted_here()`` (#200, ADR 0092), so the blunt global escape cannot silence
+a cleartext hop while enforcing — or the connection attests the hop (``tls_hop_attested``) or
+accepts it (``cleartext_accepted``, ADR 0153). Credentials are **never** sent over a cleartext
 channel (a ``username``/``password`` with ``use_tls=False`` raises at construction, even with the
 escape) — the same ``refuse_cleartext_credentials`` posture the REST destination takes. The message
 **body** is PHI on that same cleartext hop, so it is additionally governed by the shared
@@ -222,6 +223,31 @@ def _checked_header(cell: str, field: str, checked: list[str], what: str) -> lis
     return addresses
 
 
+def _refuse_unsafe_subject(subject: str) -> None:
+    """Refuse a subject that the header parser reads as text holding a control character.
+
+    ``policy.default`` parses the ``Subject:`` it is given and decodes RFC 2047 encoded words. So
+    ``=?utf-8?b?AA==?=`` holds no control character as configured, reads back as a NUL, and the
+    generator writes that NUL raw into the header (vault BACKLOG #3206). This sets the subject on a
+    scratch message, as :func:`_checked_header` does for an address, and checks what reads back.
+
+    Setting it here also moves any fault the header class raises from every send to load. Only the
+    exception's type is kept, and the refusal is raised outside the handler, so neither the text nor
+    the chain quotes the subject. Raises :class:`ValueError` naming the setting, never its value."""
+    probe = EmailMessage()
+    failure = ""
+    try:
+        probe["Subject"] = subject
+    except (UnicodeError, ValueError) as exc:
+        failure = type(exc).__name__
+    if failure:
+        raise ValueError(f"Email destination 'subject' cannot be set as a header ({failure})")
+    if _holds_control_char(str(probe["Subject"])):
+        raise ValueError(
+            "Email destination 'subject' holds an encoded word that decodes to a control character"
+        )
+
+
 @dataclass(frozen=True)
 class CheckedEnvelope:
     """One SMTP cell's envelope and its ``From:`` and ``To:`` headers, all built from addresses that
@@ -320,6 +346,9 @@ class EmailDestination(DestinationConnector):
         # rule below already refuses any non-ASCII sender.
         if has_lone_surrogate(self.subject):
             raise ValueError("Email destination 'subject' holds a lone surrogate")
+        # The two checks above read the setting as text. This one reads it as the header parser
+        # does, which decodes encoded words (vault BACKLOG #3206).
+        _refuse_unsafe_subject(self.subject)
         # Each recipient gets the rule the [egress] check applies, held here too so no build path
         # that skips that check can put an unchecked mailbox on the RCPT line. The sender is MAIL
         # FROM, where bounces go, so it gets the same rule (vault BACKLOG #2841). The headers are

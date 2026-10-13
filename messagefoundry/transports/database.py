@@ -126,9 +126,9 @@ def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bo
 
     A per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by other
     means — a proxy-terminated / trusted-segment DB link). Otherwise this stays a **STRICT verify-off
-    cell** (decision 5): refused for **both staging and prod PHI** unless the global
-    ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and that escape is **CLAMPED to non-production**
-    (decision 2) so it can never relax a production hop.
+    cell** (decision 5): refused unless the global ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and
+    that escape works only at ``[security].enforcement = warn`` (decision 2), so it can never relax
+    an enforcing hop.
 
     The escape question is the shared :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`,
     so this cell and every other weakened-TLS cell answer it in one place. ``posture`` is the

@@ -143,6 +143,7 @@ leaves the engine.
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
+| | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any entry covering more than one address is named, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
@@ -170,7 +171,7 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[auth].step_up_max_age_seconds`, `[auth].totp_skew_steps`, `[auth].initial_password_expiry_hours`,
-`[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
+`[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs` and `[backup].allow_unencrypted` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
@@ -614,9 +615,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
   (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
   (ASVS 11.3.3, BACKLOG #1169).
-- **When acceptable:** a store that holds legitimate unmarked values beside ciphertext in one column —
-  for example rows written by a keyless run of a store that was keyed before. Turn it on for one keyed
-  open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+- **When acceptable:** a store that holds legitimate unmarked values in a column that is already
+  sealed. One example is rows written by a keyless run of a store that was keyed before. Since
+  BACKLOG #3383, a keyed open records each column in `keyed_surface`. A recorded column stays sealed
+  even with no ciphertext in it, so this covers a table that had emptied out too. Turn it on for one
+  keyed open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
 - **Compensating controls:** database-level access control, because planting a row needs store write
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
@@ -1054,6 +1057,34 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `approval.requested` row, since a looser floor writes no `approval.too_early` row. Review the open
   approval queue, and reject a stale request rather than leave it pending.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
+### `[approvals].operations` without a default operation — that action runs on one caller's authority
+> **Conditional** on `[approvals].enabled` (vault BACKLOG #3123, ASVS 2.3.5). Dual control ships off,
+> so a list written while it is off is not named. With it on, the default list holds
+> `connection_purge` and `dead_letter_replay`. A list that leaves either out is named as
+> `approvals.operations`, and the entry names each operation left out. An **empty** list loads and
+> holds nothing, so it is named too, with its own wording. Adding `config_reload` holds more and is
+> not named, and it does not make up for a default operation left out.
+- **What you lose:** the second approver for each operation left out. A purge or a dead-letter replay
+  left out of the list runs at once, on the caller's own authority. With an empty list every action
+  does, as it would with dual control off.
+- **When acceptable:** a site that has decided one of the two does not need a second person, such as
+  a replay its on-call operator must be able to run alone. There is no good case for an
+  empty list with dual control on: turn dual control off instead, so the setting says what the
+  engine does.
+- **Compensating controls:** nothing here supplies the second person. An operation left out still
+  needs its own permission and step-up, and the route table in [SECURITY.md](SECURITY.md) lists
+  both. Those limit who may run it and guard a stolen session; one person can still pass both.
+  Review the audit rows for the action itself, since a call that is not held writes no
+  `approval.requested` row.
+- **Where it is reported:** `security_loosenings()` names it, so at least the serve-time warning,
+  `messagefoundry security show`, `GET /security/posture` and the start's `config_loaded` audit row
+  list it. Nothing refuses it. The
+  serve-time advisory about exposed dual control reads `enabled` only, so it stays quiet for a
+  narrowed or an empty list.
+- **Reversible:** yes, immediately — restore the default (or delete the `operations` line) and
+  restart. [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+  says what happens to a request that was already held when its operation left the list.
 
 ### `[api].trusted_proxies` covering more than one address, up to every address — a host that is not the proxy may set its own source address
 > **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit
@@ -1609,7 +1640,13 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   connection secrets and the messages in flight. An application that builds the API without
   `serve` reports this, until something in it imports the command-line module, which installs
   the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  only if another audit hook refused the engine's.
+  in at least two cases. Both need an audit hook that something else added to the process first.
+  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
+  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
+  is there. The engine's hook is then in place and refuses a script, but the entry still reads
+  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
+  refusals. The interpreter reports each one on standard error, with the script's full path. The entry cannot tell the two cases apart, so read
+  it as the first, and look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

@@ -508,6 +508,8 @@ def test_runtime_joined_code_lists_survive_redaction(monkeypatch: pytest.MonkeyP
     """Lists of upper-case codes the engine joins at run time, where the comma name arm (vault
     BACKLOG #2784) would read ``A, B`` as a family-comma-given name. They join with ``/`` instead."""
     from messagefoundry.auth import trust_anchors
+    from messagefoundry.config.settings import LoggingSettings
+    from messagefoundry.logging_setup import LOG_LEVELS, set_runtime_level
     from messagefoundry.startupcode import InterpreterLaunch, StartupPosture, startup_loosenings
 
     # A stand-in on the module, not os.name itself: pathlib reads the real one.
@@ -533,14 +535,27 @@ def test_runtime_joined_code_lists_survive_redaction(monkeypatch: pytest.MonkeyP
         reaching_children=("PYTHONPATH", "PYTHONHOME"),
     )
     texts += [risk for _, risk in startup_loosenings(StartupPosture(launch=isolated))]
-    rendered = "\n".join(redaction.redact(text) for text in texts)
+    # The two refusals of an unknown log level list the levels. Both raise before they change
+    # anything: the run-time one checks the name first, and the settings one is a field validator.
+    for refuse in (
+        lambda: set_runtime_level("VERBOSE", production=False),
+        lambda: LoggingSettings._normalize_level("VERBOSE"),
+    ):
+        with pytest.raises(ValueError, match="invalid log level") as refused:
+            refuse()
+        texts.append(str(refused.value))
+    levels = "expected one of " + "/".join(LOG_LEVELS)
+    rendered = [redaction.redact(text) for text in texts]
+    assert sum(levels in text for text in rendered) == 2, rendered
     for joined in (
         "/".join(sorted(trust_anchors._WRITE_RIGHTS)),
         "PYTHONPATH/PYTHONHOME/PYTHONUSERBASE is set",
         "PYTHONPATH/PYTHONHOME is set in the engine's environment",
-        "such as Everyone or Users",
+        # Past the parenthesis: the Windows spelling of this group was scrubbed out of it (vault
+        # BACKLOG #3227), and an assert that stops at "Users" cannot see that.
+        "such as Everyone or Users (or Authenticated users), that holds a write right",
     ):
-        assert joined in rendered, (joined, rendered)
+        assert joined in "\n".join(rendered), (joined, rendered)
 
 
 def test_the_out_of_scan_probe_can_fail() -> None:

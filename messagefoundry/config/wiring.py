@@ -1011,8 +1011,9 @@ def DatabaseLookup(
     ``ERROR``; the result is never truncated. The ceiling is charged at the fetch, so an over-broad
     statement does not buffer its whole result in the transform worker first. ``0`` removes it.
 
-    Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
-    ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
+    Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is refused unless
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
     allowlist, like a DATABASE source — point the engine only at allowed hosts. Example::
 
         DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
@@ -1111,7 +1112,7 @@ def FhirLookup(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -1155,7 +1156,10 @@ def FhirLookup(
     FHIR writes stay on the :func:`FHIR` outbound). The dial-out is gated by the **fail-closed**
     ``[egress].allowed_http`` allowlist (the same arm the FHIR outbound + SMART token endpoint use) — point
     the engine only at allowed hosts. Put secrets (``bearer_token`` / ``basic_*`` / SMART keys) in
-    :func:`env`. TLS is on by default; weakening it needs ``MEFOR_ALLOW_INSECURE_TLS``. The pure
+    :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1858,7 +1862,7 @@ def MLLP(
     | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
-    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
+    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
     # too unless tls_check_hostname=False.
@@ -1985,7 +1989,8 @@ def MLLP(
     A negative value is rejected at wiring. ``tls_key_password`` decrypts a passphrase-encrypted
     ``tls_key_file`` (supply it via ``env()`` so the secret stays out of config — mirrors the API
     listener's ``MEFOR_API_TLS_KEY_PASSWORD``); omit it for an unencrypted key. ``tls_verify=False``
-    (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) —
+    (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+    ``[security].enforcement = warn`` (loud warning) —
     exactly like LDAPS / SQL Server. TLS is TLS 1.2+ and composes with the ``[egress].allowed_mllp``
     allowlist (both enforced). ``tls_allow_expired=True`` (outbound, #129 / ADR 0094) is the **granular**
     alternative to ``tls_verify=False`` for the narrow real-world case of a partner whose server
@@ -2879,7 +2884,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -2982,7 +2987,7 @@ def FHIR(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3109,8 +3114,8 @@ def Email(
     subject: str | EnvRef = "",  # static Subject (a per-message subject is a Phase-2 follow-up)
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless tls_hop_attested or cleartext_accepted is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3123,16 +3128,19 @@ def Email(
     ``recipients`` with a static ``subject``. STARTTLS by default (``use_tls=True``) on the ``587``
     submission port; port ``465`` is implicit TLS (``SMTP_SSL``). Optional ``username``/``password`` do
     SMTP ``AUTH`` (over a **verified** TLS session only — a cleartext- or unverified-credential config
-    is refused). Disabling TLS (``use_tls=False``) is MITM-able and refused unless
-    ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning), like LDAPS / SQL Server / MLLP.
+    is refused). Disabling TLS (``use_tls=False``) sends the message in cleartext. It is refused
+    unless the connection declares ``tls_hop_attested`` or ``cleartext_accepted``, each with its
+    reason, or ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+    ``[security].enforcement = warn`` (loud warning).
 
     **The server certificate is verified** (``tls_verify=True``, #323) — chain, hostname and strict RFC
     5280 flags, anchored to the OS roots, a per-connection ``tls_ca_file``, or the instance-wide
     ``[tls].internal_ca_file`` (ADR 0093). ``smtplib``'s own default context verifies **nothing**
     (``CERT_NONE``/``check_hostname=False``), so before #323 ``use_tls=True`` bought encryption without
     authentication. Point ``tls_ca_file`` at your relay's CA PEM for a private-CA server;
-    ``tls_verify=False`` is a trusted-network dev/test escape, refused on an enforcing production-PHI
-    instance even with ``MEFOR_ALLOW_INSECURE_TLS``, and it also refuses SMTP ``AUTH``.
+    ``tls_verify=False`` is a trusted-network dev/test setting, refused unless
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``, and it
+    also refuses SMTP ``AUTH``.
     The egress host is gated by ``[egress].allowed_smtp``, and every recipient's domain and the
     sender's domain by the deny-by-default ``[egress].allowed_recipient_domains`` (an empty list
     refuses the destination; the sender is listed because bounces go to it). Put
@@ -3183,8 +3191,8 @@ def Direct(
     subject: str | EnvRef = "",  # static Subject
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3393,7 +3401,7 @@ def DICOMweb(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -3560,7 +3568,7 @@ def Database(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3651,7 +3659,7 @@ def DatabasePoll(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3675,8 +3683,9 @@ def DatabasePoll(
     high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
     whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
     (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
-    ``env()``; TLS is on by default (weakening needs ``MEFOR_ALLOW_INSECURE_TLS``); the polled ``server``
-    is gated by ``[egress].allowed_db``.
+    ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
+    ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
 
     ``poll_max_rows`` mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one poll
     fetches at most this many rows and leaves the rest of the result set in the table for the next poll.
@@ -3797,7 +3806,7 @@ def Soap(
     basic_user: str | EnvRef | None = None,
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3942,7 +3951,8 @@ def Sftp(
     uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
-    refused) — accepting an unknown key needs ``MEFOR_ALLOW_INSECURE_TLS``. Put secrets (``password``/
+    refused) — ``MEFOR_ALLOW_INSECURE_TLS`` accepts an unknown key only at
+    ``[security].enforcement = warn``. Put secrets (``password``/
     ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
     refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams

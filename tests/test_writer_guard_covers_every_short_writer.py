@@ -167,7 +167,9 @@ def test_every_writer_lock_block_is_guarded() -> None:
     txns = [b for b in blocks if b.kind == "_writer_txn"]
     assert len(guards) > 60, f"liveness: only {len(guards)} _writer_guard blocks seen"
     assert len(txns) > 15, f"liveness: only {len(txns)} _writer_txn blocks seen"
-    assert sum(1 for b in guards if b.dml) > 50, "liveness: the DML reader sees no guarded writes"
+    # BACKLOG #2592 moved about twenty user writers' DML into `_write_user`, which a guarded block
+    # calls rather than spelling, so the floor dropped from 50 to 40; 49 were measured after it.
+    assert sum(1 for b in guards if b.dml) > 40, "liveness: the DML reader sees no guarded writes"
 
     stray, moved, writing = _audit(blocks, _BARE_LOCK_ALLOWED)
     assert not stray, (
