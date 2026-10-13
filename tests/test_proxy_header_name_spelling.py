@@ -1207,6 +1207,7 @@ def test_a_value_changed_in_place_is_judged_as_it_reads_at_the_next_open(
         on_a_new_request = _attempt(opener, _held(_NAME, value, target))
     # The proxy serves no TLS, so a tunnelled first open ends in a transport error.
     assert not isinstance(first, ProxyCredentialsRefusedError)
+    assert tunnelled or first is None
     assert len(sent_at_first) == 1
     assert f"{_NAME}: {_VALUE}\r\n".encode() in sent_at_first[0]
     assert peer.connections == 1
@@ -1226,8 +1227,10 @@ def test_control_a_value_left_as_it_was_crosses_at_a_second_open(
     with _WireProxy() as peer:
         opener = _admitting_with_a_second_proxy(peer, tunnelled=tunnelled)
         request = _held(_NAME, value, target)
-        _attempt(opener, request)
-        _attempt(opener, request)
+        results = [_attempt(opener, request), _attempt(opener, request)]
+    # The proxy serves no TLS, so a tunnelled open ends in a transport error.
+    assert tunnelled or results == [None, None]
+    assert not any(isinstance(raised, ProxyCredentialsRefusedError) for raised in results)
     assert len(peer.cleartext) == 2
     assert all(f"{_NAME}: {_VALUE}\r\n".encode() in head for head in peer.cleartext)
 

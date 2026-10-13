@@ -1124,7 +1124,8 @@ def _verdict_on(name: str | bytes, value: Any) -> _ProxyHeaderVerdict:
 def _judged_texts(verdicts: Collection[_ProxyHeaderVerdict]) -> list[str]:
     """``str()`` of the value of each header in ``verdicts`` that the rule judges, read now.
 
-    Every check on a request calls this, and no text is kept from one check to the next:
+    At least the cleartext check and the check that opens the connection call this, each time
+    they read a request's headers, and no text is kept from one check to the next:
     :func:`_proxy_header_verdicts` says why. The cleartext check matches the texts to the proxy
     URLs. A value whose text cannot be read cannot be judged, so its own error stops the request
     at whichever check reads it, before that check lets anything through.
@@ -1153,9 +1154,10 @@ def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVer
     plain spelling, and whether ``http.client`` would send the header. The first is read from
     an exact ``str``, which cannot change. The second is asked for another spelling only, and
     either answer to it ends in a refusal. What the value reads as is never kept, because a
-    value object can change its text in place. Every check reads ``str()`` of each judged
-    value when it runs, through :func:`_judged_texts`, so the check that matches a value to a
-    proxy URL matches the text the value has then, at a second open too.
+    value object can change its text in place. A check that needs the text reads ``str()`` of
+    each judged value when it runs, through :func:`_judged_texts`. So when the check that
+    matches a value to a proxy URL runs, it matches the text the value has then, at a second
+    open too.
 
     This closes a gap. Asked twice, a value whose ``encode`` fails once and then works was
     first a header that can never be sent, and then one that can. The rule left it out on the
