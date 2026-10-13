@@ -4098,7 +4098,9 @@ class AuthService:
 
         The flow cache stays private to the service, so route code never holds the PKCE verifier or
         the nonce. A missing/expired flow and a ``state`` mismatch are both audited with closed-set
-        slugs and are deliberately indistinguishable to the caller.
+        slugs. They share one error code at the console, but not the cookie: a mismatch consumed
+        nothing, so the console keeps the flow cookie (BACKLOG #3198). That tells the caller only
+        whether its own flow id was live, which a caller holding the cookie can already learn.
 
         **This is the THIRD challenge seam, and every failed outcome is held to a fixed deadline**
         (BACKLOG #1947, ASVS 6.3.8), the same wrapper shape as :meth:`login` and
@@ -4190,8 +4192,8 @@ class AuthService:
         never the IdP's own text. A step-up flow that reaches here is refused as
         ``flow_purpose_mismatch`` instead, as the other completions refuse the wrong kind. The
         unmatched arms are audited as ``state_unknown`` or ``state_mismatch``, not as ``reason``,
-        as on the step-up leg: an unverified ``error=`` is not attributable to the IdP. Not padded: like the route's other early refusals, it does no
-        work that depends on an account.
+        as on the step-up leg: an unverified ``error=`` is not attributable to the IdP. Not
+        padded: like the route's other early refusals, it does no work that depends on an account.
 
         Returns whether the flow was consumed, so the route knows whether to keep the browser's
         flow cookie. It returns no :class:`LoginOutcome` because it never signs anyone in."""
@@ -4678,6 +4680,25 @@ class AuthService:
         On a match the flow is consumed and a closed-set ``reason`` is audited (the route passes
         ``idp_error`` or ``malformed_callback``, never the IdP's own text), so the operator lands back
         on the step-up page they started from, still signed in."""
+        flow = await self._redeem_step_up_flow(flow_id, state, client=client)
+        if isinstance(flow, OidcStepUp):
+            return flow
+        actor = await self._step_up_actor(flow)
+        if flow.step_up_session_hash is None:
+            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
+        return await self._step_up_refused(
+            reason, actor=actor, client=client, return_to=flow.return_to
+        )
+
+    async def _redeem_step_up_flow(
+        self, flow_id: str, state: str | None, *, client: str | None
+    ) -> PendingFlow | OidcStepUp:
+        """The staged flow, consumed because ``state`` matched, or the audited refusal: the step-up
+        leg's twin of :meth:`_redeem_sign_in_flow` (BACKLOG #3198).
+
+        Both refusals are filed under the NEUTRAL actor: nothing has been verified, and any page can
+        send this callback, so naming the account would let a stranger fill that person's security
+        events with step-ups they never attempted. The sign-in leg does the same."""
         flows = self._oidc_flows
         flow, consumed = (
             flows.pop_if_state_matches(flow_id, state) if flows is not None else (None, False)
@@ -4685,9 +4706,6 @@ class AuthService:
         if flow is None:
             return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
         if not consumed:
-            # Filed under the NEUTRAL actor: nothing has been verified, and any page can send this
-            # callback, so naming the account would let a stranger fill that person's security
-            # events with step-ups they never attempted. The sign-in leg does the same.
             return await self._step_up_refused(
                 "state_mismatch",
                 actor="<oidc>",
@@ -4695,12 +4713,7 @@ class AuthService:
                 return_to=flow.return_to,
                 flow_consumed=False,
             )
-        actor = await self._step_up_actor(flow)
-        if flow.step_up_session_hash is None:
-            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
-        return await self._step_up_refused(
-            reason, actor=actor, client=client, return_to=flow.return_to
-        )
+        return flow
 
     async def complete_oidc_step_up(
         self,
@@ -4743,20 +4756,10 @@ class AuthService:
         """
         if not self.oidc_enabled or self._oidc_flows is None or self._oidc_jwks is None:
             return await self._step_up_refused("not_configured", actor="<oidc>", client=client)
-        flow, consumed = self._oidc_flows.pop_if_state_matches(flow_id, state)
-        if flow is None:
-            return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
+        flow = await self._redeem_step_up_flow(flow_id, state, client=client)
+        if isinstance(flow, OidcStepUp):
+            return flow
         return_to = flow.return_to
-        if not consumed:
-            # A forged callback carrying a code and a wrong state consumes nothing, so the step-up
-            # in flight survives it. Neutral actor, as in abandon_oidc_step_up.
-            return await self._step_up_refused(
-                "state_mismatch",
-                actor="<oidc>",
-                client=client,
-                return_to=return_to,
-                flow_consumed=False,
-            )
         actor = await self._step_up_actor(flow)
         token_hash = flow.step_up_session_hash
         if token_hash is None:
@@ -7240,7 +7243,9 @@ class AuthService:
 
         Raises :class:`ValueError`, writing nothing, for an ``oidc`` session with no
         ``idp_auth_time``: every IdP step-up on it would be refused (BACKLOG #2143, #3174). This is
-        the engine's only caller of ``Store.create_session``, so no mint path skips the check.
+        the engine's only caller of ``Store.create_session``, so every sign-in passes the check.
+        Rotation is not a sign-in: it re-keys an existing row and carries the value it finds,
+        a NULL included, which the IdP step-up then refuses.
         """
         if mechanism is SessionMechanism.OIDC and idp_auth_time is None:
             raise ValueError("an oidc session needs the verified IdP auth_time")
@@ -11741,10 +11746,11 @@ class AuthService:
             )
 
         async def audit_refused(reason: str, username: str, **extra: object) -> None:
-            # BACKLOG #3174: every other refusal past the no-op check writes the same row, so an
-            # attempt to change who may sign in as an account is never refused silently. `reason`
-            # is a closed-set literal and goes last, so nothing can overwrite it. Past the clear,
-            # the caller passes the clear's own username, as the changed-pair rows do.
+            # BACKLOG #3174: at least the refusals that name a cause write this row: a local
+            # account, a missing directory id, and an identity held elsewhere or bound meanwhile.
+            # An unknown or deleted account and an unexpected store error write none. `reason` is
+            # a closed-set literal and goes last, so nothing can overwrite it. Past the clear, the
+            # caller passes the clear's own username, as the changed-pair rows do.
             await self._audit(
                 "auth.federated_bind_refused",
                 actor=actor,

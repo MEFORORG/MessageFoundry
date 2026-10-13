@@ -152,8 +152,9 @@ def _step_up_landing(
             status_code=403,
         )
         if outcome.flow_consumed:
-            # A refusal that consumed nothing (a state mismatch) leaves the flow waiting for the
-            # real IdP return, which needs this browser's flow cookie.
+            # The refusal ended the flow, so its cookie goes too. One that consumed nothing (a
+            # state mismatch) skips this: the flow waits for the real IdP return, which needs the
+            # cookie (BACKLOG #3198).
             clear_oidc_flow_cookie(resp, request)
         return resp
     if next_ == "/ui" or is_unlock_action(next_):
