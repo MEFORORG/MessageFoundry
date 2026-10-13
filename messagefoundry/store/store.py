@@ -14598,14 +14598,16 @@ class MessageStore:
                 # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
                 # must not abort the whole retention pass. The row is left exactly as found; the
                 # message names only the cell and the message id, never the body (BACKLOG #1169).
-                # A body that fails its row's tag (BACKLOG #2593) is also audited, below.
+                if isinstance(exc, CellTagError):
+                    # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
+                    # audited below. No second WARNING on every pass.
+                    failures.append(exc)
+                    continue
                 log.warning(
                     "document strip skipped message %s: its body could not be read: %s",
                     row["id"],
                     exc,
                 )
-                if isinstance(exc, CellTagError):
-                    failures.append(exc)
                 continue
             assert raw is not None  # raw is NOT NULL
             new_raw, n_docs, n_bytes = _strip_documents(

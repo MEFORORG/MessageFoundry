@@ -33,6 +33,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any, Concatenate, Final, Protocol
@@ -277,19 +278,23 @@ _REPORT_INTERVAL_S: Final = 3600.0
 _REPORTED_MAX: Final = 4096
 _reported: dict[tuple[str, str, str], float] = {}
 _reported_audit: dict[tuple[str, str, str], float] = {}
+#: The memos are touched from the event loop and from worker threads (the content-search scan, the
+#: SQL Server fused handoff), so every read-modify-write holds this lock.
+_reported_lock = threading.Lock()
 
 
 def _first_in_interval(memo: dict[tuple[str, str, str], float], err: CellTagError) -> bool:
     """Whether ``err``'s cell has not been reported in ``memo`` within the interval; records it."""
     key = (err.table, err.column, err.row_ref)
     now = time.monotonic()
-    last = memo.get(key)
-    if last is not None and now - last < _REPORT_INTERVAL_S:
-        return False
-    memo.pop(key, None)
-    memo[key] = now
-    while len(memo) > _REPORTED_MAX:
-        memo.pop(next(iter(memo)))
+    with _reported_lock:
+        last = memo.get(key)
+        if last is not None and now - last < _REPORT_INTERVAL_S:
+            return False
+        memo.pop(key, None)
+        memo[key] = now
+        while len(memo) > _REPORTED_MAX:
+            memo.pop(next(iter(memo)))
     return True
 
 

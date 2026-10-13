@@ -424,6 +424,7 @@ from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
+from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -7445,9 +7446,16 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            row = await engine.store.get_search_preset(
-                preset_id=preset_id, owner_user_id=identity.user_id
-            )
+            try:
+                row = await engine.store.get_search_preset(
+                    preset_id=preset_id, owner_user_id=identity.user_id
+                )
+            except CellTagError:
+                # BACKLOG #2593: the criteria fail their owner tag; the store refused, alerted
+                # and audited. The caller's own preset exists, so a refusal, never a 500.
+                raise HTTPException(
+                    423, f"preset {preset_id} failed its integrity check and cannot be used"
+                ) from None
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a

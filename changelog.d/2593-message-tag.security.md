@@ -8,7 +8,9 @@
   and writes an `integrity.message_tag_failed` or `integrity.preset_tag_failed` audit row, once per
   cell per hour in each process. A message read or a preset recall refuses; the by-id message
   routes answer 423 inside the caller's channel scope and the usual 404 outside it, and an export
-  skips the row. Under `vault_transit` a failed open keeps the cipher's own error and raises no
+  skips the row; the layered-search preset recall answers 423. A delivery whose `dynamic_headers`
+  metadata read fails its tag is dead-lettered without sending, whatever the internal-error policy.
+  Under `vault_transit` a failed open keeps the cipher's own error and raises no
   integrity alert, because that cipher cannot tell a moved cell from an unreachable Vault. The message list and the dead-letter list keep the row,
   by its plaintext columns, with its sealed cells withheld. Content search leaves it out, and the
   document strip skips it. A transform handoff that reads such a message's metadata dead-letters the

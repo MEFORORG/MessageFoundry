@@ -8186,6 +8186,12 @@ class RegistryRunner:
                 retry_until = failed.retry_at
                 self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
                 await self._delivery_failure_alert_checks(name)
+        except CellTagError as exc:
+            # BACKLOG #2593: the dynamic_headers metadata read met a cell that fails its channel
+            # tag (alerted at the read). Nothing was sent. Dead-letter the row and audit it, as the
+            # transform stage does, rather than take the internal-error arm, whose STOP policy would
+            # halt the whole lane on one message.
+            await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, exc)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756: a store READ the send needed failed (the document re-attach or the
             # dynamic_headers metadata), so nothing was sent and nothing is wrong with the message.
