@@ -965,6 +965,34 @@ async def test_a_step_up_flow_never_mints_and_a_sign_in_flow_never_elevates(
         await store.close()
 
 
+async def test_the_sign_in_abandon_refuses_a_step_up_flow_as_the_wrong_kind(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3198. ``abandon_oidc_login`` re-checks the kind of flow it consumed, as the other
+    completions do, so a step-up flow that reaches the sign-in leg is audited as
+    ``flow_purpose_mismatch`` rather than as the route's ``idp_error``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token)
+        state = _staged(service, flow_id).state
+
+        consumed = await service.abandon_oidc_login(
+            flow_id, state=state, reason="idp_error", client="10.0.0.9"
+        )
+
+        assert consumed is True
+        assert service._oidc_flows is not None and service._oidc_flows.peek(flow_id) is None
+        reasons = [
+            json.loads(str(r["detail"]))["reason"]
+            for r in await _audit_rows(store, "auth.login_failed")
+        ]
+        assert reasons == [FLOW_PURPOSE_MISMATCH], reasons
+    finally:
+        await store.close()
+
+
 async def test_an_abandoned_step_up_consumes_the_flow_and_keeps_the_continuation(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:

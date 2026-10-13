@@ -153,7 +153,10 @@ class FlowCache:
 
     Keyed on ``sha256(flow_id)`` — the raw ``flow_id`` lives only in the browser cookie, so a cache
     dump never yields a usable flow id. ``put`` **rejects** at the global or per-IP cap rather than
-    evicting (eviction = a login DoS); ``pop`` is single-use and TTL-checked on ``time.monotonic``.
+    evicting (eviction = a login DoS). :meth:`pop_if_state_matches` is the only way to consume a
+    flow: single-use, TTL-checked on ``time.monotonic``, and only for the flow's own ``state``.
+    There is deliberately no plain ``pop``, because consuming before comparing let a forged callback
+    spend a sign-in in flight (BACKLOG #3198).
     """
 
     def __init__(
@@ -214,13 +217,6 @@ class FlowCache:
             return None
         return entry
 
-    def pop(self, flow_id: str) -> PendingFlow | None:
-        """Consume the flow for ``flow_id`` (single-use); None if absent or expired."""
-        entry = self._entries.pop(self._key(flow_id), None)
-        if entry is None or entry.deadline <= self._clock():
-            return None
-        return entry
-
     def pop_if_state_matches(
         self, flow_id: str, state: str | None
     ) -> tuple[PendingFlow | None, bool]:
@@ -233,10 +229,15 @@ class FlowCache:
         the real IdP return needs. Nothing here awaits, so two matching callbacks still spend it
         once.
         """
-        flow = self.peek(flow_id)
+        key = self._key(flow_id)
+        flow = self._entries.get(key)
+        if flow is not None and flow.deadline <= self._clock():
+            # Expired: dropped now, so it stops holding a cap slot until the next put prunes.
+            del self._entries[key]
+            flow = None
         if flow is None or state is None or not state_matches(flow.state, state):
             return flow, False
-        del self._entries[self._key(flow_id)]
+        del self._entries[key]
         return flow, True
 
 

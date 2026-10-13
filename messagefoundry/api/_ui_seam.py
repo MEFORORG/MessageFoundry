@@ -399,7 +399,8 @@ from typing import Any
 #: callback calls for an ``error=`` or malformed sign-in callback, so a forged one cannot end a
 #: sign-in in flight. It returns whether the flow was consumed. ``LoginOutcome`` and ``OidcStepUp``
 #: gained ``flow_consumed``, which the route reads to keep the flow cookie when a refusal consumed
-#: nothing. The digest moved because the
+#: nothing. The route types its ``LoginOutcome`` so discovery sees that class (and ``RolesGained``,
+#: one of its field types), which it did not before. The digest moved because the
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
@@ -408,7 +409,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "bc38fc9f0eddcb00"
+ENGINE_UI_SEAM: str = "c96bfcbec6050c00"
 
 
 @dataclass(frozen=True, slots=True)

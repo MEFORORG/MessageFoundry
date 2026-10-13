@@ -58,7 +58,7 @@ from messagefoundry.api.security import (
     public_route,
 )
 from messagefoundry.auth.oidc import FlowCacheFullError, FlowError
-from messagefoundry.auth.service import AuthService, OidcStepUp
+from messagefoundry.auth.service import AuthService, LoginOutcome, OidcStepUp
 
 from .. import pages
 from .._auth import (
@@ -457,7 +457,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
             await auth.audit_oidc_reject("non_navigation_fetch", client=client)
-            return _fail(request, "oidc_failed")
+            # Consumed nothing, so the cookie stays for the real IdP return (BACKLOG #3198).
+            return _fail(request, "oidc_failed", keep_flow=True)
         # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".
 
         flow_id = request.cookies.get(oidc_flow_cookie_name(request))
@@ -500,7 +501,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
             return _fail(request, "oidc_failed", keep_flow=not consumed)
 
-        outcome = await auth.complete_oidc_login(
+        # Typed so the seam discovery sees LoginOutcome, whose `flow_consumed` this route reads.
+        outcome: LoginOutcome = await auth.complete_oidc_login(
             flow_id=flow_id,
             state=state,
             code=code,

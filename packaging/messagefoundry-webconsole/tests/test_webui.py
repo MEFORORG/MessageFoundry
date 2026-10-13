@@ -8284,6 +8284,10 @@ async def test_every_other_oidc_route_reject_records_the_client(
             r = await c.get("/ui/oidc/callback" + query, headers=headers, follow_redirects=False)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/login?e=oidc_failed"
+        if reason == "callback_non_navigation_fetch":
+            # BACKLOG #3198: a refusal that consumed nothing keeps the flow cookie, so a same-site
+            # fetch cannot clear it and cancel the sign-in in flight.
+            assert "mf_oidc_flow" not in r.headers.get("set-cookie", "")
     rows = [
         a
         for a in await engine.store.list_audit(action="auth.login_failed")

@@ -4136,12 +4136,7 @@ class AuthService:
         public_origin: str,
         clock: _PadClock,
     ) -> LoginOutcome:
-        if not self.oidc_enabled or self._oidc_flows is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
-            return LoginOutcome(
-                ok=False, error="federated sign-in is not configured", reason="not_configured"
-            )
-        flow = await self._redeem_sign_in_flow(self._oidc_flows, flow_id, state, client=client)
+        flow = await self._redeem_sign_in_flow(flow_id, state, client=client)
         if isinstance(flow, LoginOutcome):
             return flow
         # The INNER leg: the public wrapper would pad a second time inside this challenge's pad.
@@ -4154,13 +4149,18 @@ class AuthService:
         )
 
     async def _redeem_sign_in_flow(
-        self, flows: oidc.FlowCache, flow_id: str, state: str | None, *, client: str | None
+        self, flow_id: str, state: str | None, *, client: str | None
     ) -> PendingFlow | LoginOutcome:
         """The staged flow, consumed because ``state`` matched, or the audited refusal.
 
         A wrong or missing ``state`` consumes nothing (BACKLOG #3198), and its outcome says so in
         ``flow_consumed``, so the route keeps the flow cookie for the real IdP return."""
-        flow, consumed = flows.pop_if_state_matches(flow_id, state)
+        if not self.oidc_enabled or self._oidc_flows is None:
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
+            return LoginOutcome(
+                ok=False, error="federated sign-in is not configured", reason="not_configured"
+            )
+        flow, consumed = self._oidc_flows.pop_if_state_matches(flow_id, state)
         if flow is None:
             await self._directory_reject_audit("<oidc>", "oidc", "state_unknown", client=client)
             return LoginOutcome(
@@ -4187,17 +4187,19 @@ class AuthService:
         check any page could cancel a sign-in in flight by sending the browser to the callback with
         ``error=``. A missing or wrong ``state`` is refused and the flow waits for the real return.
         On a match the flow is consumed and the closed-set ``reason`` the route chose is audited,
-        never the IdP's own text. Not padded: like the route's other early refusals, it does no
+        never the IdP's own text. A step-up flow that reaches here is refused as
+        ``flow_purpose_mismatch`` instead, as the other completions refuse the wrong kind. The
+        unmatched arms are audited as ``state_unknown`` or ``state_mismatch``, not as ``reason``,
+        as on the step-up leg: an unverified ``error=`` is not attributable to the IdP. Not padded: like the route's other early refusals, it does no
         work that depends on an account.
 
         Returns whether the flow was consumed, so the route knows whether to keep the browser's
         flow cookie. It returns no :class:`LoginOutcome` because it never signs anyone in."""
-        if not self.oidc_enabled or self._oidc_flows is None:
-            await self._directory_reject_audit("<oidc>", "oidc", "not_configured", client=client)
-            return True
-        flow = await self._redeem_sign_in_flow(self._oidc_flows, flow_id, state, client=client)
+        flow = await self._redeem_sign_in_flow(flow_id, state, client=client)
         if isinstance(flow, LoginOutcome):
             return flow.flow_consumed
+        if flow.step_up_session_hash is not None:
+            reason = FLOW_PURPOSE_MISMATCH
         await self._directory_reject_audit("<oidc>", "oidc", reason, client=client)
         return True
 
@@ -11738,14 +11740,15 @@ class AuthService:
                 held=held,
             )
 
-        async def audit_refused(reason: str, **extra: object) -> None:
+        async def audit_refused(reason: str, username: str, **extra: object) -> None:
             # BACKLOG #3174: every other refusal past the no-op check writes the same row, so an
             # attempt to change who may sign in as an account is never refused silently. `reason`
-            # is a closed-set literal and goes last, so nothing can overwrite it.
+            # is a closed-set literal and goes last, so nothing can overwrite it. Past the clear,
+            # the caller passes the clear's own username, as the changed-pair rows do.
             await self._audit(
                 "auth.federated_bind_refused",
                 actor=actor,
-                detail=_json({**target, "username": user.username, **extra, "reason": reason}),
+                detail=_json({**target, "username": username, **extra, "reason": reason}),
             )
 
         # A caller whose pair is already stale gets the stale answer, not whichever refusal below
@@ -11753,13 +11756,13 @@ class AuthService:
         if (user.oidc_issuer, user.oidc_subject) != (expected_issuer, expected_subject):
             raise await audit_changed(user.username, (user.oidc_issuer, user.oidc_subject))
         if user.auth_provider != AuthProvider.AD.value:
-            await audit_refused("not_a_directory_account")
+            await audit_refused("not_a_directory_account", user.username)
             raise ValueError("only a directory (AD) account can take a federated binding")
         if not user.directory_object_id:
             # BACKLOG #1143 slice C: see DirectoryObjectIdMissing. After the no-op check, so a
             # legacy binding resubmitted as it stands gets the harmless answer above, while moving
             # it to another pair is still refused. Unbinding it stays open.
-            await audit_refused(DIRECTORY_OBJECT_ID_MISSING)
+            await audit_refused(DIRECTORY_OBJECT_ID_MISSING, user.username)
             raise DirectoryObjectIdMissing(
                 f"{DIRECTORY_OBJECT_ID_MISSING}: this account has no immutable directory identifier"
                 " (objectGUID), so it cannot take a federated binding, and it never gains one."
@@ -11771,7 +11774,9 @@ class AuthService:
             )
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
         if holder is not None and holder.id != user_id:
-            await audit_refused("federated_subject_held", previous_binding_removed=False)
+            await audit_refused(
+                "federated_subject_held", user.username, previous_binding_removed=False
+            )
             raise FederatedSubjectHeld(
                 "that identity is already bound to another account; unbind it there first"
             )
@@ -11808,7 +11813,9 @@ class AuthService:
             # above. Rendered as the same refusal the sequential check gives; anything else re-raises.
             if not _is_integrity_refusal(exc):
                 raise
-            await audit_refused("federated_subject_held", previous_binding_removed=rebind)
+            await audit_refused(
+                "federated_subject_held", cleared.username, previous_binding_removed=rebind
+            )
             raise FederatedSubjectHeld(
                 "that identity is already bound to another account"
                 + (
@@ -11831,7 +11838,9 @@ class AuthService:
                 raise await audit_changed(cleared.username, None)
             await self._record_federated_unbind(user_id, cleared, actor=actor)
             # Another bind of THIS account landed between the clear and the write (BACKLOG #3174).
-            await audit_refused("account_bound_concurrently", previous_binding_removed=True)
+            await audit_refused(
+                "account_bound_concurrently", cleared.username, previous_binding_removed=True
+            )
             # This request DID write: its clear removed the pair it expected. So not the
             # changed-pair refusal, whose promise is that nothing changed.
             raise FederatedSubjectHeld(
