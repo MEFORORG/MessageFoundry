@@ -20,12 +20,14 @@ import time
 import urllib.parse
 from collections.abc import Callable, Coroutine
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
 from _totp_clock import pin_totp_clock
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+import messagefoundry
 from messagefoundry.auth import oidc, totp
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
@@ -46,6 +48,7 @@ from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._ast_sites import call_sites, find_funcs, parse_source
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
     DEFAULT_SUB,
@@ -455,6 +458,23 @@ async def test_an_idp_answer_from_before_the_request_is_refused(
 # --- freshness against the IdP's own clock (BACKLOG #2143, ADR 0142 AC-15) --------------------------
 
 
+async def _seed_oidc_session(store: MessageStore, *, idp_auth_time: float | None) -> str:
+    """An ``oidc`` session for ``jdoe`` written straight into the store, past the mint guard, so a
+    test can hold a NULL ``idp_auth_time`` as a row from before the column would."""
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None
+    token = mint_token()
+    assert await store.create_session(
+        token_hash=hash_token(token),
+        user_id=user.id,
+        expires_at=time.time() + 3600,
+        seed_reauth=False,
+        auth_mechanism=SessionMechanism.OIDC.value,
+        idp_auth_time=idp_auth_time,
+    )
+    return token
+
+
 async def _held_auth_time(store: MessageStore, token: str) -> float | None:
     session = await store.get_session(hash_token(token))
     assert session is not None
@@ -551,17 +571,7 @@ async def test_an_oidc_session_with_no_stored_auth_time_is_refused(
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
-        user = await store.get_user_by_username("jdoe")
-        assert user is not None
-        token = mint_token()
-        assert await store.create_session(
-            token_hash=hash_token(token),
-            user_id=user.id,
-            expires_at=time.time() + 3600,
-            seed_reauth=False,
-            auth_mechanism=SessionMechanism.OIDC.value,
-            idp_auth_time=held,
-        )
+        token = await _seed_oidc_session(store, idp_auth_time=held)
         assert await _held_auth_time(store, token) == held
         flow_id, _url = await _begin(service, token)
 
@@ -674,16 +684,7 @@ async def test_the_idp_clock_test_refuses_before_the_directory_is_asked(
         ldap = _CountingLdap()
         service = await _service(store, rsa_key, ldap=ldap)
         if held is None:
-            user = await store.get_user_by_username("jdoe")
-            assert user is not None
-            token = mint_token()
-            assert await store.create_session(
-                token_hash=hash_token(token),
-                user_id=user.id,
-                expires_at=time.time() + 3600,
-                seed_reauth=False,
-                auth_mechanism=SessionMechanism.OIDC.value,
-            )
+            token = await _seed_oidc_session(store, idp_auth_time=None)
             answered_at = time.time()
             expected = STEP_UP_IDP_AUTH_TIME_MISSING
         else:
@@ -742,28 +743,22 @@ async def test_an_oidc_session_is_never_minted_without_an_idp_auth_time(
 def test_issue_session_is_the_only_engine_caller_of_create_session() -> None:
     """BACKLOG #3174. The guard above sits in ``_issue_session`` because it is the one place the
     engine mints a session. A second caller of ``Store.create_session`` would mint past it, so this
-    pins that there is none. Calls are counted in the AST, so a comment or a docstring cannot hide
-    or fake one."""
-    import ast
-    from pathlib import Path
-
-    import messagefoundry
-
+    pins that there is none. Call nodes are counted in the AST, so a comment or a docstring cannot
+    hide or fake one, and a call inside a nested function counts once. The text test only skips
+    files that cannot hold a call."""
     root = Path(messagefoundry.__file__).parent
-    callers: list[str] = []
+    sites: dict[str, int] = {}
     for path in sorted(root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for call in ast.walk(node):
-                if (
-                    isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr == "create_session"
-                ):
-                    callers.append(f"{path.relative_to(root).as_posix()}:{node.name}")
-    assert callers == ["auth/service.py:_issue_session"], callers
+        source = path.read_text(encoding="utf-8")
+        if "create_session" not in source:
+            continue
+        found = call_sites(parse_source(source), "create_session")
+        if found:
+            sites[path.relative_to(root).as_posix()] = len(found)
+    assert sites == {"auth/service.py": 1}, sites
+    service = parse_source((root / "auth" / "service.py").read_text(encoding="utf-8"))
+    [issuer] = find_funcs(service, "_issue_session")
+    assert len(call_sites(issuer, "create_session")) == 1
 
 
 #: A second mapped group, for the demotion arms below (BACKLOG #2154). Synthetic.

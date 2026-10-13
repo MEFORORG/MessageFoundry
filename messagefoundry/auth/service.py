@@ -4485,6 +4485,12 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="user not found in directory", reason="not_in_directory"
             )
+        # BACKLOG #3174: the answer must name the bound row's own directory object, by the test the
+        # IdP step-up leg applies, before its groups or name are used.
+        mismatch = _directory_answer_mismatch(principal, bound.directory_object_id)
+        if mismatch is not None:
+            await self._directory_reject_audit(username, "oidc", mismatch, client=client)
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason=mismatch)
 
         now = time.time()
         max_expires_at = principal_claims.expires_at
@@ -4903,9 +4909,7 @@ class AuthService:
                 "not_in_directory", actor=actor, client=client, return_to=return_to
             )
         # BACKLOG #3174: the answer must name the row's own directory object before its groups are
-        # trusted. The lookup was keyed on that id, but a directory implementation that does not
-        # check the id itself could answer for whoever holds the name now. The same test the AD
-        # step-up re-bind applies (_directory_answer_mismatch), with its closed-set reasons.
+        # trusted, by the test the sign-in leg and the AD step-up re-bind apply.
         mismatch = _directory_answer_mismatch(principal, user.directory_object_id)
         if mismatch is not None:
             return await self._step_up_refused(
@@ -7232,14 +7236,11 @@ class AuthService:
         after the cap would let the cap evict another device's oldest session to make room for a
         session that was about to go anyway.
 
-        Raises :class:`ValueError` for an ``oidc`` session with no ``idp_auth_time``, before anything
-        is written (BACKLOG #3174). :meth:`_complete_ad_login` refuses the same mint earlier, but
-        this is the one place every session is minted, so a caller that skips that method is still
-        refused here. ``Store.create_session`` has no other caller in the engine.
+        Raises :class:`ValueError`, writing nothing, for an ``oidc`` session with no
+        ``idp_auth_time``: every IdP step-up on it would be refused (BACKLOG #2143, #3174). This is
+        the engine's only caller of ``Store.create_session``, so no mint path skips the check.
         """
         if mechanism is SessionMechanism.OIDC and idp_auth_time is None:
-            # BACKLOG #2143's rule at the mint itself: an oidc session that stores NULL refuses
-            # every IdP step-up, so it is a programming error, not a session to issue.
             raise ValueError("an oidc session needs the verified IdP auth_time")
         token = mint_token()
         token_hash = hash_token(token)
@@ -11592,11 +11593,9 @@ class AuthService:
         why the pair differed: another administrator's change, or a retry of the caller's own call
         that had already landed, look the same here.
 
-        ``held`` is the pair the row held when the refusal read it, and the row carries it as
-        ``held_issuer`` and ``held_subject`` (BACKLOG #3174). Both are ``None`` for a row read
-        unbound. ``held`` is ``None`` only on the bind arm whose conditional write found the row
-        bound without reading it. That row leaves both fields out rather than read them again,
-        because a later read could name a pair that changed after the refusal.
+        ``held`` is the pair the refusal read, written as ``held_issuer`` and ``held_subject``
+        (BACKLOG #3174). ``None`` leaves both out: one bind arm never reads the pair, and a later
+        read could name a pair that changed after the refusal.
         """
         fields: dict[str, object] = {
             **detail,

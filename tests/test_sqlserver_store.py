@@ -1327,6 +1327,8 @@ async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None
         auth_mechanism="oidc",
         idp_auth_time=1.25,
     )
+    created = await store.get_session("i" * 64)
+    assert created is not None and created.idp_auth_time == 1.25
     await store.mark_session_reauthed("i" * 64, now=3.0, idp_auth_time=2.75)
     moved = await store.get_session("i" * 64)
     assert moved is not None and moved.idp_auth_time == 2.75

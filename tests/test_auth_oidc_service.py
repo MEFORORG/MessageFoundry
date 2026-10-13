@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -44,6 +45,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_UNBOUND,
 )
 from messagefoundry.auth.service import (
+    DIRECTORY_IDENTITY_CONFLICT,
     DIRECTORY_OBJECT_ID_MISSING,
     FEDERATED_BINDING_CHANGED,
     FEDERATED_SUBJECT_NOT_BOUND,
@@ -300,10 +302,10 @@ async def _audit_rows(store: MessageStore, action: str) -> list[Row]:
     return [a for a in await store.list_audit() if a["action"] == action]
 
 
-async def _refusal_reasons(store: MessageStore) -> list[str]:
-    """The ``reason`` of each ``auth.federated_bind_refused`` row, oldest first (BACKLOG #2331)."""
+async def _bind_refusals(store: MessageStore) -> list[dict[str, Any]]:
+    """Each ``auth.federated_bind_refused`` row's detail, oldest first (BACKLOG #2331, #3174)."""
     rows = await _audit_rows(store, "auth.federated_bind_refused")
-    return [json.loads(r["detail"])["reason"] for r in reversed(rows)]
+    return [json.loads(r["detail"]) for r in reversed(rows)]
 
 
 async def _oidc_login(
@@ -1071,12 +1073,13 @@ async def test_one_subject_cannot_be_bound_to_two_accounts(
 async def test_a_directory_answer_leading_to_another_row_is_refused_before_roles(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The check left inside ``_complete_ad_login``. The pair selects ``jdoe``, but the directory,
-    asked about ``jdoe``, answers with the ``bsmith`` object, whose mirror row exists unbound. That row
-    must not be signed in, and must not take the session or any role.
+    """The pair selects ``jdoe``, but the directory, asked about ``jdoe``, answers with the ``bsmith``
+    object, whose mirror row exists unbound. That row must not be signed in, and must not take the
+    session or any role.
 
-    It is refused as ``federated_subject_already_bound``: the subject is held by a different account
-    than the one this login reached."""
+    It is refused as ``directory_identity_conflict`` since BACKLOG #3174: the answer's object id is
+    not the bound row's. Before that it reached ``_complete_ad_login`` and was refused there as
+    ``federated_subject_already_bound``."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap(by_username={"jdoe": OTHER})
@@ -1093,11 +1096,43 @@ async def test_a_directory_answer_leading_to_another_row_is_refused_before_roles
         out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
 
         assert not out.ok and out.token is None
-        assert out.reason == "federated_subject_already_bound"
+        # BACKLOG #3174: the answer names another object than the bound row's, so the id test
+        # refuses it before _complete_ad_login's own check is reached.
+        assert out.reason == DIRECTORY_IDENTITY_CONFLICT
         assert await store.list_sessions(other_id) == []
         assert await store.get_user_role_ids(other_id) == []
         other = await store.get_user(other_id)
         assert other is not None and other.oidc_subject is None, "the reached row took the pair"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("answer_id", "reason"),
+    [("guid-someone-else", DIRECTORY_IDENTITY_CONFLICT), (None, DIRECTORY_OBJECT_ID_MISSING)],
+    ids=["another-object", "no-id"],
+)
+async def test_a_sign_in_directory_answer_for_another_object_is_refused(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    answer_id: str | None,
+    reason: str,
+) -> None:
+    """BACKLOG #3174: the sign-in leg refuses a directory answer whose object id is not the bound
+    row's, by the test the step-up leg applies (``tests/test_oidc_step_up.py``). For these two arms
+    ``_complete_ad_login`` would give the same reasons later, so they pin the outcome, not the
+    order. The arm only the new test refuses as ``directory_identity_conflict`` is
+    ``test_a_directory_answer_leading_to_another_row_is_refused_before_roles``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(replace(PRINCIPAL, directory_object_id=answer_id))
+        service = await _service(store, rsa_key, ldap=ldap)
+        out = await _oidc_login(service, monkeypatch, rsa_key)
+        assert not out.ok and out.token is None and out.reason == reason
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None and await store.list_sessions(user.id) == []
+        rows = await _audit_rows(store, "auth.login_failed")
+        assert any(json.loads(r["detail"])["reason"] == reason for r in rows), rows
     finally:
         await store.close()
 
@@ -1735,7 +1770,7 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
             )
         # BACKLOG #2331: the stale refusal is audited too, under its own reason. What matters here
         # is that no row carries the directory-id reason the later check would have written.
-        assert await _refusal_reasons(store) == [FEDERATED_BINDING_CHANGED]
+        assert [d["reason"] for d in await _bind_refusals(store)] == [FEDERATED_BINDING_CHANGED]
 
         with pytest.raises(DirectoryObjectIdMissing):
             await service.bind_federated_subject(
@@ -1745,18 +1780,12 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
                 expected_subject="S-1-legacy",
                 actor="admin",
             )
-        assert await _refusal_reasons(store) == [
+        assert [d["reason"] for d in await _bind_refusals(store)] == [
             FEDERATED_BINDING_CHANGED,
             DIRECTORY_OBJECT_ID_MISSING,
         ]
     finally:
         await store.close()
-
-
-async def _bind_refusals(store: MessageStore) -> list[dict[str, Any]]:
-    """Each ``auth.federated_bind_refused`` row's detail, oldest first."""
-    rows = await _audit_rows(store, "auth.federated_bind_refused")
-    return [json.loads(r["detail"]) for r in reversed(rows)]
 
 
 async def test_a_subject_held_elsewhere_and_a_local_account_are_audited(
