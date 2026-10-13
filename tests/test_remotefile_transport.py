@@ -1487,6 +1487,49 @@ def test_sftp_password_login_never_takes_the_escape(
     assert _PolicyCallingSSHClient.authenticated is False  # refused before any password crossed
 
 
+@pytest.mark.parametrize("escape", [True, False])
+def test_sftp_password_build_warning_fires_only_where_the_escape_would_have_applied(
+    escape: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The build-time WARNING is for a password login the escape would have let through: the
+    escape is permitted and no known_hosts file is named. A named file, or no escape, is quiet."""
+    monkeypatch.setattr(remotefile, "weakened_tls_escape_permitted_here", lambda: escape)
+    base = {"host": "h", "port": 22, "remote_dir": "/in", "username": "svc", "password": "x"}
+
+    def warned(settings: dict[str, Any]) -> bool:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            _SftpClient(settings, name="OB_SFTP")
+        return any("logs in with a password" in r.getMessage() for r in caplog.records)
+
+    assert warned(base) is escape
+    assert warned({**base, "known_hosts": "known_hosts"}) is False
+
+
+def test_sftp_password_login_with_a_known_hosts_file_still_refuses_an_unknown_key(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quiet at build is not a weaker connect: the unknown key is refused before authentication."""
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _PolicyCallingParamiko)
+    _PolicyCallingSSHClient.authenticated = False
+    client = _SftpClient(
+        {
+            "host": "h",
+            "port": 22,
+            "remote_dir": "/in",
+            "username": "svc",
+            "password": "synthetic",
+            "known_hosts": "known_hosts",
+        },
+        name="OB_SFTP",
+    )
+    with pytest.raises(_RemoteError, match="with no escape"):
+        client.list_dir("/in")
+    assert _PolicyCallingSSHClient.authenticated is False
+
+
 def test_sftp_key_only_login_keeps_the_escape(escape_at_warn: None) -> None:
     """The control arm: a login with no password is outside this row and still takes the escape."""
     client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in", "username": "svc"})

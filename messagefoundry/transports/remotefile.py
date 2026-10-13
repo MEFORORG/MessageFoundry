@@ -1651,12 +1651,15 @@ class _SftpClient(_RemoteClient):
         # hand the password to whichever server answered. A key-only login keeps the escape.
         escape = weakened_tls_escape_permitted_here()
         self._accept_unknown = escape and not self._password
-        if escape and self._password:
+        if escape and self._password and not self._known_hosts:
             # Said at build, so the operator learns it before a delivery is refused at connect.
+            # Only with no known_hosts file named: that is where the escape would have been
+            # relied on. A named file is taken to hold the key; the connect still checks it.
             logger.warning(
-                "%sREMOTEFILE sftp %s logs in with a password, so %s does not let it accept an "
-                "unknown host key; an unknown key is refused at connect. Add the server's host key "
-                "to known_hosts.",
+                "%sREMOTEFILE sftp %s logs in with a password and names no known_hosts file. "
+                "%s, though set on an instance at [security].enforcement = warn, does not let a "
+                "password login accept an unknown host key, so a key missing from the system "
+                "known_hosts is refused at connect. Add the server's host key to known_hosts.",
                 hop_name_prefix(self._name),
                 self._host,
                 INSECURE_TLS_ESCAPE_ENV,
@@ -1734,15 +1737,15 @@ class _SftpClient(_RemoteClient):
             client.load_host_keys(str(self._known_hosts))
         # RejectPolicy (default-secure): an unknown host key raises rather than being trusted. Only
         # fall back to AutoAddPolicy behind the explicit insecure escape (set in __init__, logged).
-        # A password login refuses with text that names the connection and the fix.
-        policy: object
-        if self._accept_unknown:
-            policy = paramiko.AutoAddPolicy()
-        elif self._password:
-            policy = _RefuseUnknownHostKey(paramiko, name=self._name)
-        else:
-            policy = paramiko.RejectPolicy()
-        client.set_missing_host_key_policy(policy)
+        client.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy() if self._accept_unknown else paramiko.RejectPolicy()
+        )
+        if self._password:
+            # __init__ never sets _accept_unknown for a password login, so the policy above is
+            # RejectPolicy. This one refuses the same keys, with text that names the connection
+            # and the fix (vault BACKLOG #3230). Kept apart from the call above so that call reads
+            # as it did before, which CodeQL's dismissed alert 13 is matched against.
+            client.set_missing_host_key_policy(_RefuseUnknownHostKey(paramiko, name=self._name))
         pkey = self._load_key(paramiko)
         # Constrain the MAC proposal to the approved set (BACKLOG #1171), and the cipher proposal to
         # its own approved set. Both are passed on every connect, not behind a setting: a control an
