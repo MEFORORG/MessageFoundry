@@ -1511,7 +1511,7 @@ the console routes with a rule of their own.
 | `GET` | `/ui/connections` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/connections/bulk-control` | `connections:control` | `require_ui` |
 | `POST` | `/ui/connections/purge-bulk` | `messages:purge` | `require_ui_step_up_action` |
-| `GET` | `/ui/connections/purge-confirm` | `messages:purge` | `require_ui_step_up` |
+| `GET` | `/ui/connections/purge-confirm` | `messages:purge` | `require_ui_step_up_action` |
 | `POST` | `/ui/connections/{name}/flag` | `config:deploy` | `require_ui` |
 | `POST` | `/ui/connections/{name}/purge/{scope}` | `messages:purge` | `require_ui_step_up_action` |
 | `POST` | `/ui/connections/{name}/restart` | `connections:control` | `require_ui` |
@@ -1565,7 +1565,7 @@ the console routes with a rule of their own.
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse`**+**`messages:edit` | `require_ui_step_up_action` |
-| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse`**+**`messages:edit` | `require_ui_step_up` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse`**+**`messages:edit` | `require_ui_step_up_action` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/upload-form` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -1655,8 +1655,9 @@ else would need its own authorization rule stated here.
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
    It draws the same bucket, and its 429 carries the same `Retry-After` the JSON floor sends.
 3. **The uploaded-logs resend-confirm GET is no longer weaker than its JSON equivalent (BACKLOG
-   #1822).** `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is `require_ui_step_up`, like the
-   permission-equivalent JSON browse route. The one weaker uploaded-logs GET left is
+   #1822).** `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` was made `require_ui_step_up`, like
+   the permission-equivalent JSON browse route, and since owner ruling 2026-10-13 (#3241 R2) it
+   holds the `upload_resend` proof without spending it. The one weaker uploaded-logs GET left is
    `GET /ui/uploaded-logs`, under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`,
    not this prose.
 
@@ -2408,6 +2409,10 @@ in `X-Step-Up-Action`; the engine client does this itself. The console's re-auth
 when it continues to the action's confirm page, editor or auto-retry. The message editor asks for the
 grant before it opens and the resubmit spends it after its own input checks, so a re-auth no longer
 drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
+The purge and upload-resend confirm pages hold their proof the same way, so the window alone no
+longer opens a page whose POST then asks for a re-auth. The JSON export spends its proof after its
+own criteria check, so a malformed export costs no proof (owner ruling 2026-10-13, #3241 R2). The
+bulk purge confirm page still drops its selection across a re-auth, as before.
 A refusal the engine handler raises before its store write gives the proof back (owner ruling
 2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
 refusal from the store call on keeps the spend, because the store may have committed: the next

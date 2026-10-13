@@ -5688,16 +5688,12 @@ def create_app(
         engine: Engine,
         identity: Identity,
         ids: list[str],
-        content: str | None = None,
-        field_path: str | None = None,
-        field_value: str | None = None,
-        target: str = "both",
         channel_id: str | None = None,
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 1000,
-        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
+        spec: SearchSpec | None = None,
     ) -> StreamingResponse:
         """Stream a batch of message bodies to a downloadable NDJSON file (#124, ADR 0131) — the
         Corepoint-parity bulk export a one-at-a-time ``/messages/{id}/raw`` fetch can't provide.
@@ -5717,7 +5713,9 @@ def create_app(
 
         This is the shared implementation behind both request shapes (BACKLOG #1184): the GET below,
         which takes ids and the URL-safe criteria, and the POST, which is the only way to select by
-        ``content`` or ``field_value``."""
+        ``content`` or ``field_value``. Each route checks its criteria with :func:`_export_spec` and
+        spends the export proof before it calls this (owner ruling 2026-10-13, #3241 R2), so a
+        search selection arrives as ``spec`` and a malformed one cost no proof."""
         # #200 (ADR 0092): a bulk-PHI read behind step-up (NOT require_phi_read), so apply the data-path
         # hop guard explicitly before any body is decrypted — exactly as the step-up search route does.
         enforce_phi_read_hop(request)
@@ -5731,16 +5729,8 @@ def create_app(
             selected = ids[:limit]
             selection: dict[str, object] = {"mode": "ids", "requested": len(ids)}
         else:
-            try:
-                spec = make_spec(
-                    content=content,
-                    field_path=field_path,
-                    field_value=field_value,
-                    target=SearchTarget(target),
-                    scan_limit=scan_limit,
-                )
-            except ContentSearchError as exc:
-                raise HTTPException(400, str(exc)) from exc
+            if spec is None:
+                raise HTTPException(400, "an export by search needs its checked criteria")
             result = await engine.store.search_messages(
                 spec,
                 channel_id=channel_id,
@@ -5865,6 +5855,32 @@ def create_app(
     # interactive gate — a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated
     # messages:export capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one
     # message.
+    def _export_spec(
+        ids: list[str],
+        *,
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
+    ) -> SearchSpec | None:
+        """The export's own input check, run BEFORE its proof is spent (owner ruling 2026-10-13,
+        #3241 R2): ``None`` for an export by ``ids``, else the checked search spec. A malformed
+        criterion answers 400 and costs the caller no proof. Pure: it reads nothing and writes
+        nothing."""
+        if ids:
+            return None
+        try:
+            return make_spec(
+                content=content,
+                field_path=field_path,
+                field_value=field_value,
+                target=SearchTarget(target),
+                scan_limit=scan_limit,
+            )
+        except ContentSearchError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @app.get("/messages/export")
     async def export_messages_get(
         request: Request,
@@ -5874,6 +5890,7 @@ def create_app(
                 STEP_UP_ACTION_MESSAGE_EXPORT,
                 Permission.MESSAGES_EXPORT,
                 Permission.MESSAGES_VIEW_RAW,
+                proof_in_route=True,
             )
         ),
         ids: list[ResourceId] = Query(default=[], max_length=MAX_EXPORT_IDS),  # noqa: B006 — FastAPI repeated ?ids=
@@ -5892,19 +5909,19 @@ def create_app(
         operator-typed needle is PHI-shaped and a query string is logged in three places the redactor
         cannot reach. Send a needle-bearing save-all to ``POST /messages/export``. Message ids stay —
         they are engine-minted opaque identifiers, not patient data."""
+        spec = _export_spec(ids, field_path=field_path, target=target, scan_limit=scan_limit)
+        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EXPORT)
         return await export_messages(
             request,
             engine=engine,
             identity=identity,
             ids=ids,
-            field_path=field_path,
-            target=target,
             channel_id=channel_id,
             status=status,
             message_type=message_type,
             control_id=control_id,
             limit=limit,
-            scan_limit=scan_limit,
+            spec=spec,
         )
 
     @app.post("/messages/export")
@@ -5917,26 +5934,32 @@ def create_app(
                 STEP_UP_ACTION_MESSAGE_EXPORT,
                 Permission.MESSAGES_EXPORT,
                 Permission.MESSAGES_VIEW_RAW,
+                proof_in_route=True,
             )
         ),
     ) -> StreamingResponse:
         """The needle-bearing shape of the export above (BACKLOG #1184): same gate, same per-row channel
         re-check, same pre-stream audit — the selection criteria arrive in the request BODY."""
+        spec = _export_spec(
+            criteria.ids,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            scan_limit=_scan_limit_or_default(criteria.scan_limit),
+        )
+        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EXPORT)
         return await export_messages(
             request,
             engine=engine,
             identity=identity,
             ids=criteria.ids,
-            content=criteria.content,
-            field_path=criteria.field_path,
-            field_value=criteria.field_value,
-            target=criteria.target,
             channel_id=criteria.channel_id,
             status=criteria.status,
             message_type=criteria.message_type,
             control_id=criteria.control_id,
             limit=criteria.limit,
-            scan_limit=_scan_limit_or_default(criteria.scan_limit),
+            spec=spec,
         )
 
     @app.get("/messages/{message_id}", response_model=MessageDetail)

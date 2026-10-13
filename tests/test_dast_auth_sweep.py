@@ -756,7 +756,11 @@ def test_without_a_re_proof_the_action_bound_rows_are_findings(
     # Exit 2 today, because the lost rows also breach the write-reach floor; either code reds.
     assert code != 0, f"a sweep that could not pass the step-up wall exited {code}"
     assert refused and refused <= {f"{m} {p}" for m, p in _action_bound_rows()}, refused
-    assert {"POST /messages/{message_id}/resend", "GET /messages/export"} <= refused, refused
+    # A body-less GET export now fails its own criteria check before its spend (owner ruling
+    # 2026-10-13, #3241 R2), so it is reached without a proof and is not here.
+    assert {"POST /messages/{message_id}/resend", "POST /connections/{name}/purge"} <= refused, (
+        refused
+    )
 
 
 async def test_a_refused_re_proof_is_a_could_not_measure() -> None:

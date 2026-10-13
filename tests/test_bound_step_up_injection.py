@@ -436,3 +436,32 @@ async def test_an_edit_resend_refused_at_its_store_write_keeps_the_spend(
             assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), again.status_code
     finally:
         await engine.stop()
+
+
+# --- the export spends after its input check (owner ruling 2026-10-13, #3241 R2) ---------------
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_a_malformed_export_costs_no_proof(
+    engine: Engine, tmp_path: Path, method: str
+) -> None:
+    """A criterion the export refuses (400) or the framework refuses (422) is checked before the
+    spend, so the same proof then opens a well-formed export, once."""
+    service = await _service(engine)
+    await _add(service, "adm", [Role.ADMINISTRATOR.value])
+    get = method == "GET"
+    malformed: list[tuple[dict[str, Any] | None, dict[str, Any] | None, int]] = (
+        [(None, {"field_path": "NOT A PATH"}, 400), (None, {"limit": 0}, 422)]
+        if get
+        else [({"content": "x", "field_path": "PID-5"}, None, 400), ({"limit": 0}, None, 422)]
+    )
+    good = (None, {"ids": [NO_SUCH]}) if get else ({"ids": [NO_SUCH]}, None)
+    async with _client(engine, service, tmp_path) as c:
+        token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EXPORT)
+        for body, query, expected in malformed:
+            r = await _call(c, token, method, "/messages/export", body, query)
+            assert r.status_code == expected and _past_the_step_up(r), (body, query, r.status_code)
+        ok = await _call(c, token, method, "/messages/export", good[0], good[1])
+        assert ok.status_code == 200 and _past_the_step_up(ok), (ok.status_code, ok.text)
+        again = await _call(c, token, method, "/messages/export", good[0], good[1])
+        assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EXPORT), "the export spent its proof"

@@ -381,3 +381,21 @@ def test_the_browse_page_offers_resend_only_to_a_role_that_can_resend() -> None:
     reader = str(uploaded_log_detail(result, can_resend=False))
     assert confirm not in reader
     assert "messages:edit" in reader
+
+
+async def test_the_purge_confirm_page_holds_the_purge_proof(engine: Engine) -> None:
+    """Owner ruling 2026-10-13 (#3241 R2): a fresh window no longer opens the purge confirm page,
+    because its POST would then ask for a re-auth after the operator confirmed. The page holds the
+    proof and spends nothing, so the POST still spends it once."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        assert _reauth_next(await c.get(page)) == page  # the window alone: refused
+        await mint_bound_proof(c, page)
+        assert (await c.get(page)).status_code == 200
+        assert (await c.get(page)).status_code == 200  # held, not spent
+        ran = await c.post("/ui/connections/OB_X/purge/all", headers=SAME_ORIGIN)
+        assert _reauth_next(ran) is None and ran.status_code == 404
+        assert _reauth_next(await c.get(page)) == page  # the POST spent it

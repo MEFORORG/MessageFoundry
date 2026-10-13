@@ -345,6 +345,9 @@ _BEFORE_THE_SPEND = frozenset(
         "_reload_hold_params",
         "_rejoin_without_proof",
         "_held_reply",
+        # The export's own input check (owner ruling 2026-10-13, #3241 R2): pure, it reads nothing.
+        "_export_spec",
+        "_scan_limit_or_default",
     }
 )
 
@@ -355,8 +358,14 @@ def test_each_proof_in_route_route_spends_before_it_holds_or_runs_anything() -> 
     as action-bound. So the spend must be a top-level statement of the body, every call before it
     must be on :data:`_BEFORE_THE_SPEND`, and every return before it must be ``_held_reply``."""
     routes = _proof_in_route_routes()
-    # Positive control: the walk finds the two routes vault BACKLOG #2625 moved, by name.
-    assert set(routes) == {"purge_connection", "reload_config"}, sorted(routes)
+    # Positive control: the walk finds the routes that take their proof in the route, by name:
+    # the two vault BACKLOG #2625 moved and the two exports (owner ruling 2026-10-13, #3241 R2).
+    assert set(routes) == {
+        "purge_connection",
+        "reload_config",
+        "export_messages_get",
+        "export_messages_post",
+    }, sorted(routes)
     for name, func in routes.items():
         spend_at = next(
             (

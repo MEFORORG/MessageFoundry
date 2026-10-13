@@ -26,7 +26,6 @@ from .._auth import (
     assert_same_origin,
     register_ui_action,
     require_ui,
-    require_ui_step_up,
     require_ui_step_up_action,
 )
 from ._common import CONNECTION_RULE, refuse
@@ -193,7 +192,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_purge_confirm(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_PURGE)),
+        # The purge proof HELD, not spent (owner ruling 2026-10-13, #3241 R2), as the editor holds
+        # its own: the window alone opened this page and then cost a re-auth at the POST. The POST
+        # spends it.
+        identity: Identity = Depends(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_CONNECTION_PURGE, Permission.MESSAGES_PURGE, spend=False
+            )
+        ),
         # NOT annotated, unlike every other name on this surface, and the reason is an audit
         # row. FastAPI validates a query parameter before the handler body, so a 422 here would
         # return BEFORE the channel-scope branch below that calls core.audit_channel_denied --
@@ -209,7 +215,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # shared outbound (mirrors purge_connection); validate the scope (404, not 422, matching
         # the per-name route); then RE-DERIVE eligibility from LIVE quiescence — intersect the
         # requested ?dest with rr.outbound_quiesced(d), dropping anything since-started / not-yet-
-        # quiesced. On a stale step-up, require_ui_step_up already 303'd to /ui/reauth and the
+        # quiesced. With no held proof, the gate already 303'd to /ui/reauth and the
         # unlock flow GET-redirects back here WITHOUT the query, so dest is empty → nothing pre-
         # armed (the operator re-selects). The confirm form POSTs to /ui/connections/purge-bulk.
         if identity.allowed_channels is not None:

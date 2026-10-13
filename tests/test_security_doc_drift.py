@@ -1311,6 +1311,9 @@ _UI_BOUND_WITHOUT_JSON = frozenset(
         ("POST", "/ui/account/webauthn/enroll"),
         ("POST", "/ui/account/webauthn/{credential_id_hash}/delete"),
         ("GET", "/ui/messages/{message_id}/edit"),
+        # The confirm pages hold the proof their POST spends (owner ruling 2026-10-13, #3241 R2).
+        ("GET", "/ui/connections/purge-confirm"),
+        ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
     }
 )
 
