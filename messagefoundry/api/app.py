@@ -5232,11 +5232,15 @@ def create_app(
     async def approve_action(
         approval_id: ResourceId,
         request: Request,
-        identity: Identity = Depends(require_paced(Permission.APPROVALS_APPROVE)),
+        # Owner ruling 2026-10-13 (#3241 R4): a FRESH step-up, as the resolve below asks. The
+        # release runs the held operation, so it asks at least what the request side asked; reject
+        # runs nothing and stays paced.
+        identity: Identity = Depends(require_step_up(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalDecisionResult:
         """Release a pending action: re-executes the captured operation and audits both identities. A
-        requester can never approve their own request (dual-control, 2.3.5)."""
+        requester can never approve their own request (dual-control, 2.3.5). Needs a fresh step-up
+        window (``require_step_up``)."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
         try:

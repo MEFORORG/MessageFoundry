@@ -174,11 +174,10 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/uploaded-logs"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
-        # BACKLOG #1982: the console's approve and reject mirror the JSON approve and reject, both
-        # require_paced, which require_ui charges too. They are flagged only because the JSON
-        # resolve, same method and permission, is require_step_up. The console's own resolve
-        # (BACKLOG #2460) carries require_ui_step_up, so it is not in this set.
-        ("POST", "/ui/approvals/{approval_id}/approve"),
+        # BACKLOG #1982: the console's reject mirrors the JSON reject, require_paced, which
+        # require_ui charges too. It is flagged only because the JSON approve and resolve, same
+        # method and permission, are require_step_up. The console's approve (owner ruling
+        # 2026-10-13, #3241 R4) and resolve (BACKLOG #2460) carry require_ui_step_up.
         ("POST", "/ui/approvals/{approval_id}/reject"),
         # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload") and BACKLOG #1822 removed
         # ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"): both now carry
@@ -1235,6 +1234,8 @@ _UI_JSON_COUNTERPARTS: dict[tuple[str, str], tuple[str, str]] = {
         "POST",
         "/approvals/{approval_id}/resolve",
     ),
+    # Owner ruling 2026-10-13 (#3241 R4).
+    ("POST", "/ui/approvals/{approval_id}/approve"): ("POST", "/approvals/{approval_id}/approve"),
     ("POST", "/ui/cluster/stepdown"): ("POST", "/cluster/stepdown"),
     ("POST", "/ui/cluster/force-stepdown"): ("POST", "/cluster/stepdown"),
     ("POST", "/ui/config/reload"): ("POST", "/config/reload"),

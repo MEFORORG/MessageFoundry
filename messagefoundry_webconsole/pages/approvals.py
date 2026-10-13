@@ -72,6 +72,7 @@ _NOTICES: dict[str, str] = {
         "Recorded: the interrupted release's effects were not applied. Nothing was re-run."
     ),
     "choose_again": "Nothing was recorded. You proved it is you; choose the outcome again.",
+    "approve_again": "Nothing was released. You proved it is you; approve the request again.",
 }
 
 # The resolve buttons, one per ResolveOutcome; a test pins that every outcome has one.

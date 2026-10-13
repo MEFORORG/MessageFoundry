@@ -1463,8 +1463,40 @@ async def test_requester_cannot_resolve_their_own_interrupted_request(engine: En
     ]
 
 
+async def test_approve_requires_a_fresh_step_up_and_reject_does_not(engine: Engine) -> None:
+    """Owner ruling 2026-10-13 (#3241 R4): the release runs the held operation, so approve asks for
+    a fresh step-up, as resolve does. Reject runs nothing and stays paced."""
+    from messagefoundry.auth.tokens import hash_token
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "op2", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        held = (await _request_replay(c, await _token(c, "op"))).json()["approval_id"]
+        # A second requester, so the same request is a second hold rather than a repeat of the first.
+        other = (await _request_replay(c, await _token(c, "op2"))).json()["approval_id"]
+        assert other != held
+        approver = await _token(c, "approver")
+        token = approver["Authorization"].removeprefix("Bearer ")
+        await service.store.mark_session_reauthed(hash_token(token), now=0.0)  # window elapsed
+        stale = await c.post(f"/approvals/{held}/approve", headers=approver)
+        assert stale.status_code == 403
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        assert await _status_of(engine, held) == "pending"
+        # Reject is no release: the same stale window still declines a request.
+        declined = await c.post(f"/approvals/{other}/reject", headers=approver)
+        assert declined.status_code == 200, declined.text
+        # Positive control: re-prove the password, and the same session releases it.
+        reauth = await c.post("/me/reauth", headers=approver, json={"password": PW})
+        assert reauth.status_code == 200, reauth.text
+        rotated = {"Authorization": f"Bearer {reauth.json()['token']}"}
+        released = await c.post(f"/approvals/{held}/approve", headers=rotated)
+        assert released.status_code == 200, released.text
+
+
 async def test_resolve_requires_a_fresh_step_up(engine: Engine) -> None:
-    """Approve and reject are require_paced; resolve is require_step_up, per the owner ruling."""
+    """Reject is require_paced; approve (#3241 R4) and resolve are require_step_up."""
     from messagefoundry.auth.tokens import hash_token
 
     service = await _service(engine)
