@@ -402,13 +402,41 @@ def test_without_a_cwd_the_note_comes_from_the_project_dir(
     assert (wt / ".claude" / "steer.txt").exists()
 
 
-def test_a_cwd_that_does_not_exist_is_said_aloud(
+def test_a_cwd_that_does_not_exist_reads_no_note_and_says_so_once(
     primary_and_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
+    """CLAUDE_PROJECT_DIR names the primary, so falling back to it would read, delete and inject the
+    primary session's note into this one. The hook runs before every tool call, so it says so once
+    per cooldown rather than every time."""
     repo, _ = primary_and_worktree
     gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
     ctx = run_hook_with_cwd(repo, gone)
     assert ctx is not None
     assert ctx.startswith("[steer] Could not read this session's worktree"), ctx
     assert "deleted-worktree, which does not exist" in ctx, ctx
-    assert f"{PREFIX}PRIMARY-NOTE" in ctx, "the fallback is the old behaviour, said aloud"
+    assert "PRIMARY-NOTE" not in ctx, "another session's note was read"
+    assert (repo / ".claude" / "steer.txt").exists(), "another session's note was removed"
+    assert run_hook_with_cwd(repo, gone) is None, "the same fault was said twice in its cooldown"
+
+
+def test_the_sender_writes_to_the_worktree_it_stands_in(
+    primary_and_worktree: tuple[Path, Path],
+) -> None:
+    """The sender and the hook must agree. Run from inside a worktree session, CLAUDE_PROJECT_DIR
+    names the primary, and the sender used to write the note there, where the hook never looked."""
+    repo, wt = primary_and_worktree
+    (wt / ".claude" / "steer.txt").unlink()
+    env = os.environ.copy()
+    env["CLAUDE_PROJECT_DIR"] = str(repo)
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(SEND), "SENT-FROM-THE-WORKTREE"],
+        cwd=str(wt),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (wt / ".claude" / "steer.txt").read_text(encoding="utf-8") == "SENT-FROM-THE-WORKTREE"
+    assert (repo / ".claude" / "steer.txt").read_text(encoding="utf-8") == "PRIMARY-NOTE"

@@ -19,29 +19,31 @@
 
     IT READS THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
     worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, this
-    hook then ran with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
-    Across MessageFoundry worktree transcripts it printed "This chat's worktree: <primary>" 410 times
-    against 48 for a worktree, and told worktree sessions they sat in the shared trunk.
+    hook then ran with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY,
+    so it named the primary as a worktree session's own and told it it sat in the shared trunk.
 
     Only the `cwd` field of the JSON on stdin names the session's worktree. So the hook moves there
     (scripts/hooks/_hookinput.ps1) before its first git call, and presence.ps1, overlap.ps1 and every
     git call below answer for the session. Input with no `cwd` leaves it where it started, as before.
-    A `cwd` it cannot use becomes the banner's first line, and the banner then describes the checkout
-    the hook runs in.
+    A `cwd` it cannot use, or a helper that is missing, becomes the banner's first line, and the
+    banner then describes the checkout the hook runs in. _hookinput.ps1 says what the `cwd` means.
 #>
 $ErrorActionPreference = "SilentlyContinue"
 
 $lines = @()
 
-# Into the session's own directory BEFORE any git call. A helper that fails to load leaves the hook
-# exactly as it was before the helper existed.
+# Into the session's own directory BEFORE any git call. Under SilentlyContinue a dot-source of a
+# missing file does not throw, so the helper is tested for first and its absence is said aloud.
+$cwdFault = ''
+$hookInput = Join-Path $PSScriptRoot '../hooks/_hookinput.ps1'
 try {
-    . (Join-Path $PSScriptRoot '../hooks/_hookinput.ps1')
+    if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw "scripts/hooks/_hookinput.ps1 is missing beside this hook" }
+    . $hookInput
     $cwdFault = Enter-CcxHookCwd -Text (Read-CcxHookInput)
-    if ($cwdFault) {
-        $lines += "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. Everything below describes $((Get-Location).Path), where this hook runs, which may not be your worktree."
-    }
-} catch { }
+} catch { $cwdFault = "the hook could not read its input ($($_.Exception.Message))" }
+if ($cwdFault) {
+    $lines += "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. Everything below describes $((Get-Location).Path), where this hook runs, which may not be your worktree."
+}
 
 # Add parallel-session coordination only when 2+ worktrees share this .git (real collision risk).
 $root = (& git rev-parse --show-toplevel 2>$null)
@@ -49,9 +51,12 @@ if ($root) {
     $wt = @(& git worktree list 2>$null)
     if ($wt.Count -gt 1) {
         $branch = (& git branch --show-current 2>$null)
-        # Primary (trunk) checkout vs a linked worktree: a linked worktree's git-dir is under .git/worktrees/.
-        $gitDir = (& git rev-parse --git-dir 2>$null)
-        $isPrimary = ($gitDir -notmatch 'worktrees')
+        # Primary (trunk) checkout vs a linked worktree: the primary's git-dir IS the common dir. A
+        # match on 'worktrees' in the git-dir misreads a primary that sits under a directory of that
+        # name, once the hook runs from a subdirectory and git prints the path in full.
+        $gitDir = (& git rev-parse --path-format=absolute --git-dir 2>$null)
+        $commonDir = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
+        $isPrimary = ($gitDir -and $commonDir -and ("$gitDir".Trim().TrimEnd('/') -ieq "$commonDir".Trim().TrimEnd('/')))
 
         $lines += ""
         $lines += "[PARALLEL SESSION ($($wt.Count) worktrees active)]"

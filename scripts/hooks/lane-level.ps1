@@ -180,14 +180,17 @@ if ($SelfTest) {
 }
 
 # INTO THE SESSION'S OWN DIRECTORY, BEFORE THE FIRST GIT CALL. See the header. The self-test above
-# never gets here, so it still reads no stdin. A helper that fails to load leaves the hook as it was.
+# never gets here, so it still reads no stdin. A missing helper is said aloud, like a bad `cwd`.
+$cwdFault = ''
 try {
-    . (Join-Path $PSScriptRoot '_hookinput.ps1')
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+    . $hookInput
     $cwdFault = Enter-CcxHookCwd -Text (Read-CcxHookInput)
-    if ($cwdFault) {
-        Say "[lane] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. What follows describes $((Get-Location).Path), where this hook runs."
-    }
-} catch { }
+} catch { $cwdFault = "the hook could not read its input ($($_.Exception.Message))" }
+if ($cwdFault) {
+    Say "[lane] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. What follows describes $((Get-Location).Path), where this hook runs."
+}
 
 $coord = Get-CoordRoot
 if (-not $coord -or -not (Test-Path -LiteralPath $coord)) {

@@ -25,6 +25,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = ROOT / "scripts" / "worktree" / "session-context.ps1"
 PRESENCE = ROOT / "scripts" / "coord" / "presence.ps1"
+HOOKINPUT = ROOT / "scripts" / "hooks" / "_hookinput.ps1"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or os.name != "nt",
@@ -61,6 +62,10 @@ def staged(tmp_path: Path) -> Path:
     (repo / "scripts" / "worktree").mkdir(parents=True)
     (repo / "scripts" / "coord").mkdir(parents=True)
     shutil.copy(CONTEXT, repo / "scripts" / "worktree" / "session-context.ps1")
+    # The shipped layout: the hook dot-sources its input reader from scripts/hooks, and says aloud
+    # when it is missing.
+    (repo / "scripts" / "hooks").mkdir(parents=True)
+    shutil.copy(HOOKINPUT, repo / "scripts" / "hooks" / "_hookinput.ps1")
     return repo
 
 
@@ -74,6 +79,7 @@ def run_context(repo: Path) -> subprocess.CompletedProcess[str]:
             str(repo / "scripts" / "worktree" / "session-context.ps1"),
         ],
         cwd=str(repo),
+        input="",  # the hook reads its input; an inherited stdin would hold the read to its bound
         capture_output=True,
         text=True,
         timeout=180,
@@ -232,8 +238,6 @@ def test_self_is_excluded_from_the_peer_count(staged: Path) -> None:
 # and vary only that field.
 # --------------------------------------------------------------------------------------------------
 
-HOOKINPUT = ROOT / "scripts" / "hooks" / "_hookinput.ps1"
-
 
 def _top(path: Path) -> str:
     """The toplevel exactly as git prints it, which is how the banner prints it."""
@@ -330,3 +334,57 @@ def test_a_cwd_that_does_not_exist_is_said_aloud(
     assert f"This chat's worktree: {_top(repo)}" in out, (
         "the fallback is the old behaviour, said aloud"
     )
+
+
+def test_a_missing_input_reader_is_said_aloud(primary_and_worktree: tuple[Path, Path]) -> None:
+    """Under SilentlyContinue a dot-source of a missing file does not throw, so a hook that relied
+    on the throw would fall back to the primary in silence."""
+    repo, wt = primary_and_worktree
+    (repo / "scripts" / "hooks" / "_hookinput.ps1").unlink()
+    out = run_in_primary(repo, {"hook_event_name": "SessionStart", "cwd": str(wt)})
+    assert "[session-context] COULD NOT READ THIS SESSION'S WORKTREE" in out, out
+    assert "_hookinput.ps1 is missing" in out, out
+
+
+def test_a_primary_under_a_directory_named_worktrees_is_still_the_primary(
+    tmp_path: Path,
+) -> None:
+    """Read from a subdirectory, git prints the git-dir in full, so a test for 'worktrees' in it
+    misreads a primary that sits under a directory of that name. The common dir is the measure."""
+    base = Path(os.path.realpath(tmp_path)) / "worktrees"
+    base.mkdir()
+    repo = base / "primary"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    _git(repo, "worktree", "add", "-q", "-b", "linked", str(base / "linked"))
+    (repo / "scripts" / "worktree").mkdir(parents=True)
+    (repo / "scripts" / "hooks").mkdir(parents=True)
+    shutil.copy(CONTEXT, repo / "scripts" / "worktree" / "session-context.ps1")
+    shutil.copy(HOOKINPUT, repo / "scripts" / "hooks" / "_hookinput.ps1")
+    sub = repo / "sub"
+    sub.mkdir()
+    out = run_in_primary(repo, {"hook_event_name": "SessionStart", "cwd": str(sub)})
+    assert "SHARED PRIMARY checkout" in out, out
+
+
+def test_the_hook_reads_its_input_when_a_shim_runs_it_in_process(
+    primary_and_worktree: tuple[Path, Path],
+) -> None:
+    """The user-level shim runs the hook with `& $s` inside its own pwsh -Command, stdin inherited.
+    The read must reach the input from there too, not only under -File."""
+    repo, wt = primary_and_worktree
+    script = str(repo / "scripts" / "worktree" / "session-context.ps1").replace("'", "''")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", f"& '{script}'"],
+        cwd=str(repo),
+        input=json.dumps({"hook_event_name": "SessionStart", "cwd": str(wt)}).encode("utf-8"),
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+    out = proc.stdout.decode("utf-8", "replace")
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    assert f"This chat's worktree: {_top(wt)}  (branch: linked)" in out, out

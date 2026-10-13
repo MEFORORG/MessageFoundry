@@ -48,7 +48,8 @@
     session's goalPromptedAt landed on the PRIMARY's record. Only the `cwd` field of the JSON on stdin
     names the worktree, so the hook moves there (scripts/hooks/_hookinput.ps1) before it starts
     seat.ps1, which inherits the location. Input with no `cwd` leaves it where it started, as before.
-    A `cwd` it cannot use is reported on the `[seat]` line.
+    A `cwd` it cannot use, or a missing helper, stamps NO record, because the only one left is the
+    primary's. It says so on a `[seat]` line and still prints the prompt.
 
 .NOTES
     Wired at SessionStart. Emits at most one line so it cannot crowd a session's context.
@@ -66,15 +67,25 @@ try {
     $raw = ''
     $cwdFault = ''
     $helper = $false
-    try { . (Join-Path $PSScriptRoot '_hookinput.ps1'); $helper = [bool](Get-Command Enter-CcxHookCwd -EA SilentlyContinue) } catch { }
+    # Tested for first: a dot-source of a missing file is not reliably a throw, and its absence is a
+    # fault to say aloud.
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    try {
+        if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+        . $hookInput
+        $helper = $true
+    } catch { $cwdFault = "the hook could not load its input reader ($($_.Exception.Message))" }
     try {
         if ($helper) { $raw = Read-CcxHookInput }
         elseif (-not [Console]::IsInputRedirected) { $raw = '' }
         else { $raw = [Console]::In.ReadToEnd() }
     } catch { $raw = '' }
     if ($helper -and $raw) { $cwdFault = Enter-CcxHookCwd -Text $raw }
+    # NOTHING IS STAMPED WITHOUT THE SESSION'S WORKTREE. The only record left to stamp is the one for
+    # where this hook started, the primary under the desktop app, and a record there says this session
+    # sits in the primary. The prompt itself is still printed below.
     if ($cwdFault) {
-        Write-Output "[seat] could not read this session's worktree: $cwdFault. The declaration prompt below is stamped on $((Get-Location).Path), where this hook runs."
+        Write-Output "[seat] could not read this session's worktree: $cwdFault. No record was stamped, so the fleet board cannot show that this seat was asked."
     }
 
     $sessionId = ''
@@ -108,8 +119,10 @@ try {
     if ($sessionId) { $args += @('-SessionId', $sessionId) }
     if ($sessionName) { $args += @('-DerivedSeat', $sessionName) }
 
-    $out = & pwsh @args 2>&1
-    $null = $out   # seat.ps1 owns its own error log; -Prompt is deliberately silent
+    if (-not $cwdFault) {
+        $out = & pwsh @args 2>&1
+        $null = $out   # seat.ps1 owns its own error log; -Prompt is deliberately silent
+    }
 
     Write-Output @"
 [seat] Declare what this seat is for before starting work -- one command, and it is what the fleet

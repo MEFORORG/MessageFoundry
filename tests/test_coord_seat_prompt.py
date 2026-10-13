@@ -287,11 +287,17 @@ class TestThePromptLandsOnTheSessionsWorktree:
         _prompt_in_primary(repo, {"session_id": "s1"})
         assert _same_dir(record(repo)["worktree"], repo), record(repo)["worktree"]
 
-    def test_a_cwd_that_does_not_exist_is_said_aloud(
+    def test_a_cwd_that_does_not_exist_stamps_nothing_and_says_so(
         self, repo: Path, linked: Path, tmp_path: Path
     ) -> None:
+        """The only record left to stamp is the primary's, and a record there would say this
+        session sits in the primary. The prompt itself is still printed."""
         gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
         proc = _prompt_in_primary(repo, {"session_id": "s1", "cwd": gone})
         assert "[seat] could not read this session's worktree" in proc.stdout, proc.stdout
         assert "deleted-worktree, which does not exist" in proc.stdout, proc.stdout
-        assert _same_dir(record(repo)["worktree"], repo), "the fallback is the old behaviour"
+        assert "No record was stamped" in proc.stdout, proc.stdout
+        assert "-Declare" in proc.stdout, "the declaration prompt is still printed"
+        common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        seats = Path(common) / "mefor-coord" / "seats"
+        assert not list(seats.rglob("s1.json")), "a record was stamped for a checkout nobody named"

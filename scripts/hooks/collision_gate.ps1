@@ -40,13 +40,15 @@
     IT CHECKS FROM THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
     worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
     hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
-    overlap.ps1 skips "your own worktree" by ITS directory, so from the primary it would report the
-    session's own uncommitted edits as a live peer's and deny the session its own file.
+    overlap.ps1 reads an absolute -File against ITS OWN worktree root. From the primary, a path into a
+    sibling worktree is under no root it knows, matches no row's Files, and the walk prints "[]": the
+    gate allowed every edit a worktree session made, and said nothing. A blind gate, read as all-clear.
 
     Only the `cwd` field of the JSON on stdin names the worktree, so the gate moves there
     (scripts/hooks/_hookinput.ps1) before its first git call and before it starts overlap.ps1. Input
-    with no `cwd` leaves it where it started, as before. A `cwd` it cannot use lands on the unresolved
-    notice below: allowed, and said aloud.
+    with no `cwd` leaves it where it started, as before. A `cwd` it cannot use, one that sits in no
+    checkout, or a missing helper lands on the unresolved notice below: allowed, and said aloud, with
+    its throttle stamp keyed on the cwd the input named.
 #>
 [CmdletBinding()]
 param(
@@ -154,9 +156,15 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
             # other session for the whole cooldown -- and those sessions would read that silence as
             # "checked, nobody is here", which is precisely the defect this notice exists to remove.
             # One session's diagnostic must never become another session's false all-clear.
+            #
+            # $script:StampWho names the session when the gate never reached its directory. git would
+            # then answer for where the gate started, the primary under the desktop app, and every
+            # worktree session would share one stamp, so one session's notice would silence the rest.
             $who = "shared"
-            $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $top) {
+            $top = $null
+            if ($script:StampWho) { $who = $script:StampWho }
+            else { $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null) }
+            if ($top) {
                 $who = (Split-Path ([string]$top).Trim() -Leaf) -replace '[^A-Za-z0-9._-]+', '-'
                 if (-not $who) { $who = "shared" }
             }
@@ -192,15 +200,35 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
 
 $target = $PathOverride
 $cwdFault = ''
+$slug = 'cwd-unusable'
 if (-not $target) {
     if (-not [Console]::IsInputRedirected) { exit 0 }
-    # Read as UTF-8 through the shared helper where it loads, and as before where it does not.
-    try { . (Join-Path $PSScriptRoot '_hookinput.ps1') } catch { }
-    $raw = if (Get-Command Read-CcxHookInput -ErrorAction SilentlyContinue) { Read-CcxHookInput } else { [Console]::In.ReadToEnd() }
+    # Read as UTF-8 through the shared helper. Under SilentlyContinue a dot-source of a missing file
+    # does not throw, so the helper is tested for first. Without it the input is still read, so the
+    # gate can name the file, and then it says it could not check.
+    $hasHelper = $false
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    try {
+        if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+        . $hookInput
+        $hasHelper = $true
+    } catch {
+        $cwdFault = "the gate could not load its input reader ($($_.Exception.Message))"
+        $slug = 'input-reader-missing'
+    }
+    $raw = if ($hasHelper) { Read-CcxHookInput } else { try { [Console]::In.ReadToEnd() } catch { '' } }
     # INTO THE SESSION'S OWN DIRECTORY, BEFORE ANY GIT CALL. See the header: this process may have
     # started in the primary checkout. Moving here is what makes overlap.ps1, a CHILD started in this
-    # location, skip the session's own worktree instead of reporting it as a peer.
-    if (Get-Command Enter-CcxHookCwd -ErrorAction SilentlyContinue) { $cwdFault = Enter-CcxHookCwd -Text $raw }
+    # location, read the edit's path against the session's own worktree.
+    if ($hasHelper) {
+        $cwdFault = Enter-CcxHookCwd -Text $raw
+        # A directory that exists but sits in no checkout is entered without complaint, and overlap.ps1
+        # then finds no repository and prints "[]", the bytes of an all-clear.
+        if (-not $cwdFault) {
+            $wt = Get-CcxHookWorktree -Text $raw
+            if ($wt.Named -and -not $wt.Root) { $cwdFault = $wt.Reason }
+        }
+    }
     try { $hook = $raw | ConvertFrom-Json -ErrorAction Stop } catch {
         Write-Unresolved "payload-unreadable" `
             "the PreToolUse payload on stdin was not readable JSON, so the gate never learned which file this edit targets"
@@ -215,15 +243,27 @@ if (-not $target) {
     $target = [string]$hook.tool_input.file_path
     # NotebookEdit and some variants name the path differently; absence just means nothing to check.
     if (-not $target) { $target = [string]$hook.tool_input.notebook_path }
+    # The stamp is keyed on the cwd the input named, so each session keeps its own notice. See
+    # Write-Unresolved for why a shared stamp is a false all-clear.
+    if ($cwdFault) {
+        $named = ''
+        try { $named = [string]$hook.cwd } catch { $named = '' }
+        if ($named) {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $h = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($named))[0..3] | ForEach-Object { $_.ToString('x2') })
+            $sha.Dispose()
+            $script:StampWho = "cwd-$h"
+        }
+    }
 }
 if (-not $target) { exit 0 }
 
-# A `cwd` the gate cannot use means it does not know which worktree is its own, so overlap.ps1 would
-# count this session's own edits as a peer's. A deny on that is a session blocked by itself, and an
-# allow on it says nothing. So the gate says it could not check, which is its posture for every input
-# it cannot use.
+# The gate could not run from the session's own worktree, so overlap.ps1 would read the edit's path
+# against whatever checkout the gate started in. Under the desktop app that is the primary, where an
+# absolute path into a worktree matches nobody's files and the walk prints "[]". So the gate says it
+# could not check, which is its posture for every input it cannot use.
 if ($cwdFault) {
-    Write-Unresolved "cwd-unusable" "$cwdFault, so the gate cannot tell this session's own worktree from a peer's"
+    Write-Unresolved $slug "$cwdFault, so the gate cannot read this edit against this session's own worktree"
 }
 
 if (-not (Test-Path -LiteralPath $OverlapScript)) {

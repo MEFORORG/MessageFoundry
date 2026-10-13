@@ -181,7 +181,11 @@
     [Console]::In, which decodes with the console code page. Measured the same week, that turns a UTF-8
     `cafe` with an acute e into `caf` plus two box-drawing characters. git then finds no repository at
     that path and the drain exits silent, so that worktree's mail is never shown. The read now goes
-    through scripts/hooks/_hookinput.ps1, and through [Console]::In only where that helper cannot load.
+    through scripts/hooks/_hookinput.ps1.
+
+    A `cwd` THE INPUT NAMES BUT THE DRAIN CANNOT USE READS NO BOX, and neither does a missing helper.
+    Either says "NO BOX ... NOTHING WAS READ", because silence there reads as an empty box, and any
+    other box would be another session's mail for this session's Stop to file.
 
     ASCII-only on purpose; run under pwsh 7 by the hook.
 #>
@@ -703,10 +707,21 @@ function Test-ReceiptProtected {
 try {
     # --- Read the hook input. It carries session_id and cwd, which is our whole addressing substrate.
     # As UTF-8 bytes through the shared helper; see the header for what the console decoder did.
+    # Tested for first: under SilentlyContinue a dot-source of a missing file does not throw.
     $stdinRaw = ''
-    try { . (Join-Path $PSScriptRoot '_hookinput.ps1') } catch { }
-    if (Get-Command Read-CcxHookInput -ErrorAction SilentlyContinue) { $stdinRaw = Read-CcxHookInput }
-    elseif ([Console]::IsInputRedirected) { $stdinRaw = [Console]::In.ReadToEnd() }
+    $cwdFault = ''
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    $hasHelper = $false
+    try {
+        if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+        . $hookInput
+        $hasHelper = $true
+    } catch { $cwdFault = "the drain could not load its input reader ($($_.Exception.Message))" }
+    if ($hasHelper) {
+        $stdinRaw = Read-CcxHookInput
+        $cwdFault = (Get-CcxHookPayloadCwd -Text $stdinRaw).Reason
+    }
+    elseif ([Console]::IsInputRedirected) { try { $stdinRaw = [Console]::In.ReadToEnd() } catch { $stdinRaw = '' } }
     $hook = $null
     try { $hook = $stdinRaw | ConvertFrom-Json } catch { }
     # THE FALLBACK IS NOW LOAD-BEARING, not arbitrary. A payload with no hook_event_name must default to
@@ -725,6 +740,18 @@ try {
     # not been measured against the phantom, and this list is meant to be extended by MEASUREMENT
     # rather than by inference. Adding a member is a measurement, not an edit.
     $consuming = ($eventName -eq 'Stop')
+
+    # NO BOX, AND SAID. The input named a directory the drain cannot use, or the drain could not read
+    # the input as UTF-8. Showing any other box here would be showing another session's mail, and on
+    # Stop this session would then file it as read. So nothing is read, and the reader is told that
+    # this silence is not an empty box.
+    if ($cwdFault) {
+        Write-Injection -Event $eventName -Text (
+            "[mefor-mail] NO BOX. $((Get-Clean $cwdFault 300)), so this drain cannot tell which box is this " +
+            "session's and NOTHING WAS READ. This is not an empty box. As of $([DateTime]::UtcNow.ToString('o'))."
+        )
+        exit 0
+    }
 
     $cwd = if ($hook -and $hook.cwd) { [string]$hook.cwd } else { (Get-Location).Path }
 

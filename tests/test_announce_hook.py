@@ -1465,10 +1465,43 @@ def test_without_a_cwd_the_announcement_names_where_the_hook_runs(
     assert "could not read this session's worktree" not in p.stdout
 
 
-def test_a_cwd_that_does_not_exist_is_said_aloud(repo: Path, linked: Path, tmp_path: Path) -> None:
+def test_a_cwd_that_does_not_exist_announces_nothing(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """The only checkout left to name is where the hook started, the primary under the desktop app.
+    Announcing it would tell every peer this session sits in the primary."""
     sd = tmp_path / "state"
     gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
     p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=gone)
-    assert "[announce] could not read this session's worktree" in p.stdout, p.stdout
     assert "deleted-worktree, which does not exist" in p.stdout, p.stdout
-    assert f"[SESSION-ANNOUNCE] {_top(repo)} (" in p.stdout, "the fallback is the old behaviour"
+    assert "announced nothing" in p.stdout, p.stdout
+    assert "[SESSION-ANNOUNCE]" not in p.stdout, p.stdout
+    assert outcomes(sd) == ["ERROR"], receipts(sd)
+
+
+def test_a_cwd_in_another_repository_stands_down_whatever_the_shim_resolved(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The shim resolves -CommonDir where the hook STARTED. Once the hook is in the session's own
+    directory, that answer may name a different repository from the one the session is in. The MF
+    guard must judge the session's repository, so a session in a foreign repo is left alone."""
+    foreign = Path(os.path.realpath(tmp_path)) / "foreign"
+    foreign.mkdir()
+    _git_init(foreign)
+    common = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    sd = tmp_path / "state"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER],
+        payload_cwd=str(foreign),
+        extra=("-CommonDir", common),
+    )
+    assert p.stdout.strip() == "", p.stdout
+    assert receipts(sd) == [], "a session in a foreign repository left state in this one"

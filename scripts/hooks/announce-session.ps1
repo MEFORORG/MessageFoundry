@@ -71,8 +71,11 @@
 
     So stdin is read FIRST, before any git call, and the hook moves into that `cwd`
     (scripts/hooks/_hookinput.ps1). Every git call, and the mail.ps1 child, then answers for the
-    session. Input with no `cwd` leaves the hook where it started, as before. A `cwd` it cannot use
-    prints one `[announce]` line, and the hook goes on for the checkout it runs in.
+    session. Input with no `cwd` leaves the hook where it started, as before. A `cwd` it cannot use,
+    or a missing helper, announces NOTHING: one `[announce]` line and an ERROR receipt, because the
+    only checkout left to name is where the hook started. Inside the session's directory the hook
+    asks git for the common dir again rather than trusting -CommonDir, which the shim resolved where
+    the hook started.
 
     OUTCOME CODES: ANNOUNCED, ANNOUNCED_MAIL, NO_PEERS, NO_SESSION_ID, NO_LOGIN, LOOKUP_FAILED, LOOKUP_KILLED,
     UNATTENDED, DISABLED, BUDGET_EXHAUSTED, SETTLED, RECENT_CWD, ERROR. There is deliberately NO code for the
@@ -325,27 +328,41 @@ function Write-Receipt {
 try {
     # --- 0. HOOK INPUT, THEN THE SESSION'S OWN DIRECTORY ---------------------------------------------
     # BEFORE ANY GIT CALL. Under the desktop app this process starts in the PRIMARY checkout, and only
-    # the input's `cwd` names the worktree; see the header. A helper that fails to load leaves the read
-    # and the location exactly as they were before the helper existed.
+    # the input's `cwd` names the worktree; see the header. Under SilentlyContinue a dot-source of a
+    # missing file does not throw, so the helper is tested for first. Without it the hook cannot tell
+    # which checkout the session is in, and section 6b says so and announces nothing.
     #
     # '-not $SelfTest' is UNCONDITIONAL, not conditional on redirection: measured on this host,
     # [Console]::IsInputRedirected is True from an agent shell with NO pipe at all, so a read guarded
     # only on redirection turns the diagnostic switch into a hang.
-    try { . (Join-Path $PSScriptRoot '_hookinput.ps1') } catch { }
-    $hasHelper = [bool](Get-Command Enter-CcxHookCwd -ErrorAction SilentlyContinue)
+    $cwdFault = ''
+    $hasHelper = $false
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    try {
+        if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+        . $hookInput
+        $hasHelper = $true
+    } catch { $cwdFault = "the hook could not load its input reader ($($_.Exception.Message))" }
     $raw = $PayloadOverride
     if (-not $raw -and -not $SelfTest) {
         if ($hasHelper) { $raw = Read-CcxHookInput }
-        elseif ([Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() }
+        elseif ([Console]::IsInputRedirected) { try { $raw = [Console]::In.ReadToEnd() } catch { $raw = '' } }
     }
-    $cwdFault = ''
-    if ($hasHelper -and $raw) { $cwdFault = Enter-CcxHookCwd -Text $raw }
+    $moved = $false
+    if ($hasHelper -and $raw) {
+        $cwdFault = Enter-CcxHookCwd -Text $raw
+        $moved = (-not $cwdFault) -and (Get-CcxHookPayloadCwd -Text $raw).Named
+    }
 
     # --- 1. COMMON DIR -------------------------------------------------------------------------------
     # MANDATORY inert-outside-a-repo guarantee: this entry is user-global and runs in every unrelated
     # project on the machine.
+    #
+    # The shim's -CommonDir was resolved where the hook STARTED. Once section 0 has moved into the
+    # session's directory, that answer may be another repository's, and the guard below would pass on
+    # it while $top named this one. So a moved hook asks git again, and stands down outside a repo.
     $cd = $CommonDir
-    if (-not $cd) {
+    if ($moved -or -not $cd) {
         $cd = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
         if ($LASTEXITCODE -ne 0 -or -not $cd) { exit 0 }
     }
@@ -371,14 +388,6 @@ try {
     }
 
     if (-not $isMf) { exit 0 }
-
-    # LOUD, because a silent fallback is the defect section 0 fixes: the announce below would name the
-    # checkout this hook runs in, and a peer reading it would take that for this session's worktree.
-    if ($cwdFault) {
-        $where = if ($top) { $top } else { '(no checkout)' }
-        Write-Output ("[announce] could not read this session's worktree: {0}. Anything announced below names {1}, where this hook runs." -f `
-            ((Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?'), ((Get-Clean $where 150) -replace '[^\x20-\x7E]', '?'))
-    }
 
     # The login lookup lives in the shared registry library, one definition with the liveness fence.
     #
@@ -430,6 +439,21 @@ try {
         }
         $markerKey = $clean
         $script:MarkerKey = $markerKey
+    }
+
+    # --- 6b. NO KNOWN CHECKOUT, NO ANNOUNCEMENT -----------------------------------------------------
+    # Section 0 could not put this hook in the session's directory, so $top is where the hook started:
+    # under the desktop app, the primary. Announcing that would tell every peer the session is in the
+    # primary, which is the defect section 0 fixes. So the hook says why, leaves a receipt, and stops.
+    if ($cwdFault) {
+        $why = (Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?'
+        if ($SelfTest) {
+            Write-Output "[announce -SelfTest] $why; a real run would announce nothing."
+        } else {
+            Write-Output "[announce] $why, so this hook cannot tell which checkout this session is in and announced nothing."
+            Write-Receipt 'ERROR' @{ note = $cwdFault }
+            exit 0
+        }
     }
 
     if (-not $SelfTest) {

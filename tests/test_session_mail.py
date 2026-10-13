@@ -1619,7 +1619,10 @@ def test_an_anchor_is_refused_when_the_cwd_does_not_exist(
     """
     info = seed(repo, tmp_path, [{"body": "vanished cwd"}], box_cwd=container)
     proc = run_drain(repo, cwd=container / "gone", anchor_repo=repo, run_from=container)
-    assert not proc.stdout.strip(), f"a vanished cwd was anchored: {proc.stdout!r}"
+    assert "vanished cwd" not in proc.stdout, f"a vanished cwd was anchored: {proc.stdout!r}"
+    # Not silence: since 2026-10-13 the drain says it read no box, so the reader cannot take the
+    # quiet for an empty box. It still reads nothing, anchored or not.
+    assert "NO BOX" in injection(proc) and "NOTHING WAS READ" in injection(proc), proc.stdout
     assert box_files(repo, str(info["key"]), "inbox")
 
 

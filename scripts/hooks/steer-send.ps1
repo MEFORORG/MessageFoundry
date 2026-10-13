@@ -24,13 +24,18 @@ function Resolve-ProjectDir {
     param([string]$Explicit)
 
     if ($Explicit) { return (Resolve-Path -LiteralPath $Explicit).Path }
-    if ($env:CLAUDE_PROJECT_DIR) { return $env:CLAUDE_PROJECT_DIR }
 
-    # Fall back to the enclosing worktree root. NOT `Get-Location`: the hook only ever reads
-    # <project root>/.claude/steer.txt, so writing relative to an arbitrary CWD drops the note
-    # somewhere nothing looks -- silently, while also littering a stray .claude directory.
+    # The enclosing worktree root FIRST, then CLAUDE_PROJECT_DIR. The desktop app starts a worktree
+    # session with CLAUDE_PROJECT_DIR naming the PRIMARY (measured 2026-10-12), and steer-inject.ps1
+    # reads the note from the worktree its hook input's `cwd` sits in. Trying the variable first sent
+    # a note written from inside a worktree to the primary, where that session never looks.
+    #
+    # NOT `Get-Location`: the hook only ever reads <project root>/.claude/steer.txt, so writing
+    # relative to an arbitrary CWD drops the note somewhere nothing looks -- silently, while also
+    # littering a stray .claude directory.
     $root = & git rev-parse --show-toplevel 2>$null
     if ($LASTEXITCODE -eq 0 -and $root) { return $root.Trim() }
+    if ($env:CLAUDE_PROJECT_DIR) { return $env:CLAUDE_PROJECT_DIR }
 
     throw "Not inside a git worktree and no -ProjectDir given: refusing to guess where the session is."
 }
