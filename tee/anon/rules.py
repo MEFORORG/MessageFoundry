@@ -270,25 +270,32 @@ def _forget_warnings() -> None:
     _warned.clear()
 
 
+#: The header segments. Fields 1 and 2 of each hold delimiters: the field separator and the
+#: encoding characters. So field N of a header line sits at split index N-1, one lower than in
+#: any other segment. The leak-check, the tee adapter and the refusal below read this set. The
+#: engine adapter does NOT: it gets the same numbering from the parser's own list of header ids,
+#: so a change here alone moves the check and the tee away from the engine (BACKLOG #2998).
+HEADER_SEGMENTS: frozenset[str] = frozenset({"MSH", "FHS", "BHS"})
+
 #: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
-#: id, and 3 in MSH, because MSH-1 and MSH-2 hold the message's own delimiters. With either of
-#: those rewritten the output has no readable header, and the leak-check has no separators to
-#: walk it with.
+#: id, and 3 in a header segment, because fields 1 and 2 hold delimiters. With MSH-1 or MSH-2
+#: rewritten the output has no readable header, and the leak-check has no separators to walk it
+#: with. With BHS-1 or FHS-1 rewritten the engine wrote the line with its separators missing.
 _FIRST_REWRITABLE_FIELD = 1
-_FIRST_REWRITABLE_MSH_FIELD = 3
+_FIRST_REWRITABLE_HEADER_FIELD = 3
 
 
 def _unwritable_fields(rules: tuple[FieldRule, ...]) -> tuple[str, ...]:
-    """The fields ``rules`` would rewrite and no rule can: a segment id, MSH-1 or MSH-2. Sorted,
-    and empty when the rule set is fine.
+    """The fields ``rules`` would rewrite and no rule can: a segment id, or field 1 or 2 of a
+    header segment (:data:`HEADER_SEGMENTS`). Sorted, and empty when the rule set is fine.
 
     The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
     path with a stray space or newline are named like ``MSH-2``. A path whose number ``int()``
     cannot read is not a whole-field address, and it is not this check's to name.
     ``FieldRule`` refuses every path that is not a whole-field address when the rule is built,
     field 0 and ``MSH-02`` included (BACKLOG #2330). So for those spellings this check is a
-    second line, and for ``MSH-1`` and ``MSH-2`` it is the only one. A ``KEEP`` rewrites
-    nothing, so it is allowed (BACKLOG #2265).
+    second line, and for fields 1 and 2 of ``MSH``, ``BHS`` and ``FHS`` it is the only one. A
+    ``KEEP`` rewrites nothing, so it is allowed (BACKLOG #2265).
     """
     named: set[str] = set()
     for rule in rules:
@@ -299,15 +306,15 @@ def _unwritable_fields(rules: tuple[FieldRule, ...]) -> tuple[str, ...]:
             field = int(number)
         except ValueError:
             continue
-        is_msh = segment.upper() == "MSH"
-        if field < (_FIRST_REWRITABLE_MSH_FIELD if is_msh else _FIRST_REWRITABLE_FIELD):
+        is_header = segment.upper() in HEADER_SEGMENTS
+        if field < (_FIRST_REWRITABLE_HEADER_FIELD if is_header else _FIRST_REWRITABLE_FIELD):
             named.add(f"{segment}-{field}")
     return tuple(sorted(named))
 
 
 def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
-    """Refuse a rule set that would rewrite a segment id, MSH-1 or MSH-2 (a body-free
-    :class:`AnonError`).
+    """Refuse a rule set that would rewrite a segment id, or field 1 or 2 of ``MSH``, ``BHS`` or
+    ``FHS`` (a body-free :class:`AnonError`).
 
     Both adapters call this for every message, so a rule set built in code meets the refusal
     too. :func:`load_rules` runs the same check once, on the overlay (BACKLOG #2997)."""
@@ -315,8 +322,8 @@ def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
     if named:
         raise AnonError(
             f"a rule names {', '.join(named)}, which no rule can rewrite: field 0 is the "
-            "segment id, and MSH-1 and MSH-2 hold the message's delimiters. Repair or remove a "
-            "later MSH line that carries data there. Refusing to emit"
+            "segment id, and fields 1 and 2 of a header segment (MSH/BHS/FHS) hold delimiters. "
+            "Repair or remove a line that carries data there. Refusing to emit"
         )
 
 
@@ -344,8 +351,9 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     and column. TOML that runs out after a final newline names the last line. A path the system refuses to open is
     reported as the path's fault. It quotes nothing from the file, and it chains no other exception.
 
-    An overlay whose final rule set would rewrite ``MSH-1`` or ``MSH-2`` is refused here too, once,
-    with the field named (BACKLOG #2997). A ``keep`` on either still loads.
+    An overlay whose final rule set would rewrite field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` is
+    refused here too, once, with the field named (BACKLOG #2997, #2998). A ``keep`` on any of
+    them still loads.
 
     A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
     it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
@@ -427,12 +435,14 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
     # Checked on the final rule set, so a later keep on the same path lifts the refusal. Left to
     # the adapters alone, this rule would fail every message and the tee would report a count.
-    # Field 0 never gets this far: the path check above refuses it, so only MSH-1 and MSH-2 can.
+    # Field 0 never gets this far: the path check above refuses it. Only field 1 or 2 of a header
+    # segment can.
     unwritable = _unwritable_fields(rules)
     if unwritable:
         raise RuleError(
             f"anon overlay {overlay} sets a rule on {', '.join(unwritable)}, which no rule can "
-            "rewrite: MSH-1 and MSH-2 hold the message's delimiters. Remove the rule"
+            "rewrite: fields 1 and 2 of a header segment (MSH/BHS/FHS) hold delimiters. Remove "
+            "the rule"
         )
     # Field addresses and kinds only, never a value.
     _warn_once(

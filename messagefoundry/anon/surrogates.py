@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import _pools
 from .keying import Keyer
-from .rules import AnonError, FieldRule, SurrogateKind
+from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind
 
 #: A never-matching pattern — the site-code detector when no prefix is configured (a token-less
 #: public build). ``re`` has no built-in "match nothing", so encode one explicitly.
@@ -460,8 +460,9 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     )
     if has_unreachable_line(text, mapped_paths):
         raise AnonError(
-            "message has a line no rule can reach (a malformed segment id) — refusing to emit; "
-            "repair the line, then retry"
+            "message has a line no rule can reach (a malformed segment id, or a header line with "
+            "no separator after its encoding characters) — refusing to emit; repair the line, "
+            "then retry"
         )
     return text
 
@@ -496,11 +497,12 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
     The OBX-5 case reads OBX-2 from the text it is given. A rule that rewrites OBX-2 hides the date
     type, and that OBX-5 is then scrubbed as before the exemption existed.
 
-    An MSH line is never skipped. Both adapters apply an ``MSH-N`` rule (BACKLOG #2265), but this
-    test does not number MSH fields the MSH way, so a ``DATE`` rule there earns no exemption: its
-    output is checked and scrubbed like any other MSH field. What this lets through: a site
-    code that reads as a year and a month, sitting in a date field, leaves as its first four digits
-    and ``01``.
+    A header line (``MSH``, ``BHS``, ``FHS``) is never skipped. Both adapters apply a rule there
+    (BACKLOG #2265, #2998), but this test does not number a header's fields the header way, so a
+    ``DATE`` rule there earns no exemption: its output is checked and scrubbed like any other
+    header field. Before, a ``BHS-7`` date rule exempted the field one to the right of the one
+    the rule wrote. What this lets through: a site code that reads as a year and a month,
+    sitting in a date field, leaves as its first four digits and ``01``.
     """
     if not _SITE_PREFIXES:
         return lambda fields, index: False  # no site code can match, so there is nothing to skip
@@ -513,7 +515,7 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
 
     def is_date_output(fields: list[str], index: int) -> bool:
         seg_id = fields[0]
-        if index == 0 or seg_id.upper() == "MSH":
+        if index == 0 or seg_id.upper() in HEADER_SEGMENTS:
             return False
         if f"{seg_id}-{index}" not in date_paths and not (
             obx5_dates
@@ -636,9 +638,9 @@ _TIME_OF_DAY = r"""
       )?)?
     (?:[+-](?:(?:0[0-9]|1[0-3])[0-5][0-9]|1400))?  # offset, no wider than 1400 either way
 """
-#: Every character the three grammars are written in. A message that declares one of them as a
-#: separator is not preserved at all: under a repetition separator of ``-``, ``000-12-3456`` splits
-#: into three valid numbers.
+#: Every character the three grammars are written in. No numeric value is kept when one of them is
+#: the component, repetition or subcomponent separator: under a repetition separator of ``-``,
+#: ``000-12-3456`` splits into three valid numbers. The field separator is not read.
 _NUMERIC_GRAMMAR_CHARS = frozenset("0123456789+-.:/<>=")
 #: What each COMPONENT of a preserved numeric value must match, by position. A value with more
 #: components than its type has is refused. ``NM`` takes a leading comparator because ``<5`` under
@@ -672,8 +674,8 @@ def _obx5_parts(value: str, seps: Seps) -> Iterator[str]:
 def _fits_numeric_grammar(grammar: tuple[re.Pattern[str], ...], value: str, seps: Seps) -> bool:
     """True if every repetition of ``value`` fits ``grammar``, component by component. An empty
     component is legal, because an ``SN`` leaves out the parts it does not use. No numeric type has
-    subcomponents, and the patterns refuse that separator like any other stray character. Nothing
-    is kept under a separator the grammars themselves use, because the split would hide it."""
+    subcomponents, and the patterns refuse that separator. Nothing is kept when a grammar uses the
+    component, repetition or subcomponent separator. The field separator is not read."""
     if not _NUMERIC_GRAMMAR_CHARS.isdisjoint((seps.component, seps.repetition, seps.subcomponent)):
         return False
     for rep in value.split(seps.repetition):

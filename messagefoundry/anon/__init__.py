@@ -5,7 +5,9 @@
 Turns a real, messy HL7 v2 message into a **structurally-faithful, de-identified** copy to commit,
 share, and replay as a fixture — the first built slice of the de-identification capability CLAUDE.md
 §9 / PHI.md §9 call planned-not-built. Consumed by the standalone **tee** relay and the PySide6
-**test harness**; a byte-identical ``tee/anon/`` vendors the shared logic for the dependency-free tee.
+**test harness**; ``tee/anon/`` vendors the logic for the dependency-free tee. Only some of its
+files are byte-identical copies: ``tests/test_anon_parity.py`` names which, and checks that the two
+anonymizers give the same output on a generated corpus and a set of hand-written inputs.
 
 Two-layer rule model (ADR 0030 §2): field **selection** is data (:func:`load_rules` over an optional
 ``anon.toml``); surrogate **production** is code (:mod:`.surrogates`). Surrogates are deterministic
@@ -42,6 +44,7 @@ from .leak import (
     coverage_clause,
     leak_check,
     leak_report,
+    message_version,
     refusal_advice,
 )
 from .rules import (
@@ -71,6 +74,7 @@ __all__ = [
     "leak_check",
     "leak_report",
     "load_rules",
+    "message_version",
     "retargeted_defaults",
 ]
 
@@ -146,6 +150,10 @@ def anonymize_checked(
     ``anon.toml`` ``keep`` names, other than :data:`.leak.ALWAYS_DECIDED` (set ids, PID-8, PV1-2).
     It asks whether every field was DECIDED, not whether its value is safe: a kept field passes
     it and is still scanned for PHI shapes. The MSH header is outside its reach (BACKLOG #1710).
+    A line that is a bare segment id and passed, such as an empty ``PV2``, is in the report under
+    its own address. It counts as undecided unless a rule or a ``keep`` names any field of that
+    segment, because a wrapped line of free text that is exactly such an id looks the same
+    (BACKLOG #3001).
 
     The report's ``blanked_fields`` names each field the ``date`` kind scrubbed to empty because the
     value was not a timestamp it could keep. It is a record, not a refusal cause (BACKLOG #2330).
@@ -153,8 +161,11 @@ def anonymize_checked(
     effective = rules if rules is not None else load_rules(overlay)
     blanked: list[str] = []
     output = anonymize(raw, salt=salt, rules=effective, blanked=blanked)
+    # The version of the INPUT: a rule on MSH-12 has put a surrogate in the output, and a
+    # surrogate version can leave out a bare id the real version defines (BACKLOG #3004).
     report = replace(
-        leak_report(output, rules=effective), blanked_fields=tuple(sorted(set(blanked)))
+        leak_report(output, rules=effective, version=message_version(raw)),
+        blanked_fields=tuple(sorted(set(blanked))),
     )
     if on_report is not None:
         on_report(report)
