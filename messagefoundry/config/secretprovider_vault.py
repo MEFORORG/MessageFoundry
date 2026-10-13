@@ -111,6 +111,7 @@ def _build_client(
     *,
     revocation_attested: bool,
     posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
 ) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake KV backend without a live
     Vault. ``addr``/``token`` pass through; when ``None``, hvac falls back to its own VAULT_ADDR/VAULT_TOKEN
@@ -121,7 +122,8 @@ def _build_client(
     setting, or ``False`` where no settings are in scope, which fails closed.
 
     ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
-    enforcing, so leaving it out is the strict answer."""
+    enforcing, so leaving it out is the strict answer. ``revocation_reason`` is the attestation's
+    reason, for the one line an attested crossing logs."""
     hvac = _import_hvac()
     # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): hvac's default is True, and this was
     # one of the three clients that did not carry the no-redirect policy every other shipped HTTP
@@ -162,6 +164,7 @@ def _build_client(
             revocation_attested=revocation_attested,
             attestation_section="secrets",
             posture=posture,
+            revocation_reason=revocation_reason,
         )
     except InsecureHopRefused as exc:
         # BACKLOG #2317: the mount refuses an address that would send the token in cleartext,
@@ -215,6 +218,7 @@ class VaultSecretProvider:
             token,
             revocation_attested=self._settings.vault_revocation_attested,
             posture=self._posture,
+            revocation_reason=self._settings.vault_revocation_attested_reason,
         )
         try:
             # read_secret_version returns {'data': {'data': {<field>: <value>, ...}, 'metadata': {...}}}.

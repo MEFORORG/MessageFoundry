@@ -320,7 +320,11 @@ def build_transit_cipher(
     # unchanged either way: both paths propagate and the cipher provider refuses to come up.
     # lazy hvac import; fails closed naming the [vault] extra
     client = _build_client(
-        addr, token, revocation_attested=settings.vault_revocation_attested, posture=posture
+        addr,
+        token,
+        revocation_attested=settings.vault_revocation_attested,
+        posture=posture,
+        revocation_reason=settings.vault_revocation_attested_reason,
     )
     try:
         # Startup connectivity + key-existence + key-TYPE check: read the key metadata (no crypto, no

@@ -17,6 +17,7 @@ Synthetic data only: every host, token, key name and reason here is made up.
 
 from __future__ import annotations
 
+import logging
 import ssl
 from collections.abc import Callable
 from typing import Any
@@ -92,6 +93,10 @@ def _hop_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "synthetic-data-key")
     monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
+    # A crossing is logged once per process for each hop, so each test starts with none logged.
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setattr(strict_requests, "_CROSSINGS_LOGGED", set())
 
 
 @pytest.fixture
@@ -405,12 +410,22 @@ def _unchecked() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def _refuse(url: str, proxy: str | None = None, **overrides: Any) -> None:
-    from messagefoundry.transports.strict_requests import _refuse_an_unrevoked_vault_hop
+def _refuse(
+    url: str,
+    proxy: str | None = None,
+    *,
+    ssl_context_factory: Callable[[], ssl.SSLContext] = _unchecked,
+    **overrides: Any,
+) -> None:
+    """One call of the guard, with a fresh read of the CRL flag as a new adapter would hold."""
+    from messagefoundry.transports.strict_requests import (
+        _ContextChecksRevocation,
+        _refuse_an_unrevoked_vault_hop,
+    )
 
     arguments: dict[str, Any] = {
         "connector": "Vault test hop",
-        "ssl_context_factory": _unchecked,
+        "checks_revocation": _ContextChecksRevocation(ssl_context_factory),
         "revocation_attested": False,
         "attestation_section": "store",
     }
@@ -455,10 +470,15 @@ def test_a_context_that_checks_revocation_crosses_and_is_read_only_when_needed()
     # The control: the same call on a context without the flag refuses.
     with pytest.raises(VaultHopRefused):
         _refuse(_OFF_BOX)
-    # On the box, or attested, the answer is already ALLOW, so no context is built for it.
+    # On the box the answer is already ALLOW, so no context is built for it.
     _refuse(_ON_BOX, ssl_context_factory=checking)
-    _refuse(_OFF_BOX, ssl_context_factory=checking, revocation_attested=True)
     assert len(built) == 1
+    # Attested, the answer is ALLOW too. The flag is read once more in this process, for the
+    # line the first attested crossing would log, and never for a later one.
+    _refuse(_OFF_BOX, ssl_context_factory=checking, revocation_attested=True)
+    assert len(built) == 2
+    _refuse(_OFF_BOX, ssl_context_factory=checking, revocation_attested=True)
+    assert len(built) == 2
 
 
 @pytest.mark.parametrize("url", ["https://localhost:8200", "https://[::1]:8200", _ON_BOX])
@@ -469,3 +489,212 @@ def test_loopback_is_decided_without_dns(url: str) -> None:
     # A name that only resolves to loopback is not proven on the box.
     with pytest.raises(VaultHopRefused):
         _refuse("https://localhost.synthetic.test:8200")
+
+
+# --- the three answers, and what each one logs ------------------------------------------------
+
+_LOGGER = "messagefoundry.transports.strict_requests"
+_CROSSED = "verified TLS hop crossed without certificate revocation checking"
+
+
+def _crossing_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _LOGGER and _CROSSED in record.getMessage()
+    ]
+
+
+def _assert_names_no_address(line: str) -> None:
+    for absent in (_HOST, _PROXY_HOST, "8200", "3128", _TOKEN, "https://"):
+        assert absent not in line, absent
+
+
+@_ENTRY_POINTS
+@pytest.mark.parametrize("posture", [None, _ENFORCING], ids=["unknown", "enforcing"])
+def test_an_attested_crossing_is_logged_once_for_the_hop_with_its_reason(
+    entry: EntryPoint,
+    posture: HopPosture | None,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Enforcing with the attestation: the hop crosses, and the crossing is on the record. Three
+    client builds in one process log one line, because the secret provider builds a client on
+    every read and the key provider on every DR backup pass.
+    Mutations: drop the ``log_attested_crossing`` call (no line); drop ``_first_crossing`` from
+    its condition (three lines); pass no ``revocation_reason`` at the client build (no reason)."""
+    from messagefoundry.secretscrub import scrub_credentials
+
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    section = _HOPS[entry][2]
+    for _ in range(3):
+        with pytest.raises(_FAIL_CLOSED) as caught:
+            entry(monkeypatch, _OFF_BOX, True, posture)
+        _assert_crossed(caught, entry)
+    assert dials == [(_HOST, 8200)] * 3
+    (line,) = _crossing_lines(caplog)
+    assert "on operator attestation" in line
+    assert _HOPS[entry][1] in line
+    assert f"[{section}].vault_revocation_attested; reason: {_REASON})" in line
+    assert "no CRL lever is built" in line
+    assert "Logged once per process for this hop" in line
+    _assert_names_no_address(line)
+    # The credential scrub on the log handlers leaves the line as it was written.
+    assert scrub_credentials(line) == line
+
+
+@_ENTRY_POINTS
+def test_a_posture_that_is_not_enforcing_warns_once_and_crosses(
+    entry: EntryPoint,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``[security].enforcement = warn`` with no attestation: the hop crosses and says so, once
+    per process. The line names the hop's own pair as the way to cross under ``enforce``.
+    Mutations: delete the WARN arm, so WARN falls through to the refusal (the hop is refused);
+    drop the ``logger.warning`` call (no line); drop ``_first_crossing`` (three lines)."""
+    from messagefoundry.secretscrub import scrub_credentials
+
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    section = _HOPS[entry][2]
+    for _ in range(3):
+        with pytest.raises(_FAIL_CLOSED) as caught:
+            entry(monkeypatch, _OFF_BOX, False, _NOT_ENFORCING)
+        _assert_crossed(caught, entry)
+    assert dials == [(_HOST, 8200)] * 3
+    (line,) = _crossing_lines(caplog)
+    assert "because [security].enforcement is not enforce" in line
+    assert _HOPS[entry][1] in line
+    assert f"refused unless [{section}].vault_revocation_attested is true with its reason" in line
+    assert "on operator attestation" not in line
+    assert TLS_REVOCATION_ATTESTED_ENV not in line
+    _assert_names_no_address(line)
+    assert scrub_credentials(line) == line
+
+
+@_ENTRY_POINTS
+def test_the_crossings_that_log_nothing(
+    entry: EntryPoint,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Three crossings write no line: a Vault on the box, an attested hop on an instance that
+    is not enforcing, where the attestation crossed no refusal, and the blanket variable on such
+    an instance. The controls are the two tests above, on the same address."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    with pytest.raises(_FAIL_CLOSED):
+        entry(monkeypatch, _ON_BOX, False, _ENFORCING)
+    with pytest.raises(_FAIL_CLOSED):
+        entry(monkeypatch, _OFF_BOX, True, _NOT_ENFORCING)
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with pytest.raises(_FAIL_CLOSED):
+        entry(monkeypatch, _OFF_BOX, False, _NOT_ENFORCING)
+    assert len(dials) == 3
+    assert _crossing_lines(caplog) == []
+
+
+def test_a_refusal_logs_no_crossing(
+    monkeypatch: pytest.MonkeyPatch, dials: list[object], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A refused hop crossed nothing, and it does not use up the hop's one line."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    with pytest.raises(_FAIL_CLOSED):
+        _kv(monkeypatch, _OFF_BOX, False, _ENFORCING)
+    assert _crossing_lines(caplog) == []
+    with pytest.raises(_FAIL_CLOSED):
+        _kv(monkeypatch, _OFF_BOX, True, _ENFORCING)
+    assert len(_crossing_lines(caplog)) == 1
+
+
+def test_one_hop_crossed_both_ways_logs_each_once(
+    monkeypatch: pytest.MonkeyPatch, dials: list[object], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The key is the hop and the kind of crossing. The two store hops share one label, one
+    address and one pair, so they share a line; the secret provider has its own."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    for entry in (_kek, _transit, _kv):
+        with pytest.raises(_FAIL_CLOSED):
+            entry(monkeypatch, _OFF_BOX, True, _ENFORCING)
+        with pytest.raises(_FAIL_CLOSED):
+            entry(monkeypatch, _OFF_BOX, False, _NOT_ENFORCING)
+    lines = _crossing_lines(caplog)
+    assert len(lines) == 4
+    assert sum("Vault transit key provider" in line for line in lines) == 2
+    assert sum("Vault KV secret provider" in line for line in lines) == 2
+    assert sum("on operator attestation" in line for line in lines) == 2
+
+
+@pytest.mark.parametrize(
+    ("attested", "posture", "reads"),
+    [
+        # Warned: the answer could turn on the flag, so it is read, at the mount, once.
+        (False, _NOT_ENFORCING, 1),
+        # Attested under an enforcing posture: read once, for the line the crossing logs.
+        (True, _ENFORCING, 1),
+        # Attested where no refusal was crossed: nothing to decide and nothing to log.
+        (True, _NOT_ENFORCING, 0),
+    ],
+    ids=["warned", "attested", "attested-not-enforcing"],
+)
+def test_the_crl_flag_is_read_once_for_a_client_however_many_times_it_sends(
+    attested: bool,
+    posture: HopPosture,
+    reads: int,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+) -> None:
+    """The guard runs at the mount and before every send, and the Transit cipher sends once per
+    stored cell. Reading the flag builds a TLS context, so it is read off one context and kept.
+    Mutation: ``return context_checks_revocation(self._factory())`` with no kept answer."""
+    import requests
+
+    from messagefoundry.config import secretprovider_vault
+    from messagefoundry.transports import strict_requests
+
+    seen: list[object] = []
+    real = strict_requests.context_checks_revocation
+
+    def counting(ctx: ssl.SSLContext | None) -> bool:
+        seen.append(ctx)
+        return real(ctx)
+
+    monkeypatch.setattr(strict_requests, "context_checks_revocation", counting)
+    client = secretprovider_vault._build_client(
+        _OFF_BOX,
+        _TOKEN,
+        revocation_attested=attested,
+        posture=posture,
+        revocation_reason=_REASON if attested else None,
+    )
+    assert len(seen) == reads
+    for _ in range(4):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            client.adapter.get("v1/secret/data/mefor/ad")
+    assert len(dials) == 4
+    assert len(seen) == reads
+
+
+def test_one_hop_under_every_posture() -> None:
+    """The decision table, on the guard itself: a posture that is not enforcing crosses with no
+    attestation, and an enforcing or unknown one needs it."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    _refuse(_OFF_BOX, posture=_NOT_ENFORCING)
+    for posture in (None, _ENFORCING):
+        with pytest.raises(VaultHopRefused):
+            _refuse(_OFF_BOX, posture=posture)
+        _refuse(_OFF_BOX, posture=posture, revocation_attested=True)
+
+
+def test_an_answer_the_guard_does_not_know_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ALLOW and WARN are named, and everything else refuses. So a fourth answer added to the
+    shared authority later fails closed here.
+    Mutation: ``if disposition is not HopDisposition.REFUSE: return`` in place of the WARN arm."""
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setattr(strict_requests, "revocation_hop_disposition", lambda **_: object())
+    with pytest.raises(strict_requests.VaultHopRefused):
+        _refuse(_OFF_BOX, posture=_NOT_ENFORCING)

@@ -72,7 +72,8 @@ own would turn that test red.
 
 **A verifying hop that checks no revocation is refused unless it is attested (vault BACKLOG
 #2983, owner ruling 2026-10-13).** :func:`_refuse_an_unrevoked_vault_hop` says how. It runs when the
-client is built and again before each send, on the same inputs.
+client is built and again before each send, on the same inputs. On an instance that is not
+enforcing, the same hop is crossed with a warning.
 
 **A refusal of the hop is one type at both phases (BACKLOG #2318).** Every check on the hop itself,
 its address, its proxy, its TLS leg or its pool, raises :class:`VaultHopRefused`, an
@@ -86,9 +87,11 @@ shrinking it to a type name.
 from __future__ import annotations
 
 import http.client
+import logging
 import re
 import socket
 import ssl
+import threading
 import urllib.parse
 from collections.abc import Callable
 from typing import Any, Literal
@@ -111,6 +114,7 @@ from messagefoundry.config.tls_policy import (
     context_checks_revocation,
     insecure_hop_disposition,
     is_loopback_hop_host,
+    log_attested_crossing,
     revocation_hop_disposition,
     tls_revocation_attested,
 )
@@ -121,6 +125,8 @@ from messagefoundry.transports.bounded_read import (
     StrictHTTPResponse,
     read_bounded,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAX_VAULT_REPLY_BYTES",
@@ -422,7 +428,8 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
     :func:`_refuse_an_unrevoked_vault_hop` reads them before each ``https://`` send.
 
     ``posture`` is the instance posture the caller holds. It may be left out, because leaving it
-    out is the strict answer: ``None`` counts as enforcing.
+    out is the strict answer: ``None`` counts as enforcing. ``revocation_reason`` is the
+    attestation's reason, and it is only ever logged.
     """
 
     #: requests copies an adapter's state through these names, then rebuilds its pool manager, so
@@ -437,6 +444,8 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         "_revocation_attested",
         "_attestation_section",
         "_posture",
+        "_revocation_reason",
+        "_checks_revocation",
     ]
 
     def __init__(
@@ -447,6 +456,7 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         revocation_attested: bool,
         attestation_section: VaultAttestationSection,
         posture: HopPosture | None = None,
+        revocation_reason: str | None = None,
         limit: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         # Set BEFORE super().__init__(), which builds the pool manager through init_poolmanager.
@@ -458,6 +468,9 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         self._revocation_attested = revocation_attested
         self._attestation_section = attestation_section
         self._posture = posture
+        self._revocation_reason = revocation_reason
+        # One read for the client's whole life: the mount and every send share it.
+        self._checks_revocation = _ContextChecksRevocation(ssl_context_factory)
 
     def init_poolmanager(
         self,
@@ -527,16 +540,24 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
             _refuse_a_cleartext_vault_hop(url, proxy, connector=self._connector)
         # Vault BACKLOG #2983: checked at construction too. This catches a proxy that appeared
         # since, which takes a loopback Vault off the box.
+        self.refuse_an_unrevoked_hop(url, proxy)
+        return pool
+
+    def refuse_an_unrevoked_hop(self, url: str, proxy: str | None) -> None:
+        """Run :func:`_refuse_an_unrevoked_vault_hop` on one hop of this adapter.
+
+        One method for the mount and for each send, so both judge on the same inputs and share
+        one read of the CRL flag."""
         _refuse_an_unrevoked_vault_hop(
             url,
             proxy,
             connector=self._connector,
-            ssl_context_factory=self._ssl_context_factory,
+            checks_revocation=self._checks_revocation,
             revocation_attested=self._revocation_attested,
             attestation_section=self._attestation_section,
             posture=self._posture,
+            revocation_reason=self._revocation_reason,
         )
-        return pool
 
     def send(
         self, request: requests.PreparedRequest, *args: Any, **kwargs: Any
@@ -827,15 +848,72 @@ _SECRETS_REVOCATION_LEVER = (
 )
 
 
+#: What both crossing records say about the hop. Fixed text, like the refusal: it names no part
+#: of the address and no proxy.
+_UNCHECKED_VAULT_HOP = (
+    "the Vault server certificate is verified, but this hop checks no certificate revocation "
+    "(no CRL and no OCSP), and no CRL lever is built for it"
+)
+#: How a crossing record names the hop's pair. A log line, not a refusal, so it is built here.
+_REVOCATION_PAIR: dict[VaultAttestationSection, str] = {
+    "store": "[store].vault_revocation_attested",
+    "secrets": "[secrets].vault_revocation_attested",
+}
+
+#: The crossings already logged in this process, by connector label and kind.
+_CROSSINGS_LOGGED: set[tuple[str, str]] = set()
+_CROSSINGS_LOCK = threading.Lock()
+
+
+def _first_crossing(connector: str, kind: str) -> bool:
+    """Whether this is the first ``kind`` of crossing on the ``connector`` hop in this process.
+
+    A crossing is logged once per process for each hop, not at every client build. The secret
+    provider builds a client on every ``resolve``, and the key provider on every DR backup pass,
+    so a line per build would repeat without end and bury the first one.
+
+    **The hop is named by its connector label.** The key provider and the Transit cipher share
+    one label, one Vault address and one settings pair, so they share one line. A process that
+    crosses the same hop both ways, attested and warned, logs each once."""
+    key = (connector, kind)
+    with _CROSSINGS_LOCK:
+        if key in _CROSSINGS_LOGGED:
+            return False
+        _CROSSINGS_LOGGED.add(key)
+        return True
+
+
+class _ContextChecksRevocation:
+    """Whether the contexts ``factory`` builds check revocation, read once and kept.
+
+    The guard runs at the mount and again before every send. Building a context costs about
+    11 ms (a review agent's measurement, 2026-10-13), and the Transit cipher sends once per
+    stored cell. So the flag is read off one context the factory builds, the first time the
+    answer could matter, and that answer is kept for the adapter's life. Every connection's
+    context comes from the same factory."""
+
+    __slots__ = ("_answer", "_factory")
+
+    def __init__(self, factory: Callable[[], ssl.SSLContext]) -> None:
+        self._factory = factory
+        self._answer: bool | None = None
+
+    def __call__(self) -> bool:
+        if self._answer is None:
+            self._answer = context_checks_revocation(self._factory())
+        return self._answer
+
+
 def _refuse_an_unrevoked_vault_hop(
     url: str,
     proxy: str | None,
     *,
     connector: str,
-    ssl_context_factory: Callable[[], ssl.SSLContext],
+    checks_revocation: Callable[[], bool],
     revocation_attested: bool,
     attestation_section: VaultAttestationSection,
     posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
 ) -> None:
     """Refuse a verifying Vault hop that checks no revocation and carries no attestation (vault
     BACKLOG #2983, owner ruling 2026-10-13).
@@ -860,14 +938,37 @@ def _refuse_an_unrevoked_vault_hop(
     * ``tls_revocation_attested()``, the process-wide variable, goes in ``blanket_attested``
       only. The authority ranks that below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing posture.
-    * ``crl_checked`` is read off a context the factory builds, never off a setting. No CRL
-      lever is built for this hop, so it is ``False`` today. The context is built only when the
-      answer could matter, since the two inputs above each allow without it.
+    * ``crl_checked`` is ``checks_revocation()``, which reads the flag off a context the hop's
+      own factory builds, never off a setting (:class:`_ContextChecksRevocation`). No CRL lever
+      is built for this hop, so it is ``False`` today. It is asked only when the answer could
+      matter: the authority is asked first without it, and a CRL check can only turn that
+      answer into ALLOW.
     * ``posture`` is the instance posture the caller holds, or ``None``. **An unknown posture
       counts as enforcing.** The providers hold no ``[security]`` section, so each caller hands
       its own posture down, and a caller that holds none passes ``None``. That is at least every
       command that opens a store with no posture, and it is refused like an enforcing instance,
       on purpose. ``tests/test_vault_posture_census.py`` lists what each caller passes.
+
+    **The three answers.**
+
+    * REFUSE raises. It needs an enforcing or unknown posture, and a hop that is off the box,
+      not attested and not CRL-checked.
+    * WARN crosses and logs a WARNING. It is the same hop on an instance whose
+      ``[security].enforcement`` is not ``enforce``. The line names the hop's pair as the way to
+      cross under ``enforce``.
+    * ALLOW crosses. A hop that crossed an enforcing or unknown posture on its attestation logs
+      a WARNING through ``tls_policy.log_attested_crossing``, with ``revocation_reason``. A hop
+      on the box logs nothing, and neither does a hop whose context checks a CRL.
+
+    Each line is logged once per process for each hop (:func:`_first_crossing`). Neither is an
+    ``audit`` table row: the hop can be dialled before any store is open.
+
+    **The process-wide variable is silent where it counts.** On an instance that is not
+    enforcing, ``MEFOR_TLS_REVOCATION_ATTESTED`` turns WARN into ALLOW, as the authority ranks
+    it, and no line is logged for that crossing. Under an enforcing or unknown posture it
+    changes nothing.
+
+    Any answer that is none of the three refuses, so a new one fails closed.
 
     Never ``RevocationHopGuard.enforce_construction`` or ``enforce_insecure_hop``: each raises
     the unmarked base type, and the guard's text echoes the host. Raises
@@ -882,18 +983,54 @@ def _refuse_an_unrevoked_vault_hop(
         return
     on_box = _stays_on_the_box(host, proxy)
     attested = revocation_attested is True
-    disposition = revocation_hop_disposition(
-        # An unknown posture is enforcing: `fail_closed` turns `None` into the strict value.
-        enforcing=HopPosture.fail_closed(
-            enforcing=None if posture is None else posture.enforcing
-        ).enforcing,
-        is_loopback_hop=on_box,
-        proxy_proven=False,
-        attested=attested,
-        crl_checked=not (on_box or attested) and context_checks_revocation(ssl_context_factory()),
-        blanket_attested=tls_revocation_attested(),
-    )
+    # An unknown posture is enforcing: `fail_closed` turns `None` into the strict value.
+    enforcing = HopPosture.fail_closed(
+        enforcing=None if posture is None else posture.enforcing
+    ).enforcing
+
+    def decide(crl_checked: bool) -> HopDisposition:
+        return revocation_hop_disposition(
+            enforcing=enforcing,
+            is_loopback_hop=on_box,
+            proxy_proven=False,
+            attested=attested,
+            crl_checked=crl_checked,
+            blanket_attested=tls_revocation_attested(),
+        )
+
+    disposition = decide(False)
+    if disposition is not HopDisposition.ALLOW and checks_revocation():
+        disposition = decide(True)
     if disposition is HopDisposition.ALLOW:
+        # The attestation is why this hop crossed only where nothing above it in the authority
+        # allowed it: off the box, and with no CRL check. The flag is read last, and only for
+        # the one line this process logs.
+        if (
+            attested
+            and enforcing
+            and not on_box
+            and _first_crossing(connector, "attested")
+            and not checks_revocation()
+        ):
+            log_attested_crossing(
+                logger,
+                crossing="verified TLS hop crossed without certificate revocation checking",
+                connection=None,
+                detail=f"{connector}; {_UNCHECKED_VAULT_HOP}. Logged once per process for this hop",
+                reason=revocation_reason,
+                declaration=_REVOCATION_PAIR[attestation_section],
+            )
+        return
+    if disposition is HopDisposition.WARN:
+        if _first_crossing(connector, "warned"):
+            logger.warning(
+                "verified TLS hop crossed without certificate revocation checking, because "
+                "[security].enforcement is not enforce; %s; %s. Under enforce this hop is "
+                "refused unless %s is true with its reason. Logged once per process for this hop.",
+                connector,
+                _UNCHECKED_VAULT_HOP,
+                _REVOCATION_PAIR[attestation_section],
+            )
         return
     # Two raise sites, so each text is built from module constants alone and the source scan in
     # tests/test_vault_hop_refusal_marker.py can hold it to that.
@@ -994,6 +1131,7 @@ def mount_strict_reply_adapter(
     revocation_attested: bool,
     attestation_section: VaultAttestationSection,
     posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
     limit: int = DEFAULT_MAX_RESPONSE_BYTES,
 ) -> None:
     """Mount :class:`StrictReplyAdapter` for both schemes on ``client``'s ``requests`` session.
@@ -1015,6 +1153,8 @@ def mount_strict_reply_adapter(
 
     ``posture`` is the instance posture the caller holds, or ``None`` where it holds none.
     ``None`` counts as enforcing, so a caller that leaves it out gets the strict answer.
+    ``revocation_reason`` is the attestation's ``vault_revocation_attested_reason``. It is only
+    logged, on the line an attested crossing writes.
 
     ``limit`` is the reply ceiling. The Transit client passes :data:`MAX_VAULT_REPLY_BYTES`; the KV
     client reads small secrets and keeps the shared egress ceiling.
@@ -1045,15 +1185,6 @@ def mount_strict_reply_adapter(
             request_kwargs.get("proxies") if isinstance(request_kwargs, dict) else None
         ),
     )
-    _refuse_an_unrevoked_vault_hop(
-        sent,
-        proxy,
-        connector=connector,
-        ssl_context_factory=ssl_context_factory,
-        revocation_attested=revocation_attested,
-        attestation_section=attestation_section,
-        posture=posture,
-    )
     adapter = StrictReplyAdapter(
         connector=connector,
         limit=limit,
@@ -1061,6 +1192,10 @@ def mount_strict_reply_adapter(
         revocation_attested=revocation_attested,
         attestation_section=attestation_section,
         posture=posture,
+        revocation_reason=revocation_reason,
     )
+    # Before the adapter is mounted, so a refused hop leaves the session as hvac built it. The
+    # adapter runs the check, so this one and each send's share its one read of the CRL flag.
+    adapter.refuse_an_unrevoked_hop(sent, proxy)
     for prefix in ("https://", "http://"):
         session.mount(prefix, adapter)

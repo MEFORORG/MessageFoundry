@@ -116,6 +116,7 @@ def _build_client(
     *,
     revocation_attested: bool,
     posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
 ) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake Transit backend without
     a live Vault. ``addr``/``token`` are passed through; when ``None``, hvac falls back to its own
@@ -126,7 +127,8 @@ def _build_client(
     Pass the setting, or ``False`` where no settings are in scope, which fails closed.
 
     ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
-    enforcing, so leaving it out is the strict answer."""
+    enforcing, so leaving it out is the strict answer. ``revocation_reason`` is the attestation's
+    reason, for the one line an attested crossing logs."""
     hvac = _import_hvac()
     # ASVS 4.2.5: ``token`` ships as an ``X-Vault-Token`` request header on EVERY Transit
     # encrypt/decrypt/HMAC call, and ``addr`` becomes the request URL -- both from MEFOR_* env, and
@@ -190,6 +192,7 @@ def _build_client(
             revocation_attested=revocation_attested,
             attestation_section="store",
             posture=posture,
+            revocation_reason=revocation_reason,
             limit=MAX_VAULT_REPLY_BYTES,
         )
     except InsecureHopRefused as exc:
@@ -357,6 +360,7 @@ class VaultKeyProvider:
             token,
             revocation_attested=self._settings.vault_revocation_attested,
             posture=self._posture,
+            revocation_reason=self._settings.vault_revocation_attested_reason,
         )
         try:
             # BACKLOG #1166. Check the KEK's TYPE before unwrapping under it. Unlike the Transit

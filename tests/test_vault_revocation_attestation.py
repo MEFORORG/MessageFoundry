@@ -331,6 +331,41 @@ def test_every_vault_client_build_is_listed_and_none_is_a_no_op() -> None:
     assert sorted(found) == _BUILDERS
 
 
+def _reason_problems(source: str) -> list[str]:
+    """Each client build in ``source`` that passes a setting as its flag and not that same
+    object's reason."""
+    problems = []
+    for call in call_sites(parse_source(source), _BUILD):
+        flag = _keyword(call, _FLAG)
+        if flag is None or ast.unparse(flag) not in _OWN_SETTING:
+            continue
+        reason = _keyword(call, "revocation_reason")
+        wanted = f"{ast.unparse(flag)}_reason"
+        if reason is None or ast.unparse(reason) != wanted:
+            problems.append(f"line {call.lineno}: revocation_reason is not {wanted}")
+    return problems
+
+
+def test_every_build_that_passes_its_setting_passes_that_settings_reason() -> None:
+    """An attested crossing logs its reason, so each build hands down the reason that sits
+    beside the flag it passes. Without it the line would read ``(none provided)``."""
+    checked = 0
+    for path in _modules():
+        source = path.read_text(encoding="utf-8")
+        if _BUILD in source:
+            assert _reason_problems(source) == [], path.relative_to(_PACKAGE).as_posix()
+            checked += sum(shape == "setting" for _, _, shape in _builders(source, ""))
+    # The control that the scan read something: the builds listed with a setting.
+    assert checked == sum(shape == "setting" for _, _, shape in _BUILDERS)
+    # And that it can fail: a build with the flag and no reason, and one with another's reason.
+    flag = "revocation_attested=self._settings.vault_revocation_attested"
+    assert len(_reason_problems(f"_build_client(a, t, {flag})")) == 1
+    other = "revocation_reason=other.vault_revocation_attested_reason"
+    assert len(_reason_problems(f"_build_client(a, t, {flag}, {other})")) == 1
+    own = "revocation_reason=self._settings.vault_revocation_attested_reason"
+    assert _reason_problems(f"_build_client(a, t, {flag}, {own})") == []
+
+
 def test_the_build_census_sees_a_call_a_listed_one_could_hide() -> None:
     """The control for the census, from the second review round. Three plants that a census keyed
     by function name would have missed: a build outside any function, a literal ``True`` ahead of

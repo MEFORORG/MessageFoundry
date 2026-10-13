@@ -265,9 +265,11 @@ _CENSUS: list[Row] = sorted(
         ("store/keyprovider_vault.py", "build_provider", "VaultKeyProvider", "posture"),
         ("store/keyprovider_vault.py", "store_vault_client", "_build_client", "posture"),
         ("support/bundle.py", "_db_info", "open_store", "-"),
+        # The adapter keeps the posture it was built with. Its one method runs the guard for the
+        # mount and for each send, so the guard has one caller.
         (
             "transports/strict_requests.py",
-            "StrictReplyAdapter.get_connection_with_tls_context",
+            "StrictReplyAdapter.refuse_an_unrevoked_hop",
             "_refuse_an_unrevoked_vault_hop",
             "self._posture",
         ),
@@ -275,12 +277,6 @@ _CENSUS: list[Row] = sorted(
             "transports/strict_requests.py",
             "mount_strict_reply_adapter",
             "StrictReplyAdapter",
-            "posture",
-        ),
-        (
-            "transports/strict_requests.py",
-            "mount_strict_reply_adapter",
-            "_refuse_an_unrevoked_vault_hop",
             "posture",
         ),
         ("verify/checks.py", "check_lockable_accounts._census", "open_store", "-"),
