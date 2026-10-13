@@ -71,6 +71,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     RevocationHopGuard,
     build_smtp_tls_context,
+    hop_name_prefix,
     smtp_login_approved,
 )
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
@@ -315,6 +316,48 @@ def checked_sender(cell: str, sender: str) -> list[Address]:
     return _checked_header(cell, "From", [sender], "sender")
 
 
+def refuse_unverified_smtp_credential(
+    cell: str,
+    *,
+    connection: str | None,
+    username: str | None,
+    use_tls: bool,
+    tls_verify: bool,
+    tls_check_hostname: bool,
+) -> None:
+    """Refuse an SMTP login to a peer the engine has not verified: a cleartext hop, or TLS with the
+    certificate check or the name check off. The Email and Direct destinations both call it, first,
+    so no refusal that offers an escape or an attestation is reached by a credentialed hop. None of
+    those lifts this one (docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
+    unverified peer*; vault BACKLOG #3230).
+
+    The name-check arm is BACKLOG #1314: with the chain verified and the name not, any certificate
+    from the anchor is accepted, whoever it was issued to.
+
+    Keyed on ``username``, because the connectors log in only when one is set. Raises
+    :class:`ValueError` naming ``connection`` and the settings that do fix it, never the
+    credential."""
+    if username is None:
+        return
+    if not use_tls:
+        weakness = "over cleartext (use_tls=false)"
+        need = "STARTTLS/implicit TLS"
+    elif not tls_verify:
+        weakness = "over an unverified TLS session (tls_verify=false)"
+        need = "a verified TLS session"
+    elif not tls_check_hostname:
+        weakness = "over a TLS session whose peer NAME is unverified (tls_check_hostname=false)"
+        need = "a session bound to the host, not merely to the trust anchor"
+    else:
+        return
+    raise ValueError(
+        f"{hop_name_prefix(connection)}{cell} sends SMTP authentication credentials {weakness}; "
+        f"refused -- credentials require {need}. No escape, posture or attestation lifts this. "
+        "Turn on use_tls, tls_verify and tls_check_hostname (all on by default), and pin a private "
+        "CA with tls_ca_file if the relay's certificate does not chain to a public root."
+    )
+
+
 class EmailDestination(DestinationConnector):
     """Deliver each transformed payload as a plain-text SMTP email (outbound only — ADR 0029 Phase 1).
 
@@ -385,6 +428,17 @@ class EmailDestination(DestinationConnector):
         # the guard reads the CRL flag off that context). Only that arm ever sets it; the cleartext and
         # verify-off arms carry their own gates and deliberately have no revocation guard.
         revocation_guard_pending = False
+        # The credential refusal runs before the arms below, because the levers their refusals name
+        # (the escape, tls_hop_attested, cleartext_accepted) never lift it (vault BACKLOG #3230).
+        # Each arm then decides only the hop's body, with no credential on it.
+        refuse_unverified_smtp_credential(
+            "Email destination",
+            connection=config.name,
+            username=self.username,
+            use_tls=self.use_tls,
+            tls_verify=self.tls_verify,
+            tls_check_hostname=self.tls_check_hostname,
+        )
         if not self.use_tls:
             # ADR 0153: `cleartext_accepted` joins this disjunction. The pre-gate fires BEFORE the shared
             # authority below, so without this arm an SMTP outbound that declared the acceptance would
@@ -405,13 +459,6 @@ class EmailDestination(DestinationConnector):
                     "is accepted), or "
                     f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
                     "(dev/trusted-network only) — use STARTTLS (the default)."
-                )
-            # Credentials over an un-encrypted channel are never allowed, even with the escape: a
-            # cleartext AUTH puts the password on the wire (the refuse_cleartext_credentials rule).
-            if self.username is not None:
-                raise ValueError(
-                    "Email destination sends SMTP authentication credentials over cleartext (use_tls=false); "
-                    "refused — credentials require STARTTLS/implicit TLS"
                 )
             # #200 (ADR 0092): the credential is refused outright above, but the message BODY is PHI and
             # was previously only WARNed about before being put on the wire — a warn where the (strictly
@@ -450,32 +497,10 @@ class EmailDestination(DestinationConnector):
                     "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
                     "has no effect while enforcing, the default, or with no posture)."
                 )
-            # Credentials over an unauthenticated channel are refused for the same reason they are
-            # refused over cleartext: an on-path attacker who can present any cert can capture the
-            # AUTH exchange. The use_tls=false arm above states the cleartext half of this rule.
-            if self.username is not None:
-                raise ValueError(
-                    "Email destination sends SMTP authentication credentials over an unverified TLS session "
-                    "(tls_verify=false); refused — credentials require a verified TLS session"
-                )
             # No RevocationHopGuard here: a hop that does not verify the certificate at all has nothing
             # whose revocation status could matter, and the composition rule forbids two gates deciding
             # the same hop (docs/DEPLOYMENT.md §"composition"). The refusal above is that hop's gate.
         else:
-            # BACKLOG #1314: the THIRD weakening axis. The chain IS verified here, but with
-            # `tls_check_hostname=false` the peer NAME is not, so any certificate chaining to the
-            # configured anchor is accepted whatever it was issued to -- the AUTH exchange then
-            # hands the credential to a peer whose identity was never established.
-            #
-            # ABSOLUTE, like the two arms above, and deliberately keyed on no escape: in both of
-            # them the escape governs the BODY posture and never the CREDENTIAL. A third arm keeps
-            # that split, so a hop cannot attest its way to a credentialed unverified-name session.
-            if not self.tls_check_hostname and self.username is not None:
-                raise ValueError(
-                    "Email destination sends SMTP authentication credentials over a TLS session whose peer NAME is "
-                    "unverified (tls_check_hostname=false); refused — credentials require a "
-                    "session bound to the host, not merely to the trust anchor"
-                )
             # #201 (ADR 0078 amendment): the hop now genuinely verifies the server cert (#323 — it did
             # not before; smtplib's default context is ssl._create_unverified_context), but stdlib ssl
             # does NO OCSP/CRL revocation, so a revoked-but-unexpired SMTP-server cert is still

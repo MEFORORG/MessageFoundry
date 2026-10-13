@@ -86,7 +86,7 @@ from messagefoundry.transports.base import (
     float_setting,
     register_destination,
 )
-from messagefoundry.transports.email import checked_envelope
+from messagefoundry.transports.email import checked_envelope, refuse_unverified_smtp_credential
 
 __all__ = ["DirectDestination"]
 
@@ -403,7 +403,16 @@ class DirectDestination(DestinationConnector):
         # STARTTLS-by-default posture, identical to EmailDestination: the S/MIME body already protects
         # PHI, but the SMTP session still carries envelope metadata + any AUTH credentials, so cleartext
         # SMTP is refused unless the project-wide dev escape is set, and credentials are NEVER sent over
-        # a cleartext channel.
+        # a cleartext channel. The credential refusal is Email's, and runs first for Email's reason:
+        # no lever the arms below name lifts it (vault BACKLOG #3230).
+        refuse_unverified_smtp_credential(
+            "Direct destination",
+            connection=config.name,
+            username=self.username,
+            use_tls=self.use_tls,
+            tls_verify=self.tls_verify,
+            tls_check_hostname=self.tls_check_hostname,
+        )
         if not self.use_tls:
             # #323: read through the CLAMPED escape, not the raw insecure_tls_allowed(). This call site
             # was the last unclamped one in the file, sitting one branch away from the clamped arm
@@ -427,11 +436,6 @@ class DirectDestination(DestinationConnector):
                     "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
                     "or with no posture) — use STARTTLS (the default)"
                 )
-            if self.username is not None:
-                raise ValueError(
-                    "Direct destination sends SMTP authentication credentials over cleartext (use_tls=false); "
-                    "refused — credentials require STARTTLS/implicit TLS"
-                )
             logger.warning(
                 "Direct destination %s has TLS disabled (use_tls=false); the SMTP session crosses the "
                 "network in CLEARTEXT (dev/trusted-network only)",
@@ -449,26 +453,6 @@ class DirectDestination(DestinationConnector):
                     f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
                     "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
                     "has no effect while enforcing, the default, or with no posture)."
-                )
-            if self.username is not None:
-                raise ValueError(
-                    "Direct destination sends SMTP authentication credentials over an unverified TLS session "
-                    "(tls_verify=false); refused — credentials require a verified TLS session"
-                )
-        else:
-            # BACKLOG #1314: the THIRD weakening axis. The chain IS verified here, but with
-            # `tls_check_hostname=false` the peer NAME is not, so any certificate chaining to the
-            # configured anchor is accepted whatever it was issued to -- the AUTH exchange then
-            # hands the credential to a peer whose identity was never established.
-            #
-            # ABSOLUTE, like the two arms above, and deliberately keyed on no escape: in both of
-            # them the escape governs the BODY posture and never the CREDENTIAL. A third arm keeps
-            # that split, so a hop cannot attest its way to a credentialed unverified-name session.
-            if not self.tls_check_hostname and self.username is not None:
-                raise ValueError(
-                    "Direct destination sends SMTP authentication credentials over a TLS session whose peer "
-                    "NAME is unverified (tls_check_hostname=false); refused — credentials "
-                    "require a session bound to the host, not merely to the trust anchor"
                 )
         # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
         # DIRECT WITH NO SMTP CREDENTIAL does not take a RevocationHopGuard even though the hop now

@@ -850,6 +850,24 @@ def test_credentials_over_a_fully_verified_hop_still_construct(pki: dict[str, An
     DirectDestination(_dest(pki, username="svc", password="pw"))
 
 
+@pytest.mark.parametrize(
+    "weak",
+    [{"use_tls": False}, {"tls_verify": False}, {"tls_check_hostname": False}],
+    ids=["cleartext", "verify-off", "name-off"],
+)
+def test_a_credential_refusal_names_the_connection_and_no_escape(
+    pki: dict[str, Any], weak: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3230: the credential refusal runs before the body refusal, which offers the
+    escape, so an enforcing instance is told the fix that works rather than one that does not."""
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with pytest.raises(ValueError, match="authentication credentials") as info:
+        DirectDestination(_dest(pki, username="svc", password="synthetic", **weak))
+    message = str(info.value)
+    assert "connection 'OB_DIRECT'" in message and "tls_ca_file" in message
+    assert INSECURE_TLS_ESCAPE_ENV not in message and "synthetic" not in message
+
+
 # --- signature_padding: the ASVS 11.3.1 operator choice (BACKLOG #1168) ------------------------------
 #
 # Measured against the PINNED cryptography (50.0.1 in requirements.lock), not the interpreter that
