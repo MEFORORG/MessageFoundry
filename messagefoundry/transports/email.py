@@ -26,9 +26,10 @@ the ``587`` submission port; port ``465`` (implicit TLS) maps to ``smtplib.SMTP_
 set on an instance at ``[security].enforcement = warn`` — read through the CLAMPED
 ``weakened_tls_escape_permitted_here()`` (#200, ADR 0092), so the blunt global escape cannot silence
 a cleartext hop while enforcing — or the connection attests the hop (``tls_hop_attested``) or
-accepts it (``cleartext_accepted``, ADR 0153). Credentials are **never** sent over a cleartext
-channel (a ``username``/``password`` with ``use_tls=False`` raises at construction, even with the
-escape) — the same ``refuse_cleartext_credentials`` posture the REST destination takes. The message
+accepts it (``cleartext_accepted``, ADR 0153). Credentials are **never** sent to a peer the engine
+has not verified: a ``username`` on a cleartext hop, or with ``tls_verify`` or
+``tls_check_hostname`` off, raises at construction, and no escape, posture or attestation lifts
+that (:func:`refuse_unverified_smtp_credential`, vault BACKLOG #3230). The message
 **body** is PHI on that same cleartext hop, so it is additionally governed by the shared
 :class:`~messagefoundry.transports.mllp.InsecureHopGuard` gradient every other cleartext-egress
 transport consumes (refuse enforcing-production-PHI off-loopback, warn non-enforcing PHI, allow
@@ -413,10 +414,10 @@ class EmailDestination(DestinationConnector):
         )
         self.encoding: str = str(s.get("encoding", "utf-8"))
 
-        # STARTTLS-by-default posture, mirroring RestDestination's verify_tls /
-        # refuse_cleartext_credentials handling. Disabling TLS puts the body (PHI) and any AUTH
-        # credentials on the wire in cleartext, so it is refused unless the project-wide dev escape is
-        # set. The escape is the SAME project-wide gate every sibling connector uses — not a new
+        # STARTTLS-by-default posture. Disabling TLS puts the body (PHI) on the wire in cleartext, so
+        # it is refused unless the project-wide dev escape is set. A credential on that hop never gets
+        # this far: refuse_unverified_smtp_credential refuses it below, and no lever here lifts that.
+        # The escape is the SAME project-wide gate every sibling connector uses — not a new
         # mechanism — but it is now read through the CLAMPED weakened_tls_escape_permitted_here()
         # (#200, ADR 0092 decision 2) rather than the raw insecure_tls_allowed(): the blunt global
         # escape must not silence a cleartext hop on an ENFORCING production-PHI instance, exactly as

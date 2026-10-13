@@ -222,11 +222,12 @@ def test_a_dicomweb_verify_tls_that_resolves_falsy_is_refused(
         _verify_dest(tmp_path, name, values)
 
 
-def test_a_dicomweb_verify_tls_that_resolves_none_builds_with_verification_on(
+def test_a_dicomweb_verify_tls_that_resolves_none_passes_wiring_with_verification_on(
     tmp_path: Path,
 ) -> None:
-    # This case was refused until vault BACKLOG #3230, when None meant off. It now means the
-    # default, on, so the pinned CA is read and nothing is refused.
+    # This case was refused at wiring until vault BACKLOG #3230, when None meant off. It now
+    # means the default, on, so the unread-CA refusal does not fire, and the connector's own read
+    # (bool_setting, as dicomweb.py calls it) turns verification on. No connector is built here.
     dest = _verify_dest(tmp_path, "OB_DW_NONE", {})
     assert dest.settings["verify_tls"] is None
     assert bool_setting(dest.settings, "verify_tls", default=True) is True

@@ -447,8 +447,9 @@ class DirectDestination(DestinationConnector):
                     "Direct destination tls_verify=false disables server-certificate verification on "
                     f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED. The "
                     "S/MIME body still protects the clinical payload, but envelope metadata is exposed "
-                    "to an on-path attacker presenting any certificate. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file for the "
-                    f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+                    "to an on-path attacker presenting any certificate. Use a trusted CA "
+                    "(tls_ca_file, or [tls].internal_ca_file for the instance), or set "
+                    f"{INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
                     "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
                     "has no effect while enforcing, the default, or with no posture)."
                 )

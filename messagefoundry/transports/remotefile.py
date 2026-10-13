@@ -15,8 +15,7 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
   server certificate and hostname are verified by default** (a verifying :class:`ssl.SSLContext`, not
   ftplib's no-verify stdlib fallback); ``tls_verify=false`` drops verification only when the explicit
   escape ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn`` (and
-  is logged loudly), mirroring the MLLP outbound posture,
-  and only on an anonymous hop: with a credential it is refused outright (vault BACKLOG #2636).
+  is logged loudly), mirroring the MLLP outbound posture, and only on an anonymous hop.
 
 Each credential refusal above follows one rule, stated once in docs/SECURITY-LOOSENING.md, *No
 escape sends a credential to an unverified peer*.
