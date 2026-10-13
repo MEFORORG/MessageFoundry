@@ -2037,22 +2037,32 @@ X12/FHIR seams come later.
 
 **A clean result from `anonymize_checked` does not prove the output is PHI-free.** The rule map
 rewrites the fields it names. The leak-check then looks at the output, and it refuses in only
-these cases:
+these cases. A refused rule set and the `require_full_coverage` switch are apart from these, and
+both are described below:
 
 | The leak-check refuses when | Where it looks |
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
-| A dashed SSN (`NNN-NN-NNNN`) appears | Fields no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears | Fields no rule maps |
+| The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
+| A dashed SSN (`NNN-NN-NNNN`) appears whole inside one field | Fields no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears whole inside one field | Fields no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs): its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). A bare `PV2` is a legal empty segment and passes | Every line after the MSH header |
+| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it as `PV2 (line with no fields)` | Every line but the header. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
 case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+
+**A shape split across fields by the message's own field separator passes.** The detectors read
+one field at a time, after the message is split on the separator its header declares. Under a
+field separator of `-`, at least the lines `ZZZ-1-123-45-6789` and `ZZZ-1-555-555-0100` would
+pass `anonymize_checked` on both anonymizers. The message itself cuts each value into three
+fields. Under `|`, the same two values are refused. With `require_full_coverage` on, such a
+message is refused only because nobody decided the `ZZZ` fields. A `keep` on each of them would
+let it through.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
 `KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
@@ -2067,7 +2077,10 @@ names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
 - `LEE|` with only empty fields passes and is not reported at all.
 - A bare fragment that is a real segment id for the message's version, such as `ROL` or `CON`,
   passes as an empty segment. With no readable version in MSH-12, any id that some HL7 version
-  defines does.
+  defines does. The coverage report records each such line by its segment id alone, as in
+  `ROL (line with no fields)`, with no line position. That entry is not an overlay key. Without
+  the `require_full_coverage` switch described below, every such line passes, and the report is
+  the only record of it (vault BACKLOG #3001).
 
 A bare Z-segment id, such as `ZPD` with no field separator, is refused unless a rule that
 rewrites a field names that segment. Nothing else tells it apart from a wrapped `ZOE`. A `keep`
@@ -2077,46 +2090,74 @@ anonymizer and the leak-check apply this to the same rules, so they accept and r
 lines.
 
 A bare id from a later HL7 version than MSH-12 names is refused too: `SFT` came in with 2.5, so a
-bare `SFT` in a 2.3 message is not an empty segment.
+bare `SFT` in a 2.3 message is not an empty segment. That holds for a line ahead of the header
+too. Both anonymizers judge every line against the version in the header's own MSH-12.
 
-A line holding only whitespace or control characters is dropped before anything else runs. The
-engine and the tee used to disagree on one at the start or end of a message. They still differ on
-whitespace after the last field of the last line: the engine's parser trims it and the tee keeps
-it. A bare `MSH`, `FHS` or `BHS` line is refused; a header segment carries the separators.
+`anonymize_checked` judges a bare line by the HL7 version of its input, so a rule on `MSH-12`
+does not change which bare line passes. A caller that runs `anonymize` and then `leak_check` or
+`leak_report` itself must pass `version=message_version(raw)` to get the same answer. Without
+it, the check reads the surrogate version the rule wrote, and can refuse a line that passed on
+the way in (vault BACKLOG #3004).
 
-A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
+A line holding only whitespace or control characters is dropped before anything else runs.
+
+**An `MSH`, `FHS` or `BHS` line with fewer than three split fields is refused,** whether it comes
+before the header or after it. Such a line has no separator after its encoding characters. That
+includes a bare `FHS` and a minimal `BHS|^~\&` line; add a trailing separator to pass the second.
+The header itself is the one exception, because the check does not walk it. Any other `MSH` line
+ahead of the header is refused, whatever it holds. That includes a leading bare `MSH` or `msh`,
+on both anonymizers (vault BACKLOG #3001). A leading `MSH|^~\&` line is still taken as the
+header, and the version then reads as empty.
+
+The refusal covers a gap in the engine's HL7 parser, and the gap itself is still open. Once a
+field of the message is set, the parser writes a later header line of that kind back out of
+shape: `BHS|TEXT` comes back as `BHS|TEX|BHS|TEXT`. The anonymizers refuse such a message. Any
+other caller of the parser would still get the misshapen line.
+
+A second MSH line in capitals is checked. Its fields, and the fields of every `BHS` and `FHS`
+line, are numbered the header way: field 1 is the field separator. So the leak-check and the
+coverage report name the encoding characters of a `BHS` line `BHS-2`.
 
 **A rule for an MSH field is applied to every MSH line, the header included.** The engine and
 the tee both do this (BACKLOG #2265). Before, the tee skipped the rule while the leak-check
 counted its field as scrubbed. No default rule names an MSH field, so the header is kept unless
-an overlay maps one.
+an overlay maps one. A rule for a `BHS` or `FHS` field lands on the same field on the engine and
+the tee, and the leak-check counts that field (vault BACKLOG #2998).
 
-A rule that would rewrite `MSH-1` or `MSH-2` is refused, because those two fields hold the
-message's delimiters. A `keep` on either is allowed, because it rewrites nothing. A rule for
-field 0 of any segment, which is the segment id, is refused whatever its kind: `PID-0` is not a
-whole-field address, so the rule is refused when it is built or loaded (BACKLOG #2330). A later
+A rule that would rewrite field 1 or 2 of `MSH`, `BHS` or `FHS` is refused, because those
+fields hold delimiters. An overlay with such a rule is refused when it loads, with one error
+that names the file and the field (vault BACKLOG #2997). A rule set built in code is refused at
+each message. A `keep` on any of them is allowed, because it rewrites nothing. A rule
+for field 0 of any segment, which is the segment id, is refused whatever its kind: `PID-0` is not
+a whole-field address, so the rule is refused when it is built or loaded (BACKLOG #2330). A later
 MSH line that carries data where `MSH-2` belongs cannot be scrubbed by a rule. Repair or remove
 that line.
 
 **The two anonymizers still differ on some inputs, at least these:**
 
-- A `BHS` or `FHS` line. The engine numbers it the HL7 way, where `BHS-1` is the separator. The
-  tee and the leak-check number it as an ordinary segment. So an engine rule lands one field to
-  the left of the field the check counts as scrubbed, and that field can still hold its value.
-  A tee rule written with the HL7 number scrubs the next field along.
-- A later `MSH`, `BHS` or `FHS` line with fewer than two field separators. The engine writes it
-  back out of shape, and a rule can then land on the wrong text.
 - A header not in capitals, such as `Msh`. The engine refuses the message. The tee emits it.
+- A first `MSH` line with no separator after its encoding characters, such as `MSH|^~\&`. The
+  tee emits the message. The engine refuses it at least when a line that a rule names follows.
+- A line ahead of the header that the check does not refuse: a line with fields, or a bare id
+  the header's version defines. The tee emits the line, and its leak-check walks it against the
+  header's version. The engine's parser refuses at least a message that leads with a `PID` line
+  or a bare `PV2`. A leading `BHS` or `FHS` line with its separator is emitted by both.
+- Whitespace after the last field of the last line. The engine's parser trims it before a rule
+  reads the value, and the tee does not. So a date in that field is filled by the engine and
+  emptied by the tee.
 
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on the clean path
 and on a leak-check refusal, and inside the `LeakError`. A message the anonymizer refuses with
-`AnonError` (no parseable MSH, or a line no rule can reach) gets no report, and the
-`anonymize-captures` coverage line does not count it. `python -m tee anonymize-captures` logs it at INFO once per
-run, after it has checked the captures, with a count per address. A quieter `--log-level` does not
-hide it: the line is then printed plain to stderr. It says the denylist tables were live only when
-they loaded and passed the floor check on every message. Read that list before you share
-a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
+`AnonError` gets no report and is not in the coverage count. The `anonymize-captures` summary
+gives the number of such messages apart from that count (vault BACKLOG #3004). It cannot say
+which cause applies to each, and the `error:` line that ends the run repeats the number.
+
+`python -m tee anonymize-captures` logs the summary at INFO once per run, after it has checked
+the captures, with a count per address. A quieter `--log-level` does not hide it: the line is
+then printed plain to stderr. It says the denylist tables were live only when they loaded and
+passed the floor check on every message. Read that list before you share a dataset. Map any
+field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### Dates and locations: mapped, and still NOT Safe Harbor de-identified
 
@@ -2204,8 +2245,8 @@ What the `date` kind does to a value:
   number that is not a date. A site code that is itself a year followed by `01` leaves whole.
   The skip needs the rules: `leak_check` called with no rules, and the publish gate's own scan
   of a committed file, still flag a kept `YYYYMM` date under such a prefix. The skip never
-  reaches an MSH line. A `date` rule on an MSH field is applied, and a `YYYYMM` it leaves there
-  is still treated as a site code.
+  reaches an `MSH`, `BHS` or `FHS` line. A `date` rule on a field of such a line is applied, and
+  a `YYYYMM` it leaves there is still treated as a site code.
 
 Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.
@@ -2224,6 +2265,11 @@ message that has a present field that meets all three of these:
    the newest version does for a segment 2.5.1 lacks. A set id is excused only when it holds
    one to four digits. `PID-8` and `PV1-2` are excused only when the whole value is a code of
    one or two characters, so a coded value with text components is not excused.
+
+**The switch also refuses a bare line that passed,** such as an empty `PV2`, unless a rule or a
+`keep` names any field of that segment. A wrapped line of free text that is exactly a segment id
+looks the same as an empty segment, so someone has to decide it. A default rule counts: a bare
+`PV1` or `NTE` passes the switch, because the default rules name a field of each.
 
 A `keep` is how you record a decision to leave a field as it is:
 
@@ -2244,8 +2290,21 @@ lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.
 
-**The tee reads the overlay once, before the first message.** An overlay it cannot read or parse,
-or one that breaks the schema, refuses the whole run with one `error:` line and writes no dataset.
+**An overlay can also point a default field at a different kind, and that can leave part of the
+field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
+rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
+the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check counts such a field
+as scrubbed, and its shape detectors do not scan what is left. So a clean return does not clear it. `load_rules`
+logs one WARNING line for each such field, under the same once-per-set rule as a keep. The line
+names the field, the default kind and the new kind. `python -m tee anonymize-captures` prints
+one `warning:` line that lists them. A retarget to the same kind does not warn, and neither does
+a `drop`. Nothing refuses the retarget (vault BACKLOG #3000).
+
+**The tee checks the salt and reads the overlay once, before it reads the store.** A salt the
+keyer refuses, an overlay it cannot read or parse, or one that breaks the schema, refuses the
+whole run with one `error:` line and writes no dataset. That holds even when the store has no
+captured bodies (vault BACKLOG #3003). The keep and retarget `warning:` lines are printed only
+after the store read, so a run on an empty store prints neither.
 
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
@@ -2269,14 +2328,12 @@ which HIPAA Safe Harbor counts as an identifier; a default rule now scrubs it.
 
 **What the switch does not cover, at least:**
 
-- It never looks at the first MSH line, the header. A kept `MSH-7` date there is never checked.
-  A later MSH line is checked like any other segment.
+- It never looks at the header, the one line the separators are read from. A kept `MSH-7` date
+  there is never checked. A later MSH line is checked like any other segment.
 - A blanket `keep` passes whatever it names. It at least leaves a record of that choice in
   `anon.toml`, where a reviewer can see it.
 - A short value in a fixed-list field passes. A two-letter code in `PID-8` could still be
   initials.
-- The `BHS`, `FHS` and short header line gaps listed above, under "The two anonymizers still
-  differ", apply with the switch on too.
 
 Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identification — do not conflate
 "we encrypt" or "we redact logs" with "we de-identify."
