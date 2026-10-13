@@ -343,8 +343,9 @@ class CertExpiryRunner:
             # BACKLOG #3176: only the alerts' shared_with is lost, not the scan or an alert.
             log.error("cert_expiry: could not group the CRL rows by file", exc_info=True)
             sharing = {}
+        said = _HeldCopyLog(sharing)
         for cert in rows:
-            check = self._inspect(cert, now, held)
+            check = self._inspect(cert, now, held, said)
             if check is None:
                 continue
             checks.append(check)
@@ -410,7 +411,11 @@ class CertExpiryRunner:
         return rows
 
     def _inspect(
-        self, cert: MonitoredCert, now: float, held: HeldCrlSnapshot | None = None
+        self,
+        cert: MonitoredCert,
+        now: float,
+        held: HeldCrlSnapshot | None = None,
+        said: _HeldCopyLog | None = None,
     ) -> CertCheck | None:
         # The load / notAfter / days-remaining path lives once in pki.read_cert_facts; this monitor
         # only needs notAfter + days_remaining from the returned public facts.
@@ -438,7 +443,12 @@ class CertExpiryRunner:
             )
         if cert.kind == "crl":
             return _judge_crl(
-                cert, now, pem, crl_facts, held if held is not None else held_crl_snapshot()
+                cert,
+                now,
+                pem,
+                crl_facts,
+                held if held is not None else held_crl_snapshot(),
+                said if said is not None else _HeldCopyLog({}),
             )
         if facts is None:
             return None
@@ -462,6 +472,40 @@ def _rows_by_crl_file(rows: Sequence[MonitoredCert]) -> dict[str, tuple[str, ...
             if row.label not in labels:
                 labels.append(row.label)
     return {key: tuple(labels) for key, labels in by_file.items()}
+
+
+class _HeldCopyLog:
+    """The held-copy warnings one scan pass has logged (vault BACKLOG #3099).
+
+    A held copy is matched by its file, so every row naming a file judges the same copies and
+    reaches the same account of them. N listeners sharing one CRL file logged that account N times
+    a pass, each line listing the same N holders. A pass now logs it once, under the first row to
+    reach it, and that line names the other rows.
+
+    Only the log line is folded. Each row still returns its own check and raises its own alert,
+    with its own ``detail`` and ``shared_with`` (vault BACKLOG #2319)."""
+
+    def __init__(self, sharing: Mapping[str, tuple[str, ...]]) -> None:
+        self._sharing = sharing
+        self._logged: set[tuple[str, str, str]] = set()
+
+    def other_rows(self, cert: MonitoredCert, why: str, remedy: str) -> tuple[str, ...] | None:
+        """The other rows naming ``cert``'s file, for its warning to name, or ``None`` when this
+        pass has already logged the same account of that file.
+
+        The account is the file with ``why`` and ``remedy``, so a file replaced part way through a
+        pass, which a later row then judges differently, is logged again. A file the grouping does
+        not hold is never folded, because its line could not name the rows left out: a failed
+        grouping (BACKLOG #3176) costs the fold and no row its mention."""
+        key = crl_path_key(cert.path)
+        labels = self._sharing.get(key)
+        if labels is None:
+            return ()
+        account = (key, why, remedy)
+        if account in self._logged:
+            return None
+        self._logged.add(account)
+        return tuple(label for label in labels if label != cert.label)
 
 
 def held_crl_label(path: str) -> str:
@@ -553,6 +597,7 @@ def _judge_crl(
     pem: bytes | None,
     file_facts: CrlFacts | None,
     held: HeldCrlSnapshot,
+    said: _HeldCopyLog,
 ) -> CertCheck | None:
     """Judge a CRL by its file AND by the copies of it that live TLS contexts hold (BACKLOG #299).
 
@@ -564,7 +609,8 @@ def _judge_crl(
 
     The alert therefore stays up until no context holds the old copy: the reload pass applied the file
     to it (:mod:`messagefoundry.pipeline.crl_reload`), or a restart or a rebuild of that hop replaced
-    it. A copy the reload refused names the refusal in the log line. A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
+    it. A copy the reload refused names the refusal in the log line, which ``said`` keeps to one a
+    pass for each file (vault BACKLOG #3099). A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
     silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged.
     A failure judging the held copies is logged and leaves the file's own verdict standing."""
     stale: list[CrlFacts] = []
@@ -650,19 +696,24 @@ def _judge_crl(
             # only to the log. The remedy leads, because the alert instance keeps only the start
             # of it. The date is the alert's own not_after, so it is not repeated here.
             detail = f"{remedy}. Held by: {', '.join(holders)}."
-            log.warning(
-                "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), "
-                "from %s). The hop keeps the copy it read when it built its context; the soonest "
-                "CRL in it (issuer %r) lapses at %s. %s.",
-                cert.label,
-                cert.path,
-                why,
-                len(copies),
-                ", ".join(holders),
-                oldest.issuer,
-                log_timestamp(oldest.next_update_iso),
-                remedy,
-            )
+            # Vault BACKLOG #3099: once a pass for each file, not once for each row naming it.
+            others = said.other_rows(cert, why, remedy)
+            if others is not None:
+                log.warning(
+                    "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d "
+                    "load(s), from %s). The hop keeps the copy it read when it built its context; "
+                    "the soonest CRL in it (issuer %r) lapses at %s. %s.%s",
+                    cert.label,
+                    cert.path,
+                    why,
+                    len(copies),
+                    ", ".join(holders),
+                    oldest.issuer,
+                    log_timestamp(oldest.next_update_iso),
+                    remedy,
+                    # The alert's own words for the same fact (pipeline.alerts.crl_expiry_detail).
+                    f" The same file also serves {', '.join(map(repr, others))}." if others else "",
+                )
     except Exception:
         log.error(
             "cert_expiry: could not judge the copies of %r CRL %s that live hops hold",
