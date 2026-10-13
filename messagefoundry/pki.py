@@ -478,16 +478,17 @@ def _signature_state(
 
 
 def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
-    """Why some CRL in ``pem`` is not signed by a CA in ``ca_ders``, or ``None`` when each one is.
+    """Why a CA in ``ca_ders`` is not confirmed to have signed some CRL in ``pem``, or ``None``
+    when each CRL is confirmed.
 
     The flag is True when a listed CA fits the CRL and none verifies it, whether the check failed
     or could not run, and False when no listed CA fits. :class:`CrlSignature` says what "fits"
     means. A block with the True flag is reported over one with the False flag, wherever it sits
-    in the file. OpenSSL checks a CRL's signature at the handshake,
-    not at the load. So OpenSSL itself loads a CRL with the right issuer name and Authority Key
-    Identifier but a bad signature, and then every handshake it judges fails with ``CRL signature
-    failure``. The running-hop reload calls this before a live load, because a load cannot be
-    undone (BACKLOG #299).
+    in the file. OpenSSL checks a CRL's signature at the handshake, not at the load. So OpenSSL
+    itself loads a CRL with the right issuer name and Authority Key Identifier but a bad
+    signature, and then every handshake it judges fails with ``CRL signature failure``. The
+    running-hop reload calls this before a live load, because a load cannot be undone
+    (BACKLOG #299).
 
     **The flag is wider than what a start refuses (vault BACKLOG #2905).** It is True for every
     :class:`CrlSignature` state but ``verified`` and ``unlisted``. A start refuses only ``bad``,

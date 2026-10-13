@@ -1820,14 +1820,16 @@ the engine checks each CRL in the file against the CA certificates that hop alre
 the file in one case only, where it has proof. Three things all hold then. A listed CA has the
 CRL's issuer name, compared exactly. The CRL names that CA's key by its key identifier. The engine
 ran the signature check with that key, and the check failed. Where several listed CAs share that
-name, the check must run and fail for each one the CRL's key identifier does not rule out. A
-handshake that OpenSSL judges by such a CRL fails with `CRL signature failure`, an error that does
-not name the file. The refusal names the setting, the file and the CRL. Give the setting the CRL
-that CA signed. No setting turns this check off, as for an expired CRL.
+name, the check must run and fail for each of them that the engine finds to fit the CRL's
+authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
+`CRL signature failure`, an error that does not name the file. The refusal names the setting, the
+file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
+an expired CRL.
 
-The check reads only the file a CRL setting names. A CRL inside a hop's CA file is in use on the
-hops that the paragraph on a CRL inside a CA file, further down, names. The engine never checks
-its signature, at a start or at a reload. OpenSSL still checks it at each handshake it judges.
+The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
+alone, on the hops that the paragraph on a CRL inside a CA file, further down, names. It is in use
+there, and the engine does not check its signature, at a start or at a reload. OpenSSL still checks
+it at each handshake it judges.
 
 Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
@@ -1853,16 +1855,20 @@ three cases warn:
 If the check itself fails, the engine logs an ERROR that says so, and loads the file.
 
 The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
-engine process logs the WARNING once while the file keeps the same bytes. It remembers only the
-version it judged last, so an earlier version that returns is logged again. A hop whose CA list
+engine process logs the WARNING once while the file keeps the same bytes. It keeps that record for
+one version only, the last one it logged a line for. So an earlier version is logged again when it
+returns after another version that was logged. A version in between that logged nothing, because
+it verified or was refused, does not reset the record. A hop whose CA list
 gives a different result for the same file logs its own line, and each engine shard logs its own. A system
 root the hop has loaded counts as a listed CA. So the same proof against a system root's key refuses
 the start too.
 
-The reload is stricter than a start. Under rule 2 it holds back every CRL that a listed CA of that
-name does not verify, whether or not the CRL names a key. That includes a CRL the engine cannot
-check. Its ERROR says to fix the file. After a CA renews its key the file can be right, and a
-restart then loads it with the WARNING above.
+The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
+a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with
+that CA's key, the remedy is the one the `bad_signature` row below describes. That is so whether or
+not the CRL names a key, and whether the check failed or could not run. After a CA renews its key
+the file can be right, and a restart then loads it with the WARNING above. Where the engine matches
+the CRL to no listed CA, the remedy is the `no_issuer` row's: restart.
 
 **What a signature refusal stops.** It has the reach of the expired-CRL refusal, because one check
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound

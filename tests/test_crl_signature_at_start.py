@@ -635,21 +635,77 @@ def _resigned_with_sha1(pem: bytes, signer: rsa.RSAPrivateKey) -> bytes:
     return x509.load_der_x509_crl(der[: -len(signature)] + signature).public_bytes(_PEM)
 
 
-def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad() -> None:
+def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
+    tmp_path: Path,
+) -> None:
     """A CRL that names the CA's key and that the reload holds back, while a start loads it. The
     reload's remedy used to say a start refuses such a file. The forged twin is the control: the
     same hand-made encoding is proven bad, so the first reading is not an artefact of it."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ca = [_ca(key, key).public_bytes(serialization.Encoding.DER)]
+    ca = _ca(key, key)
+    ders = [ca.public_bytes(serialization.Encoding.DER)]
 
     good = _resigned_with_sha1(_crl(key, names=key), key)
     forged = _resigned_with_sha1(_crl(other, names=key), other)
 
-    assert [s.state for s in judge_crl_signatures(good, ca)] == ["uncheckable"]
-    assert [s.state for s in judge_crl_signatures(forged, ca)] == ["bad"]
-    verdict = crl_signature_refusal(good, ca)
+    assert [s.state for s in judge_crl_signatures(good, ders)] == ["uncheckable"]
+    assert [s.state for s in judge_crl_signatures(forged, ders)] == ["bad"]
+    verdict = crl_signature_refusal(good, ders)
     assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
+
+    ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
+    ca_file.write_bytes(ca.public_bytes(_PEM))
+    crl_file.write_bytes(good)
+    assert _hop(ca_file, crl_file).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    crl_file.write_bytes(forged)
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        _hop(ca_file, crl_file)
+
+
+def test_a_version_that_logs_nothing_in_between_does_not_reset_the_record(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The record is touched only when there is a line to log. So a version that verifies, or
+    # one that is refused, leaves it alone, and the first version is not logged again. The
+    # control is the A, B, A test above, where the version in between warns and the count is 3.
+    with caplog.at_level("WARNING"):
+        first = twins.write_crl("new", None)  # unproven on a hop that lists the old CA
+        twins.hop("old")
+        twins.write_crl("old", "old")  # verifies
+        twins.hop("old")
+        twins.write_crl("stranger", "old")  # proven bad
+        with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+            twins.hop("old")
+        twins.crl.write_bytes(first)
+        twins.hop("old")
+    assert len(_warnings(caplog)) == 1
+
+
+def test_a_crl_that_reaches_a_hop_through_its_ca_file_alone_is_not_signature_checked(
+    twins: _Twins, tmp_path: Path
+) -> None:
+    """The start check judges the bytes of the CRL setting's file and nothing else. A forged CRL
+    that names the listed CA's key refuses the start from the CRL setting, and loads from the CA
+    file. It is in use there: the handshake fails on it."""
+    forged = _crl(twins.stranger, names=twins.new_key)
+    bundle = tmp_path / "ca-and-crl.pem"
+    bundle.write_bytes(twins.new_ca.read_bytes() + forged)
+    # The CRL setting holds another issuer's CRL, which only turns revocation checking on.
+    twins.crl.write_bytes(_crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME))
+
+    hop = _hop(bundle, twins.crl)  # builds: the forged CRL in the CA file is not judged
+    assert hop.cert_store_stats()["crl"] == 2
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(hop, twins.server(sends_renewed=False))
+
+    # Controls. The same CRL in the CRL setting refuses. So does the same CA file once a CRL
+    # setting names it, which is why the guide says "through its CA file alone".
+    twins.crl.write_bytes(forged)
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        twins.hop("new")
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        _hop(bundle, bundle)
 
 
 #: Sentences ``docs/CONFIGURATION.md`` carried and the code does not bear out. Each is matched
@@ -657,14 +713,17 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad()
 _RETRACTED_GUIDE_CLAIMS = (
     # Not when the engine cannot check with that key, nor when the name differs only in case.
     "A start refuses it when the CRL names the CA's key and that key did not sign it",
-    # A version that returns is logged again; the A, B, A test above counts three lines.
+    # A version that returns after another that warned is logged again: the A, B, A test above.
     "logged once per engine process for each version of the file",
-)
-#: Sentences the guide must keep, each for a fact the code bears out and a reader acts on.
-_REQUIRED_GUIDE_SENTENCES = (
+    # Too wide both ways. A version that returns after one that logged nothing is not logged
+    # again, and a CA file that a CRL setting names is signature-checked. Tests above pin both.
     "an earlier version that returns is logged again",
-    # A CRL inside a hop's CA file: ``harden_crl_check`` judges the CRL setting's bytes only.
-    "The engine never checks its signature, at a start or at a reload",
+    "The engine never checks its signature",
+)
+#: Sentences the guide must keep, each for a fact a test above pins and a reader acts on.
+_REQUIRED_GUIDE_SENTENCES = (
+    "an earlier version is logged again when it returns after another version that was logged",
+    "the engine does not check its signature, at a start or at a reload",
 )
 
 
