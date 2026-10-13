@@ -1291,13 +1291,22 @@ def test_unbounded_sender_metadata_cannot_push_the_preamble_off_the_top(
 
 def test_a_body_shaped_like_a_message_payload_is_withheld(repo: Path, tmp_path: Path) -> None:
     """DEFECT 7's backstop. It catches the realistic accident -- somebody pasting an ADT into a
-    handoff note -- and its presence is NOT evidence that the queue is PHI-safe."""
-    body = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5\nPID|1||123456||DOE^JOHN"
-    seed(repo, tmp_path, [{"body": body}])
+    handoff note -- and its presence is NOT evidence that the queue is PHI-safe.
+
+    The patient id holds capital letters on purpose. The hook prints runs of digits near the withheld
+    body, at least in the message id, the sent time and the on-disk path. A digits-only id,
+    ``123456``, sat inside the id's time stamp at 12:34:56 UTC and failed a run (BACKLOG #3087). The
+    stem below is that run's id, pinned so every run meets that moment. ``QR123456K`` holds the same
+    six digits. No stamp carries a capital other than ``T`` or ``Z``, so Q, R and K keep it apart."""
+    mrn = "QR123456K"
+    body = f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5\nPID|1||{mrn}||DOE^JOHN"
+    stem = "20261006T123456171-csxyd6"
+    seed(repo, tmp_path, [{"stem": stem, "body": body}])
     text = injection(run_drain(repo))
+    assert f"--- message id={stem}" in text
     assert "body withheld" in text
     assert "DOE^JOHN" not in text
-    assert "123456" not in text
+    assert mrn not in text
     assert "1 withheld" in text
     assert "docs/SESSION-MAIL.md" in text
     assert re.search(r"(\d+) bytes are on disk at", text)
