@@ -2072,8 +2072,14 @@ no digest is refused the same way, with reason `no_approved_digest`. A release t
 the digest now is refused with reason `digest_unavailable`, and the engine logs the cause at
 WARNING. The requester asks again, and a second approver reviews the new bytes.
 
-A request for a directory outside the reload roots, or a missing one, files no hold. It gets the
-status and refusal row an inline reload gets. It writes no `config_reload_attempted` row, because
+This digest fails closed, unlike the provenance fingerprint, which skips what it cannot read. A
+file or folder it covers that cannot be read gives no digest at all, never the digest of the rest.
+A directory gone by the time the digest reads it is refused as missing, never digested as an empty
+bundle.
+
+A request for a directory outside the reload roots, a missing one, or one that cannot be resolved
+files no hold. It gets the status and refusal row an inline reload gets. The last is refused with
+reason `unreadable`, and the engine logs the cause at WARNING. It writes no `config_reload_attempted` row, because
 nothing was attempted. A repeat request joins an open hold only while the digest is unchanged. An
 ungated reload takes no request-time digest. At least these limits remain:
 
@@ -2085,9 +2091,9 @@ ungated reload takes no request-time digest. At least these limits remain:
 - each check samples the files. An edit that lands after the first check runs its module code
   before the second check refuses it. An edit reverted while the release loads is not seen at all.
   Hashing, compiling and running the same bytes is that same step 1;
-- the request-time digest is taken before the route checks its step-up proof. Some requests still
-  file a hold with no digest: a file in the directory cannot be read, or resolving the path raises
-  an OS error. Their release is certain to be refused;
+- the request-time digest is taken before the route checks its step-up proof. A request still
+  files a hold with no digest when a file or folder the digest covers cannot be read. Its release
+  is certain to be refused, with reason `no_approved_digest`;
 - a directory moved away during a release is recorded as `not_found`, not as an edit;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;

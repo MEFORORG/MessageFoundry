@@ -390,6 +390,7 @@ from messagefoundry.pipeline import (
     ApprovedConfig,
     ConfigDigestMismatch,
     ConfigDigestUnavailable,
+    ConfigDirUnreadable,
     ConfigReloadDenied,
     Engine,
     ReloadOutcome,
@@ -1657,6 +1658,7 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigReloadDenied,
     ConfigDigestMismatch,
     ConfigDigestUnavailable,
+    ConfigDirUnreadable,
     FileNotFoundError,
     WiringError,
 )
@@ -1708,7 +1710,9 @@ async def _audit_refused_reload(
     one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
-    reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING.
+    reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A directory
+    that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
+    engine logged why at WARNING.
 
     The inline route and the dual-control executor share this, so a held reload whose directory
     vanished or left the reload roots before its release is refused and recorded the way an inline
@@ -1755,6 +1759,11 @@ async def _audit_refused_reload(
             if unbound
             else "the config changed after this reload was requested; request the reload again"
         )
+    elif isinstance(exc, ConfigDirUnreadable):
+        # The engine logged the cause, scrubbed, where it raised this.
+        _log.warning("config reload refused: its config directory could not be resolved")
+        action, detail["reason"] = "config_reload_failed", "unreadable"
+        status, answer = 422, "the engine could not read the config directory; see the engine log"
     elif isinstance(exc, ConfigDigestUnavailable):
         # Not "the config changed": nothing shows it did. The digest's own WARNING names the cause.
         _log.warning("config reload refused: its config digest could not be taken")
@@ -5482,17 +5491,24 @@ def create_app(
         # approver is an additional control, not a replacement. On hold, 202 + the pending id; the
         # captured config_dir is replayed on release.
         if gate is not None and not req.dry_run:
+            # A hold its release could only refuse is not filed (vault BACKLOG #2596). Its row is
+            # written inside an outliving operation, as every refusal past this point is, so a
+            # request deadline cannot cut it short.
             if hold_refusal is not None:
-                # A hold its release could only refuse is not filed (vault BACKLOG #2596).
-                await _answer_refused_reload(engine, hold_refusal, req, request, user)
+                return await outliving.run(
+                    _answer_refused_reload(engine, hold_refusal, req, request, user),
+                    "refused config reload",
+                )
             if hold_params is None:
                 try:
                     hold_params = await _reload_hold_params(
                         engine, gate, req.config_dir, user.username
                     )
                 except _RELOAD_REFUSALS as exc:
-                    # A hold its release could only refuse is not filed (vault BACKLOG #2596).
-                    await _answer_refused_reload(engine, exc, req, request, user)
+                    return await outliving.run(
+                        _answer_refused_reload(engine, exc, req, request, user),
+                        "refused config reload",
+                    )
             pending = await gate.guard(
                 "config_reload",
                 hold_params,

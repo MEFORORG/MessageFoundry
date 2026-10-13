@@ -151,6 +151,17 @@ class ConfigReloadDenied(Exception):
     ``config_reload_roots`` entry — never an arbitrary client-supplied path."""
 
 
+class ConfigDirUnreadable(Exception):
+    """A reload target that could not be resolved for a reason other than its being missing, such
+    as a parent the service account cannot read. :meth:`Engine.reload_detail` and
+    :meth:`Engine.reload_target_digest` raise it before anything is read or swapped, so the reload
+    routes and the dual-control release refuse and audit it like any other refusal. The cause is
+    logged at WARNING where it is raised; the message names no path."""
+
+    def __init__(self) -> None:
+        super().__init__("the config directory could not be resolved")
+
+
 class ConfigDigestMismatch(Exception):
     """A released reload's config is not the config its approval named (vault BACKLOG #2596).
 
@@ -2470,38 +2481,38 @@ class Engine:
         :meth:`reload_detail` in an :class:`ApprovedConfig` (vault BACKLOG #2596). The target is
         found by :meth:`_existing_reload_target`, as a reload finds it, so a path outside the reload
         roots is never read, and its refusal propagates: a hold that release can only refuse is
-        never filed. ``None`` means no digest could be taken: resolving the path raised another
-        OSError, or a file could not be read. The reason is logged at WARNING, and the release
-        refuses it."""
-        try:
-            path = await self._existing_reload_target(config_dir)
-        except FileNotFoundError:
-            raise
-        except OSError as exc:
-            # Not a refusal the reload routes answer (_RELOAD_REFUSALS), so it must not escape the
-            # request as a 500. The hold is filed with no digest, as an unreadable bundle's is.
-            # The error can carry a client's config_dir, so it is scrubbed for py/log-injection.
-            log.warning(
-                "config reload target could not be resolved: %s", scrub_log_argument(safe_exc(exc))
-            )
-            return None
+        never filed. That covers a missing directory, including one gone by the time the digest
+        reads it (``FileNotFoundError``), and one that cannot be resolved
+        (:class:`ConfigDirUnreadable`). ``None`` means the directory is there and no digest could be
+        taken, because a folder or a file the digest covers could not be read. The reason is logged
+        at WARNING, and the release refuses the hold that carries it."""
+        path = await self._existing_reload_target(config_dir)
         return await self._content_digest(path)
 
     async def _content_digest(self, path: Path) -> str | None:
-        """The ADR 0041 D1 content digest of ``path`` alone, or ``None`` when it cannot be taken.
+        """The ADR 0041 D1 content digest of ``path`` alone, for an approval to bind, or ``None``
+        when it cannot be taken. It fails closed: a file or folder it covers that cannot be read
+        gives ``None``, not the digest of the rest, and a directory that is gone raises
+        ``FileNotFoundError``, not the digest of an empty bundle (vault BACKLOG #2596).
 
         Not :meth:`fingerprint_bundle`, whose detail is lost whole when only its advisory VCS head
-        cannot be read. An approval binds content, so that failure must not refuse a release."""
+        cannot be read. An approval binds content, so that failure must not refuse a release. That
+        one also stays best-effort, skipping what it cannot read, because it records provenance and
+        refuses nothing."""
         return await asyncio.to_thread(self._content_digest_blocking, path)
 
     @staticmethod
     def _content_digest_blocking(path: Path) -> str | None:
         """:meth:`_content_digest` on a worker thread. A direct call, so the crypto inventory
         scanner, which follows a call it can see, keeps this hash on its record."""
-        from messagefoundry.config.fingerprint import config_fingerprint
+        from messagefoundry.config.fingerprint import ConfigDirMissing, config_fingerprint
 
         try:
-            return config_fingerprint(path)
+            return config_fingerprint(path, strict=True)
+        except ConfigDirMissing:
+            # The directory itself is gone: a missing directory, as a reload of one is, and not an
+            # unreadable bundle. A file that vanished from a present one is the latter.
+            raise
         except (OSError, ValueError) as exc:
             # The path can come from a client's config_dir, so it is scrubbed for CodeQL
             # py/log-injection as the reload refusal logs scrub theirs.
@@ -2515,10 +2526,23 @@ class Engine:
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by
         :meth:`_resolve_reload_target`, and refused with ``FileNotFoundError`` when it is not a
-        directory. Off the event loop: the resolve opens the target and each parent, and a slow
+        directory, or :class:`ConfigDirUnreadable` when resolving it raises another ``OSError``.
+        Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
         #2581)."""
-        path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
+        try:
+            path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            # Not FileNotFoundError, so not a missing directory: a parent the service account cannot
+            # read, say. Refused as its own case, so the routes and the dual-control release audit it
+            # rather than answering a 500 with no row. The error can carry a client's config_dir, so
+            # it is scrubbed for py/log-injection.
+            log.warning(
+                "config reload target could not be resolved: %s", scrub_log_argument(safe_exc(exc))
+            )
+            raise ConfigDirUnreadable() from exc
         if not await asyncio.to_thread(path.is_dir):
             raise FileNotFoundError(f"config directory not found: {config_dir}")
         return path
@@ -2632,12 +2656,16 @@ class Engine:
         after the load with the digest the audit row records, before any check that can refuse the
         graph as invalid. A load that fails is checked too, so an edit that breaks the graph is
         refused as an edit. A miss raises :class:`ConfigDigestMismatch`, or
-        :class:`ConfigDigestUnavailable` when no digest can be taken now, with nothing swapped.
-        ``None`` binds nothing: an ungated reload, a convergence reload and a dry run pass none. The
-        digest covers what :mod:`messagefoundry.config.fingerprint` hashes and no more.
+        :class:`ConfigDigestUnavailable` when no digest can be taken now, with nothing swapped. The
+        digest fails closed (:meth:`_content_digest`): a file or folder it cannot read gives
+        :class:`ConfigDigestUnavailable`, and a directory gone since the resolve gives
+        ``FileNotFoundError``. ``None`` binds nothing: an ungated reload, a convergence reload and a
+        dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint` hashes
+        and no more.
 
         Raises ``ConfigReloadDenied`` (path outside the allowed roots), ``FileNotFoundError``
-        (missing dir), ``ConfigDigestMismatch`` (not the approved bytes), ``ConfigDigestUnavailable``
+        (missing dir), ``ConfigDirUnreadable`` (a dir that cannot be resolved),
+        ``ConfigDigestMismatch`` (not the approved bytes), ``ConfigDigestUnavailable``
         (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / an
         environment value file this reload could not read) — the caller maps these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
@@ -2749,10 +2777,12 @@ class Engine:
             # Again, on the digest the audit row records, so a released reload's row names the
             # approved digest. Before every check that can refuse the graph as invalid, so a tamper
             # is audited as one and those checks read only approved bytes. An edit that lands and
-            # is reverted inside the load is not seen.
+            # is reverted inside the load is not seen. The fail-closed digest first: the recorded
+            # one skips a file it cannot read, so on its own it could match with a file unbound.
+            _require_approved(await self._content_digest(path), approval)
             taken = fingerprint.get("fingerprint") if fingerprint is not None else None
-            current = taken if isinstance(taken, str) else await self._content_digest(path)
-            _require_approved(current, approval)
+            if isinstance(taken, str):
+                _require_approved(taken, approval)
         # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
         # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
         self.guard_registry(registry)

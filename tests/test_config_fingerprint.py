@@ -10,7 +10,12 @@ executes it, so it must be in the fingerprint) and the data-authored ``connectio
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from messagefoundry.config.fingerprint import config_fingerprint, config_fingerprint_detail
 
@@ -124,3 +129,73 @@ def test_detail_has_fingerprint_and_file_count(tmp_path: Path) -> None:
     assert detail["scheme"] == "mefor-cfg-fp:v2"
     # tmp_path is outside any git work tree, so provenance is omitted (not None, absent).
     assert "git_head" not in detail
+
+
+# --- vault BACKLOG #2596: the strict digest a dual-control approval binds fails closed ----------
+
+
+def _unreadable(
+    monkeypatch: pytest.MonkeyPatch, name: str, *, when: dict[str, bool] | None = None
+) -> None:
+    """Make ``read_bytes`` of every file called ``name`` fail as an access-denied read does, always,
+    or while ``when["on"]``. A real access list cannot be set portably, and a Windows administrator
+    reads through one anyway. tests/test_dual_control_reload.py uses it too."""
+    real = Path.read_bytes
+
+    def _read(self: Path) -> bytes:
+        if (when is None or when["on"]) and self.name == name:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read)
+
+
+@pytest.mark.parametrize("name", ["cfg.py", "dev.toml"])
+def test_strict_refuses_a_file_it_cannot_read_where_the_default_skips_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    d = tmp_path / "cfg"
+    _bundle(d)
+    readable = config_fingerprint(d, strict=True)
+    _unreadable(monkeypatch, name)
+    with pytest.raises(PermissionError):
+        config_fingerprint(d, strict=True)
+    # The control, and the observational rule every other caller keeps: the rest is digested.
+    assert config_fingerprint(d) != readable
+    assert config_fingerprint_detail(d)["files"] == 4
+
+
+def test_strict_refuses_a_missing_directory_where_the_default_digests_an_empty_bundle(
+    tmp_path: Path,
+) -> None:
+    gone, empty, a_file = tmp_path / "gone", tmp_path / "empty", tmp_path / "a-file"
+    empty.mkdir()
+    a_file.write_text("x", encoding="utf-8")
+    for not_a_dir in (gone, a_file):
+        with pytest.raises(FileNotFoundError):
+            config_fingerprint(not_a_dir, strict=True)
+    # The control: an empty directory is a directory, and the default digests a missing one as it.
+    assert config_fingerprint(empty, strict=True) == config_fingerprint(gone)
+
+
+def test_strict_refuses_a_folder_it_cannot_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``glob`` swallows a listing error, so an unlistable ``codesets`` folder would leave its
+    tables out of the digest. A missing one is fine: nothing in it is left out."""
+    d = tmp_path / "cfg"
+    _bundle(d)
+    readable = config_fingerprint(d, strict=True)
+    real_scandir = os.scandir
+
+    def _scandir(path: Any) -> Any:
+        if Path(path).name == "codesets":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    with pytest.raises(PermissionError):
+        config_fingerprint(d, strict=True)
+    monkeypatch.undo()
+    shutil.rmtree(d / "codesets")
+    assert config_fingerprint(d, strict=True) != readable  # the control: absent, not refused
