@@ -7202,8 +7202,13 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     return keyless_opt_out_refusal(settings.store, settings.security)
 
 
-def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifier | None:
+def _offline_security_notifier(
+    settings: ServiceSettings, posture: HopPosture | None = None
+) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
+
+    ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
+    (vault BACKLOG #2983). ``None`` counts as enforcing there.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -7246,7 +7251,7 @@ def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifi
     try:
         return security_notifier_from_settings(
             alerts,
-            secret_provider=resolve_secret_provider(settings.secrets),
+            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
         )
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the recovery must not die here
@@ -7696,7 +7701,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # nothing about a notice it does not owe. Attached, not passed to the build (#2081).
             existing = await store.get_user_by_username(username)
             security_notifier = (
-                _offline_security_notifier(settings) if existing is not None else None
+                _offline_security_notifier(settings, posture) if existing is not None else None
             )
             service.attach_security_notifier(security_notifier)
             if security_notifier is not None:

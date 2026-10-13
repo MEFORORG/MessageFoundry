@@ -2824,8 +2824,9 @@ def _check_vault_revocation_attested(
     section's Vault hops. They are service settings, not declarations in the graph, so the
     connection line cannot list them.
 
-    The entries are :func:`~messagefoundry.config.settings.security_loosenings`' own names for the
-    two switches, so this line and the posture read-out cannot name them differently.
+    The entries come from :func:`~messagefoundry.config.settings.vault_revocation_attestations`,
+    the walk :func:`~messagefoundry.config.settings.security_loosenings` reads too, so this line
+    and the posture read-out name a switch the same way.
 
     Advisory (``required=False``): a reasoned attestation is the one lever these hops have. It
     reports the settings and builds no Vault client, so it does not say whether a hop would be
@@ -2856,10 +2857,11 @@ def _check_vault_revocation_attested(
             required=False,
             detail=f"settings did not load: {_settings_error(exc)}",
         )
+    from messagefoundry.config.settings import vault_revocation_attestations
+
     attested = [
-        (f"{section}.vault_revocation_attested", held.vault_revocation_attested_reason)
-        for section, held in (("store", settings.store), ("secrets", settings.secrets))
-        if held.vault_revocation_attested
+        (switch, reason)
+        for switch, _hops, reason in vault_revocation_attestations(settings.store, settings.secrets)
     ]
     if not attested:
         return CheckResult(

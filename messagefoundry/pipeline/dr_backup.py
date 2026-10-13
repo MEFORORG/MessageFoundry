@@ -1190,10 +1190,7 @@ class BackupRunner:
         """The 32-byte store DEK via the ADR 0019 KeyProvider seam, or ``None`` (identity cipher)."""
         import base64
 
-        key_b64 = resolve_active_key(
-            self._store_settings,  # type: ignore[arg-type]
-            posture=self._hop_posture,
-        )
+        key_b64 = resolve_active_key(self._store_settings, posture=self._hop_posture)  # type: ignore[arg-type]
         if not key_b64:
             return None
         return base64.b64decode(key_b64)
@@ -2314,6 +2311,7 @@ async def run_restore_verify(
     store_settings: object,
     full: bool = False,
     allow_unencrypted: bool = False,
+    posture: HopPosture | None = None,
 ) -> VerifyResult:
     """Verify an existing ``.mfbak`` archive WITHOUT activating it (ADR 0049 — 0049's owned primitive,
     which ADR 0048's cold-seed activation *calls*). Resolves the store's decrypt-capable keyring (active
@@ -2329,9 +2327,15 @@ async def run_restore_verify(
     # The decrypt-capable keyring, NOT just the active key: a backup taken under a key that has since
     # been retired (a routine WP-5 rotation) must still verify, or ADR 0048's cold-seed activation would
     # falsely refuse a perfectly recoverable archive (AC-5: compare to the resolved key, incl. retired).
+    # `posture` is the caller's, for the Vault hop the key resolve and a full verify can dial
+    # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
+    # command holds none, and `None` counts as enforcing on that hop.
     keys = [
         base64.b64decode(k)
-        for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
+        for k in resolve_decrypt_keys(
+            store_settings,  # type: ignore[arg-type]
+            posture=posture,
+        )
     ]
     # `staging_root=None` is a standalone verify: a private directory under the OS temp dir, never
     # where the backup runner stages. See the staging-location block above `_Staging` (BACKLOG #1174).
@@ -2346,6 +2350,7 @@ async def run_restore_verify(
         # Threaded through so a full verify opens the snapshot under the SAME cipher/keyring/provider
         # the keyring above was resolved from, instead of a bare default (see _full_open_check).
         store_settings=store_settings,
+        posture=posture,
     )
 
 

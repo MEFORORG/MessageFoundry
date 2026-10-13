@@ -469,15 +469,10 @@ def test_a_context_that_checks_revocation_crosses_and_is_read_only_when_needed()
     # The control: the same call on a context without the flag refuses.
     with pytest.raises(VaultHopRefused):
         _refuse(_OFF_BOX)
-    # On the box the answer is already ALLOW, so no context is built for it.
+    # On the box, or attested, the answer is already ALLOW, so no context is built for it.
     _refuse(_ON_BOX, ssl_context_factory=checking)
+    _refuse(_OFF_BOX, ssl_context_factory=checking, revocation_attested=True)
     assert len(built) == 1
-    # Attested, the answer is ALLOW too. The flag is read once more in this process, for the
-    # line the first attested crossing would log, and never for a later one.
-    _refuse(_OFF_BOX, ssl_context_factory=checking, revocation_attested=True)
-    assert len(built) == 2
-    _refuse(_OFF_BOX, ssl_context_factory=checking, revocation_attested=True)
-    assert len(built) == 2
 
 
 @pytest.mark.parametrize("url", ["https://localhost:8200", "https://[::1]:8200", _ON_BOX])
@@ -631,9 +626,9 @@ def test_one_hop_crossed_both_ways_logs_each_once(
     [
         # Warned: the answer could turn on the flag, so it is read, at the mount, once.
         (False, _NOT_ENFORCING, 1),
-        # Attested under an enforcing posture: read once, for the line the crossing logs.
-        (True, _ENFORCING, 1),
-        # Attested where no refusal was crossed: nothing to decide and nothing to log.
+        # Attested: the answer is ALLOW without it, so no context is built to read it. The
+        # client build then builds one context, the one the suite assertion checks.
+        (True, _ENFORCING, 0),
         (True, _NOT_ENFORCING, 0),
     ],
     ids=["warned", "attested", "attested-not-enforcing"],
@@ -839,3 +834,98 @@ def test_the_blanket_variable_crosses_a_probe_only_where_the_posture_is_not_enfo
     assert len(problems) == 1 and problems[0].startswith("token lookup-self failed")
     assert dials == [(_HOST, 8200)]
     assert _crossing_lines(caplog) == []
+
+
+# --- repairs from the first round of code review ----------------------------------------------
+
+
+def test_a_posture_with_no_dial_is_enforcing() -> None:
+    """``HopPosture`` is a plain dataclass, so nothing stops a caller building one whose dial is
+    ``None``. Only the value ``False`` relaxes the guard.
+    Mutation: ``enforcing = posture is None or posture.enforcing``."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    for dial in (None, 0, ""):
+        with pytest.raises(VaultHopRefused):
+            _refuse(_OFF_BOX, posture=HopPosture(enforcing=dial))  # type: ignore[arg-type]
+    _refuse(_OFF_BOX, posture=HopPosture(enforcing=False))  # the control
+
+
+def test_an_attested_crossing_never_reads_the_crl_flag(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An attested hop is allowed without the flag, and its line is written without it. So a
+    context factory is never called on that path: it cannot fail there, and an attested client
+    build makes no context beyond the one the suite assertion checks.
+    Mutation: add ``and not checks_revocation()`` to the attested arm's condition."""
+    from messagefoundry.transports.strict_requests import _refuse_an_unrevoked_vault_hop
+
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+
+    def never() -> bool:
+        raise AssertionError("the attested path read the CRL flag")
+
+    for _ in range(2):
+        _refuse_an_unrevoked_vault_hop(
+            _OFF_BOX,
+            None,
+            connector="Vault test hop",
+            checks_revocation=never,
+            revocation_attested=True,
+            revocation_reason=_REASON,
+            attestation_section="store",
+        )
+    assert len(_crossing_lines(caplog)) == 1
+
+
+def test_the_restore_verify_hands_its_callers_posture_to_the_key_resolve(
+    monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
+) -> None:
+    """DR activation inside ``serve`` verifies its cold seed through ``run_restore_verify``, and
+    the engine holds the posture. The ``restore-verify`` command holds none.
+    Mutation: ``resolve_decrypt_keys(store_settings)`` in ``run_restore_verify``."""
+    import asyncio
+
+    from messagefoundry.pipeline.dr_backup import run_restore_verify
+
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _OFF_BOX)
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    settings = StoreSettings(key_provider="vault")
+    archive = str(tmp_path / "absent.mfbak")
+
+    with pytest.raises(KeyProviderError) as refused:
+        asyncio.run(run_restore_verify(archive, store_settings=settings))
+    assert "vault_revocation_attested" in str(refused.value)
+    assert dials == []
+    with pytest.raises(KeyProviderError) as crossed:
+        asyncio.run(run_restore_verify(archive, store_settings=settings, posture=_NOT_ENFORCING))
+    assert "vault_revocation_attested" not in str(crossed.value)
+    assert dials == [(_HOST, 8200)]
+
+
+@pytest.mark.parametrize(("enforcement", "crosses"), [("warn", True), ("enforce", False)])
+def test_the_serve_path_upload_cipher_is_built_under_the_instance_posture(
+    enforcement: str,
+    crosses: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    tmp_path: Any,
+) -> None:
+    """``serve`` builds the uploaded-logs cipher in ``create_app``, before its lifespan opens the
+    store. That build is the first Vault dial of a start, so it takes the posture the lifespan
+    derives. RED before the repair: it passed none, so a ``warn`` instance was refused here.
+    Mutation: ``build_store_cipher(store_settings)`` in ``create_app``."""
+    from messagefoundry.api.app import create_app
+    from messagefoundry.config.settings import AiSettings, SecuritySettings
+
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _OFF_BOX)
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with pytest.raises(KeyProviderError) as caught:
+        create_app(
+            store_settings=StoreSettings(key_provider="vault", uploads_dir=str(tmp_path)),
+            ai_settings=AiSettings(),
+            security_settings=SecuritySettings(enforcement=enforcement),  # type: ignore[arg-type]
+            allow_no_auth=True,
+        )
+    assert ("vault_revocation_attested" not in str(caught.value)) is crosses
+    assert dials == ([(_HOST, 8200)] if crosses else [])

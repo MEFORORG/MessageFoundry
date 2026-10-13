@@ -10,12 +10,19 @@ enforcing.
 
 So no caller can loosen the guard by forgetting the argument. What could loosen it is a caller that
 passes a posture it made up, or a new link that drops the one it was handed. This file lists every
-call to a link of that chain under ``messagefoundry/``, with the expression it passes. A new call,
-or a changed expression, turns :func:`test_every_link_of_the_posture_chain_is_listed` red, and a
-person then decides what that caller should pass.
+call to a link of that chain under ``messagefoundry/`` and ``harness/``, with the expression it
+passes. A new call, or a changed expression, turns
+:func:`test_every_link_of_the_posture_chain_is_listed` red, and a person then decides what that
+caller should pass.
 
 **A caller listed with** ``-`` **passes no posture, on purpose.** It is at least every command that
 opens a store with no posture in scope, and it is judged like an enforcing instance.
+
+**What the scan cannot see.** It reads the expression a call passes, not where that value came
+from. A caller that builds a posture, binds it to a local named ``posture`` and passes that reads
+as handed down. So :func:`test_every_place_a_posture_is_built_is_listed` lists every place a
+``HopPosture`` is built at all. A link this file does not name is not scanned either: the list
+is at least the chain as it stood when this was written (SDS-3.6).
 
 The scan reads source, so it holds with no Vault extra installed.
 """
@@ -66,15 +73,26 @@ _LINKS: dict[str, int | None] = {
     "probe_vault": None,
     "store_vault_client": None,
     "secrets_vault_client": None,
-    # the DR backup runner, which resolves the key on every pass
+    # the DR backup runner, which resolves the key on every pass, and the restore family
     "BackupRunner": None,
     "_BackupRunner": None,
     "_verify_archive_blocking": None,
     "_verify_in_staging": None,
     "_full_open_check": None,
     "_decrypt_check": None,
+    "run_restore_verify": None,
+    "run_restore": None,
+    "DrCoordinator": None,
+    # the engine, which hands its posture to the backup runner and the DR coordinator
+    "Engine": None,
+    # the offline commands' security notifier, which resolves an SMTP secret
+    "_offline_security_notifier": 1,
 }
 _KEYWORDS = ("posture", "hop_posture")
+
+#: The one name that builds a posture. Any use of it as a value is a row: a call, or a
+#: ``HopPosture.fail_closed(...)``, which reads the name first. An annotation is not a use.
+_BUILDERS: dict[str, int | None] = {"HopPosture": None}
 
 #: The expressions a caller may pass: a posture it was handed or holds, and nothing it built.
 _HANDED_DOWN = frozenset(
@@ -83,12 +101,37 @@ _HANDED_DOWN = frozenset(
 
 Row = tuple[str, str, str, str]
 
+#: The one expression ``serve`` derives its posture with, where it is written inline.
+_SERVE_DERIVATION = (
+    "hop_posture_from_ai(ai_settings, enforcement=(security_settings or "
+    "SecuritySettings()).enforcement) if ai_settings else None"
+)
+#: Each listed call that passes something other than a name it was handed, and why that is right.
+#: A new one must be argued here, in review.
+_NOT_HANDED_DOWN: dict[Row, str] = {
+    ("api/app.py", "create_managed_app.lifespan", "Engine", _SERVE_DERIVATION): (
+        "derived on the spot from the instance's own [ai] and [security] settings, by the same "
+        "function as the lifespan's _hop_posture"
+    ),
+    (
+        "harness/load/connscale/runner.py",
+        "_store_reader._read",
+        "open_store",
+        "HopPosture(enforcing=False)",
+    ): (
+        "a synthetic load rig. It holds no instance settings and declares a warn posture for its "
+        "own rig store (vault BACKLOG #2354). If its settings ever named a Vault provider, an "
+        "unattested off-box Vault would be warned there, not refused"
+    ),
+}
+
 
 class _Scan(ast.NodeVisitor):
     """One row per call to a link: module, enclosing function by qualified name, link, posture."""
 
-    def __init__(self, relative: str) -> None:
+    def __init__(self, relative: str, links: dict[str, int | None]) -> None:
         self.relative = relative
+        self.links = links
         self.scope: list[str] = []
         self.rows: list[Row] = []
         #: The nodes already counted as a call, so they are not counted again as a reference.
@@ -122,12 +165,12 @@ class _Scan(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         name = callee_name(node)
-        if name in _LINKS:
+        if name is not None and name in self.links:
             self.seen.add(id(node.func))
-            self._row(name, _posture_of(node, _LINKS[name]))
+            self._row(name, _posture_of(node, self.links[name]))
         # A link handed to a runner as its first argument, with the link's own keywords after it:
         # `asyncio.to_thread(link, ..., posture=...)` or `functools.partial(link, posture=...)`.
-        target = _link_named(node.args[0]) if node.args else None
+        target = _link_named(node.args[0], self.links) if node.args else None
         if target is not None:
             self.seen.add(id(node.args[0]))
             self._row(target, _posture_of(node, None))
@@ -137,7 +180,7 @@ class _Scan(ast.NodeVisitor):
         """Any other use of a link's name as a value, such as a callback argument. The caller
         that finally calls it is out of this scan's sight, so the row says so."""
         if isinstance(node.ctx, ast.Load) and id(node) not in self.seen:
-            name = _link_named(node)
+            name = _link_named(node, self.links)
             if name is not None:
                 self._row(name, _BY_REFERENCE)
         self.generic_visit(node)
@@ -146,9 +189,9 @@ class _Scan(ast.NodeVisitor):
     visit_Attribute = _reference
 
 
-def _link_named(node: ast.expr) -> str | None:
+def _link_named(node: ast.expr, links: dict[str, int | None]) -> str | None:
     name = node.id if isinstance(node, ast.Name) else getattr(node, "attr", None)
-    return name if isinstance(node, ast.Name | ast.Attribute) and name in _LINKS else None
+    return name if isinstance(node, ast.Name | ast.Attribute) and name in links else None
 
 
 def _posture_of(call: ast.Call, position: int | None) -> str:
@@ -160,22 +203,39 @@ def _posture_of(call: ast.Call, position: int | None) -> str:
     return _NONE
 
 
-def _scan(source: str, relative: str) -> list[Row]:
-    scan = _Scan(relative)
+def _scan(source: str, relative: str, links: dict[str, int | None] = _LINKS) -> list[Row]:
+    scan = _Scan(relative, links)
     scan.visit(parse_source(source))
     return scan.rows
 
 
+_HARNESS = _PACKAGE.parent / "harness"
+
+
+def _sources() -> list[tuple[str, str]]:
+    """Each module to scan, as its listed name and its source. A module under ``messagefoundry/``
+    is named from there, as the attestation census names it; one under ``harness/`` keeps that
+    prefix. The harness is a client, but its load rigs open a store themselves."""
+    rigs = sorted(_HARNESS.rglob("*.py"))
+    assert len(rigs) >= 20, f"the walk found only {len(rigs)} module(s) under {_HARNESS}"
+    named = [(path.relative_to(_PACKAGE).as_posix(), path) for path in _modules()]
+    named += [(path.relative_to(_PACKAGE.parent).as_posix(), path) for path in rigs]
+    return [(relative, path.read_text(encoding="utf-8")) for relative, path in named]
+
+
+def _rows(links: dict[str, int | None]) -> tuple[Row, ...]:
+    rows: list[Row] = []
+    for relative, source in _sources():
+        # Code that calls a link has to spell its name, so a file that spells none is not parsed.
+        if any(name in source for name in links):
+            rows.extend(_scan(source, relative, links))
+    return tuple(sorted(rows))
+
+
 @functools.cache
 def _found() -> tuple[Row, ...]:
-    """Every row under ``messagefoundry/``, sorted. Scanned once for the whole file."""
-    rows: list[Row] = []
-    for path in _modules():
-        source = path.read_text(encoding="utf-8")
-        # Code that calls a link has to spell its name, so a file that spells none is not parsed.
-        if any(name in source for name in _LINKS):
-            rows.extend(_scan(source, path.relative_to(_PACKAGE).as_posix()))
-    return tuple(sorted(rows))
+    """Every call to a link under ``messagefoundry/`` and ``harness/``, sorted. Scanned once."""
+    return _rows(_LINKS)
 
 
 #: Every call to a link, at the commit that last changed this list. Sorted, and a list, so two
@@ -191,7 +251,11 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_backup.run", "open_store", "-"),
         ("__main__.py", "_build_provision_auth_service", "resolve_secret_provider", "posture"),
         ("__main__.py", "_check_privileges", "probe_vault", "posture"),
-        ("__main__.py", "_offline_security_notifier", "resolve_secret_provider", "-"),
+        ("__main__.py", "_admin_reset_totp.notice", "_offline_security_notifier", "-"),
+        ("__main__.py", "_offline_security_notifier", "resolve_secret_provider", "posture"),
+        ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
+        ("__main__.py", "_restore", "run_restore", "-"),
+        ("__main__.py", "_restore_verify", "run_restore_verify", "-"),
         ("__main__.py", "_provision_admin", "build_store_cipher", "posture"),
         ("__main__.py", "_provision_admin.administrator_exists", "open_store", "posture"),
         ("__main__.py", "_provision_admin.run", "open_store", "posture"),
@@ -199,7 +263,16 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_rotate_key", "resolve_active_key", "-"),
         ("__main__.py", "_rotate_key.run", "open_store", "-"),
         ("__main__.py", "_store_transit_bound.run", "open_store", "-"),
-        ("api/app.py", "create_app", "build_store_cipher", "-"),
+        ("api/app.py", "create_app", "build_store_cipher", "posture"),
+        ("api/app.py", "create_managed_app.lifespan", "Engine", _SERVE_DERIVATION),
+        (
+            "harness/load/connscale/runner.py",
+            "_store_reader._read",
+            "open_store",
+            "HopPosture(enforcing=False)",
+        ),
+        ("pipeline/dr.py", "DrCoordinator._verify_seed", "run_restore_verify", "self._hop_posture"),
+        ("pipeline/engine.py", "Engine.dr_coordinator", "DrCoordinator", "self._hop_posture"),
         ("api/app.py", "create_managed_app.lifespan", "open_store", "_hop_posture"),
         ("api/app.py", "create_managed_app.lifespan", "resolve_secret_provider", "_hop_posture"),
         ("config/secretprovider.py", "_load_external_provider", "build_provider", "posture"),
@@ -241,8 +314,8 @@ _CENSUS: list[Row] = sorted(
         ("pipeline/dr_backup.py", "_verify_archive_blocking", "_verify_in_staging", "posture"),
         ("pipeline/dr_backup.py", "_verify_in_staging", "_full_open_check", "posture"),
         ("pipeline/dr_backup.py", "run_restore", "resolve_decrypt_keys", "-"),
-        ("pipeline/dr_backup.py", "run_restore_verify", "_verify_archive_blocking", "-"),
-        ("pipeline/dr_backup.py", "run_restore_verify", "resolve_decrypt_keys", "-"),
+        ("pipeline/dr_backup.py", "run_restore_verify", "_verify_archive_blocking", "posture"),
+        ("pipeline/dr_backup.py", "run_restore_verify", "resolve_decrypt_keys", "posture"),
         ("pipeline/engine.py", "Engine.start", "BackupRunner", "self._hop_posture"),
         ("privilege_probes.py", "probe_vault", "secrets_vault_client", "posture"),
         ("privilege_probes.py", "probe_vault", "store_vault_client", "posture"),
@@ -309,9 +382,49 @@ def test_every_link_of_the_posture_chain_is_listed() -> None:
 def test_no_caller_passes_a_posture_it_built() -> None:
     """The one way a caller could turn the guard off is to pass a posture of its own making, such
     as ``HopPosture(enforcing=False)``. Every listed expression is a name the caller was handed
-    or holds."""
+    or holds, except the rows :data:`_NOT_HANDED_DOWN` argues one by one.
+
+    This judges the expression, not where its value came from; the next test covers that."""
     built = [row for row in _CENSUS if row[3] not in _HANDED_DOWN]
-    assert built == []
+    assert sorted(built) == sorted(_NOT_HANDED_DOWN)
+    assert all(_NOT_HANDED_DOWN.values())
+
+
+#: Every place a posture is built, in ``messagefoundry/`` and ``harness/``: module and function.
+#: A caller that built one, bound it to a local and passed the local would read as handed down
+#: in the census above, so it must show up here instead.
+_POSTURES_BUILT = sorted(
+    [
+        # The one derivation from an instance's settings.
+        ("config/settings.py", "hop_posture_from_ai"),
+        # An enforcing default for a connector built with no posture stamped. It cannot relax.
+        ("transports/rest.py", "_current_hop_posture_fail_closed"),
+        # The synthetic load rigs, which declare a warn posture for their own rig stores. Only
+        # the `open_store` one reaches a link of this chain; `_NOT_HANDED_DOWN` argues it.
+        ("harness/load/connscale/runner.py", "_reset_server_store"),
+        ("harness/load/connscale/runner.py", "_reset_server_store"),
+        ("harness/load/connscale/runner.py", "_store_reader._read"),
+        ("harness/load/shardcert.py", "_queue_breakdown"),
+        ("harness/load/shardcert.py", "_reset_store"),
+    ]
+)
+
+
+def test_every_place_a_posture_is_built_is_listed() -> None:
+    """The engine derives its posture in one function, from the loaded settings, and one more
+    builds an enforcing default. Neither can relax a hop the instance did not relax. A new place
+    that builds one turns this red.
+
+    Mutation: add ``posture = HopPosture(enforcing=False)`` to any function in ``messagefoundry/``."""
+    found = sorted((relative, where) for relative, where, _, _ in _rows(_BUILDERS))
+    assert found == _POSTURES_BUILT
+    planted = "def _a_new_command():\n    posture = HopPosture(enforcing=False)\n"
+    assert [(r, w) for r, w, _, _ in _scan(planted, "planted.py", _BUILDERS)] == [
+        ("planted.py", "_a_new_command")
+    ]
+    # The control that the planted caller is what the census alone would miss.
+    passed = "def _a_new_command():\n    open_store(settings, posture=posture)\n"
+    assert _scan(passed, "planted.py")[0][3] in _HANDED_DOWN
 
 
 _PLANTED = """
@@ -347,6 +460,7 @@ def test_the_census_fires_on_a_planted_caller() -> None:
     assert sorted(unlisted) == sorted(planted)
     assert stale == []
     assert [row for row in planted if row[3] not in _HANDED_DOWN] == [planted[1]]
+    assert planted[1] not in _NOT_HANDED_DOWN
 
 
 def test_a_second_identical_call_is_a_difference() -> None:

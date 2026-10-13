@@ -1170,7 +1170,6 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   **None of these is an `audit` table row that carries the reason**: all three clients can be
   built before the store opens.
   The entry is named whenever the flag is set, whether or not a Vault provider is selected.
-  `messagefoundry check` has no line for it.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused when the settings load.
   `messagefoundry security show` does not stop on a file that will not load: it marks its report

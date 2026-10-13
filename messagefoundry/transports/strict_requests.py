@@ -748,9 +748,11 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     the box: the proxy reads the request, token and all. A host-less address is not counted as
     loopback, because it names no hop at all.
 
-    **So the authority reduces to "on the box, or refused".** This hop has no posture in scope:
-    the providers are built from the environment and hold no ``[security]`` section (see
-    ``tls_policy.vault_client_verify_kwargs``), and it has no attestation or acceptance field. So
+    **So the authority reduces to "on the box, or refused".** This check takes no posture, on
+    purpose. A cleartext Vault hop has no attestation or acceptance field, so there is nothing
+    a relaxed posture could be weighed against. The adapter does hold the instance posture
+    since vault BACKLOG #2983, for the revocation check alone. **Do not pass it here:** it
+    would send the Vault token in cleartext on a ``warn`` instance. So
     a non-loopback ``http://`` Vault is refused under every ``[security].enforcement`` setting,
     like this hop's two older refusals (an ``https://`` proxy in front of an ``http://`` Vault, and
     ``verify=False``), neither of which has an escape. The HTTP-family sibling is
@@ -767,7 +769,7 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     # The three constants leave `on_box` as the only input. The call stays so this cell follows
     # the shared authority if its rule for an on-box hop ever changes.
     disposition = insecure_hop_disposition(
-        enforcing=True,  # no posture in scope (docstring); fail closed
+        enforcing=True,  # takes no posture, on purpose (docstring); fail closed
         is_loopback_hop=on_box,
         hop_attested=False,
         cleartext_accepted=False,
@@ -830,8 +832,8 @@ def _refuse_cleartext_proxy_credentials(proxy: str | None, *, connector: str) ->
     SOCKS proxy it goes in the SOCKS greeting instead, also in the clear.
 
     Refused under every ``[security].enforcement`` setting, for the reason the cleartext refusal
-    gives: this hop has no posture in scope and no acceptance field. There is no loopback
-    exception. Raises :class:`VaultHopRefused` with fixed text."""
+    gives: the check takes no posture, on purpose, and the hop has no acceptance field. There is
+    no loopback exception. Raises :class:`VaultHopRefused` with fixed text."""
     if proxy and _proxy_carries_cleartext_credentials(proxy):
         raise VaultHopRefused(f"{connector}: {_CLEARTEXT_PROXY_CREDENTIALS}")
 
@@ -955,7 +957,8 @@ def _refuse_an_unrevoked_vault_hop(
       cross under ``enforce``.
     * ALLOW crosses. A hop that crossed an enforcing or unknown posture on its attestation logs
       a WARNING through ``tls_policy.log_attested_crossing``, with ``revocation_reason``. A hop
-      on the box logs nothing, and neither does a hop whose context checks a CRL.
+      on the box logs nothing, and neither does an unattested hop whose context checks a CRL.
+      The attested line is written without reading the context, since no CRL lever is built.
 
     Each line is logged once per process for each hop (:func:`_first_crossing`). Neither is an
     ``audit`` table row: the hop can be dialled before any store is open.
@@ -981,7 +984,8 @@ def _refuse_an_unrevoked_vault_hop(
     on_box = _stays_on_the_box(host, proxy)
     attested = revocation_attested is True
     # An unknown posture is enforcing, the rule `HopPosture.fail_closed` gives an unknown dial.
-    enforcing = posture is None or posture.enforcing
+    # Only the value `False` relaxes it, so a posture built with no dial at all stays strict.
+    enforcing = posture is None or posture.enforcing is not False
 
     def decide(crl_checked: bool) -> HopDisposition:
         return revocation_hop_disposition(
@@ -997,16 +1001,12 @@ def _refuse_an_unrevoked_vault_hop(
     if disposition is not HopDisposition.ALLOW and checks_revocation():
         disposition = decide(True)
     if disposition is HopDisposition.ALLOW:
-        # The attestation is why this hop crossed only where nothing above it in the authority
-        # allowed it: off the box, and with no CRL check. The flag is read last, and only for
-        # the one line this process logs.
-        if (
-            attested
-            and enforcing
-            and not on_box
-            and _first_crossing(connector, "attested")
-            and not checks_revocation()
-        ):
+        # The attestation is why this hop crossed where nothing above it in the authority
+        # allowed it: off the box, under a posture that would have refused. This arm does not
+        # read the CRL flag. No CRL lever is built, so the read could only build a context to
+        # learn nothing, and `_UNCHECKED_VAULT_HOP` already says no lever is built. A change
+        # that builds one must revisit that text and this arm together.
+        if attested and enforcing and not on_box and _first_crossing(connector, "attested"):
             log_attested_crossing(
                 logger,
                 crossing=_CROSSED_UNCHECKED,

@@ -488,7 +488,9 @@ async def test_a_request_archive_outside_seed_dir_is_refused_untouched(
 
         verified: list[str] = []
 
-        async def recording_verify(path: str, *, store_settings: object) -> VerifyResult:
+        async def recording_verify(
+            path: str, *, store_settings: object, posture: object = None
+        ) -> VerifyResult:
             verified.append(path)
             return await run_restore_verify(path, store_settings=store_settings)
 

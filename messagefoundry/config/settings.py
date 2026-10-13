@@ -4217,6 +4217,24 @@ class AiSettings(_Section):
         return prod
 
 
+def vault_revocation_attestations(
+    store: StoreSettings, secrets: SecretsSettings
+) -> list[tuple[str, str, str | None]]:
+    """Each Vault revocation attestation that is set: its switch name, the hops it covers and its
+    reason (vault BACKLOG #2983).
+
+    The one walk of the two pairs. :func:`security_loosenings` and ``messagefoundry check`` both
+    read it, so the two surfaces name a switch the same way."""
+    return [
+        (f"{section}.vault_revocation_attested", hops, held.vault_revocation_attested_reason)
+        for section, hops, held in (
+            ("store", "the store's Vault hops (the key provider and the Transit cipher)", store),
+            ("secrets", "the connector secret provider's Vault hop", secrets),
+        )
+        if held.vault_revocation_attested
+    ]
+
+
 def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> HopPosture:
     """The instance's :class:`~messagefoundry.config.tls_policy.HopPosture` for the #200 hop-refusal gate.
 
@@ -9205,7 +9223,7 @@ def security_loosenings(
     # the entry is the record a reviewer reads, and the serve-time warning prints it.
     out.extend(
         (
-            f"{section}.vault_revocation_attested",
+            switch,
             f"revocation of the Vault server certificate on {hops} is attested as covered outside "
             f"the engine (reason: {reason}) -- the engine verifies that certificate but its own "
             "handshake checks no CRL and no OCSP, and the attestation adds no check. Wherever the "
@@ -9213,21 +9231,7 @@ def security_loosenings(
             "caught only if what the reason names really covers it. No CRL lever is built for "
             "these hops. It never lifts a cleartext or verify-off refusal",
         )
-        for section, hops, attested, reason in (
-            (
-                "store",
-                "the store's Vault hops (the key provider and the Transit cipher)",
-                store.vault_revocation_attested,
-                store.vault_revocation_attested_reason,
-            ),
-            (
-                "secrets",
-                "the connector secret provider's Vault hop",
-                secrets.vault_revocation_attested,
-                secrets.vault_revocation_attested_reason,
-            ),
-        )
-        if attested
+        for switch, hops, reason in vault_revocation_attestations(store, secrets)
     )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
     # acknowledgment of it are different facts and an operator can hold either without the other. A hop

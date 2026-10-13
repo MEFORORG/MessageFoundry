@@ -460,6 +460,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # Vault BACKLOG #2983 adds the tls_policy import, for one name: HopPosture, a value type. The
     # backup runner holds the instance posture and hands it to the key resolve and the full verify,
     # so the Vault hop they can dial is judged as `serve` judges it. Builds no context.
+    # pipeline/dr.py names the same type for the same reason: the DR coordinator hands the engine's
+    # posture to the cold-seed verify. It calls no crypto of its own.
+    "messagefoundry/pipeline/dr.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/dr_backup.py": frozenset(
         {
             "hashlib",
@@ -896,6 +899,10 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: limits, and they are the most useful lines in this table: each is a first-party crypto decision
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/pipeline/dr.py": (
+        "names HopPosture, a value type, to hand the engine's posture to the cold-seed verify; "
+        "that verify runs in pipeline/dr_backup.py, which is inventoried"
+    ),
     "messagefoundry/config/secretprovider.py": (
         "names HopPosture, a value type, to hand the caller's posture to the provider it loads; "
         "the guard that reads it is in transports/strict_requests.py, which is inventoried"

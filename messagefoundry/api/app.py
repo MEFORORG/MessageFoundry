@@ -2893,8 +2893,19 @@ def create_app(
     # there is no bound to share and nothing durable to charge.
     app.state.upload_store = None
     if store_settings is not None and store_settings.uploads_dir:
+        # Vault BACKLOG #2983: `serve` reaches this build before its lifespan opens the store, so
+        # it is handed the instance posture the lifespan derives. None (no [ai]) is enforcing.
+        posture = (
+            hop_posture_from_ai(
+                ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
+            )
+            if ai_settings is not None
+            else None
+        )
         upload_cipher = (
-            engine.store.cipher() if engine is not None else build_store_cipher(store_settings)
+            engine.store.cipher()
+            if engine is not None
+            else build_store_cipher(store_settings, posture=posture)
         )
         app.state.upload_store = UploadStore(
             store_settings.uploads_dir,
