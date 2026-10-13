@@ -14,6 +14,10 @@ Synthetic data only: every host, token, key name and reason here is made up.
 
 from __future__ import annotations
 
+import ast
+import inspect
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -31,6 +35,8 @@ from messagefoundry.config.settings import (
     load_settings,
     security_loosenings,
 )
+from tests._ast_sites import call_sites, parse_source
+from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 _REASON = "the Vault server certificate lives 24 hours (synthetic)"
 _SECTIONS = pytest.mark.parametrize(
@@ -163,3 +169,189 @@ def test_each_attestation_is_a_named_loosening_that_carries_its_reason() -> None
     assert "the connector secret provider's Vault hop" in secrets_only[names[1]]
     # The wording the review asked for: the lever is not built, which is not "cannot exist".
     assert "No CRL lever is built" in secrets_only[names[1]]
+
+
+# --- the caller census ------------------------------------------------------------------------
+#
+# The guard's keyword is REQUIRED, so Python refuses a call that leaves it out. But that refusal
+# comes only when the call runs, and a literal ``True`` satisfies it. These scans read the source,
+# so they hold with no Vault extra installed and before any client is built.
+
+_PACKAGE = Path(__file__).resolve().parent.parent / "messagefoundry"
+_MOUNT = "mount_strict_reply_adapter"
+_BUILD = "_build_client"
+_FLAG = "revocation_attested"
+_SETTING = "vault_revocation_attested"
+
+#: Every module that mounts the strict reader, with the settings section its hop's pair is in.
+_MOUNTERS = {
+    "config/secretprovider_vault.py": "secrets",
+    "store/keyprovider_vault.py": "store",
+}
+#: Every function that builds a Vault client, by module, with what it may pass as the flag:
+#: ``setting`` is its own section's ``vault_revocation_attested``, and ``False`` fails closed.
+_BUILDERS = {
+    ("config/secretprovider_vault.py", "resolve"): "setting",
+    ("config/secretprovider_vault.py", "secrets_vault_client"): "False",
+    ("store/keyprovider_vault.py", "active_key"): "setting",
+    ("store/keyprovider_vault.py", "store_vault_client"): "False",
+    ("store/crypto_transit.py", "build_transit_cipher"): "setting",
+}
+
+
+def _keyword(call: ast.Call, name: str) -> ast.expr | None:
+    return next((k.value for k in call.keywords if k.arg == name), None)
+
+
+def _mount_problems(source: str, section: str) -> list[str]:
+    """What is wrong with each mount call in ``source``: the flag missing, a constant where the
+    caller's own flag belongs, or the wrong section."""
+    problems = []
+    for call in call_sites(parse_source(source), _MOUNT):
+        flag = _keyword(call, _FLAG)
+        if not (isinstance(flag, ast.Name) and flag.id == _FLAG):
+            problems.append(f"line {call.lineno}: {_FLAG} is not the caller's own {_FLAG}")
+        named = _keyword(call, "attestation_section")
+        if not (isinstance(named, ast.Constant) and named.value == section):
+            problems.append(f"line {call.lineno}: attestation_section is not {section!r}")
+    return problems
+
+
+def _build_shape(call: ast.Call) -> str:
+    """How a client build passes the flag: ``setting``, ``False``, or what is wrong."""
+    flag = _keyword(call, _FLAG)
+    if flag is None:
+        return "MISSING"
+    if isinstance(flag, ast.Attribute) and flag.attr == _SETTING:
+        return "setting"
+    if isinstance(flag, ast.Constant) and flag.value is False:
+        return "False"
+    return f"UNEXPECTED {ast.unparse(flag)}"
+
+
+def _builders(path: Path) -> dict[tuple[str, str], str]:
+    tree = parse_source(path.read_text(encoding="utf-8"))
+    relative = path.relative_to(_PACKAGE).as_posix()
+    return {
+        (relative, func.name): _build_shape(call)
+        for func in ast.walk(tree)
+        if isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef)
+        for call in call_sites(func, _BUILD)
+    }
+
+
+def _modules() -> list[Path]:
+    modules = sorted(_PACKAGE.rglob("*.py"))
+    # 337 modules when tests/test_vault_hop_refusal_marker.py set this floor. A moved package or
+    # a changed glob leaves few or none to scan.
+    assert len(modules) >= 300, f"the walk found only {len(modules)} module(s) under {_PACKAGE}"
+    return modules
+
+
+def test_every_mount_of_the_strict_reader_passes_its_callers_own_flag() -> None:
+    """A new caller that mounts the reader must say whether its hop is attested, from a setting.
+    This is what the required keyword buys, checked without running the call."""
+    found = {}
+    for path in _modules():
+        source = path.read_text(encoding="utf-8")
+        # Code that calls the name has to spell it, so a file that never does is not parsed.
+        if _MOUNT in source and call_sites(parse_source(source), _MOUNT):
+            found[path.relative_to(_PACKAGE).as_posix()] = source
+    assert sorted(found) == sorted(_MOUNTERS), "a module mounts the reader and is not listed here"
+    for relative, source in found.items():
+        assert _mount_problems(source, _MOUNTERS[relative]) == [], relative
+
+
+_SHIPPED_MOUNT = (
+    "mount_strict_reply_adapter(client, connector=c, ssl_context_factory=f, "
+    'revocation_attested=revocation_attested, attestation_section="store")'
+)
+
+
+@pytest.mark.parametrize(
+    ("planted", "problem"),
+    [
+        # The planted omission: a new client build that mounts the reader and forgets the flag.
+        (
+            "mount_strict_reply_adapter(client, connector=c, ssl_context_factory=f, "
+            'attestation_section="store")',
+            "revocation_attested is not",
+        ),
+        # A literal satisfies Python's required keyword and attests every hop the caller builds.
+        (
+            _SHIPPED_MOUNT.replace("=revocation_attested,", "=True,"),
+            "revocation_attested is not",
+        ),
+        # The process-wide variable in the per-hop slot is the defect BACKLOG #299 removed.
+        (
+            _SHIPPED_MOUNT.replace("=revocation_attested,", "=tls_revocation_attested(),"),
+            "revocation_attested is not",
+        ),
+        # The other section's pair would name the wrong lever in the refusal.
+        (_SHIPPED_MOUNT.replace('"store"', '"secrets"'), "attestation_section is not 'store'"),
+    ],
+)
+def test_the_mount_scan_can_fail(planted: str, problem: str) -> None:
+    """The control for the scan above. The shipped call shape passes it, and each of these does
+    not."""
+    assert planted != _SHIPPED_MOUNT
+    (found,) = _mount_problems(planted, "store")
+    assert problem in found
+    assert _mount_problems(_SHIPPED_MOUNT, "store") == []
+
+
+def test_every_vault_client_build_is_listed_and_none_is_a_no_op() -> None:
+    """The list of callers. An unknown posture counts as enforcing, so the only way a client
+    build could skip the guard is by what it passes as the flag: each passes its own section's
+    setting, or ``False`` where no settings are in scope, which fails closed. Never a literal
+    ``True``, and never nothing."""
+    found: dict[tuple[str, str], str] = {}
+    for path in _modules():
+        if _BUILD in path.read_text(encoding="utf-8"):
+            found.update(_builders(path))
+    assert found == _BUILDERS
+
+
+@pytest.mark.parametrize(
+    ("call", "shape"),
+    [
+        ("_build_client(addr, token)", "MISSING"),
+        ("_build_client(addr, token, revocation_attested=True)", "UNEXPECTED True"),
+        (
+            "_build_client(addr, token, revocation_attested=tls_revocation_attested())",
+            "UNEXPECTED tls_revocation_attested()",
+        ),
+        (
+            "_build_client(a, t, revocation_attested=self._settings.vault_revocation_attested)",
+            "setting",
+        ),
+        ("_build_client(a, t, revocation_attested=False)", "False"),
+    ],
+)
+def test_the_build_scan_tells_the_shapes_apart(call: str, shape: str) -> None:
+    """The control for the list above: a build that passes nothing, or a literal ``True``, would
+    not match the listed shape."""
+    (site,) = call_sites(parse_source(call), _BUILD)
+    assert _build_shape(site) == shape
+
+
+def test_the_flag_is_required_at_every_layer() -> None:
+    """No default anywhere between the setting and the decision, so leaving the flag out is an
+    error at each layer and never a silent ``False`` or ``True``."""
+    if not extra_is_installed(OPTIONAL_EXTRAS["vault"]):
+        pytest.skip("the [vault] extra is not installed, so strict_requests does not import")
+    from messagefoundry.config import secretprovider_vault
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.transports import strict_requests
+
+    for func, names in (
+        (strict_requests.mount_strict_reply_adapter, (_FLAG, "attestation_section")),
+        (strict_requests.StrictReplyAdapter.__init__, (_FLAG, "attestation_section")),
+        (strict_requests._refuse_an_unrevoked_vault_hop, (_FLAG, "attestation_section")),
+        (keyprovider_vault._build_client, (_FLAG,)),
+        (secretprovider_vault._build_client, (_FLAG,)),
+    ):
+        parameters = inspect.signature(func).parameters
+        for name in names:
+            assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, (func, name)
+            assert parameters[name].default is inspect.Parameter.empty, (func, name)
