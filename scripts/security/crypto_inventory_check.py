@@ -1084,12 +1084,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.oidc.flow",
             "hash:via messagefoundry.auth.oidc_http",
             "hash:via messagefoundry.auth.tokens",
+            # BACKLOG #2592: the passkey set is checked against the digest the account's integrity
+            # seal covers (store.passkey_digest, a SHA-256 the seal authenticates).
+            "hash:via messagefoundry.store.store",
             "key_cert:via messagefoundry.auth.oidc_http",
             "key_cert:via messagefoundry.auth.webauthn",
             "mac:via messagefoundry.auth.totp",
             "sign_verify:via messagefoundry.auth.oidc.claims",
             "sign_verify:via messagefoundry.auth.webauthn",
-            # BACKLOG #2592: the session loader checks each session row's integrity seal.
+            # BACKLOG #2592: the session loader checks each session row's integrity seal, and the
+            # user loader each account's.
             "sign_verify:via messagefoundry.store.store",
             "tls_context:via messagefoundry.auth.oidc_http",
         }

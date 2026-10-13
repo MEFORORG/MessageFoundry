@@ -101,6 +101,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RoleGrant,
     SessionRecord,
     Stage,
     StreamingAttachmentsUnsupported,
@@ -2147,7 +2148,7 @@ class AuthStore(Protocol):
     #
     # ADR 0197: a password change also clears BOTH locks and both failure counts, and zeroes the
     # second-step cycle count, because the password those failures proved is gone. The sign-in cycle
-    # count stays (``store.PASSWORD_CHANGE_LOCKOUT_CLEAR``).
+    # count stays (``store.password_change``).
     #
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
@@ -2375,6 +2376,25 @@ class AuthStore(Protocol):
 
     async def get_user_role_ids(self, user_id: str) -> list[str]: ...
 
+    async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
+        """The account's role rows, whole, as its integrity seal covers them (BACKLOG #2592).
+
+        The store writes the user seal: every write to ``users``, ``user_roles`` or the account's
+        passkeys goes through one helper per backend, which verifies the record it read before it
+        re-seals it and raises :class:`~messagefoundry.store.row_seal.RowSealError` rather than
+        re-seal a record that fails. Deleting needs no key. :class:`AuthService` checks the seal,
+        in its one user loader; the store's readers return rows unchecked."""
+        ...
+
+    async def reseal_user_records(self) -> tuple[int, int]:
+        """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592).
+        Returns ``(re-sealed, refused)``; a record that fails its seal is left as it is."""
+        ...
+
+    async def count_unsealed_users(self) -> int:
+        """How many accounts carry no integrity seal (BACKLOG #2592)."""
+        ...
+
     # --- saved-search presets (ADR 0136, BACKLOG #151) — per-user, criteria encrypted at rest -----
 
     async def upsert_search_preset(
@@ -2416,7 +2436,14 @@ class AuthStore(Protocol):
         *,
         assigned_by: str | None = None,
         now: float | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Replace the account's roles with ``role_ids``. Raises ``UnknownRoleError``, writing
+        nothing, when an id the account does not already hold has no ``roles`` row as the write
+        reads it; a role deleted after that read fails the ``user_roles`` foreign key instead, with
+        the driver's integrity error. A held id with no row is dropped (BACKLOG #2592,
+        ``store.existing_roles_only``). :meth:`remove_unless_last_admin` with ``SET_ROLES`` does
+        the same."""
+        ...
 
     async def remove_unless_last_admin(
         self,

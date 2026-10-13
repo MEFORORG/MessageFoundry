@@ -378,7 +378,7 @@ async def test_a_directory_repoint_and_its_audit_row_commit_together() -> None:
             _directory_principal("repoint", "first@example.org"), None, mfa_verified=True
         )
         assert out.ok
-        before = await store.get_user_by_username("repoint")
+        before = await service._load_user_by_username("repoint")  # checked (#2592)
         assert before is not None and before.email == "first@example.org"
 
         _refuse_audit_appends(store)

@@ -771,6 +771,12 @@ async def test_auth_users_roles_sessions(store) -> None:
 
     await store.set_ad_group_role_map([("CN=Ops,DC=x", "operator")])
     assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
+    # BACKLOG #2592: this map has no role foreign key, so it can name a deleted role. That id is
+    # not handed to a sign-in, whose role write would refuse it; the live role still is.
+    await store.set_ad_group_role_map(
+        [("CN=Ops,DC=x", "operator"), ("CN=Ops,DC=x", "custom:no-such-role")]
+    )
+    assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
 
     await store.record_login_failure("u1", failed_attempts=2, locked_until=500.0, now=10.0)
     assert (await store.get_user("u1")).locked_until == 500.0
@@ -1316,13 +1322,11 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
 async def test_set_password_claim_stamp_round_trip(store) -> None:
     """BACKLOG #1245 ``users.password_claimed_at`` on the real SQL Server backend.
 
-    ``password_claim_set`` is shared by all three backends, so the SQL TEXT of the claim term is
-    single-sourced — but the ARGUMENT BINDING around it is hand-written per backend and nothing
-    else on this leg executes ``set_password`` at all. This backend is the sharp one: the claim
-    value is spliced POSITIONALLY into the MIDDLE of a ``?`` list, between the
-    ``must_change_password`` bind and the ``updated_at`` bind. An arity mismatch between the term
-    and its argument shifts every later bind by one, which would write the claim timestamp into a
-    neighbouring column (or the user id into a FLOAT one) rather than failing outright.
+    The claim rule is ``store.password_change``, shared by all three backends since BACKLOG #2592,
+    and the write is the sealed user record's one whole-row ``?`` statement -- nothing else on this
+    leg executes ``set_password`` at all. An arity mismatch in that statement shifts every later
+    bind by one, which would write the claim timestamp into a neighbouring column (or the user id
+    into a FLOAT one) rather than failing outright.
 
     Every assertion below compares against the EXACT timestamp passed, never merely ``is not
     None``: a shifted bind that landed the ``must_change_password`` flag in the column would still
@@ -5487,6 +5491,65 @@ async def test_session_seal_contract(store) -> None:
 
         await assert_session_seal_contract(keyed, raw)
         assert_session_columns(await columns())
+    finally:
+        await keyed.close()
+
+
+async def test_user_seal_contract(store) -> None:
+    """BACKLOG #2592: the sealed user record, the same contract the SQLite suite runs, on a keyed
+    handle, with the round trip that pins the canonical bytes (AC-19). ``raw`` runs each statement
+    on a pooled connection, outside the store's helpers. The fixture clears the user and role
+    tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._user_seal_contract import (
+        assert_user_columns,
+        assert_user_record_round_trips,
+        assert_user_seal_contract,
+    )
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        async def columns() -> set[str]:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(
+                    "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('users')"
+                )
+                return {str(r[0]) for r in await cur.fetchall()}
+
+        assert_user_columns(await columns())
+        await assert_user_record_round_trips(keyed)
+        await assert_user_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
+    """BACKLOG #2592: this backend has the ``user_roles`` role foreign key too, so a grant that
+    commits while its custom role is deleted fails the delete rather than leaving a sealed role row
+    with no role behind it. The race is made, not hoped for: ``tests/_user_seal_contract.py`` runs
+    the grant on a second connection inside the delete."""
+    import pyodbc
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._user_seal_contract import assert_role_delete_race_refused
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+        await assert_role_delete_race_refused(keyed, pyodbc.IntegrityError)
     finally:
         await keyed.close()
 
