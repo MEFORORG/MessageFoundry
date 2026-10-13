@@ -490,9 +490,10 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # BACKLOG #2547, before requests parses the proxy URL: a credentialed URL that will not
         # parse would otherwise fail in requests' own parser, whose error can quote the password.
         # proxy_manager_for checks again, on a requests too old to call this hook.
-        _refuse_cleartext_proxy_credentials(
-            requests.utils.select_proxy(request.url or "", proxies), connector=self._connector
-        )
+        # The proxy is selected once: the three checks below judge the same one.
+        url = request.url or ""
+        proxy = requests.utils.select_proxy(url, proxies)
+        _refuse_cleartext_proxy_credentials(proxy, connector=self._connector)
         pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
         # Both halves: the class is one of ours, and nothing below it put the stock reader back.
         if not (
@@ -512,20 +513,17 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # BACKLOG #300: an https pool for an http:// request can only be an https proxy's, and
         # requests will not verify it. Checked at construction too; this also catches a proxy
         # setting that changed after the client was built.
-        url = request.url or ""
         if _scheme_of(url) != "https":
             if pool.scheme == "https":
                 raise VaultHopRefused(_unverifiable_proxy_leg(self._connector))
             # BACKLOG #2317: a non-https request carries the token in cleartext unless it stays
             # on the box. Checked at construction too; this catches a proxy that appeared since.
-            _refuse_a_cleartext_vault_hop(
-                url, requests.utils.select_proxy(url, proxies), connector=self._connector
-            )
+            _refuse_a_cleartext_vault_hop(url, proxy, connector=self._connector)
         # Vault BACKLOG #2983: checked at construction too. This catches a proxy that appeared
         # since, which takes a loopback Vault off the box.
         _refuse_an_unrevoked_vault_hop(
             url,
-            requests.utils.select_proxy(url, proxies),
+            proxy,
             connector=self._connector,
             ssl_context_factory=self._ssl_context_factory,
             revocation_attested=self._revocation_attested,
@@ -686,6 +684,17 @@ def _vault_scheme_and_host(url: str) -> tuple[str, str]:
     return (parts.scheme or "").lower(), (parts.host or "").strip("[]")
 
 
+def _stays_on_the_box(host: str, proxy: str | None) -> bool:
+    """Whether a hop to ``host``, sent through ``proxy`` or direct, stays on this machine.
+
+    One rule for the cleartext refusal and the revocation refusal: a loopback host, by
+    ``tls_policy.is_loopback_hop_host``, which never resolves DNS, reached with no proxy. A
+    loopback address behind a proxy is not on the box, because the proxy carries it elsewhere.
+    A blank host is not either: that function counts ``""`` as loopback, and here it names no
+    hop at all."""
+    return not proxy and bool(host) and is_loopback_hop_host(host)
+
+
 def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str) -> None:
     """Refuse a Vault hop whose token would cross the network in cleartext (BACKLOG #2317).
 
@@ -714,7 +723,7 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     scheme, host = _vault_scheme_and_host(url)
     if scheme == "https":
         return
-    on_box = scheme == "http" and not proxy and bool(host) and is_loopback_hop_host(host)
+    on_box = scheme == "http" and _stays_on_the_box(host, proxy)
     # The three constants leave `on_box` as the only input. The call stays so this cell follows
     # the shared authority if its rule for an on-box hop ever changes.
     disposition = insecure_hop_disposition(
@@ -850,7 +859,8 @@ def _refuse_an_unrevoked_vault_hop(
       ``[security]`` section, as :func:`_refuse_a_cleartext_vault_hop` records. Threading the
       posture to this call is the next slice of vault BACKLOG #2983. Until then the authority
       answers ALLOW or REFUSE only, and anything but ALLOW refuses. When the posture arrives, the
-      WARN answer needs its own arm here.
+      WARN answer needs its own arm here. That arm would also build a context on every send of
+      an unattested off-box hop, so read the CRL flag once at mount then.
 
     Never ``RevocationHopGuard.enforce_construction`` or ``enforce_insecure_hop``: each raises
     the unmarked base type, and the guard's text echoes the host. Raises
@@ -863,7 +873,7 @@ def _refuse_an_unrevoked_vault_hop(
     scheme, host = _vault_scheme_and_host(url)
     if scheme != "https":
         return
-    on_box = not proxy and bool(host) and is_loopback_hop_host(host)
+    on_box = _stays_on_the_box(host, proxy)
     attested = revocation_attested is True
     disposition = revocation_hop_disposition(
         enforcing=HopPosture.fail_closed(enforcing=None).enforcing,

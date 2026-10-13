@@ -79,6 +79,11 @@ def _hop_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(urllib.request, "getproxies_registry", dict, raising=False)
     monkeypatch.setattr(urllib.request, "getproxies_macosx_sysconf", dict, raising=False)
     monkeypatch.setattr(urllib.request, "proxy_bypass_registry", lambda host: False, raising=False)
+    # hvac reads these once, at import, so unsetting the env vars would not undo them.
+    import hvac.v1  # type: ignore[import-untyped]  # the [vault] extra ships no stubs
+
+    for name in ("VAULT_CACERT", "VAULT_CAPATH", "VAULT_CLIENT_CERT", "VAULT_CLIENT_KEY"):
+        monkeypatch.setattr(hvac.v1, name, None, raising=False)
     monkeypatch.setenv("MEFOR_SECRETS_VAULT_TOKEN", _TOKEN)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
