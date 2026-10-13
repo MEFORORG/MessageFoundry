@@ -1954,3 +1954,71 @@ def test_the_footer_reports_the_BACKLOG_and_not_only_this_pass(repo: Path, tmp_p
     assert "oldest" in text, (
         "the depth alone does not say whether the queue is aging toward its TTL"
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# The input is read as UTF-8, because its `cwd` is the address.
+#
+# The desktop app starts a worktree session's hooks in the PRIMARY checkout (measured 2026-10-12), so
+# the payload `cwd` is the only thing naming the worktree. The drain used it, but read stdin through
+# [Console]::In, which decodes with the console code page: a UTF-8 e-acute arrived as two box-drawing
+# characters, git found no repository there, and the drain exited silent. The harness writes raw
+# UTF-8, so these tests do too, and the drain runs IN the primary, as the app runs it.
+# --------------------------------------------------------------------------------------------------
+
+ACCENTED = "caf\u00e9-linked"
+
+
+@pytest.fixture
+def accented_worktree(repo: Path, tmp_path: Path) -> Path:
+    """A worktree linked to ``repo`` whose path is not ASCII, holding one message sent to it."""
+    wt = Path(os.path.realpath(tmp_path)) / ACCENTED
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "accented", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    send = subprocess.run(
+        [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(wt),
+            "-Body", "addressed to the accented worktree",
+        ],
+        cwd=str(wt),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )  # fmt: skip
+    assert send.returncode == 0, send.stderr.decode("utf-8", "replace")
+    return wt
+
+
+def _drain_in_primary(repo: Path, wt: Path, *, ascii_escaped: bool) -> str:
+    payload = {"hook_event_name": "Stop", "session_id": SELF_ID, "cwd": str(wt)}
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)],
+        cwd=str(repo),
+        input=json.dumps(payload, ensure_ascii=ascii_escaped).encode("utf-8"),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    return str(json.loads(out)["hookSpecificOutput"]["additionalContext"]) if out else ""
+
+
+def test_a_worktree_whose_path_is_not_ascii_gets_its_mail(
+    repo: Path, accented_worktree: Path
+) -> None:
+    text = _drain_in_primary(repo, accented_worktree, ascii_escaped=False)
+    assert "    | addressed to the accented worktree" in text, text
+
+
+def test_the_same_address_escaped_to_ascii_gets_its_mail(
+    repo: Path, accented_worktree: Path
+) -> None:
+    """The control. Escaped as \\u00e9, the bytes are ASCII and any decoder reads them, so the
+    message is delivered. The arm above differs only in the bytes on stdin."""
+    text = _drain_in_primary(repo, accented_worktree, ascii_escaped=True)
+    assert "    | addressed to the accented worktree" in text, text

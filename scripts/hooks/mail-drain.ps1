@@ -175,6 +175,14 @@
     verifies its own. Do not open-code a move in this file. The measurement is in
     docs/adr/0161-async-session-mail-for-unreachable-peers.md.
 
+    THE INPUT IS READ AS UTF-8, because its `cwd` is the address. The desktop app starts a worktree
+    session's hooks in the PRIMARY checkout (measured 2026-10-12), so the payload `cwd` is the only
+    thing naming the worktree, and this script already used it. But it read stdin through
+    [Console]::In, which decodes with the console code page. Measured the same week, that turns a UTF-8
+    `cafe` with an acute e into `caf` plus two box-drawing characters. git then finds no repository at
+    that path and the drain exits silent, so that worktree's mail is never shown. The read now goes
+    through scripts/hooks/_hookinput.ps1, and through [Console]::In only where that helper cannot load.
+
     ASCII-only on purpose; run under pwsh 7 by the hook.
 #>
 
@@ -694,8 +702,11 @@ function Test-ReceiptProtected {
 
 try {
     # --- Read the hook input. It carries session_id and cwd, which is our whole addressing substrate.
+    # As UTF-8 bytes through the shared helper; see the header for what the console decoder did.
     $stdinRaw = ''
-    if ([Console]::IsInputRedirected) { $stdinRaw = [Console]::In.ReadToEnd() }
+    try { . (Join-Path $PSScriptRoot '_hookinput.ps1') } catch { }
+    if (Get-Command Read-CcxHookInput -ErrorAction SilentlyContinue) { $stdinRaw = Read-CcxHookInput }
+    elseif ([Console]::IsInputRedirected) { $stdinRaw = [Console]::In.ReadToEnd() }
     $hook = $null
     try { $hook = $stdinRaw | ConvertFrom-Json } catch { }
     # THE FALLBACK IS NOW LOAD-BEARING, not arbitrary. A payload with no hook_event_name must default to
