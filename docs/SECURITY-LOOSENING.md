@@ -1126,11 +1126,11 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   and wherever a client is built without a known posture, which counts as enforcing.
 - **Which callers know the posture:** at least `serve`, `check-privileges` and
   `provision-admin` hand it to the guard. On an instance at `enforcement = warn` they cross an
-  unattested off-box Vault with a WARNING. **The other commands that open a store hold no
-  posture, at least today, so they refuse that Vault even on a `warn` instance.** That includes
-  at least `rotate-key`, `backup` and `audit-verify`. So `warn` alone does not make an off-box
-  Vault usable by every command: set the pair. `tests/test_vault_posture_census.py` lists what
-  each caller passes.
+  unattested off-box Vault with a WARNING. **A command that holds no posture refuses that
+  Vault even on a `warn` instance.** That includes at least `rotate-key`, `backup` and
+  `audit-verify`, at least today. So `warn` alone does not make an off-box Vault usable by
+  every command: set the pair. This bullet is the one place the docs name callers.
+  `tests/test_vault_posture_census.py` is the list itself: what each call passes.
 - **`check-privileges` follows the same rule.** It builds each Vault client with that hop's own
   pair and its own posture. So it probes an off-box Vault only where `serve` would reach it, and
   otherwise reports the token as not observed, with the refusal.

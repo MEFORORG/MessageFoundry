@@ -1303,8 +1303,10 @@ unchanged for that reason: the handshake still checks no CRL and no OCSP.
 
 **No CRL lever is built.** The ruling chose that. It is a statement about this build, not about
 the hop: the engine builds the context each Vault handshake runs on, so a CRL could reach it. The
-guard already reads whether that context checks a CRL, off the context itself. So a later CRL
-build would need no change to the guard, only a context that loads one.
+guard already reads whether that context checks a CRL, off the context itself, for a hop that
+is not attested. So a later CRL build can start there. It must still change the guard in at
+least two places: the refusal text, which offers the attestation alone, and the attested
+crossing's line, which is written without reading the context and says no lever is built.
 
 **What the attestation can rest on.** Not on the engine. A short-lived Vault server certificate is
 the main honest basis. `docs/SECURITY-LOOSENING.md` holds the operator's version of this, and
@@ -1322,8 +1324,9 @@ carries the reason, because a Vault hop can be dialled before any store is open.
    `GET /security/posture` list it, and the serve-time loosening WARNING prints it at each start.
 2. The start's `config_loaded` audit row lists the switch name, without the reason.
 3. A hop that crosses an enforcing or unknown posture on its attestation logs a WARNING with the
-   reason. A hop that crosses on a warn posture logs a WARNING that names the pair. Each is
-   written once per process for each hop.
+   reason. A hop with no attestation that crosses on a warn posture logs a WARNING that names
+   the pair. Each is written once per process for each hop. **Two crossings on a warn instance
+   log nothing:** an attested hop, and a hop crossed on the process-wide variable.
 4. `messagefoundry check` lists each set pair on its `vault-revocation-attested` line.
 
 **Named gap: the proxy leg.** Through an `https://` proxy a Vault hop has a second TLS leg, to the

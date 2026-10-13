@@ -20,9 +20,17 @@ opens a store with no posture in scope, and it is judged like an enforcing insta
 
 **What the scan cannot see.** It reads the expression a call passes, not where that value came
 from. A caller that builds a posture, binds it to a local named ``posture`` and passes that reads
-as handed down. So :func:`test_every_place_a_posture_is_built_is_listed` lists every place a
-``HopPosture`` is built at all. A link this file does not name is not scanned either: the list
-is at least the chain as it stood when this was written (SDS-3.6).
+as handed down. Two more lists narrow that, and neither closes it:
+
+* :func:`test_every_place_a_posture_is_built_is_listed` lists every place the name
+  ``HopPosture`` is used as a value.
+* :func:`test_every_posture_derivation_reads_the_instances_own_dial` lists every call to
+  ``hop_posture_from_ai``, with the dial it is given.
+
+A posture reached some other way is still unseen: at least ``dataclasses.replace``, an import
+under another name, or ``current_hop_posture()``. A link this file does not name is not scanned
+either. So read these lists as at least the chain as it stood when this was written (SDS-3.6),
+and read a new caller's posture in review.
 
 The scan reads source, so it holds with no Vault extra installed.
 """
@@ -32,7 +40,7 @@ from __future__ import annotations
 import ast
 import functools
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import pytest
 
@@ -129,9 +137,16 @@ _NOT_HANDED_DOWN: dict[Row, str] = {
 class _Scan(ast.NodeVisitor):
     """One row per call to a link: module, enclosing function by qualified name, link, posture."""
 
-    def __init__(self, relative: str, links: dict[str, int | None]) -> None:
+    def __init__(
+        self,
+        relative: str,
+        links: dict[str, int | None],
+        shape: Callable[[ast.Call, int | None], str] | None = None,
+    ) -> None:
         self.relative = relative
         self.links = links
+        #: What a row records about a call. The posture it passes, unless a caller says otherwise.
+        self.shape = shape or _posture_of
         self.scope: list[str] = []
         self.rows: list[Row] = []
         #: The nodes already counted as a call, so they are not counted again as a reference.
@@ -167,7 +182,7 @@ class _Scan(ast.NodeVisitor):
         name = callee_name(node)
         if name is not None and name in self.links:
             self.seen.add(id(node.func))
-            self._row(name, _posture_of(node, self.links[name]))
+            self._row(name, self.shape(node, self.links[name]))
         # A link handed to a runner as its first argument, with the link's own keywords after it:
         # `asyncio.to_thread(link, ..., posture=...)` or `functools.partial(link, posture=...)`.
         target = _link_named(node.args[0], self.links) if node.args else None
@@ -425,6 +440,67 @@ def test_every_place_a_posture_is_built_is_listed() -> None:
     # The control that the planted caller is what the census alone would miss.
     passed = "def _a_new_command():\n    open_store(settings, posture=posture)\n"
     assert _scan(passed, "planted.py")[0][3] in _HANDED_DOWN
+
+
+#: The dial ``serve`` reads: its ``[security]`` section, or that section's shipped default.
+_SERVE_DIAL = "(security_settings or SecuritySettings()).enforcement"
+#: Every call that derives a posture from settings, with the ``enforcement`` it is given. Each
+#: reads the dial off the instance's own ``[security]`` settings, never a constant.
+_DERIVATIONS = sorted(
+    [
+        ("__main__.py", "_check_privileges", "settings.security.enforcement"),
+        ("__main__.py", "_connection.validate", "settings.security.enforcement"),
+        ("__main__.py", "_provision_admin", "settings.security.enforcement"),
+        ("__main__.py", "_renew_api_tls_before_spawning", "settings.security.enforcement"),
+        ("__main__.py", "_start_logging", "settings.security.enforcement"),
+        ("__main__.py", "_store_provision_schema", "settings.security.enforcement"),
+        ("api/app.py", "create_app", _SERVE_DIAL),
+        ("api/app.py", "create_app", "_phi_read_enforcement"),
+        ("api/app.py", "create_managed_app.lifespan", _SERVE_DIAL),
+        ("api/app.py", "create_managed_app.lifespan", _SERVE_DIAL),
+        ("checks.py", "_check_build", "settings.security.enforcement"),
+        ("verify/federation.py", "_client_credential_row", "settings.security.enforcement"),
+        ("verify/federation.py", "_revocation_row", "settings.security.enforcement"),
+    ]
+)
+#: How a derivation may spell the dial: the loaded settings' own field, or a local read from it.
+_OWN_DIAL = (
+    "settings.security.enforcement",
+    _SERVE_DIAL,
+    # `create_app` reads the serve dial into this local one line above the call.
+    "_phi_read_enforcement",
+)
+
+
+def _dial_of(call: ast.Call, _position: int | None) -> str:
+    return next((ast.unparse(k.value) for k in call.keywords if k.arg == "enforcement"), _NONE)
+
+
+def _derivations(source: str, relative: str) -> list[tuple[str, str, str]]:
+    scan = _Scan(relative, {"hop_posture_from_ai": None}, shape=_dial_of)
+    scan.visit(parse_source(source))
+    return [(module, where, dial) for module, where, _, dial in scan.rows]
+
+
+def test_every_posture_derivation_reads_the_instances_own_dial() -> None:
+    """A caller could relax the guard without building a ``HopPosture`` itself, by deriving one
+    from a constant: ``hop_posture_from_ai(ai, enforcement=SecurityEnforcement.WARN)``. Every
+    derivation is listed with its dial, and every dial is the loaded settings' own.
+
+    Mutation: pass ``enforcement=SecurityEnforcement.WARN`` at any call of the derivation."""
+    found: list[tuple[str, str, str]] = []
+    for relative, source in _sources():
+        if "hop_posture_from_ai" in source:
+            found.extend(_derivations(source, relative))
+    assert sorted(found) == _DERIVATIONS
+    assert [row for row in _DERIVATIONS if row[2] not in _OWN_DIAL] == []
+    planted = (
+        "def _a_new_command():\n"
+        "    posture = hop_posture_from_ai(settings.ai, enforcement=SecurityEnforcement.WARN)\n"
+    )
+    assert _derivations(planted, "planted.py") == [
+        ("planted.py", "_a_new_command", "SecurityEnforcement.WARN")
+    ]
 
 
 _PLANTED = """

@@ -1144,8 +1144,8 @@ def mount_strict_reply_adapter(
     ``revocation_attested`` is the hop's own ``vault_revocation_attested`` setting, and
     ``attestation_section`` the section it was read from (vault BACKLOG #2983). Both are REQUIRED,
     so a caller cannot mount the reader and forget the revocation check. Pass the setting, never a
-    literal ``True``. An ``https://`` Vault that is not on the box is refused without it, as
-    :func:`_refuse_an_unrevoked_vault_hop` says.
+    literal ``True``. Under an enforcing or unknown posture, an ``https://`` Vault that is not
+    on the box is refused without it, as :func:`_refuse_an_unrevoked_vault_hop` says.
 
     ``posture`` is the instance posture the caller holds, or ``None`` where it holds none.
     ``None`` counts as enforcing, so a caller that leaves it out gets the strict answer.

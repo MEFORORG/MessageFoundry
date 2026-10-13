@@ -963,11 +963,10 @@ bind-guard ladder above:
     `vault-revocation-attested` line.
   - **A Vault behind any proxy is off the box**, a loopback Vault included. A proxy can reach
     these clients from the environment alone; [CONFIGURATION.md](CONFIGURATION.md) says how.
-  - **A command that holds no instance posture is judged as enforcing.** At least `serve`,
-    `check-privileges` and `provision-admin` hand their posture to the guard. The other commands
-    that open a store do not, at least today, so they refuse an unattested off-box Vault even on
-    an instance at `[security].enforcement = warn`. `tests/test_vault_posture_census.py` lists
-    what each caller passes. Attest the hop rather than lowering the dial.
+  - **A command that holds no instance posture is judged as enforcing.** So it refuses an
+    unattested off-box Vault even on an instance at `[security].enforcement = warn`.
+    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) names which callers hand their posture to
+    the guard. Attest the hop rather than lowering the dial.
 
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine

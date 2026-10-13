@@ -206,7 +206,7 @@ async def test_open_store_threads_audit_mac_fn_into_the_server_backend(
         return object()
 
     monkeypatch.setattr(
-        "messagefoundry.store.base.build_store_cipher", lambda _s: _StubTransitCipher()
+        "messagefoundry.store.base.build_store_cipher", lambda _s, **_: _StubTransitCipher()
     )
     store_module = importlib.import_module(module)
     monkeypatch.setattr(getattr(store_module, attr), "open", _fake_open)

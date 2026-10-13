@@ -76,6 +76,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
         # doc-drift guard, but the doc half is not the reason it stays.
         "test_adaptive_attributes_doc_drift.py",
+        # Reads every module under messagefoundry/ and harness/ and lists each call that hands a
+        # posture toward a Vault hop (vault BACKLOG #2983). What breaks it is a new caller in the
+        # engine, which arrives as an ENGINE diff. Its one import of a test module is how it
+        # shares that module's walk of the package.
+        "test_vault_posture_census.py",
         # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of
         # docs/architecture-diagram.md (`pipeline/`, `store/`, ...) to a folder that exists. What
         # breaks that arm is an engine package being renamed or removed, which arrives as an ENGINE
