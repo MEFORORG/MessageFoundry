@@ -272,9 +272,11 @@ def _narrowed_pool_classes(
             Nothing the engine ships sets ``ca_cert_data`` today, since requests and hvac never pass
             it, so this guards a later caller.
 
-            **The refusal is an** ``InsecureHopRefused``, **like every other check on this hop.**
+            **The refusal is a** :class:`VaultHopRefused`, **like every other check on this hop.**
             urllib3 does not catch that type, so it reaches the caller as it is, and
-            :func:`vault_failure_text` keeps its text. A urllib3 ``SSLError`` raised here would not:
+            :func:`vault_failure_text` keeps its text. The base ``InsecureHopRefused`` would reach
+            the caller too, but that function keeps the text of the marked type only (vault BACKLOG
+            #3247). A urllib3 ``SSLError`` raised here would not reach the caller as it is:
             measured with urllib3 2.8.0, one raised before the proxy has connected comes out of
             requests as a ``ProxyError``, and the providers would then report a type name only.
 
@@ -303,7 +305,7 @@ def _narrowed_pool_classes(
             nothing that was seen to wait, so the directory is loaded as before."""
             if isinstance(self.ca_cert_data, str) and _has_encryption_header(self.ca_cert_data):
                 # Fixed text: it names no part of the CA text it refuses.
-                raise InsecureHopRefused(
+                raise VaultHopRefused(
                     f"{connector}: the CA text for this hop holds a PEM block with an encryption "
                     "header (Proc-Type or DEK-Info). Loading it can make the TLS library wait for "
                     "a password; refusing to load it (BACKLOG #3090)"
