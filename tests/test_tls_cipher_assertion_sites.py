@@ -725,7 +725,9 @@ def test_the_vault_kv_secret_provider_asserts_its_tls_suites(every_suite_looks_w
     """
 
     with pytest.raises(ValueError, match=secretprovider_vault._VAULT_KV_CONNECTOR):
-        secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+        secretprovider_vault._build_client(
+            "https://vault.example.test:8200", "s.token", revocation_attested=True
+        )
 
 
 @_vault_extra
@@ -739,7 +741,9 @@ def test_the_vault_transit_key_provider_asserts_its_tls_suites(
     """
 
     with pytest.raises(ValueError, match=keyprovider_vault._VAULT_TRANSIT_CONNECTOR):
-        keyprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+        keyprovider_vault._build_client(
+            "https://vault.example.test:8200", "s.token", revocation_attested=True
+        )
 
 
 @_vault_extra
@@ -778,7 +782,9 @@ def test_the_vault_hop_handshakes_on_the_asserted_context(
     its own context; red.
     """
 
-    client = module._build_client("https://vault.example.test:8200", "s.token")
+    client = module._build_client(
+        "https://vault.example.test:8200", "s.token", revocation_attested=True
+    )
     at_construction = [ctx for seen_label, ctx in asserted_contexts if seen_label == label]
     assert len(at_construction) == 1, "construction did not assert this hop's context exactly once"
 
@@ -801,7 +807,9 @@ def test_the_shipped_vault_hop_offers_no_weak_suite() -> None:
     everything; a clean list pinned alone cannot fail when the call is deleted. Both are needed.
     """
 
-    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    client = secretprovider_vault._build_client(
+        "https://vault.example.test:8200", "s.token", revocation_attested=True
+    )
     real = _context_urllib3_builds_for(client)
     ciphers = real.get_ciphers()
     assert ciphers, "the Vault hop offered no suites at all, so this test proves nothing"
@@ -906,7 +914,9 @@ def test_the_only_ssl_context_on_the_hvac_stack_is_the_engines() -> None:
 
     from messagefoundry.transports.strict_requests import StrictReplyAdapter  # noqa: PLC0415
 
-    client = secretprovider_vault._build_client("https://vault.example.test:8200", "s.token")
+    client = secretprovider_vault._build_client(
+        "https://vault.example.test:8200", "s.token", revocation_attested=True
+    )
     assert not [a for a in dir(client) if "ssl" in a.lower() or "context" in a.lower()]
 
     session = client.adapter.session

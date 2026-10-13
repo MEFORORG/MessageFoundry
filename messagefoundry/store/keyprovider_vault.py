@@ -109,10 +109,14 @@ def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
     )
 
 
-def _build_client(addr: str | None, token: str | None) -> Any:
+def _build_client(addr: str | None, token: str | None, *, revocation_attested: bool) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake Transit backend without
     a live Vault. ``addr``/``token`` are passed through; when ``None``, hvac falls back to its own
-    ``VAULT_ADDR``/``VAULT_TOKEN`` environment conventions."""
+    ``VAULT_ADDR``/``VAULT_TOKEN`` environment conventions.
+
+    ``revocation_attested`` is ``[store].vault_revocation_attested`` (vault BACKLOG #2983). It is
+    REQUIRED, so no caller builds a store Vault client without saying whether the hop is attested.
+    Pass the setting, or ``False`` where no settings are in scope, which fails closed."""
     hvac = _import_hvac()
     # ASVS 4.2.5: ``token`` ships as an ``X-Vault-Token`` request header on EVERY Transit
     # encrypt/decrypt/HMAC call, and ``addr`` becomes the request URL -- both from MEFOR_* env, and
@@ -161,7 +165,8 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # factory (BACKLOG #300). crypto_transit.py shares this function, so its per-cell client gets
     # the strict reader and the narrowing too, and so this client takes the larger Transit ceiling.
     # The mount also refuses an address that would send the token in cleartext (BACKLOG #2317), so
-    # both clients built here are checked before any I/O.
+    # both clients built here are checked before any I/O. It refuses an off-box https:// Vault
+    # whose revocation nothing checks and nobody attested, too (vault BACKLOG #2983).
     from messagefoundry.transports.strict_requests import (
         MAX_VAULT_REPLY_BYTES,
         mount_strict_reply_adapter,
@@ -172,6 +177,8 @@ def _build_client(addr: str | None, token: str | None) -> Any:
             client,
             connector=_VAULT_TRANSIT_CONNECTOR,
             ssl_context_factory=context_factory,
+            revocation_attested=revocation_attested,
+            attestation_section="store",
             limit=MAX_VAULT_REPLY_BYTES,
         )
     except InsecureHopRefused as exc:
@@ -331,7 +338,9 @@ class VaultKeyProvider:
         # the store DEK" — turning a configuration refusal into what reads as a Vault-side failure,
         # the same mistake ADR 0180 records for the LDAPS site. Fail-closed is unchanged either way:
         # both paths propagate out of open_store and serve refuses to start.
-        client = _build_client(addr, token)
+        client = _build_client(
+            addr, token, revocation_attested=self._settings.vault_revocation_attested
+        )
         try:
             # BACKLOG #1166. Check the KEK's TYPE before unwrapping under it. Unlike the Transit
             # cipher, this path paid for NO metadata round trip -- measured zero read_key calls at
@@ -442,8 +451,13 @@ def store_vault_client(address: str, token: str) -> Any:
     #2317). For ``check-privileges``, which reads the token's own grants through it and changes
     nothing. Take ``address`` from :func:`store_vault_address` and ``token`` from
     :func:`store_vault_token`; both refuse an unset variable, and the client uses exactly the
-    values they returned."""
-    return _build_client(address, token)
+    values they returned.
+
+    **No settings are in scope here, so the hop counts as not attested** (vault BACKLOG #2983).
+    An ``https://`` Vault that is off the box is refused by this client even where
+    ``[store].vault_revocation_attested`` is set. Handing the setting to this call is the next
+    slice of that item."""
+    return _build_client(address, token, revocation_attested=False)
 
 
 def kek_required_capabilities() -> dict[str, frozenset[str]]:

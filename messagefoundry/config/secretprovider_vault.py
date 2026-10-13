@@ -104,10 +104,14 @@ def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
     return vault_client_verify_kwargs(ca_file=ca, addr=addr, cell=f"[secrets].provider={_EXTRA!r}")
 
 
-def _build_client(addr: str | None, token: str | None) -> Any:
+def _build_client(addr: str | None, token: str | None, *, revocation_attested: bool) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake KV backend without a live
     Vault. ``addr``/``token`` pass through; when ``None``, hvac falls back to its own VAULT_ADDR/VAULT_TOKEN
-    environment conventions."""
+    environment conventions.
+
+    ``revocation_attested`` is ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983). It is
+    REQUIRED, so no caller builds this client without saying whether the hop is attested. Pass the
+    setting, or ``False`` where no settings are in scope, which fails closed."""
     hvac = _import_hvac()
     # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): hvac's default is True, and this was
     # one of the three clients that did not carry the no-redirect policy every other shipped HTTP
@@ -142,12 +146,17 @@ def _build_client(addr: str | None, token: str | None) -> Any:
 
     try:
         mount_strict_reply_adapter(
-            client, connector=_VAULT_KV_CONNECTOR, ssl_context_factory=context_factory
+            client,
+            connector=_VAULT_KV_CONNECTOR,
+            ssl_context_factory=context_factory,
+            revocation_attested=revocation_attested,
+            attestation_section="secrets",
         )
     except InsecureHopRefused as exc:
         # BACKLOG #2317: the mount refuses an address that would send the token in cleartext,
-        # before any I/O. Raised as this provider's own fail-closed type, which every caller
-        # handles, with the refusal's fixed text kept whole.
+        # before any I/O. Vault BACKLOG #2983: it also refuses an off-box https:// Vault whose
+        # revocation nothing checks and nobody attested. Raised as this provider's own
+        # fail-closed type, which every caller handles, with the refusal's fixed text kept whole.
         raise SecretProviderError(str(exc)) from exc
     return client
 
@@ -186,7 +195,9 @@ class VaultSecretProvider:
         # from Vault KV" — turning a configuration refusal into what reads as a connectivity failure,
         # the same mistake ADR 0180 records for the LDAPS site. Fail-closed is unchanged either way:
         # both paths propagate and the subsystem refuses to come up.
-        client = _build_client(addr, token)
+        client = _build_client(
+            addr, token, revocation_attested=self._settings.vault_revocation_attested
+        )
         try:
             # read_secret_version returns {'data': {'data': {<field>: <value>, ...}, 'metadata': {...}}}.
             response: Any = client.secrets.kv.v2.read_secret_version(path=path, mount_point=mount)
@@ -265,8 +276,13 @@ def secrets_vault_client(address: str, token: str) -> Any:
     same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
     own grants through it and changes nothing. Take ``address`` from :func:`secrets_vault_address`
     and ``token`` from :func:`secrets_vault_token`; both refuse an unset variable, and the client
-    uses exactly the values they returned."""
-    return _build_client(address, token)
+    uses exactly the values they returned.
+
+    **No settings are in scope here, so the hop counts as not attested** (vault BACKLOG #2983).
+    An ``https://`` Vault that is off the box is refused by this client even where
+    ``[secrets].vault_revocation_attested`` is set. Handing the setting to this call is the next
+    slice of that item."""
+    return _build_client(address, token, revocation_attested=False)
 
 
 def kv_required_capabilities(refs: Iterable[str]) -> dict[str, frozenset[str]]:

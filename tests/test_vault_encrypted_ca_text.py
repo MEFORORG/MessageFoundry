@@ -170,7 +170,12 @@ def test_a_ca_directory_reaches_the_proxy_leg_and_is_not_refused(tmp_path: Path)
     import requests
 
     made, factory = _contexts(_RecordingContext)
-    adapter = _strict().StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
+    adapter = _strict().StrictReplyAdapter(
+        connector="Vault test hop",
+        ssl_context_factory=factory,
+        revocation_attested=True,
+        attestation_section="secrets",
+    )
     request = requests.Request("GET", "https://vault.test:8200/v1/sys/health").prepare()
     pool = adapter.get_connection_with_tls_context(
         request, str(tmp_path), proxies={"https": "https://proxy.test:3128"}
@@ -199,7 +204,12 @@ def test_the_refusal_reaches_the_caller_with_its_text(proxy: str | None) -> None
     import requests
 
     made, factory = _contexts(_NoTlsLoad)
-    adapter = _strict().StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
+    adapter = _strict().StrictReplyAdapter(
+        connector="Vault test hop",
+        ssl_context_factory=factory,
+        revocation_attested=True,
+        attestation_section="secrets",
+    )
     text = _PLAIN.replace(_BEGIN, _BEGIN + _HEADERS)
     # requests never sets ca_cert_data, so a later caller is stood in for at the pool manager.
     adapter.poolmanager.connection_pool_kw["ca_cert_data"] = text

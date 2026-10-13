@@ -312,7 +312,8 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
     # ValueError; the `except Exception` below would relabel that "could not reach a Vault Transit
     # key", turning a configuration refusal into what reads as a connectivity failure. Fail-closed is
     # unchanged either way: both paths propagate and the cipher provider refuses to come up.
-    client = _build_client(addr, token)  # lazy hvac import; fails closed naming the [vault] extra
+    # lazy hvac import; fails closed naming the [vault] extra
+    client = _build_client(addr, token, revocation_attested=settings.vault_revocation_attested)
     try:
         # Startup connectivity + key-existence + key-TYPE check: read the key metadata (no crypto, no
         # secrets). This turns a mis-provisioned Vault into a refuse-to-start rather than a first-write
