@@ -982,3 +982,109 @@ def test_a_partial_map_of_dormant_peers_reports_rather_than_exiting_quietly(
     # satisfied by a gate that has simply started reporting everything.
     complete = {**DORMANT_ROW, "Dirty": [], "MatchedDirty": False}
     assert run_gate(make_overlap_stub(tmp_path, [complete]), state_dir=tmp_path / "s2") is None
+
+
+# --------------------------------------------------------------------------------------------------
+# Which worktree is "yours".
+#
+# overlap.ps1 skips the asker's own worktree by ITS working directory. Measured 2026-10-12: the desktop
+# app starts a worktree session's CLI with `--project-config-root <primary checkout>`, and a hook then
+# runs in the PRIMARY. So overlap.ps1 counted the session's own uncommitted edit as a live peer's, and
+# the gate could deny a session its own file. Only the hook input's `cwd` names the worktree.
+#
+# The stub below keeps the one rule that matters here, the self-skip, and keeps it by asking git where
+# it runs, exactly as overlap.ps1 does. The gate runs IN the primary, as the app runs it.
+# --------------------------------------------------------------------------------------------------
+
+
+def _top(path: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _self_skipping_overlap_stub(tmp_path: Path, rows: list[dict[str, Any]]) -> Path:
+    """overlap.ps1's self-skip: drop the row whose Root is the toplevel this process runs in."""
+    stub = tmp_path / "overlap-self-skip.ps1"
+    payload = json.dumps(rows).replace("'", "''")
+    stub.write_text(
+        "param([string]$File,[switch]$Json,[switch]$Refresh,[int]$CacheSeconds,"
+        "[string]$Repo,[string[]]$ConfigRoot,[string]$TasksDir,[int]$TimeBudgetSeconds)\n"
+        '$me = "$(& git rev-parse --path-format=absolute --show-toplevel 2>$null)"'
+        ".Trim().ToLowerInvariant()\n"
+        f"$rows = @('{payload}' | ConvertFrom-Json)\n"
+        "$keep = @($rows | Where-Object { ([string]$_.Root).ToLowerInvariant() -ne $me })\n"
+        "ConvertTo-Json -InputObject $keep -Depth 6 -AsArray -Compress\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
+@pytest.fixture
+def primary_and_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    base = Path(os.path.realpath(tmp_path))
+    repo = base / "primary"
+    repo.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.invalid"],
+        ["config", "user.name", "t"],
+        ["commit", "-q", "--allow-empty", "-m", "init"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    wt = base / "linked"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "linked", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    return repo, wt
+
+
+def _own_edit_gate(
+    tmp_path: Path, repo: Path, wt: Path, cwd_field: str | None
+) -> dict[str, Any] | None:
+    """The session in ``wt`` edits a.py, and the only live row editing a.py is ``wt`` itself."""
+    own = {**EDITING_ROW, "Worktree": "linked", "Branch": "linked", "Root": _top(wt)}
+    payload: dict[str, Any] = {"tool_name": "Edit", "tool_input": {"file_path": str(wt / "a.py")}}
+    if cwd_field is not None:
+        payload["cwd"] = cwd_field
+    return run_gate(
+        _self_skipping_overlap_stub(tmp_path, [own]),
+        state_dir=tmp_path / "gate-state",
+        raw_input=json.dumps(payload),
+        cwd=repo,
+    )
+
+
+def test_a_session_is_not_refused_its_own_file(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, wt = primary_and_worktree
+    got = _own_edit_gate(tmp_path, repo, wt, str(wt))
+    assert got is None, f"the gate treated the session's own worktree as a peer: {got}"
+
+
+def test_without_a_cwd_the_gate_checks_from_where_it_runs(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The control. With no `cwd` the same call denies, so the arm above can fail."""
+    repo, wt = primary_and_worktree
+    got = _own_edit_gate(tmp_path, repo, wt, None)
+    assert got is not None and got["hookSpecificOutput"].get("permissionDecision") == "deny", got
+
+
+def test_a_cwd_that_does_not_exist_allows_and_says_it_could_not_check(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, wt = primary_and_worktree
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    got = _own_edit_gate(tmp_path, repo, wt, gone)
+    assert got is not None, "a `cwd` the gate cannot use must not pass as an all-clear"
+    out = got["hookSpecificOutput"]
+    assert "permissionDecision" not in out, f"fail-open: it must allow, not deny: {out}"
+    assert "could NOT check this edit (cwd-unusable)" in out["additionalContext"], out
+    assert "deleted-worktree, which does not exist" in out["additionalContext"], out

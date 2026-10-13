@@ -36,6 +36,17 @@
 
     Wired on Edit|Write|MultiEdit|NotebookEdit. The overlap map is cached, so the common case is a
     cache read, not a git walk across every worktree.
+
+    IT CHECKS FROM THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
+    worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
+    hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
+    overlap.ps1 skips "your own worktree" by ITS directory, so from the primary it would report the
+    session's own uncommitted edits as a live peer's and deny the session its own file.
+
+    Only the `cwd` field of the JSON on stdin names the worktree, so the gate moves there
+    (scripts/hooks/_hookinput.ps1) before its first git call and before it starts overlap.ps1. Input
+    with no `cwd` leaves it where it started, as before. A `cwd` it cannot use lands on the unresolved
+    notice below: allowed, and said aloud.
 #>
 [CmdletBinding()]
 param(
@@ -180,9 +191,17 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
 }
 
 $target = $PathOverride
+$cwdFault = ''
 if (-not $target) {
     if (-not [Console]::IsInputRedirected) { exit 0 }
-    try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop } catch {
+    # Read as UTF-8 through the shared helper where it loads, and as before where it does not.
+    try { . (Join-Path $PSScriptRoot '_hookinput.ps1') } catch { }
+    $raw = if (Get-Command Read-CcxHookInput -ErrorAction SilentlyContinue) { Read-CcxHookInput } else { [Console]::In.ReadToEnd() }
+    # INTO THE SESSION'S OWN DIRECTORY, BEFORE ANY GIT CALL. See the header: this process may have
+    # started in the primary checkout. Moving here is what makes overlap.ps1, a CHILD started in this
+    # location, skip the session's own worktree instead of reporting it as a peer.
+    if (Get-Command Enter-CcxHookCwd -ErrorAction SilentlyContinue) { $cwdFault = Enter-CcxHookCwd -Text $raw }
+    try { $hook = $raw | ConvertFrom-Json -ErrorAction Stop } catch {
         Write-Unresolved "payload-unreadable" `
             "the PreToolUse payload on stdin was not readable JSON, so the gate never learned which file this edit targets"
     }
@@ -198,6 +217,14 @@ if (-not $target) {
     if (-not $target) { $target = [string]$hook.tool_input.notebook_path }
 }
 if (-not $target) { exit 0 }
+
+# A `cwd` the gate cannot use means it does not know which worktree is its own, so overlap.ps1 would
+# count this session's own edits as a peer's. A deny on that is a session blocked by itself, and an
+# allow on it says nothing. So the gate says it could not check, which is its posture for every input
+# it cannot use.
+if ($cwdFault) {
+    Write-Unresolved "cwd-unusable" "$cwdFault, so the gate cannot tell this session's own worktree from a peer's"
+}
 
 if (-not (Test-Path -LiteralPath $OverlapScript)) {
     Write-Unresolved "overlap-missing" "no overlap script at $OverlapScript"
