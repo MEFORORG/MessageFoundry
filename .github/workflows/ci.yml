@@ -640,19 +640,24 @@ jobs:
       #
       # THE JOB CAP keeps the 12 minutes the overhead row below derives, 38 + 12 = 50. The 12 was not
       # re-derived here. This pool's worst same-row overhead on this leg, job wall clock minus the
-      # step, is 5:22 (n=694), and 1.5 x 5:22 is 8:03, so the 12 still covers it.
+      # step, is 5:22 (n=694), and 1.5 x 5:22 is 8:03, so the 12 still covers it. The rule applied
+      # to that 5:22 alone would give 9 and a job cap of 47; whether to shrink the 12 is left open.
+      # The worst pre-pytest setup in this pool over every conclusion is 6:18 (cancelled run
+      # 37639352866), over the 5:22 the 2026-08 rows below still use. On it the nesting gap is
+      # 50:00 - 6:18 - 38:00 = 5:42.
       #
-      # THIS BUYS LITTLE TIME, AND THE ROW SAYS WHY. At 38:00 the gate reds a run over 1753.8s
-      # (29:13), 4 percent over the worst pooled run. The pool's median is 22:10 against 15:48 in
-      # the pool before it, and by the day a step started it rose from 21:24 on 2026-10-07 to 24:14
-      # on 2026-10-12. The suite grew as well: the red run on 2026-10-07 printed `32060 passed` and
-      # this one `37755 passed`. The gate's RE-DERIVE annotation is still the trigger to re-measure.
+      # THIS BUYS LITTLE TIME. At 38:00 the gate reds a run over 1753.8s, 29:14 or longer, 4 percent
+      # over the worst pooled run. By the day a step started, this leg's median rose from 21:24 on
+      # 2026-10-07 to 24:14 on 2026-10-12. The suite grew as well: the red run on 2026-10-07 printed
+      # `32060 passed` and this one `37755 passed`. The rule sizes from the worst row measured, not
+      # from that trend. The gate's RE-DERIVE annotation is still the trigger to re-measure.
       #
       # THE TWO WINDOWS ROWS WERE LEFT ALONE, AS A SEPARATE RE-MEASURE. In this pool their worst
-      # passing steps are 36:28 and 39:31, under the 55:00 caps' 42:18 red line, and both are over
+      # passing steps are 36:28 and 39:31, under the 55:00 caps' 42:19 red line, and both are over
       # their 2026-08-08 rows. One windows-2025 job was cancelled at 68:35 with its step at 48:16
       # (push run 37585340441, 2026-10-07, 18:31 of setup before pytest). That meets the
-      # "RE-DERIVE IF" trigger further down, and nobody has acted on it.
+      # "RE-DERIVE IF" trigger further down, and 18:31 is over the 2:32 setup maximum the
+      # windows-2025 nesting row uses. Neither is re-derived in this change.
       #
       # THE UBUNTU ROW WAS RE-DERIVED AGAIN 2026-10-07, AS PART OF THE WEB CONSOLE STEP-MARGIN GATE
       # RE-MEASURE OF THAT DATE, TO 34:00 / JOB 46:00 (SUPERSEDED 2026-10-13, ABOVE). Merge-group run 37568821379, a
@@ -893,7 +898,7 @@ jobs:
       #
       #   ubuntu  5:22 + 30:59 + 2:22 = 38:43 vs 43:00  +4:17   |  old: 32:43 vs 37:00  +4:17  (band held)
       #           (since 2026-10-07: 5:22 + 33:59 + 2:22 = 41:43 vs 46:00, +4:17)
-      #           (since 2026-10-13: 5:22 + 37:59 + 2:22 = 45:43 vs 50:00, +4:17)
+      #           (since 2026-10-13, same 2026-08 addends: 5:22 + 37:59 + 2:22 = 45:43 vs 50:00, +4:17)
       #   W22     4:05 + 54:59 + 2:51 = 61:55 vs 66:00  +4:05   |  old: 42:55 vs 46:00  +3:04
       #   W25     2:32 + 54:59 + 3:59 = 61:30 vs 66:00  +4:30   |  old: 42:30 vs 46:00  +3:30
       #
@@ -913,7 +918,7 @@ jobs:
       # `Tests` kill is a NAMED STEP failure rather than an unattributed job cancellation:
       #   ubuntu  5:22 + 25:00 = 30:22 < 37:00  (gap 6:38)
       #           (since 2026-10-07: 5:22 + 34:00 = 39:22 < 46:00, gap 6:38)
-      #           (since 2026-10-13: 5:22 + 38:00 = 43:22 < 50:00, gap 6:38)
+      #           (since 2026-10-13, same 2026-08 setup: 5:22 + 38:00 = 43:22 < 50:00, gap 6:38)
       #   W22     4:05 + 55:00 = 59:05 < 66:00  (gap 6:55)
       #   W25     2:32 + 55:00 = 57:32 < 66:00  (gap 8:28)
       #
