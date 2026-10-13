@@ -33,9 +33,9 @@ undone, so that is proved on a scratch context BEFORE the live one sees the byte
 signature must also verify against a CA certificate the hop lists for its issuer
 (:func:`~messagefoundry.pki.crl_signature_refusal`). OpenSSL checks that signature only at the
 handshake, so OpenSSL would load a badly signed CRL and then fail every handshake it judges. A start
-checks the signature too, and refuses only the proven case: a CRL that names a listed CA's key and
-is not signed by it (vault BACKLOG #2905). Anything short of that a start loads with a warning, so
-this reload holds back some files a start would load.
+checks the signature too, and refuses only the proven case, which is
+:class:`~messagefoundry.pki.CrlSignature` state ``bad`` (vault BACKLOG #2905). Anything short of
+that a start loads with a warning, so this reload holds back some files a start would load.
 The hop's list holds only its own trust store. An intermediate CA the peer sends in its handshake is
 not in it, so a CRL that intermediate issued is refused with :data:`NO_ISSUER`. That refusal is
 retried every pass, because a CA directory adds a CA to the store only when a handshake first needs
@@ -179,15 +179,18 @@ LAPSES_FIRST = (
     "Fix the file now with a CRL that is in effect: the hop's copy lapses before the file's CRL "
     "takes effect, and every peer is refused in between, restart or not"
 )
-#: True of both things a start does with such a file (vault BACKLOG #2905). A start refuses a CRL
-#: that names the CA's key and is not signed by it. It loads any other with a warning, and the
-#: handshake then decides. The reload gives this one remedy for all of those cases, because
-#: :func:`~messagefoundry.pki.crl_signature_refusal` folds them into one flag. So it cannot
-#: tell a renewed CA key, where a restart is enough, from a forged CRL. That is unfiled.
+#: True of both things a start does with such a file (vault BACKLOG #2905). A start refuses only a
+#: CRL it proves badly signed, :class:`~messagefoundry.pki.CrlSignature` state ``bad``. It loads
+#: any other with a warning, and the handshake then decides. The reload gives this one remedy for
+#: all of those cases, because :func:`~messagefoundry.pki.crl_signature_refusal` folds them into
+#: one flag. So it cannot tell a renewed CA key, where a restart is enough, from a forged CRL.
+#: Vault BACKLOG #3506 holds that as an open finding.
 BAD_SIGNATURE = (
-    "If the file is wrong, fix it: give a CRL the hop's CA signed. Where the CRL names that "
-    "CA's key, a start refuses the file too. Otherwise a start loads it with a warning, and each "
-    "handshake then decides. It passes where the peer's chain carries the CA that signed the "
+    "If the file is wrong, fix it: give a CRL the hop's CA signed. A start refuses the file too "
+    "only where it proves the signature bad: the CRL names that CA's key, and the check with "
+    "that key fails. In every other case a start loads it with a warning, and each handshake "
+    "then decides. That covers at least a CRL that names no key and a signature the engine "
+    "cannot check. The handshake passes where the peer's chain carries the CA that signed the "
     "CRL, as after a CA renews its key, and fails where it does not"
 )
 NO_ISSUER = (

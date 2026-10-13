@@ -1806,9 +1806,10 @@ issuer. The engine applies a replaced file only when all three of these hold:
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
 what to do. It also raises the `crl_reload_refused` alert described further down. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
-CRL fails its signature check under rule 2 is held back too. A start refuses it when the CRL names
-the CA's key and that key did not sign it, so fix that file. Otherwise a start loads it with a
-warning, and each handshake then decides. The next paragraphs say which is which.
+CRL fails its signature check under rule 2 is held back too. A start refuses it only where the
+engine proves the signature bad, so fix that file. In every other case a start loads it with a
+warning, and each handshake then decides. The next paragraphs say what counts as proof, and name
+cases that load.
 A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
 a file that drops an issuer, and a CRL signed under a new key. When the hops holding one file need
 different things, the ERROR names the strongest: fix the file, then restart, then wait. When it names
@@ -1816,10 +1817,18 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
-the file in one case only: the CRL names a listed CA's key by its key identifier, and that key did
-not sign the CRL. A handshake that OpenSSL judges by such a CRL fails with `CRL signature failure`,
-an error that does not name the file. The refusal names the setting, the file and the CRL. Give the
-setting the CRL that CA signed. No setting turns this check off, as for an expired CRL.
+the file in one case only, where it has proof. Three things all hold then. A listed CA has the
+CRL's issuer name, compared exactly. The CRL names that CA's key by its key identifier. The engine
+ran the signature check with that key, and the check failed. Where several listed CAs share that name, the check must run
+and fail for each one the CRL's key identifier does not rule out. A handshake that OpenSSL judges by
+such a CRL fails with `CRL signature failure`, an error that does not name the file. The refusal
+names the setting, the file and the CRL. Give the setting the CRL that CA signed. No setting turns
+this check off, as for an expired CRL.
+
+The check reads only the file a CRL setting names. Some hops also load the CRLs inside their CA file,
+and where such a hop checks revocation those CRLs are in use. The engine never checks their
+signatures, at a start or at a reload. OpenSSL still checks each one at the handshake it judges. The
+paragraph on a CRL inside a CA file, further down, says which hops load one.
 
 Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
@@ -1828,33 +1837,42 @@ such a file was measured to pass its handshakes. Remove the bad copy.
 Anything short of that proof loads, and the engine logs one WARNING for the file. At least these
 three cases warn:
 
-- No CA the hop lists has the CRL's issuer name and the key the CRL names. This is the usual case
-  when the peer sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same
-  way until a handshake first uses it.
+- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly, and then
+  the key identifier the CRL carries. This is the usual case when the peer sends the intermediate CA
+  that issued the CRL. A CA in a CA directory reads the same way until a handshake first uses it.
+  So does a listed CA whose name differs from the CRL's issuer name only in letter case. OpenSSL
+  treats those two names as one, so it still judges peers by that CRL. Measured on CPython 3.14.6
+  with OpenSSL 3.5.7: a badly signed CRL of that kind started with the WARNING, and then failed its
+  handshake with `CRL signature failure`.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
-- The engine cannot check the signature with the listed CA's key.
+- The engine cannot check the signature with the listed CA's key, even where the CRL names that key.
+  At least two kinds were measured on the same build. One is a signature of another kind than the
+  key, such as an ECDSA signature on a CRL that names an RSA key. The other is an RSA signature over
+  SHA-1 that the CA did make: the engine cannot confirm it, and that CRL passed its handshake.
 
 If the check itself fails, the engine logs an ERROR that says so, and loads the file.
 
-The file is in use in each case, and OpenSSL still checks the signature at every handshake. The
-WARNING is logged once per engine process for each version of the file. A hop whose CA list gives a
-different result for the same file logs its own line, and each engine shard logs its own. A system
-root the hop has loaded counts as a listed CA. So a CRL that names a system root's key, and that the
-root did not sign, refuses the start too.
+The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
+engine process logs the WARNING once while the file keeps the same bytes. It remembers only the
+version it judged last, so an earlier version that returns is logged again. A hop whose CA list
+gives a different result for the same file logs its own line, and each engine shard logs its own. A system
+root the hop has loaded counts as a listed CA. So the same proof against a system root's key refuses
+the start too.
 
 The reload is stricter than a start. Under rule 2 it holds back every CRL that a listed CA of that
-name does not verify, whether or not the CRL names a key. Its ERROR says to fix the file. After a
-CA renews its key the file can be right, and a restart then loads it with the WARNING above.
+name does not verify, whether or not the CRL names a key. That includes a CRL the engine cannot
+check. Its ERROR says to fix the file. After a CA renews its key the file can be right, and a
+restart then loads it with the WARNING above.
 
 **What a signature refusal stops.** It has the reach of the expired-CRL refusal, because one check
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound
 connection is isolated: that lane is marked failed and alerted, and the rest of the graph starts.
 `check`, a live reload, a promote and a connection upsert build every connection before they change
-anything, so one refusal there blocks the whole change. `[tls].crl_file` is shared. One badly signed
-CRL in it refuses each hop that loads the file and lists the CA whose key the CRL names. At least
-two kinds of hop are not refused. A loopback hop loads no CRL. A hop whose own CA list lacks that CA
+anything, so one refusal there blocks the whole change. `[tls].crl_file` is shared. One CRL in it
+refuses each hop that loads the file and reaches that proof, which takes a hop that lists the CA
+whose key the CRL names. At least two kinds of hop are not refused. A loopback hop loads no CRL. A hop whose own CA list lacks that CA
 only warns.
 
 **It is not only a start-time check for the Postgres store.** That store builds a TLS context for
@@ -1937,26 +1955,30 @@ file. An engine that dies without stopping leaves its alert open; resolve it in 
 rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped
 event.
 
-Until a hop is current, the scan judges the copy it holds as well as the new file. So the alert does
-not clear on the file alone, and the alert's date can be the held copy's rather than the new file's.
-When it is, the notifier event carries `held_copy` set to `true` (vault BACKLOG #2319). Its `detail`
+**The next paragraphs are about the CRL expiry alert, not `crl_reload_refused`.** The expiry alert
+is the `cert_expiry` event that "CRL files" above describes. `crl_reload_refused` carries no expiry
+date, no `held_copy` and no `shared_with`.
+
+Until a hop is current, the expiry scan judges the copy it holds as well as the new file. So the
+expiry alert does not clear on the file alone, and its date can be the held copy's rather than the
+new file's. When it is, the notifier event carries `held_copy` set to `true` (vault BACKLOG #2319). Its `detail`
 names the setting whose hop holds the copy, and says what to do: wait for the reload, fix the file, or
-restart. The log line says the same. A replaced file that is not near expiry raises no alert. Each
+restart. The log line says the same. A replaced file that is not near expiry raises no expiry alert. Each
 scan still logs a warning that a running hop holds an older copy, and why. If the file cannot be read,
 the scan judges the held copy instead of skipping it.
 
 **A held copy is matched by its file, not by its hop.** When two settings or connections name one
-CRL file, each gets its own row, and a copy that one hop holds is reported under both. Each alert
-then lists the other rows in `shared_with`. Its `detail` names the setting that holds the copy, so
+CRL file, each gets its own row, and a copy that one hop holds is reported under both. Each expiry
+alert then lists the other rows in `shared_with`. Its `detail` names the setting that holds the copy, so
 read that, not the row's label, to find the hop to restart.
 
 **A CRL inside a CA file counts too, on an outbound hop that checks revocation** (vault BACKLOG
 #2319). The outbound hops that resolve a trust anchor load `[tls].internal_ca_file`, or a
 connection's own `tls_ca_file`, whole, CRL blocks included. So does the syslog forwarder with
 `[logging].forward_tls_ca_file`. Once a CRL setting turns revocation checking on for that hop, those
-CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer. The scan watches
+CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer. The expiry scan watches
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
-file, so a refreshed CRL inside one needs a restart, and the alert's `detail` says so. Put a CRL in
+file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. Put a CRL in
 the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
 only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
 The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.

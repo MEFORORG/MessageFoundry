@@ -551,9 +551,16 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
 
 
 #: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
-#: state, in the words of the one warning :func:`_check_crl_signatures` logs.
+#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` says
+#: what the engine did, not what the CA list holds: a listed CA whose name differs from the
+#: issuer's only in letter case reads ``unlisted`` too, and OpenSSL would use that CA
+#: (:class:`~messagefoundry.pki.CrlSignature` says why).
 _UNCONFIRMED_SIGNATURE = {
-    "unlisted": "no CA certificate this hop lists has that name and the key the CRL names",
+    "unlisted": (
+        "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
+        "exactly, letter case included, and then the CRL's authority key identifier, where it "
+        "carries one)"
+    ),
     "unproven": (
         "a listed CA has that name and its key does not verify the CRL, but the CRL does not "
         "name that CA's key, so a renewed CA key could explain it"
@@ -571,7 +578,8 @@ def _check_crl_signatures(
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
 
     **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
-    ``bad``: the CRL names a listed CA's key by key identifier, and that key does not verify it.
+    ``bad``, which that class defines. In short: the CRL names a listed CA's key by key identifier,
+    and the check with that key ran and failed. A key that cannot run the check is not proof.
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.

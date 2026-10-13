@@ -42,6 +42,7 @@ from messagefoundry.config.tls_policy import (
     build_verifying_client_context,
     harden_crl_check,
 )
+from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -403,7 +404,7 @@ def _postgres_shaped(twins: _Twins, listed: str) -> ssl.SSLContext:
 @pytest.mark.parametrize(
     ("signer", "names", "words"),
     [
-        pytest.param("new", "new", "no CA certificate this hop lists", id="unlisted"),
+        pytest.param("new", "new", "matched it to no CA certificate this hop lists", id="unlisted"),
         pytest.param("new", None, "a renewed CA key could explain it", id="unproven"),
     ],
 )
@@ -555,3 +556,98 @@ def test_a_judgment_that_fails_warns_once_and_does_not_stop_the_start(
     ]
     assert len(logged) == 1 and "RuntimeError" in logged[0]
     assert logged[0].startswith(f"{_SETTING} ({str(twins.crl)!r})")
+
+
+# --- vault BACKLOG #3506: the texts claim no more than the code does ----------------------------
+
+
+def test_the_unlisted_warning_is_true_of_a_listed_ca_whose_name_differs_only_in_case(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The engine compares names exactly and OpenSSL folds case. So a listed CA can have the
+    CRL's issuer name, as OpenSSL reads it, and the key the CRL names, and still read
+    ``unlisted``. The warning used to say no listed CA "has that name", which is the wrong cause
+    here. This pins the words, not the matching: if the matching ever folds case, change both."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    listed = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-Case-CA")])
+    lower = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-case-ca")])
+    ca = _ca(key, key, name=listed)
+    leaf, leaf_key = _leaf(listed, key)
+    ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
+    ca_file.write_bytes(ca.public_bytes(_PEM))
+    (tmp_path / "leaf.pem").write_bytes(leaf.public_bytes(_PEM))
+    (tmp_path / "leaf-key.pem").write_bytes(_key_pem(leaf_key))
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(tmp_path / "leaf.pem", tmp_path / "leaf-key.pem")
+
+    pem = _crl(key, names=key, name=lower, revoke=leaf.serial_number)
+    crl_file.write_bytes(pem)
+    der = ca.public_bytes(serialization.Encoding.DER)
+    assert [s.state for s in judge_crl_signatures(pem, [der])] == ["unlisted"]
+
+    with caplog.at_level("WARNING"):
+        hop = _hop(ca_file, crl_file)
+    (line,) = _warnings(caplog)
+    assert "matched it to no CA certificate this hop lists" in line
+    assert "letter case included" in line
+    assert "has that name" not in line
+
+    # The premise, on this interpreter's OpenSSL: it takes that CA for the CRL's issuer, and
+    # judges the peer by the CRL. Control: the same hop passes with a CRL that revokes nothing.
+    with pytest.raises(ssl.SSLError, match="revoked"):
+        _handshake(hop, server)
+    crl_file.write_bytes(_crl(key, names=key, name=lower))
+    _handshake(_hop(ca_file, crl_file), server)  # raises if refused
+
+
+def test_the_reload_reason_for_an_unlisted_issuer_uses_the_start_warnings_words(
+    twins: _Twins,
+) -> None:
+    # One cause, one set of words: the reload's reason must stay true of the case above too.
+    verdict = crl_signature_refusal(twins.write_crl("new", "new"), _ders(twins.old_ca))
+    assert verdict is not None and verdict[1] is False
+    assert "matched it to no CA certificate this hop lists" in verdict[0]
+    assert "letter case included" in verdict[0]
+    assert "names no CA certificate" not in verdict[0]
+
+
+def test_the_reload_remedy_promises_a_start_refusal_only_for_the_proven_case(
+    tmp_path: Path,
+) -> None:
+    """The remedy used to say a start refuses the file "where the CRL names that CA's key". This
+    is a file where that is false: the CRL names the RSA CA's key and carries an ECDSA signature.
+    The reload holds it back with this remedy, and a start loads it."""
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca = _ca(rsa_key, rsa_key)
+    pem = _crl(ec.generate_private_key(ec.SECP256R1()), names=rsa_key)
+    (tmp_path / "ca.pem").write_bytes(ca.public_bytes(_PEM))
+    (tmp_path / "crl.pem").write_bytes(pem)
+
+    verdict = crl_signature_refusal(pem, [ca.public_bytes(serialization.Encoding.DER)])
+    assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
+    assert _hop(tmp_path / "ca.pem", tmp_path / "crl.pem").verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+    assert "only where it proves the signature bad" in BAD_SIGNATURE
+    assert "a signature the engine cannot check" in BAD_SIGNATURE
+    assert "Where the CRL names that CA's key, a start refuses the file too" not in BAD_SIGNATURE
+
+
+#: Sentences ``docs/CONFIGURATION.md`` carried and the code does not bear out (vault BACKLOG
+#: #3506). Each is matched with runs of white space folded, as a reader sees the paragraph.
+_RETRACTED_DOC_CLAIMS = (
+    # Not when the engine cannot check with that key, nor when the name differs only in case.
+    "A start refuses it when the CRL names the CA's key and that key did not sign it",
+    # A version that returns is logged again; the A, B, A test above counts three lines.
+    "logged once per engine process for each version of the file",
+)
+
+
+def test_the_configuration_guide_does_not_make_the_retracted_claims() -> None:
+    guide = Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md"
+    text = " ".join(guide.read_text(encoding="utf-8").split())
+    # Control: this is the guide, and it still has the paragraph these claims sat in.
+    assert "A start checks each CRL's signature too" in text
+    assert "an earlier version that returns is logged again" in text
+    assert "The engine never checks their signatures" in text
+    for claim in _RETRACTED_DOC_CLAIMS:
+        assert claim not in text, claim

@@ -390,7 +390,13 @@ class CrlSignature:
 
     ``where`` names the block and its issuer, for a message. ``state`` is one of five. A CA "fits"
     when its subject equals the CRL's issuer name exactly and it fits the CRL's Authority Key
-    Identifier (:func:`_akid_fit`).
+    Identifier (:func:`_akid_fit`). "Exactly" is ``cryptography``'s name comparison, in which
+    letter case counts. OpenSSL's comparison folds case. So a listed CA whose name differs from
+    the issuer's only in case is ``unlisted`` here, while OpenSSL takes it for the issuer and
+    judges peers by the CRL. Measured 2026-10-13 on CPython 3.14.6 with OpenSSL 3.5.7: such a
+    CRL, badly signed and naming that CA's key, started with the warning and then failed its
+    handshake with ``CRL signature failure``. Every text that describes ``unlisted`` must stay
+    true of that case.
 
     * ``verified``: a CA that fits verifies the CRL.
     * ``bad``: **proven** badly signed. The CRL's key identifier equals a fitting CA's Subject Key
@@ -493,9 +499,13 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     unlisted: str | None = None
     for signature in judge_crl_signatures(pem, ca_ders):
         if signature.state == "unlisted":
-            # Go on: a block that is known to be badly signed is the stronger finding.
+            # Go on: a block that is known to be badly signed is the stronger finding. The words
+            # are the start warning's (``tls_policy._UNCONFIRMED_SIGNATURE``), and must stay true
+            # of a listed CA whose name differs only in letter case (:class:`CrlSignature`).
             unlisted = unlisted or (
-                f"{signature.where} names no CA certificate this hop lists as its issuer"
+                f"{signature.where}: the engine matched it to no CA certificate this hop lists "
+                "(it compares the issuer name exactly, letter case included, and then the CRL's "
+                "authority key identifier, where it carries one)"
             )
         elif signature.state != "verified":
             return (
@@ -552,7 +562,10 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
     it is not proof. The key is then asked directly (:func:`_verify_with`), and only its
     ``InvalidSignature`` counts as proof. Everything else is ``None``: a key or an algorithm
     ``cryptography`` does not support, a key of another kind than the signature, and a
-    ``ValueError`` or ``TypeError`` from either call."""
+    ``ValueError`` or ``TypeError`` from either call. So is a signature the key accepts after
+    ``is_signature_valid`` refused it. Measured 2026-10-13 with ``cryptography`` 50.0.2: an RSA
+    PKCS1v15 signature over SHA-1 that the CA did make reads ``None`` that way, and a forged one
+    reads False."""
     try:
         key = ca.public_key()
         if crl.is_signature_valid(key):  # type: ignore[arg-type]
