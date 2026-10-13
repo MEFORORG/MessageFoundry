@@ -48,18 +48,28 @@ A conforming sidecar is a **loopback TLS-terminating re-originator**, not a tunn
    either — solving both halves).
 3. Be **fail-closed**: if ECH cannot be negotiated (destination publishes no `ECHConfig`), fail rather than
    silently completing a non-ECH handshake.
+4. **Do not re-frame what it carries** (BACKLOG #1125). The sidecar reads and re-sends every request
+   and reply, so it is a second HTTP parser on the hop. Keep each engine request's `Content-Length`,
+   and never re-send its body chunked. Refuse ambiguous framing rather than clean it up: both
+   `Content-Length` and `Transfer-Encoding`, a duplicate or conflicting `Content-Length`, a folded
+   header line (obs-fold), or a bare LF or bare CR in a head. After a reply it could not read to its
+   framed end, drop that connection to the partner. The shapes and the reasons are in
+   [DEPLOYMENT.md](../../docs/DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses),
+   and the outbound form of the rule is in
+   [CONFIGURATION.md](../../docs/CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries).
 
 Candidate implementations (operator-supplied, downloaded beside the engine like OpenBao for the store
 sidecar): **sing-box** (Go `crypto/tls` client ECH since 1.23) configured as a TLS-terminating proxy, or a
 purpose-built ~500-line Go re-originator. A generic CONNECT-tunneling proxy is **not** conforming.
 
 **A reference implementation exists in history, not in the tree.** A 312-line stdlib-only Go
-re-originator satisfying all three points above was written here and, on 2026-08-10, retired from the
+re-originator satisfying points 1 to 3 above was written here and, on 2026-08-10, retired from the
 repository (BACKLOG #1011): nothing built, tested, linted or version-pinned it, and it shipped in no
 sdist or wheel. Recover it with `git show 62fd628d:tools/ech-sidecar/main.go` (its own README, at
 `62fd628d:tools/ech-sidecar/README.md`, carries the recorded manual proof against
 `crypto.cloudflare.com` — a one-off observation, never re-run by any automated check). Treat it as a
-worked example of the contract, not as supported software.
+worked example of the contract, not as supported software. It predates point 4, and nobody has
+checked it against that point.
 
 ## Wire it in MessageFoundry
 
