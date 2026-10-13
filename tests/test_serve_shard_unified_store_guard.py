@@ -276,7 +276,7 @@ def test_guard_and_entrypoint_agree_on_the_same_inputs() -> None:
     # drops to 1 and the guard becomes inert; this test states the input contract it would break.
     reg = _registry("a", "b")
     assert shard_ids(reg) == ["a", "b"]
-    with pytest.raises(ValueError, match="2 shards"):
+    with pytest.raises(ValueError, match="2 engine shards"):
         require_unified_store(StoreBackend.SQLITE, shard_ids(reg))
 
 

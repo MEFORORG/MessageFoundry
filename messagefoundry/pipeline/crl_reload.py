@@ -181,9 +181,10 @@ _NOT_PROVABLE = (
     "Give this setting a bare CRL. A restart applies the file only if the hop already trusts that "
     "certificate"
 )
-#: The refusals the reload judges again on the next pass, for the same bytes. Time can lift a
-#: WAIT. A CA directory adds a CA to the trust store only when a handshake first needs it, so a
-#: CA the reload could not list can appear later, which is why :data:`NO_ISSUER` is here too.
+#: The refusals that can lift while the bytes stay the same. Time can lift a WAIT. A CA directory
+#: adds a CA to the trust store only when a handshake first needs it, so a CA the reload could not
+#: list can appear later, which is why :data:`NO_ISSUER` is here too. :attr:`_Refusals.sticky`
+#: says when one of these makes the next pass judge the same bytes again.
 _RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
 #: Which remedy a refusal names when the contexts of one file disagree: the earliest here. A file
 #: to fix, then a restart, outrank a wait, because waiting would not apply the file.
@@ -328,18 +329,49 @@ class _NotProvable(ValueError):
 
 class _Refusals:
     """The refusal of a pass for one file that outranks the rest (:data:`_PRECEDENCE`, the first
-    among equals), kept whole, and whether every one was sticky."""
+    among equals), kept whole, and whether the next pass must judge the same bytes again."""
 
     def __init__(self) -> None:
         self.strongest: tuple[str, str] | None = None
-        self.sticky = True
+        #: True once the next pass must judge these bytes again. Either a refusal that can lift
+        #: (:data:`_RETRIED`) is what stopped a context or the whole pass, so that context may
+        #: still take them, or the reason reported carries a warning that ends with time.
+        self.pending = False
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
 
-    def add(self, reason: str, remedy: str) -> None:
+    def add(self, reason: str, remedy: str, *, stops: bool = True) -> None:
+        """Record one refusal. Pass ``stops=False`` where a check further on may still be what
+        stops the context. The refusal then counts for the rank alone, and :meth:`stopped_by`
+        says so if it turns out to be what holds the context back."""
         if self.strongest is None or _RANK[remedy] < _RANK[self.strongest[1]]:
             self.strongest = (reason, remedy)
-        self.sticky = self.sticky and remedy not in _RETRIED
+        if stops:
+            self.stopped_by(remedy)
+
+    def stopped_by(self, remedy: str) -> None:
+        """Note that the refusal naming ``remedy`` is what holds a context, or the pass, back."""
+        self.pending = self.pending or remedy in _RETRIED
+
+    def reopen(self) -> None:
+        """Have the next pass judge these bytes again, whatever stopped each context."""
+        self.pending = True
+
+    @property
+    def sticky(self) -> bool:
+        """Whether the reload treats this pass's verdict as final until the file changes.
+
+        False while a refusal that can lift is what stops some context. Once it lifts, that
+        context takes the file, or meets a check it had not reached, which may outrank the
+        refusal reported. False while the refusal reported can itself lift, because the operator
+        would go on reading it afterwards. A refusal that can lift but is neither changes nothing
+        when it does: a check that does not lift stops its context all the same, and a refusal
+        that outranks it is the one reported (vault BACKLOG #2866).
+
+        "Final" is the reload's rule, not a proof. A file check reads the hop's CA list, which a
+        CA directory can still add to. A file to fix was already final on its own, and a wait
+        beside it no longer keeps the pass open."""
+        return not self.pending and (self.strongest is None or self.strongest[1] not in _RETRIED)
 
 
 # Pass state, touched only under _PASS_LOCK. Keyed by path key, pruned to the held paths each pass.
@@ -350,6 +382,9 @@ _SEEN: dict[str, tuple[tuple[int, int, int], tuple[int, int]]] = {}
 _UNREADABLE: set[str] = set()
 #: The last unexpected failure per file outside a judged version, so its traceback is logged once.
 _FAILED: dict[str, str] = {}
+#: The fingerprint of each held file's bytes when a pass last judged them, and the label it gave
+#: them, so every retry of one refusal names the file the same way (:func:`_label`).
+_LABELS: dict[str, tuple[tuple[int, int], str]] = {}
 
 
 def _read_path(pairs: Sequence[tuple[ssl.SSLContext, HeldCrl]]) -> str:
@@ -398,7 +433,7 @@ class _Change:
     #: The bytes, or ``None`` when the stamp was unchanged and they were not read this pass.
     pem: bytes | None
     fingerprint: tuple[int, int]
-    #: True when these bytes were refused before, for a reason time can lift.
+    #: True when these bytes were refused before, and not for good (:attr:`_Refusals.sticky`).
     retry: bool
 
 
@@ -427,10 +462,45 @@ def _triage(
         return None
     prior = reload_refusal(key, fingerprint)
     if prior is not None and prior.sticky:
-        # Nothing but a change to the file can alter this verdict, so these bytes are not judged
-        # again. A refusal time can lift is retried every pass.
+        # The reload treats this verdict as final until the file changes, so these bytes are not
+        # judged again. :attr:`_Refusals.sticky` says which verdicts are retried every pass.
         return prior
     return _Change(pem, fingerprint, retry=prior is not None)
+
+
+def _label(
+    key: str,
+    fingerprint: tuple[int, int],
+    stale: Sequence[tuple[ssl.SSLContext, HeldCrl]],
+    path: str,
+    *,
+    refused: bool,
+) -> str:
+    """How a pass names the file whose bytes have ``fingerprint``: the label those bytes were
+    first refused under, worked out from the holders that were ``stale`` then.
+
+    Every reason leads with the label, and :func:`_finish` logs a refusal again when its reason
+    changes. A label worked out afresh each pass changed for the same bytes. The stale set shrinks
+    as contexts take the file, so the path became one holder's setting once the others were
+    current. Reading every holder instead would not hold still either: a short-lived context
+    built from the file as it is now comes and goes between passes. So the label is worked out
+    when the bytes are first refused, and kept while that refusal stands (vault BACKLOG #3099).
+
+    ``refused`` says a refusal for these bytes is on record. Without one the label is worked out
+    afresh: bytes put back after a change may meet different holders, and must not be named by
+    the ones that were stale the first time."""
+    kept = _LABELS.get(key)
+    if refused and kept is not None and kept[0] == fingerprint:
+        return kept[1]
+    shown = next((h.configured_path for _, h in stale if h.configured_path), path)
+    # The setting, only when every stale holder recorded the same one. Several listeners can share
+    # one CRL now that each records its connection's tls_crl_file (vault BACKLOG #1997), and naming
+    # whichever the pass met first sent the operator to one hop of several. The path alone is
+    # never wrong, and it does not grow with the number of holders.
+    held_by = {h.setting for _, h in stale}
+    label = crl_label(shown, held_by.pop() if len(held_by) == 1 else None)
+    _LABELS[key] = (fingerprint, label)
+    return label
 
 
 def _reload_path(
@@ -453,13 +523,7 @@ def _reload_path(
         clear_reload_refusal(key)
         return None
     prior = reload_refusal(key, fingerprint)
-    shown = next((h.configured_path for _, h in stale if h.configured_path), path)
-    # The setting, only when every stale holder recorded the same one. Several listeners can share
-    # one CRL now that each records its connection's tls_crl_file (vault BACKLOG #1997), and naming
-    # whichever the pass met first sent the operator to one hop of several. The path alone is
-    # never wrong, and it does not grow with the number of holders.
-    held_by = {h.setting for _, h in stale}
-    label = crl_label(shown, held_by.pop() if len(held_by) == 1 else None)
+    label = _label(key, fingerprint, stale, path, refused=prior is not None)
     refusals = _Refusals()
     reloaded = 0
     blocks: tuple[CrlBlock, ...] = ()  # stays empty when the bytes cannot be judged
@@ -475,11 +539,12 @@ def _reload_path(
         ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]] = []
         for ctx, held in stale:
             # First, for every context: does some CRL it holds lapse before the file can apply?
-            # That outranks every other verdict below, so no other path may hide it.
+            # That outranks every other verdict below, so no other path may hide it. It is recorded
+            # for the rank alone: what stops this context is decided below and in ``_load``.
             if held.blocks not in timing:
                 timing[held.blocks] = _time_verdict(held.blocks, blocks, now=now)
             if (late := timing[held.blocks]) is not None and late[1] == LAPSES_FIRST:
-                refusals.add(f"{label}: {late[0]}", LAPSES_FIRST)
+                refusals.add(f"{label}: {late[0]}", LAPSES_FIRST, stops=False)
             if held.reloads >= max_reloads:
                 capped = (
                     f"this hop has taken {held.reloads} CRL reloads, and each one stays in its "
@@ -526,7 +591,7 @@ def _reload_path(
             remedy,
         )
         # Judged again each pass, so the warning goes once its time has passed.
-        refusals.sticky = False
+        refusals.reopen()
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
 
 
@@ -544,15 +609,22 @@ def _load(
     """Load the staged ``copy`` into each context in ``ready`` that passes the per-context checks.
 
     A context paired with a verdict (a wait, a restart) gets the checks and then that verdict, so a
-    file to fix is reported as one whatever else holds the context back. Returns how many contexts now hold the file. A failure in
-    one context is that context's refusal alone, retried next pass: the contexts already loaded
-    stay counted, and the rest are still tried."""
+    file to fix is reported as one whatever else holds the context back. Returns how many contexts
+    now hold the file. A failure in one context is that context's refusal alone, retried next pass:
+    the contexts already loaded stay counted, and the rest are still tried.
+
+    The check that stops a context decides whether these bytes are judged again
+    (:attr:`_Refusals.sticky`). A context that fails a file check is stopped by it, wait or no
+    wait. A context that passes every file check and only waits takes them once the wait lifts."""
     reloaded = 0
     signatures: dict[frozenset[bytes], tuple[str, bool] | None] = {}
     for ctx, held, held_back in ready:
         if held_back is not None:
-            # Recorded first, so a file check below that ranks lower cannot hide it.
-            refusals.add(f"{label}: {held_back[0]}", held_back[1])
+            # :data:`_RANK` picks the refusal reported, whatever the order: order only breaks a
+            # tie. The place of this call still matters. Each file check below ends in
+            # ``continue``, so a verdict recorded after them would be skipped for a context that
+            # fails one. Recorded for the rank alone, until the file checks have passed.
+            refusals.add(f"{label}: {held_back[0]}", held_back[1], stops=False)
         try:
             anchors = frozenset(ctx.get_ca_certs(binary_form=True))
             if certificates - anchors:
@@ -570,6 +642,8 @@ def _load(
                 refusals.add(f"{label}: {why}", BAD_SIGNATURE if found else NO_ISSUER)
                 continue
             if held_back is not None:
+                # Every file check passed, so this verdict alone holds the context back.
+                refusals.stopped_by(held_back[1])
                 continue
             ctx.load_verify_locations(cafile=str(copy))  # cafile= ONLY: cadata= loads no CRL
         except Exception as exc:
@@ -675,7 +749,7 @@ def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
 
 def _prune(held: Collection[str]) -> None:
     """Drop the pass state and the refusals of every path key not in ``held``. Under the pass lock."""
-    for state in (_SEEN, _FAILED):
+    for state in (_SEEN, _FAILED, _LABELS):
         for gone in [key for key in state if key not in held]:
             del state[gone]
     _UNREADABLE.intersection_update(held)

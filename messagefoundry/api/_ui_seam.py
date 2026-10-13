@@ -391,6 +391,10 @@ from typing import Any
 #: ``admin_revoke_user_sessions``, ``set_user_roles`` and ``set_channel_scope``. The digest did not
 #: move, for the same reason, and the same TypeError skew applies to those three calls.
 #:
+#: BACKLOG #1154: ``export_audit`` gained the keyword ``token``, the session it resolves again
+#: before each page, and ``/ui/audit/export`` passes its cookie session. The digest did not move,
+#: for the same reason. A call without ``token`` raises TypeError before any row is read.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

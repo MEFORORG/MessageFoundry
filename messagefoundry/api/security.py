@@ -1860,13 +1860,26 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     return identity
 
 
+class ExportStopped(RuntimeError):
+    """A running export lost its caller's standing, so the stream aborts (BACKLOG #1154). The
+    bulk message export and the audit export raise it.
+
+    The response has already started, so no status code can say so. Raising aborts the transfer,
+    and the client sees an incomplete download rather than a short file that looks complete. The
+    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
+    and uvicorn writes a traceback. Returning without the final body message would avoid
+    that, but the ``@app.middleware("http")`` layers would then finish the response cleanly,
+    which is the short file this exists to prevent."""
+
+
 async def recheck_standing(
     auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
 ) -> Identity | None:
     """Resolve the caller again, mid-response, or ``None`` once it may no longer have the data.
 
-    For a response that outlives its gate: the ``/ws/stats`` feed asks before every frame, and the
-    bulk message export asks before every row (BACKLOG #1154, ASVS 8.3.2). The gate resolved the
+    For a response that outlives its gate: the ``/ws/stats`` feed asks before every frame, the bulk
+    message export before every row, and the audit export before every page (BACKLOG #1154, ASVS
+    8.3.2). The gate resolved the
     identity once. Without this, a session revoked, a role withdrawn or a channel scope narrowed
     after that point would not reach a response already running.
 
