@@ -561,9 +561,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
   (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
   (ASVS 11.3.3, BACKLOG #1169).
-- **When acceptable:** a store that holds legitimate unmarked values beside ciphertext in one column —
-  for example rows written by a keyless run of a store that was keyed before. Turn it on for one keyed
-  open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+- **When acceptable:** a store that holds legitimate unmarked values in a column that is already
+  sealed. One example is rows written by a keyless run of a store that was keyed before. Since
+  BACKLOG #3383, a keyed open records each column in `keyed_surface`. A recorded column stays sealed
+  even with no ciphertext in it, so this covers a table that had emptied out too. Turn it on for one
+  keyed open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
 - **Compensating controls:** database-level access control, because planting a row needs store write
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
@@ -1586,7 +1588,13 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   connection secrets and the messages in flight. An application that builds the API without
   `serve` reports this, until something in it imports the command-line module, which installs
   the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  only if another audit hook refused the engine's.
+  in at least two cases. Both need an audit hook that something else added to the process first.
+  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
+  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
+  is there. The engine's hook is then in place and refuses a script, but the entry still reads
+  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
+  refusals. The interpreter reports each one on standard error, with the script's full path. The entry cannot tell the two cases apart, so read
+  it as the first, and look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

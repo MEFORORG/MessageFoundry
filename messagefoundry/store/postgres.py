@@ -119,7 +119,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
-    report_unmarked,
+    report_sealed_surface,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -278,6 +278,12 @@ _RELEASE_CHUNK = 500
 # which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
 # single transaction while the store is still opening.
 _ATTACHMENT_CHUNK_BATCH = 16
+# BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. RETURNING yields a row
+# only when this statement wrote the marker, which is how the seal learns it was the writer.
+_INSERT_KEYED_MARKER = (
+    "INSERT INTO keyed_surface (surface_table, surface_column, keyed_at) VALUES ($1, $2, $3)"
+    " ON CONFLICT (surface_table, surface_column) DO NOTHING RETURNING 1"
+)
 
 # Advisory-lock keys passed to the TWO-key pg_advisory_xact_lock(classid, hashtext($key)). They
 # serialize the audit-chain append (H-7) and schema init across concurrent opens; the finalize lock is
@@ -672,6 +678,15 @@ _SCHEMA: list[str] = [
         id          INTEGER PRIMARY KEY CHECK (id = 1),
         salt        TEXT NOT NULL,
         created_at  DOUBLE PRECISION NOT NULL
+    )""",
+    # The keyed-surface marker (BACKLOG #3383) -- see the SQLite `_SCHEMA` and
+    # `MessageStore._encrypt_existing_rows` for when a row is written and what it decides. One row per
+    # cipher-covered (table, column); never deleted by the engine. Non-secret.
+    """CREATE TABLE IF NOT EXISTS keyed_surface (
+        surface_table  TEXT NOT NULL,
+        surface_column TEXT NOT NULL,
+        keyed_at       DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (surface_table, surface_column)
     )""",
     # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
     # at most, written only by `store attest-transit-bound` with its audit row in the same
@@ -1081,15 +1096,16 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     refuse-weakened-TLS logic (ASVS 12.3.2).
 
     A weakened posture (``trust_server_certificate=true`` or ``encrypt=false``) is MITM-able, so it
-    **refuses** unless the explicit ``MEFOR_ALLOW_INSECURE_TLS`` dev escape is set — it can't be
-    silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
+    **refuses** unless the explicit ``MEFOR_ALLOW_INSECURE_TLS`` dev escape is set on an instance at
+    ``[security].enforcement = warn`` — it can't be silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
     ``False`` (no TLS) only under the escape with ``encrypt=false``; an SSLContext that skips cert
     verification under the escape with ``trust_server_certificate=true``; otherwise a verifying
     SSLContext the engine builds, against the pinned CA or the system trust store.
 
     #200 (ADR 0092 decision 2): the engine<->store hop routes the escape through the ONE clamp
     (:func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`) so ``MEFOR_ALLOW_INSECURE_TLS``
-    can NEVER relax a **production-PHI** store hop (the SQL Server twin above is keyed identically). It
+    works only at ``[security].enforcement = warn`` and can NEVER relax an **enforcing** store hop
+    (the SQL Server twin above is keyed identically). It
     stays a STRICT verify-off cell (no gradient) and keeps NO second escape. ``posture`` (threaded from
     ``open_store``) ``None`` reads the ambient posture, and with none the escape is NOT permitted
     (vault BACKLOG #2354). CORRECTED: this read *"``None`` leaves the escape unclamped"*."""
@@ -2353,6 +2369,11 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn:
             return await conn.fetchrow(sql, *params)
 
+    async def _fetchval(self, sql: str, *params: Any) -> Any:
+        """The first column of the first row ``sql`` returns, or ``None``."""
+        async with self._timed_acquire(record=False) as conn:
+            return await conn.fetchval(sql, *params)
+
     async def _execute(self, sql: str, *params: Any) -> int:
         """Run one write on a bounded borrow and return its row count, read from asyncpg's status
         tag. Most callers ignore it; the session purge and the session cap read it (BACKLOG
@@ -2623,9 +2644,10 @@ class PostgresStore:
 
     async def _encrypt_existing_rows(self) -> None:
         """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1 /
-        WP-5), one (table, column) surface at a time, each in ONE transaction. A surface that already
-        holds ciphertext is SEALED and its unmarked values are refused at read, not sealed (BACKLOG
-        #1169). The SQLite twin documents why; :meth:`_seal_surface` carries the mechanics."""
+        WP-5), one (table, column) surface at a time, each in ONE transaction. A surface with its
+        ``keyed_surface`` marker, or one that already holds ciphertext, is SEALED and its unmarked
+        values are refused at read, not sealed (BACKLOG #1169, #3383). The SQLite twin documents why
+        and when the marker is written; :meth:`_seal_surface` carries the mechanics."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -2706,47 +2728,54 @@ class PostgresStore:
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
 
-        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
-        surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
-        11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD
-        from the row instead (the queue payload's routing tag, BACKLOG #2593). Identifiers are code
-        constants; only the marker pattern is a parameter.
+        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: decide whether
+        the surface is sealed (its ``keyed_surface`` marker, or a marked value; BACKLOG #3383),
+        reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
+        every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
+        ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
+        (the queue payload's routing tag, BACKLOG #2593). Identifiers are code constants; only the
+        marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
-        transaction opens. A reservation must commit independently of the seal it covers, and an
-        engine shard's peer only ever adds MARKED values, which cannot turn an unsealed verdict into
-        a wrong seal."""
+        transaction opens, because a reservation must commit independently of the seal it covers.
+        An engine shard's peer can still key the surface in between. So the marker insert is the
+        seal transaction's FIRST statement: a peer's uncommitted insert of the same key makes it
+        wait, and a committed one makes it insert nothing, and then this open seals nothing."""
         keys = key_cols if key_cols is not None else aad_cols
         pending_where = f"{column} NOT LIKE $1 AND {column} <> ''"
-        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", like)
-        pending = int(row["n"]) if row is not None else 0
-        if not pending:
+        count_sql = f"SELECT COUNT(*) FROM {table} WHERE {pending_where}"
+        strict = not allows_unmarked(self._cipher)
+        keyed = await self._surface_keyed(table, column)
+        pending = int(await self._fetchval(count_sql, like) or 0)
+        is_sealed = keyed
+        if pending and strict and not keyed:
+            is_sealed = await self._surface_holds_ciphertext(table, column, like)
+            if is_sealed:
+                # As on SQLite: a peer may have sealed the rows between the count and the probe,
+                # so count again rather than report its legitimate seal as a plant.
+                pending = int(await self._fetchval(count_sql, like) or 0)
+        if not pending or (strict and is_sealed):
+            if pending:
+                report_sealed_surface(log, self._cipher, table, column, pending)
+            if not keyed:
+                await self._execute(_INSERT_KEYED_MARKER, table, column, time.time())
             return 0
-        if not allows_unmarked(self._cipher):
-            marked = await self._fetchone(
-                f"SELECT 1 AS x FROM {table} WHERE {column} LIKE $1 LIMIT 1", like
-            )
-            if marked is not None:
-                log.warning(
-                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
-                    "sealed and every read of them is refused (a stripped marker or a planted row). "
-                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
-                    table,
-                    column,
-                    pending,
-                )
-                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
-                # invisible except in the log. Names the cell only (BACKLOG #1169).
-                report_unmarked(self._cipher, table, column)
-                return 0
         await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
         select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(keys))
         sealed = 0
-        # One transaction for the whole surface: asyncpg rolls it back on any exception, so a crash
-        # or a failure part-way leaves the surface exactly as unsealed as it was.
+        # One transaction for the whole surface, marker included: asyncpg rolls it back on any
+        # exception, so a crash or a failure part-way leaves the surface exactly as unsealed as it was.
         async with self._timed_acquire() as conn, conn.transaction():
+            claimed = await conn.fetchval(_INSERT_KEYED_MARKER, table, column, time.time())
+            if claimed is None and strict:
+                # A peer keyed this surface after the reads above, so it sealed the legacy rows.
+                # READ COMMITTED: this count sees the peer's committed seal.
+                left = int(await conn.fetchval(count_sql, like) or 0)
+                log.debug("cipher column %s.%s was keyed by another process", table, column)
+                if left:
+                    report_sealed_surface(log, self._cipher, table, column, left)
+                return 0
             while True:
                 rows = await conn.fetch(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
@@ -2772,6 +2801,22 @@ class PostgresStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()
         return sealed
+
+    async def _surface_keyed(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""
+        row = await self._fetchone(
+            "SELECT 1 AS x FROM keyed_surface WHERE surface_table = $1 AND surface_column = $2",
+            table,
+            column,
+        )
+        return row is not None
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
+        """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
+        row = await self._fetchone(
+            f"SELECT 1 AS x FROM {table} WHERE {column} LIKE $1 LIMIT 1", like
+        )
+        return row is not None
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
 
@@ -4617,14 +4662,16 @@ class PostgresStore:
             await self._after_fenced_write(exc)
             return
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(4)  # ADR 0157 C1 — TERMINAL
         try:
             async with self._timed_acquire() as conn, conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
-                    return
+                    return False
                 await self._exec_terminal(
                     conn,
                     "mark_done",
@@ -4654,10 +4701,20 @@ class PostgresStore:
                     f"attempt {row['attempts']}",
                     now,
                 )
+                if reply_dropped is not None:
+                    await self._event(
+                        conn,
+                        row["message_id"],
+                        "reply_dropped",
+                        row["destination_name"],
+                        reply_dropped,
+                        now,
+                    )
                 await self._maybe_finalize_message(conn, row["message_id"], now)
         except _FencedWrite as exc:
             await self._after_fenced_write(exc)
-            return
+            return False
+        return True
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in ONE transaction — the batch counterpart of

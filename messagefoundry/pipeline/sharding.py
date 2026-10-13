@@ -54,7 +54,7 @@ event loop and no process state, so they are safe to call from the loader, the e
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from types import MappingProxyType
 
 from messagefoundry.config.settings import StoreBackend
@@ -81,6 +81,27 @@ def shard_ids(registry: Registry) -> list[str]:
     return sorted(ids)
 
 
+def join_shard_names(names: Iterable[str]) -> str:
+    """Engine shard names in sorted order, joined with `` / ``, for a log line or a refusal.
+
+    It replaces a comma between bare names. The log's PHI pass
+    (:data:`messagefoundry.redaction._COMMA_NAME_RUN`) takes two capitalized words around a comma
+    for a family-comma-given name, so ``EAST, WEST`` and ``East,West`` each reached the log as
+    ``[redacted]`` (vault BACKLOG #3227). Lower-case names passed, which is why it went unseen.
+
+    The spaces around the slash matter too. Without them, numeric names build a date shape
+    (``12/34/5678``), and the same pass scrubs that, which the comma never did.
+
+    This keeps the JOIN from adding a scrubbed shape. A name the pass scrubs by itself, such as
+    ``East Wing`` or an eight-digit number that starts with ``19`` or ``20``, is still scrubbed.
+
+    At least one list of engine shard names does not come through here. ``supervise`` logs its
+    ``name->:port`` pairs joined with a comma. That list passes, because a port number sits before
+    each comma and no two names meet around one. ``tests/test_supervisor.py`` holds it.
+    """
+    return " / ".join(sorted(names))
+
+
 def require_unified_store(store_backend: StoreBackend, ids: Sequence[str]) -> None:
     """Enforce the no-split-store rule: a multi-shard deployment must share ONE unified store (ADR 0063).
 
@@ -102,12 +123,13 @@ def require_unified_store(store_backend: StoreBackend, ids: Sequence[str]) -> No
     is_server_db = store_backend in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER)
     if not is_server_db and len(distinct) > 1:
         raise ValueError(
-            f"multi-process sharding ({len(distinct)} shards: {', '.join(distinct)}) requires a server-DB "
-            "store (Postgres or SQL Server) so every shard shares ONE unified database — a single-file "
-            f"store like {store_backend.value!r} would split the message store into one file per shard "
-            "(fragmenting search / reporting / audit / replay), which is not allowed. Set [store].backend "
-            "= 'postgres' or 'sqlserver' (all shards connect to the same database), or run a single "
-            "un-sharded engine."
+            f"multi-process engine sharding ({len(distinct)} engine shards: {join_shard_names(distinct)}) "
+            "requires a server-DB store (Postgres or SQL Server) so every engine shard shares ONE "
+            "unified database — a single-file "
+            f"store like {store_backend.value!r} would split the message store into one file per "
+            "engine shard (fragmenting search / reporting / audit / replay), which is not allowed. Set "
+            "[store].backend = 'postgres' or 'sqlserver' (all engine shards connect to the same "
+            "database), or run a single un-sharded engine."
         )
 
 
