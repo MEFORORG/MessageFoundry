@@ -4,19 +4,21 @@
 
 A held copy of a CRL is matched by its file, so every row naming the file judges the same copies.
 Each row logged the scan's whole account of them: N listeners sharing one CRL file gave N warnings
-per pass, each listing the same N holders. The pass now logs that account once per file, and the
-one line names the other rows.
+per pass, each listing the same N holders. A pass now logs the same account once, and that line
+names the other rows.
 
-Only the log line is folded. Each row still raises its own ``crl_expiry`` alert with its own
+Only the scan's own line is folded. Each row still raises its own ``crl_expiry`` alert with its own
 ``detail`` and ``shared_with`` (vault BACKLOG #2319), and the tests below pin that beside the count.
+At least two cases still log more than one line for a file in a pass, and each has a test here: a
+file replaced part way through the pass, and a pass whose row grouping failed.
 
 The instrument is the scan itself: real MLLP listener contexts built by ``_mllp_ssl_context``, the
 rows ``certs_from_registry`` reads from a real ``Registry``, one ``run_once``, and the WARNING
 records of ``messagefoundry.pipeline.cert_expiry`` that name the file.
 
-Run against ``cert_expiry.py`` as it stood before the fix, four tests fail: the three-listener
-count, the count on each of two passes, the two-file count, and the file replaced part way through
-a pass. The other three pass before and after, as their comments say.
+Run against ``cert_expiry.py`` as it stood before the fix, five tests fail: the three-listener
+count, the count on each of two passes, the two-file count, the two spellings of one path, and the
+file replaced part way through a pass. The other three pass before and after, as their comments say.
 
 All material is synthetic and minted here. No PHI.
 """
@@ -25,8 +27,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import ssl
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +38,12 @@ import pytest
 
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.config.wiring import MLLP, InboundConnection, Registry
-from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, certs_from_registry
+from messagefoundry.pipeline.alerts import crl_expiry_detail
+from messagefoundry.pipeline.cert_expiry import (
+    CertExpiryRunner,
+    MonitoredCert,
+    certs_from_registry,
+)
 from messagefoundry.transports.mllp import _mllp_ssl_context
 from tests.test_cert_expiry import _RecordingSink
 from tests.test_crl_bundle_anchors import (  # noqa: F401 - clean_anchor_checks is a fixture
@@ -46,7 +55,13 @@ from tests.test_crl_held_copy_alert import _another_ca, _Ca, _mine
 pytestmark = pytest.mark.usefixtures("clean_anchor_checks")
 
 _HELD = "still holds a copy of"
-_ALSO = "The same file also serves"
+#: How the line ends when it names no other row: the pending-reload remedy, with nothing after it.
+_NO_OTHER_ROW = "logs why."
+
+
+def _also(*labels: str) -> str:
+    """How the line ends when it names other rows: the alert's own sentence for a shared file."""
+    return " " + crl_expiry_detail(held_copy=False, detail="", shared_with=labels)
 
 
 @pytest.fixture
@@ -54,19 +69,33 @@ def ca() -> _Ca:
     return _another_ca("mefor-3099-ca")
 
 
-def _scan(
-    registry: Registry, caplog: pytest.LogCaptureFixture, sink: _RecordingSink | None = None
-) -> _RecordingSink:
-    """One pass over the registry's rows, leaving only that pass's records in ``caplog``."""
-    sink = sink or _RecordingSink()
-    runner = CertExpiryRunner(
-        lambda: certs_from_registry(registry, None),
+def _runner(
+    registry: Registry, sink: _RecordingSink, extra: Sequence[MonitoredCert] = ()
+) -> CertExpiryRunner:
+    """A monitor over the registry's rows, then ``extra``, as the engine's is over its own."""
+    return CertExpiryRunner(
+        lambda: [*certs_from_registry(registry, None), *extra],
         CertMonitorSettings(warn_days=30),
         alert_sink=sink,
     )
+
+
+def _pass(runner: CertExpiryRunner, caplog: pytest.LogCaptureFixture) -> None:
+    """One scan pass, leaving only that pass's records in ``caplog``."""
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
         runner.run_once(now=time.time())
+
+
+def _scan(
+    registry: Registry,
+    caplog: pytest.LogCaptureFixture,
+    sink: _RecordingSink | None = None,
+    extra: Sequence[MonitoredCert] = (),
+) -> _RecordingSink:
+    """One pass of a new monitor over the registry's rows."""
+    sink = sink or _RecordingSink()
+    _pass(_runner(registry, sink, extra), caplog)
     return sink
 
 
@@ -139,7 +168,8 @@ def test_three_listeners_sharing_one_stale_crl_log_one_warning(
     # The row the line is logged under leads; the line names the other two after it, once each.
     first, *others = site.names
     assert f"a copy of {first!r} CRL {site.crl} " in line
-    assert line.endswith(f"{_ALSO} {', '.join(map(repr, others))}.")
+    assert line.endswith(_NO_OTHER_ROW + _also(*others))
+    assert line.count(_also(*others)) == 1
 
 
 def test_the_alerts_are_still_one_per_listener(
@@ -176,21 +206,23 @@ def test_control_one_listener_logs_one_warning_that_names_no_other_row(
     assert len(lines) == 1
     assert "(1 load(s), from " in lines[0]
     assert lines[0].count(_holder(site.names[0])) == 1
-    assert _ALSO not in lines[0]
-    assert lines[0].endswith("logs why.")  # the line as it was, with nothing added
+    assert lines[0].endswith(_NO_OTHER_ROW)  # the line as it was, with nothing added
     assert len(_mine(sink, site.crl)) == 1
 
 
 def test_each_pass_logs_the_warning_again(
     ca: _Ca, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # The fold is per pass, not per process: while the listeners hold the old copy, every pass
-    # still says so. Before the fix each pass logged three lines.
+    # The fold is per pass, not per monitor: while the listeners hold the old copy, every pass
+    # still says so. One monitor runs both passes, as the engine's one monitor runs all of its
+    # own, so a fold kept on the monitor would silence the second. Before the fix each pass logged
+    # three lines.
     site = _site(ca, tmp_path, 3)
+    runner = _runner(site.registry, _RecordingSink())
 
-    _scan(site.registry, caplog)
+    _pass(runner, caplog)
     first = site.lines(caplog)
-    _scan(site.registry, caplog)
+    _pass(runner, caplog)
     second = site.lines(caplog)
 
     assert (len(first), len(second)) == (1, 1)
@@ -211,9 +243,30 @@ def test_two_stale_crl_files_log_one_warning_each(
 
     east_lines, west_lines = east.lines(caplog), west.lines(caplog)
     assert (len(east_lines), len(west_lines)) == (1, 1)
-    assert east_lines[0].endswith(f"{_ALSO} 'IB_EAST2_ADT'.")
-    assert west_lines[0].endswith(f"{_ALSO} 'IB_WEST2_ADT'.")
+    assert east_lines[0].endswith(_NO_OTHER_ROW + _also("IB_EAST2_ADT"))
+    assert west_lines[0].endswith(_NO_OTHER_ROW + _also("IB_WEST2_ADT"))
     assert "IB_WEST" not in east_lines[0] and "IB_EAST" not in west_lines[0]
+
+
+def test_two_spellings_of_one_path_and_a_settings_row_fold_together(
+    ca: _Ca, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The fold is keyed as held copies are: by the file, not by how a row spells its path. A
+    # settings row naming the listeners' file by another spelling joins their line and is named in
+    # it. A fold keyed on the spelling would log that row apart. Before the fix: three lines.
+    site = _site(ca, tmp_path, 2)
+    respelled = os.path.join(str(site.crl.parent), ".", site.crl.name)
+    assert respelled != str(site.crl) and Path(respelled).samefile(site.crl)
+
+    sink = _scan(
+        site.registry, caplog, extra=[MonitoredCert("tls.crl_file", respelled, kind="crl")]
+    )
+
+    # Every held-copy line of the pass, whichever spelling it prints: all three rows are this file.
+    held = [r.getMessage() for r in caplog.records if _HELD in r.getMessage()]
+    assert len(held) == 1
+    assert held[0].endswith(_NO_OTHER_ROW + _also("IB_SITE2_ADT", "tls.crl_file"))
+    assert len(_mine(sink, site.crl)) == 3  # and still one alert for each row
 
 
 class _ReplacingSink(_RecordingSink):
@@ -263,6 +316,7 @@ def test_a_file_replaced_part_way_through_a_pass_is_logged_again(
     assert "A reload is pending" in lines[0]
     assert "whose file cannot be parsed" in lines[1]
     assert f"a copy of {site.names[1]!r} CRL " in lines[1]
+    assert lines[1].endswith(_also(site.names[0], site.names[2]))
 
 
 def test_a_failure_grouping_the_rows_folds_nothing(
@@ -284,5 +338,5 @@ def test_a_failure_grouping_the_rows_folds_nothing(
     assert len(lines) == 3
     for line, name in zip(lines, site.names, strict=True):
         assert f"a copy of {name!r} CRL " in line
-        assert _ALSO not in line
+        assert line.endswith(_NO_OTHER_ROW)
     assert len(_mine(sink, site.crl)) == 3

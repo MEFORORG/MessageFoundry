@@ -46,7 +46,7 @@ from messagefoundry.config.tls_policy import (
     judge_crl_bytes,
     staged_crl,
 )
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, crl_expiry_detail
 from messagefoundry.pipeline.crl_reload import RELOAD_INTERVAL_SECONDS
 from messagefoundry.pki import (
     CertFacts,
@@ -475,35 +475,37 @@ class _HeldCopyLog:
 
     A held copy is matched by its file, so every row naming a file judges the same copies and
     reaches the same account of them. N listeners sharing one CRL file logged that account N times
-    a pass, each line listing the same N holders. A pass now logs it once, under the first row to
-    reach it, and that line names the other rows.
+    a pass, each line listing the same N holders. A pass now logs an account once, under the first
+    row to reach it, and that line names the other rows.
 
-    Only the log line is folded. Each row still returns its own check and raises its own alert,
-    with its own ``detail`` and ``shared_with`` (vault BACKLOG #2319)."""
+    Only the scan's own line is folded. Each row still returns its own check and raises its own
+    alert, with its own ``detail`` and ``shared_with`` (vault BACKLOG #2319), and a sink that logs
+    its alerts still logs one for each row."""
 
     def __init__(self, sharing: Mapping[str, tuple[str, ...]]) -> None:
         self._sharing = sharing
         self._logged: set[tuple[object, ...]] = set()
 
-    def other_rows(
-        self, cert: MonitoredCert, account: tuple[object, ...]
-    ) -> tuple[str, ...] | None:
-        """The other rows naming ``cert``'s file, for its warning to name, or ``None`` when this
-        pass has already logged the same ``account`` of that file. ``()`` still means log it.
+    def first(self, cert: MonitoredCert, account: tuple[object, ...]) -> bool:
+        """Whether to log ``account`` of ``cert``'s file: True unless this pass already has.
 
         ``account`` is everything the line says but the row and the path's spelling. Each row reads
         the file itself, so a file replaced part way through a pass can give a later row another
-        account, and that one is logged too. A file the grouping does not hold is never folded,
-        because its line could not name the rows left out: a failed grouping (BACKLOG #3176) costs
-        the fold and no row its mention."""
+        account, and that one is logged too. A file the grouping does not hold is always logged,
+        because no line could name the rows a fold left out: a failed grouping (BACKLOG #3176)
+        costs the fold and no row its mention."""
         key = crl_path_key(cert.path)
-        labels = self._sharing.get(key)
-        if labels is None:
-            return ()
+        if key not in self._sharing:
+            return True
         logged = (key, *account)
         if logged in self._logged:
-            return None
+            return False
         self._logged.add(logged)
+        return True
+
+    def others(self, cert: MonitoredCert) -> tuple[str, ...]:
+        """The other rows naming ``cert``'s file, for its line to name."""
+        labels = self._sharing.get(crl_path_key(cert.path), ())
         return tuple(label for label in labels if label != cert.label)
 
 
@@ -608,8 +610,8 @@ def _judge_crl(
 
     The alert therefore stays up until no context holds the old copy: the reload pass applied the file
     to it (:mod:`messagefoundry.pipeline.crl_reload`), or a restart or a rebuild of that hop replaced
-    it. A copy the reload refused names the refusal in the log line, which ``said`` keeps to one a
-    pass for each file (vault BACKLOG #3099). A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
+    it. A copy the reload refused names the refusal in the log line. ``said`` keeps rows that share
+    a file from each logging the same line in one pass (vault BACKLOG #3099). A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
     silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged.
     A failure judging the held copies is logged and leaves the file's own verdict standing."""
     stale: list[CrlFacts] = []
@@ -695,7 +697,8 @@ def _judge_crl(
             # only to the log. The remedy leads, because the alert instance keeps only the start
             # of it. The date is the alert's own not_after, so it is not repeated here.
             detail = f"{remedy}. Held by: {', '.join(holders)}."
-            # Vault BACKLOG #3099: once a pass for each file, not once for each row naming it.
+            # Vault BACKLOG #3099: the same account once a pass, not once for each row naming the
+            # file. It is everything the line says below but the row and the path.
             account = (
                 why,
                 len(copies),
@@ -704,8 +707,9 @@ def _judge_crl(
                 log_timestamp(oldest.next_update_iso),
                 remedy,
             )
-            others = said.other_rows(cert, account)
-            if others is not None:
+            if said.first(cert, account):
+                # The sentence the alert uses for the rows sharing a file, so the two cannot drift.
+                also = crl_expiry_detail(held_copy=False, detail="", shared_with=said.others(cert))
                 log.warning(
                     "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d "
                     "load(s), from %s). The hop keeps the copy it read when it built its context; "
@@ -713,8 +717,7 @@ def _judge_crl(
                     cert.label,
                     cert.path,
                     *account,
-                    # The alert's own words for the same fact (pipeline.alerts.crl_expiry_detail).
-                    f" The same file also serves {', '.join(map(repr, others))}." if others else "",
+                    f" {also}" if also else "",
                 )
     except Exception:
         log.error(
