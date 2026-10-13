@@ -323,3 +323,92 @@ def test_it_never_denies_a_tool_call(tmp_path: Path) -> None:
     _, out, _ = run_hook(tmp_path)
     assert "permissionDecision" not in out, f"the hook emitted a decision: {out!r}"
     assert "deny" not in out.lower(), f"the hook emitted a denial: {out!r}"
+
+
+# ------------------------------------------------------------------ whose note it reads
+#
+# Measured 2026-10-12: the desktop app starts a worktree session's CLI with `--project-config-root
+# <primary checkout>`, and a hook then runs with CLAUDE_PROJECT_DIR naming the PRIMARY. So a note
+# queued for a worktree session was never read, and the primary's note was read instead. Only the
+# hook input's `cwd` names the worktree. These tests set CLAUDE_PROJECT_DIR to the primary, as the
+# app does, and vary only that field.
+
+
+@pytest.fixture
+def primary_and_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """A primary checkout and one linked worktree, each holding its own queued note."""
+    base = Path(os.path.realpath(tmp_path))
+    repo = base / "primary"
+    repo.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.invalid"],
+        ["config", "user.name", "t"],
+        ["commit", "-q", "--allow-empty", "-m", "init"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    wt = base / "linked"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "linked", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    queue(repo, "PRIMARY-NOTE")
+    queue(wt, "WORKTREE-NOTE")
+    return repo, wt
+
+
+def run_hook_with_cwd(project_dir: Path, cwd_field: str | None) -> str | None:
+    """The hook as the app runs it: CLAUDE_PROJECT_DIR on the primary, `cwd` in the input."""
+    env = os.environ.copy()
+    env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+    payload: dict[str, object] = {"hook_event_name": "PreToolUse", "tool_name": "Read"}
+    if cwd_field is not None:
+        payload["cwd"] = cwd_field
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env,
+        cwd=str(project_dir),
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout.strip()
+    return str(json.loads(out)["hookSpecificOutput"]["additionalContext"]) if out else None
+
+
+def test_the_note_comes_from_the_worktree_the_hook_input_names(
+    primary_and_worktree: tuple[Path, Path],
+) -> None:
+    repo, wt = primary_and_worktree
+    ctx = run_hook_with_cwd(repo, str(wt))
+    assert ctx is not None and f"{PREFIX}WORKTREE-NOTE" in ctx, ctx
+    assert "PRIMARY-NOTE" not in ctx
+    assert (repo / ".claude" / "steer.txt").exists(), "the primary's note was consumed"
+    assert not (wt / ".claude" / "steer.txt").exists(), "the worktree's note was not consumed"
+
+
+def test_without_a_cwd_the_note_comes_from_the_project_dir(
+    primary_and_worktree: tuple[Path, Path],
+) -> None:
+    """The control. With no `cwd` the same call reads the primary, so the arm above can fail."""
+    repo, wt = primary_and_worktree
+    ctx = run_hook_with_cwd(repo, None)
+    assert ctx is not None and f"{PREFIX}PRIMARY-NOTE" in ctx, ctx
+    assert "Could not read this session's worktree" not in ctx
+    assert (wt / ".claude" / "steer.txt").exists()
+
+
+def test_a_cwd_that_does_not_exist_is_said_aloud(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, _ = primary_and_worktree
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    ctx = run_hook_with_cwd(repo, gone)
+    assert ctx is not None
+    assert ctx.startswith("[steer] Could not read this session's worktree"), ctx
+    assert "deleted-worktree, which does not exist" in ctx, ctx
+    assert f"{PREFIX}PRIMARY-NOTE" in ctx, "the fallback is the old behaviour, said aloud"
