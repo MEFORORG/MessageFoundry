@@ -284,6 +284,19 @@ def _header_version(header: list[str], seps: Seps) -> str:
     return header[11].split(seps.component)[0] if len(header) > 11 else ""
 
 
+def _split_at_header(text: str) -> tuple[Seps, str, list[str], int] | None:
+    """The separators of ``text``, its lines, and the index of its header: the first line
+    ``read_message_seps`` accepts. ``None`` when the message has no parseable MSH."""
+    parsed = read_message_seps(text)
+    if parsed is None:
+        return None
+    seps, field_sep = parsed
+    lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
+    # read_message_seps accepted one of these lines, so the search cannot come back empty.
+    header_at = next(n for n, seg in enumerate(lines) if read_message_seps(seg) is not None)
+    return seps, field_sep, lines, header_at
+
+
 def message_version(text: str) -> str | None:
     """The HL7 version in MSH-12 of the header of ``text``: the first line ``read_message_seps``
     accepts, the same line :func:`unmapped_field_values` takes as the header. ``None`` when the
@@ -292,15 +305,11 @@ def message_version(text: str) -> str | None:
 
     ``anonymize_checked`` reads this from its INPUT and hands it to :func:`leak_report`, so the
     leak-check judges a bare line by the version the message came with (BACKLOG #3004)."""
-    text = text.replace("\x0b", "").replace("\x1c", "")
-    parsed = read_message_seps(text)
-    if parsed is None:
+    found = _split_at_header(text.replace("\x0b", "").replace("\x1c", ""))
+    if found is None:
         return None
-    seps, field_sep = parsed
-    lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
-    # read_message_seps accepted one of these lines, so the search cannot come back empty.
-    header = next(seg for seg in lines if read_message_seps(seg) is not None)
-    return _header_version(header.split(field_sep), seps)
+    seps, field_sep, lines, header_at = found
+    return _header_version(lines[header_at].split(field_sep), seps)
 
 
 def unmapped_field_values(
@@ -346,14 +355,11 @@ def unmapped_field_values(
     rule names is addressed as :data:`UNKNOWN_SEGMENT`: its fields are still checked, but the id
     itself, which may be a wrapped name, is never printed.
     """
-    parsed = read_message_seps(text)
-    if parsed is None:
+    found = _split_at_header(text)
+    if found is None:
         return []
-    seps, field_sep = parsed
+    seps, field_sep, lines, header_at = found
     out: list[tuple[str, str]] = []
-    lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
-    # read_message_seps accepted one of these lines, so the search cannot come back empty.
-    header_at = next(n for n, seg in enumerate(lines) if read_message_seps(seg) is not None)
     if version is None:
         version = _header_version(lines[header_at].split(field_sep), seps)
     nameable = known_segments(version) | {path.split("-", 1)[0] for path in mapped_paths}
