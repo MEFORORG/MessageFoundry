@@ -17,7 +17,7 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import ValidationError
@@ -43,7 +43,10 @@ if TYPE_CHECKING:
     from messagefoundry.checks import CheckResult
 
 _REASON = "the Vault server certificate lives 24 hours (synthetic)"
-_PAIR = {"vault_revocation_attested": True, "vault_revocation_attested_reason": _REASON}
+_PAIR: dict[str, Any] = {
+    "vault_revocation_attested": True,
+    "vault_revocation_attested_reason": _REASON,
+}
 _SECTIONS = pytest.mark.parametrize(
     ("section", "model"), [("store", StoreSettings), ("secrets", SecretsSettings)]
 )

@@ -349,7 +349,7 @@ def test_open_store_hands_its_posture_to_the_cipher_build(
 
     monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _OFF_BOX)
     monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
-    selected = (
+    selected: dict[str, Any] = (
         {"key_provider": "vault"}
         if provider == "key_provider"
         else {"cipher_provider": "vault_transit"}
@@ -652,14 +652,14 @@ def test_the_crl_flag_is_read_once_for_a_client_however_many_times_it_sends(
     import requests
 
     from messagefoundry.config import secretprovider_vault
+    from messagefoundry.config.tls_policy import context_checks_revocation
     from messagefoundry.transports import strict_requests
 
     seen: list[object] = []
-    real = strict_requests.context_checks_revocation
 
     def counting(ctx: ssl.SSLContext | None) -> bool:
         seen.append(ctx)
-        return real(ctx)
+        return context_checks_revocation(ctx)
 
     monkeypatch.setattr(strict_requests, "context_checks_revocation", counting)
     client = secretprovider_vault._build_client(
