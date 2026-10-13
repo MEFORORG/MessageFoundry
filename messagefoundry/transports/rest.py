@@ -1080,9 +1080,9 @@ def opener_tls_context(
 
 
 #: The ways across a revocation refusal for a hop re-addressed to an ECH sidecar (ADR 0139). The
-#: connection-shaped default offers ``[tls].crl_file`` and an egress proxy, and neither can cross
-#: this hop: the sidecar makes the TLS connection to the peer, so the engine consults no CRL for it,
-#: and ``ech_egress`` excludes ``proxy_url``. Fixed text, with no URL part and no setting value.
+#: connection-shaped default offers ``[tls].crl_file``, which cannot cross this hop: the sidecar
+#: makes the TLS connection to the peer, so the engine consults no CRL for it. Fixed text, with no
+#: URL part and no setting value.
 ECH_HOP_WAYS_ACROSS = (
     "This hop goes through an ECH sidecar, which makes the TLS connection to the peer itself, so "
     "a CRL configured on the engine cannot check it. Set tls_revocation_attested=true with a "
@@ -1100,6 +1100,7 @@ def refuse_unrevoked_verified_hop(
     opener: urllib.request.OpenerDirector | None,
     ways_across: str | None = None,
     connection: str | None,
+    description: str = "delivers over verified https but performs no certificate revocation checking",
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
@@ -1146,6 +1147,11 @@ def refuse_unrevoked_verified_hop(
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
 
+    ``description`` says what the hop does over verified https, in the refusal's own words. The
+    default fits a destination. A hop that only reads, such as the ``FhirLookup`` read path, passes
+    its own, so its refusal does not say it delivers (BACKLOG #2987). The refusal appends
+    ``to <host>`` to it.
+
     A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
     BACKLOG #1924)."""
     if scheme != "https":
@@ -1153,7 +1159,7 @@ def refuse_unrevoked_verified_hop(
     RevocationHopGuard.capture(
         host=_hop_guard_host(url, cell=connector),
         cell=f"{connector} (verified TLS, no revocation check)",
-        description="delivers over verified https but performs no certificate revocation checking",
+        description=description,
         attested=revocation_attested,
         attested_reason=revocation_attested_reason,
         connection=connection,

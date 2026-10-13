@@ -169,8 +169,8 @@ def test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop(
 def test_the_ech_token_hop_refusal_offers_only_a_lever_that_can_cross_it(
     name: str, settings_for: dict[str, dict[str, object]], bare_crl: str
 ) -> None:
-    """The default refusal offers ``[tls].crl_file`` and an egress proxy. Neither can cross an ECH
-    hop, so its refusal names the attestation alone, in fixed text."""
+    """The default refusal offers ``[tls].crl_file``, which cannot cross an ECH hop, so its refusal
+    names the attestation alone, in fixed text."""
     settings = settings_for[name]
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation") as exc:
         _provider(name, settings, crl=bare_crl, ech=True)
@@ -185,7 +185,9 @@ def test_the_ech_token_hop_refusal_offers_only_a_lever_that_can_cross_it(
     default = str(exc.value)
     assert ECH_HOP_WAYS_ACROSS not in default
     assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in default
-    assert "egress proxy" in default
+    # BACKLOG #2987: the default no longer offers an egress proxy, a lever no call site can set.
+    assert "egress proxy" not in default
+    assert "tls_revocation_attested=true" in default
 
 
 @pytest.mark.parametrize("name", _PROVIDERS)
