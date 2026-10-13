@@ -123,8 +123,9 @@ MALFORMED_SEGMENT = "(malformed segment)"
 #: The address a malformed line's first field always gets. :func:`structural_phi_hits` refuses on it.
 _MALFORMED_LINE = f"{MALFORMED_SEGMENT}-0"
 #: The hit a malformed line raises. Named so :func:`refusal_advice` can tell it from a PHI shape.
-#: It names both kinds of line :func:`_line_is_malformed` refuses, in the words
-#: ``normalized_message`` uses, so an operator reading it knows a short header line is one cause.
+#: It names two of the kinds of line the walk refuses, in the words ``normalized_message`` uses,
+#: so an operator reading it knows a short header line is one cause. It does not name a bare id
+#: that is well formed but not defined, or an ``MSH`` line ahead of the header.
 MALFORMED_LINE_HIT = (
     "line no rule can reach (a malformed segment id, or a header line with no separator after "
     "its encoding characters)"
@@ -289,9 +290,9 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
 
     A segment with no fields is legal HL7, so a bare ``PV2`` is an empty segment and passes;
     :func:`unmapped_field_values` gives it a coverage record. A bare ``LEE`` or ``ZOE`` is three
-    letters of untrusted text that no rule can address, so it is malformed. ``defined`` is the ids the message's HL7 version defines plus the ids a
-    rule names, so a bare ``ZPD`` is an empty segment only when a rule names ``ZPD``. A Z-prefix
-    alone does not count (BACKLOG #2247).
+    letters of untrusted text that no rule can address, so it is malformed. ``defined`` is the ids
+    the message's HL7 version defines plus the ids a rule names, so a bare ``ZPD`` is an empty
+    segment only when a rule names ``ZPD``. A Z-prefix alone does not count (BACKLOG #2247).
 
     A header line (``MSH``, ``FHS``, ``BHS``) is malformed with fewer than
     :data:`_HEADER_MIN_FIELDS` split fields. A bare one carries no separators, and the engine's
