@@ -171,6 +171,7 @@ from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
     _SESSION_CAP_ORDER_SQL,
+    AD_ROLE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
@@ -178,6 +179,8 @@ from messagefoundry.store.store import (
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
     AdminRemoval,
+    AdRoleMap,
+    AdRoleMapChange,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -217,6 +220,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RoleGrant,
+    RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
     Stage,
@@ -231,6 +235,7 @@ from messagefoundry.store.store import (
     _opt_float,
     _session_cap_groups,
     _transit_attestation_row,
+    ad_role_map_write,
     admin_guard_counts,
     audit_append_refusal,
     audit_append_secret,
@@ -258,14 +263,19 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    report_refused_ad_role_map,
     report_refused_role_holder,
+    report_role_reseal,
+    report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
     scope_if_source,
     scope_withdrawal,
+    seal_role,
     seal_session,
     seal_user,
     session_insert_params,
@@ -827,7 +837,13 @@ _SCHEMA: list[str] = [
         display_name TEXT NOT NULL,
         description  TEXT,
         builtin      BOOLEAN NOT NULL DEFAULT TRUE,
-        permissions  TEXT
+        permissions  TEXT,
+        seal         TEXT NOT NULL DEFAULT ''
+    )""",
+    # BACKLOG #2592: one integrity seal per directory map, over its sorted pairs.
+    """CREATE TABLE IF NOT EXISTS authority_set_seal (
+        name TEXT PRIMARY KEY,
+        seal TEXT NOT NULL DEFAULT ''
     )""",
     """CREATE TABLE IF NOT EXISTS user_roles (
         user_id     TEXT NOT NULL REFERENCES users(id),
@@ -1041,6 +1057,9 @@ _SCHEMA.append(_gated_add_column("users", "session_epoch", "INTEGER NOT NULL DEF
 # nothing seals it here.
 _SCHEMA.append(_gated_add_column("users", "cred_digest", "TEXT NOT NULL DEFAULT ''"))
 _SCHEMA.append(_gated_add_column("users", "authz_seal", "TEXT NOT NULL DEFAULT ''"))
+# BACKLOG #2592: a role's integrity seal. An existing custom role gets an empty seal and grants nothing
+# until an administrator saves it again; store.py's report_unsealed_role_records says why.
+_SCHEMA.append(_gated_add_column("roles", "seal", "TEXT NOT NULL DEFAULT ''"))
 # Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table. Gated, because a bare
 # ADD COLUMN IF NOT EXISTS would hold ACCESS EXCLUSIVE on the hottest table through the batch even when
 # the column is there. In _SCHEMA, so adding it moves _schema_hash() and needs no _MIGRATION_REV bump.
@@ -1155,6 +1174,22 @@ _PG_WEBAUTHN_INSERT: Final = (
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
     " aaguid, created_at, last_used_at)"
     " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+)
+# The `$n` twins of store.py's role write and map read (BACKLOG #2592); store.py states the
+# contract. The role write is used only by `_write_role`.
+_PG_ROLE_UPSERT: Final = (
+    "INSERT INTO roles (id, display_name, description, builtin, permissions, seal)"
+    " VALUES ($1,$2,$3,$4,$5,$6)"
+    " ON CONFLICT (id) DO UPDATE SET display_name=excluded.display_name,"
+    " description=excluded.description, builtin=excluded.builtin,"
+    " permissions=excluded.permissions, seal=excluded.seal"
+)
+_PG_AD_ROLE_MAP_READ: Final = (
+    "SELECT 'seal' AS k, seal AS a, NULL::text AS b, TRUE AS live FROM authority_set_seal"
+    " WHERE name=$1"
+    " UNION ALL"
+    " SELECT 'pair' AS k, m.ad_group AS a, m.role_id AS b, r.id IS NOT NULL AS live"
+    " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
 )
 
 
@@ -1584,6 +1619,7 @@ class PostgresStore:
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
                 report_unsealed_users(await store.count_unsealed_users())
+                report_unsealed_role_records(await store.count_unsealed_role_records())
             # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
             # genesis append takes the audit advisory lock and needs INSERT and SELECT only.
             await load_audit_chain(store, read_only=read_only)
@@ -2974,6 +3010,7 @@ class PostgresStore:
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
         report_user_reseal(*await self.reseal_user_records())
+        report_role_reseal(*await self.reseal_role_records())
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             while True:
@@ -8988,18 +9025,14 @@ class PostgresStore:
         builtin: bool = True,
         permissions: str | None = None,
     ) -> None:
-        await self._execute(
-            "INSERT INTO roles (id, display_name, description, builtin, permissions)"
-            " VALUES ($1,$2,$3,$4,$5)"
-            " ON CONFLICT (id) DO UPDATE SET display_name=excluded.display_name,"
-            " description=excluded.description, builtin=excluded.builtin,"
-            " permissions=excluded.permissions",
-            role_id,
-            display_name,
-            description,
-            builtin,
-            permissions,
-        )
+        row = RoleRow(role_id, display_name, description, bool(builtin), permissions, "")
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._write_role(conn, row)
+
+    async def _write_role(self, conn: Any, row: RoleRow) -> None:
+        """The one writer of a ``roles`` row (BACKLOG #2592); store.py's
+        ``MessageStore._write_role`` states the contract. Call it inside ``conn``'s transaction."""
+        await conn.execute(_PG_ROLE_UPSERT, *seal_role(self._row_sealer, row).write_params())
 
     async def list_roles(self) -> Sequence[Row]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
@@ -9027,7 +9060,14 @@ class PostgresStore:
                     await conn.execute(
                         "DELETE FROM user_roles WHERE role_id=$1 AND user_id=$2", role_id, holder
                     )
-            await conn.execute("DELETE FROM ad_group_role_map WHERE role_id=$1", role_id)
+            # The map is re-sealed only when it verifies; store.py says why.
+            try:
+                await self._write_ad_role_map(
+                    conn, lambda m: m.without_role(role_id), replaces_whole=False
+                )
+            except RowSealError:
+                report_refused_ad_role_map()
+                await conn.execute("DELETE FROM ad_group_role_map WHERE role_id=$1", role_id)
             await conn.execute("DELETE FROM roles WHERE id=$1", role_id)
             return True
 
@@ -9169,14 +9209,11 @@ class PostgresStore:
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        rows = await self._fetchall(
-            "SELECT DISTINCT role_id FROM ad_group_role_map WHERE ad_group = ANY($1::text[])",
-            normalized,
-        )
-        return {str(r["role_id"]) for r in rows}
+        """The role ids the map gives ``groups``, its seal UNCHECKED; store.py's twin says why."""
+        return (await self.get_ad_group_role_map()).roles_for(groups)
+
+    async def get_ad_group_role_map(self) -> AdRoleMap:
+        return AdRoleMap.from_rows(await self._fetchall(_PG_AD_ROLE_MAP_READ, AD_ROLE_MAP))
 
     async def list_ad_group_role_map(self) -> Sequence[Row]:
         return await self._fetchall(
@@ -9184,15 +9221,89 @@ class PostgresStore:
         )
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
+        replacement = AdRoleMap.from_entries(entries)
         async with self._timed_acquire() as conn, conn.transaction():
+            await self._write_ad_role_map(conn, lambda _: replacement, replaces_whole=True)
+
+    async def _write_ad_role_map(
+        self, conn: Any, change: AdRoleMapChange, *, replaces_whole: bool
+    ) -> bool:
+        """The one writer of the AD group-to-role map and its seal (BACKLOG #2592); store.py's
+        ``MessageStore._write_ad_role_map`` states the contract. Call it inside ``conn``'s
+        transaction. The map's seal row is created if absent and locked first, so two map writes
+        run one after the other and each reads the pairs the other committed."""
+        await conn.execute(
+            "INSERT INTO authority_set_seal (name, seal) VALUES ($1, '')"
+            " ON CONFLICT (name) DO NOTHING",
+            AD_ROLE_MAP,
+        )
+        seal = await conn.fetchval(
+            "SELECT seal FROM authority_set_seal WHERE name=$1 FOR UPDATE", AD_ROLE_MAP
+        )
+        rows = await conn.fetch("SELECT ad_group, role_id FROM ad_group_role_map")
+        current = AdRoleMap.of(
+            [(str(r["ad_group"]), str(r["role_id"])) for r in rows], str(seal or "")
+        )
+        new = ad_role_map_write(self._row_sealer, current, change, replaces_whole=replaces_whole)
+        if new is None:
+            return False
+        if new.pairs != current.pairs:
             await conn.execute("DELETE FROM ad_group_role_map")
-            for ad_group, role_id in pairs:
+            for ad_group, role_id in new.pairs:
                 await conn.execute(
                     "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES ($1,$2)",
                     ad_group,
                     role_id,
                 )
+        await conn.execute(
+            "UPDATE authority_set_seal SET seal=$1 WHERE name=$2", new.seal, AD_ROLE_MAP
+        )
+        return True
+
+    async def count_unsealed_role_records(self) -> int:
+        """store.py's ``MessageStore.count_unsealed_role_records`` states the contract."""
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM roles WHERE builtin = FALSE AND seal = ''"
+        )
+        current = await self.get_ad_group_role_map()
+        unsealed = int(row["n"]) if row else 0
+        return unsealed + (1 if current.pairs and not current.seal else 0)
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and the AD group-to-role map under the active key, for
+        ``rotate-key`` (BACKLOG #2592); store.py's ``MessageStore.reseal_role_records`` states the
+        contract."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        rows = await self._fetchall(
+            "SELECT id FROM roles WHERE seal <> '' AND seal NOT LIKE $1 ORDER BY id",
+            f"{SEAL_PREFIX}{sealer.key_id}:%",
+        )
+        resealed = refused = 0
+        for found in rows:
+            async with self._timed_acquire(record=False) as conn, conn.transaction():
+                locked = await conn.fetchrow(
+                    "SELECT * FROM roles WHERE id=$1 FOR UPDATE", str(found["id"])
+                )
+                if locked is None:
+                    continue
+                role = RoleRow.from_mapping(dict(locked))
+                if not role_seal_ok(sealer, role):
+                    refused += 1
+                    continue
+                await self._write_role(conn, role)
+                resealed += 1
+        current = await self.get_ad_group_role_map()
+        if current.seal and not sealer.is_active(current.seal):
+            try:
+                async with self._timed_acquire(record=False) as conn, conn.transaction():
+                    resealed += await self._write_ad_role_map(
+                        conn, lambda m: m, replaces_whole=False
+                    )
+            except RowSealError:
+                refused += 1
+        return resealed, refused
 
     async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})

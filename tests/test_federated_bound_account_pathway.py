@@ -406,18 +406,19 @@ async def test_a_bind_that_lands_during_a_windows_sso_sign_in_leaves_no_session(
         await _windows_sso(service, monkeypatch, "jdoe")  # the row exists and is unbound
         user = await store.get_user_by_username("jdoe")
         assert user is not None
-        real = store.roles_for_ad_groups
+        real = store.get_ad_group_role_map
         armed = [True]
         checks_passed = 0
 
-        async def lookup(groups: Any) -> set[str]:
+        async def lookup() -> Any:
             nonlocal checks_passed
             checks_passed += 1
             if armed.pop() if armed else False:
                 await _bind(service, store, DEFAULT_SUB)
-            return await real(groups)
+            return await real()
 
-        monkeypatch.setattr(store, "roles_for_ad_groups", lookup)
+        # The service reads the AD role map through its one sealed loader (BACKLOG #2592).
+        monkeypatch.setattr(store, "get_ad_group_role_map", lookup)
         raced = await service.authenticate_kerberos(b"spnego-token")
 
         assert checks_passed == 1, "the sign-in was refused before the bind could land"

@@ -67,6 +67,7 @@ from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdminRemoval,
+    AdRoleMap,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -2362,7 +2363,11 @@ class AuthStore(Protocol):
         permissions: str | None = None,
     ) -> None:
         """Create-or-update a role. ``permissions`` is a JSON array of ``Permission`` wire values for a
-        custom role (ADR 0045), or ``None`` for a built-in row (which resolves from code)."""
+        custom role (ADR 0045), or ``None`` for a built-in row (which resolves from code).
+
+        The row is written whole and sealed (BACKLOG #2592), through one helper per backend. The
+        service checks the seal where it reads a custom role; the readers here return rows
+        unchecked. Saving a role again seals it, which is how one that fails is repaired."""
         ...
 
     async def list_roles(self) -> Sequence[Row]: ...
@@ -2393,6 +2398,17 @@ class AuthStore(Protocol):
 
     async def count_unsealed_users(self) -> int:
         """How many accounts carry no integrity seal (BACKLOG #2592)."""
+        ...
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and the AD group-to-role map under the active key, for
+        ``rotate-key`` (BACKLOG #2592). Returns ``(re-sealed, refused)``; one that fails its seal
+        is left as it is."""
+        ...
+
+    async def count_unsealed_role_records(self) -> int:
+        """How many custom roles carry no integrity seal, plus one when the AD group-to-role map
+        has pairs and no seal (BACKLOG #2592)."""
         ...
 
     # --- saved-search presets (ADR 0136, BACKLOG #151) — per-user, criteria encrypted at rest -----
@@ -2622,7 +2638,15 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
+    async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """The role ids the AD group-to-role map gives ``groups``, its seal UNCHECKED."""
+        ...
+
+    async def get_ad_group_role_map(self) -> AdRoleMap:
+        """The whole AD group-to-role map and its seal, read in one statement (BACKLOG #2592).
+        Unchecked: :class:`AuthService` checks the seal in its one map loader. The map is written
+        whole and sealed, through one helper per backend."""
+        ...
 
     async def list_ad_group_role_map(self) -> Sequence[Row]: ...
 

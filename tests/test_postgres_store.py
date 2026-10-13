@@ -92,6 +92,7 @@ _TABLES = (
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
     "user_roles",
     "ad_group_role_map",
+    "authority_set_seal",  # BACKLOG #2592: the map's seal, under the key of the test that wrote it
     "ad_group_scope_map",
     "users",
     "roles",
@@ -5199,6 +5200,39 @@ async def test_user_seal_contract(store) -> None:
         assert_user_columns({str(r["column_name"]) for r in rows})
         await assert_user_record_round_trips(keyed)
         await assert_user_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_role_seal_contract(store) -> None:
+    """BACKLOG #2592: sealed custom role definitions and the sealed AD group-to-role map, the same
+    contract the SQLite suite runs, on a keyed handle, with the role table's columns pinned to the
+    record the seal covers. ``raw`` runs each statement on a pooled connection, outside the store's
+    helpers. The fixture truncates the role and map tables on the next entry."""
+    from dataclasses import fields
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import RoleRow
+    from tests._role_seal_contract import assert_role_seal_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'roles'"
+            )
+        assert {str(r["column_name"]) for r in rows} == {f.name for f in fields(RoleRow)}
+        await assert_role_seal_contract(keyed, raw)
     finally:
         await keyed.close()
 

@@ -159,6 +159,7 @@ from messagefoundry.store.store import (
     _USER_ROLE_INSERT,
     _USER_ROLES_CLEAR,
     _WEBAUTHN_INSERT,
+    AD_ROLE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
@@ -166,6 +167,8 @@ from messagefoundry.store.store import (
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
     AdminRemoval,
+    AdRoleMap,
+    AdRoleMapChange,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -207,6 +210,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RoleGrant,
+    RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
     Stage,
@@ -225,6 +229,7 @@ from messagefoundry.store.store import (
     _session_cap_groups,
     _session_live_params,
     _transit_attestation_row,
+    ad_role_map_write,
     admin_guard_counts,
     audit_append_refusal,
     audit_append_secret,
@@ -252,14 +257,19 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    report_refused_ad_role_map,
     report_refused_role_holder,
+    report_role_reseal,
+    report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
     require_notify_email,
+    role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
     scope_if_source,
     scope_withdrawal,
+    seal_role,
     seal_session,
     seal_user,
     session_insert_params,
@@ -719,6 +729,33 @@ _MSSQL_USER_RESEAL: Final = (
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
     " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
+)
+# The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
+# states the contract. Used only by `_write_role` and `_write_ad_role_map`.
+_MSSQL_ROLE_MERGE: Final = (
+    "MERGE roles WITH (HOLDLOCK) AS t"
+    " USING (SELECT ? AS id, ? AS display_name, ? AS description, ? AS builtin,"
+    " ? AS permissions, ? AS seal) AS s"
+    " ON t.id=s.id"
+    " WHEN MATCHED THEN UPDATE SET display_name=s.display_name,"
+    " description=s.description, builtin=s.builtin, permissions=s.permissions, seal=s.seal"
+    " WHEN NOT MATCHED THEN INSERT (id, display_name, description, builtin, permissions, seal)"
+    " VALUES (s.id, s.display_name, s.description, s.builtin, s.permissions, s.seal);"
+)
+_MSSQL_SET_SEAL_MERGE: Final = (
+    "MERGE authority_set_seal WITH (HOLDLOCK) AS t"
+    " USING (SELECT ? AS name, ? AS seal) AS s ON t.name=s.name"
+    " WHEN MATCHED THEN UPDATE SET seal=s.seal"
+    " WHEN NOT MATCHED THEN INSERT (name, seal) VALUES (s.name, s.seal);"
+)
+# The AD group-to-role map and its seal in one statement; store.py's twin says why.
+_MSSQL_AD_ROLE_MAP_READ: Final = (
+    "SELECT N'seal' AS k, seal AS a, CAST(NULL AS NVARCHAR(64)) AS b, 1 AS live"
+    " FROM authority_set_seal WHERE name=?"
+    " UNION ALL"
+    " SELECT N'pair' AS k, m.ad_group AS a, m.role_id AS b,"
+    " CASE WHEN r.id IS NULL THEN 0 ELSE 1 END AS live"
+    " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
 )
 #: The passkey deletes, each counted from ``OUTPUT`` for the same reason.
 _MSSQL_WEBAUTHN_DELETE_ONE: Final = (
@@ -2223,11 +2260,18 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
         description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1,
-        permissions NVARCHAR(MAX) NULL)""",
+        permissions NVARCHAR(MAX) NULL, seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     # Custom RBAC roles (ADR 0045): roles.permissions on a pre-existing DB. COL_LENGTH-gated; NULL on
     # existing built-in rows = resolves from code (byte-identical). Idempotent.
     """IF COL_LENGTH('roles','permissions') IS NULL
         ALTER TABLE roles ADD permissions NVARCHAR(MAX) NULL""",
+    # BACKLOG #2592: a role's integrity seal. An existing custom role gets an empty seal and grants
+    # nothing until an administrator saves it again; store.py's report_unsealed_role_records says why.
+    """IF COL_LENGTH('roles','seal') IS NULL
+        ALTER TABLE roles ADD seal NVARCHAR(256) NOT NULL DEFAULT ''""",
+    # BACKLOG #2592: one integrity seal per directory map, over its sorted pairs.
+    """IF OBJECT_ID('authority_set_seal','U') IS NULL CREATE TABLE authority_set_seal (
+        name NVARCHAR(64) NOT NULL PRIMARY KEY, seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     """IF OBJECT_ID('user_roles','U') IS NULL CREATE TABLE user_roles (
         user_id NVARCHAR(64) NOT NULL, role_id NVARCHAR(64) NOT NULL, assigned_at FLOAT NOT NULL,
         assigned_by NVARCHAR(256) NULL, CONSTRAINT pk_user_roles PRIMARY KEY (user_id, role_id))""",
@@ -3431,6 +3475,7 @@ class SqlServerStore:
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
                 report_unsealed_users(await store.count_unsealed_users())
+                report_unsealed_role_records(await store.count_unsealed_role_records())
             # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
             # genesis append takes the audit applock and needs INSERT and SELECT only.
             await load_audit_chain(store, read_only=read_only)
@@ -7814,6 +7859,7 @@ class SqlServerStore:
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
         report_user_reseal(*await self.reseal_user_records())
+        report_role_reseal(*await self.reseal_role_records())
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
@@ -13018,18 +13064,31 @@ class SqlServerStore:
         builtin: bool = True,
         permissions: str | None = None,
     ) -> None:
-        # Single atomic MERGE under HOLDLOCK (range-locks the key) so two concurrent seeders can't both
-        # find the row absent and both INSERT the same PK -> violation (the UPDATE-then-INSERT race).
-        await self._execute(
-            "MERGE roles WITH (HOLDLOCK) AS t"
-            " USING (SELECT ? AS id, ? AS display_name, ? AS description, ? AS builtin,"
-            " ? AS permissions) AS s"
-            " ON t.id=s.id"
-            " WHEN MATCHED THEN UPDATE SET display_name=s.display_name,"
-            " description=s.description, builtin=s.builtin, permissions=s.permissions"
-            " WHEN NOT MATCHED THEN INSERT (id, display_name, description, builtin, permissions)"
-            " VALUES (s.id, s.display_name, s.description, s.builtin, s.permissions);",
-            (role_id, display_name, description, 1 if builtin else 0, permissions),
+        row = RoleRow(role_id, display_name, description, bool(builtin), permissions, "")
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await self._write_role(cur, row)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def _write_role(self, cur: Any, row: RoleRow) -> None:
+        """The one writer of a ``roles`` row (BACKLOG #2592); store.py's
+        ``MessageStore._write_role`` states the contract. Call it on ``cur`` inside an open
+        transaction. One MERGE under HOLDLOCK (range-locks the key), so two concurrent seeders
+        cannot both find the row absent and both INSERT the same key."""
+        sealed = seal_role(self._row_sealer, row)
+        await cur.execute(
+            _MSSQL_ROLE_MERGE,
+            (
+                sealed.id,
+                sealed.display_name,
+                sealed.description,
+                1 if sealed.builtin else 0,
+                sealed.permissions,
+                sealed.seal,
+            ),
         )
 
     async def list_roles(self) -> list[dict[str, Any]]:
@@ -13064,7 +13123,14 @@ class SqlServerStore:
                             "DELETE FROM user_roles WHERE role_id=? AND user_id=?",
                             (role_id, holder),
                         )
-                await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
+                # The map is re-sealed only when it verifies; store.py says why.
+                try:
+                    await self._write_ad_role_map(
+                        cur, lambda m: m.without_role(role_id), replaces_whole=False
+                    )
+                except RowSealError:
+                    report_refused_ad_role_map()
+                    await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
                 await cur.execute("DELETE FROM roles WHERE id=?", (role_id,))
                 await self._commit(conn)
                 return True
@@ -13305,19 +13371,14 @@ class SqlServerStore:
         )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
-        # BACKLOG #2592: joined to roles, because this backend's map has no role foreign key and can
-        # hold a deleted role's id. The user write path refuses such an id, which would refuse the
-        # sign-in; SQLite and Postgres refuse the map row itself.
-        rows = await self._fetchall(
-            "SELECT DISTINCT m.role_id FROM ad_group_role_map m JOIN roles r ON r.id = m.role_id"
-            f" WHERE m.ad_group IN ({placeholders})",
-            tuple(normalized),
-        )
-        return {str(r["role_id"]) for r in rows}
+        """The role ids the map gives ``groups``, its seal UNCHECKED; store.py's twin says why.
+        BACKLOG #2592: a pair whose role has no roles row is left out, because this backend's map
+        has no role foreign key and can hold a deleted role's id. The user write path refuses such
+        an id, which would refuse the sign-in; SQLite and Postgres refuse the map row itself."""
+        return (await self.get_ad_group_role_map()).roles_for(groups)
+
+    async def get_ad_group_role_map(self) -> AdRoleMap:
+        return AdRoleMap.from_rows(await self._fetchall(_MSSQL_AD_ROLE_MAP_READ, (AD_ROLE_MAP,)))
 
     async def list_ad_group_role_map(self) -> list[dict[str, Any]]:
         return await self._fetchall(
@@ -13325,19 +13386,99 @@ class SqlServerStore:
         )
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
+        replacement = AdRoleMap.from_entries(entries)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM ad_group_role_map")
-                for ad_group, role_id in pairs:
-                    await cur.execute(
-                        "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
-                        (ad_group, role_id),
-                    )
+                await self._write_ad_role_map(cur, lambda _: replacement, replaces_whole=True)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+
+    async def _write_ad_role_map(
+        self, cur: Any, change: AdRoleMapChange, *, replaces_whole: bool
+    ) -> bool:
+        """The one writer of the AD group-to-role map and its seal (BACKLOG #2592); store.py's
+        ``MessageStore._write_ad_role_map`` states the contract. Call it on ``cur`` inside an open
+        transaction. The map's seal key is read under ``UPDLOCK, HOLDLOCK`` first, which locks it
+        whether or not its row exists yet, so two map writes run one after the other."""
+        await cur.execute(
+            "SELECT seal FROM authority_set_seal WITH (UPDLOCK, HOLDLOCK) WHERE name=?",
+            (AD_ROLE_MAP,),
+        )
+        seal_rows = await cur.fetchall()
+        await cur.execute("SELECT ad_group, role_id FROM ad_group_role_map")
+        current = AdRoleMap.of(
+            [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
+            str(seal_rows[0][0] or "") if seal_rows else "",
+        )
+        new = ad_role_map_write(self._row_sealer, current, change, replaces_whole=replaces_whole)
+        if new is None:
+            return False
+        if new.pairs != current.pairs:
+            await cur.execute("DELETE FROM ad_group_role_map")
+            for ad_group, role_id in new.pairs:
+                await cur.execute(
+                    "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
+                    (ad_group, role_id),
+                )
+        await cur.execute(_MSSQL_SET_SEAL_MERGE, (AD_ROLE_MAP, new.seal))
+        return True
+
+    async def count_unsealed_role_records(self) -> int:
+        """store.py's ``MessageStore.count_unsealed_role_records`` states the contract."""
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM roles WHERE builtin = 0 AND seal = ''"
+        )
+        current = await self.get_ad_group_role_map()
+        unsealed = int(row["n"]) if row else 0
+        return unsealed + (1 if current.pairs and not current.seal else 0)
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and the AD group-to-role map under the active key, for
+        ``rotate-key`` (BACKLOG #2592); store.py's ``MessageStore.reseal_role_records`` states the
+        contract."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        rows = await self._fetchall(
+            "SELECT id FROM roles WHERE seal <> '' AND seal NOT LIKE ? ORDER BY id",
+            (f"{SEAL_PREFIX}{sealer.key_id}:%",),
+        )
+        resealed = refused = 0
+        for found in rows:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(
+                        "SELECT * FROM roles WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (str(found["id"]),),
+                    )
+                    locked = await self._fetch_dicts(cur)
+                    role = RoleRow.from_mapping(locked[0]) if locked else None
+                    if role is not None and not role_seal_ok(sealer, role):
+                        refused += 1
+                    elif role is not None:
+                        await self._write_role(cur, role)
+                        resealed += 1
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+        current = await self.get_ad_group_role_map()
+        if current.seal and not sealer.is_active(current.seal):
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    resealed += await self._write_ad_role_map(
+                        cur, lambda m: m, replaces_whole=False
+                    )
+                    await self._commit(conn)
+                except RowSealError:
+                    await conn.rollback()
+                    refused += 1
+                except Exception:
+                    await conn.rollback()
+                    raise
+        return resealed, refused
 
     async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
