@@ -698,3 +698,144 @@ def test_an_answer_the_guard_does_not_know_refuses(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(strict_requests, "revocation_hop_disposition", lambda **_: object())
     with pytest.raises(strict_requests.VaultHopRefused):
         _refuse(_OFF_BOX, posture=_NOT_ENFORCING)
+
+
+# --- the two check-privileges clients ---------------------------------------------------------
+#
+# `check-privileges` reads each Vault token's own grants through the client the provider builds.
+# So the probe is held to the hop's revocation rule, with the hop's own attestation and the
+# command's posture. Three consumers, two clients: the key provider and the Transit cipher share
+# the store client.
+
+
+def _consumer(kind: str) -> Any:
+    from messagefoundry.privilege_check import VaultConsumer
+
+    hop = "vault.secrets" if kind == "kv" else "vault.store"
+    return VaultConsumer(hop, kind, kind, kind, ("mefor/ad",) if kind == "kv" else ())  # type: ignore[arg-type]
+
+
+def _probe(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    *,
+    attested: tuple[str, ...] = (),
+    posture: HopPosture | None = None,
+) -> tuple[str, ...]:
+    """The problems one probe reports. ``attested`` names the sections whose pair is set."""
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.privilege_probes import probe_vault
+
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _OFF_BOX)
+    settings = ServiceSettings.model_validate({section: _pair(True) for section in attested})
+    return probe_vault(_consumer(kind), settings, posture=posture).problems
+
+
+_PROBES = pytest.mark.parametrize(
+    ("kind", "section", "connector"),
+    [
+        ("kv", "secrets", "Vault KV secret provider"),
+        ("kek", "store", "Vault transit key provider"),
+        ("transit", "store", "Vault transit key provider"),
+    ],
+)
+
+
+def _assert_probe_refused(problems: tuple[str, ...], section: str, connector: str) -> None:
+    from messagefoundry.transports import strict_requests
+
+    lever = {
+        "store": strict_requests._STORE_REVOCATION_LEVER,
+        "secrets": strict_requests._SECRETS_REVOCATION_LEVER,
+    }[section]
+    assert problems == (
+        f"no Vault client: {connector}: {strict_requests._UNREVOKED_VAULT_HOP} {lever}",
+    )
+    assert _HOST not in problems[0]
+
+
+@_PROBES
+@pytest.mark.parametrize("posture", [None, _ENFORCING], ids=["unknown", "enforcing"])
+def test_a_probe_of_an_off_box_vault_is_refused_without_its_hops_attestation(
+    kind: str,
+    section: str,
+    connector: str,
+    posture: HopPosture | None,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+) -> None:
+    """The probe never raises: the refusal comes back as a problem, with the fixed text whole,
+    and it names the pair this path reads. The OTHER section's pair is set here, and so is the
+    blanket variable, and neither is a way across.
+    Mutation: give either client the other section's ``vault_revocation_attested``."""
+    other = "store" if section == "secrets" else "secrets"
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    problems = _probe(monkeypatch, kind, attested=(other,), posture=posture)
+    _assert_probe_refused(problems, section, connector)
+    assert dials == []
+
+
+@_PROBES
+@pytest.mark.parametrize("posture", [None, _ENFORCING], ids=["unknown", "enforcing"])
+def test_a_probe_crosses_on_its_hops_attestation_and_logs_it_once(
+    kind: str,
+    section: str,
+    connector: str,
+    posture: HopPosture | None,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED before this change: both clients passed ``False``, so the probe refused an off-box
+    Vault even with the pair set, and the refusal told the operator to set a flag this path
+    ignored. Mutation: ``revocation_attested=False`` at either client's build."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    for _ in range(2):
+        problems = _probe(monkeypatch, kind, attested=(section,), posture=posture)
+        assert len(problems) == 1 and problems[0].startswith("token lookup-self failed")
+        assert "vault_revocation_attested" not in problems[0]
+    assert dials == [(_HOST, 8200)] * 2
+    (line,) = _crossing_lines(caplog)
+    assert connector in line
+    assert f"[{section}].vault_revocation_attested; reason: {_REASON})" in line
+
+
+@_PROBES
+def test_a_probe_under_a_posture_that_is_not_enforcing_warns_and_crosses(
+    kind: str,
+    section: str,
+    connector: str,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mutation: drop ``posture=posture`` where ``probe_vault`` binds either client."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    for _ in range(2):
+        problems = _probe(monkeypatch, kind, posture=_NOT_ENFORCING)
+        assert len(problems) == 1 and problems[0].startswith("token lookup-self failed")
+    assert dials == [(_HOST, 8200)] * 2
+    (line,) = _crossing_lines(caplog)
+    assert connector in line
+    assert "because [security].enforcement is not enforce" in line
+    assert f"unless [{section}].vault_revocation_attested is true" in line
+
+
+@_PROBES
+def test_the_blanket_variable_crosses_a_probe_only_where_the_posture_is_not_enforcing(
+    kind: str,
+    section: str,
+    connector: str,
+    monkeypatch: pytest.MonkeyPatch,
+    dials: list[object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    _assert_probe_refused(_probe(monkeypatch, kind, posture=_ENFORCING), section, connector)
+    assert dials == []
+    problems = _probe(monkeypatch, kind, posture=_NOT_ENFORCING)
+    assert len(problems) == 1 and problems[0].startswith("token lookup-self failed")
+    assert dials == [(_HOST, 8200)]
+    assert _crossing_lines(caplog) == []

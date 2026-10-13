@@ -6975,7 +6975,7 @@ def _check_privileges(args: argparse.Namespace) -> int:
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     others = settings_hops(
         settings,
-        vault_probe=functools.partial(probe_vault, posture=posture),
+        vault_probe=functools.partial(probe_vault, settings=settings, posture=posture),
         ldap_probe=lambda: read_ldap_bind(settings, posture),
     )
     hops = [store_hop(report, settings.store), *others]

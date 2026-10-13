@@ -152,6 +152,9 @@ def _reading(vault: _FakeVault, token: str = _TOKEN) -> VaultTokenReading:
 
 
 _STORE = VaultConsumer("vault.store", "kek", "store key provider", "read and decrypt the KEK")
+#: Settings with neither Vault hop attested (vault BACKLOG #2983). Every Vault address in this
+#: file is loopback or faked, so no test here turns on the attestation.
+_NO_ATTESTATION = ServiceSettings()
 
 
 def _out(hop: Any) -> str:
@@ -302,7 +305,7 @@ def test_an_unset_token_and_address_are_both_named_in_one_run(
     monkeypatch.delenv("MEFOR_STORE_VAULT_TOKEN", raising=False)
     monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
-    reading = probe_vault(_STORE)
+    reading = probe_vault(_STORE, _NO_ATTESTATION)
     joined = " ".join(reading.problems)
     assert "MEFOR_STORE_VAULT_TOKEN is not set" in joined
     assert "MEFOR_STORE_VAULT_ADDR is not set" in joined
@@ -348,7 +351,7 @@ def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> N
 def test_an_unknown_consumer_kind_is_refused_not_probed_as_the_kek() -> None:
     bogus = VaultConsumer("vault.x", cast("Any", "kv2"), "x", "x")
     with pytest.raises(ValueError, match="no Vault probe for consumer kind 'kv2'"):
-        probe_vault(bogus)
+        probe_vault(bogus, _NO_ATTESTATION)
 
 
 def test_a_probe_problem_is_logged_without_the_token(caplog: pytest.LogCaptureFixture) -> None:
@@ -572,7 +575,7 @@ def test_the_transit_cipher_probe_asks_about_the_cipher_paths(
     monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t, **_: vault)
     settings = ServiceSettings.model_validate({"store": {"cipher_provider": "vault_transit"}})
     (consumer,) = vault_consumers(settings)
-    reading = probe_vault(consumer)
+    reading = probe_vault(consumer, _NO_ATTESTATION)
     assert set(reading.required) == set(crypto_transit.transit_cipher_required_capabilities())
     assert "transit/hmac/mefor-data" in vault.asked
 
@@ -1012,7 +1015,7 @@ def test_the_store_probe_never_sends_the_token_to_vault_addr(
     )
     with pytest.raises(KeyProviderError, match="MEFOR_STORE_VAULT_ADDR is not set"):
         keyprovider_vault.store_vault_address()
-    reading = probe_vault(_STORE)
+    reading = probe_vault(_STORE, _NO_ATTESTATION)
     assert any("MEFOR_STORE_VAULT_ADDR is not set" in p for p in reading.problems)
     assert not reading.looked_up
 
@@ -1031,7 +1034,7 @@ def test_the_secrets_probe_never_sends_the_token_to_vault_addr(
     with pytest.raises(SecretProviderError, match="MEFOR_SECRETS_VAULT_ADDR is not set"):
         secretprovider_vault.secrets_vault_address()
     kv = VaultConsumer("vault.secrets", "kv", "kv", "kv", ("mefor/ad",))
-    reading = probe_vault(kv)
+    reading = probe_vault(kv, _NO_ATTESTATION)
     assert any("MEFOR_SECRETS_VAULT_ADDR is not set" in p for p in reading.problems)
 
 
@@ -1079,7 +1082,7 @@ def test_a_missing_key_name_is_named_in_the_same_run_as_an_unset_token(
     monkeypatch.delenv("MEFOR_STORE_VAULT_TOKEN", raising=False)
     monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
     monkeypatch.delenv("MEFOR_STORE_VAULT_TRANSIT_KEY", raising=False)
-    joined = " ".join(probe_vault(_STORE).problems)
+    joined = " ".join(probe_vault(_STORE, _NO_ATTESTATION).problems)
     assert "MEFOR_STORE_VAULT_TOKEN is not set" in joined
     assert "MEFOR_STORE_VAULT_TRANSIT_KEY is not set" in joined
 
@@ -1091,7 +1094,7 @@ def test_the_secrets_probe_refuses_an_unset_token_too(monkeypatch: pytest.Monkey
         secretprovider_vault, "_build_client", lambda a, t, **_: pytest.fail("built")
     )
     kv = VaultConsumer("vault.secrets", "kv", "kv", "kv", ("mefor/ad",))
-    reading = probe_vault(kv)
+    reading = probe_vault(kv, _NO_ATTESTATION)
     assert any("MEFOR_SECRETS_VAULT_TOKEN is not set" in p for p in reading.problems)
     assert not reading.looked_up
 

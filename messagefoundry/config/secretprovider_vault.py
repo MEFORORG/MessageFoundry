@@ -294,7 +294,14 @@ def secrets_vault_address() -> str:
     return addr
 
 
-def secrets_vault_client(address: str, token: str, *, posture: HopPosture | None = None) -> Any:
+def secrets_vault_client(
+    address: str,
+    token: str,
+    *,
+    revocation_attested: bool,
+    posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
+) -> Any:
     """The connector-secret hop's Vault client, built by the same :func:`_build_client`
     :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor, no redirects, and the
     same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
@@ -302,11 +309,17 @@ def secrets_vault_client(address: str, token: str, *, posture: HopPosture | None
     and ``token`` from :func:`secrets_vault_token`; both refuse an unset variable, and the client
     uses exactly the values they returned.
 
-    **No settings are in scope here, so the hop counts as not attested** (vault BACKLOG #2983).
-    An ``https://`` Vault that is off the box is refused by this client even where
-    ``[secrets].vault_revocation_attested`` is set. Handing the setting to this call is the next
-    slice of that item."""
-    return _build_client(address, token, revocation_attested=False, posture=posture)
+    **The same revocation rule too** (vault BACKLOG #2983). ``revocation_attested`` is
+    ``[secrets].vault_revocation_attested`` and is REQUIRED, with ``revocation_reason`` beside it
+    and the caller's ``posture``. So this client crosses an off-box ``https://`` Vault where
+    :meth:`VaultSecretProvider.resolve` would, and its refusal names the pair this path reads."""
+    return _build_client(
+        address,
+        token,
+        revocation_attested=revocation_attested,
+        posture=posture,
+        revocation_reason=revocation_reason,
+    )
 
 
 def kv_required_capabilities(refs: Iterable[str]) -> dict[str, frozenset[str]]:

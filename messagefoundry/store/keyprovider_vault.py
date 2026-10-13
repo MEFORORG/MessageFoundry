@@ -468,7 +468,14 @@ def store_vault_address() -> str:
     return addr
 
 
-def store_vault_client(address: str, token: str, *, posture: HopPosture | None = None) -> Any:
+def store_vault_client(
+    address: str,
+    token: str,
+    *,
+    revocation_attested: bool,
+    posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
+) -> Any:
     """The store hop's Vault client, built by the same :func:`_build_client` the providers use:
     same TLS narrowing, same anchor, no redirects, and the same cleartext-address refusal (BACKLOG
     #2317). For ``check-privileges``, which reads the token's own grants through it and changes
@@ -476,11 +483,17 @@ def store_vault_client(address: str, token: str, *, posture: HopPosture | None =
     :func:`store_vault_token`; both refuse an unset variable, and the client uses exactly the
     values they returned.
 
-    **No settings are in scope here, so the hop counts as not attested** (vault BACKLOG #2983).
-    An ``https://`` Vault that is off the box is refused by this client even where
-    ``[store].vault_revocation_attested`` is set. Handing the setting to this call is the next
-    slice of that item."""
-    return _build_client(address, token, revocation_attested=False, posture=posture)
+    **The same revocation rule too** (vault BACKLOG #2983). ``revocation_attested`` is
+    ``[store].vault_revocation_attested`` and is REQUIRED, with ``revocation_reason`` beside it
+    and the caller's ``posture``. So this client crosses an off-box ``https://`` Vault where
+    the provider's own client would, and its refusal names the pair this path reads."""
+    return _build_client(
+        address,
+        token,
+        revocation_attested=revocation_attested,
+        posture=posture,
+        revocation_reason=revocation_reason,
+    )
 
 
 def kek_required_capabilities() -> dict[str, frozenset[str]]:

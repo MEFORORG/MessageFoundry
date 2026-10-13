@@ -195,14 +195,26 @@ _MOUNTERS = {
 }
 #: Every call that builds a Vault client: module, enclosing function, and what it passes as the
 #: flag. ``setting`` is the ``vault_revocation_attested`` of the settings object that function
-#: holds, and ``False`` fails closed. A list, so a second call in one function is a second row.
+#: holds. ``parameter`` is the function's own required ``revocation_attested``, which its caller
+#: fills; :data:`_CLIENT_CALLERS` lists those callers. ``False`` fails closed, and no shipped
+#: build passes it. A list, so a second call in one function is a second row.
 _BUILDERS = sorted(
     [
         ("config/secretprovider_vault.py", "resolve", "setting"),
-        ("config/secretprovider_vault.py", "secrets_vault_client", "False"),
+        ("config/secretprovider_vault.py", "secrets_vault_client", "parameter"),
         ("store/crypto_transit.py", "build_transit_cipher", "setting"),
         ("store/keyprovider_vault.py", "active_key", "setting"),
-        ("store/keyprovider_vault.py", "store_vault_client", "False"),
+        ("store/keyprovider_vault.py", "store_vault_client", "parameter"),
+    ]
+)
+#: The two ``check-privileges`` clients, with the settings section each one's hop is in. Every
+#: use of one, as a call or handed to ``functools.partial``, must pass that section's own pair.
+_CLIENTS = {"secrets_vault_client": "secrets", "store_vault_client": "store"}
+#: Every use of a ``check-privileges`` client: module and client. Each is checked for its pair.
+_CLIENT_CALLERS = sorted(
+    [
+        ("privilege_probes.py", "secrets_vault_client"),
+        ("privilege_probes.py", "store_vault_client"),
     ]
 )
 #: The two spellings of "the settings object this function holds". Each module holds only its own
@@ -235,9 +247,44 @@ def _build_shape(call: ast.Call) -> str:
         return "MISSING"
     if ast.unparse(flag) in _OWN_SETTING:
         return "setting"
+    if isinstance(flag, ast.Name) and flag.id == _FLAG:
+        return "parameter"
     if isinstance(flag, ast.Constant) and flag.value is False:
         return "False"
     return f"UNEXPECTED {ast.unparse(flag)}"
+
+
+def _client_uses(source: str, relative: str) -> list[tuple[str, str, str, str]]:
+    """One row per use of a ``check-privileges`` client in ``source``: where, which client, and
+    the flag and reason it is given. A use is a call, or the client handed to another call as
+    its first argument with the client's own keywords after it, as ``functools.partial`` takes
+    it. Any other mention of the name is a row with nothing given, so it cannot pass."""
+    tree = parse_source(source)
+    rows, counted = [], set()
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        target = call.func
+        if not (isinstance(target, ast.Name) and target.id in _CLIENTS) and call.args:
+            target = call.args[0]
+        if isinstance(target, ast.Name) and target.id in _CLIENTS:
+            counted.add(id(target))
+            flag, reason = _keyword(call, _FLAG), _keyword(call, "revocation_reason")
+            rows.append(
+                (
+                    relative,
+                    target.id,
+                    ast.unparse(flag) if flag is not None else "MISSING",
+                    ast.unparse(reason) if reason is not None else "MISSING",
+                )
+            )
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and node.id in _CLIENTS
+            and id(node) not in counted
+            and isinstance(node.ctx, ast.Load)
+        ):
+            rows.append((relative, node.id, "NOT GIVEN", "NOT GIVEN"))
+    return rows
 
 
 def _builders(source: str, relative: str) -> list[tuple[str, str, str]]:
@@ -331,6 +378,68 @@ def test_every_vault_client_build_is_listed_and_none_is_a_no_op() -> None:
     assert sorted(found) == _BUILDERS
 
 
+def test_each_check_privileges_client_is_given_its_own_sections_pair() -> None:
+    """``check-privileges`` probes a Vault through the client the provider builds, so it must be
+    held to the same rule with the same attestation. Each client is given the flag and the
+    reason of the section its hop is in, read off the loaded settings.
+
+    RED before this change: both clients passed ``False``, so the command could not probe an
+    off-box ``https://`` Vault, and its refusal named a flag that path ignored.
+    Mutation: give the store client ``settings.secrets.vault_revocation_attested``."""
+    uses: list[tuple[str, str, str, str]] = []
+    for path in _modules():
+        source = path.read_text(encoding="utf-8")
+        relative = path.relative_to(_PACKAGE).as_posix()
+        if any(name in source for name in _CLIENTS):
+            # The module that defines a client names it once, in its `def`, which is no use.
+            uses.extend(_client_uses(source, relative))
+    assert sorted((relative, client) for relative, client, _, _ in uses) == _CLIENT_CALLERS
+    for relative, client, flag, reason in uses:
+        pair = f"settings.{_CLIENTS[client]}.vault_revocation_attested"
+        assert (flag, reason) == (pair, f"{pair}_reason"), (relative, client)
+
+
+@pytest.mark.parametrize(
+    ("planted", "flag"),
+    [
+        # A literal attests every Vault the command is ever pointed at.
+        ("partial(store_vault_client, revocation_attested=True, posture=posture)", "True"),
+        # The other section's pair: the secrets hop's review does not cover the store's Vault.
+        (
+            "partial(store_vault_client, "
+            "revocation_attested=settings.secrets.vault_revocation_attested)",
+            "settings.secrets.vault_revocation_attested",
+        ),
+        # The process-wide variable in the per-hop slot is the defect BACKLOG #299 removed.
+        (
+            "store_vault_client(a, t, revocation_attested=tls_revocation_attested())",
+            "tls_revocation_attested()",
+        ),
+        ("store_vault_client(a, t)", "MISSING"),
+        # Handed on with nothing bound, as this file's own earlier shape did.
+        ("read_vault_token(token, address, store_vault_client, required)", "NOT GIVEN"),
+    ],
+)
+def test_the_client_scan_can_fail(planted: str, flag: str) -> None:
+    """The control for the scan above: five shapes it must not pass, and the shipped one."""
+    ((_, client, found, _),) = _client_uses(planted, "planted.py")
+    assert (client, found) == ("store_vault_client", flag)
+    assert found != "settings.store.vault_revocation_attested"
+    shipped = (
+        "partial(store_vault_client, "
+        "revocation_attested=settings.store.vault_revocation_attested, "
+        "revocation_reason=settings.store.vault_revocation_attested_reason, posture=posture)"
+    )
+    assert _client_uses(shipped, "planted.py") == [
+        (
+            "planted.py",
+            "store_vault_client",
+            "settings.store.vault_revocation_attested",
+            "settings.store.vault_revocation_attested_reason",
+        )
+    ]
+
+
 def _reason_problems(source: str) -> list[str]:
     """Each client build in ``source`` that passes a setting as its flag and not that same
     object's reason."""
@@ -400,6 +509,7 @@ def test_the_build_census_sees_a_call_a_listed_one_could_hide() -> None:
             "setting",
         ),
         ("_build_client(a, t, revocation_attested=False)", "False"),
+        ("_build_client(a, t, revocation_attested=revocation_attested)", "parameter"),
     ],
 )
 def test_the_build_scan_tells_the_shapes_apart(call: str, shape: str) -> None:
@@ -424,6 +534,8 @@ def test_the_flag_is_required_at_every_layer() -> None:
         (strict_requests._refuse_an_unrevoked_vault_hop, (_FLAG, "attestation_section")),
         (keyprovider_vault._build_client, (_FLAG,)),
         (secretprovider_vault._build_client, (_FLAG,)),
+        (keyprovider_vault.store_vault_client, (_FLAG,)),
+        (secretprovider_vault.secrets_vault_client, (_FLAG,)),
     ):
         parameters = inspect.signature(func).parameters
         for name in names:
