@@ -1247,6 +1247,107 @@ def test_a_file_to_fix_is_reported_for_a_context_at_the_cap(
     assert _accepts(hop, pki.server())
 
 
+# --- vault BACKLOG #2866 item 1: a start that cannot stage its private copy -----------------------
+
+
+def _fail_mkdtemp(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(prefix: str) -> str:
+        raise PermissionError(13, "Permission denied", f"C:/tmp/{prefix}random")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", fail)
+
+
+def _fail_the_private_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = Path.write_bytes
+
+    def fail(self: Path, data: bytes) -> int:
+        if self.parent.name.startswith("mefor-crl-"):
+            raise OSError(28, "No space left on device", str(self))
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail)
+
+
+def _scratch_load_raises(monkeypatch: pytest.MonkeyPatch, exc: OSError) -> None:
+    """Make OpenSSL's read of the private copy raise ``exc``."""
+
+    def fail(crl_file: str, blocks: object, *, label: str) -> ssl.SSLContext:
+        raise exc
+
+    monkeypatch.setattr(tls_policy_module, "crl_scratch_context", fail)
+
+
+def _fail_the_private_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    gone = FileNotFoundError(2, "No such file or directory", "C:/tmp/mefor-crl-random/crl.pem")
+    _scratch_load_raises(monkeypatch, gone)
+
+
+@pytest.mark.parametrize(
+    ("fail", "why"),
+    [
+        (_fail_mkdtemp, "Permission denied"),
+        (_fail_the_private_write, "No space left on device"),
+        (_fail_the_private_read, "No such file or directory"),
+    ],
+    ids=["mkdtemp", "write", "read"],
+)
+def test_a_start_that_cannot_stage_its_private_copy_is_a_refusal_that_names_the_file(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, fail: object, why: str
+) -> None:
+    # The private copy is staged only on a context that already holds a CRL, as a built hop does.
+    hop = pki.outbound_hop()
+    harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")  # control: a second load passes
+    assert callable(fail)
+    fail(monkeypatch)
+
+    with pytest.raises(ValueError, match="private copy") as refused:
+        harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+
+    said = str(refused.value)
+    assert said.startswith(f"[tls].crl_file ({str(pki.crl)!r})")  # the setting and the file
+    assert why in said
+    assert "mefor-crl-" not in said  # never the random path, as the reload's reason leaves it out
+    # Still an OSError, so a caller that carries on or retries on one does what it did before.
+    assert isinstance(refused.value, OSError)
+    assert isinstance(refused.value.__cause__, OSError)
+
+
+def test_an_openssl_error_on_the_private_copy_is_not_reworded_as_a_staging_failure(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ``ssl.SSLError`` is an ``OSError``. It is about the bytes, so it must not read as a full disk.
+    hop = pki.outbound_hop()
+    unreadable = ssl.SSLError(ssl.SSL_ERROR_SSL, "[X509] no certificate or crl found")
+    _scratch_load_raises(monkeypatch, unreadable)
+
+    with pytest.raises(ssl.SSLError, match="no certificate or crl found") as passed:
+        harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+    assert passed.value is unreadable and not isinstance(passed.value, ValueError)
+
+
+# --- vault BACKLOG #2866 item 2: a BEGIN marker inside a comment still refuses the file -----------
+
+
+def test_a_begin_marker_inside_a_comment_line_refuses_the_file_and_says_why(
+    pki: _Pki, tmp_path: Path
+) -> None:
+    # Kept on purpose: OpenSSL loads this file's one CRL, and the engine refuses the file anyway.
+    # ``judge_every_crl`` records why, where it counts the markers.
+    crl = pki.crl.read_bytes()
+    commented = b"# the -----BEGIN X509 CRL----- block below is the root CRL\n" + crl
+    assert _openssl_count(tmp_path, commented) == 1
+    # Control: a comment line without the marker is judged, so the marker is what refuses.
+    assert len(judge_every_crl(b"# the block below is the root CRL\n" + crl, now=time.time())) == 1
+
+    with pytest.raises(ValueError, match="does not start a line") as refused:
+        judge_every_crl(commented, now=time.time())
+    assert "cannot tell it from a CRL" in str(refused.value)  # the reason, in the refusal itself
+
+    pki.crl.write_bytes(commented)
+    with pytest.raises(ValueError, match="text in a comment"):
+        pki.outbound_hop()
+
+
 # --- vault BACKLOG #2866 items 3 and 4: a refusal that holds still across passes -------------------
 
 
