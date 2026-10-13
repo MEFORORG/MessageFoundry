@@ -345,7 +345,7 @@ class CertExpiryRunner:
             sharing = {}
         said = _HeldCopyLog(sharing)
         for cert in rows:
-            check = self._inspect(cert, now, held, said)
+            check = self._inspect(cert, now, held, said=said)
             if check is None:
                 continue
             checks.append(check)
@@ -415,7 +415,8 @@ class CertExpiryRunner:
         cert: MonitoredCert,
         now: float,
         held: HeldCrlSnapshot | None = None,
-        said: _HeldCopyLog | None = None,
+        *,
+        said: _HeldCopyLog,
     ) -> CertCheck | None:
         # The load / notAfter / days-remaining path lives once in pki.read_cert_facts; this monitor
         # only needs notAfter + days_remaining from the returned public facts.
@@ -443,12 +444,7 @@ class CertExpiryRunner:
             )
         if cert.kind == "crl":
             return _judge_crl(
-                cert,
-                now,
-                pem,
-                crl_facts,
-                held if held is not None else held_crl_snapshot(),
-                said if said is not None else _HeldCopyLog({}),
+                cert, now, pem, crl_facts, held if held is not None else held_crl_snapshot(), said
             )
         if facts is None:
             return None
@@ -487,24 +483,27 @@ class _HeldCopyLog:
 
     def __init__(self, sharing: Mapping[str, tuple[str, ...]]) -> None:
         self._sharing = sharing
-        self._logged: set[tuple[str, str, str]] = set()
+        self._logged: set[tuple[object, ...]] = set()
 
-    def other_rows(self, cert: MonitoredCert, why: str, remedy: str) -> tuple[str, ...] | None:
+    def other_rows(
+        self, cert: MonitoredCert, account: tuple[object, ...]
+    ) -> tuple[str, ...] | None:
         """The other rows naming ``cert``'s file, for its warning to name, or ``None`` when this
-        pass has already logged the same account of that file.
+        pass has already logged the same ``account`` of that file. ``()`` still means log it.
 
-        The account is the file with ``why`` and ``remedy``, so a file replaced part way through a
-        pass, which a later row then judges differently, is logged again. A file the grouping does
-        not hold is never folded, because its line could not name the rows left out: a failed
-        grouping (BACKLOG #3176) costs the fold and no row its mention."""
+        ``account`` is everything the line says but the row and the path's spelling. Each row reads
+        the file itself, so a file replaced part way through a pass can give a later row another
+        account, and that one is logged too. A file the grouping does not hold is never folded,
+        because its line could not name the rows left out: a failed grouping (BACKLOG #3176) costs
+        the fold and no row its mention."""
         key = crl_path_key(cert.path)
         labels = self._sharing.get(key)
         if labels is None:
             return ()
-        account = (key, why, remedy)
-        if account in self._logged:
+        logged = (key, *account)
+        if logged in self._logged:
             return None
-        self._logged.add(account)
+        self._logged.add(logged)
         return tuple(label for label in labels if label != cert.label)
 
 
@@ -697,7 +696,15 @@ def _judge_crl(
             # of it. The date is the alert's own not_after, so it is not repeated here.
             detail = f"{remedy}. Held by: {', '.join(holders)}."
             # Vault BACKLOG #3099: once a pass for each file, not once for each row naming it.
-            others = said.other_rows(cert, why, remedy)
+            account = (
+                why,
+                len(copies),
+                ", ".join(holders),
+                oldest.issuer,
+                log_timestamp(oldest.next_update_iso),
+                remedy,
+            )
+            others = said.other_rows(cert, account)
             if others is not None:
                 log.warning(
                     "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d "
@@ -705,12 +712,7 @@ def _judge_crl(
                     "the soonest CRL in it (issuer %r) lapses at %s. %s.%s",
                     cert.label,
                     cert.path,
-                    why,
-                    len(copies),
-                    ", ".join(holders),
-                    oldest.issuer,
-                    log_timestamp(oldest.next_update_iso),
-                    remedy,
+                    *account,
                     # The alert's own words for the same fact (pipeline.alerts.crl_expiry_detail).
                     f" The same file also serves {', '.join(map(repr, others))}." if others else "",
                 )
