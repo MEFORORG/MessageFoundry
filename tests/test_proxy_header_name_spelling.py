@@ -981,6 +981,21 @@ def test_the_verdict_stays_with_the_request_when_it_is_opened_again() -> None:
     assert value.asked == 2
 
 
+def test_a_verdict_does_not_outlive_its_header_on_the_request() -> None:
+    """The request keeps a verdict, and with it the value judged. Once the header is gone the
+    next check drops both, so the request holds the value no longer than its header."""
+    with _WireProxy() as peer:
+        opener, url = _on_leg("direct", peer)
+        request = _held(_NAME + " ", _VALUE, url)
+        _refused(opener, request, "#3417")
+        kept_while_held = _VALUE in repr(vars(request)["_mefor_proxy_header_verdicts"])
+        request.headers.clear()
+        _attempt(opener, request)
+    assert kept_while_held
+    assert peer.connections == 1
+    assert _VALUE not in repr(vars(request))
+
+
 def test_an_error_over_a_later_header_does_not_lose_an_earlier_verdict() -> None:
     """Two odd spellings. The first gets its verdict, and asking about the second raises an
     error that is no verdict, which stops the request. The first header's answer is kept all
@@ -1101,6 +1116,27 @@ def test_a_name_that_claims_to_be_a_headers_twin_cannot_hide_it() -> None:
     assert twin.asked == 0
 
 
+def test_control_an_unredirected_header_still_wins_over_its_twin() -> None:
+    """The other polarity. ``do_open`` sends an unredirected header and drops its twin in
+    ``headers``, so the rule judges that one alone. The twin here holds what the other proxy's
+    URL would make, and the request would be refused if the rule judged it."""
+    with _WireProxy() as peer:
+        handler = LoopbackDirectProxyHandler(
+            {
+                "http": f"http://{peer.address}",
+                "https": f"http://{_URL_CRED}@other.example.test:3128",
+            },
+            caller_header_admitted=True,
+        )
+        request = urllib.request.Request(_HTTP_TARGET)
+        request.add_unredirected_header(_NAME, _VALUE)
+        request.add_header(_NAME, _URL_VALUE)
+        _attempt(build_strict_opener(handler), request)
+    assert len(peer.cleartext) == 1
+    assert f"{_NAME}: {_VALUE}\r\n".encode() in peer.cleartext[0]
+    assert _URL_VALUE.encode() not in peer.cleartext[0]
+
+
 class _Undecoded(bytes):
     """A ``bytes`` name whose ``decode`` gives another name than the bytes it holds."""
 
@@ -1156,6 +1192,24 @@ def test_http_client_is_asked_once_about_each_of_two_headers(asked: list[tuple[A
     assert peer.connections == 0
     assert type(raised) is ValueError
     assert asked == [(" " + _NAME, _VALUE), (_NAME + " ", None)]
+
+
+def test_a_bytes_twin_of_an_unredirected_header_is_not_judged(
+    asked: list[tuple[Any, Any]],
+) -> None:
+    """``do_open`` drops a ``bytes`` twin as it drops a ``str`` one, so the walk does too: one
+    question, about the header that would be sent."""
+    name = _NAME.encode() + b" "
+    twin = bytes(bytearray(name))
+    assert twin == name and twin is not name
+    with _WireProxy() as peer:
+        opener, url = _on_leg("direct", peer)
+        request = urllib.request.Request(url)
+        request.unredirected_hdrs[name] = _VALUE  # type: ignore[index]
+        request.headers[twin] = "made up"  # type: ignore[index]
+        _refused(opener, request, "#3417")
+    assert peer.connections == 0
+    assert asked == [(name, _VALUE)]
 
 
 def test_control_http_client_is_never_asked_about_the_plain_name(

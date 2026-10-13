@@ -126,7 +126,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Collection, Mapping
-from typing import Any, Literal, NamedTuple, Protocol, cast, overload
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, cast, overload
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -879,8 +880,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
       Once every refusal above has had its turn, the request fails with the class of error
       ``http.client`` raises for it, a ``ValueError`` or a ``TypeError``, and not with this
       error. :func:`_refuse_a_proxy_header_that_can_never_be_sent` explains.
-    * The value of a plainly spelled header. The rule matches ``str()`` of it to a proxy URL,
-      and ``http.client`` sends what its ``encode`` gives.
+    * The value of a plainly spelled header, where it is not a ``str``. The rule matches
+      ``str()`` of the value to a proxy URL. ``http.client`` sends a ``bytes`` value as it is,
+      and any other by what its ``encode`` gives. So at least a ``bytes`` value that holds a
+      proxy URL's credential is not matched to it.
     * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
       trusts, so a context on the system store accepts any publicly trusted certificate for the
       proxy's host.
@@ -1067,8 +1070,10 @@ def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | 
     come before a credential refusal that applies. Nothing else is caught. Any other error says
     nothing about the header, so it stops the request where it is raised.
 
-    **Only :func:`_verdict_on` asks this, once for a header.** A second call could get another
-    answer: from a value whose ``encode`` fails once, or a name whose ``title()`` changes.
+    **Only :func:`_verdict_on` asks this, and a header that got an answer is not asked about
+    again.** A second call could get another answer: from a value whose ``encode`` fails once,
+    or a name whose ``title()`` changes. An error that is no verdict leaves nothing to keep, so
+    that header is asked about again at the next check, and the request stops there again.
     """
     probe = _StrictHTTPConnection("localhost")
     probe.putrequest("GET", "/")
@@ -1081,8 +1086,12 @@ def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | 
     return None
 
 
-class _ProxyHeaderVerdict(NamedTuple):
-    """What the rule decided about one header whose name reads as ``Proxy-Authorization``."""
+@dataclass(frozen=True, eq=False, slots=True)
+class _ProxyHeaderVerdict:
+    """What the rule decided about one header whose name reads as ``Proxy-Authorization``.
+
+    Compared by identity only. A generated ``==`` would ask the name and the value, and a
+    name object's answer must decide nothing here."""
 
     #: The name and the value as the request stores them: the two objects that were judged.
     name: str | bytes
@@ -1124,9 +1133,10 @@ def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVer
     more than once while it is opened: by the proxy handler, perhaps by a second one, and by
     the strict handler that opens the connection. Each check walks the headers the request
     holds at that moment, because urllib may add one in between. A header an earlier walk
-    judged keeps its verdict for as long as the request lasts, through a second open too. Only
-    a header not seen before is judged: one stored under another name object, or holding
-    another value object.
+    judged keeps its verdict for as long as the request holds it, through a second open too.
+    Only a header not seen before is judged: one stored under another name object, or holding
+    another value object. A verdict is dropped once the request no longer holds its header,
+    so no value outlives its header here.
 
     This closes a gap. Asked twice, a value whose ``encode`` fails once and then works was
     first a header that can never be sent, and then one that can. The rule left it out on the
@@ -1137,16 +1147,18 @@ def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVer
     so a name object cannot answer its way to another header's verdict.
     """
     kept: dict[tuple[int, int], _ProxyHeaderVerdict] = vars(req).setdefault(_VERDICTS_ATTR, {})
-    verdicts = []
+    held: dict[tuple[int, int], _ProxyHeaderVerdict] = {}
     for name, value in _proxy_header_items(req):
+        # A kept verdict holds both objects, so neither id can have passed to another object.
         key = (id(name), id(value))
         verdict = kept.get(key)
-        # A kept verdict holds both objects, so neither id can have passed to another object.
-        if verdict is None or verdict.name is not name or verdict.value is not value:
+        if verdict is None:
             # Kept at once, so an error raised over a later header does not lose this answer.
             verdict = kept[key] = _verdict_on(name, value)
-        verdicts.append(verdict)
-    return tuple(verdicts)
+        held[key] = verdict
+    for key in [key for key in kept if key not in held]:
+        del kept[key]
+    return tuple(held.values())
 
 
 def _proxy_credential_headers(req: urllib.request.Request) -> tuple[_ProxyHeaderVerdict, ...]:
