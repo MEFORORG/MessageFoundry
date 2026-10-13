@@ -307,8 +307,12 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
 
     **An encryption header inside a block refuses, before that load** (BACKLOG #2270). A
     ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
-    none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX TTY run the
-    row asked for was NOT done: the box this was built on is Windows. What was measured there, on
+    none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX terminal run
+    was done later, off-version (BACKLOG #3090, 2026-10-12): on CPython 3.12.3 / OpenSSL 3.0.13 on
+    Linux with a pseudo-terminal, the same ``cadata=`` load wrote ``Enter PEM pass phrase:`` and was
+    still waiting at 5 seconds, while ``cafile=`` refused at once with ``PEM lib``.
+    ``tests/test_encrypted_pem_cafile_pin.py`` holds that table and pins it on each CI platform.
+    What was measured first, on Windows, on
     CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
     ``cadata=`` load of a certificate block carrying ``Proc-Type: 4,ENCRYPTED`` and ``DEK-Info:``
     did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
