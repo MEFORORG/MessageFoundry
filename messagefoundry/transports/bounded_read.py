@@ -848,8 +848,12 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     verified TLS leg included: neither urllib nor a proxy is sure to take that spelling as the
     proxy's own. One that can never be sent is not refused by this rule at all; the list below
     says what happens to it. The exception never covers
-    a request that goes direct, and never a credential from a proxy URL, including one a request
-    carries on to a second proxy. **A TLS leg whose context does not fully verify the proxy is
+    a request that goes direct. It never covers a header whose value reads, by ``str()``, as
+    the credential a proxy URL in the handler's map makes, including one a request carries on to
+    a second proxy. That text is read from the value at each check and is never kept, so a
+    second open of the same request is judged by what the value reads as then. A value that is
+    not a ``str`` may be sent as other text than it reads as, which the list below names as
+    outside this check. **A TLS leg whose context does not fully verify the proxy is
     refused regardless**, admitted or not, because that guard never reads the TLS context.
 
     So an admitted header may cross a cleartext leg but not an unverified TLS leg. That asymmetry
@@ -1069,9 +1073,12 @@ def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | 
     nothing about the header, so it stops the request where it is raised.
 
     **Only :func:`_verdict_on` asks this, and a header that got an answer is not asked about
-    again.** A second call could get another answer: from a value whose ``encode`` fails once,
-    or a name whose ``title()`` changes. An error that is no verdict leaves nothing to keep, so
-    that header is asked about again at the next check, and the request stops there again.
+    again while its request holds the same name object and the same value object.** A header
+    stored again under another name object, or with another value object, is one not seen
+    before, and it is asked about. A second call could get another answer: from a value whose
+    ``encode`` fails once, or a name whose ``title()`` changes. An error that is no verdict
+    leaves nothing to keep, so that header is asked about again at the next check, and the
+    request stops there again.
     """
     probe = _StrictHTTPConnection("localhost")
     probe.putrequest("GET", "/")
@@ -1132,10 +1139,17 @@ def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVer
     more than once while it is opened: by the proxy handler, perhaps by a second one, and by
     the strict handler that opens the connection. Each check walks the headers the request
     holds at that moment, because urllib may add one in between. A header an earlier walk
-    judged keeps its verdict for as long as the request holds it, through a second open too.
-    Only a header not seen before is judged: one stored under another name object, or holding
-    another value object. A verdict is dropped once the request no longer holds its header,
-    so no value outlives its header here.
+    judged keeps its verdict while the request holds the same two objects, through a second
+    open too. Only a header not seen before is judged: one stored under another name object,
+    or holding another value object. A verdict is dropped at the next check after the request
+    stops holding its header. Until that check the request still holds the value judged.
+
+    **What is kept, and what is not.** A verdict keeps two answers: whether the name is the
+    plain spelling, and whether ``http.client`` would send the header. The first is read from
+    an exact ``str``, which cannot change. The second is asked for another spelling only, and
+    either answer to it ends in a refusal. What the value reads as is never kept. The check
+    that matches a value to a proxy URL reads ``str()`` of it each time it runs, so a value
+    object whose text was changed in place is judged by its new text, at a second open too.
 
     This closes a gap. Asked twice, a value whose ``encode`` fails once and then works was
     first a header that can never be sent, and then one that can. The rule left it out on the
