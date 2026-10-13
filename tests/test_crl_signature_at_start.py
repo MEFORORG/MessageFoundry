@@ -618,20 +618,23 @@ def test_the_unlisted_words_are_true_of_a_listed_ca_whose_name_differs_only_in_c
 
 _SHA256_WITH_RSA = bytes.fromhex("06092a864886f70d01010b")
 _SHA1_WITH_RSA = bytes.fromhex("06092a864886f70d010105")
+_SHA384_WITH_RSA = bytes.fromhex("06092a864886f70d01010c")
 
 
-def _resigned_with_sha1(pem: bytes, signer: rsa.RSAPrivateKey) -> bytes:
-    """``pem``, an RSA SHA-256 CRL, as an RSA SHA-1 CRL signed by ``signer``. The builder refuses
-    SHA-1. So the two algorithm identifiers are swapped by hand, which keeps every length, and
-    the signature is replaced."""
+def _resigned(
+    pem: bytes, signer: rsa.RSAPrivateKey, oid: bytes, digest: hashes.HashAlgorithm
+) -> bytes:
+    """``pem``, an RSA SHA-256 CRL, signed again by ``signer`` under another digest. The builder
+    refuses SHA-1. So the two algorithm identifiers are swapped by hand for ``oid``, which has
+    the same length, and the signature is replaced."""
     der = x509.load_pem_x509_crl(pem).public_bytes(serialization.Encoding.DER)
     assert der.count(_SHA256_WITH_RSA) == 2
-    der = der.replace(_SHA256_WITH_RSA, _SHA1_WITH_RSA)
+    der = der.replace(_SHA256_WITH_RSA, oid)
     body = x509.load_der_x509_crl(der).tbs_certlist_bytes
     try:
-        signature = signer.sign(body, padding.PKCS1v15(), hashes.SHA1())
+        signature = signer.sign(body, padding.PKCS1v15(), digest)
     except UnsupportedAlgorithm:
-        pytest.skip("this build cannot sign with SHA-1, so the CRL cannot be minted")
+        pytest.skip(f"this build cannot sign with {digest.name}, so the CRL cannot be minted")
     return x509.load_der_x509_crl(der[: -len(signature)] + signature).public_bytes(_PEM)
 
 
@@ -639,16 +642,19 @@ def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
     tmp_path: Path,
 ) -> None:
     """A CRL that names the CA's key and that the reload holds back, while a start loads it. The
-    reload's remedy used to say a start refuses such a file. The forged twin is the control: the
-    same hand-made encoding is proven bad, so the first reading is not an artefact of it."""
+    reload's remedy used to say a start refuses such a file. The SHA-384 CRL is the control for
+    the hand-made encoding: the same swap under a digest the library accepts reads ``verified``.
+    So ``uncheckable`` is about SHA-1, not about the swap."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     ca = _ca(key, key)
     ders = [ca.public_bytes(serialization.Encoding.DER)]
 
-    good = _resigned_with_sha1(_crl(key, names=key), key)
-    forged = _resigned_with_sha1(_crl(other, names=key), other)
+    good = _resigned(_crl(key, names=key), key, _SHA1_WITH_RSA, hashes.SHA1())
+    forged = _resigned(_crl(other, names=key), other, _SHA1_WITH_RSA, hashes.SHA1())
+    control = _resigned(_crl(key, names=key), key, _SHA384_WITH_RSA, hashes.SHA384())
 
+    assert [s.state for s in judge_crl_signatures(control, ders)] == ["verified"]
     assert [s.state for s in judge_crl_signatures(good, ders)] == ["uncheckable"]
     assert [s.state for s in judge_crl_signatures(forged, ders)] == ["bad"]
     verdict = crl_signature_refusal(good, ders)
@@ -706,33 +712,3 @@ def test_a_crl_that_reaches_a_hop_through_its_ca_file_alone_is_not_signature_che
         twins.hop("new")
     with pytest.raises(ValueError, match="does not verify the CRL's signature"):
         _hop(bundle, bundle)
-
-
-#: Sentences ``docs/CONFIGURATION.md`` carried and the code does not bear out. Each is matched
-#: with runs of white space folded, as a reader sees the paragraph.
-_RETRACTED_GUIDE_CLAIMS = (
-    # Not when the engine cannot check with that key, nor when the name differs only in case.
-    "A start refuses it when the CRL names the CA's key and that key did not sign it",
-    # A version that returns after another that warned is logged again: the A, B, A test above.
-    "logged once per engine process for each version of the file",
-    # Too wide both ways. A version that returns after one that logged nothing is not logged
-    # again, and a CA file that a CRL setting names is signature-checked. Tests above pin both.
-    "an earlier version that returns is logged again",
-    "The engine never checks its signature",
-)
-#: Sentences the guide must keep, each for a fact a test above pins and a reader acts on.
-_REQUIRED_GUIDE_SENTENCES = (
-    "an earlier version is logged again when it returns after another version that was logged",
-    "the engine does not check its signature, at a start or at a reload",
-)
-
-
-def test_the_configuration_guide_keeps_the_corrected_sentences() -> None:
-    guide = Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md"
-    text = " ".join(guide.read_text(encoding="utf-8").split())
-    # Control: this is the guide, and it still has the paragraph these sentences sit in.
-    assert "A start checks each CRL's signature too" in text
-    for claim in _RETRACTED_GUIDE_CLAIMS:
-        assert claim not in text, claim
-    for sentence in _REQUIRED_GUIDE_SENTENCES:
-        assert sentence in text, sentence

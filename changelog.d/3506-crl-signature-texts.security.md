@@ -1,5 +1,6 @@
-- **The CRL signature texts now say only what the engine does.** A start refuses a CRL file only
-  where the engine proves a signature bad. The configuration guide now says what counts as proof,
+- **The CRL signature texts now say only what the engine does.** On a CRL's signature, a start
+  refuses the file only where the engine proves that signature bad. Its other CRL refusals are
+  unchanged. The configuration guide now says what counts as proof,
   and names cases that load with a WARNING although the CRL names a CA's key: at least a
   signature the engine cannot check with that key, and an issuer name that differs from the CA's
   only in letter case. The reload's `bad_signature` remedy sentence and the start WARNING are

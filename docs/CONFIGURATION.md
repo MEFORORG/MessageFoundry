@@ -1806,10 +1806,11 @@ issuer. The engine applies a replaced file only when all three of these hold:
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
 what to do. It also raises the `crl_reload_refused` alert described further down. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
-CRL fails its signature check under rule 2 is held back too. A start refuses it only where the
-engine proves the signature bad, so fix that file. In every other case a start loads it with a
-warning, and each handshake then decides. The next paragraphs say what counts as proof, and name
-cases that load.
+CRL fails its signature check under rule 2 is held back too. On the signature, a start refuses it
+only where the engine proves the signature bad, so fix that file. Short of that proof the signature
+does not stop a start: unless another rule refuses the file, a start loads it with a warning, and
+each handshake then decides. The next paragraphs say what counts as proof, and name cases that
+load.
 A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
 a file that drops an issuer, and a CRL signed under a new key. When the hops holding one file need
 different things, the ERROR names the strongest: fix the file, then restart, then wait. When it names
@@ -1827,9 +1828,9 @@ file and the CRL. Give the setting the CRL that CA signed. No setting turns this
 an expired CRL.
 
 The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
-alone, on the hops that the paragraph on a CRL inside a CA file, further down, names. It is in use
-there, and the engine does not check its signature, at a start or at a reload. OpenSSL still checks
-it at each handshake it judges.
+alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. It
+is in use there, and the engine does not check its signature, at a start or at a reload. OpenSSL
+still checks it at each handshake it judges.
 
 Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
@@ -1840,11 +1841,11 @@ three cases warn:
 
 - The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly, and then
   the CRL's authority key identifier, where it carries one. This is the usual case when the peer
-  sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a handshake first uses it.
-  So does a listed CA whose name differs from the CRL's issuer name only in letter case. OpenSSL
-  treats those two names as one, so it still judges peers by that CRL. A badly signed CRL of that
-  kind was measured to start with the WARNING, and then to fail its handshake with
-  `CRL signature failure`.
+  sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a
+  handshake first uses it. So does a listed CA whose name differs from the CRL's issuer name only
+  in letter case. Where the letters that differ are ASCII, OpenSSL was measured to treat the two
+  names as one, so it still judges peers by that CRL. A badly signed CRL of that kind started with
+  the WARNING, and then failed its handshake with `CRL signature failure`.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.

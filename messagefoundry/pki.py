@@ -391,12 +391,12 @@ class CrlSignature:
     ``where`` names the block and its issuer, for a message. ``state`` is one of five. A CA "fits"
     when its subject equals the CRL's issuer name exactly and it fits the CRL's Authority Key
     Identifier (:func:`_akid_fit`). "Exactly" is ``cryptography``'s name comparison, in which
-    letter case counts. OpenSSL's comparison folds case. So a listed CA whose name differs from
-    the issuer's only in case is ``unlisted`` here, while OpenSSL takes it for the issuer and
-    judges peers by the CRL. Measured 2026-10-13 on CPython 3.14.6 with OpenSSL 3.5.7: such a
-    CRL, badly signed and naming that CA's key, started with the warning and then failed its
-    handshake with ``CRL signature failure``. Every text that describes ``unlisted`` must stay
-    true of that case.
+    letter case counts. OpenSSL's comparison is looser: it folds the case of ASCII letters, at
+    least. So a listed CA whose name differs from the issuer's only in the case of ASCII letters
+    is ``unlisted`` here, while OpenSSL takes it for the issuer and judges peers by the CRL.
+    Measured 2026-10-13 on CPython 3.14.6 with OpenSSL 3.5.7: such a CRL, badly signed and
+    naming that CA's key, started with the warning and then failed its handshake with ``CRL
+    signature failure``. Every text that describes ``unlisted`` must stay true of that case.
 
     * ``verified``: a CA that fits verifies the CRL.
     * ``bad``: **proven** badly signed. The CRL's key identifier equals a fitting CA's Subject Key

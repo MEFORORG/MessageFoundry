@@ -554,8 +554,8 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
 #: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
 #: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` says
 #: what the engine did, not what the CA list holds: a listed CA whose name differs from the
-#: issuer's only in letter case reads ``unlisted`` too, and OpenSSL would use that CA
-#: (:class:`~messagefoundry.pki.CrlSignature` says why).
+#: issuer's only in letter case reads ``unlisted`` too, and OpenSSL can still use that CA
+#: (:class:`~messagefoundry.pki.CrlSignature` says when).
 _UNCONFIRMED_SIGNATURE = {
     "unlisted": (
         "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
