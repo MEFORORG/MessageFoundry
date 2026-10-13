@@ -82,10 +82,10 @@ _UNNAMED_ESCAPE = "the escape"
 _BOM = "\ufeff"
 
 #: Files that must each hold at least one checked text. Pinned so a scanner that matches nothing
-#: fails here instead of passing vacuously.
+#: fails here instead of passing vacuously. ``auth/ldap.py`` left the list with vault BACKLOG #3230:
+#: its LDAPS refusal no longer names the escape, because no escape releases that bind.
 _MUST_FIND = frozenset(
     {
-        "messagefoundry/auth/ldap.py",
         "messagefoundry/config/settings.py",
         "messagefoundry/pipeline/alert_sinks.py",
         "messagefoundry/store/postgres.py",
