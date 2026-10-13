@@ -452,7 +452,7 @@ class EmailDestination(DestinationConnector):
                 or config.cleartext_accepted
             ):
                 raise ValueError(
-                    "Email destination use_tls=false sends the message (and any credentials) over "
+                    "Email destination use_tls=false sends the message over "
                     f"cleartext SMTP; refused unless the connection sets {HOP_ATTESTATION_LEVER} "
                     "(the hop IS secure by other means), or "
                     "cleartext_accepted=true with a cleartext_reason (the hop is NOT secure and that "
@@ -491,8 +491,8 @@ class EmailDestination(DestinationConnector):
                 raise ValueError(
                     "Email destination tls_verify=false disables server-certificate verification on "
                     f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED, so "
-                    "an on-path attacker presenting any certificate reads the message body (PHI) and "
-                    "any SMTP authentication credential. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file "
+                    "an on-path attacker presenting any certificate reads the message body (PHI). "
+                    "Use a trusted CA (tls_ca_file, or [tls].internal_ca_file "
                     f"for the instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
                     "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
                     "has no effect while enforcing, the default, or with no posture)."

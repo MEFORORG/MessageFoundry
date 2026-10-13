@@ -401,10 +401,9 @@ class DirectDestination(DestinationConnector):
         self._probe_build()
 
         # STARTTLS-by-default posture, identical to EmailDestination: the S/MIME body already protects
-        # PHI, but the SMTP session still carries envelope metadata + any AUTH credentials, so cleartext
-        # SMTP is refused unless the project-wide dev escape is set, and credentials are NEVER sent over
-        # a cleartext channel. The credential refusal is Email's, and runs first for Email's reason:
-        # no lever the arms below name lifts it (vault BACKLOG #3230).
+        # PHI, but the SMTP session still carries envelope metadata, so cleartext SMTP is refused
+        # unless the project-wide dev escape is set. The credential refusal is Email's, and runs
+        # first for Email's reason: no lever the arms below name lifts it (vault BACKLOG #3230).
         refuse_unverified_smtp_credential(
             "Direct destination",
             connection=config.name,
@@ -447,9 +446,8 @@ class DirectDestination(DestinationConnector):
                 raise ValueError(
                     "Direct destination tls_verify=false disables server-certificate verification on "
                     f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED. The "
-                    "S/MIME body still protects the clinical payload, but envelope metadata and any "
-                    "SMTP authentication credential are exposed to an on-path attacker presenting any "
-                    "certificate. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file for the "
+                    "S/MIME body still protects the clinical payload, but envelope metadata is exposed "
+                    "to an on-path attacker presenting any certificate. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file for the "
                     f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
                     "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
                     "has no effect while enforcing, the default, or with no posture)."
