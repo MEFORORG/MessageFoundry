@@ -5,8 +5,11 @@
   `preset_criteria_aad`. Both hold on SQLite, Postgres and SQL Server. A message moved to another
   channel, or a preset moved to another owner, outside the store no longer opens. Opening one of
   them raises an `integrity_drift` alert, under the subject `messages-tag` or `search_presets-tag`,
-  and writes an `integrity.message_tag_failed` or `integrity.preset_tag_failed` audit row. A
-  message read or a preset recall refuses. The message list and the dead-letter list keep the row,
+  and writes an `integrity.message_tag_failed` or `integrity.preset_tag_failed` audit row, once per
+  cell per hour in each process. A message read or a preset recall refuses; the by-id message
+  routes answer 423 inside the caller's channel scope and the usual 404 outside it, and an export
+  skips the row. Under `vault_transit` a failed open keeps the cipher's own error and raises no
+  integrity alert, because that cipher cannot tell a moved cell from an unreachable Vault. The message list and the dead-letter list keep the row,
   by its plaintext columns, with its sealed cells withheld. Content search leaves it out, and the
   document strip skips it. A transform handoff that reads such a message's metadata dead-letters the
   routed row, so the message records `ERROR` and the lane moves on; on the SQL Server fused path the

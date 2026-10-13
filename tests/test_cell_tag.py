@@ -101,6 +101,93 @@ def test_open_message_cell_refuses_a_moved_cell_and_alerts() -> None:
     assert not isinstance(missing.value, CellTagError)
 
 
+class _NoKeyringView:
+    """A cipher that, like Vault Transit, cannot say which keys it holds."""
+
+    def __init__(self, inner: AesGcmCipher) -> None:
+        self._inner = inner
+        self.encrypts = True
+
+    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        return self._inner.decrypt(stored, aad=aad)
+
+    def is_encrypted(self, stored: str) -> bool:
+        return self._inner.is_encrypted(stored)
+
+
+def test_a_cipher_that_cannot_name_its_keys_keeps_its_own_error() -> None:
+    """Under such a cipher a failed open may be an unreachable provider, so it is not reported as an
+    integrity failure: the read still refuses, with the cipher's own error and no alert."""
+    inner = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(inner, AesGcmCipher)
+    seen: list[str] = []
+    inner.set_tag_failure_hook(lambda table, reason: seen.append(reason))
+    sealed = inner.encrypt("SYNTH", aad=message_cell_aad("raw", message_id="nk1", channel_id="A"))
+    with pytest.raises(CipherError) as refused:
+        open_message_cell(
+            _NoKeyringView(inner),  # type: ignore[arg-type]
+            "raw",
+            sealed,
+            message_id="nk1",
+            channel_id="B",
+        )
+    assert not isinstance(refused.value, CellTagError) and not seen
+    with pytest.raises(CellTagError):  # control: the keyring itself names it a tag failure
+        open_message_cell(inner, "raw", sealed, message_id="nk1", channel_id="B")
+
+
+def test_a_failed_cell_is_reported_once_per_interval() -> None:
+    """A list view meets the same failed row on every poll; it alerts once, not every time."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(cipher, AesGcmCipher)
+    seen: list[str] = []
+    cipher.set_tag_failure_hook(lambda table, reason: seen.append(reason))
+    sealed = cipher.encrypt(
+        "SYNTH", aad=message_cell_aad("raw", message_id="once1", channel_id="A")
+    )
+    for _ in range(3):
+        with pytest.raises(CellTagError):
+            open_message_cell(cipher, "raw", sealed, message_id="once1", channel_id="B")
+    other = cipher.encrypt("SYNTH", aad=message_cell_aad("raw", message_id="once2", channel_id="A"))
+    with pytest.raises(CellTagError):  # control: another row still alerts
+        open_message_cell(cipher, "raw", other, message_id="once2", channel_id="B")
+    assert len(seen) == 2 and "once1" in seen[0] and "once2" in seen[1]
+
+
+async def test_the_scoped_message_read_hides_a_failed_row_out_of_scope() -> None:
+    """The API's one by-id read: out of scope a row that fails its tag is the same 404 as any other
+    refused row, with the channel denial audited; in scope it is a 423, never a 500."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from messagefoundry.api.message_scope import get_scoped_message, read_scoped_message
+
+    audits: list[str] = []
+
+    class _Store:
+        async def get_message(self, message_id: str) -> None:
+            raise CellTagError("messages", "raw", message_id, "IB_SECRET")
+
+        async def record_audit(self, action: str, **_: object) -> None:
+            audits.append(action)
+
+    engine: Any = SimpleNamespace(store=_Store())
+    request = Request({"type": "http", "client": ("127.0.0.1", 1), "headers": []})
+    out: Any = SimpleNamespace(username="u", can_access_channel=lambda c: c != "IB_SECRET")
+    inside: Any = SimpleNamespace(username="u", can_access_channel=lambda c: True)
+    assert await read_scoped_message(engine, out, "m-scope", request) is None
+    assert audits == ["auth.channel_denied"]
+    with pytest.raises(HTTPException) as hidden:
+        await get_scoped_message(engine, out, "m-scope", request)
+    assert hidden.value.status_code == 404
+    with pytest.raises(HTTPException) as refused:
+        await get_scoped_message(engine, inside, "m-scope", request)
+    assert refused.value.status_code == 423
+    assert await read_scoped_message(engine, inside, "m-scope", request) is None  # export skips
+
+
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
 
 
@@ -121,11 +208,9 @@ def _literal_cells(path: pathlib.Path, tables: set[str]) -> int:
 def test_one_builder_builds_every_message_and_preset_tag() -> None:
     """No store module builds a message cell's or a preset's associated data except through the
     builders, whose own ``cell_aad`` frame names the table by variable, not by literal."""
-    counts = {
-        p.name: n
-        for p in sorted(_STORE_DIR.rglob("*.py"))
-        if (n := _literal_cells(p, {"messages", "search_presets"}))
-    }
+    files = sorted(_STORE_DIR.rglob("*.py"))
+    assert len(files) >= 3, files  # the walk found the store modules
+    counts = {p.name: n for p in files if (n := _literal_cells(p, {"messages", "search_presets"}))}
     assert counts == {}, counts
     # Positive control: the same instrument finds the literal cells another table still uses.
     assert _literal_cells(_STORE_DIR / "store.py", {"queue"}) > 0

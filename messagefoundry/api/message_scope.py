@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import HTTPException, Request
 
 from messagefoundry.api.security import client_ip
+from messagefoundry.store.cell_tag import CellTagError
 
 if TYPE_CHECKING:
     from messagefoundry.auth import Identity
@@ -51,14 +52,37 @@ async def audit_channel_denied(
     )
 
 
+#: What an in-scope caller is told when a message's cells fail their integrity tag (BACKLOG #2593).
+#: 423, as for an upload the store cipher refuses: the message exists and needs an operator.
+_INTEGRITY_REFUSED = (
+    "this message's stored contents failed their integrity check and cannot be shown"
+)
+
+
 async def read_scoped_message(
-    engine: Engine, identity: Identity, message_id: str, request: Request
+    engine: Engine,
+    identity: Identity,
+    message_id: str,
+    request: Request,
+    *,
+    refuse_integrity: bool = False,
 ) -> dict[str, Any] | None:
-    """The message row, or ``None`` when it does not exist or sits outside the caller's channels.
+    """The message row, or ``None`` when it does not exist, sits outside the caller's channels, or
+    its cells fail their channel tag.
 
     An out-of-scope row is audited as ``auth.channel_denied`` before ``None`` comes back, so a caller
-    that skips it (the export stream) still leaves the refusal on the record."""
-    row = await engine.store.get_message(message_id)
+    that skips it (the export stream) still leaves the refusal on the record. A row whose cells fail
+    their tag was refused, alerted and audited by the store (BACKLOG #2593). Out of scope it reads as
+    any other refused row, so the answer never says the message exists. In scope it is ``None`` for
+    a caller that skips (the export stream), or, with ``refuse_integrity``, a 423."""
+    try:
+        row = await engine.store.get_message(message_id)
+    except CellTagError as err:
+        if not identity.can_access_channel(err.channel_id):
+            await audit_channel_denied(engine, identity, err.channel_id, client_ip(request))
+        elif refuse_integrity:
+            raise HTTPException(423, _INTEGRITY_REFUSED) from None
+        return None
     if row is None:
         return None
     if not identity.can_access_channel(row["channel_id"]):
@@ -73,8 +97,9 @@ async def get_scoped_message(
     """The message row, or the 404 every by-id message route answers.
 
     The same 404 covers a missing message and one outside the caller's channel scope, so the answer
-    never says which. The refusal is audited first, by :func:`read_scoped_message`."""
-    row = await read_scoped_message(engine, identity, message_id, request)
+    never says which. The refusal is audited first, by :func:`read_scoped_message`. An in-scope
+    message whose cells fail their integrity tag answers 423 (BACKLOG #2593)."""
+    row = await read_scoped_message(engine, identity, message_id, request, refuse_integrity=True)
     if row is None:
         raise HTTPException(404, f"no such message: {message_id}")
     return row

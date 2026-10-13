@@ -116,7 +116,7 @@ from messagefoundry.store.cell_tag import (
     open_message_cell,
     open_preset_criteria,
     preset_criteria_aad,
-    report_cell_tag_failure,
+    report_cell_tag_failures,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
@@ -5164,8 +5164,8 @@ class PostgresStore:
             await self._after_fenced_write(exc)
             return False
         finally:
-            for failure in tag_failures:  # BACKLOG #2593: after the transaction, never inside it
-                await report_cell_tag_failure(self, failure)
+            # BACKLOG #2593: after the transaction, never inside it.
+            await report_cell_tag_failures(self, tag_failures)
         return True
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
@@ -7292,8 +7292,7 @@ class PostgresStore:
                 failures=failures,
             )
             out.append(d)
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return out
 
     async def count_messages(
@@ -7351,8 +7350,7 @@ class PostgresStore:
         )
         failures: list[CellTagError] = []
         result = await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit, failures)
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return result
 
     def _scan_rows(
@@ -7377,17 +7375,14 @@ class PostgresStore:
             d = dict(cand)
             stored_raw = d.pop("raw", None)
 
-            def opened(column: str, stored: str | None, d: dict[str, Any] = d) -> str | None:
-                return open_message_cell(
-                    self._cipher, column, stored, message_id=d["id"], channel_id=d["channel_id"]
-                )
-
+            tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
             try:
-                d["summary"] = opened("summary", d["summary"])
-                if not row_matches(spec, raw=opened("raw", stored_raw), summary=d["summary"]):
+                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
+                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                if not row_matches(spec, raw=raw, summary=d["summary"]):
                     continue
-                d["error"] = opened("error", d["error"])
-                d["metadata"] = opened("metadata", d["metadata"])
+                for column in ("error", "metadata"):
+                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
             except CellTagError as err:
                 failures.append(err)
                 continue
@@ -7436,8 +7431,7 @@ class PostgresStore:
                 failures=failures,
             )
             out.append(d)
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return out
 
     async def count_dead(
@@ -9640,8 +9634,7 @@ class PostgresStore:
                     await conn.executemany(
                         "UPDATE messages SET raw=$1, documents_pruned=$2 WHERE id=$3", updates
                     )
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
         )

@@ -201,7 +201,7 @@ from messagefoundry.store import (
     StreamingAttachmentsUnsupported,
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
-from messagefoundry.store.cell_tag import CellTagError, report_cell_tag_failure
+from messagefoundry.store.cell_tag import CellTagError, CellTagSink, dead_letter_on_cell_tag
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
@@ -1089,7 +1089,7 @@ class _RoutedPrep:
     while every store handoff stays serial and in ascending claim order — so per-destination outbound
     FIFO (``ORDER BY seq``, ADR 0059; correct only under one serial writer per lane) is preserved.
     Exactly one field is populated: ``missing_handler`` (the row's handler is gone → dead-letter on
-    apply), ``error`` (the handler raised → internal-error policy on apply), or ``outcome`` (the
+    apply), ``tag_failure`` (the loopback metadata read failed its tag → dead-letter on apply), ``error`` (the handler raised → internal-error policy on apply), or ``outcome`` (the
     transform produced deliveries/state/meta to hand off). A handler raise is captured here rather than
     raised so a concurrent ``gather`` never cancels a sibling (ADR 0057 policy is applied on the serial
     apply, in claim order)."""
@@ -1097,6 +1097,8 @@ class _RoutedPrep:
     missing_handler: bool = False
     error: Exception | None = None
     outcome: TransformOutcome | None = None
+    #: The loopback metadata read met a cell that fails its row tag → dead-letter on apply (#2593).
+    tag_failure: CellTagError | None = None
 
 
 def _contiguous_by_message(items: Sequence[OutboxItem]) -> list[list[OutboxItem]]:
@@ -9348,13 +9350,11 @@ class RegistryRunner:
             if result.xform_exc is not None:  # CONTENT: a handler raise → internal-error policy
                 return await self._apply_transform_internal_error(name, item, result.xform_exc)
             if isinstance(result.handoff_exc, CellTagError):
-                # BACKLOG #2593: the message's own metadata cell failed its row tag. The sync
-                # handoff rolled back and the alert was raised at the read; dead-letter the row
-                # (message ERROR) and audit it, as the async transform_handoff does, rather than
-                # re-pend a row that would fail the same way until the inbound stopped.
-                await self.store.dead_letter_now(item.id, str(result.handoff_exc))
-                # record_audit lives on AuditStore, which every shipped backend implements.
-                await report_cell_tag_failure(cast(AuditStore, self.store), result.handoff_exc)
+                # BACKLOG #2593: the message's own metadata cell failed its row tag (in the sync
+                # handoff, which rolled back, or in the loopback read). Dead-letter the row (message
+                # ERROR) and audit it, as the async transform_handoff does, rather than re-pend a
+                # row that would fail the same way until the inbound stopped.
+                await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, result.handoff_exc)
                 return _ItemOutcome.PROCESSED, None
             if result.handoff_exc is not None:  # INFRA: acquire/handoff fault → propagate → T17
                 raise result.handoff_exc
@@ -9374,6 +9374,12 @@ class RegistryRunner:
         # concurrent-batch entry (which does not pre-check) is self-contained.
         prep = await self._prepare_routed(name, ic, item)
         return await self._apply_routed(name, item, prep)
+
+    @property
+    def _cell_tag_sink(self) -> CellTagSink:
+        """The store as the dead-letter-and-audit sink a cell-tag failure needs (BACKLOG #2593).
+        ``record_audit`` lives on AuditStore, which every shipped backend implements."""
+        return cast(CellTagSink, self.store)
 
     async def _prepare_routed(
         self,
@@ -9421,8 +9427,12 @@ class RegistryRunner:
         # and the metadata read is skipped entirely for non-loopback inbounds).
         response_view: dict[str, Any] | None = None
         if ic.spec.type is ConnectorType.LOOPBACK:
-            msg = await self.store.get_message(item.message_id)
-            raw_meta = msg.get("metadata") if msg else None
+            # Only the metadata cell is read. One that fails its row tag (BACKLOG #2593) makes the
+            # row a dead-letter on apply, not an infrastructure fault that re-pends it forever.
+            try:
+                raw_meta = await self.store.message_metadata_json(item.message_id)
+            except CellTagError as err:
+                return _RoutedPrep(tag_failure=err)
             meta = json.loads(raw_meta) if raw_meta else {}
             corr = meta.get("correlation_id") if isinstance(meta, dict) else None
             if corr:
@@ -9512,6 +9522,10 @@ class RegistryRunner:
         :meth:`_process_routed_item` exactly: handler-missing → dead-letter (``PROCESSED``); handler
         raise → internal-error policy (``STOP``/``CONTINUE``); else ``transform_handoff`` + lane wakes
         (``PROCESSED``). Returns ``(outcome, None)`` — the routed path never re-pends-with-backoff."""
+        if prep.tag_failure is not None:
+            # BACKLOG #2593: the loopback read met a message cell that fails its row tag.
+            await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, prep.tag_failure)
+            return _ItemOutcome.PROCESSED, None
         if prep.missing_handler:
             # Handler gone (removed/renamed since routing). Can't transform this row;
             # dead-letter it (message ERROR, replayable once restored) — the per-row analogue
@@ -9690,8 +9704,20 @@ class RegistryRunner:
         # byte-identical to the split _process_routed_item path.
         response_view: dict[str, Any] | None = None
         if ic.spec.type is ConnectorType.LOOPBACK:
-            msg = await self.store.get_message(item.message_id)
-            raw_meta = msg.get("metadata") if msg else None
+            # Only the metadata cell is read. One that fails its row tag (BACKLOG #2593) comes back
+            # as the handoff fault the caller dead-letters, as the split path's prep does.
+            try:
+                raw_meta = await self.store.message_metadata_json(item.message_id)
+            except CellTagError as err:
+                return _FusedTransformResult(
+                    deliveries=[],
+                    pt_deliveries=[],
+                    applied_state=[],
+                    xform_exc=None,
+                    handoff_exc=err,
+                    outbound_wakes=(),
+                    ingress_wakes=(),
+                )
             meta = json.loads(raw_meta) if raw_meta else {}
             corr = meta.get("correlation_id") if isinstance(meta, dict) else None
             if corr:

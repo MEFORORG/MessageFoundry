@@ -93,7 +93,7 @@ from messagefoundry.store.cell_tag import (
     open_message_cell,
     open_preset_criteria,
     preset_criteria_aad,
-    report_cell_tag_failure,
+    report_cell_tag_failures,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
@@ -7137,8 +7137,7 @@ class SqlServerStore:
                 tag_failures=tag_failures,
             )
         finally:
-            for failure in tag_failures:
-                await report_cell_tag_failure(self, failure)
+            await report_cell_tag_failures(self, tag_failures)
 
     async def _ingress_handoff_txn(
         self,
@@ -8299,8 +8298,7 @@ class SqlServerStore:
                 except Exception:
                     await conn.rollback()
                     raise
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
         )
@@ -11209,8 +11207,7 @@ class SqlServerStore:
                 channel_id=r["channel_id"],
                 failures=failures,
             )
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return rows
 
     async def count_messages(
@@ -11267,8 +11264,7 @@ class SqlServerStore:
         )
         failures: list[CellTagError] = []
         result = await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit, failures)
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return result
 
     def _scan_rows(
@@ -11293,17 +11289,14 @@ class SqlServerStore:
             d = dict(cand)
             stored_raw = d.pop("raw", None)
 
-            def opened(column: str, stored: str | None, d: dict[str, Any] = d) -> str | None:
-                return open_message_cell(
-                    self._cipher, column, stored, message_id=d["id"], channel_id=d["channel_id"]
-                )
-
+            tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
             try:
-                d["summary"] = opened("summary", d.get("summary"))
-                if not row_matches(spec, raw=opened("raw", stored_raw), summary=d["summary"]):
+                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
+                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                if not row_matches(spec, raw=raw, summary=d["summary"]):
                     continue
-                d["error"] = opened("error", d.get("error"))
-                d["metadata"] = opened("metadata", d.get("metadata"))
+                for column in ("error", "metadata"):
+                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
             except CellTagError as err:
                 failures.append(err)
                 continue
@@ -11347,8 +11340,7 @@ class SqlServerStore:
                 channel_id=r.pop("message_channel_id"),
                 failures=failures,
             )
-        for err in failures:
-            await report_cell_tag_failure(self, err)
+        await report_cell_tag_failures(self, failures)
         return rows
 
     async def count_dead(

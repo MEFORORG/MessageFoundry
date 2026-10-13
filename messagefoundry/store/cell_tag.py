@@ -33,6 +33,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import time
 from collections.abc import Callable, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any, Concatenate, Final, Protocol
 
@@ -50,7 +51,9 @@ __all__ = [
     "PRESET_TAG_COLUMNS",
     "PRESET_TAG_FAILED_ACTION",
     "CellTagError",
+    "CellTagSink",
     "audits_cell_tag",
+    "dead_letter_on_cell_tag",
     "dead_letters_on_cell_tag",
     "is_row_tagged",
     "message_cell_aad",
@@ -59,6 +62,7 @@ __all__ = [
     "open_tagged_cell",
     "preset_criteria_aad",
     "report_cell_tag_failure",
+    "report_cell_tag_failures",
     "row_tag_aad",
     "row_tag_columns",
     "withhold_message_cells",
@@ -199,7 +203,12 @@ def open_tagged_cell(
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:
-        if not is_tag_failure(cipher, stored):
+        # Only an in-process keyring can say it holds the key a marker names. A cipher that cannot
+        # (Vault Transit) also wraps an unreachable provider in CipherError, so there a failure keeps
+        # the cipher's own error rather than reading as an integrity failure.
+        if not callable(getattr(cipher, "holds_key_for", None)) or not is_tag_failure(
+            cipher, stored
+        ):
             raise
         err = CellTagError(table, column, row_id, channel_id)
         _alert(cipher, err)
@@ -260,9 +269,35 @@ def withhold_message_cells(
         failures.append(err)
 
 
+#: How long one cell's failure is reported once per process. A list view or a retention pass meets
+#: the same failed row on every run; without this each run would write the WARNING, the alert and the
+#: audit row again.
+_REPORT_INTERVAL_S: Final = 3600.0
+#: The most cells remembered; the oldest is forgotten first.
+_REPORTED_MAX: Final = 4096
+_reported: dict[tuple[str, str, str], float] = {}
+_reported_audit: dict[tuple[str, str, str], float] = {}
+
+
+def _first_in_interval(memo: dict[tuple[str, str, str], float], err: CellTagError) -> bool:
+    """Whether ``err``'s cell has not been reported in ``memo`` within the interval; records it."""
+    key = (err.table, err.column, err.row_ref)
+    now = time.monotonic()
+    last = memo.get(key)
+    if last is not None and now - last < _REPORT_INTERVAL_S:
+        return False
+    memo.pop(key, None)
+    memo[key] = now
+    while len(memo) > _REPORTED_MAX:
+        memo.pop(next(iter(memo)))
+    return True
+
+
 def _alert(cipher: object, err: CellTagError) -> None:
-    """Log a WARNING and raise ``integrity_drift`` through the cipher's tag-failure hook. Never
-    raises."""
+    """Log a WARNING and raise ``integrity_drift`` through the cipher's tag-failure hook, once per
+    cell per interval. Never raises."""
+    if not _first_in_interval(_reported, err):
+        return
     reason = f"a {err.table}.{err.column} cell failed its integrity tag (row {err.row_ref})"
     _log.warning("%s; the read was refused", reason)
     report = getattr(cipher, "report_tag_failure", None)
@@ -289,6 +324,8 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
     if err.audited:
         return
     err.audited = True
+    if not _first_in_interval(_reported_audit, err):
+        return
     action = MESSAGE_TAG_FAILED_ACTION if err.table == "messages" else PRESET_TAG_FAILED_ACTION
     try:
         await store.record_audit(
@@ -319,13 +356,13 @@ def audits_cell_tag[S: _AuditSink, **P, R](
     return wrapper
 
 
-class _DeadLetterSink(_AuditSink, Protocol):
+class CellTagSink(_AuditSink, Protocol):
     async def dead_letter_now(
         self, outbox_id: str, error: str, now: float | None = None
     ) -> None: ...
 
 
-def dead_letters_on_cell_tag[S: _DeadLetterSink, **P](
+def dead_letters_on_cell_tag[S: CellTagSink, **P](
     fn: Callable[Concatenate[S, P], Coroutine[Any, Any, bool]],
 ) -> Callable[Concatenate[S, P], Coroutine[Any, Any, bool]]:
     """Wrap a stage handoff whose keyword ``routed_id`` names the in-flight row it consumes. When the
@@ -338,9 +375,22 @@ def dead_letters_on_cell_tag[S: _DeadLetterSink, **P](
         try:
             return await fn(self, *args, **kwargs)
         except CellTagError as err:
-            await self.dead_letter_now(str(kwargs["routed_id"]), str(err))
-            await report_cell_tag_failure(self, err)
+            await dead_letter_on_cell_tag(self, str(kwargs["routed_id"]), err)
             return False
 
     functools.update_wrapper(wrapper, fn)
     return wrapper
+
+
+async def dead_letter_on_cell_tag(store: CellTagSink, row_id: str, err: CellTagError) -> None:
+    """Dead-letter the in-flight queue row ``row_id`` whose message failed its cell tag, so the lane
+    moves on and the message is ``ERROR`` (count-and-log), then audit the failure. The one policy for
+    a stage that met a tag failure, on the async handoffs and the runner's fused path alike."""
+    await store.dead_letter_now(row_id, str(err))
+    await report_cell_tag_failure(store, err)
+
+
+async def report_cell_tag_failures(store: _AuditSink, failures: list[CellTagError]) -> None:
+    """:func:`report_cell_tag_failure` for each failure a list-shaped read collected."""
+    for err in failures:
+        await report_cell_tag_failure(store, err)
