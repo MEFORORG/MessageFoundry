@@ -1124,11 +1124,16 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   address the client will really dial, hvac's `VAULT_ADDR` fallback included. A loopback Vault
   behind a proxy is not on the box. The refusal applies under `[security].enforcement = enforce`,
   and wherever a client is built without a known posture, which counts as enforcing.
-  **Known gaps in this build**, both tracked by vault BACKLOG #2983. No Vault client build is
-  handed the posture yet, so every build counts as enforcing, also on an `enforcement = warn`
-  instance. And `messagefoundry check-privileges` builds its two Vault clients with no settings in
-  scope, so it refuses an off-box Vault even with the flag set, and reports that token as not
-  observed.
+- **Which callers know the posture:** at least `serve`, `check-privileges` and
+  `provision-admin` hand it to the guard. On an instance at `enforcement = warn` they cross an
+  unattested off-box Vault with a WARNING. **The other commands that open a store hold no
+  posture, at least today, so they refuse that Vault even on a `warn` instance.** That includes
+  at least `rotate-key`, `backup` and `audit-verify`. So `warn` alone does not make an off-box
+  Vault usable by every command: set the pair. `tests/test_vault_posture_census.py` lists what
+  each caller passes.
+- **`check-privileges` follows the same rule.** It builds each Vault client with that hop's own
+  pair and its own posture. So it probes an off-box Vault only where `serve` would reach it, and
+  otherwise reports the token as not observed, with the refusal.
 - **What you lose:** that refusal. A revoked but unexpired Vault certificate is then accepted
   unless something outside the engine stops it. These hops carry the key that unwraps the store
   DEK, every at-rest cell under `vault_transit`, and connector credentials.
@@ -1145,20 +1150,25 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   accepts. Set the CA file first.
 - **What it cannot do:** it never lifts the hop's other refusals: an `http://` Vault off the
   box, proxy credentials sent in cleartext, or a hop that verifies no peer. It is also not the
-  process-wide `MEFOR_TLS_REVOCATION_ATTESTED`. That variable does **not** cross an enforcing
-  Vault hop, because it cannot say which hop's certificate was reviewed (BACKLOG #299). In this
-  build it changes nothing on these hops, since every client build counts as enforcing. The
-  shared rule these hops decide by ranks it so: under a posture known to be `warn`, it turns the
-  warning into a silent allow. That holds here once a client build is handed the posture.
+  process-wide `MEFOR_TLS_REVOCATION_ATTESTED`. That variable does **not** cross a Vault hop
+  under an enforcing or unknown posture, because it cannot say which hop's certificate was
+  reviewed (BACKLOG #299). **On an instance at `enforcement = warn` it does change something:**
+  where the posture reaches the guard, it turns the warning into a silent crossing, and no line
+  is logged. The shared rule every revocation guard decides by ranks it so.
 - **Named gap, the proxy leg:** through an `https://` proxy the hop has a second TLS leg, to the
   proxy. Nothing checks revocation of the proxy's certificate, and this attestation does not
   claim it. The Vault leg's own TLS, inside the tunnel, is what protects the token.
-- **How it is reported:** three ways. `security_loosenings()` names it as
+- **How it is reported:** at least five ways. `security_loosenings()` names it as
   `store.vault_revocation_attested` or `secrets.vault_revocation_attested`, with the reason, so
   `messagefoundry security show` and `GET /security/posture` list it. The serve-time loosening
   WARNING prints that entry, reason included, at each start. The start's `config_loaded` audit
-  row lists the switch name. **It is not an `audit` table row that carries the reason**, and no
-  record is written at each crossing: all three clients can be built before the store opens.
+  row lists the switch name. `messagefoundry check` lists each set pair, with its reason, on its
+  `vault-revocation-attested` line. And a hop that crosses an enforcing or unknown posture on
+  its attestation logs a WARNING that carries the reason. That line is written **once per
+  process for each hop**, not at each crossing: the secret provider builds a client on every
+  read. The key provider and the Transit cipher share one line.
+  **None of these is an `audit` table row that carries the reason**: all three clients can be
+  built before the store opens.
   The entry is named whenever the flag is set, whether or not a Vault provider is selected.
   `messagefoundry check` has no line for it.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason

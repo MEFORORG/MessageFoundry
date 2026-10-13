@@ -606,6 +606,7 @@ _SETTINGS_LEGS = (
     "oidc-auth-params",
     "static-credentials",
     "alert-smtp-tls",
+    "vault-revocation-attested",
 )
 
 

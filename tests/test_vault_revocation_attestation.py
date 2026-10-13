@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import ValidationError
@@ -38,7 +39,11 @@ from messagefoundry.config.settings import (
 from tests._ast_sites import call_sites, parse_source
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
+if TYPE_CHECKING:
+    from messagefoundry.checks import CheckResult
+
 _REASON = "the Vault server certificate lives 24 hours (synthetic)"
+_PAIR = {"vault_revocation_attested": True, "vault_revocation_attested_reason": _REASON}
 _SECTIONS = pytest.mark.parametrize(
     ("section", "model"), [("store", StoreSettings), ("secrets", SecretsSettings)]
 )
@@ -541,3 +546,99 @@ def test_the_flag_is_required_at_every_layer() -> None:
         for name in names:
             assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, (func, name)
             assert parameters[name].default is inspect.Parameter.empty, (func, name)
+
+
+# --- the check line ---------------------------------------------------------------------------
+
+_LEG = "vault-revocation-attested"
+_ATTESTATION_ENV = tuple(
+    f"MEFOR_{section}_VAULT_REVOCATION_ATTESTED{suffix}"
+    for section in ("STORE", "SECRETS")
+    for suffix in ("", "_REASON")
+)
+
+
+def _checked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str | None) -> CheckResult:
+    """The leg's own result for a service file holding ``toml``, or for no service file."""
+    from messagefoundry.checks import _check_vault_revocation_attested
+
+    for name in (*_ATTESTATION_ENV, "MEFOR_AI_ENVIRONMENT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    if toml is None:
+        return _check_vault_revocation_attested(tmp_path, suppress_search=True)
+    service = tmp_path / "service.toml"
+    service.write_text(toml, encoding="utf-8")
+    return _check_vault_revocation_attested(tmp_path, service_config=service)
+
+
+def _toml(*sections: str, reason: bool = True) -> str:
+    lines = []
+    for section in sections:
+        lines += [f"[{section}]", "vault_revocation_attested = true"]
+        if reason:
+            lines.append(f'vault_revocation_attested_reason = "{_REASON}"')
+    return "\n".join(lines) + "\n"
+
+
+def test_check_says_none_when_no_vault_hop_is_attested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It says so rather than going quiet: an absent line reads like a check that did not run.
+    Mutation: list a section whether or not its flag is set."""
+    result = _checked(tmp_path, monkeypatch, "[store]\n")
+    assert (result.ok, result.required, result.skipped) == (True, False, False)
+    assert result.detail == "no Vault hop's revocation is attested"
+
+
+@pytest.mark.parametrize(
+    ("sections", "count"), [(("store",), 1), (("secrets",), 1), (("store", "secrets"), 2)]
+)
+def test_check_lists_each_attested_vault_hop_with_its_reason(
+    sections: tuple[str, ...], count: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The names are the loosening report's own, so the two surfaces cannot disagree.
+    Mutation: read ``settings.store`` for both sections."""
+    result = _checked(tmp_path, monkeypatch, _toml(*sections))
+    assert (result.ok, result.required, result.skipped) == (True, False, False)
+    assert f"{count} Vault attestation(s)" in result.detail
+    for section in ("store", "secrets"):
+        entry = f'{section}.vault_revocation_attested ("{_REASON}")'
+        assert (entry in result.detail) is (section in sections)
+        if section in sections:
+            store = StoreSettings(**_PAIR) if section == "store" else None
+            secrets = SecretsSettings(**_PAIR) if section == "secrets" else None
+            assert f"{section}.vault_revocation_attested" in _loosenings(
+                store=store, secrets=secrets
+            )
+
+
+def test_check_fails_a_flag_with_no_reason_and_skips_a_bare_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flag with no reason is refused by the settings load, and a present but refused file is
+    a failure, not a skip. With no service file at all there is nothing to read."""
+    refused = _checked(tmp_path, monkeypatch, _toml("store", reason=False))
+    assert (refused.ok, refused.skipped) == (False, False)
+    assert "settings did not load" in refused.detail
+    bare = _checked(tmp_path, monkeypatch, None)
+    assert (bare.ok, bare.skipped) == (True, True)
+
+
+def test_check_runs_the_vault_attestation_leg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The leg is one of ``check``'s, in the report a CI gate reads.
+    Mutation: drop it from the list ``run_checks`` builds."""
+    from messagefoundry.checks import run_checks
+
+    for name in (*_ATTESTATION_ENV, "MEFOR_AI_ENVIRONMENT"):
+        monkeypatch.delenv(name, raising=False)
+    config = tmp_path / "config"
+    config.mkdir()
+    service = tmp_path / "service.toml"
+    service.write_text(_toml("secrets"), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    report = run_checks(config, run_lint=False, service_config=service)
+    (result,) = [r for r in report.results if r.name == _LEG]
+    assert f'secrets.vault_revocation_attested ("{_REASON}")' in result.detail
