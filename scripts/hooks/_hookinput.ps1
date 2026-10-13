@@ -6,13 +6,19 @@
 
 .DESCRIPTION
     WHY THIS EXISTS. The desktop app starts a worktree session's CLI with
-    `--project-config-root <primary checkout>`. Measured 2026-10-12: under that flag a hook runs with
-    its working directory, `$env:CLAUDE_PROJECT_DIR` and `git rev-parse --show-toplevel` all naming
-    the PRIMARY. Only the `cwd` field of the JSON on stdin names the worktree the session is in.
+    `--project-config-root <primary checkout>`. Measured 2026-10-12 in a fixture launched with that
+    flag (korus#220 records it): a hook runs with its working directory, `$env:CLAUDE_PROJECT_DIR`
+    and `git rev-parse --show-toplevel` all naming the PRIMARY. Only the `cwd` field of the JSON on
+    stdin names the worktree the session is in.
 
-    Across MessageFoundry worktree transcripts, session-context.ps1 printed "This chat's worktree:
-    <primary>" 410 times against 48 for a worktree. Every hook that asks git, `$PWD` or
-    CLAUDE_PROJECT_DIR where it is gets the same wrong answer.
+    Seen live 2026-10-13: this repository's announce hook told a session in a worktree to announce
+    itself as "<primary> (main)". Every hook that asks git, `$PWD` or CLAUDE_PROJECT_DIR where it is
+    gets the same wrong answer.
+
+    THE CWD IS WHERE THE SESSION IS NOW, NOT WHERE IT STARTED. A session that runs `cd` into another
+    checkout moves its `cwd` there, and these hooks then answer for that checkout. That is accepted,
+    as in korus#220: nothing in the input names the launch directory, and a session working in a
+    checkout is the one these hooks should answer for.
 
     So a hook reads its input with Read-CcxHookInput and then does ONE of two things:
 
@@ -43,6 +49,7 @@ function Read-CcxHookInput {
         AND BOUNDED IN TIME. IsInputRedirected is True from an agent shell with no pipe at all
         (announce-session.ps1 measured it), and a caller that leaves stdin open would hang an
         unbounded read. The harness writes its JSON and closes the pipe, so it never meets the bound.
+        A read that does meet it says so on stderr, so "no input" and "input still open" differ.
     #>
     param([int] $TimeoutMs = 2000)
     try {
@@ -50,6 +57,7 @@ function Read-CcxHookInput {
         $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
         $read = $reader.ReadToEndAsync()
         if ($read.Wait($TimeoutMs)) { return $read.Result }
+        [Console]::Error.WriteLine("[hook-input] stdin was still open after $TimeoutMs ms, so the hook read no input and answers for $($PWD.Path).")
         return ''
     }
     catch { return '' }
