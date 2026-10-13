@@ -1395,6 +1395,59 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
     assert again is not None and again.id == "dir-upgrade"
 
 
+async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None:
+    """The gated ADD for ``sessions.idp_auth_time`` (BACKLOG #2143) on a database from before it.
+
+    BACKLOG #3174: only the SQLite migration was tested against an existing table. Driven against a
+    table that really lacks the column, with the ``schema_meta`` marker cleared, for the reasons
+    ``test_directory_object_id_column_upgrade_is_idempotent`` gives. The type is asserted, and a
+    fractional value round-trips, so a column added as an integer cannot pass."""
+
+    async def _column_type() -> str | None:
+        async with store._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT data_type FROM information_schema.columns"
+                " WHERE table_name='sessions' AND column_name='idp_auth_time'"
+            )
+
+    async with store._pool.acquire() as conn:
+        await conn.execute("ALTER TABLE sessions DROP COLUMN idp_auth_time")
+        await conn.execute("DELETE FROM schema_meta")
+    assert await _column_type() is None  # positive control: the column really is gone
+
+    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    assert await _column_type() == "double precision"
+
+    await store.create_user(
+        user_id="idp-upgrade",
+        username="idp-upgrade",
+        auth_provider="ad",
+        directory_object_id="guid-idp-upgrade",
+        now=1.0,
+        password_generated=False,
+    )
+    await store.create_session(
+        token_hash="i" * 64,
+        user_id="idp-upgrade",
+        expires_at=9e9,
+        now=2.0,
+        auth_mechanism="oidc",
+        idp_auth_time=1.25,
+    )
+    created = await store.get_session("i" * 64)
+    assert created is not None and created.idp_auth_time == 1.25
+    await store.mark_session_reauthed("i" * 64, now=3.0, idp_auth_time=2.75)
+    moved = await store.get_session("i" * 64)
+    assert moved is not None and moved.idp_auth_time == 2.75
+
+    # A second full run against the migrated table skips the ADD and leaves the value alone.
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM schema_meta")
+    assert await store._ensure_schema() is True
+    again = await store.get_session("i" * 64)
+    assert again is not None and again.idp_auth_time == 2.75
+
+
 async def test_mark_session_reauthed_reanchors_client(store) -> None:
     """WP-L3-13: mark_session_reauthed(client=) re-anchors the session's client address via COALESCE;
     a None client leaves it unchanged while still refreshing reauth_at. Exercises the new COALESCE

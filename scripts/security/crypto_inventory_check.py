@@ -1081,7 +1081,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #1167: the passkey credential match and _rekey_token_state's grant walk.
             "compare:via messagefoundry.credential",
             "compare:via messagefoundry.auth.oidc.claims",
-            "compare:via messagefoundry.auth.oidc.flow",
+            # The OIDC `state` compare moved into FlowCache.pop_if_state_matches (BACKLOG #3198), so
+            # it is listed under messagefoundry/auth/oidc/flow.py and no longer here.
             "compare:via messagefoundry.auth.oidc_http",  # BACKLOG #1167: the anchor pin compare
             "compare:via messagefoundry.auth.totp",
             "csprng:secrets.token_urlsafe",
