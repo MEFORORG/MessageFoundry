@@ -17,6 +17,14 @@
     The failure it replaces, measured 2026-08-23: a lane held NINE claims while reporting ONE active
     item and THREE free slots. A claim-counting gauge would have reported both lanes full for the
     entire outage. Both numbers were honest -- only the lane knows which is which.
+
+    IT READS THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
+    worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
+    hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
+    This hook tells a builder lane from the dispatcher by its worktree's name and branch, so from the
+    primary it would answer for neither. Only the `cwd` field of the JSON on stdin names the worktree,
+    so the hook moves there (scripts/hooks/_hookinput.ps1) before its first git call. Input with no
+    `cwd` leaves it where it started, as before. A `cwd` it cannot use is reported as a `[lane]` line.
 #>
 [CmdletBinding()]
 param([switch]$SelfTest)
@@ -170,6 +178,16 @@ if ($SelfTest) {
     Write-Host 'lane-level self-test: 7 assertions pass, 6 of them asserting a state that must NOT be greenable.'
     exit 0
 }
+
+# INTO THE SESSION'S OWN DIRECTORY, BEFORE THE FIRST GIT CALL. See the header. The self-test above
+# never gets here, so it still reads no stdin. A helper that fails to load leaves the hook as it was.
+try {
+    . (Join-Path $PSScriptRoot '_hookinput.ps1')
+    $cwdFault = Enter-CcxHookCwd -Text (Read-CcxHookInput)
+    if ($cwdFault) {
+        Say "[lane] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. What follows describes $((Get-Location).Path), where this hook runs."
+    }
+} catch { }
 
 $coord = Get-CoordRoot
 if (-not $coord -or -not (Test-Path -LiteralPath $coord)) {
