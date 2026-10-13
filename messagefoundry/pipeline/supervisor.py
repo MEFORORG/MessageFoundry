@@ -58,7 +58,7 @@ from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _config_preflight
-from messagefoundry.pipeline.sharding import require_unified_store, shard_ids
+from messagefoundry.pipeline.sharding import join_shard_names, require_unified_store, shard_ids
 
 logger = logging.getLogger(__name__)
 
@@ -586,13 +586,13 @@ async def supervise(
         logger.error(
             "supervise: every engine shard tripped the crash-loop breaker (%s); the whole fleet is "
             "down",
-            ", ".join(sorted(supervisor.crash_looped)),
+            join_shard_names(supervisor.crash_looped),
         )
         return 1
     if supervisor.crash_looped:
         logger.error(
             "supervise: stopped with engine shard(s) %s down after a crash loop",
-            ", ".join(sorted(supervisor.crash_looped)),
+            join_shard_names(supervisor.crash_looped),
         )
     return 0
 

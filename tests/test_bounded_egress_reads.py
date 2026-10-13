@@ -56,7 +56,7 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
 from messagefoundry.transports import bounded_read, build_destination
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     MAX_TOKEN_RESPONSE_BYTES,
@@ -297,11 +297,13 @@ def _dicomweb() -> DicomWebDestination:
 
 def test_rest_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
     """The read still stops one byte past the bound. What an over-cap body then means after a 2xx
-    is vault BACKLOG #2180: with capture off nothing looks inside it, so it comes back empty."""
+    is vault BACKLOG #2180: with capture off nothing looks inside it, so it comes back dropped
+    (vault BACKLOG #3040 item 5)."""
     dest = _rest()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
-    assert dest._post("<payload/>") == ("", 200, {})
+    dropped = ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
+    assert dest._post("<payload/>") == (dropped, 200, {})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
@@ -371,12 +373,13 @@ def test_soap_fault_body_is_bounded_and_the_status_still_classifies(
 
 
 def test_fhir_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
-    """As for REST with capture off: the body comes back empty (vault BACKLOG #2180)."""
+    """As for REST with capture off: the body comes back dropped (vault BACKLOG #2180, #3040)."""
     dest = _fhir()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
     body = json.dumps({"resourceType": "Patient"})
-    assert dest._post(body, "POST", f"{FHIR_BASE}/Patient", {}) == ("", 200, {})
+    dropped = ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
+    assert dest._post(body, "POST", f"{FHIR_BASE}/Patient", {}) == (dropped, 200, {})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
@@ -517,16 +520,53 @@ def test_ai_broker_maps_an_over_cap_reply_onto_its_own_error_type() -> None:
 # --- the alert webhook --------------------------------------------------------------------------
 
 
-def test_alert_webhook_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_alert_webhook_drain_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The drain stops one byte past the bound. Before #3040 the over-cap reply then raised, and
+    the notifier reported an alert the host had taken with a 2xx as failed. Owner ruling
+    2026-10-12 (#3040 item 1): it counts as delivered, with a WARNING that carries no reply byte."""
     transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     import messagefoundry.pipeline.alert_sinks as sinks
 
     monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", opener.open)
-    with pytest.raises(ResponseTooLargeError):
+    with caplog.at_level(logging.WARNING, logger=bounded_read.logger.name):
+        transport._post({"type": "queue_buildup", "connection": "OB_X"})  # no raise
+    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
+    (record,) = [r for r in caplog.records if r.name == bounded_read.logger.name]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "alert webhook answered with status 200 and a response body over the "
+        f"{DEFAULT_MAX_RESPONSE_BYTES}-byte bound; the body is dropped and the 2xx is taken as "
+        "the partner's answer"
+    )
+
+
+@pytest.mark.parametrize("status", [None, "200", 300, 500], ids=["None", "str", "300", "500"])
+def test_alert_webhook_over_cap_reply_with_no_2xx_to_show_still_raises(
+    status: object,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE CONTROL for the test above: the delivered arm keys on a 2xx the reader shows, and fails
+    closed without one. urllib never hands the webhook such a reader, since it raises every
+    non-2xx as HTTPError first. So it is the 2xx, and not the size alone, that makes the alert
+    delivered."""
+    transport = WebhookTransport("https://hooks.example/x", timeout=5.0)
+    resp = _UnboundedResp()
+    resp.status = status  # type: ignore[assignment]
+    import messagefoundry.pipeline.alert_sinks as sinks
+
+    monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", _FakeOpener(resp).open)
+    with (
+        caplog.at_level(logging.WARNING, logger=bounded_read.logger.name),
+        pytest.raises(ResponseTooLargeError),
+    ):
         transport._post({"type": "queue_buildup", "connection": "OB_X"})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
+    assert "the 2xx is taken as" not in caplog.text
 
 
 # --- the signing key file (a LOCAL read, not an egress reply) -------------------------------------
@@ -901,6 +941,7 @@ _READERS = frozenset(
         "read_bounded",
         "read_bounded_text",
         "drain_bounded",
+        "drain_2xx_reply",
         "read_reply_body",
         "request_token",
         "_read_token_reply",

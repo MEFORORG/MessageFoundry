@@ -41,10 +41,13 @@ from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
+    AlertsSettings,
     ApiSettings,
     ApprovalsSettings,
     AuthSettings,
     EgressSettings,
+    LoggingSettings,
+    TlsSettings,
 )
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
@@ -642,7 +645,15 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
     store = await MessageStore.open(tmp_path / "dc.db")
     preflight = ta.make_settings_anchor_preflight(
-        ta.collect_anchor_specs(auth, ApiSettings()), store, enforcing=True
+        ta.collect_anchor_specs(
+            auth,
+            ApiSettings(),
+            tls=TlsSettings(),
+            alerts=AlertsSettings(),
+            log_settings=LoggingSettings(),
+        ),
+        store,
+        enforcing=True,
     )
     engine = Engine(
         store,

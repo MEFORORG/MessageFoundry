@@ -174,7 +174,8 @@ could drop/rewrite a config module that executes as the service account on the n
 
    **The decision now runs on every platform.** The ctypes readers moved into
    `_win32_config_source_probes`, which only reads and reports. The pure
-   `_enforce_windows_config_source` makes every decision on what those readers return. The tests
+   `_enforce_windows_config_source` (now `_enforce_windows_paths`, vault BACKLOG #2626) makes
+   every decision on what those readers return. The tests
    replace the readers and nothing else, so each error arm runs on the Linux CI leg. The ctypes
    readers' own error paths are still run by no test, on any platform. The test this
    replaced patched the whole Windows function with a stub that logged its own warning, so it

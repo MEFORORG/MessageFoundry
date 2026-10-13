@@ -1015,7 +1015,8 @@ route handler only when all of them pass.
 4. **A second axis: per-channel scope** — `users.channel_scope` narrows operational routes to a set of
    connections, and it **denies by default**: a new non-administrator is granted no channel until
    somebody grants one (BACKLOG #1152; the full rule is *Per-channel scoping (DLQ-SCOPE)* below).
-   Out-of-scope *message* access returns **404** (existence-hiding); connection control and inbound
+   Out-of-scope *message* access returns **404** (existence-hiding) on every by-id JSON route; the bulk
+   export skips such a row instead (*Single-route data rules* below). Connection control and inbound
    injection return **403**. Denials are audited `auth.channel_denied`.
 
 The table below has **seven** rows. `require` is the ladder itself; five wrappers extend it
@@ -1153,6 +1154,20 @@ replacement:
   at once (`/raw`, attachments, `/ui/messages/{id}/body`, a one-id `/messages/export`), and the
   route gates on `/outbound` and the `/responses` body stay as a second line. No deployment exists,
   so no stored role is broken by the change.
+  *Decided 2026-10-12, vault BACKLOG #2727, by the maintainers and not by an owner ruling:* the
+  rule is judged **per role**, and it stays that way. A `view_raw` role meant to pair with another
+  role's `view_summary` is refused, even for a user who would hold both roles. That cost is
+  accepted. A role is the unit an administrator grants, so such a role could later be assigned
+  alone. The premise is that every identity is built from whole roles: the built-in ones, plus
+  each custom role's decoded set. `Identity.build` has at least three callers, two in
+  `AuthService` and the embedder's system identity in `api/security.py`, and each passes whole
+  roles. While that holds and no role has the shape, no merged identity has it either.
+  `Identity.build` itself does not check this and no test pins its callers, so a caller that
+  hands it a narrowed permission set would break the premise. A rule on the merged identity
+  would need a check wherever a role reaches a user, at least each role assignment and each
+  directory group mapping. `raw_body_without_summary` in
+  [`auth/permissions.py`](../messagefoundry/auth/permissions.py) is the one predicate, and
+  `tests/test_custom_roles.py` pins the per-role answer.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
   a forbidden value that somehow reached storage is dropped.
@@ -1213,7 +1228,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
 | `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **Refuses (400) whenever `[security].require_mfa` covers your local account and TOTP is on, passkeys or not**, because in this release TOTP is the only factor with a way past the sign-in lock; an administrator's factor reset is the recovery (`AuthService.disable_mfa`, ADR 0197 Amendment A). A directory account is refused only when TOTP is its last second factor and the requirement's scope covers it (BACKLOG #1022), and a local account the requirement does not cover is not refused. The passkey removal path refuses only that last-factor case (ADR 0068 decision 5), so the two routes no longer refuse on the same condition |
 | `GET` | `/me/sessions` | `require` | |
-| `GET` | `/me/security-events` | `require` | |
+| `GET` | `/me/security-events` | `require` | data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate |
 | `DELETE` | `/me/sessions` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2) |
 
@@ -1297,10 +1312,10 @@ tuple: they act only on the caller's own account.
 | `POST` | `/connections/{name}/test` | `connections:test` | `require_paced` — reachability probe; honors `[egress]`, sends no real data, audited |
 | `POST` | `/connections/{name}/test-credential` | `connections:test` | `require_paced` |
 | `POST` | `/connections/{name}/flag` | `config:deploy` | `require_paced` |
-| `POST` | `/connections/{name}/purge` | `messages:purge` | `require_step_up_action` (action `connection_purge`, vault BACKLOG #2625) — may return **202 + `approval_id`** under dual control |
+| `POST` | `/connections/{name}/purge` | `messages:purge` | `require_step_up_action` (action `connection_purge`, vault BACKLOG #2625) — may return **202 + `approval_id`** under dual control; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/config/reload` | `config:deploy` | `require_step_up_action` (action `config_reload`, vault BACKLOG #2625; a `dry_run` takes it too, because the loader executes the config's Python either way) — the target dir must resolve within an allowed root (see below) |
 | `GET` | `/approvals` | `approvals:approve` | `require` |
-| `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request |
+| `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
@@ -1313,9 +1328,9 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|---|
 | `GET` | `/messages` | `messages:read` | `require_phi_read` | per-property redaction; `messages:view_summary` unlocks `summary`/`error`/`metadata`; per-channel scope |
 | `GET` | `/messages/search` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (a bulk-selecting GET) |
-| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`, vault BACKLOG #2625) | one of the two-permission routes **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
+| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`, vault BACKLOG #2625) | one of the two-permission routes **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/messages/search` | `messages:read` | `require_step_up` | the needle-bearing sibling of the GET above (BACKLOG #1184): `content`/`field_value` travel in the BODY so they never reach a URL, access log or browser history. Same gate, same shared implementation, so the PHI-read hop and budget are charged identically |
-| `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`) | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs |
+| `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`) | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/messages/{message_id}` | `messages:view_raw` | `require_phi_read` | per-property redaction of the wrapper **and** each nested `OutboxInfo`/`EventInfo`; returns **no body** (BACKLOG #2345); `summary` and `metadata` come back display-masked unless the request passes `reveal_summary=true`, and the `message_view` audit row lists the properties returned complete in `revealed` (BACKLOG #2346); the error text (`error`, each `outbox[].last_error`, each `events[].detail`) comes back as a fixed `****` mask unless the request passes `reveal_errors=true`, a separate act, recorded in `revealed` as `error`, `outbox.last_error` and `events.detail` (BACKLOG #2436) |
 | `GET` | `/messages/{message_id}/raw` | `messages:view_raw` | `require_phi_read` | the raw body, as its own act: writes a `message_body_view` audit row carrying a `surface`. An HTTP caller declares `harness`, `apiclient` or `api` (the default); the engine records `console` itself for the web console's in-process call, and the query parameter does not accept it (BACKLOG #2345) |
 | `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes, audited `attachment_download`; the handler's two 422 refusals (an undecodable stored value, an SVG it cannot sanitize) serve nothing and are audited `attachment_download_refused` with a `reason`; a request-validation 422 never reaches the handler and is not (BACKLOG #2387) |
@@ -1325,7 +1340,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/messages/{message_id}/resend` | `messages:resend` | `require_step_up_action` (action `message_resend`, vault BACKLOG #2625) | per-channel access to **both** the origin's and the alternate outbound's channel |
 | `POST` | `/messages/{message_id}/edit-resend` | `messages:edit` | `require_step_up_action` (action `message_edit_resend`, vault BACKLOG #2625) | implies `messages:view_raw`; the DIRECT `to` power-path additionally requires per-channel access to the alternate outbound's channel |
 | `GET` | `/dead-letters` | `messages:read` | `require_phi_read` | per-property redaction; per-channel scope |
-| `POST` | `/dead-letters/replay` | `messages:replay` | `require_step_up` | may return **202 + `approval_id`** under dual control |
+| `POST` | `/dead-letters/replay` | `messages:replay` | `require_step_up` | may return **202 + `approval_id`** under dual control; data rule: *Single-route data rules* below (BACKLOG #1151) |
 
 #### Search presets & layered search (PHI)
 
@@ -1457,6 +1472,13 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 `GET /ui/messages/{message_id}/parse-tree`, `GET /ui/messages/{message_id}/edit`,
 `GET /ui/uploaded-logs/file/{file_id}` and the three `/ui/account/webauthn/*` routes among them.
 
+**A `/ui` route that reads or changes engine data calls the engine's handler for it in-process,
+so it carries the same data rule as that handler's JSON route (BACKLOG #1151).** At least
+these do: the dashboard (`/ui`, `/ui/connections`), connection start, stop, restart, bulk control
+and flag, the message list, search and by-id pages, single-message replay and resend, and the
+dead-letter, alerts, events and monitoring pages. *Single-route data rules* below names more, and
+the console routes with a rule of their own.
+
 | Method | Path | Permission | Gate |
 |---|---|---|---|
 | `GET` | `/ui` | `monitoring:read` | `require_ui` |
@@ -1498,8 +1520,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/cluster/stepdown-confirm` | `cluster:control`**+**`monitoring:read` | `require_ui_step_up` |
 | `GET` | `/ui/config` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/config/reload` | `config:deploy` | `require_ui_step_up_action` |
-| `GET` | `/ui/connection/{name}` | `monitoring:read` | `require_ui` |
-| `GET` | `/ui/connection/{name}/events/{event_id}/reason` | `monitoring:read`**+**`messages:view_summary` | `require_ui` |
+| `GET` | `/ui/connection/{name}` | `monitoring:read` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `GET` | `/ui/connection/{name}/events/{event_id}/reason` | `monitoring:read`**+**`messages:view_summary` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/ui/connections` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/connections/bulk-control` | `connections:control` | `require_ui` |
 | `POST` | `/ui/connections/purge-bulk` | `messages:purge` | `require_ui_step_up_action` |
@@ -1740,7 +1762,7 @@ the same permission set on the same method reds CI until it is listed here.
 > scope sees an empty console, and the landing page says so in a sentence rather than leaving it to
 > read as broken RBAC; that is deliberately a page banner and not a start-time refusal, which would
 > make a fresh single-operator install unbootable for the same condition. A channel-scoped user
-> **cannot purge** a shared outbound (purge spans every inbound feeding it). **AD users** inherit
+> **cannot purge any outbound** (*Single-route data rules* below). **AD users** inherit
 > their scope from the `ad_group_scope_map` (`GET/PUT /ad-group-scope-map`; channel `*` = all; a
 > group is keyed by its full DN only, as the [AD-group to role map](#ad-group--role-mapping) says): on
 > login the group-derived scope is persisted — a wildcard row persists the explicit `["*"]` grant —
@@ -1837,16 +1859,51 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /events` with a `connection=` filter outside the scope answers 403 and is audited
 >   `auth.channel_denied`. Without the filter it returns only the caller's own connections, as the
 >   monitoring paragraph above says.
+> - `POST /connections/{name}/purge` answers 403 to every scoped caller, for any outbound and for a
+>   well-formed name that names none. That holds even when the scope lists every inbound that feeds the
+>   outbound, because a purge spans every inbound feeding it. Only an all-channels caller can
+>   purge. The refusal is audited `auth.channel_denied`.
+> - `POST /dead-letters/replay` from a scoped caller must name a `channel_id` in its scope. A
+>   replay with no `channel_id`, which would replay every channel, answers 403, and so does a
+>   `channel_id` outside the scope. Both refusals are audited `auth.channel_denied`. A
+>   `destination_name` only narrows a replay inside the channel it names.
+> - `GET /messages/export` and `POST /messages/export` read each selected message through the
+>   caller's scope before they stream it. An id in `ids` that is outside the scope is skipped, not
+>   refused: the export still answers 200 and leaves that row out. Each skipped row writes one
+>   `auth.channel_denied` row. An unknown id is skipped with no denial row. The `selected` count
+>   in the `messages_export` audit row still counts the skipped ids. How a scope change stops a
+>   running export is in *A revoked privilege reaches the next request* below.
+> - `POST /approvals/{approval_id}/approve` checks the requester's channel scope again before it
+>   releases a held request, by the rule the request route used. A held dead-letter replay needs
+>   a scope that still covers its `channel_id`, and a held replay of every channel needs an
+>   all-channels requester. A held purge needs a requester who is still all-channels. Otherwise
+>   the release answers 409, the request stays pending, and an `approval.stale_requester` row
+>   records the reason `requester_out_of_scope`.
+> - `GET /me/security-events` returns the `auth.*` rows recorded under the caller's username, and
+>   only those at or after the account's `created_at`. So an account does not see rows written
+>   under its name before it existed, such as a failed sign-in or a deleted account's history. The
+>   bound does not help when an account keeps its `created_at` while its name or holder changes.
+>   At least a directory rename onto the name does that.
+> - `GET /ui/connection/{name}` answers 404 for any name that is not a row on the caller's own
+>   dashboard. For a scoped caller that is an inbound outside its scope, any outbound, and a name
+>   that exists nowhere. That differs from the 403 the JSON per-name routes give, and it writes no
+>   `auth.channel_denied` row. Its reason page, `/ui/connection/{name}/events/{event_id}/reason`,
+>   shares the rule. On an in-scope page, a refused event read shows an empty event list.
 >
 > The console reaches the same rules, because its routes call these handlers in-process. That
 > covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
-> `/ui/alerts/{alert_id}/*` writes, `/ui/status` and `/ui/nav-status`. The console's preset
-> list, save and delete call the `/search/presets` handlers, so they carry those rows' owner rule.
-> One console difference: `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404
-> and redirects, so another user's preset id looks like one already deleted.
+> `/ui/alerts/{alert_id}/*` writes, `/ui/status`, `/ui/nav-status`, the two `/ui` purge POSTs, the
+> three `/ui/dead-letters` replay routes, the `/ui` approve route and `/ui/security-events`. The
+> console's preset list, save and delete call the `/search/presets` handlers, so they carry those
+> rows' owner rule. The console differs in at least these ways.
+> `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404 and redirects, so another
+> user's preset id looks like one already deleted. `/ui/connections/purge-confirm` checks the
+> purge rule itself, before any purge: a scoped caller gets its own 403 and denial row. The
+> `/ui/nav-status` alert bell is null without `monitoring:diagnose`.
 >
 > `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
-> all-channels caller as the control. It reds if a bullet loses its route, a named fact, or its
+> all-channels caller as the control. The security-event feed has no channel axis, so its control
+> is the raw audit log. It reds if a bullet loses its route, a named fact, or its
 > route-map pointer, or names a route nothing executes. It does not execute this console paragraph,
 > the outbound-by-name case, or the administrator case; those are read from the code.
 
@@ -2327,7 +2384,9 @@ route, and it would also refuse an honest directory approver whose engine row is
 sign-in.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
-flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
+flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves
+either out is named as a security loosening (vault BACKLOG #3123);
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what that gives up. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
 and do not satisfy this control.)
 
@@ -2803,8 +2862,9 @@ identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
 **rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
-opt-out**: when the instance is **exposed** (an off-loopback bind, or a declared TLS-terminating
-proxy, `[api].tls_terminated_upstream`) with `require_mfa` *turned off*, `serve` makes the
+opt-out**: when the instance is **exposed** (an off-loopback bind, a declared TLS-terminating
+proxy (`[api].tls_terminated_upstream`), or a set `[api].trusted_proxies`; vault BACKLOG #2251)
+with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** under `[security].enforcement = enforce`, the
 default in every environment, and **warns** otherwise or where
 `[security].allow_single_factor_admin_when_exposed` is set, mirroring the keyless-store and
@@ -3130,16 +3190,22 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The policy is applied** — `tests/test_field_authz_enforcement_sites.py` hits the redaction
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
-  `monitoring:diagnose` without it for the alert list). That `view_raw` role is one minting now
-  refuses (see [Custom roles](#custom-roles-adr-0045)), so this test lifts the pairing rule alone
-  to reach the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated
-  property comes back `null`. A companion assertion checks that an administrator sees all
-  fifteen, matched **per model, not per property name**, so the negative cannot pass vacuously.
-  That distinction is load-bearing: keyed on names, `last_error` looked covered by
-  `DeadLetterRow.last_error` on
-  `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
-  outbox row carries a non-null `last_error` is the dead-lettered one and its detail route was not in
-  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
+  `monitoring:diagnose` without it for the alert list). Minting now refuses that `view_raw` role
+  (see [Custom roles](#custom-roles-adr-0045)). So this test lifts the pairing rule alone to reach
+  the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated property
+  comes back `null`. It also reads each surface as an administrator, and checks two things there
+  (vault BACKLOG #2727). The administrator sees a gated value on that surface. And for each
+  model, the restricted response holds at least as many objects as the administrator saw carrying
+  one. So a surface that returns the restricted caller fewer objects of a model than that now
+  fails, where before it passed with nothing checked. That is a count per model. It does not
+  match object to object, so a surface that swaps the carrying rows for as many others of the
+  same model still passes. A companion assertion checks that an administrator sees all fifteen
+  across the surfaces, matched **per model, not per property name**. That distinction is
+  load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
+  `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message
+  whose outbox row carries a non-null `last_error` is the dead-lettered one and its detail route
+  was not in the surface list. It is now, and the coverage assertion is keyed on
+  `(model, property)` pairs.
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
@@ -3811,9 +3877,9 @@ The dual-control release re-checks the requester's standing too.
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235) describes that
 check and its directory gap.
 
-Two long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
+Three long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
 the route's permissions, no pending password change, a met second factor and a notification address
-on file. Neither asks again for a fresh step-up, the client-network check or the new-address check;
+on file. None asks again for a fresh step-up, the client-network check or the new-address check;
 those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
@@ -3848,6 +3914,15 @@ on that session, for example) ends it as a revocation would.
   stops reading or a store read is slow, the session sits idle. A single stall of about three
   quarters of the idle window can be enough. The next row's check then ends the session and the
   export.
+- The audit export (`GET /audit/export`, and the console's `/ui/audit/export`, which passes its
+  cookie session) asks before every page of up to 1,000 rows, not every row. A page is one store
+  read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the
+  bulk export bullet above says, with the reason `standing_changed`. The pages are read with the
+  identity the export started with. A caller that may now read fewer rows, as after losing
+  `users:manage`, would still receive the lock rows. So that stops it too, with the reason
+  `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  the reason, then aborts the transfer. The idle clock moves as the bulk export's does, at most
+  every quarter of the window.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
@@ -4916,7 +4991,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
 | Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged; it never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
-| Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`. Where that surfaces inside a delivery, as it does when a delivery mints its token, the message retries and then dead-letters like any other reply the engine could not read. At least a probe, the alert webhook and the AI broker report it to their own caller instead, and nothing retries those. **A REST, SOAP, FHIR or DICOMweb delivery that already holds a 2xx is the exception** (vault BACKLOG #2180, owner ruling 2026-10-05): a retry would send again a request the partner answered 2xx, so an over-cap body there is either dropped with a WARNING or refused for good with the code `reply-too-large`. The table under REST in [`CONNECTIONS.md`](CONNECTIONS.md) says which destination and mode does which. The ruling names the principle, which is to judge the body by who reads it, and not the FHIR cases that refuse; refusing those is a reading of it made when this was built, which the owner may reverse, and the note under that table says which rows it covers. A `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
+| Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`. Where that surfaces inside a delivery, as it does when a delivery mints its token, the message retries and then dead-letters like any other reply the engine could not read. At least a probe and the AI broker report it to their own caller instead, and nothing retries those. The alert webhook counts an over-cap body after a 2xx as delivered and logs a WARNING that carries no reply byte, because nothing reads that body (owner ruling 2026-10-12, vault BACKLOG #3040 item 1). **A REST, SOAP, FHIR or DICOMweb delivery that already holds a 2xx does not retry either** (vault BACKLOG #2180, owner ruling 2026-10-05): a retry would send again a request the partner answered 2xx, so an over-cap body there is either dropped or refused for good with the code `reply-too-large`. The table under REST in [`CONNECTIONS.md`](CONNECTIONS.md) says which destination and mode does which. The ruling names the principle, which is to judge the body by who reads it, and not the FHIR cases that refuse; refusing those is a reading of it made when this was built, which the owner may reverse, and the note under that table says which rows it covers. A `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped, and the step-up start `POST /ui/reauth/oidc` (`begin_oidc_step_up`) — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited` on the sign-in start; 429 re-rendering the step-up page, no `Retry-After`, on `POST /ui/reauth/oidc`; WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
 | **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one. The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. The DICOM intake carries no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. Bytes outside a frame count toward that deadline too (vault BACKLOG #2847 brought MLLP into line). [CONNECTIONS.md](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326) states when its clock starts and stops. |
@@ -5396,7 +5471,29 @@ amended 2026-10-06). One gap remains. The hop reads the file again by path when 
 context, so a file swapped after the check would be trusted until that connection is built again.
 A matching pin is no escape for a file whose permissions the engine cannot read.
 [CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin)
-states the checks once. `[tls].internal_ca_file` takes none of these checks yet.
+states the checks once.
+
+At least three settings name a CA that an engine hop dials with, and each takes the permission and
+change checks too (vault BACKLOG #3188): `[tls].internal_ca_file`, `[alerts].email_tls_ca_file` and
+`[logging].forward_tls_ca_file`. The engine checks each one at start and at every reload, but only
+while its hop reads it. That means the internal CA under `augment` or `pinned`, the email CA while
+an alert or security-notice sender verifies over TLS, and the syslog CA while logs are forwarded over
+verified TLS. Under `enforce`, a file another account could replace, or one whose permissions the
+engine cannot read, refuses the start or the reload. These settings take no pin.
+
+**The engine finds a swapped file at the next start or reload, not when a hop reads it.** Each hop
+reads the file again by path, on its own schedule. The SMTP hop reads it at every send, so a file
+swapped between reloads would be trusted by the next send. A connection that falls back to the
+internal CA reads it when the connection is built, and the syslog forwarder reads it once, at start.
+Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
+`restart_required` row for them. A changed syslog CA takes effect only at a restart.
+
+At least four readers sit before or outside the check. At start, the syslog forwarder and the alert
+notifier are built before the check runs, so an alert sent during startup, or the first forwarded
+records, would use a CA not yet checked. The `supervise` process builds its own forwarder and runs
+no check. The offline recovery commands send security notices over an SMTP hop with no check. The
+internal CA is checked under `augment` or `pinned` even when no hop reads it, because every hop is
+loopback or names its own `tls_ca_file`.
 
 ### PHI data-plane integrity residuals — scope-outs (#190, ADR 0093)
 

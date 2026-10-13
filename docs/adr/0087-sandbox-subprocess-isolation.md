@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -59,8 +59,9 @@ in-process, byte-identically and with zero overhead.
   the process boundary. Defence-in-depth on top: a **forbidden-import guard** (a `sys.meta_path`
   finder that denies `socket`/`ssl`/store/crypto/transports/api, with those already-cached modules
   purged so a cached import re-triggers it), a **parent-enforced wall-clock cap** (the authoritative
-  bound on every platform — the parent kills a worker that overruns it) plus a POSIX `RLIMIT_AS`
-  memory backstop inside the child where `resource` exists (a no-op on Windows). There is no
+  bound on every platform — the parent kills a worker that overruns it) plus a POSIX memory
+  backstop inside the child where `resource` exists (a no-op on Windows; on Linux `RLIMIT_DATA` as
+  headroom above the loaded graph, see the 2026-10-11 amendment below). There is no
   CPU-time limit beyond the wall cap (see "POSIX CPU limit dropped" below).
   The import guard is **defence-in-depth only** and must never be cited as a compensating control: a
   module imported before the finder goes up keeps a live reference (`urllib.request.socket` is the
@@ -120,8 +121,72 @@ cap (AC-4). `tests/test_sandbox.py::test_a_reused_worker_has_no_lifetime_cpu_bud
 change on POSIX.
 
 **What did not change.** `RLIMIT_AS` (`[sandbox].mem_mb`) is untouched and outside this ruling.
-Whether it stays is still open as vault BACKLOG #3133 part 2. `RLIMIT_CORE` stays at zero, so a
+Whether it stays is still open as vault BACKLOG #3133 part 2. (Part 2 was ruled on 2026-10-11; see
+the next section.) `RLIMIT_CORE` stays at zero, so a
 crashing worker that holds message bodies writes no core file.
+
+### Memory cap is headroom above the loaded graph (amendment, 2026-10-11)
+
+**The owner ruled on 2026-10-11 to keep a memory cap and change what it measures** (owner ruling
+2026-10-11, batch 290 Manager session, option "Amended fix"; vault BACKLOG #3133 part 2).
+
+**Why.** The worker set `RLIMIT_AS` to `mem_mb` once, right after `load_config` had built the
+graph. That had two faults. First, the cap covered the graph the worker had already loaded, so a
+graph near or above 512 MiB left little or no room for any call. Second, `RLIMIT_AS` counts address
+space, not memory in use. Each new thread gets a glibc malloc arena that reserves about 64 MiB of
+address space, and that reservation stays mapped after the thread exits. So even a cap measured from
+the post-load size became a lifetime budget. The review that proposed this fix measured it on WSL
+with Python 3.12 and glibc: seven joined threads used about 480 of 512 MiB of headroom while resident
+memory rose about 8 MiB.
+
+**What changed.**
+
+1. On Linux the worker reads its own `VmData` from `/proc/self/status` right after `load_config`.
+   It sets `RLIMIT_DATA` to that figure plus `mem_mb`. So `mem_mb` is headroom above the loaded
+   graph, and a large graph still starts.
+2. `RLIMIT_DATA` counts writable private memory. A thread arena's reservation is mapped with no
+   access and only becomes writable as it is used, so the reservation itself does not count. That
+   alone is not enough. Once an arena has grown, glibc trims it with `MADV_DONTNEED`, which leaves
+   the pages writable, so each arena's peak stays counted after its threads exit. So the parent
+   also starts the worker with `MALLOC_ARENA_MAX=2`: the main arena, which can give memory back, and
+   at most one thread arena, whose first heap holds at most 64 MiB. It is set only on Linux with
+   a cap configured. An operator value named in
+   `[sandbox].pass_environment` wins. A live thread's stack also counts, and glibc keeps up to
+   about 40 MiB of exited threads' stacks mapped for reuse. So threads can still hold about
+   100 MiB of the headroom, but no more, however many a worker starts.
+
+   The review measured the two halves as separate candidates on glibc, `RLIMIT_DATA` alone and
+   `MALLOC_ARENA_MAX=2` with `RLIMIT_AS`, with about the same result for its thread case. Both are
+   used because each closes what the other leaves open: `RLIMIT_AS` would still count reserved
+   address space outside malloc, and `MALLOC_ARENA_MAX` is a glibc setting that the free-threaded
+   build's mimalloc ignores. The engine ships on the GIL build
+   (`.github/workflows/freethread-smoke.yml`). **The choice was not measured again on Linux before
+   it was built.** The three tests below pin it on the hosted Linux leg.
+3. Elsewhere on POSIX, and on Linux before 4.7, `mem_mb` stays an absolute `RLIMIT_AS` cap, and
+   the worker logs a line saying so. Resident memory is never the baseline: it would leave
+   out memory the graph holds but has not touched.
+4. A `MemoryError` while the worker runs a call or encodes its result is answered with a `fail`
+   frame of kind `memory`, which names the cap. The worker then exits, and the parent reaps it, so
+   memory the call left held cannot fail a later message. The parent reports that the call ran
+   out of memory, with the worker's text naming the cap.
+
+**What this gives up.** `RLIMIT_DATA` does not count a shared mapping. Python's `mmap.mmap(-1, n)`
+makes one, so a call can allocate around the cap that way. It was never a bound against admin code
+that sets out to evade it; it is a backstop against a runaway. Linux before 4.7 counted only the
+`brk` heap against `RLIMIT_DATA`, so on those kernels the worker keeps the absolute `RLIMIT_AS`
+cap. A kernel booted with `ignore_rlimit_data` does not enforce it either, and the worker does not
+detect that. The free-threaded build was not measured: if its allocator maps memory writable
+before use, its reservations would count. Only a `MemoryError` recycles the worker. A call that fails in another way near the cap, such
+as a thread that cannot start, or a Handler that catches the `MemoryError` itself, keeps its worker.
+
+`tests/test_sandbox.py` pins the change on Linux; the absolute `RLIMIT_AS` arm has no test:
+`test_a_graph_larger_than_mem_mb_does_not_fail_an_innocent_call`,
+`test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker` and
+`test_threads_a_call_joined_do_not_spend_the_memory_cap`. In the thread test, four threads take
+turns growing malloc arenas, which the worker's `MALLOC_ARENA_MAX=2` makes them share. Its positive
+control, `test_without_the_arena_limit_threads_do_spend_the_memory_cap`, runs the same calls with
+`MALLOC_ARENA_MAX=64`, so each thread grows its own arena, and expects the innocent call after them
+to run out of memory. The control runs only on glibc, the GIL build, and overcommit not in mode 2.
 
 ### IPC codec (amendment — MFW2, replaces the pickle pipe)
 
@@ -339,6 +404,15 @@ target, no `pickle` import left to mis-suppress:
   SHALL be pinned by a test rather than left to drift. This is the one place `[sandbox].mode` is not
   transparent; it is a residual, not a guarantee — see "Out of scope / honest residuals".
   → `tests/test_sandbox.py::test_a_mutating_router_is_the_one_documented_mode_divergence`
+- **AC-16** — WHERE `[sandbox].mode=subprocess` on Linux, THE SYSTEM SHALL measure `[sandbox].mem_mb`
+  as headroom above the worker's memory once its graph is loaded, SHALL NOT count address space that
+  a joined thread only reserved, SHALL NOT let joined threads' malloc arenas keep more than two
+  arenas' peak counted, and IF a call runs out of memory THEN SHALL report the memory cap and start a
+  fresh worker for the next message (amendment of 2026-10-11).
+  → `tests/test_sandbox.py::test_a_graph_larger_than_mem_mb_does_not_fail_an_innocent_call`,
+  `tests/test_sandbox.py::test_a_runaway_allocation_hits_the_memory_cap_and_recycles_the_worker`,
+  `tests/test_sandbox.py::test_threads_a_call_joined_do_not_spend_the_memory_cap`,
+  `tests/test_sandbox.py::test_without_the_arena_limit_threads_do_spend_the_memory_cap`
 
 ## Options considered
 

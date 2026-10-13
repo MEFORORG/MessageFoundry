@@ -26,16 +26,18 @@ decrypt/verify), **MDN** disposition notifications, **DNS CERT / LDAP** certific
 
 **Fail-loud at construction** (the ``RestDestination``/``EmailDestination`` pattern): a missing
 host/sender/recipient, an unreadable/malformed signing key, cert, recipient cert, or trust anchor, a
-signing key that does not match its cert, a recipient cert whose key is not RSA, a trial S/MIME build
-that fails, or a cleartext-credential misconfiguration **raises here**, so it fails at
-``check``/dry-run/start — never as a wire-time surprise. The blocking crypto + SMTP
+signing key that does not match its cert, a recipient cert whose key is not RSA, key material of a
+type or strength off the floor (``_require_key_strength``), a trial S/MIME build that fails, or a
+cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start —
+never as a wire-time surprise. The blocking crypto + SMTP
 exchange runs off the event loop via ``asyncio.to_thread``.
 
 **STARTTLS posture is inherited from EMAIL.** The signed+encrypted S/MIME body already protects PHI at
 rest and in flight, but the SMTP session still carries envelope metadata (and any AUTH credentials), so
 TLS stays on by default; disabling it is refused unless the project-wide ``MEFOR_ALLOW_INSECURE_TLS``
-escape is set, and SMTP AUTH over cleartext is refused outright (the ``refuse_cleartext_credentials``
-rule). The ``[egress].allowed_direct`` allowlist is the authoritative fail-closed host gate (enforced
+escape is set on an instance at ``[security].enforcement = warn``, and SMTP AUTH over cleartext is
+refused outright (the ``refuse_cleartext_credentials`` rule). One part is not inherited: EMAIL also
+lets ``tls_hop_attested`` or ``cleartext_accepted`` cross this gate, and Direct reads neither. The ``[egress].allowed_direct`` allowlist is the authoritative fail-closed host gate (enforced
 by the runner at load/reload/start).
 
 **Idempotency.** Delivery is at-least-once, so a retry re-sends the S/MIME message; a Direct mailbox
@@ -58,7 +60,7 @@ from typing import Any
 from cryptography import x509
 from cryptography.exceptions import InternalError, InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 
@@ -177,9 +179,55 @@ _MIN_RSA_BITS = 2048
 #: pins the two equal. A change here changes that floor too, so it needs the same ruling.
 _APPROVED_EC_CURVES = frozenset({"secp256r1", "secp384r1", "secp521r1"})
 
+#: The EdDSA key types the floor admits with no size or curve check: each has one fixed size, and
+#: both are at or above 128-bit security. Listed so the floor's allowed key TYPES are the same four
+#: as the XML-DSig floor's (RSA, EC, Ed25519, Ed448; BACKLOG #3384), and a test pins the two sets.
+#:
+#: **On the list because Direct can carry them on one surface, the trust anchor.** Measured on the
+#: pinned ``cryptography`` (50.0.2): ``verify_directly_issued_by`` checks an RSA recipient cert
+#: issued by an Ed25519 or an Ed448 CA. The other two surfaces cannot use EdDSA, and each refuses it
+#: with its own type gate, which names the library limit rather than strength. ``recipient_cert``
+#: must be RSA because the envelope builder supports nothing else (BACKLOG #1918). ``signing_key``
+#: must be RSA or EC because ``add_signer`` raises ``TypeError: Only RSA & EC keys are supported at
+#: this time`` for any other key.
+_EDDSA_KEY_TYPES: tuple[type, ...] = (
+    ed25519.Ed25519PrivateKey,
+    ed25519.Ed25519PublicKey,
+    ed448.Ed448PrivateKey,
+    ed448.Ed448PublicKey,
+)
+
+
+#: The key types the floor admits, as an error message names them.
+_ALLOWED_KEY_TYPES_TEXT = "RSA, EC, Ed25519, Ed448"
+
+
+def _key_type_name(key: Any) -> str:
+    """A short, content-free name for a key's type, for an error message: ``DSAPublicKey`` becomes
+    ``DSA``. Only the class name is read, never the key material."""
+    if isinstance(key, (ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey)):
+        return "EC"
+    name = type(key).__name__
+    return name.removesuffix("PrivateKey").removesuffix("PublicKey") or name
+
+
+def _cert_public_key(cert: x509.Certificate, setting: str) -> Any:
+    """``cert.public_key()``, with a key algorithm ``cryptography`` cannot load refused as a
+    ``ValueError`` naming the setting. Unmapped, it raises ``UnsupportedAlgorithm`` ("Unknown key
+    type", measured on 50.0.2), which is not a ``ValueError`` and so escapes the construction
+    contract. A type nobody can read is not on the allow-list either (BACKLOG #3384)."""
+    try:
+        return cert.public_key()
+    except UnsupportedAlgorithm as exc:
+        raise ValueError(
+            f"Direct destination '{setting}' holds a key of a type this connector cannot read, so "
+            "it is not on the approved list for Direct S/MIME material "
+            f"({_ALLOWED_KEY_TYPES_TEXT})."
+        ) from exc
+
 
 def _require_key_strength(key: Any, setting: str) -> None:
-    """Refuse Direct S/MIME key material that parses and is the right shape but is too weak to use.
+    """Refuse Direct S/MIME key material that parses but is of a type or strength not allowed.
 
     Applied to all three operator-supplied surfaces. Two of them are counterparty-chosen -- the
     partner's ``recipient_cert`` and the issuing ``trust_anchor`` -- which is normally a reason for
@@ -187,28 +235,50 @@ def _require_key_strength(key: Any, setting: str) -> None:
     infrastructure rather than a tightening of ours. It is safe at THIS value for the reason recorded
     on :data:`_MIN_RSA_BITS`: no certificate policy governing Direct permits what it refuses.
 
-    A key type this connector cannot classify passes rather than raises. The floor exists to catch a
-    weak key of a KNOWN type; turning it into a second, silent type gate would refuse Ed25519 on a
-    day someone adds it, for a reason that has nothing to do with strength. The one type gate this
-    connector does have is separate and names its reason: ``recipient_cert`` must be RSA because the
-    envelope builder supports nothing else (BACKLOG #1918).
+    THE KEY TYPE IS ALLOW-LISTED, the same four types as the XML-DSig floor in
+    ``parsing/xml/signature.py`` (BACKLOG #3384):
+
+    - RSA passes at :data:`_MIN_RSA_BITS` or more.
+    - EC passes only on a curve in :data:`_APPROVED_EC_CURVES`.
+    - Ed25519 and Ed448 pass; :data:`_EDDSA_KEY_TYPES` says which surface can use them.
+    - DSA, and every other type, is refused at any size.
+
+    On ``recipient_cert`` (RSA only) and ``signing_key`` (RSA or EC only) a type gate runs first
+    and is stricter than this list, so there the floor checks RSA size and EC curve only. Each gate
+    names the one remedy that works on its surface. The type list does its own refusing on
+    ``trust_anchor``, the one surface that can carry every type on it.
+
+    This used to pass any type it could not classify, on the reasoning that a strength floor should
+    not also be a type gate. That reasoning let a DSA trust anchor through: measured before this
+    change, an RSA recipient cert issued by a 2048-bit DSA CA constructed cleanly. A floor that
+    passes what it has not considered is not a floor, so a type nobody listed is now refused by
+    construction, and adding one is a deliberate edit to this list.
     """
-    if isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)) and key.key_size < _MIN_RSA_BITS:
-        raise ValueError(
-            f"Direct destination '{setting}' is RSA-{key.key_size}, below the {_MIN_RSA_BITS}-bit "
-            f"floor for Direct S/MIME material (DirectTrust and the CA/Browser forum's S/MIME rules "
-            f"both require at least {_MIN_RSA_BITS}). Supply key material of at least "
-            f"{_MIN_RSA_BITS} bits."
-        )
-    if (
-        isinstance(key, (ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey))
-        and key.curve.name not in _APPROVED_EC_CURVES
-    ):
-        approved = ", ".join(sorted(_APPROVED_EC_CURVES))
-        raise ValueError(
-            f"Direct destination '{setting}' uses EC curve {key.curve.name!r}, which is not on "
-            f"the approved list ({approved}). Supply a key on an approved curve."
-        )
+    if isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)):
+        if key.key_size < _MIN_RSA_BITS:
+            raise ValueError(
+                f"Direct destination '{setting}' is RSA-{key.key_size}, below the "
+                f"{_MIN_RSA_BITS}-bit floor for Direct S/MIME material (DirectTrust and the "
+                f"CA/Browser forum's S/MIME rules both require at least {_MIN_RSA_BITS}). Supply "
+                f"key material of at least {_MIN_RSA_BITS} bits."
+            )
+        return
+    if isinstance(key, (ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey)):
+        if key.curve.name not in _APPROVED_EC_CURVES:
+            approved = ", ".join(sorted(_APPROVED_EC_CURVES))
+            raise ValueError(
+                f"Direct destination '{setting}' uses EC curve {key.curve.name!r}, which is not on "
+                f"the approved list ({approved}). Supply a key on an approved curve."
+            )
+        return
+    if isinstance(key, _EDDSA_KEY_TYPES):
+        return
+    raise ValueError(
+        f"Direct destination '{setting}' key type is {_key_type_name(key)}, which is not on the "
+        f"approved list for Direct S/MIME material ({_ALLOWED_KEY_TYPES_TEXT}). DSA is refused "
+        f"at any size. Supply an RSA key of at least {_MIN_RSA_BITS} bits, an EC key on an "
+        "approved curve, or an Ed25519 or Ed448 key."
+    )
 
 
 #: The RSA signature paddings an operator may select for the CMS SignerInfo, by ``signature_padding``
@@ -279,6 +349,21 @@ class DirectDestination(DestinationConnector):
             s.get("signing_key"), s.get("signing_key_password")
         )
         self._verify_signing_key_matches_cert()
+        # RSA or EC only, because the signer is. add_signer raises `TypeError: Only RSA & EC keys
+        # are supported at this time` for any other key (cryptography 50.0.2), so an Ed25519 or
+        # Ed448 signer, which the floor admits, would otherwise reach the build probe and be refused
+        # there in the library's words. Runs BEFORE the floor, like the recipient's RSA-only gate:
+        # it is stricter than the floor's type list, so it refuses DSA and unlisted types too, named
+        # by type, with the one remedy that works on this surface (BACKLOG #3384). After this line
+        # the signer is RSA or EC, which the padding check below relies on.
+        if not isinstance(self._signing_key, (rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey)):
+            kind = _key_type_name(self._signing_key)
+            raise ValueError(
+                f"Direct destination 'signing_key' key type is {kind}; "
+                "S/MIME signing here supports only RSA and EC signing keys, so every send would "
+                f"fail. Supply an RSA key of at least {_MIN_RSA_BITS} bits or an EC key on an "
+                "approved curve."
+            )
         # The signing cert's public half is compared byte-for-byte against this key just above, so
         # flooring the key covers the cert too -- they cannot differ by the time this runs.
         _require_key_strength(self._signing_key, "signing_key")
@@ -292,17 +377,22 @@ class DirectDestination(DestinationConnector):
         self._recipient_cert = _load_cert(
             "recipient_cert", _read_file("recipient_cert", s.get("recipient_cert"))
         )
-        recipient_key = self._recipient_cert.public_key()
+        recipient_key = _cert_public_key(self._recipient_cert, "recipient_cert")
         # RSA only, because the envelope is. The pinned cryptography's PKCS7EnvelopeBuilder raises
         # `TypeError: Only RSA keys are supported at this time` for any other recipient key, so an EC
         # cert would construct cleanly and then fail every send (BACKLOG #1918). The signer and the
-        # trust anchor are NOT restricted: add_signer and verify_directly_issued_by both take EC.
+        # trust anchor are not held to RSA, because add_signer and verify_directly_issued_by both
+        # take EC; they meet the floor's key-type allow-list instead (BACKLOG #3384).
+        #
+        # This gate runs BEFORE the floor on purpose. It is stricter than the floor's type list, so
+        # a DSA or unlisted recipient key is refused here, named by type, with the one remedy that
+        # works on this surface. Run the other way, an EC key on an unapproved curve would be told
+        # to move to an approved curve, and then be refused here.
         if not isinstance(recipient_key, rsa.RSAPublicKey):
-            kind = "EC" if isinstance(recipient_key, ec.EllipticCurvePublicKey) else "not RSA"
             raise ValueError(
-                f"Direct destination 'recipient_cert' key type is {kind}; S/MIME encryption here "
-                "supports only RSA recipient keys, so every send would fail. Supply the partner's "
-                "RSA encryption certificate."
+                f"Direct destination 'recipient_cert' key type is {_key_type_name(recipient_key)}; "
+                "S/MIME encryption here supports only RSA recipient keys, so every send would "
+                "fail. Supply the partner's RSA encryption certificate."
             )
         _require_key_strength(recipient_key, "recipient_cert")
         # Trust anchor — the CA(s) the recipient cert must chain to. Verified at construction so a cert
@@ -449,12 +539,14 @@ class DirectDestination(DestinationConnector):
         )
         if refusal is not None:
             raise ValueError(refusal)
+        # UnsupportedAlgorithm too: a key of a type cryptography cannot load raises it, and it is
+        # not a ValueError, so unmapped it would escape the construction contract (BACKLOG #3384).
         try:
             return serialization.load_pem_private_key(data, password=pw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, UnsupportedAlgorithm):
             try:
                 return serialization.load_der_private_key(data, password=pw)
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
                 # A wrong passphrase and a malformed key both surface here; do not distinguish (either
                 # way the operator must fix the setting) and never leak the material.
                 raise ValueError(
@@ -470,7 +562,7 @@ class DirectDestination(DestinationConnector):
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        cert_pub = self._signing_cert.public_key().public_bytes(
+        cert_pub = _cert_public_key(self._signing_cert, "signing_cert").public_bytes(
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
@@ -563,7 +655,7 @@ class DirectDestination(DestinationConnector):
         # be the one that issues this recipient. The loop below returns on the first match, so
         # checking inside it would leave a weak sibling anchor unexamined and still trusted.
         for anchor in anchors:
-            _require_key_strength(anchor.public_key(), "trust_anchor")
+            _require_key_strength(_cert_public_key(anchor, "trust_anchor"), "trust_anchor")
         for anchor in anchors:
             try:
                 # verify_directly_issued_by checks the issuer/subject name match AND that the anchor's

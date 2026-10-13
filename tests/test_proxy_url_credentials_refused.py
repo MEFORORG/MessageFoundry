@@ -221,9 +221,7 @@ def test_control_without_the_check_the_credentials_cross_in_cleartext(
     target: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Mutation control: the same opener and proxy, with the reading behind the refusal undone."""
-    monkeypatch.setattr(
-        bounded_read, "_sends_cleartext_proxy_credentials", lambda req, proxy, proxies: False
-    )
+    monkeypatch.setattr(bounded_read, "_sends_cleartext_proxy_credentials", lambda *a, **k: False)
     with _WireProxy() as proxy:
         value = f"http://{_CRED}@{proxy.address}"
         opener = build_strict_opener(urllib.request.ProxyHandler({"http": value, "https": value}))
@@ -293,7 +291,7 @@ def test_control_two_proxies_without_the_header_check_the_second_proxy_gets_the_
 ) -> None:
     """Mutation control for the reproduction: with the header reading undone, the check sees only
     each proxy's own URL, and the old leak comes back on the wire."""
-    monkeypatch.setattr(bounded_read, "_proxy_url_credentials", lambda proxies: set())
+    monkeypatch.setattr(bounded_read, "_proxy_credential_headers", lambda req: {})
     with _WireProxy() as a, _WireProxy() as b:
         _open_and_discard(_two_proxy_opener(a, b, credentialed="http"), _HTTP_TARGET)
     assert a.connections == 0
@@ -476,9 +474,7 @@ def test_control_without_the_check_an_at_sign_after_a_path_moves_the_proxy_host(
     """Mutation control for the ``at-sign-after-a-path`` shape above: with the reading undone,
     urllib dials the host after the ``@`` and sends it a credential header. The check reads the
     value with urllib's own parser, so it judges the proxy urllib would dial."""
-    monkeypatch.setattr(
-        bounded_read, "_sends_cleartext_proxy_credentials", lambda req, proxy, proxies: False
-    )
+    monkeypatch.setattr(bounded_read, "_sends_cleartext_proxy_credentials", lambda *a, **k: False)
     value = f"http://127.0.0.1:3128/x@{_PROXY_HOST}"
     dialled = _dial(build_strict_opener(urllib.request.ProxyHandler({"http": value})), _HTTP_TARGET)
     assert dialled.host == _PROXY_HOST
@@ -534,18 +530,6 @@ def test_a_proxy_url_credential_copied_onto_a_new_request_is_refused_at_a_plain_
     with pytest.raises(ProxyCredentialsRefusedError) as caught:
         opener.open(urllib.request.Request(_HTTPS_TARGET, headers=copied), timeout=1)
     _assert_fixed_refusal(caught.value)
-
-
-def test_control_a_proxy_header_the_caller_set_is_not_this_checks(recorded: None) -> None:
-    """A header no proxy URL in the opener would make, such as the one ``proxy_user`` builds, is
-    judged when the connection is built, by the posture-keyed guard. This check leaves it alone."""
-    opener = build_strict_opener(urllib.request.ProxyHandler({"https": f"http://{_PROXY_HOST}"}))
-    own = "Basic " + base64.b64encode(b"other:value").decode()
-    request = urllib.request.Request(_HTTPS_TARGET, headers={"Proxy-Authorization": own})
-    with pytest.raises(_Dialled) as dialled:
-        opener.open(request, timeout=1)
-    assert dialled.value.host == _PROXY_HOST
-    assert dialled.value.proxy_header == own
 
 
 def test_the_refusal_is_a_urlerror_that_copies_and_pickles(recorded: None) -> None:

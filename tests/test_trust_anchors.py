@@ -33,7 +33,14 @@ from messagefoundry.auth.trust_anchors import (
     owner_only_from_icacls,
     run_anchor_preflight,
 )
-from messagefoundry.config.settings import ApiSettings, AuthSettings, EgressSettings
+from messagefoundry.config.settings import (
+    AlertsSettings,
+    ApiSettings,
+    AuthSettings,
+    EgressSettings,
+    LoggingSettings,
+    TlsSettings,
+)
 from messagefoundry.store import MessageStore
 
 _posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits (icacls is the nt path)")
@@ -50,6 +57,17 @@ async def store(tmp_path: Path):
 def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each test starts with no consumer load recorded (BACKLOG #2185), whatever ran before it."""
     monkeypatch.setattr(ta, "_LOADED", {})
+
+
+def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
+    """:func:`collect_anchor_specs` with each dialling section at its default, which names no CA."""
+    return collect_anchor_specs(
+        auth,
+        api if api is not None else ApiSettings(),
+        tls=TlsSettings(),
+        alerts=AlertsSettings(),
+        log_settings=LoggingSettings(),
+    )
 
 
 def _pem(tmp_path: Path, body: bytes | None = None) -> Path:
@@ -792,12 +810,12 @@ def test_a_pin_does_not_excuse_an_anchor_anyone_can_replace(
 
 
 def test_collect_specs_dormant_when_unconfigured() -> None:
-    assert collect_anchor_specs(AuthSettings(), ApiSettings()) == []
+    assert _settings_specs(AuthSettings()) == []
 
 
 def test_collect_specs_includes_each_configured_anchor(tmp_path: Path) -> None:
     a = _pem(tmp_path, b"a")
-    specs = collect_anchor_specs(
+    specs = _settings_specs(
         AuthSettings(oidc_tls_ca_cert_file=str(a), ad_tls_ca_cert_file=str(a)),
         ApiSettings(tls_cert_file=str(a), tls_client_ca_file=str(a), tls_client_ca_pin="ab" * 32),
     )
@@ -1292,11 +1310,11 @@ def test_the_ad_anchor_has_the_pin_escape(tmp_path: Path, monkeypatch: pytest.Mo
     auth = AuthSettings(
         ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=hashlib.sha256(body).hexdigest()
     )
-    (spec,) = collect_anchor_specs(auth, ApiSettings())
+    (spec,) = _settings_specs(auth)
     assert spec.label == "ad"
     enforce_anchor(spec, enforcing=True)
     # The control: with no pin, the same unjudged anchor still refuses at enforce and offers the pin.
-    (unpinned,) = collect_anchor_specs(AuthSettings(ad_tls_ca_cert_file=str(p)), ApiSettings())
+    (unpinned,) = _settings_specs(AuthSettings(ad_tls_ca_cert_file=str(p)))
     with pytest.raises(TrustAnchorError) as err:
         enforce_anchor(unpinned, enforcing=True)
     text = str(err.value)
@@ -1316,7 +1334,7 @@ async def test_the_start_and_the_reload_refuse_an_ad_trusted_certificate_block_a
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     settings = _ad_settings(ad_tls_ca_cert_file=str(p))
-    (ad,) = collect_anchor_specs(settings, ApiSettings())
+    (ad,) = _settings_specs(settings)
     with pytest.raises(TrustAnchorError, match="trusted-certificate"):
         await run_anchor_preflight([ad], store, enforcing=True)
     with pytest.raises(TrustAnchorError, match="trusted-certificate"):
@@ -1456,7 +1474,7 @@ def _pinned_ad_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
     auth = AuthSettings(
         ad_tls_ca_cert_file=str(p), ad_tls_ca_cert_pin=hashlib.sha256(good).hexdigest()
     )
-    (spec,) = collect_anchor_specs(auth, ApiSettings())
+    (spec,) = _settings_specs(auth)
     return spec, p
 
 
@@ -1548,7 +1566,7 @@ async def test_a_reload_refuses_a_settings_anchor_swapped_for_a_crl(
     p.write_bytes(_block(b"good"))
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
-    (spec,) = collect_anchor_specs(AuthSettings(ad_tls_ca_cert_file=str(p)), ApiSettings())
+    (spec,) = _settings_specs(AuthSettings(ad_tls_ca_cert_file=str(p)))
     engine, cfg = await _anchored_engine(tmp_path, spec)
     try:
         await engine.reload_detail(cfg)  # the control: the real certificate goes live
@@ -1793,7 +1811,7 @@ async def test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart(
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     settings = _ad_settings(ad_tls_ca_cert_file=str(p))
     LdapAuthenticator(settings)  # the consumer: it loads the checked bytes and keeps them
-    (spec,) = collect_anchor_specs(settings, ApiSettings())
+    (spec,) = _settings_specs(settings)
     cfg = tmp_path / "cfg"
     _file_graph(cfg)
     app = create_managed_app(
@@ -2241,7 +2259,7 @@ async def test_a_set_anchor_nothing_loads_refuses_at_start_and_reload(
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     crl = tmp_path / "crl-only.pem"
     crl.write_bytes(_crl_only())
-    specs = collect_anchor_specs(AuthSettings(**unused(str(crl))), ApiSettings())
+    specs = _settings_specs(AuthSettings(**unused(str(crl))))
     assert len(specs) == 1
     cfg = tmp_path / "cfg"
     _file_graph(cfg)
@@ -2257,7 +2275,7 @@ async def test_a_set_anchor_nothing_loads_refuses_at_start_and_reload(
             pass
 
     for path in (crl, tmp_path / "gone.pem"):
-        (spec,) = collect_anchor_specs(AuthSettings(**unused(str(path))), ApiSettings())
+        (spec,) = _settings_specs(AuthSettings(**unused(str(path))))
         preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
         assert preflight is not None
         with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
@@ -2265,4 +2283,184 @@ async def test_a_set_anchor_nothing_loads_refuses_at_start_and_reload(
         assert isinstance(err.value.__cause__, TrustAnchorError)
 
     unset = {k: v for k, v in unused(str(crl)).items() if not k.endswith("_tls_ca_cert_file")}
-    assert collect_anchor_specs(AuthSettings(**unset), ApiSettings()) == []
+    assert _settings_specs(AuthSettings(**unset)) == []
+
+
+# --- the dialling settings CAs (vault BACKLOG #3188) ---------------------------------------------
+
+_SMTP: dict[str, Any] = {
+    "email_smtp_host": "smtp.example.org",
+    "email_from": "alerts@example.org",
+    "email_to": ["ops@example.org"],
+}
+_SYSLOG_TLS: dict[str, Any] = {"forward_host": "collector.example.org", "forward_protocol": "tls"}
+
+
+def _dialling_specs(
+    ca: str,
+    *,
+    tls: dict[str, Any] | None = None,
+    alerts: dict[str, Any] | None = None,
+    log_settings: dict[str, Any] | None = None,
+    auth: dict[str, Any] | None = None,
+) -> list[AnchorSpec]:
+    """:func:`collect_anchor_specs` with ``ca`` as the dialling CA of each section named."""
+
+    def with_ca(key: str, overrides: dict[str, Any] | None) -> dict[str, Any]:
+        return {} if overrides is None else {key: ca, **overrides}
+
+    return collect_anchor_specs(
+        AuthSettings(**(auth or {})),
+        ApiSettings(),
+        tls=TlsSettings(**with_ca("internal_ca_file", tls)),
+        alerts=AlertsSettings(**with_ca("email_tls_ca_file", alerts)),
+        log_settings=LoggingSettings(**with_ca("forward_tls_ca_file", log_settings)),
+    )
+
+
+#: Each case's hop reads its CA: (label, setting, the sections to build).
+_DIALLING_READ: dict[str, tuple[str, str, dict[str, Any]]] = {
+    "internal-augment": (
+        "tls_internal_ca",
+        "[tls].internal_ca_file",
+        {"tls": {"trust_anchor_mode": "augment"}},
+    ),
+    "internal-pinned": (
+        "tls_internal_ca",
+        "[tls].internal_ca_file",
+        {"tls": {"trust_anchor_mode": "pinned"}},
+    ),
+    "email-transport": ("alerts_email_ca", "[alerts].email_tls_ca_file", {"alerts": _SMTP}),
+    "email-notifier-only": (
+        "alerts_email_ca",
+        "[alerts].email_tls_ca_file",
+        {"alerts": {**_SMTP, "email_to": []}},
+    ),
+    "forward-tls": (
+        "logging_forward_ca",
+        "[logging].forward_tls_ca_file",
+        {"log_settings": _SYSLOG_TLS},
+    ),
+}
+
+#: Each case names a dialling CA that no hop reads, or reads into a context that verifies nothing.
+_DIALLING_UNREAD: dict[str, dict[str, Any]] = {
+    "internal-system": {"tls": {}},
+    "email-unset": {"alerts": {}},
+    "email-no-host": {"alerts": {**_SMTP, "email_smtp_host": None}},
+    "email-no-from": {"alerts": {**_SMTP, "email_from": None}},
+    "email-no-tls": {"alerts": {**_SMTP, "email_use_tls": False}},
+    "email-no-verify": {"alerts": {**_SMTP, "email_tls_verify": False}},
+    "email-no-recipient-no-notices": {
+        "alerts": {**_SMTP, "email_to": []},
+        "auth": {"notify_security_events": False},
+    },
+    "forward-off": {"log_settings": {**_SYSLOG_TLS, "forward_enabled": False}},
+    "forward-no-host": {"log_settings": {"forward_protocol": "tls"}},
+    "forward-udp": {"log_settings": {**_SYSLOG_TLS, "forward_protocol": "udp"}},
+    "forward-no-verify": {"log_settings": {**_SYSLOG_TLS, "forward_tls_verify": False}},
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DIALLING_READ))
+def test_a_dialling_settings_ca_is_collected_when_its_hop_reads_it(
+    tmp_path: Path, case: str
+) -> None:
+    """Red under: a section left out of :func:`collect_anchor_specs`. The spec carries no pin and
+    ``loads_verified_bytes=False``, since each hop loads the file again by path."""
+    label, setting, sections = _DIALLING_READ[case]
+    ca = str(_pem(tmp_path))
+    (spec,) = _dialling_specs(ca, **sections)
+    assert (spec.label, spec.setting, spec.path) == (label, setting, ca)
+    assert spec.pin is None and spec.loads_verified_bytes is False
+
+
+@pytest.mark.parametrize("case", sorted(_DIALLING_UNREAD))
+def test_a_dialling_settings_ca_its_hop_does_not_read_is_not_collected(
+    tmp_path: Path, case: str
+) -> None:
+    """The control for the case above: a CA no hop trusts is not checked, so a missing file
+    refuses nothing. Red under: a hop condition dropped from its spec builder."""
+    assert _dialling_specs(str(tmp_path / "gone.pem"), **_DIALLING_UNREAD[case]) == []
+
+
+@pytest.mark.parametrize("case", ["internal-augment", "email-transport", "forward-tls"])
+async def test_a_refused_dialling_settings_ca_refuses_the_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """A CA another account can write refuses the reload at ``enforce`` and writes its row. The
+    control: the same file with an owner-only ACL passes and writes its baseline. Red under: the
+    spec left out of the settings preflight."""
+    from messagefoundry.config.wiring import WiringError
+
+    label, _setting, sections = _DIALLING_READ[case]
+    acl: dict[str, bool] = {"ok": True}
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: acl["ok"])
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    specs = _dialling_specs(str(_pem(tmp_path)), **sections)
+    preflight = ta.make_settings_anchor_preflight(specs, store, enforcing=True)
+    assert preflight is not None
+    await preflight()
+    assert [r["event"] for r in await _rows(store, label)] == ["observed"]
+    acl["ok"] = False
+    with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert "acl_insecure" in [r["event"] for r in await _rows(store, label)]
+
+
+async def test_an_unjudged_dialling_settings_ca_refuses_at_enforce_and_warns_at_warn(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ACL the engine could not read refuses at ``enforce``. No pin can stand in for it, since
+    the hop reads the file again by path. ``warn`` passes with the row."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    specs = _dialling_specs(str(_pem(tmp_path)), log_settings=_SYSLOG_TLS)
+    with pytest.raises(TrustAnchorError, match="A pin does not help here"):
+        await run_anchor_preflight(specs, store, enforcing=True)
+    await run_anchor_preflight(specs, store, enforcing=False)
+    events = [r["event"] for r in await _rows(store, "logging_forward_ca")]
+    assert events.count("acl_indeterminate") == 2, events
+
+
+async def test_the_restart_report_skips_a_dialling_settings_ca(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No consumer records a fingerprint for these CAs, so a changed file writes a ``changed`` row
+    and no ``restart_required`` row."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    ca = _pem(tmp_path, _block(b"v1"))
+    specs = _dialling_specs(str(ca), tls={"trust_anchor_mode": "pinned"})
+    preflight = ta.make_settings_anchor_preflight(specs, store, enforcing=True)
+    assert preflight is not None
+    await preflight()
+    ca.write_bytes(_block(b"v2"))
+    await preflight()
+    events = [r["event"] for r in await _rows(store, "tls_internal_ca")]
+    assert sorted(events) == ["changed", "observed"], events
+
+
+async def test_a_refused_dialling_settings_ca_refuses_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The start path: ``serve`` hands these specs to the managed app, whose lifespan refuses."""
+    from messagefoundry.api.app import create_managed_app
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    specs = _dialling_specs(str(_pem(tmp_path)), alerts=_SMTP)
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        trust_anchor_specs=specs,
+        trust_anchors_enforcing=True,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
+        async with app.router.lifespan_context(app):
+            pass

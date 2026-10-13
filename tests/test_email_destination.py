@@ -949,6 +949,88 @@ def test_a_lone_surrogate_in_the_subject_is_refused_at_load(code: int) -> None:
     assert subject not in str(caught.value)
 
 
+#: RFC 2047 encoded words that hold no control character as text and decode to one. The first is
+#: the row's own example (vault BACKLOG #3206): the base64 is short, and the parser still reads NULs.
+_ENCODED_CONTROL_SUBJECTS = {
+    "utf16-nul": "=?utf-16?b?AAA?=",
+    "utf8-nul": "=?utf-8?b?AA==?=",
+    "del-mid-subject": "Referral =?utf-8?q?=7F?= note",
+    "carriage-return": "=?utf-8?q?a=0Db?=",
+    "crlf": "=?utf-8?q?a=0D=0ABcc:_x?=",
+    "next-line": "=?utf-8?q?=C2=85?=",
+    "line-separator": "=?utf-8?q?=E2=80=A8?=",
+}
+
+
+@pytest.mark.parametrize(
+    "subject", _ENCODED_CONTROL_SUBJECTS.values(), ids=_ENCODED_CONTROL_SUBJECTS.keys()
+)
+def test_an_encoded_word_subject_that_decodes_to_a_control_character_is_refused_at_load(
+    subject: str,
+) -> None:
+    # CONTROL for the instrument: as text the subject is clean, so only the header read can refuse
+    # it, and the header read does hold a control character.
+    assert not email_module._holds_control_char(subject)
+    probe = EmailMessage()
+    probe["Subject"] = subject
+    assert email_module._holds_control_char(str(probe["Subject"]))
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings["subject"] = subject
+    with pytest.raises(ValueError, match="'subject' holds an encoded word that decodes") as caught:
+        EmailDestination(dest)
+    assert subject not in str(caught.value)
+
+
+@pytest.mark.parametrize("subject", ["=?utf-16?b?AAA?=", "=?utf-8?b?AA==?=", "x =?utf-8?q?=7F?= y"])
+def test_the_refused_subject_would_have_put_a_raw_control_byte_on_the_wire(subject: str) -> None:
+    """What the load refusal prevents, measured on the email package itself: the generator writes
+    the decoded control character raw into the ``Subject:`` line."""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    [line] = [
+        raw
+        for raw in msg.as_bytes(policy=email.policy.SMTP).split(b"\r\n")
+        if raw[:8] == b"Subject:"
+    ]
+    assert b"\x00" in line or b"\x7f" in line, line
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "",
+        "Result ready",
+        "Result  ready ",  # runs of spaces and a trailing one read back unchanged
+        "=?utf-8?b?UsOpZg==?=",  # an encoded word that decodes to plain text is still allowed
+        "=?utf-8?b?AA==",  # not an encoded word (no closing ?=), so nothing decodes
+        "long " * 40,  # folded when written; the fold adds no control character to the value
+    ],
+)
+def test_a_subject_whose_header_read_is_clean_still_loads(subject: str) -> None:
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings["subject"] = subject
+    built = EmailDestination(dest)._build_message("PID|1|synthetic")
+    assert not email_module._holds_control_char(str(built["Subject"]))
+
+
+def test_a_subject_the_header_class_cannot_take_is_refused_at_load_by_type_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe sets the subject once at load, so a fault the header class raises is a load
+    refusal instead of a failure at every send (vault BACKLOG #3206, item 6a). The text checks
+    refuse every shape known to raise there, so they are switched off to reach the probe's arm."""
+    monkeypatch.setattr(email_module, "has_lone_surrogate", lambda _value: False)
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    subject = f"Referral {_LONE_SURROGATE} note"
+    dest.settings["subject"] = subject
+    with pytest.raises(ValueError, match="'subject' cannot be set as a header") as caught:
+        EmailDestination(dest)
+    text = str(caught.value)
+    assert "UnicodeEncodeError" in text
+    assert "Referral" not in text and "note" not in text
+    assert caught.value.__context__ is None, "the chain must not hold the error that names it"
+
+
 def test_a_non_ascii_subject_that_can_be_encoded_is_written_as_utf8() -> None:
     # The control for the test above: only the unencodable shape is refused. Serialized, because a
     # U+DC80 subject also builds and reads back equal, and goes wrong only when written.

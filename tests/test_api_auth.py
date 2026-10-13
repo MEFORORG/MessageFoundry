@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,7 +17,7 @@ import pytest
 from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
-from messagefoundry.api.security import deadline_utc
+from messagefoundry.api.security import ExportStopped, deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
@@ -80,7 +80,11 @@ _DEFAULT_PEER = ("127.0.0.1", 123)
 
 
 def _client(
-    engine: Engine, service: AuthService, *, peer: tuple[str, int] | None = None
+    engine: Engine,
+    service: AuthService,
+    *,
+    peer: tuple[str, int] | None = None,
+    raise_app_exceptions: bool = True,
 ) -> httpx.AsyncClient:
     """``peer`` pins the ASGI scope's client address; omitted, ``_DEFAULT_PEER`` stands.
 
@@ -97,14 +101,19 @@ def _client(
     The loopback default is not neutral for every gate, so do not read it as one:
     ``client_network_allowed`` fails CLOSED on a None client and allows any loopback spelling
     unconditionally. A test of ``[security].allowed_client_networks`` must therefore set ``peer``
-    explicitly rather than lean on either default."""
+    explicitly rather than lean on either default.
+
+    ``raise_app_exceptions=False`` returns the response an aborted stream sent so far, rather than
+    raising the abort, for a test that reads what a stopped export delivered."""
     transport = httpx.ASGITransport(
-        app=create_app(engine, auth=service), client=_DEFAULT_PEER if peer is None else peer
+        app=create_app(engine, auth=service),
+        client=_DEFAULT_PEER if peer is None else peer,
+        raise_app_exceptions=raise_app_exceptions,
     )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
-async def _add(service: AuthService, username: str, *roles: Role) -> None:
+async def _add(service: AuthService, username: str, *roles: Role) -> str:
     user_id = await create_local_user_chosen(
         service,
         username=username,
@@ -115,6 +124,7 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
         actor="test",
     )
     await _clear_must_change(service, user_id)
+    return user_id
 
 
 async def _clear_must_change(service: AuthService, user_id: str) -> None:
@@ -179,6 +189,29 @@ async def test_unauthenticated_is_rejected_but_health_is_open(engine: Engine) ->
         assert (await c.get("/health")).status_code == 200
         assert (await c.get("/stats")).status_code == 401
         assert (await c.get("/connections")).status_code == 401
+
+
+async def test_a_write_the_store_refuses_for_a_failing_seal_answers_409(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2592: a store refusal over a record that fails its integrity seal reaches the
+    caller as a 409 with a fixed text, never a 500 and never the row. The control is the same
+    request answering 200 before the refusal is planted."""
+    from messagefoundry.store.row_seal import RowSealError
+
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "viewer")).json()["token"]
+        assert (await c.get("/me/sessions", headers=_auth(token))).status_code == 200
+
+        async def refused(_user_id: str) -> list[Any]:
+            raise RowSealError("user")
+
+        monkeypatch.setattr(service, "list_sessions", refused)
+        r = await c.get("/me/sessions", headers=_auth(token))
+        assert r.status_code == 409
+        assert "integrity check" in r.json()["detail"]
 
 
 async def test_security_events_feed_lists_callers_auth_events(engine: Engine) -> None:
@@ -671,52 +704,6 @@ async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
     # The response.read row records that no body went out to the view_raw-only caller.
     reads = [dict(r) for r in await engine.store.list_audit(action="response.read")]
     assert any(r["actor"] == "rawonly" and '"body": false' in r["detail"] for r in reads), reads
-
-
-async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:
-    """vault BACKLOG #1187: the admin's own surface, POST and PUT /roles/custom, answers 400 with the
-    pairing message. Controls: a POST and a PUT keeping view_summary are accepted. A final listing
-    shows neither refusal wrote anything, name included."""
-    service = await _service(engine)
-    await _add(service, "adm", Role.ADMINISTRATOR)
-    async with _client(engine, service) as c:
-        h = _auth((await _login(c, "adm")).json()["token"])  # a fresh login is step-up fresh
-        refused = await c.post(
-            "/roles/custom",
-            headers=h,
-            json={"display_name": "Raw", "permissions": ["messages:read", "messages:view_raw"]},
-        )
-        assert refused.status_code == 400, refused.text
-        assert "messages:view_raw needs messages:view_summary" in refused.json()["detail"]
-        made = await c.post(
-            "/roles/custom",
-            headers=h,
-            json={
-                "display_name": "Raw and summary",
-                "permissions": ["messages:read", "messages:view_raw", "messages:view_summary"],
-            },
-        )
-        assert made.status_code == 201, made.text
-        role_url = f"/roles/custom/{made.json()['id']}"
-        both = ["messages:read", "messages:view_raw", "messages:view_summary"]
-        # PUT control: the same edit keeping view_summary is accepted.
-        kept = await c.put(role_url, headers=h, json={"display_name": "R", "permissions": both})
-        assert kept.status_code == 200, kept.text
-        # The refused edit drops view_summary and also renames; the 400's detail ties it to the
-        # pairing rule, and the listing below shows the rename did not land either.
-        edited = await c.put(
-            role_url,
-            headers=h,
-            json={
-                "display_name": "Changed",
-                "permissions": ["messages:read", "messages:view_raw"],
-            },
-        )
-        assert edited.status_code == 400, edited.text
-        assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
-        # Neither refusal wrote anything: one role, still holding view_summary.
-        listed = (await c.get("/roles/custom", headers=h)).json()
-        assert [(r["display_name"], r["permissions"]) for r in listed] == [("R", sorted(both))]
 
 
 def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:
@@ -1253,6 +1240,137 @@ async def test_audit_export_logs_a_stream_cut_short(
         ):
             await c.get("/audit/export?format=csv&actor=alice", headers=h)
     assert "audit export by auditor ended early: 2 of 7 rows sent" in caplog.text
+
+
+# --- BACKLOG #1154: the audit export resolves its caller again before every page ------------
+
+
+async def _export_with_mid_stream_act(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    role: Role,
+    act: Callable[[AuthService, str], Awaitable[None]],
+    *,
+    raise_app_exceptions: bool = False,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Export seven rows at a page of two, running ``act`` right after the SECOND page is read.
+
+    ``httpx.ASGITransport`` runs the whole response before it returns, so a change mid-export has
+    to be made from inside the stream. The first page is read at the gate and sent; the second is
+    read and not yet sent when ``act`` runs. Returns the CSV data lines and the stop rows."""
+    from messagefoundry.api import auth_routes
+
+    monkeypatch.setattr(auth_routes, "_AUDIT_EXPORT_PAGE", 2)
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    service = await _service(engine)
+    uid = await _add(service, "exporter", role)
+    real = engine.store.list_audit
+    fired = False
+
+    async def wrapped(**kw: Any) -> Any:
+        nonlocal fired
+        rows = await real(**kw)
+        if kw.get("before_id") is not None and not fired:
+            fired = True
+            await act(service, uid)
+        return rows
+
+    async with _client(engine, service, raise_app_exceptions=raise_app_exceptions) as c:
+        h = _auth((await _login(c, "exporter")).json()["token"])
+        monkeypatch.setattr(engine.store, "list_audit", wrapped)
+        try:
+            resp = await c.get("/audit/export?format=csv&actor=alice", headers=h)
+        finally:
+            monkeypatch.setattr(engine.store, "list_audit", real)
+    assert resp.status_code == 200  # the response had started; a stop is in the body
+    lines = [ln for ln in resp.text.splitlines() if ln]
+    assert lines[0] == "ts,actor,action,channel_id,client,detail"
+    stops = [
+        json.loads(r["detail"])
+        for r in await engine.store.list_audit(action="audit.export.stopped", limit=10)
+    ]
+    return lines[1:], stops
+
+
+async def _revoke(service: AuthService, uid: str) -> None:
+    await service.revoke_sessions_for_user(uid, actor="admin")
+
+
+async def test_audit_export_stops_after_the_page_a_revoke_lands_in(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revocation that lands after page one stops the export before page two, with one stop row
+    that holds counts only. Before BACKLOG #1154 the stream ran to the end of the trail under the
+    identity the gate resolved."""
+    data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, _revoke)
+    assert [float(ln.split(",")[0]) for ln in data] == [106.0, 105.0]
+    assert stops == [{"count": 7, "streamed": 2, "reason": "standing_changed"}]
+
+
+async def test_audit_export_stop_reaches_the_server_as_an_abort(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop leaves the app as a raise, so the client sees a failed download and not a short
+    file that looks complete."""
+    with pytest.raises(ExportStopped):
+        await _export_with_mid_stream_act(
+            engine, monkeypatch, Role.AUDITOR, _revoke, raise_app_exceptions=True
+        )
+
+
+async def test_audit_export_with_nothing_withdrawn_streams_every_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: the same hook with a harmless act sends all seven rows and records no stop, so
+    a re-check that refused every caller cannot pass the tests around it."""
+
+    async def nothing(_service: AuthService, _uid: str) -> None:
+        return None
+
+    data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, nothing)
+    assert len(data) == 7 and stops == []
+
+
+async def test_audit_export_stops_when_the_permission_is_withdrawn(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The role is changed in the store directly, so no session is revoked and only the per-page
+    re-check can carry the loss of ``audit:export``."""
+
+    async def demote(service: AuthService, uid: str) -> None:
+        await service.store.set_user_roles(uid, [Role.VIEWER.value])
+
+    data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, demote)
+    assert len(data) == 2
+    assert stops == [{"count": 7, "streamed": 2, "reason": "standing_changed"}]
+
+
+async def test_audit_export_stops_when_the_lock_rows_are_no_longer_readable(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An administrator who loses ``users:manage`` but keeps ``audit:export`` may no longer read
+    the lock rows the export started with, so it stops as a scope change."""
+
+    async def narrow(service: AuthService, uid: str) -> None:
+        await service.store.set_user_roles(uid, [Role.AUDITOR.value])
+
+    data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.ADMINISTRATOR, narrow)
+    assert len(data) == 2
+    assert stops == [{"count": 7, "streamed": 2, "reason": "scope_changed"}]
+
+
+async def test_audit_export_continues_when_the_lock_rows_become_readable(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other polarity: an auditor who gains ``users:manage`` loses nothing, because the pages
+    are read with the narrower start, so the export runs to the end."""
+
+    async def widen(service: AuthService, uid: str) -> None:
+        await service.store.set_user_roles(uid, [Role.ADMINISTRATOR.value])
+
+    data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, widen)
+    assert len(data) == 7 and stops == []
 
 
 async def test_audit_export_denied_to_unauthorized_role(engine: Engine) -> None:

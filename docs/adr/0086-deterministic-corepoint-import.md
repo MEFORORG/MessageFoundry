@@ -84,6 +84,13 @@ The importer treats every value as **untrusted data**: each value lifted into ge
 rendered through `json.dumps`, whose fully-escaped literal cannot break out into executable code
 (CLAUDE.md §5/§8). No new dependency — `json` parse + string codegen only.
 
+**(a.2) AMENDMENT 2026-10-12 — a JSON export's endpoints are emitted undeployed (BACKLOG #1130).**
+An escaped literal stops code injection, but the endpoint config
+itself is still the export's choice. A File `directory` is a whole path with no base to contain it
+in, so no fold or containment check fits, and an MLLP `port` or `host` is the same untrusted text.
+The JSON layer therefore emits every endpoint `deployed=False`, as the XML layer does, keeping each
+value as written for an operator to review before dropping the flag.
+
 ### (a′) AMENDMENT 2026-07-24 — the VALIDATED export format is XML
 
 A real Corepoint export was inspected (privately; nothing from it is in this repository — the fixtures

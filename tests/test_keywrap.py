@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 
-from messagefoundry import keywrap
+from messagefoundry import keywrap, pki
 from messagefoundry.keywrap import KeyWrapRefused, key_wrap_refusal
 from tests._approved_key_wrap import (
     AES256_CBC,
@@ -41,13 +41,18 @@ from tests._approved_key_wrap import (
     SCRYPT,
     _pfx_parts,
     approved_pfx,
+    cert_bag,
+    data_part,
+    encrypted_part,
     integer,
     octets,
     oid,
     pem,
+    pfx_of,
     pkcs8_pem,
     pkcs12_bundle,
     seq,
+    shrouded_key_bag,
     tlv,
     with_pbmac1,
     with_pkcs12_kdf_mac,
@@ -836,6 +841,262 @@ def test_a_pbmac1_mac_over_sha1_and_a_truncated_bundle_are_refused(material: Mat
     for bad, why in ((sha1_prf, "PBKDF2-HMAC-SHA-1"), (approved[:-4], "cannot read")):
         refusal = _p12_refusal(bad)
         assert refusal is not None and why in refusal
+
+
+# --- PKCS#12 key bags inside an encrypted part (BACKLOG #1352) ---------------------------------
+#
+# The check that reads a bundle's outside cannot see a key bag inside an EncryptedData part: that
+# part needs the passphrase to open. `pki.load_pkcs12` now opens each such part itself, after the
+# outside passes, and holds every key bag in it to the same floor before cryptography decrypts the
+# key. Why the part is opened rather than refused is recorded in keywrap, beside
+# pkcs12_encrypted_parts.
+
+_P12_PASSPHRASES = [pytest.param(b"synthetic-pfx", id="passphrase"), pytest.param(b"", id="empty")]
+
+#: A PKCS#12 PBE wrap, the SHA-1 PKCS#12 derivation (pbeWithSHAAnd3-KeyTripleDES-CBC). The checker
+#: reads only the wrap, so the ciphertext is a placeholder.
+_PKCS12_PBE_WRAP = _wrap_only(
+    seq(oid("1.2.840.113549.1.12.1.3"), seq(octets(b"s" * 8), integer(2048)))
+)
+
+
+def _epki_der(key: ec.EllipticCurvePrivateKey, passphrase: bytes, *, iterations: int) -> bytes:
+    """The DER EncryptedPrivateKeyInfo of a PBKDF2 wrap: HMAC-SHA-256 at 2048 (the library
+    default, under the floor) or HMAC-SHA-512 at anything else."""
+    prf = "sha256" if iterations == 2048 else "sha512"
+    text = pkcs8_pem(key, passphrase, prf=prf, iterations=iterations)
+    return base64.b64decode(b"".join(text.splitlines()[1:-1]))
+
+
+def _key_bag(material: Material, kind: str, passphrase: bytes) -> bytes:
+    if kind == "pkcs12-pbe":
+        return shrouded_key_bag(_PKCS12_PBE_WRAP)
+    iterations = {"pbkdf2-2048": 2048, "strong": 210_000}[kind]
+    return shrouded_key_bag(_epki_der(material.key, passphrase, iterations=iterations))
+
+
+def _nested(material: Material, kind: str, passphrase: bytes) -> bytes:
+    """A bundle whose certificate and ``kind`` key bag sit together in one AES-256-CBC
+    EncryptedData part at the PBKDF2 floor, with a PBMAC1 MAC at the floor: its outside passes."""
+    bags = (cert_bag(_p12_cert(material.key)), _key_bag(material, kind, passphrase))
+    return pfx_of(
+        encrypted_part(*bags, passphrase=passphrase, iterations=210_000), passphrase=passphrase
+    )
+
+
+class _Loaded(Exception):
+    """cryptography's PKCS#12 loader was reached."""
+
+
+@pytest.fixture
+def spy_p12_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    def reached(*_: object) -> None:
+        raise _Loaded
+
+    monkeypatch.setattr("messagefoundry.pki.pkcs12.load_key_and_certificates", reached)
+
+
+@pytest.mark.parametrize("kind", ["pbkdf2-2048", "pkcs12-pbe"])
+@pytest.mark.parametrize("passphrase", _P12_PASSPHRASES)
+def test_a_weak_key_bag_in_a_clear_part_is_refused(
+    material: Material, kind: str, passphrase: bytes, spy_p12_load: None
+) -> None:
+    # The control for the nested cases below: the same weak bag, in a clear Data part, was refused
+    # before this change by the outside check alone, and still is.
+    bags = (cert_bag(_p12_cert(material.key)), _key_bag(material, kind, passphrase))
+    bundle = pfx_of(data_part(*bags), passphrase=passphrase)
+    refusal = _p12_refusal(bundle)
+    assert refusal is not None and "holds a private key that" in refusal, refusal
+    with pytest.raises(KeyWrapRefused, match="holds a private key that"):
+        pki.load_pkcs12(bundle, passphrase)
+
+
+@pytest.mark.parametrize(
+    ("kind", "why"),
+    [
+        ("pbkdf2-2048", "PBKDF2-HMAC-SHA-256 at 2048 iterations"),
+        ("pkcs12-pbe", "PKCS#12 PBE scheme"),
+    ],
+)
+@pytest.mark.parametrize("passphrase", _P12_PASSPHRASES)
+def test_a_weak_key_bag_inside_an_encrypted_part_is_refused_before_it_loads(
+    material: Material, kind: str, why: str, passphrase: bytes, spy_p12_load: None
+) -> None:
+    bundle = _nested(material, kind, passphrase)
+    # The outside check alone still passes it: reaching the bag takes the passphrase.
+    assert _p12_refusal(bundle) is None
+    with pytest.raises(KeyWrapRefused) as refused:
+        pki.load_pkcs12(bundle, passphrase)
+    text = str(refused.value)
+    assert "has an encrypted part that holds a private key that" in text and why in text, text
+    assert "-pbmac1_pbkdf2" in text  # the re-export remedy
+    if passphrase:
+        assert passphrase.decode() not in text
+
+
+@pytest.mark.parametrize("passphrase", _P12_PASSPHRASES)
+def test_the_nested_weak_bag_is_real_so_the_gap_was_real(
+    material: Material, passphrase: bytes
+) -> None:
+    # Without the inner check, cryptography opens the nested 2048-iteration key: the refusal above
+    # stops a load that would otherwise succeed, not one that fails anyway.
+    key, cert, _ = pkcs12.load_key_and_certificates(
+        _nested(material, "pbkdf2-2048", passphrase), passphrase
+    )
+    assert key is not None and cert is not None
+
+
+@pytest.mark.parametrize("passphrase", _P12_PASSPHRASES)
+def test_a_strong_key_bag_inside_an_encrypted_part_still_loads(
+    material: Material, passphrase: bytes
+) -> None:
+    # The positive control. It also proves the inner decryption keys PBES2 off the passphrase's
+    # own bytes, empty or not: any other reading fails to decrypt and the load raises.
+    key, cert, _ = pki.load_pkcs12(_nested(material, "strong", passphrase), passphrase)
+    assert key is not None and cert is not None
+
+
+def test_the_reexport_shape_with_the_certificate_in_an_encrypted_part_still_loads(
+    material: Material,
+) -> None:
+    # The certificate in an AES-256-CBC EncryptedData part, the key in a shrouded bag in a clear
+    # part: the SHAPE OpenSSL 3's export writes. Its default parameters (2048 iterations and a
+    # PKCS#12-KDF MAC) are refused for other reasons; at the floor, which is what the re-export
+    # command the refusals give writes, the bundle must keep loading once the part is opened.
+    passphrase = b"synthetic-pfx"
+    bundle = approved_pfx(material.key, _p12_cert(material.key), passphrase)
+    key, cert, _ = pki.load_pkcs12(bundle, passphrase)
+    assert key is not None and cert is not None
+
+
+@pytest.mark.parametrize(
+    ("variant", "why"),
+    [
+        ("des-ede3-cbc", "a content cipher other than AES-CBC"),
+        ("scrypt", "a key derivation other than PBKDF2"),
+        ("not-data", "a content type other than Data"),
+        ("keylength", "a PBKDF2 key length that does not match its cipher"),
+    ],
+)
+def test_an_encrypted_part_this_engine_does_not_open_is_refused(
+    material: Material, variant: str, why: str, spy_p12_load: None
+) -> None:
+    # Fail closed: a part whose keys cannot be reached is refused, not handed to cryptography
+    # unchecked. Every one passes the outside check, which judges only the derivation.
+    passphrase = b"synthetic-pfx"
+    bags = (cert_bag(_p12_cert(material.key)), _key_bag(material, "strong", passphrase))
+    build: dict[str, Any] = {"passphrase": passphrase, "iterations": 210_000}
+    if variant == "scrypt":
+        scrypt = seq(oid(SCRYPT), seq(octets(b"s" * 16), integer(1 << 17), integer(8), integer(1)))
+        build["kdf"] = scrypt
+    elif variant == "des-ede3-cbc":
+        build["cipher"] = ("1.2.840.113549.3.7", 24)
+    elif variant == "not-data":
+        build["content_type"] = "1.2.840.113549.1.7.2"  # signedData
+    else:
+        build["key_length_field"] = 16  # AES-256-CBC wants 32
+    bundle = pfx_of(encrypted_part(*bags, **build), passphrase=passphrase)
+    assert _p12_refusal(bundle) is None
+    with pytest.raises(KeyWrapRefused) as refused:
+        pki.load_pkcs12(bundle, passphrase)
+    assert why in str(refused.value) and "does not open it" in str(refused.value)
+    _assert_no_chain(refused.value)
+
+
+def test_an_encrypted_part_that_does_not_parse_is_refused_by_both_steps(
+    material: Material,
+) -> None:
+    # A constructed [0] for the ciphertext is BER. Both steps read EncryptedData through one
+    # reader, so both refuse it as unreadable rather than one passing what the other cannot read.
+    passphrase = b"synthetic-pfx"
+    part = encrypted_part(
+        cert_bag(_p12_cert(material.key)),
+        passphrase=passphrase,
+        iterations=210_000,
+        content_tag=0xA0,
+    )
+    bundle = pfx_of(part, passphrase=passphrase)
+    outside = _p12_refusal(bundle)
+    assert outside is not None and "cannot read" in outside
+    with pytest.raises(KeyWrapRefused, match="cannot read") as refused:
+        keywrap.pkcs12_encrypted_parts(bundle, setting="s")
+    _assert_no_chain(refused.value)
+
+
+@pytest.mark.parametrize(
+    ("cipher", "key_length_field"),
+    [
+        pytest.param(("2.16.840.1.101.3.4.1.2", 16), None, id="aes-128-cbc"),
+        pytest.param(("2.16.840.1.101.3.4.1.22", 24), None, id="aes-192-cbc"),
+        pytest.param((AES256_CBC, 32), 32, id="aes-256-cbc-with-keylength"),
+    ],
+)
+def test_every_aes_cbc_part_size_still_loads(
+    material: Material, cipher: tuple[str, int], key_length_field: int | None
+) -> None:
+    # Positive controls for each cipher the hand-over accepts, and for a keyLength that agrees
+    # with its cipher. Each loads through cryptography, so the key sizes are the real ones.
+    passphrase = b"synthetic-pfx"
+    bags = (cert_bag(_p12_cert(material.key)), _key_bag(material, "strong", passphrase))
+    part = encrypted_part(
+        *bags,
+        passphrase=passphrase,
+        iterations=210_000,
+        cipher=cipher,
+        key_length_field=key_length_field,
+    )
+    key, cert, _ = pki.load_pkcs12(pfx_of(part, passphrase=passphrase), passphrase)
+    assert key is not None and cert is not None
+
+
+def test_the_hand_over_judges_the_floor_itself(material: Material) -> None:
+    # A part under the floor is refused by the outside check, and by the hand-over too, so a
+    # caller that skipped the outside check still cannot derive under the floor.
+    passphrase = b"synthetic-pfx"
+    part = encrypted_part(cert_bag(_p12_cert(material.key)), passphrase=passphrase, iterations=2048)
+    bundle = pfx_of(part, passphrase=passphrase)
+    outside = _p12_refusal(bundle)
+    assert outside is not None and "2048 iterations" in outside
+    with pytest.raises(
+        KeyWrapRefused, match="has an encrypted part that is wrapped with .* 2048"
+    ) as refused:
+        keywrap.pkcs12_encrypted_parts(bundle, setting="s")
+    _assert_no_chain(refused.value)
+
+
+def test_a_wrong_passphrase_on_an_encrypted_part_fails_without_echoing_it(
+    material: Material, spy_p12_load: None
+) -> None:
+    bundle = _nested(material, "strong", b"synthetic-pfx")
+    with pytest.raises(ValueError) as failed:
+        pki.load_pkcs12(bundle, b"not-the-passphrase")
+    assert "not-the-passphrase" not in str(failed.value)
+    assert "synthetic-pfx" not in str(failed.value)
+
+
+def test_pki_can_derive_with_every_prf_keywrap_hands_it() -> None:
+    # keywrap hands over a part only under a PRF OID its floor table approves; pki must map each
+    # one, or a new row there would fail every import with a generic error.
+    assert keywrap.PBKDF2_MIN_ITERATIONS and set(pki._PART_PRF) == set(
+        keywrap.PBKDF2_MIN_ITERATIONS
+    )
+
+
+def test_decrypted_contents_that_do_not_parse_point_at_the_passphrase() -> None:
+    # A wrong passphrase that leaves valid padding lands here, so the text names the setting to
+    # check and does not tell the operator to re-export a bundle that may be fine.
+    with pytest.raises(KeyWrapRefused) as refused:
+        keywrap.refuse_weak_pkcs12_contents(b"\x30\x05\x01", setting="s", unlock_setting="U")
+    text = str(refused.value)
+    assert "can read" in text and "check U" in text and "Re-export" not in text
+    _assert_no_chain(refused.value)
+
+
+def _assert_no_chain(refusal: BaseException) -> None:
+    # The refusals are raised after their handlers end, so both chain links are empty and nothing
+    # is left for a chain walker (BACKLOG #1796). This pins the chain only: the refusal's own
+    # traceback still reaches the frames that hold the bundle or the decrypted contents.
+    assert refusal.__cause__ is None and refusal.__context__ is None
 
 
 def _rsa_pem(bits: int, fmt: serialization.PrivateFormat, *, encrypted: bool = False) -> str:

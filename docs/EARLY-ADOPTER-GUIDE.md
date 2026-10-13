@@ -56,10 +56,13 @@ operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 
 **Who should pilot it now.** Teams who want a Python-native, open-source alternative to Mirth/Corepoint
 and who are comfortable validating a pre-1.0 tool against their own traffic before trusting it. A single
-engine node on a trusted network is the simplest pilot; **native TLS** (API + MLLP) and an opt-in
-**active-passive failover** cluster on a shared server-DB store (PostgreSQL or SQL Server) are both built when you need them (see
-§2/§6/§14). Native MFA (TOTP and passkeys), off-box log forwarding and the HL7 v2 de-identification
-framework are built too (§2). What is genuinely *not* there yet is listed in §2 — track those items
+engine node on a trusted network is the simplest pilot; an opt-in
+**active-passive failover** cluster on a shared server-DB store (PostgreSQL or SQL Server) is built when you need it (see
+§2/§14). One table in §2 says, for at least the main security controls, which are built, which
+are on by default and which are missing: the
+[security controls table](#security-controls-built-on-by-default-and-not-built).
+This section does not repeat it.
+What is genuinely *not* there yet is listed in §2 — track those items
 and pilot the parts that are ready. (Horizontal *active-active*
 scale-out was dropped and is not a planned milestone; active-passive HA is the supported HA model.)
 
@@ -68,9 +71,9 @@ scale-out was dropped and is not a planned milestone; active-passive HA is the s
 ## 2. Maturity & honest limitations — read before you plan
 
 MessageFoundry is solid for single-node production, and now also supports **opt-in active-passive
-failover** (a leader/standby cluster on a shared server-DB store — PostgreSQL or SQL Server; §14). The authoritative
-built-vs-roadmap references are [ARCHITECTURE.md](ARCHITECTURE.md) and the README "Roadmap" section —
-use the table below alongside them when planning.
+failover** (a leader/standby cluster on a shared server-DB store — PostgreSQL or SQL Server; §14).
+[ARCHITECTURE.md](ARCHITECTURE.md) describes the model in full. Use the tables below alongside it
+when planning. Security controls have a table of their own, the second one below.
 
 ### Built and production-ready
 
@@ -81,28 +84,48 @@ use the table below alongside them when planning.
 | **PostgreSQL** store backend (single-node) | ✅ Production-ready — full staged pipeline, at-rest encryption, retention; single-node parity with SQLite |
 | **Microsoft SQL Server** store backend (single-node) | ✅ Production-ready — full staged pipeline + response capture, at-rest encryption; needs the `sqlserver` extra + OS-level ODBC Driver 18. Engine-enforced retention/purge at full parity with SQLite; only WAL checkpoint / `VACUUM` / the DB-tier `.mfbak` snapshot are DBA-owned there. |
 | Transactional staged queue (ingress→routed→outbound), at-least-once, dead-letter, replay | ✅ Built — see [ADR 0001](adr/0001-staged-pipeline-architecture.md) |
-| Auth + RBAC + hash-chained audit log | ✅ Built — see [SECURITY.md](SECURITY.md) |
-| At-rest body encryption (AES-256-GCM, required by default: the engine refuses to start without a key unless you opt out) + key rotation | ✅ Built — see [PHI.md](PHI.md) |
 | MLLP / TCP / File connectors; REST / SOAP / Database destinations; Database poll source | ✅ Built — see [CONNECTIONS.md](CONNECTIONS.md) |
 | Validation & load tooling (`generate`, `check`, `dryrun`, the test harness, the load harness) | ✅ Built — see §8/§9 and [LOAD-TESTING.md](LOAD-TESTING.md) |
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
-| **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused; the API's self-signed placeholder from [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md) does not count). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
-| **Native MFA** (TOTP and passkeys, local and directory accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; while it is on, a directory session that proved no factor owes one under either `require_mfa_scope` value (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
-| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction, to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). The transport **default** is UDP. Under the default `[security].enforcement = enforce`, though, `serve` and `supervise` refuse to start without verified TLS forwarding to a collector on another host. That needs `forward_tls_ca_file` and, for the revocation check, `forward_tls_crl_file`. A loopback collector address does not count. Under `warn` the refusal is only a warning. The collector is an egress destination too: [`[egress].allowed_syslog`](CONFIGURATION.md#egress) says when an unlisted one is refused, under either enforcement value. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
+
+### Security controls: built, on by default, and not built
+
+**This table is where these facts are stated.** `README.md`, §1 and the opening of §6 of this
+guide, and two paragraphs of [PHI.md](PHI.md) (in §1 and §12) link here in place of their own
+lists. A test reads every row, most of them against the setting behind the row. If another page
+disagrees with a row, report it (§15).
+
+It holds at least the controls those pages used to list as built or as missing. It is not a full
+security inventory. [SECURITY.md](SECURITY.md) and [PHI.md](PHI.md) go further, and the last column
+names the page that documents each control. **Built is not the same as on**, so read the third
+column before you plan around a row.
+
+| Control | Status | Shipped default, or what to do instead | Documented in |
+|---|---|---|---|
+| **Sign-in, RBAC and the hash-chained audit log** | Built | Always on. `serve` always requires sign-in, and no setting turns it off. | [SECURITY.md](SECURITY.md) |
+| **At-rest body encryption** (AES-256-GCM) and key rotation | Built | Required. The engine refuses to start without a store key unless you take the audited opt-out. | [PHI.md §3](PHI.md#3-encryption-at-rest) |
+| **API TLS** (HTTPS/WSS, TLS 1.2 or later) | Built | Always served, with one exception. With no operator certificate the engine serves a self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). The exception is a declared TLS-terminating proxy with no operator certificate: the engine then speaks plain HTTP to that proxy. At the shipped `[security].enforcement = enforce`, a non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused, and the placeholder does not count. §6 says what `warn` changes. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **MLLP-over-TLS** (TLS 1.2 or later) | Built | Off. MLLP is plaintext until you set `tls = true` on the connection. At the shipped `[security].enforcement = enforce`, a non-loopback plaintext MLLP listener is refused. [PHI.md §4](PHI.md#4-data-in-transit) states the exceptions. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **mTLS** (API clients and MLLP partners) | Built | Off. API mTLS acts only once `[api].tls_client_ca_file` names a CA. An inbound MLLP connection asks for a client certificate only once its `tls_ca_file` names a CA. An outbound one presents a client certificate only once you give it `tls_cert_file`. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **Certificate revocation checking** | Built | Not on every hop. Where it is built, it reads a CRL file your PKI publishes. You name one per hop, for example `[logging].forward_tls_crl_file`. | [DEPLOYMENT.md](DEPLOYMENT.md#revocation-guard-behavior) says which hops are covered and which are not |
+| **Transport TLS for raw TCP and X12** | Not built | Those two connectors are plaintext only. Keep them on loopback, or put a TLS-terminating proxy in front. | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| **Native second factor** (TOTP and passkeys, local and directory accounts) | Built | On. `[security].require_mfa` enforces a second factor as an access gate on every authorized route. An OIDC session can meet it on the identity provider's MFA claim, which the engine checks while `[auth].oidc_require_mfa_claim` is on, the default. | [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states which sessions owe an engine factor |
+| **Off-box log and audit forwarding** | Built | No collector is named, so nothing is forwarded until `[logging].forward_host` names one. `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction, to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). The transport **default** is UDP. Under the default `[security].enforcement = enforce`, though, `serve` and `supervise` refuse to start without verified TLS forwarding to a collector on another host. That needs `forward_tls_ca_file` and, for the revocation check, `forward_tls_crl_file`. A loopback collector address does not count. Under `warn` the refusal is only a warning. The collector is an egress destination too: [`[egress].allowed_syslog`](CONFIGURATION.md#egress) says when an unlisted one is refused, under either enforcement value. | [PHI.md §7](PHI.md#7-logging--phi-redaction) |
+| **PHI redaction of the logs** | Built | Always on, for every log handler, the forwarder included. It is best-effort, so keep the level at `INFO` or above. | [PHI.md §7](PHI.md#7-logging--phi-redaction) |
+| **HL7 v2 de-identification framework** | Built | A tool you run to build test datasets (`python -m tee anonymize-captures`, the test harness). HL7 v2 only; other formats are not covered yet. | [PHI.md §9](PHI.md#9-de-identification) |
+| **De-identification on the AI-assist path** | Not built | The AI assistant's `deidentified` scope falls back to `code_only`. | [AI.md](AI.md) |
 
 ### Experimental or not yet built — **do not depend on these for a production pilot**
 
 | Capability | Status & implication |
 |---|---|
-| **Transport TLS for raw TCP / X12** | ❌ Not built — those two connectors are plaintext-only; keep them on loopback or front with a TLS-terminating proxy. (API + MLLP **do** have native TLS — see §6/[DEPLOYMENT.md](DEPLOYMENT.md).) |
 | **`ack_after=delivered`** (defer the ACK until downstream delivery) | ❌ Not built — requesting it is rejected at config load. Only **ACK-on-receipt** exists, so a routing/transform/delivery failure happens **after** the sender was already told `AA` and will **not** NAK back. Operators rely on the message disposition + alerts, not the ACK. |
-| **De-identification on the AI-assist path** | ❌ Not built. The AI assistant's `deidentified` scope falls back to `code_only`. The de-identification framework itself is built for HL7 v2 ([ADR 0030](adr/0030-anonymization-test-harness-tee.md), `messagefoundry/anon/`) and builds test datasets; other formats are not covered yet. |
 | **In-place SQLite → server-DB migration** | ❌ Not built. Server-DB deployments are **greenfield only** — there is no automatic carry-over of SQLite history. Drain and cut over deliberately (§13). |
 | **A throughput guarantee for your hardware** | **CAUTION:** By design. A baseline + tuning method is **published** ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), Gate #3) as a two-tier gate — host-independent **conformance** invariants (hard) + **performance** numbers *"as measured on the reference config"*. Because the durable-write path is hardware-dependent, those msg/s are not a promise for your box. **Measure on your own hardware** (§9). |
 
-**The early-adopter bargain, stated plainly:** you get a durable engine with native TLS, real auth,
-opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
+**The early-adopter bargain, stated plainly:** you get a durable engine, the controls the
+[security controls table](#security-controls-built-on-by-default-and-not-built) marks built, opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
 your own hardware and working around the pieces §2 lists as not built yet. If that trade is acceptable, the rest of this guide is your playbook.
 
 ---
@@ -297,9 +320,11 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 >   patient data ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
 >
 > The refuse/warn severity of the PHI serve-gate ladder is the `[security].enforcement` dial (default
-> `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind you hit only the
-> keyless-PHI refusal above — the off-loopback exposure rungs (TLS, MFA-at-exposure, …) need a non-loopback
-> bind, and MFA-at-exposure also fires on a loopback bind behind a declared or trusted proxy. Set `[security].enforcement = warn` to downgrade the PHI refusals to loud, audited warnings during
+> `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind with no proxy
+> declared or trusted you hit at least the keyless-PHI refusal above, and none of the exposure rungs. Those need an exposed
+> instance: a non-loopback bind, or a loopback bind behind a declared or trusted proxy
+> (`[api].tls_terminated_upstream` or `[api].trusted_proxies`). At least the MFA-at-exposure rung fires on
+> each of those. Which other rungs fire depends on which of them you have. Set `[security].enforcement = warn` to downgrade the PHI refusals to loud, audited warnings during
 > local bring-up.
 
 ### 4.4 Run it as a Windows service (the supported production run-mode)
@@ -310,7 +335,7 @@ required:
 
 ```powershell
 # from an elevated shell
-scripts\service\install-service.ps1 -Environment prod -ServiceAccount "NT SERVICE\MessageFoundry"
+scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
 
 The installer is idempotent, auto-downloads a SHA-256-pinned NSSM, bakes absolute `serve` paths into
@@ -330,7 +355,7 @@ engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by na
 
 ### 4.5 Provision the first administrator
 
-Auth is **enabled by default**, and **the engine creates no account on its own**. Until you create the
+Sign-in is **always required**, and **the engine creates no account on its own**. Until you create the
 first Administrator, nobody can manage the engine. At the shipped posture a start with no Administrator
 is refused. If a start goes ahead without one, a Windows sign-in (Kerberos), where configured, can
 still create a directory account, but that account holds no role. Create the
@@ -415,10 +440,10 @@ Guidance for a clean first flow:
 ## 6. Security & PHI hardening before real data
 
 Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DEPLOYMENT.md](DEPLOYMENT.md)**
-(network exposure). MEFOR ships real auth, RBAC, audit, at-rest encryption, off-box log forwarding,
-and **native TLS** (API + MLLP, with a fail-closed off-loopback bind guard). Its native second factor
-is on by default, and the engine refuses to start without a store encryption key unless you opt
-out. The remaining transport gaps include **raw TCP and X12**, which have no native TLS. Complete this checklist **before any real PHI flows**:
+(network exposure). For at least the main controls, what is built, what is on by default and what
+is missing is in the
+[security controls table](#security-controls-built-on-by-default-and-not-built) in §2. The steps
+below are what you do about it. Complete this checklist **before any real PHI flows**:
 
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,
@@ -432,15 +457,13 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       works only under `[security].enforcement = warn`. It serves bearer tokens and PHI behind that
       placeholder. No trust store vouches for the placeholder. So an on-path attacker can pose as the
       engine to any client that has not pinned it.
-      (`serve` always requires sign-in; there is no switch that turns it off.)
-- [ ] **MLLP off-loopback requires native TLS too.** MLLP-over-TLS is built: set `tls = true` +
-      `tls_cert_file`/`tls_key_file` per connection (opt-in mTLS via `tls_ca_file`; ≥ TLS 1.2). MLLP is
-      **plaintext by default**, and a non-loopback plaintext MLLP bind is refused. **Raw TCP and X12 have
-      no transport TLS** — keep them on a trusted segment or proxy-terminate. Full matrix:
-      [DEPLOYMENT.md](DEPLOYMENT.md).
+- [ ] **MLLP off-loopback requires native TLS too.** Set `tls = true` +
+      `tls_cert_file`/`tls_key_file` per connection (opt-in mTLS via `tls_ca_file`; ≥ TLS 1.2).
+      **Keep raw TCP and X12 on a trusted segment, or proxy-terminate them**; the §2 table says
+      why. Full matrix: [DEPLOYMENT.md](DEPLOYMENT.md).
 - [ ] **Give at-rest encryption its key and make it mandatory:** mint a key with `messagefoundry gen-key`
       (or a Windows DPAPI-protected key file via `messagefoundry protect-key`) and set
-      `MEFOR_STORE_ENCRYPTION_KEY`. The engine already refuses to start without one by default. Also
+      `MEFOR_STORE_ENCRYPTION_KEY`. The §2 table says what a start with no key does. Also
       set `[store].require_encryption = true`, so the audited opt-out
       (`[security].allow_unencrypted_phi`) cannot start it unencrypted either.
 - [ ] **Enable volume encryption (BitLocker/LUKS).** App-level encryption protects message *bodies*;
@@ -456,14 +479,15 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       a directory account's engine TOTP and recovery codes and its step-up re-binds. A locked
       account cannot sign in by Windows SSO or OIDC ([the lockout rule](SECURITY.md#authentication-pathways--comparative-strength)).
       Keep the engine's **native second factor**
-      (`[security].require_mfa`, WP-14, **on by default**) on. It covers directory accounts too:
+      (`[security].require_mfa`, WP-14) on. It covers directory accounts too:
       a Kerberos session owes an engine factor even when your directory enforces its own MFA
       ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)).
-- [ ] **Populate the fail-closed `[egress]` allowlist** (it defaults to unrestricted) for REST/Database
-      destinations.
+- [ ] **Populate the fail-closed `[egress]` allowlist** for REST/Database
+      destinations. [CONFIGURATION.md](CONFIGURATION.md#egress) says what `serve` does with an
+      empty list.
 - [ ] **Keep logging at `INFO` or above** and `expose_docs` off in production. Full payloads are never
-      logged at INFO+ by design, but PHI-log-redaction of chained-exception traceback text is not yet
-      fully closed — **do not raise the service to DEBUG with real PHI**.
+      logged at INFO+ by design, and log redaction is best-effort
+      ([PHI.md §7](PHI.md#7-logging--phi-redaction)) — **do not raise the service to DEBUG with real PHI**.
 - [ ] **Author routers/handlers so they never interpolate raw HL7 into an exception message** (it can
       surface in `last_error`/`detail`).
 - [ ] Run **`messagefoundry audit-verify`** periodically (the audit log is tamper-*evident*, not
@@ -711,7 +735,7 @@ incumbent's outcomes for the same messages.
 partner / one low-volume interface).
 
 **Prereqs:** switch to **Postgres (single-node)** if you need a server DB; **encryption on**
-(`require_encryption=true`); **alerts wired** and **monitoring in place** (§12); **backups automated**;
+(a store key set, and `require_encryption=true` so the audited opt-out cannot lift the refusal); **alerts wired** and **monitoring in place** (§12); **backups automated**;
 **upgrade + rollback runbook validated on staging** (§13).
 
 **Exit criteria (→ Stage 3):**

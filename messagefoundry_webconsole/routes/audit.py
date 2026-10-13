@@ -22,6 +22,7 @@ from messagefoundry.auth.service import AuthService
 from .. import pages
 from .._auth import (
     require_ui,
+    session_token,
 )
 from .._service import _service
 
@@ -65,7 +66,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # handler, so the CSV, its lock-row exclusion, its audit.export row and its X-Audit-Withheld
     # header are that route's. The filters are declared with the same types GET /audit/export uses,
     # because an in-process call skips the handler's own validation. Every argument is passed
-    # explicitly, for the reason _audit_ui_list gives about Query sentinels.
+    # explicitly, for the reason _audit_ui_list gives about Query sentinels. ``token`` is the
+    # cookie session, which the handler resolves again before each page it sends (BACKLOG #1154).
     @app.get("/ui/audit/export")
     async def ui_audit_export(
         request: Request,
@@ -87,6 +89,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             action=action,
             since=since,
             until=until,
+            token=session_token(request),
         )
         return response
 

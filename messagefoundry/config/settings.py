@@ -145,6 +145,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "settings_file_path",
     "settings_error_detail",
     "keyless_opt_out_refusal",
     "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
@@ -745,8 +746,9 @@ class StoreSettings(_Section):
     aad_bind: bool = True
     # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
     # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
-    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
-    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # seals legacy plaintext only on a (table, column) surface that is still unsealed: not yet
+    # recorded in `keyed_surface` and holding no ciphertext (BACKLOG #3383). So a non-blank unmarked
+    # value on a sealed surface is a stripped marker or a planted row -- the cipher
     # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
     # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
     # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
@@ -1422,9 +1424,10 @@ class ApiSettings(_Section):
     def host_is_browser_origin(self) -> bool:
         """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
         engine off-box or through a proxy. ``serve`` reads it for the console exposure checks
-        (BACKLOG #2218) and as ``instance_exposed``, the single exposure test its refusing arms read:
-        MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251). A change to
-        :func:`request_host_is_browser_origin` therefore moves those security refusals too."""
+        (BACKLOG #2218) and as ``instance_exposed``, the single exposure test at least three of its
+        arms read: MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251).
+        They do not all refuse, and each arm in ``serve`` says what it does. A change to
+        :func:`request_host_is_browser_origin` therefore moves those refusals and warnings too."""
         return request_host_is_browser_origin(
             loopback=self.is_loopback,
             trusted_proxies=self.trusted_proxies,
@@ -1646,8 +1649,10 @@ class ApiSettings(_Section):
                 "[api].trusted_proxies requires [api].tls_terminated_upstream = true, or an "
                 "operator [api].tls_cert_file if the proxy re-encrypts to the engine. Without "
                 "either, a proxy forwarding X-Forwarded-Proto 'http' makes the web console issue "
-                "its session cookie without Secure (BACKLOG #2055). A declared terminator is an "
-                "exposed posture: see docs/CONFIGURATION.md for what serve then requires."
+                "its session cookie without Secure (BACKLOG #2055). Either route is an exposed "
+                "posture, on a loopback bind too: a set [api].trusted_proxies counts as exposed "
+                "with or without a declared terminator. See docs/CONFIGURATION.md for what serve "
+                "then requires."
             )
         # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
         # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
@@ -2135,7 +2140,11 @@ class SandboxSettings(_Section):
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
     # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
     wall_seconds: float = Field(default=5.0, gt=0)
-    # POSIX-only RLIMIT_AS address-space cap (MiB) inside the child (no-op on Windows). None disables it.
+    # POSIX-only memory cap (MiB) inside the child (no-op on Windows). None disables it. On Linux it is
+    # HEADROOM above the loaded graph: RLIMIT_DATA at the worker's VmData after load_config, plus this,
+    # with MALLOC_ARENA_MAX=2 so thread arenas cannot keep spending it.
+    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it dead-letters and its
+    # worker is recycled (ADR 0087, amendment of 2026-10-11).
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
@@ -2189,8 +2198,10 @@ class DiagnosticsSettings(_Section):
     #   "all"    — record every event (the default; unchanged behavior).
     #   "errors" — drop routine success events (received/delivered/replayed); keep the compliance floor.
     #   "off"    — keep ONLY the compliance floor.
-    # COMPLIANCE FLOOR (retained at EVERY level, even "off"): `viewed` (a PHI-access record — the HIPAA
-    # message-view trail must never be dropped) and the terminal failure events `dead`/`error`/`failed`.
+    # COMPLIANCE FLOOR (retained at EVERY level, even "off"): at least `viewed` (a PHI-access record —
+    # the HIPAA message-view trail must never be dropped) and the terminal failure events
+    # `dead`/`error`/`failed`. The full set is `_AUDIT_FLOOR_EVENTS` in store/store.py, and
+    # docs/PHI.md section 7 row 6 lists it.
     message_events: Literal["all", "errors", "off"] = "all"
     # ASVS 16.3.2 (BACKLOG #244; default flipped ON by BACKLOG #1277). Audit EVERY authorization GRANT,
     # not just the sensitive/state-changing set. Setting it false narrows the trail back to that set
@@ -8299,13 +8310,14 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
 
 def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]:
-    """The ``[approvals]`` dual-control limits set LOOSER THAN THEIR SHIPPED DEFAULT, as
-    ``(switch, risk)`` entries for :func:`security_loosenings` (BACKLOG #2489; ASVS 2.3.5, 2.4.2).
+    """The ``[approvals]`` dual-control limits and held list set LOOSER THAN THEIR SHIPPED DEFAULT,
+    as ``(switch, risk)`` entries for :func:`security_loosenings` (BACKLOG #2489; ASVS 2.3.5, 2.4.2).
 
     It reads them as :func:`_auth_limit_loosenings` reads the ``[auth]`` limits: the shipped default
     is the cutoff, a stricter value is never named, and a part of a control is named only while the
-    control is built. Dual control ships OFF, so nothing here is named until ``enabled`` is on with
-    at least one operation held. Switching it off again is the shipped posture, not a loosening.
+    control is built. Dual control ships OFF, so nothing here is named until ``enabled`` is on, and
+    its two limits only with at least one operation held. Switching it off again is the shipped
+    posture, not a loosening.
 
     The direction is read from ``ApprovalGate``. Its dwell check skips a ``min_dwell_seconds`` of 0
     and refuses an approve younger than the floor, so a floor below the default is looser. Its
@@ -8315,13 +8327,46 @@ def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]
     Values are quoted at 15 significant digits, so a value just past the default never prints as
     the default itself.
 
-    **Not covered:** ``approve`` checks neither ``enabled`` nor ``operations``, and each request
-    keeps the deadline stamped when it was made. A request left pending when dual control is turned
-    off can still be released under the current dwell, and nothing here names that."""
+    **The held list is read the same way (vault BACKLOG #3123).** While ``enabled`` is on, an
+    ``operations`` list that leaves out an operation the field's own default holds is named as
+    ``approvals.operations``, with the operations left out. ``ApprovalGate`` holds an action only
+    while its operation is in the list, so each one left out completes on one caller's authority.
+    An EMPTY list loads and holds nothing, which is that narrowing at its largest: it gets its own
+    wording, and the dwell and expiry are then not named, because they bind no request. Adding an
+    operation the default leaves out (``config_reload``) holds more and is not named, and it does
+    not make up for a default one left out.
+
+    **A request already held.** ``ApprovalGate.approve`` refuses a request whose operation is no
+    longer held (409, ``approval.no_longer_gated``), whether dual control was turned off or the
+    operation left the list. So narrowing the list releases nothing already held; it changes what
+    the NEXT call does. Each request keeps the deadline stamped when it was made."""
     out: list[tuple[str, str]] = []
-    if not (approvals.enabled and approvals.operations):
+    if not approvals.enabled:
         return out
     fields = ApprovalsSettings.model_fields
+    held = set(approvals.operations)
+    if not held:
+        return [
+            (
+                "approvals.operations",
+                "dual control is on and holds no operation. One caller's authority completes "
+                "every action with no second approver, as it does with dual control off",
+            )
+        ]
+    # The default is read off the field, so a default that moves is followed and never restated.
+    left_out = sorted(set(fields["operations"].get_default(call_default_factory=True)) - held)
+    if left_out:
+        # The names end the sentence, so nothing after them reads as one more operation.
+        one = len(left_out) == 1
+        out.append(
+            (
+                "approvals.operations",
+                "dual control is on and its list leaves out the default "
+                f"{'operation' if one else 'operations'} {', '.join(left_out)}. "
+                f"One caller's authority completes {'it' if one else 'each'} with "
+                "no second approver",
+            )
+        )
     dwell, dwell_default = approvals.min_dwell_seconds, fields["min_dwell_seconds"].default
     if dwell <= 0:
         out.append(
@@ -8539,7 +8584,8 @@ def security_loosenings(
     AD timeout, step-up window, TOTP skew and temporary-password life
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
-    (#2489), any ``[api].trusted_proxies`` entry covering more than one address, with its own
+    (#2489), an ``[approvals].operations`` list that leaves out a default operation (vault BACKLOG
+    #3123), any ``[api].trusted_proxies`` entry covering more than one address, with its own
     wording where the entries together cover every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
@@ -8587,7 +8633,8 @@ def security_loosenings(
 
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
-    it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
+    it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489) and the
+    held list (vault BACKLOG #3123).
     ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302).
 
@@ -8996,7 +9043,8 @@ def security_loosenings(
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
     out.extend(_auth_limit_loosenings(auth))
-    # BACKLOG #2489: the dual-control dwell floor and expiry ceiling, read the same way.
+    # BACKLOG #2489: the dual-control dwell floor and expiry ceiling, read the same way. Vault
+    # BACKLOG #3123: and a held list that leaves out a default operation.
     out.extend(_approvals_loosenings(approvals))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
@@ -9380,6 +9428,13 @@ def settings_error_detail(exc: Exception) -> str:
     return str(exc)
 
 
+def settings_file_path(config_path: str | Path | None) -> Path:
+    """The settings file :func:`load_settings` reads for ``config_path``: that path, else
+    ``./messagefoundry.toml``, which it reads only when it exists. One rule, so the ``serve`` start
+    check vets the file the load read (vault BACKLOG #2626)."""
+    return Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
+
+
 def load_settings(
     *,
     config_path: str | Path | None = None,
@@ -9402,7 +9457,7 @@ def load_settings(
     data: dict[str, dict[str, Any]] = {}
     file_data: Mapping[str, Any] = {}
 
-    path = Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
+    path = settings_file_path(config_path)
     if config_path is not None and not path.exists():
         raise FileNotFoundError(f"service config not found: {path}")
     if (config_path is not None or default_file) and path.exists():

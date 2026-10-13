@@ -218,6 +218,7 @@ from messagefoundry.transports.base import (
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
+    ReplyBodyDropped,
     SyncReplyResolver,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -3458,11 +3459,23 @@ class RegistryRunner:
                     exc,
                     exc_info=not refused,
                 )
+                if isinstance(exc, ValueError):
+                    # No lane is marked here, so a reload reads the changed setting.
+                    what = _ANCHOR_SETTING_REFUSED
+                    advice = "Fix the setting, then reload; the server log says why"
+                elif refused:
+                    what = "tls_ca_file was refused"
+                    advice = (
+                        "Fix the file, then reload; the server log and the auth.trust_anchor "
+                        "audit rows say why"
+                    )
+                else:
+                    # The check did not run, so nothing says the file is at fault.
+                    what = "tls_ca_file could not be checked"
+                    advice = "The server log says why; reload once the cause is fixed"
                 fixed = TrustAnchorError(
-                    f"{direction} connection '{name}': its tls_ca_file "
-                    f"{'was refused' if refused else 'could not be checked'} on this passive DR "
-                    "standby, and POST /dr/activate needs it. Fix the file, then reload; the "
-                    "server log and the auth.trust_anchor audit rows say why"
+                    f"{direction} connection '{name}': its {what} on this passive DR standby, "
+                    f"and POST /dr/activate needs it. {advice}"
                 )
                 self._record_failed(name, fixed, kind=direction)
 
@@ -3546,7 +3559,11 @@ class RegistryRunner:
         A refusal that fails a lane is raised as a fixed line naming the connection. The refusal
         text names the CA's path, the folders above it and its SHA-256, so it goes to the server
         log only, as the connection-test route keeps it from API callers (BACKLOG #1142). The lane
-        status and the ``connection_stopped`` alert carry the fixed line."""
+        status and the ``connection_stopped`` alert carry the fixed line. A ``ValueError`` is a
+        refused setting, not a refused file, and its line says so (vault BACKLOG #3224). The
+        reverse does not hold: a pin that is not a SHA-256 raises ``TrustAnchorError`` and still
+        takes the file's line. The exception type cannot tell those two apart; the check that
+        raises would have to say which it is."""
         if self._lane_anchor_check is None:
             return
         try:
@@ -3556,10 +3573,17 @@ class RegistryRunner:
                 raise
             self._anchor_refused[(direction, name)] = _anchor_key(settings)
             log.warning("%s connection %r: trust anchor refused: %s", direction, name, exc)
-            raise TrustAnchorError(
-                f"{direction} connection '{name}': its tls_ca_file was refused. Fix the file, then "
-                "start the connection; the server log and the auth.trust_anchor audit rows say why"
-            ) from exc
+            # The setting's advice names both steps. The reload takes in the changed value. It
+            # also rebuilds the lane when the CA path or the pin changed. A change to any other
+            # value, such as the url, leaves the failure kept, and the start then builds the lane.
+            tail = (
+                f"{_ANCHOR_SETTING_REFUSED}. Fix the setting, then reload and start the "
+                "connection; the server log says why"
+                if isinstance(exc, ValueError)
+                else "tls_ca_file was refused. Fix the file, then start the connection; the "
+                "server log and the auth.trust_anchor audit rows say why"
+            )
+            raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
@@ -3632,7 +3656,17 @@ class RegistryRunner:
             return False
         try:
             settings = self._anchor_lane_settings(new)
-        except Exception:  # noqa: BLE001 - an unresolvable value is a change; the build reports it
+        except Exception as exc:  # noqa: BLE001 - an unresolvable value is a change
+            # The line says only what happened here (vault BACKLOG #3224). The reload that
+            # asked resolves the same settings again and is refused on them, so the lane's
+            # record and mark stay as they were.
+            log.info(
+                "%s connection %r: its kept trust-anchor failure could not be compared, because "
+                "its settings no longer resolve: %s",
+                direction,
+                name,
+                safe_exc(exc),
+            )
             return False
         return _anchor_key(settings) == key
 
@@ -3790,8 +3824,11 @@ class RegistryRunner:
             await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)
             # vault BACKLOG #2371: a CA refusal on a lane already recorded failed is not alerted
-            # again. A calendar window open reaches here once per window, and the refusal was
-            # alerted when the lane first failed. Other build failures alert as before.
+            # again. A calendar window open reaches here once per window, and the lane was
+            # alerted when it first failed. Other build failures alert as before. A lane that
+            # first failed for another reason keeps that older reason in its status; the CA
+            # refusal is in the server log and the auth.trust_anchor rows (vault BACKLOG #3224,
+            # item 3, declined: recording it again is what the alert-storm test pins against).
             if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
                 self._record_failed(name, exc, kind="outbound")
             return
@@ -8280,7 +8317,9 @@ class RegistryRunner:
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
             # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
             # is the single-writer discipline that yields exactly one captured reply per row.
-            if response is not None:
+            # A ReplyBodyDropped is a non-capturing delivery too: plain mark_done, which also
+            # writes the drop. Tested by exclusion, so any other reply is captured as before.
+            if response is not None and not isinstance(response, ReplyBodyDropped):
                 # ADR 0013 Increment 2: if this outbound declares reingress_to, the same
                 # capture transaction also produces a Stage.RESPONSE work-row; wake the
                 # re-ingress worker. Read live from the registry (a reload swaps it).
@@ -8328,9 +8367,30 @@ class RegistryRunner:
             else:
                 # PHASE (b): the store completion round-trip (plain mark_done — the non-capturing path).
                 _done_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                await self.store.mark_done(item.id)
+                # vault BACKLOG #3040 items 2 and 5: a ReplyBodyDropped means the partner answered
+                # 2xx and its reply body was dropped over the byte bound. The reply_dropped event
+                # commits with the DONE flip, and the WARNING follows that write and says what it
+                # did. Status, bound and names only.
+                dropped = response if isinstance(response, ReplyBodyDropped) else None
+                if dropped is None:
+                    await self.store.mark_done(item.id)
+                else:
+                    recorded = await self.store.mark_done(item.id, reply_dropped=dropped.detail)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
+                if dropped is not None:
+                    log.warning(
+                        "delivery worker %r: outbox row %s (message %s) answered with status %s "
+                        "and a response body over the %d-byte bound; the body is dropped, and %s",
+                        name,
+                        item.id,
+                        item.message_id,
+                        dropped.status,
+                        dropped.limit,
+                        "the row is recorded as delivered with a reply_dropped event"
+                        if recorded
+                        else "the store recorded nothing: the row was gone or the write was fenced",
+                    )
             # Emit the throttled per-process summary (send_ack vs mark_done) after a delivered row —
             # a no-op between windows. Only on the delivered path (a retried/dead-lettered row records
             # neither phase, so there is nothing new to summarize).
@@ -11003,6 +11063,13 @@ def _insecure_bind_cause(source: Source) -> str:
         return f"tls_hop_attested; reason: {source.tls_hop_attested_reason or '(none provided)'}"
     # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
     return "--allow-insecure-bind / require_encryption_for_remote = false"
+
+
+#: What a lane's fixed refusal line says for a ``ValueError`` from its CA check (vault BACKLOG
+#: #3224). That is a setting the check refused, such as a blank or unread ``tls_ca_pin`` or a
+#: ``tls_ca_file`` value that is no path. Mending the file does nothing for it, and a start alone
+#: reads the same setting again. Each site adds its own advice.
+_ANCHOR_SETTING_REFUSED = "tls_ca_pin or tls_ca_file setting was refused"
 
 
 def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:

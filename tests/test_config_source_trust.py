@@ -315,7 +315,7 @@ def test_non_admin_sids_not_recognized(sid: str) -> None:
 # ---- Tier 3: a Win32 read that fails REFUSES (BACKLOG #1654) ----------------
 #
 # These replace the ctypes readers and nothing else: load_config runs the real Windows dispatch in
-# _assert_safe_config_source_windows and the real decisions in _enforce_windows_config_source, so
+# _assert_safe_config_source_windows and the real decisions in _enforce_windows_paths, so
 # every error arm is exercised on the Linux CI leg too.
 
 # A read that is clean in every respect: owned by the engine's own account, which alone holds write.
