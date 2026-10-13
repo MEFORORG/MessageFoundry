@@ -847,9 +847,15 @@ def test_a_store_sealed_under_another_key_is_could_not_start(
     sealing_key = generate_key()
     db = tmp_path / "sealed.db"
 
-    # A plaintext state row, sealed by the second keyed open: the migration path the store's own
-    # encryption tests use. Synthetic value, no message content.
-    _existing_empty_store(db, sealing_key)
+    # A plaintext state row in a store no key has opened yet, sealed by the first keyed open: the
+    # migration path the store's own encryption tests use. Synthetic value, no message content. It is
+    # planted BEFORE that open, because a keyed open records every cipher surface as keyed (BACKLOG
+    # #3383), and a plaintext row written there afterwards is refused as a plant, not sealed.
+    async def create_keyless() -> None:
+        store = await MessageStore.open(db)
+        await store.close()
+
+    asyncio.run(create_keyless())
     con = sqlite3.connect(db)
     con.execute(
         "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",

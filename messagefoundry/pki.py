@@ -19,11 +19,13 @@ import datetime
 import ipaddress
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from typing import Literal
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, padding, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
+from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -41,7 +43,9 @@ __all__ = [
     "CertFacts",
     "CrlBlock",
     "CrlFacts",
+    "CrlSignature",
     "crl_signature_refusal",
+    "judge_crl_signatures",
     "judge_every_crl",
     "read_crl_facts",
     "read_soonest_crl_facts",
@@ -313,12 +317,21 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     the delta aside, so revocations only the delta lists are dropped. Give the setting base CRLs
     only."""
     blocks = list(_crl_blocks(pem))
+    # Refused, never skipped, even when the uncounted marker is only text in a comment line and
+    # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine
+    # cannot tell a comment from a CRL the operator meant to load: skipped, a CRL typed after a
+    # space would be reported as applied while the hop still checks the old one. And
+    # :func:`_crl_blocks` is a model with a measured miss, which its docstring records, so an
+    # uncounted marker may be a CRL OpenSSL loads unjudged. A load counts what OpenSSL took, and
+    # that count is the backstop; this check does not lean on it.
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(
-            "it has a '-----BEGIN X509 CRL-----' marker that does not start a line, so OpenSSL "
-            "does not load that CRL. The marker must be the first thing on its line, after a line "
-            "feed: no space, tab or other text before it, and no line that ends in a carriage "
-            "return alone"
+            "it has a '-----BEGIN X509 CRL-----' marker that does not start a line. If that is a "
+            "CRL, OpenSSL can skip it as written. If it is text in a comment, the engine "
+            "cannot tell it from a CRL the file is meant to hold. Either one refuses the file. "
+            "Put each CRL's marker first on its line, after a line feed: no space, tab or other "
+            "text before it, and no line that ends in a carriage return alone. Take the marker "
+            "text out of any comment"
         )
     if not blocks:
         raise ValueError(_NO_CRL)
@@ -370,80 +383,228 @@ def _selection(
     return scope, key_id, frozenset(critical)
 
 
+#: What a hop's CA list says about one CRL's signature. :class:`CrlSignature` gives each meaning.
+CrlSignatureState = Literal["verified", "bad", "uncheckable", "unproven", "unlisted"]
+
+
+@dataclass(frozen=True)
+class CrlSignature:
+    """What a hop's CA list says about the signature of one CRL in a file (vault BACKLOG #2905).
+
+    ``where`` names the block and its issuer, for a message. ``state`` is one of five. A CA "fits"
+    when its subject equals the CRL's issuer name exactly and it fits the CRL's Authority Key
+    Identifier (:func:`_akid_fit`).
+
+    * ``verified``: a CA that fits verifies the CRL.
+    * ``bad``: **proven** badly signed. The CRL's key identifier equals a fitting CA's Subject Key
+      Identifier, and every fitting CA's key was checked and does not verify the CRL. The CRL names
+      that key, and that key did not sign it.
+    * ``uncheckable``: some fitting CA could not be checked, and none verifies. "Cannot check" is
+      not "does not verify" (:func:`_verifies`).
+    * ``unproven``: every fitting CA was checked and none verifies, but the CRL names none of them
+      by key identifier. A CRL with no key identifier fits every CA of that name. So a CA that
+      renewed its key reads this way, while the peer's own chain may still carry the CA that
+      signed the CRL. That is read from OpenSSL's source, which takes a CRL's issuer from the
+      peer's chain. It is not measured for every chain shape.
+    * ``unlisted``: no listed CA fits. An intermediate the peer sends in its handshake is never in
+      the list, so this is the usual answer for that intermediate's CRL."""
+
+    where: str
+    state: CrlSignatureState
+
+
+def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSignature]:
+    """The :class:`CrlSignature` of each CRL in ``pem`` against the CAs in ``ca_ders``, in file
+    order, one at a time (vault BACKLOG #2905).
+
+    OpenSSL checks a CRL's signature at the handshake, not when it loads the file. This is the
+    engine's own check, for a start (``harden_crl_check``) and for the running-hop reload
+    (:func:`crl_signature_refusal`). A CA that ``cryptography`` cannot read is ignored
+    (:data:`_UNREADABLE_CA`): it cannot be shown to be an issuer, and a trust store may hold one
+    that OpenSSL loads. Before vault BACKLOG #2905 such a CA raised out of the reload's check,
+    which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
+    block that does not parse raises ``ValueError``."""
+    cas: list[tuple[x509.Name, x509.Certificate]] = []
+    for der in ca_ders:
+        try:
+            ca = x509.load_der_x509_certificate(der)
+            cas.append((ca.subject, ca))
+        except _UNREADABLE_CA:
+            continue
+    blocks = list(_crl_blocks(pem))
+    for index, block in enumerate(blocks, start=1):
+        crl = x509.load_pem_x509_crl(block)
+        where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
+        yield CrlSignature(where, _signature_state(crl, cas))
+
+
+#: What ``cryptography`` raises for a CA certificate it cannot read, at least. A CA that raises
+#: one is skipped by :func:`judge_crl_signatures`, alone. ``InvalidVersion`` comes from the
+#: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
+_UNREADABLE_CA = (ValueError, x509.InvalidVersion, x509.UnsupportedGeneralNameType)
+
+
+def _signature_state(
+    crl: x509.CertificateRevocationList, cas: list[tuple[x509.Name, x509.Certificate]]
+) -> CrlSignatureState:
+    """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
+    issuer = crl.issuer
+    fitting = False
+    named = False  # the CRL names some fitting CA's key
+    unchecked = False
+    for subject, ca in cas:
+        if subject != issuer:
+            continue
+        try:
+            names_key = _akid_fit(crl, ca)
+        except _UNREADABLE_CA:
+            continue  # its extensions or its issuer name do not read: not shown to fit
+        if names_key is None:
+            continue
+        fitting = True
+        named = named or names_key
+        answer = _verifies(crl, ca)
+        if answer:
+            return "verified"
+        unchecked = unchecked or answer is None
+    if not fitting:
+        return "unlisted"
+    if unchecked:
+        return "uncheckable"
+    return "bad" if named else "unproven"
+
+
 def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
     """Why some CRL in ``pem`` is not signed by a CA in ``ca_ders``, or ``None`` when each one is.
 
     The flag is True when a CA for the CRL's issuer was found and its key does not verify the CRL,
     and False when no such CA was found. A block that fails to verify is reported over one whose CA
-    was not found, wherever it sits in the file. OpenSSL checks a CRL's signature at the handshake, not at
-    the load. So a CRL with the right issuer name and Authority Key Identifier but a bad signature
-    loads cleanly, and then every handshake it judges fails with ``CRL signature failure``. The
-    running-hop reload calls this before a live load, because a load cannot be undone (BACKLOG #299).
+    was not found, wherever it sits in the file. OpenSSL checks a CRL's signature at the handshake,
+    not at the load. So OpenSSL itself loads a CRL with the right issuer name and Authority Key
+    Identifier but a bad signature, and then every handshake it judges fails with ``CRL signature
+    failure``. The running-hop reload calls this before a live load, because a load cannot be
+    undone (BACKLOG #299).
+
+    **The flag is wider than what a start refuses (vault BACKLOG #2905).** It is True for every
+    :class:`CrlSignature` state but ``verified`` and ``unlisted``. A start refuses only ``bad``,
+    the proven case, and loads the other two with a warning. So the reload holds back some files
+    that a start would load.
 
     A CA counts as a CRL's issuer when its subject equals the CRL's issuer name exactly, it fits the
     CRL's AKID, and its key verifies the CRL. A CA that does not parse is ignored. ``pem`` must be
     bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
-    cas: list[x509.Certificate] = []
-    for der in ca_ders:
-        try:
-            cas.append(x509.load_der_x509_certificate(der))
-        except ValueError:
-            continue
-    blocks = list(_crl_blocks(pem))
     unlisted: str | None = None
-    for index, block in enumerate(blocks, start=1):
-        crl = x509.load_pem_x509_crl(block)
-        where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
-        issuers = [ca for ca in cas if ca.subject == crl.issuer and _fits_akid(crl, ca)]
-        if not issuers:
+    for signature in judge_crl_signatures(pem, ca_ders):
+        if signature.state == "unlisted":
             # Go on: a block that is known to be badly signed is the stronger finding.
-            unlisted = unlisted or f"{where} names no CA certificate this hop lists as its issuer"
-            continue
-        if not any(_signed_by(crl, ca) for ca in issuers):
+            unlisted = unlisted or (
+                f"{signature.where} names no CA certificate this hop lists as its issuer"
+            )
+        elif signature.state != "verified":
             return (
-                f"{where} does not verify against the key of the CA certificate this hop trusts "
-                "for that issuer. Loaded, it would make every handshake it judges fail with "
-                "'CRL signature failure'",
+                f"{signature.where} does not verify against the key of the CA certificate this "
+                "hop trusts for that issuer. A handshake that OpenSSL checks against that CA's "
+                "key by this CRL fails with 'CRL signature failure'",
                 True,
             )
     return None if unlisted is None else (unlisted, False)
 
 
-def _fits_akid(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
-    """Whether ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's
-    ``X509_check_akid`` matches one: each part the AKID carries must match the CA."""
+def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
+    """How ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's ``X509_check_akid``
+    matches one: each part the AKID carries must match the CA. ``None`` when it does not fit.
+
+    When it fits, the answer is whether the CRL **names the CA's key**: the AKID carries a key
+    identifier, the CA carries a Subject Key Identifier, and the two are equal. A CRL with no key
+    identifier fits, and so does a CA with no Subject Key Identifier, but neither names the key."""
     try:
         akid = crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
     except x509.ExtensionNotFound:
-        return True
-    except x509.DuplicateExtension:
         return False
+    except x509.DuplicateExtension:
+        return None
+    names_key = False
     if akid.key_identifier is not None:
         try:
             ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
         except x509.ExtensionNotFound:
             ski = None
         except (x509.DuplicateExtension, ValueError):
-            return False
-        if ski is not None and ski != akid.key_identifier:
-            return False
+            return None
+        if ski is not None:
+            if ski != akid.key_identifier:
+                return None
+            names_key = True
     serial = akid.authority_cert_serial_number
     if serial is not None and serial != ca.serial_number:
-        return False
+        return None
     names = [
         name.value
         for name in akid.authority_cert_issuer or ()
         if isinstance(name, x509.DirectoryName)
     ]
-    return not names or ca.issuer in names
+    return names_key if not names or ca.issuer in names else None
 
 
-def _signed_by(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
-    """Whether ``ca``'s key verifies ``crl``. A key type the CRL cannot be checked with is False."""
+def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
+    """Whether ``ca``'s key verifies ``crl``: True, False when it is **proven** not to, and
+    ``None`` when the engine cannot check (vault BACKLOG #2905).
+
+    ``is_signature_valid`` answers False for a signature it cannot check as well as for one that
+    fails, because it turns every error inside its own verification into False. So a False from
+    it is not proof. The key is then asked directly (:func:`_verify_with`), and only its
+    ``InvalidSignature`` counts as proof. Everything else is ``None``: a key or an algorithm
+    ``cryptography`` does not support, a key of another kind than the signature, and a
+    ``ValueError`` or ``TypeError`` from either call."""
     try:
-        return crl.is_signature_valid(ca.public_key())  # type: ignore[arg-type]
-    except (ValueError, TypeError, UnsupportedAlgorithm):
+        key = ca.public_key()
+        if crl.is_signature_valid(key):  # type: ignore[arg-type]
+            return True
+        _verify_with(key, crl)
+    except InvalidSignature:
         return False
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        return None
+    return None  # the key accepts what ``is_signature_valid`` refused: no proof either way
+
+
+_DSA_SIGNATURES = frozenset(
+    {
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA1,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA224,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA256,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA384,
+        x509.SignatureAlgorithmOID.DSA_WITH_SHA512,
+    }
+)
+
+
+def _verify_with(key: object, crl: x509.CertificateRevocationList) -> None:
+    """Verify ``crl``'s signature with ``key`` itself. Raises ``InvalidSignature`` when it fails,
+    and ``UnsupportedAlgorithm`` when the key and the signature are not a pair this can check."""
+    signature, signed = crl.signature, crl.tbs_certlist_bytes
+    params = crl.signature_algorithm_parameters
+    digest = crl.signature_hash_algorithm
+    algorithm = crl.signature_algorithm_oid
+    if (
+        isinstance(key, rsa.RSAPublicKey)
+        and digest is not None
+        and isinstance(params, asymmetric_padding.PKCS1v15 | asymmetric_padding.PSS)
+    ):
+        key.verify(signature, signed, params, digest)
+    elif isinstance(key, ec.EllipticCurvePublicKey) and isinstance(params, ec.ECDSA):
+        key.verify(signature, signed, params)
+    elif (
+        isinstance(key, ed25519.Ed25519PublicKey)
+        and algorithm == x509.SignatureAlgorithmOID.ED25519
+    ) or (isinstance(key, ed448.Ed448PublicKey) and algorithm == x509.SignatureAlgorithmOID.ED448):
+        key.verify(signature, signed)
+    elif isinstance(key, dsa.DSAPublicKey) and digest is not None and algorithm in _DSA_SIGNATURES:
+        key.verify(signature, signed, digest)
+    else:
+        raise UnsupportedAlgorithm(
+            "the CA key and the CRL's signature are not a pair this can check"
+        )
 
 
 def _is_delta_crl(crl: x509.CertificateRevocationList) -> bool:

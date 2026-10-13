@@ -1221,7 +1221,8 @@ rules are recorded once, in
 [ADR 0105's 2026-09-28 amendment](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md). The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
 which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
 reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
-`text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served
+and the raster image types), matched case-folded and length-bounded. A `text/csv` label is served as
+`text/plain`, for the reason given below. Everything else is served
 as `application/octet-stream` -- every **browser-active** type (`text/html`, `image/svg+xml`,
 `application/hta`), every type nobody listed, and every non-clean or over-long value. The direction
 matters: the earlier control listed the browser-active subtypes to refuse, which asked a reviewer to prove
@@ -1245,6 +1246,22 @@ oversight: a PDF can carry script that runs in a viewer once a saved file is ope
 against the document rather than against the serving origin, and the declared type stops governing the
 moment the file is on disk. The instrument for the local-open threat would be content scanning, which this
 route does not do.
+
+`text/csv` gets the other answer, by a decision recorded beside the same table. A document the sender
+labelled `text/csv` downloads as `text/plain` with a `.txt` name. A sender can start a cell with `=`, and
+a spreadsheet evaluates that cell when it opens the file. The route serves a CSV's stored bytes as they
+are, so the `.txt` name is what keeps a double-click away from a spreadsheet. The comment beside the
+table holds the reasoning and the limits. At least these limits matter to an operator:
+
+- **Do not give a downloaded attachment a `.csv` name to open it.** Renaming it, or importing it into a
+  spreadsheet, still evaluates its cells.
+- The message page's attachment list still shows the sender's `text/csv` label, so the `.txt` name is
+  expected. The page carries no note that says so.
+- Which program opens a `.txt` file is set by your own host. Nobody has tested this route against a
+  browser or a spreadsheet.
+- Only the exact label `text/csv` is covered. Another spelling, such as `application/csv` or
+  `text/csv; charset=utf-8`, downloads as `application/octet-stream` with a `.bin` name, like any
+  unlisted type. The first limit applies to that file too.
 
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
@@ -1479,12 +1496,12 @@ the four HTTP destinations, and their own sections point here.
 
 | Destination | Write | `capture_response` | An over-size body after a 2xx |
 |---|---|---|---|
-| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped. The message gets a `reply_dropped` event, and then a WARNING names the connection and the message |
 | REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
 | SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
 | DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
 | FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
-| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | off | **delivered**, with the same event and WARNING |
 | FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
 
 **Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
@@ -1542,9 +1559,11 @@ connection's `proxy_url` and still follows a proxy from the environment.
 A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
 proxy override list) sends direct with no proxy credential, and logs a WARNING (vault BACKLOG
 #3442). A connection that sets `proxy_user` and also writes a `Proxy-Authorization` into `headers`
-fails to build (vault BACKLOG #3443). Its proxy handler admits any caller-set header once the
-`proxy_user` credential passes, so it could not tell the static header from its own. The rule is
-on [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
+fails to build (vault BACKLOG #3443). Its proxy handler admits a caller-set `Proxy-Authorization`
+in the plain spelling once the `proxy_user` credential passes, so it could not tell a static
+header spelled that way from its own. A static header in any other spelling of that name fails
+the build too, and the opener never admits one. The rule is on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
 
 Which legs reach the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials

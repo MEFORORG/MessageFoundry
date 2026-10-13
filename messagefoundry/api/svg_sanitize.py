@@ -24,6 +24,10 @@ the code meets them.
   change the parts that are not SVG, and those are verbatim clinical content.
 - A gzip body, which is what an SVGZ file is, is inflated under the same size bound and vetted like
   plain bytes. A sanitized SVG inside is served gzipped again (BACKLOG #2391).
+- Trial passes that keep no output check the gzip's size bound, its member cap and its soundness
+  before the one inflate that keeps the document runs (BACKLOG #1129). They use the shared loop in
+  ``parsing/_bounded_inflate.py``, as the compression codec's trial pass does, so a body over the
+  bound is refused without holding any of its output.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ from __future__ import annotations
 import gzip
 import re
 import zlib
+from collections.abc import Buffer
+from dataclasses import dataclass
 from typing import Final
 from xml.etree.ElementTree import (  # nosec B405 -- types only; every parse goes through defusedxml
     Element,
@@ -41,6 +47,7 @@ from xml.sax.saxutils import escape  # nosec B406 -- output escaping only; nothi
 from messagefoundry._vendor.defusedxml.common import DefusedXmlException
 from messagefoundry._vendor.defusedxml.ElementTree import DefusedXMLParser
 from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
+from messagefoundry.parsing._bounded_inflate import InflateCeilingExceeded, bounded_inflate
 
 __all__ = ["SvgRejected", "may_be_svg", "sanitize_if_svg", "sanitize_svg"]
 
@@ -62,11 +69,13 @@ _FIRST_CONTENT_BYTE_RE: Final = re.compile(rb"[^ \t\r\n\x0b\x0c\x00\xef\xbb\xbf\
 _ELEMENT_NAME_RE: Final = re.compile(rb"[^\s/>]*")
 #: The two leading bytes of every gzip member (RFC 1952). An SVGZ file is a gzipped SVG.
 _GZIP_MAGIC: Final = b"\x1f\x8b"
-#: The most gzip members one body may hold. Each member after the first costs a copy of what remains,
-#: so an unbounded count of tiny members would cost quadratic time.
+#: The most gzip members one body may hold. A member can inflate to nothing, so a body of many tiny
+#: members passes any byte bound while each still costs a header parse and a new decompressor.
 _MAX_GZIP_MEMBERS: Final = 16
 #: How much of a gzip body is inflated first, to clear one that is plainly not markup cheaply.
 _GZIP_SNIFF_BYTES: Final = 64 * 1024
+#: Any byte that is not NUL. Only NUL padding may follow the last gzip member.
+_NOT_NUL_RE: Final = re.compile(rb"[^\x00]")
 #: Traces of SVG in markup the parser could not read through: an ``svg`` start tag under any prefix
 #: and in any case, the SVG namespace name, or a namespace name spelled with a reference, which can
 #: hide it. Possessive quantifiers, and name classes that exclude ``<`` and ``:``, keep the scan
@@ -391,24 +400,88 @@ def _contains_svg(body: bytes) -> bool:
     return _SVG_TAG_RE.search(_without_nul(body)) is not None
 
 
-def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:
-    """Inflate the gzip ``body``, keeping at most ``limit + 1`` bytes.
+class _FirstContentWatch:
+    """A gzip decompressor for the shared inflate loop that notes the first byte past leading noise.
 
-    Returns the bytes inflated and whether they are the whole document; they are not only when the
-    output passes ``limit``. The bound is enforced while inflating, so a small body that inflates to
-    gigabytes costs no more than ``limit`` bytes of work.
+    A trial pass keeps no output, so this is how it still learns whether the document starts as
+    markup. The walk makes one per member and passes in the ``first`` the members before it found,
+    since a reader joins the members into one document."""
+
+    __slots__ = ("first", "inner")
+
+    def __init__(self, first: bytes | None) -> None:
+        self.first = first
+        self.inner = zlib.decompressobj(wbits=31)
+
+    def _see(self, piece: bytes) -> bytes:
+        if self.first is None:
+            match = _FIRST_CONTENT_BYTE_RE.search(piece)
+            if match is not None:
+                self.first = match.group()
+        return piece
+
+    def decompress(self, data: Buffer, max_length: int = 0, /) -> bytes:
+        return self._see(self.inner.decompress(data, max_length))
+
+    def flush(self) -> bytes:
+        return self._see(self.inner.flush())
+
+    @property
+    def eof(self) -> bool:
+        return self.inner.eof
+
+    @property
+    def unconsumed_tail(self) -> bytes:
+        return self.inner.unconsumed_tail
+
+    @property
+    def unused_data(self) -> bytes:
+        return self.inner.unused_data
+
+
+@dataclass(frozen=True, slots=True)
+class _Gunzipped:
+    """What one walk of a gzip body found.
+
+    ``output`` is the document, and is empty unless the walk kept its output and the body inflated
+    whole. ``whole`` is false only when the output passed the walk's limit. ``first`` is the first
+    byte past leading noise among the bytes inflated, or ``None`` when there was none."""
+
+    output: bytes
+    whole: bool
+    first: bytes | None
+
+
+def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped:
+    """Walk every member of the gzip ``body`` through the shared inflate loop, up to ``limit`` bytes.
+
+    The bound is enforced while inflating, so a small body that inflates to gigabytes costs no more
+    than ``limit`` bytes of work. With ``keep_output`` false this is a trial pass: it holds none of
+    the output, and refuses and reports exactly as a pass that keeps it would.
 
     Raises :class:`SvgRejected` for a gzip that is not sound before the bound is reached: a corrupt
     header or block, a CRC or length check that fails, a member cut short, more than
     :data:`_MAX_GZIP_MEMBERS` members, or anything but NUL padding after the last member. zlib keeps
     none of a call's output when the call raises, so there is no partial document to judge, and a
     reader that skips the trailer check could still show one. A corrupt body is never served."""
-    out = bytearray()
-    rest = body
+    view = memoryview(body)
+    first: bytes | None = None
+    parts: list[bytes] = []
+    produced = 0
+    position = 0
     for _ in range(_MAX_GZIP_MEMBERS):
-        inflater = zlib.decompressobj(wbits=31)
+        watch = _FirstContentWatch(first)
         try:
-            out += inflater.decompress(rest, limit + 1 - len(out))
+            result = bounded_inflate(
+                view[position:],
+                watch,
+                max_output_bytes=limit - produced,
+                trailing="stop",
+                keep_output=keep_output,
+                exact_ceiling=True,
+            )
+        except InflateCeilingExceeded:
+            return _Gunzipped(b"", False, watch.first)
         except zlib.error:
             # The refusal is raised after the except ends, so the zlib error stays off its chain,
             # as in sanitize_svg (BACKLOG #1796).
@@ -417,14 +490,15 @@ def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:
             corrupt = False
         if corrupt:
             raise SvgRejected("gzip body is corrupt")
-        if len(out) > limit:
-            return bytes(out), False
-        if not inflater.eof:
+        first = watch.first
+        if not result.eof:
             raise SvgRejected("gzip body is cut short")
-        rest = inflater.unused_data
-        if not rest.strip(b"\x00"):
-            return bytes(out), True
-        if not rest.startswith(_GZIP_MAGIC):
+        parts.append(result.output)
+        produced += result.produced
+        position += result.end
+        if _NOT_NUL_RE.search(view, position) is None:
+            return _Gunzipped(b"".join(parts), True, first)
+        if bytes(view[position : position + 2]) != _GZIP_MAGIC:
             raise SvgRejected("gzip body has bytes after its last member")
     raise SvgRejected(f"gzip body has more than {_MAX_GZIP_MEMBERS} members")
 
@@ -451,22 +525,30 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     The head is cleared without reading the rest of the body, so damage past the head is not seen.
     That cannot hide an SVG from a browser: no browser renders a document as SVG when its first
     byte past that noise is not ``<``. A reader that autodetects EBCDIC could, which is the same
-    assumption :func:`may_be_svg` makes for plain bytes."""
-    head, head_whole = _gunzip_bounded(body, _GZIP_SNIFF_BYTES)
-    first = _FIRST_CONTENT_BYTE_RE.search(head)
-    if first is not None and first.group() != b"<":
+    assumption :func:`may_be_svg` makes for plain bytes.
+
+    The head and the size check are trial passes that keep no output (BACKLOG #1129). Only a body
+    they admit as whole markup is inflated again, and that pass is the one that keeps the document.
+    So markup over the bound is refused before any of it is held."""
+    head = _gunzip_bounded(body, _GZIP_SNIFF_BYTES, keep_output=False)
+    if head.first not in (None, b"<"):
         return body
-    # A body that inflated whole within the head is not inflated a second time.
-    inner, whole = (head, True) if head_whole else _gunzip_bounded(body, _MAX_SVG_BYTES)
-    first = _FIRST_CONTENT_BYTE_RE.search(inner)
-    if first is not None and first.group() != b"<":
+    # A body that inflated whole within the head needs no second trial pass.
+    trial = head if head.whole else _gunzip_bounded(body, _MAX_SVG_BYTES, keep_output=False)
+    if trial.first not in (None, b"<"):
         return body
-    if first is None and whole:
-        return body  # empty, or only whitespace to its end: there is nothing to show
-    if not whole:
+    if not trial.whole:
         # Markup that passes the bound cannot be vetted, and a reader may still show the part that
         # did inflate.
         raise SvgRejected("gzip markup is larger than the bound")
+    if trial.first is None:
+        return body  # empty, or only whitespace to its end: there is nothing to show
+    kept = _gunzip_bounded(body, _MAX_SVG_BYTES, keep_output=True)
+    if not kept.whole:
+        # The trial pass admitted this body, and zlib is deterministic, so this does not happen. It
+        # refuses rather than vet an empty document, which would serve the body as stored.
+        raise SvgRejected("gzip markup is larger than the bound")
+    inner = kept.output
     vetted = _vet_markup(label, inner)
     if vetted is inner:
         return body

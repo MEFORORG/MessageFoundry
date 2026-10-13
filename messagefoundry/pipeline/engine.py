@@ -84,7 +84,7 @@ from messagefoundry.pipeline.secret_rotation import (
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
-from messagefoundry.pipeline.sharding import owned_destination_set
+from messagefoundry.pipeline.sharding import join_shard_names, owned_destination_set
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
@@ -2537,7 +2537,9 @@ class Engine:
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             try:
-                self._env_values = dict(self._env_values_provider())
+                # Off the event loop: the CLI provider reads the value file and, before that, its
+                # owner and access list (vault BACKLOG #2626), like every other file the engine reads.
+                self._env_values = dict(await asyncio.to_thread(self._env_values_provider))
             except WiringError:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
@@ -2584,8 +2586,9 @@ class Engine:
                 # universe here would leave this shard claiming by a NEW map while siblings claim by
                 # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
                 # others get none (ACKed messages stall with no alert). Fail closed instead.
-                old_ids = ",".join(running.all_shard_ids) if running.all_shard_ids else "<single>"
-                new_ids = ",".join(registry.all_shard_ids) if registry.all_shard_ids else "<single>"
+                old, new = running.all_shard_ids, registry.all_shard_ids
+                old_ids = join_shard_names(old) if old else "<single>"
+                new_ids = join_shard_names(new) if new else "<single>"
                 raise WiringError(
                     f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
                     "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "
