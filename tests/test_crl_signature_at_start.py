@@ -31,13 +31,15 @@ from pathlib import Path
 
 import pytest
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, padding, rsa
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
 from messagefoundry.config import loaded_crls
 from messagefoundry.config.tls_policy import (
+    _UNCONFIRMED_SIGNATURE,
     TrustAnchor,
     build_verifying_client_context,
     harden_crl_check,
@@ -360,6 +362,14 @@ def test_a_key_of_another_kind_than_the_signature_is_cannot_check_not_bad(tmp_pa
     hop = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
+    # Vault BACKLOG #3506. The reload holds this file back with BAD_SIGNATURE, and a start has
+    # just loaded it, though the CRL names the CA's key. So that remedy may promise a start
+    # refusal for the proven case only.
+    verdict = crl_signature_refusal(pem, [der])
+    assert verdict is not None and verdict[1] is True
+    assert "only where it proves the signature bad" in BAD_SIGNATURE
+    assert "names that CA's key, a start refuses" not in BAD_SIGNATURE
+
 
 @pytest.mark.parametrize("error", [ValueError, TypeError])
 def test_an_error_from_the_verification_is_cannot_check_and_warns(
@@ -560,94 +570,110 @@ def test_a_judgment_that_fails_warns_once_and_does_not_stop_the_start(
 
 # --- vault BACKLOG #3506: the texts claim no more than the code does ----------------------------
 
+#: The twins' name with its letter case changed. ``cryptography`` compares names exactly, and
+#: OpenSSL folds case, so a CRL under this name is ``unlisted`` and still judges the twins' leaf.
+_NAME_IN_OTHER_CASE = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MEFOR-2905-TWIN-CA")])
 
-def test_the_unlisted_warning_is_true_of_a_listed_ca_whose_name_differs_only_in_case(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+
+def test_the_unlisted_words_are_true_of_a_listed_ca_whose_name_differs_only_in_case(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The engine compares names exactly and OpenSSL folds case. So a listed CA can have the
-    CRL's issuer name, as OpenSSL reads it, and the key the CRL names, and still read
-    ``unlisted``. The warning used to say no listed CA "has that name", which is the wrong cause
-    here. This pins the words, not the matching: if the matching ever folds case, change both."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    listed = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-Case-CA")])
-    lower = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-3506-case-ca")])
-    ca = _ca(key, key, name=listed)
-    leaf, leaf_key = _leaf(listed, key)
-    ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
-    ca_file.write_bytes(ca.public_bytes(_PEM))
-    (tmp_path / "leaf.pem").write_bytes(leaf.public_bytes(_PEM))
-    (tmp_path / "leaf-key.pem").write_bytes(_key_pem(leaf_key))
-    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    server.load_cert_chain(tmp_path / "leaf.pem", tmp_path / "leaf-key.pem")
+    """The hop lists a CA that has the CRL's issuer name, as OpenSSL reads it, and the key the
+    CRL names. The engine still reads ``unlisted``. The warning used to say no listed CA "has
+    that name", which is the wrong cause here. This pins the words, not the matching: if the
+    matching ever folds case, change both."""
 
-    pem = _crl(key, names=key, name=lower, revoke=leaf.serial_number)
-    crl_file.write_bytes(pem)
-    der = ca.public_bytes(serialization.Encoding.DER)
-    assert [s.state for s in judge_crl_signatures(pem, [der])] == ["unlisted"]
+    def write(signer: ec.EllipticCurvePrivateKey, *, revoke: bool = False) -> bytes:
+        serial = twins.leaf_serial if revoke else None
+        pem = _crl(signer, names=twins.new_key, name=_NAME_IN_OTHER_CASE, revoke=serial)
+        twins.crl.write_bytes(pem)
+        return pem
 
+    server = twins.server(sends_renewed=False)
+    words = _UNCONFIRMED_SIGNATURE["unlisted"]
+    assert "letter case" in words and "has that name" not in words
+
+    pem = write(twins.new_key, revoke=True)
+    assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["unlisted"]
     with caplog.at_level("WARNING"):
-        hop = _hop(ca_file, crl_file)
+        hop = twins.hop("new")
     (line,) = _warnings(caplog)
-    assert "matched it to no CA certificate this hop lists" in line
-    assert "letter case included" in line
-    assert "has that name" not in line
+    assert words in line
+    # The reload gives the same state the same words, so the two cannot drift apart.
+    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
+    assert verdict is not None and verdict[1] is False and words in verdict[0]
 
     # The premise, on this interpreter's OpenSSL: it takes that CA for the CRL's issuer, and
     # judges the peer by the CRL. Control: the same hop passes with a CRL that revokes nothing.
     with pytest.raises(ssl.SSLError, match="revoked"):
         _handshake(hop, server)
-    crl_file.write_bytes(_crl(key, names=key, name=lower))
-    _handshake(_hop(ca_file, crl_file), server)  # raises if refused
+    write(twins.new_key)
+    _handshake(twins.hop("new"), server)  # raises if refused
+    # What the configuration guide says was measured: a badly signed CRL of this kind starts,
+    # and then fails its handshake.
+    write(twins.stranger)
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(twins.hop("new"), server)
 
 
-def test_the_reload_reason_for_an_unlisted_issuer_uses_the_start_warnings_words(
-    twins: _Twins,
-) -> None:
-    # One cause, one set of words: the reload's reason must stay true of the case above too.
-    verdict = crl_signature_refusal(twins.write_crl("new", "new"), _ders(twins.old_ca))
-    assert verdict is not None and verdict[1] is False
-    assert "matched it to no CA certificate this hop lists" in verdict[0]
-    assert "letter case included" in verdict[0]
-    assert "names no CA certificate" not in verdict[0]
+_SHA256_WITH_RSA = bytes.fromhex("06092a864886f70d01010b")
+_SHA1_WITH_RSA = bytes.fromhex("06092a864886f70d010105")
 
 
-def test_the_reload_remedy_promises_a_start_refusal_only_for_the_proven_case(
-    tmp_path: Path,
-) -> None:
-    """The remedy used to say a start refuses the file "where the CRL names that CA's key". This
-    is a file where that is false: the CRL names the RSA CA's key and carries an ECDSA signature.
-    The reload holds it back with this remedy, and a start loads it."""
-    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ca = _ca(rsa_key, rsa_key)
-    pem = _crl(ec.generate_private_key(ec.SECP256R1()), names=rsa_key)
-    (tmp_path / "ca.pem").write_bytes(ca.public_bytes(_PEM))
-    (tmp_path / "crl.pem").write_bytes(pem)
+def _resigned_with_sha1(pem: bytes, signer: rsa.RSAPrivateKey) -> bytes:
+    """``pem``, an RSA SHA-256 CRL, as an RSA SHA-1 CRL signed by ``signer``. The builder refuses
+    SHA-1. So the two algorithm identifiers are swapped by hand, which keeps every length, and
+    the signature is replaced."""
+    der = x509.load_pem_x509_crl(pem).public_bytes(serialization.Encoding.DER)
+    assert der.count(_SHA256_WITH_RSA) == 2
+    der = der.replace(_SHA256_WITH_RSA, _SHA1_WITH_RSA)
+    body = x509.load_der_x509_crl(der).tbs_certlist_bytes
+    try:
+        signature = signer.sign(body, padding.PKCS1v15(), hashes.SHA1())
+    except UnsupportedAlgorithm:
+        pytest.skip("this build cannot sign with SHA-1, so the CRL cannot be minted")
+    return x509.load_der_x509_crl(der[: -len(signature)] + signature).public_bytes(_PEM)
 
-    verdict = crl_signature_refusal(pem, [ca.public_bytes(serialization.Encoding.DER)])
+
+def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad() -> None:
+    """A CRL that names the CA's key and that the reload holds back, while a start loads it. The
+    reload's remedy used to say a start refuses such a file. The forged twin is the control: the
+    same hand-made encoding is proven bad, so the first reading is not an artefact of it."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca = [_ca(key, key).public_bytes(serialization.Encoding.DER)]
+
+    good = _resigned_with_sha1(_crl(key, names=key), key)
+    forged = _resigned_with_sha1(_crl(other, names=key), other)
+
+    assert [s.state for s in judge_crl_signatures(good, ca)] == ["uncheckable"]
+    assert [s.state for s in judge_crl_signatures(forged, ca)] == ["bad"]
+    verdict = crl_signature_refusal(good, ca)
     assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
-    assert _hop(tmp_path / "ca.pem", tmp_path / "crl.pem").verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
-
-    assert "only where it proves the signature bad" in BAD_SIGNATURE
-    assert "a signature the engine cannot check" in BAD_SIGNATURE
-    assert "Where the CRL names that CA's key, a start refuses the file too" not in BAD_SIGNATURE
 
 
-#: Sentences ``docs/CONFIGURATION.md`` carried and the code does not bear out (vault BACKLOG
-#: #3506). Each is matched with runs of white space folded, as a reader sees the paragraph.
-_RETRACTED_DOC_CLAIMS = (
+#: Sentences ``docs/CONFIGURATION.md`` carried and the code does not bear out. Each is matched
+#: with runs of white space folded, as a reader sees the paragraph.
+_RETRACTED_GUIDE_CLAIMS = (
     # Not when the engine cannot check with that key, nor when the name differs only in case.
     "A start refuses it when the CRL names the CA's key and that key did not sign it",
     # A version that returns is logged again; the A, B, A test above counts three lines.
     "logged once per engine process for each version of the file",
 )
+#: Sentences the guide must keep, each for a fact the code bears out and a reader acts on.
+_REQUIRED_GUIDE_SENTENCES = (
+    "an earlier version that returns is logged again",
+    # A CRL inside a hop's CA file: ``harden_crl_check`` judges the CRL setting's bytes only.
+    "The engine never checks its signature, at a start or at a reload",
+)
 
 
-def test_the_configuration_guide_does_not_make_the_retracted_claims() -> None:
+def test_the_configuration_guide_keeps_the_corrected_sentences() -> None:
     guide = Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md"
     text = " ".join(guide.read_text(encoding="utf-8").split())
-    # Control: this is the guide, and it still has the paragraph these claims sat in.
+    # Control: this is the guide, and it still has the paragraph these sentences sit in.
     assert "A start checks each CRL's signature too" in text
-    assert "an earlier version that returns is logged again" in text
-    assert "The engine never checks their signatures" in text
-    for claim in _RETRACTED_DOC_CLAIMS:
+    for claim in _RETRACTED_GUIDE_CLAIMS:
         assert claim not in text, claim
+    for sentence in _REQUIRED_GUIDE_SENTENCES:
+        assert sentence in text, sentence

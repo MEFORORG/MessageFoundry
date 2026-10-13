@@ -578,20 +578,20 @@ def _check_crl_signatures(
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
 
     **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
-    ``bad``, which that class defines. In short: the CRL names a listed CA's key by key identifier,
-    and the check with that key ran and failed. A key that cannot run the check is not proof.
+    ``bad``, and that class is the one place in the code that says what counts as proof.
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
 
     **Everything short of proof loads, with one warning.** That covers at least a CRL that names
-    no key, a key the engine cannot check with, and an issuer the hop does not list. The last is the usual
-    case in a two-tier PKI, where the peer sends the intermediate that issued the CRL, so it must
-    not log per hop. The warning is one line for the file, and
-    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` says how often it is
-    logged. A judgment that fails for any other reason is logged at ERROR, once, and the file
-    loads: this is a diagnosis, and a defect in it must not stop a start. That failure discards
-    the whole judgment, a proven bad CRL in the same file included.
+    no key, a key the engine cannot check with, and a CRL the engine matches to no listed CA. The
+    last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
+    the CRL, so it must not log per hop. The warning is one line for the file, and
+    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` decides how often it is
+    logged. It remembers only the file version it saw last, so an earlier version that returns
+    is logged again. A judgment that fails for any other reason is logged at ERROR, once, and the
+    file loads: this is a diagnosis, and a defect in it must not stop a start. That failure
+    discards the whole judgment, a proven bad CRL in the same file included.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
