@@ -361,7 +361,7 @@ async def test_the_flow_stages_the_hash_never_the_token(store: MessageStore) -> 
         client="10.0.0.5", public_origin="https://ops.example", prior_session=prior
     )
     assert service._oidc_flows is not None
-    flow = service._oidc_flows.pop(flow_id)
+    flow = service._oidc_flows.peek(flow_id)
     assert flow is not None
     assert flow.prior_session_hash == hash_token(prior)
     assert prior not in repr(flow)

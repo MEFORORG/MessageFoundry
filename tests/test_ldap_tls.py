@@ -191,7 +191,7 @@ def test_a_dc_outside_the_anchor_is_refused(pki: _Pki, tmp_path: Path) -> None:
 
 def test_with_verification_off_ldap3_skips_the_host_name_check_as_before(pki: _Pki) -> None:
     """ldap3 runs its name check only for ``CERT_REQUIRED`` or ``CERT_OPTIONAL``. The override keeps
-    that, so ``ad_tls_verify=false`` (refused at startup unless escaped) behaves as it did."""
+    that, so ``ad_tls_verify=false`` (refused at startup since vault BACKLOG #3230) behaves as it did."""
     suite, _protocol = _bind(
         _tls(Path(pki.ca).read_text(), ssl.CERT_NONE), _server(pki), host="dc1.example.test"
     )

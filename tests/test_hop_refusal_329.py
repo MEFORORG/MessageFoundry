@@ -14,7 +14,6 @@ non-``None`` posture through the real ``create_app`` route and ``AuthService``/n
 
 from __future__ import annotations
 
-import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -99,35 +98,54 @@ def _ldaps_verifyoff() -> AuthSettings:
     )
 
 
-def test_ldaps_verifyoff_clamped_prod_phi_even_with_escape(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    "posture", [PROD_PHI, STAGING_PHI, None], ids=["enforcing", "warn", "no-posture"]
+)
+def test_ldaps_verifyoff_is_refused_in_every_posture_even_with_escape(
+    posture: HopPosture | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Vault BACKLOG #3230: every LDAPS bind carries the service-account password, so ad_tls_verify=false
+    # is refused outright. Until then the escape released it at warn (#329); now no posture does.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    s = _ldaps_verifyoff()
-    # Enforcing PHI: refused even with the escape (the clamp bites).
-    with pytest.raises(LdapError, match="ad_tls_verify=false"):
-        LdapAuthenticator(s, posture=PROD_PHI)
-    # Non-enforcing PHI: crosses with the escape (warned loudly).
-    with caplog.at_level(logging.WARNING):
-        LdapAuthenticator(s, posture=STAGING_PHI)
-    assert any("DISABLED" in r.getMessage() for r in caplog.records)
-    # No posture fails closed (vault BACKLOG #2354): the escape needs a known non-enforcing posture.
-    with pytest.raises(LdapError, match="ad_tls_verify=false"):
-        LdapAuthenticator(s, posture=None)
+    with pytest.raises(LdapError, match="ad_tls_verify=false") as info:
+        LdapAuthenticator(_ldaps_verifyoff(), posture=posture)
+    message = str(info.value)
+    assert "with no escape" in message
+    assert "ad_tls_ca_cert_file" in message  # names the lever that does cross: a pinned CA
+    assert INSECURE_TLS_ESCAPE_ENV not in message  # never offers the escape it ignores
+    assert "synthetic-bind-secret" not in message
 
 
-async def test_ldaps_authservice_threads_posture(
+def test_ldaps_verifyoff_refuses_before_the_bind_secret_is_fetched() -> None:
+    """Like the plain-bind refusal, it runs before the secret provider is asked for the password."""
+
+    class _NeverCalled:
+        def get(self, ref: str) -> str:
+            raise AssertionError("the bind secret was fetched for a refused build")
+
+    s = _ldaps_verifyoff().model_copy(update={"ad_bind_password_secret": "kv/ad#pw"})
+    with pytest.raises(LdapError, match="ad_tls_verify=false"):
+        LdapAuthenticator(s, secret_provider=_NeverCalled(), posture=STAGING_PHI)  # type: ignore[arg-type]
+
+
+async def test_authservice_threads_posture_to_the_ldap_bind(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Seam: AuthService must thread hop_posture into the LdapAuthenticator it builds. With an enforcing
-    # PHI posture + the escape set, constructing the service raises LdapError — proof the posture reaches
-    # the cell. If the seam dropped it (posture=None), the STAGING arm below would now refuse, since a
-    # missing posture fails closed (vault BACKLOG #2354).
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with pytest.raises(LdapError, match="ad_tls_verify=false"):
-        AuthService(store, _ldaps_verifyoff(), hop_posture=PROD_PHI)
-    # A non-enforcing posture builds the service without raising (crosses with the escape).
-    AuthService(store, _ldaps_verifyoff(), hop_posture=STAGING_PHI)
+    # Seam: AuthService must thread hop_posture into the LdapAuthenticator it builds. The LDAPS
+    # verify-off cell no longer reads the posture (vault BACKLOG #3230), so the seam is proven on the
+    # plain ldap:// cell, which still does: with the enforcement dial at warn, only the posture can
+    # refuse it. If the seam dropped the posture, the enforcing arm below would build.
+    plain = AuthSettings(
+        ad_enabled=True,
+        ad_server="ldap://dc.example.com",
+        ad_allow_insecure_ldap=True,
+        ad_user_search_base="DC=example,DC=com",
+        ad_bind_dn="CN=svc,DC=example,DC=com",
+        ad_bind_password="synthetic-bind-secret",
+    )
+    with pytest.raises(LdapError, match="inert under"):
+        AuthService(store, plain, hop_posture=PROD_PHI, enforcing=False)
+    AuthService(store, plain, hop_posture=STAGING_PHI, enforcing=False)
 
 
 def test_ldaps_verifying_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:

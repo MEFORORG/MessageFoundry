@@ -347,7 +347,8 @@ def harden_crl_check(
     check flag set.
 
     A sixth, since vault BACKLOG #2905 (owner ruling 2026-10-05): a CRL that is proven badly
-    signed. :func:`_check_crl_signatures` says what counts as proof. It runs last of all, once
+    signed. :class:`~messagefoundry.pki.CrlSignature` says what counts as proof. The check is
+    :func:`_check_crl_signatures`. It runs last of all, once
     OpenSSL is known to hold exactly the CRLs judged, so it hides none of the refusals above. A
     signature it cannot confirm, short of proof, loads with one warning for the file.
 
@@ -500,18 +501,22 @@ def record_ca_bundle_crls(ctx: ssl.SSLContext, ca_file: str | None, *, setting: 
         )
         return
     try:
-        # Only the blocks OpenSSL loads: one whose BEGIN does not start a line is skipped by both.
-        if not crl_pem_blocks(pem):
-            return  # the usual CA file: certificates only
-        facts = read_soonest_crl_facts(pem, now=time.time())
+        try:
+            # Only the blocks OpenSSL loads: one whose BEGIN does not start a line is skipped by both.
+            if not crl_pem_blocks(pem):
+                return  # the usual CA file: certificates only
+            facts = read_soonest_crl_facts(pem, now=time.time())
+        except ValueError as exc:
+            logger.warning(
+                "the CA file %s carries a CRL block the expiry monitor cannot judge (%s), so no "
+                "alert will cover it. Move the CRL to the hop's CRL setting, which judges it at "
+                "start",
+                where,
+                exc,
+            )
+            return
+        # Outside that clause, so a ValueError from the record is a defect, not a bad CRL (#3176).
         record_crl_load(ctx, ca_file, pem, facts, setting=setting, ca_bundle=True)
-    except ValueError as exc:
-        logger.warning(
-            "the CA file %s carries a CRL block the expiry monitor cannot judge (%s), so no "
-            "alert will cover it. Move the CRL to the hop's CRL setting, which judges it at start",
-            where,
-            exc,
-        )
     except Exception:
         # Not a verdict on the file: a defect here. This only records for the monitor, and a hop
         # that built before this existed must not stop building because of it.
@@ -551,9 +556,16 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
 
 
 #: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
-#: state, in the words of the one warning :func:`_check_crl_signatures` logs.
+#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` says
+#: what the engine did, not what the CA list holds: a listed CA whose name differs from the
+#: issuer's only in letter case reads ``unlisted`` too, and OpenSSL can still use that CA
+#: (:class:`~messagefoundry.pki.CrlSignature` says when).
 _UNCONFIRMED_SIGNATURE = {
-    "unlisted": "no CA certificate this hop lists has that name and the key the CRL names",
+    "unlisted": (
+        "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
+        "exactly, letter case included, and then the CRL's authority key identifier, where it "
+        "carries one)"
+    ),
     "unproven": (
         "a listed CA has that name and its key does not verify the CRL, but the CRL does not "
         "name that CA's key, so a renewed CA key could explain it"
@@ -571,19 +583,21 @@ def _check_crl_signatures(
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
 
     **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
-    ``bad``: the CRL names a listed CA's key by key identifier, and that key does not verify it.
+    ``bad``, and that class says what counts as proof.
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
 
     **Everything short of proof loads, with one warning.** That covers at least a CRL that names
-    no key, a key the engine cannot check with, and an issuer the hop does not list. The last is the usual
-    case in a two-tier PKI, where the peer sends the intermediate that issued the CRL, so it must
-    not log per hop. The warning is one line for the file, and
-    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` says how often it is
-    logged. A judgment that fails for any other reason is logged at ERROR, once, and the file
-    loads: this is a diagnosis, and a defect in it must not stop a start. That failure discards
-    the whole judgment, a proven bad CRL in the same file included.
+    no key, a key the engine cannot check with, and a CRL the engine matches to no listed CA. The
+    last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
+    the CRL, so it must not log per hop. The warning is one line for the file, and
+    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` decides how often it is
+    logged. That function is asked only when there is a line to log. So it holds the last file
+    version that logged one, and an earlier version is logged again only when it returns after
+    another that logged one. A judgment that fails for any other reason is logged at ERROR,
+    once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. That
+    failure discards the whole judgment, a proven bad CRL in the same file included.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
@@ -902,9 +916,9 @@ def warn_hostname_check_off(*, connector: str, name: str, host: str) -> None:
     sibling of ``tls_allow_expired`` (:func:`relax_verify_expiry`) and is treated the same way: a
     WARNING at every construction, an advisory ``messagefoundry check`` line, and a
     ``security_loosenings()`` entry. It is NOT refused under ``[security].enforcement = enforce``,
-    because ``tls_allow_expired`` is not either. A credentialed Email, Direct or FTPS hop never
-    reaches this line: they refuse the name check off outright, with no escape, when they carry a
-    login credential (BACKLOG #1314; vault BACKLOG #2636 for FTPS). The ``[alerts]`` SMTP sink
+    because ``tls_allow_expired`` is not either. A hop that carries a credential never reaches this
+    line: it is refused first (docs/SECURITY-LOOSENING.md, *No escape sends a credential to an
+    unverified peer*). The ``[alerts]`` SMTP sink
     exposes no name-check setting, so it does not reach this line either. CORRECTED (ASVS 12.3.2 re-read, 2026-10-01):
     before this, the MLLP, FTPS, Email and Direct hops accepted it with no line at all, which the
     owner's answer to vault #2006 calls a silent weakening.
@@ -1325,16 +1339,19 @@ def apply_connection_tls_ciphers(
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
     try:
         if ciphers is None:
-            # Raises only EngineTlsListRefused, so the unset hop is never "tls_ciphers rejected".
             narrow_to_approved_suites(ctx)
-            return
-        text = str(ciphers)
-        validate_tls_ciphers(text)
-        apply_operator_tls_ciphers(ctx, text)
+        else:
+            text = str(ciphers)
+            validate_tls_ciphers(text)
+            apply_operator_tls_ciphers(ctx, text)
     except EngineTlsListRefused as exc:
         # The build refused the engine's list, so name the connector without blaming its string.
         raise EngineTlsListRefused(f"{connector}: {exc}") from exc
     except (ValueError, ssl.SSLError) as exc:
+        if ciphers is None:
+            # No operator string is set, so the connector is named without "tls_ciphers rejected"
+            # (BACKLOG #3096). Latent: the narrow raises only EngineTlsListRefused today.
+            raise ValueError(f"{connector}: {exc}") from exc
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
 
@@ -1870,9 +1887,10 @@ def urllib_handler_context(
 
 
 def _narrow_library_context(ctx: ssl.SSLContext, *, connector: str, hop: str) -> None:
-    """:func:`narrow_to_approved_suites` for a library-built hop, a refusal re-raised as ValueError.
+    """:func:`narrow_to_approved_suites` for a library-built hop, a refusal re-raised naming the hop.
 
-    The ldap3 and hvac factories share it. Each still calls :func:`harden_cipher_suites` itself
+    The refusal stays an :class:`EngineTlsListRefused`, with the connector and hop in front of its
+    text. The ldap3 and hvac factories share it. Each still calls :func:`harden_cipher_suites` itself
     after it, so the call-site guards see the assertion at each seam by name."""
     try:
         narrow_to_approved_suites(ctx)  # TLS 1.2, TLS 1.3 and sigalgs (BACKLOG #300, #2494)
@@ -2514,10 +2532,12 @@ def phi_read_hop_disposition(
 # (MLLP-over-TLS, REST/SOAP/FHIR https, the asyncpg store hop): the chain is validated (+ strict RFC
 # 5280 via harden_verify_flags) but a REVOKED-but-unexpired peer cert is still accepted — Python's ssl
 # has no OCSP/CRL fetch and the engine deliberately attempts none (offline-by-default, CLAUDE.md §2).
-# So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction /
-# `messagefoundry check` / dry-run unless revocation is proven in front (a revocation-checking egress
-# terminator) or the operator attests a revocation-checking PKI — per-connection `tls_revocation_attested`
-# or the blanket `MEFOR_TLS_REVOCATION_ATTESTED` env (the same opt-out ADR 0078 gave the listener).
+# So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction
+# (`messagefoundry check`, dry-run, reload, and the live build when `serve` starts) unless the hop's
+# own context checks a CRL or the operator attests a revocation-checking PKI for that connection with
+# `tls_revocation_attested`. A loopback hop is never refused. The blanket
+# `MEFOR_TLS_REVOCATION_ATTESTED` env (ADR 0078's listener opt-out) crosses only a non-enforcing
+# instance (BACKLOG #299).
 #
 # COMPOSES with #200 (ADR 0092): #200 refuses the CLEARTEXT / verify-off hop, so revocation only matters
 # on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse the same hop.
@@ -2548,6 +2568,7 @@ def revocation_hop_disposition(
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
     #. ``proxy_proven`` → :attr:`~HopDisposition.ALLOW` — revocation is *proven in front* by a declared
        revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
+       **Unreachable today:** no call site sets it, so no refusal offers it (BACKLOG #2987).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2607,10 +2628,13 @@ CREDENTIAL_HOP_WAYS_ACROSS = (
 #: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many
 #: hops consume it: that is the hardened-count liability SDS-3.6 names, and this very change moved
 #: four documents off such a count. Find the consumers by symbol.
+#:
+#: It offered a third lever until BACKLOG #2987 (#2977 item 9): terminate at a revocation-checking
+#: egress proxy. No call site sets ``proxy_proven``, so routing egress through such a proxy never
+#: changed the decision, and the refusal named a remedy the operator could not perform (SDS-3.7).
 _CONNECTION_WAYS_ACROSS = (
-    "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
-    "revocation-checking egress proxy, or set tls_revocation_attested=true with a "
-    "tls_revocation_attested_reason on this connection."
+    "Configure [tls].crl_file so the engine checks a CRL on this hop, or set "
+    "tls_revocation_attested=true with a tls_revocation_attested_reason on this connection."
 )
 
 
@@ -2620,14 +2644,15 @@ class RevocationHopGuard:
 
     The revocation twin of the transports' cleartext :class:`InsecureHopGuard`. Built once at connector
     construction via :meth:`capture`, which snapshots the active hop posture
-    (:func:`current_hop_posture`) and folds the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env into the
-    per-connection attestation. :meth:`enforce_construction` is the ENFORCED gate — it fires inside
-    ``build_check`` (``messagefoundry check`` / dry-run / reload / the serve pre-flight), where the derived
-    posture IS stamped, and refuses a production-PHI verified-but-unrevoked hop off-loopback there. It
-    **no-ops when the posture is unstamped** (``None`` — a live serve build after the pre-flight, or a
-    direct test/embedding): the enforced gate has already validated the config, so re-refusing here would
-    wrongly break every live serve of a legitimately-attested / non-prod lane (identical semantics to the
-    cleartext :class:`InsecureHopGuard`)."""
+    (:func:`current_hop_posture`) and reads the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env into its
+    own field, apart from the per-connection attestation (BACKLOG #299).
+    :meth:`enforce_construction` is the ENFORCED gate. It fires wherever
+    the derived posture is stamped, and refuses a production-PHI verified-but-unrevoked hop
+    off-loopback there: inside ``build_check`` (``messagefoundry check`` / dry-run / reload), and in
+    the runner's live builds when ``serve`` starts the graph, which stamp the same posture. So a first
+    ``serve`` start refuses a hop at its own build (measured for BACKLOG #2193; ``docs/CONNECTIONS.md``
+    says what each refusal stops). It **no-ops when the posture is unstamped** (``None``, such as a
+    direct test build or an embedding that stamps none)."""
 
     host: str
     cell: str
@@ -2643,9 +2668,9 @@ class RevocationHopGuard:
     #: context in :meth:`capture`, never from a global setting.
     crl_checked: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
-    #: (BACKLOG #1498). The default names ``[tls].crl_file``, an egress terminator and a
-    #: connection's ``tls_revocation_attested`` — **all three are inapplicable to the non-connection
-    #: hops that pass this field**. The ones that do (at least the IdP, the syslog forwarder and the
+    #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
+    #: ``tls_revocation_attested`` — **both are inapplicable to the non-connection hops that pass
+    #: this field**. The ones that do (at least the IdP, the syslog forwarder and the
     #: store) each load their own CRL setting and resolve no ``[tls]`` anchor, so ``[tls].crl_file``
     #: never reaches their contexts, and there is no connection to carry the flag; check any new one
     #: before relying on this. Telling such an operator to set one of them is a refusal whose remedy
@@ -2750,7 +2775,8 @@ class RevocationHopGuard:
     def enforce_construction(self) -> None:
         """The ENFORCED construction gate: raise :class:`InsecureHopRefused` on a production-PHI
         verified-but-unrevoked hop off-loopback, loud-log (+audit the attestation) on a warned hop, allow
-        the rest. No-op when the posture is unstamped (``None``) — the build_check gate is the authority."""
+        the rest. No-op when the posture is unstamped (``None``); see the class docstring for where
+        it is stamped."""
         posture = self.posture
         if posture is None:
             return
@@ -2825,9 +2851,10 @@ class TrustAnchorPolicy:
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
     #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
-    #: reaches (BACKLOG #299), and to the inbound FTPS poller, which dials out (BACKLOG #2370). Independent of ``mode``: revocation is orthogonal to which roots anchor
-    #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
-    #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
+    #: reaches (BACKLOG #299), and to the inbound FTPS poller, which dials out (BACKLOG #2370).
+    #: Independent of ``mode``: revocation is orthogonal to which roots anchor the hop, so a
+    #: ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching the
+    #: exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
     crl_file: str | None = None
 
 
@@ -2947,27 +2974,39 @@ class CaFileUnreadable(OSError, ValueError):
 
     Both bases on purpose. It was a bare ``FileNotFoundError`` before, so a caller catching
     ``OSError`` still catches it. The load seams surface a ``ValueError`` as a configuration
-    refusal, so it now reads as one too, with the setting and connection in the text."""
+    refusal, so it now reads as one too, with the setting and connection in the text.
+
+    It also covers a file that reads but holds no usable PEM, which ``ssl`` raises as an
+    :class:`ssl.SSLError` (vault BACKLOG #2977 item 10)."""
 
 
 @contextmanager
 def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
-    """Turn an unreadable ``anchor.cafile`` into :class:`CaFileUnreadable` naming its setting.
+    """Turn an unloadable ``anchor.cafile`` into :class:`CaFileUnreadable` naming its setting.
 
-    An :class:`ssl.SSLError` (a file that reads but holds no usable PEM) passes through unchanged:
-    it is an :class:`OSError` too, but not the missing-file case this names."""
+    Two shapes get the one worded error: a file that cannot be read, and one that reads but holds
+    no usable PEM. The second is an :class:`ssl.SSLError`, and it used to pass through raw, naming
+    neither the setting nor the connection (vault BACKLOG #2977 item 10)."""
     try:
         yield
-    except ssl.SSLError:
-        raise
     except OSError as exc:
         # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
         # test returns this text to the caller and audits it. The setting tells the operator where.
-        # It does not make the hop path-free; a [tls].crl_file refusal still names its file.
+        #
+        # A [tls].crl_file refusal on the same hop still names its file, and the two shapes are
+        # kept by Manager decision (BACKLOG #3096 item 11). This CA setting is per connection. The
+        # CRL file is the instance's one [tls] setting: settings load refuses a missing one, path
+        # and all, and harden_crl_check's refusals at hop build name it too. So the CRL path can
+        # still reach a connection test's text. One rule for both is not decided here.
         setting = anchor.cafile_setting or "the CA file setting"
-        raise CaFileUnreadable(
-            f"{setting} names a CA file that cannot be read: {exc.strerror or type(exc).__name__}"
-        ) from exc
+        if isinstance(exc, ssl.SSLError):
+            # OpenSSL's text names no path. reason is None for some errors, such as a bad PEM body,
+            # and absent on an SSLError built in Python.
+            reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
+            problem = f"OpenSSL could not load as PEM certificates: {reason}"
+        else:
+            problem = f"cannot be read: {exc.strerror or type(exc).__name__}"
+        raise CaFileUnreadable(f"{setting} names a CA file that {problem}") from exc
 
 
 def build_verifying_client_context(

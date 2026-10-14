@@ -812,23 +812,32 @@ class DeliveryResponse:
 
 @dataclass(frozen=True)
 class ReplyBodyDropped:
-    """A delivery the partner answered 2xx, whose reply body was over the byte bound and dropped.
+    """A delivery the partner answered 2xx, whose reply body the engine could not read and dropped.
 
     A non-capturing ``send`` returns this instead of ``None`` when nothing reads the body (vault
-    BACKLOG #2180). The message is delivered. The delivery worker marks the row done with a
-    ``reply_dropped`` event in one transaction, and only then logs a WARNING that names the message
-    (vault BACKLOG #3040 items 2 and 5).
+    BACKLOG #2180). The body was over the byte bound, or, since BACKLOG #2989, cut short of its
+    declared length or misframed. The message is delivered. The delivery worker marks the row done
+    with a ``reply_dropped`` event in one transaction, and only then logs a WARNING that names the
+    message (vault BACKLOG #3040 items 2 and 5).
 
-    It carries the status and the bound, and no byte of the reply.
+    It carries the status, the bound and ``fault``, and no byte of the reply.
     """
 
     status: int
     limit: int
+    #: What was wrong with the body, as fixed text from ``bounded_read``, never a byte the peer
+    #: sent. ``None`` means it was over the bound.
+    fault: str | None = None
+
+    @property
+    def problem(self) -> str:
+        """What was wrong with the body, in words that follow "reply body"."""
+        return self.fault if self.fault is not None else f"over the {self.limit}-byte bound"
 
     @property
     def detail(self) -> str:
-        """The ``reply_dropped`` event's detail: the status and the bound, nothing else."""
-        return f"HTTP {self.status}; reply body over the {self.limit}-byte bound"
+        """The ``reply_dropped`` event's detail: the status and the problem, nothing else."""
+        return f"HTTP {self.status}; reply body {self.problem}"
 
 
 class SourceConnector(abc.ABC):
@@ -992,8 +1001,8 @@ class DestinationConnector(abc.ABC):
     ``send`` returns ``None`` for a one-way delivery (the default for every non-capturing outbound —
     byte-identical to before ADR 0013). A **response-capturing** outbound returns a
     :class:`DeliveryResponse` carrying the partner's reply; the delivery worker persists it inside the
-    same transaction that marks the row done. A non-capturing send whose 2xx reply body was over the
-    byte bound returns :class:`ReplyBodyDropped`, which is still a delivery. ``aclose`` releases any
+    same transaction that marks the row done. A non-capturing send whose 2xx reply body it could not
+    read returns :class:`ReplyBodyDropped`, which is still a delivery. ``aclose`` releases any
     held resources (no-op by default).
 
     ``metadata`` (BACKLOG #68) is this message's read-only **user** metadata bag (the ADR 0081 ``SetMeta``

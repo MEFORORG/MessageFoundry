@@ -743,7 +743,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_bind_password` | secret | — | supply via env (`MEFOR_AUTH_AD_BIND_PASSWORD`), or use `ad_bind_password_secret`. A value in the file is still accepted, with a WARNING at load; keep it out of the file |
 | `ad_bind_password_secret` | str | — | connector `SecretProvider` reference (ADR 0019 §5) — when set and `[secrets].provider` is configured, the bind password is resolved from that backend (e.g. a Vault KV `path#field`) instead of `ad_bind_password`. A reference, not a secret. |
 | `ad_use_nested_groups` | bool | `true` | resolve nested groups (`LDAP_MATCHING_RULE_IN_CHAIN`) |
-| `ad_tls_verify` | bool | `true` | validate the LDAPS certificate |
+| `ad_tls_verify` | bool | `true` | validate the LDAPS certificate. `false` is refused at start, with no escape, because every bind carries a password ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). For a private CA, set `ad_tls_ca_cert_file` |
 | `ad_tls_ca_cert_file` | str | — | trust an internal CA for LDAPS without disabling verification. Read once at start, and every LDAPS bind trusts those bytes. **A changed file takes effect at the next restart.** The PEM rules, and what a reload does, are under `[api].tls_client_ca_file` (BACKLOG #2185) |
 | `ad_tls_ca_cert_pin` | str | — | optional lowercase-hex SHA-256 pin over the corresponding CA anchor PEM (`ad_tls_ca_cert_file`); a mismatch refuses at load + reload (ASVS 6.7.1); unset = no pin (dormant); set but empty or whitespace refuses at load |
 | `ad_allow_insecure_ldap` | bool | `false` | explicit opt-in to a non-`ldaps://` bind (trusted-network dev only). Inert under `[security].enforcement = enforce`; see its [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) entry |
@@ -1169,7 +1169,7 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | `pooled_fusing_workers` | int (≥1) | 8 | worker count for **each** per-stage fusing executor (ADR 0071 B5). Every fused stage gets its own `ThreadPoolExecutor` of this width plus a matching-width dedicated synchronous pyodbc handoff pool (one connection per worker, so a fused hop never blocks acquiring). Small by default — a fused hop holds a worker across DB latency, so this *is* the fused-stage concurrency; it also clamps the fused stages' effective `pooled_max_processing_lanes` to ~2× this value, so the claimer doesn't reserve 256 slots for a handful of workers. Inert unless `fuse_thread_hops` is on. |
 | `batch_handoff_statements` | bool | `true` | **Per-hop SQL statement batching** ([ADR 0075](adr/0075-per-hop-sql-statement-batching.md)). **Default-ON** (promoted 2026-07-08; retained as an emergency off-switch) and SQL-Server-scoped: each per-hop staged handoff (`route_handoff` / `transform_handoff`) folds the non-result-returning DML of its body into the fewest `pyodbc.execute()` T-SQL batches — the same ordered `(sql, params)` sequence, one round-trip per batch, still committing **exactly once per hop**. It cuts network round-trips, **not** transactions: no commit boundary moves, the claim stays its own poison-guard transaction, and the ACK-on-receipt fence is untouched. Each result-consuming statement whose value gates later control flow (the guard `DELETE`, the finalize `GROUP BY`, the finalize `sp_getapplock` rc-check) stays its own execute. Postgres and SQLite have no batched path and run byte-identically. **Read once at engine construction (restart to change).** Env: `MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS`. |
 | `snapshot_on_send` | bool | `true` | **Copy-on-`Send`** ([ADR 0104](adr/0104-copy-on-send-outbound-message-model-recognition-first-handler-message-type-and-hl7-field-picker.md)) — snapshot each `Send`'s payload at construction so a **divergent fan-out** (mutate between `Send`s) delivers per-destination state instead of a last-write collapse. **Default-ON** since the BACKLOG #230 default-flip: the conservative estate AST scan flagged 1 of 152 handlers and human triage found that one mutates an independent clone, so genuine divergence is **0** and the flip changes delivered bytes for no handler; and `Message.copy()` is now genuine copy-on-write, so the common single-`Send` / no-post-mutation path is zero-copy and a deepcopy fires only on an actual divergence. Set `false` to restore the pre-ADR-0104 last-write behaviour. Backend-agnostic. **Read once at engine construction (restart to change).** Env: `MEFOR_PIPELINE_SNAPSHOT_ON_SEND`. |
-| `credential_fault_policy` | enum | `stop` | **Partner-account-lockout protection** (#109, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). What an outbound File/FTP/SFTP sender does on a **permanent credential/auth fault** (bad password, key rejected). `stop` (default) halts the lane **immediately** (not after a streak) and **retains the queued rows un-errored** (they stay pending/claimable, never dead-lettered), so a backlog can't re-authenticate in a loop and trip the partner's account lockout — reusing the STOP muscle (`connection_stopped` alert; reload/restart re-arms the lane once the credential is fixed). `dead_letter` keeps the historical fail-fast (dead-letter just the offending row and advance). The policy also governs a permanent **configuration** fault (BACKLOG #2083): an FTP server that refuses `AUTH TLS`, `PBSZ`/`PROT P` or the greeting, or demands TLS of a plain session. Every queued row would meet that refusal too, so `stop` stops the lane and keeps the queue, and the alert names the configuration. A REST, SOAP, FHIR or DICOMweb outbound raises the same fault when its HTTP Digest handler refuses a challenge (BACKLOG #2323, code `auth-challenge-refused`). That needs Digest set up on the connection, for the endpoint or for the web proxy. The refused challenges are at least these: a Digest challenge naming a hash other than SHA-256, a malformed one, and one in a scheme other than Digest or Basic, such as NTLM. Other unanswered challenges do not raise it; [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md) Amendment B lists them. A **content**-permanent reject (AR/CR, no-such-dir) is unaffected — it still dead-letters. |
+| `credential_fault_policy` | enum | `stop` | **Partner-account-lockout protection** (#109, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). What an outbound File/FTP/SFTP sender does on a **permanent credential/auth fault** (bad password, key rejected). `stop` (default) halts the lane **immediately** (not after a streak) and **retains the queued rows un-errored** (they stay pending/claimable, never dead-lettered), so a backlog can't re-authenticate in a loop and trip the partner's account lockout — reusing the STOP muscle (`connection_stopped` alert; reload/restart re-arms the lane once the credential is fixed). `dead_letter` keeps the historical fail-fast (dead-letter just the offending row and advance). The policy also governs a permanent **configuration** fault (BACKLOG #2083): an FTP server that refuses `AUTH TLS`, `PBSZ`/`PROT P` or the greeting, or demands TLS of a plain session. Every queued row would meet that refusal too, so `stop` stops the lane and keeps the queue, and the alert names the configuration. A REST, SOAP, FHIR or DICOMweb outbound raises the same fault when its HTTP Digest handler refuses a challenge (BACKLOG #2323, code `auth-challenge-refused`). That needs Digest set up on the connection, for the endpoint or for the web proxy. The refused challenges are at least these: a Digest challenge naming a hash other than SHA-256, a malformed one, one with no realm or nonce, one whose `qop` does not offer `auth`, and one in a scheme other than Digest or Basic, such as NTLM. The token hop of an OAuth2 or SMART connection raises it for a web proxy's refused challenge too, when the token endpoint is `http://`. A send-time insecure-hop refusal raises the same fault with code `insecure-hop-refused` (BACKLOG #2989). Other unanswered challenges do not raise it; [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md) Amendment B and B.1 list them. A **content**-permanent reject (AR/CR, no-such-dir) is unaffected — it still dead-letters. |
 | `schedule_tick_seconds` | float (>0) | 30.0 | **Active-window scheduler tick** (#147, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). The reconcile granularity for a connection's per-connection `schedule` (a window boundary is honoured within one tick). Only affects connections that declare a `schedule`; connections with none are byte-identical always-on. |
 
 ### `[sandbox]`
@@ -1686,7 +1686,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
@@ -1805,10 +1805,12 @@ issuer. The engine applies a replaced file only when all three of these hold:
    same scope, signing key and critical extensions.
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
-what to do. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
-CRL fails its signature check under rule 2 is held back too. A start refuses it when the CRL names
-the CA's key and that key did not sign it, so fix that file. Otherwise a start loads it with a
-warning, and each handshake then decides. The next paragraphs say which is which.
+what to do. It also raises the `crl_reload_refused` alert described further down. A file failing rule 1 would also stop the engine starting, so fix the file. A file whose
+CRL fails its signature check under rule 2 is held back too. On the signature, a start refuses it
+only where the engine proves the signature bad, so fix that file. Short of that proof the signature
+does not stop a start: unless another rule refuses the file, a start loads it with a warning, and
+each handshake then decides. The next paragraphs say what counts as proof, and name cases that
+load.
 A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
 a file that drops an issuer, and a CRL signed under a new key. When the hops holding one file need
 different things, the ERROR names the strongest: fix the file, then restart, then wait. When it names
@@ -1816,10 +1818,19 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
-the file in one case only: the CRL names a listed CA's key by its key identifier, and that key did
-not sign the CRL. A handshake that OpenSSL judges by such a CRL fails with `CRL signature failure`,
-an error that does not name the file. The refusal names the setting, the file and the CRL. Give the
-setting the CRL that CA signed. No setting turns this check off, as for an expired CRL.
+the file in one case only, where it has proof. Three things all hold then. A listed CA has the
+CRL's issuer name, compared exactly. The CRL names that CA's key by its key identifier. The engine
+ran the signature check with that key, and the check failed. Where several listed CAs share that
+name, the check must run and fail for each of them that the engine finds to fit the CRL's
+authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
+`CRL signature failure`, an error that does not name the file. The refusal names the setting, the
+file and the CRL. Give the setting the CRL that CA signed. No setting turns this check off, as for
+an expired CRL.
+
+The check reads only the file a CRL setting names. A CRL can also reach a hop through its CA file
+alone, on at least the hops that the paragraph on a CRL inside a CA file, further down, names. It
+is in use there, and the engine does not check its signature, at a start or at a reload. OpenSSL
+still checks it at each handshake it judges.
 
 Each CRL in the file is judged on its own, as for an expired CRL. So a badly signed copy refuses
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
@@ -1828,33 +1839,45 @@ such a file was measured to pass its handshakes. Remove the bad copy.
 Anything short of that proof loads, and the engine logs one WARNING for the file. At least these
 three cases warn:
 
-- No CA the hop lists has the CRL's issuer name and the key the CRL names. This is the usual case
-  when the peer sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same
-  way until a handshake first uses it.
+- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly, and then
+  the CRL's authority key identifier, where it carries one. This is the usual case when the peer
+  sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a
+  handshake first uses it. So does a listed CA whose name differs from the CRL's issuer name only
+  in letter case. Where the letters that differ are ASCII, OpenSSL was measured to treat the two
+  names as one, so it still judges peers by that CRL. A badly signed CRL of that kind started with
+  the WARNING, and then failed its handshake with `CRL signature failure`.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
-- The engine cannot check the signature with the listed CA's key.
+- The engine cannot check the signature with the listed CA's key, even where the CRL names that key.
+  Two measured examples are an ECDSA signature on a CRL that names an RSA key, and an RSA signature
+  over SHA-1 that the CA did make.
 
 If the check itself fails, the engine logs an ERROR that says so, and loads the file.
 
-The file is in use in each case, and OpenSSL still checks the signature at every handshake. The
-WARNING is logged once per engine process for each version of the file. A hop whose CA list gives a
-different result for the same file logs its own line, and each engine shard logs its own. A system
-root the hop has loaded counts as a listed CA. So a CRL that names a system root's key, and that the
-root did not sign, refuses the start too.
+The file is in use in each case, and OpenSSL still checks the signature at every handshake. An
+engine process logs the WARNING once while the file keeps the same bytes. It keeps that record for
+one version only, the last one it logged a line for. So an earlier version is logged again when it
+returns after another version that was logged. A version in between that logged nothing, because
+it verified or was refused, does not reset the record. A hop whose CA list
+gives a different result for the same file logs its own line, and each engine shard logs its own. A system
+root the hop has loaded counts as a listed CA. So the same proof against a system root's key refuses
+the start too.
 
-The reload is stricter than a start. Under rule 2 it holds back every CRL that a listed CA of that
-name does not verify, whether or not the CRL names a key. Its ERROR says to fix the file. After a
-CA renews its key the file can be right, and a restart then loads it with the WARNING above.
+The reload is stricter than a start. Under rule 2 it holds back every CRL it cannot confirm against
+a listed CA. Where the engine matches the CRL to a listed CA and cannot confirm the signature with
+that CA's key, the remedy is the one the `bad_signature` row below describes. That is so whether or
+not the CRL names a key, and whether the check failed or could not run. After a CA renews its key
+the file can be right, and a restart then loads it with the WARNING above. Where the engine matches
+the CRL to no listed CA, the remedy is the `no_issuer` row's: restart.
 
 **What a signature refusal stops.** It has the reach of the expired-CRL refusal, because one check
 raises both. This is read from the code, not measured end to end. At `serve`, a refused outbound
 connection is isolated: that lane is marked failed and alerted, and the rest of the graph starts.
 `check`, a live reload, a promote and a connection upsert build every connection before they change
-anything, so one refusal there blocks the whole change. `[tls].crl_file` is shared. One badly signed
-CRL in it refuses each hop that loads the file and lists the CA whose key the CRL names. At least
-two kinds of hop are not refused. A loopback hop loads no CRL. A hop whose own CA list lacks that CA
+anything, so one refusal there blocks the whole change. `[tls].crl_file` is shared. One CRL in it
+refuses each hop that loads the file and reaches that proof. At least two kinds of hop are not
+refused. A loopback hop loads no CRL. A hop whose own CA list lacks the CA whose key the CRL names
 only warns.
 
 **It is not only a start-time check for the Postgres store.** That store builds a TLS context for
@@ -1877,26 +1900,91 @@ again, nor is a session resumed from an earlier handshake. So a newly revoked pa
 connected stays connected until it reconnects or you restart. Every reload stays in the hop's trust
 store. After `crl_max_reloads` reloads of one file, a hop refuses the next and asks for a restart.
 
-Until a hop is current, the scan judges the copy it holds as well as the new file. So the alert does
-not clear on the file alone, and the alert's date can be the held copy's rather than the new file's.
-When it is, the notifier event carries `held_copy` set to `true` (vault BACKLOG #2319). Its `detail`
+**A refused reload raises its own alert, `crl_reload_refused` (vault BACKLOG #2904).** The
+`cert_expiry` alert above speaks only once the copy a hop holds nears its `nextUpdate`. So the
+engine also alerts when it refuses a replaced file. Until the file is applied, a revocation added to
+it is not enforced on the hops that hold the old copy. Match the alert in a `[[alerts.rules]]` rule
+with `event_type = "crl_reload_refused"`. It does not depend on `warn_days`. With no `[alerts]`
+transport it is a WARNING in the log, beside the reload's ERROR.
+
+| Event field | What it holds |
+|---|---|
+| `connection` | `crl_reload:` and the CRL file's absolute path, case-folded on Windows. `@node:<node_id>` or `@shard:<id>` follows when several engine processes share the store, because each process holds its own TLS contexts. A long path is shortened to a checksum and its tail; `path` holds it whole. |
+| `path` | the file's absolute path, case kept. A relative path in a setting appears here in its absolute form |
+| `remedy_class` | a short token for what to do next; see the next table |
+| `stale_contexts` | how many running TLS contexts still held the old copy when the alert was raised |
+| `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
+| `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
+
+This event carries no CRL contents. The reason for the refusal quotes CRL issuer names and dates, so
+it is left out of this event. It is in the engine log, in the `crl_reload` ERROR line. Read that
+line before you act. That holds for this event only: the CRL expiry alert's `detail` does carry the
+reason, once the held copy nears its `nextUpdate`. The expiry date, `held_copy` and `shared_with`
+belong to the CRL expiry alert too. This event carries none of them.
+
+| `remedy_class` | What to do |
+|---|---|
+| `fix_file` | Fix the file. A start would refuse it too. |
+| `lapses_first` | Fix the file now with a CRL that is in effect. The hop's copy lapses before the file's CRL takes effect, and every peer is refused in between. A restart does not help, and a start can refuse the file too. |
+| `bad_signature` | A CRL in the file fails its signature check under rule 2. The signature paragraphs above say when to fix the file and when a restart loads it. |
+| `not_provable` | Give the setting a bare CRL. The file carries a certificate the reload cannot prove the hop trusts. |
+| `restart` | Restart the engine to apply the file. |
+| `no_issuer` | Restart the engine to apply the file. Adding the issuing intermediate CA to the hop's own CA file does not apply this file; it lets later reloads verify the CRL without a restart. |
+| `retry` | The engine tries again every pass. A restart applies the file now. |
+| `wait` | Wait. The engine applies the file once its CRL takes effect. Do not restart before then. |
+
+The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
+no remedy sentence.
+
+**One alert per file version.** The engine raises the alert when it first refuses a version of the
+file. It raises it again only when the file's bytes change or the reason does, which is the rule the
+ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
+applies while the alert is open: a second refused version inside `[alerts].realert_seconds` of the
+first updates the open alert and does not page again. So a page can name an older class than the
+alert list shows. When the engine resolves the alert itself, that ends the cooldown, so it does not
+hold back a refusal that follows a fix. A resolve made by hand in the alert list does not end it.
+
+**Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
+the event carries no `start_refuses`. With any other class a start can refuse the file too, and
+then the engine does not come up.
+
+**The alert resolves itself.** Its inverse, `crl_reload_applied`, pages nobody and cannot be a
+rule's `event_type`. The engine raises it once the refusal no longer stands on that process:
+
+- the file was applied to every hop that held an older copy;
+- the file was put back to the bytes those hops hold;
+- no hop holds the file any more.
+
+A file the engine cannot read resolves nothing, and neither does a reload pass that fails. The
+engine also resolves its open alerts when it stops, because a restart builds every hop from the
+file. An engine that dies without stopping leaves its alert open; resolve it in the alert list. A
+rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped
+event.
+
+Until a hop is current, the expiry scan judges the copy it holds as well as the new file. So the
+expiry alert does not clear on the file alone, and its date can be the held copy's rather than the
+new file's. When it is, the notifier event carries `held_copy` set to `true` (vault BACKLOG #2319). Its `detail`
 names the setting whose hop holds the copy, and says what to do: wait for the reload, fix the file, or
-restart. The log line says the same. A replaced file that is not near expiry raises no alert. Each
+restart. The log line says the same. A replaced file that is not near expiry raises no expiry alert. Each
 scan still logs a warning that a running hop holds an older copy, and why. If the file cannot be read,
 the scan judges the held copy instead of skipping it.
 
 **A held copy is matched by its file, not by its hop.** When two settings or connections name one
-CRL file, each gets its own row, and a copy that one hop holds is reported under both. Each alert
-then lists the other rows in `shared_with`. Its `detail` names the setting that holds the copy, so
+CRL file, each gets its own row, and a copy that one hop holds is reported under both. Each expiry
+alert then lists the other rows in `shared_with`. Its `detail` names the setting that holds the copy, so
 read that, not the row's label, to find the hop to restart.
 
 **A CRL inside a CA file counts too, on an outbound hop that checks revocation** (vault BACKLOG
 #2319). The outbound hops that resolve a trust anchor load `[tls].internal_ca_file`, or a
 connection's own `tls_ca_file`, whole, CRL blocks included. So does the syslog forwarder with
 `[logging].forward_tls_ca_file`. Once a CRL setting turns revocation checking on for that hop, those
-CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer. The scan watches
+CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer. The expiry scan watches
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
-file, so a refreshed CRL inside one needs a restart, and the alert's `detail` says so. Put a CRL in
+file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. A start does
+not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's
+start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
+its issuer. If the new CRL is expired, not yet in effect, a delta CRL, unreadable, or badly signed,
+`detail` says to fix it in the CA file before restarting. Put a CRL in
 the hop's CRL setting instead to have it applied without a restart. The listeners, OIDC and AD load
 only the certificates from their CA files, so a CRL there is ignored, as the CA file rows above say.
 The PostgreSQL store's `[store].ssl_root_cert` is not watched this way: it records no held copy.

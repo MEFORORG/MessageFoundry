@@ -635,7 +635,7 @@ def test_a_crl_with_a_bad_signature_is_refused_and_handshakes_still_succeed(pki:
 
     assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
     assert outcome.refusal.remedy == BAD_SIGNATURE and outcome.refusal.sticky
-    assert "does not verify" in outcome.refusal.reason
+    assert "could not confirm its signature" in outcome.refusal.reason
     assert hop.cert_store_stats() == stats
     assert _accepts(hop, pki.server())  # the old copy is kept, and the hop still works
 

@@ -179,7 +179,10 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
   (`expired`, `auth_time_stale`) instead of minting a dead session. The federated step-up in Amendment B
   never extends the cap. Local and AD session expiry are still unchanged.]*
 - **AC-7** — IF a callback arrives without a matching flow cookie, THEN THE SYSTEM SHALL refuse and
-  audit `flow_binding_missing`, even when `state` and `code` are otherwise valid.
+  audit `flow_binding_missing`, even when `state` and `code` are otherwise valid. IF a callback
+  carries the cookie but not the flow's own `state`, including an `error=` or malformed callback,
+  THEN THE SYSTEM SHALL refuse it and consume nothing, keeping the flow and its cookie for the real
+  IdP return (BACKLOG #3198).
   → `packaging/messagefoundry-webconsole/tests/test_webui.py` <!-- console-package suite -->
 
 - **AC-8** — WHILE the IdP is unreachable, THE SYSTEM SHALL continue to serve local, LDAPS, and Kerberos
@@ -533,7 +536,10 @@ B.1 left the verification of what comes back to the build. These are its criteri
   test and a freshness test, is refused as `step_up_subject_mismatch` (BACKLOG #2143). IF the directory no
   longer returns the account by its immutable id, THEN THE SYSTEM SHALL refuse with
   `not_in_directory`, and a row with no immutable id SHALL be refused with
-  `directory_object_id_missing` rather than looked up by name. IF a role stored on the account is
+  `directory_object_id_missing` rather than looked up by name. IF the directory's answer does not
+  carry the row's own immutable id, THEN THE SYSTEM SHALL refuse with `directory_object_id_missing`
+  (no id) or `directory_identity_conflict` (another id), before its groups are read (BACKLOG
+  #3174). IF a role stored on the account is
   not among the roles its current directory groups map to, THEN THE SYSTEM SHALL refuse with
   `directory_roles_demoted`, write no roles, and leave the session as it was (BACKLOG #2154). Only a
   lost role refuses, and channel scope is not compared.

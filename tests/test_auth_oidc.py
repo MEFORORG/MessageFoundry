@@ -561,19 +561,33 @@ def test_pkce_challenge_is_s256_of_the_verifier() -> None:
 def test_flow_round_trip_binds_and_is_single_use() -> None:
     cache = oidc.FlowCache(clock=lambda: 0.0)
     flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
-    got = cache.pop(flow_id)
-    assert got is not None and got.state == flow.state
-    assert cache.pop(flow_id) is None  # single-use
+    got, consumed = cache.pop_if_state_matches(flow_id, flow.state)
+    assert got is not None and got.state == flow.state and consumed
+    assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)  # single-use
+
+
+def test_a_flow_is_consumed_only_by_its_own_state() -> None:
+    """BACKLOG #3198. A missing or wrong ``state`` leaves the flow staged, so a forged callback
+    cannot spend the one the real IdP return needs. The matching state consumes it once."""
+    cache = oidc.FlowCache(clock=lambda: 0.0)
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
+    for forged in (None, "", "forged-" + flow.state, "café"):
+        got, consumed = cache.pop_if_state_matches(flow_id, forged)
+        assert got is not None and not consumed, forged
+    got, consumed = cache.pop_if_state_matches(flow_id, flow.state)
+    assert got is not None and got.state == flow.state and consumed
+    assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)  # single-use
 
 
 def test_flow_expires() -> None:
     clock = [0.0]
     cache = oidc.FlowCache(ttl_seconds=100.0, clock=lambda: clock[0])
-    flow_id, _ = oidc.start_flow(
+    flow_id, flow = oidc.start_flow(
         cache, return_to="/ui", client_ip="10.0.0.1", ttl_seconds=100.0, clock=lambda: clock[0]
     )
     clock[0] = 200.0
-    assert cache.pop(flow_id) is None
+    assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)
+    assert cache._entries == {}, "an expired flow found on lookup is dropped"
 
 
 def test_flow_cache_rejects_when_full_never_evicts() -> None:
@@ -583,7 +597,7 @@ def test_flow_cache_rejects_when_full_never_evicts() -> None:
     oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.2", clock=lambda: 0.0)
     with pytest.raises(oidc.FlowCacheFullError):
         oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.3", clock=lambda: 0.0)
-    assert cache.pop(a) is not None  # the earliest flow survived the flood
+    assert cache.peek(a) is not None  # the earliest flow survived the flood
 
 
 def test_per_ip_cap_contains_one_source() -> None:

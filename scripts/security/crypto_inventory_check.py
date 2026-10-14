@@ -425,7 +425,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     # OpenSSL-textual `notAfter` — the stdlib parser rather than a hand-rolled one. Read-only date
     # arithmetic on an ALREADY-VERIFIED cert: it builds no SSLContext, reads no key material, and makes
     # no trust decision (the chain was verified by the listener long before this runs).
-    "messagefoundry/pipeline/cert_expiry.py": frozenset({"ssl"}),
+    # BACKLOG #3176: before it advises a restart into a changed CA file, the scan judges the CRLs in
+    # it as a start judges a CRL setting (tls_policy.judge_crl_bytes, which reads the CRL fields). It
+    # loads those bytes into a scratch context (tls_policy.crl_scratch_context) to read the CA
+    # certificates OpenSSL takes from them, and checks each CRL's signature against those through
+    # pki.crl_signature_refusal (a public-key verify). The scratch context is discarded: it serves no
+    # handshake and changes no hop's trust.
+    "messagefoundry/pipeline/cert_expiry.py": frozenset(
+        {"messagefoundry.config.tls_policy", "ssl"}
+    ),
     # BACKLOG #299: applies a replaced CRL file to the live TLS contexts that hold an older copy. It
     # loads CRL bytes into a scratch ssl.SSLContext (tls_policy.crl_scratch_context, which also proves
     # OpenSSL loads exactly the CRLs judged) to find any certificate before the live load, then
@@ -1073,7 +1081,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #1167: the passkey credential match and _rekey_token_state's grant walk.
             "compare:via messagefoundry.credential",
             "compare:via messagefoundry.auth.oidc.claims",
-            "compare:via messagefoundry.auth.oidc.flow",
+            # The OIDC `state` compare moved into FlowCache.pop_if_state_matches (BACKLOG #3198), so
+            # it is listed under messagefoundry/auth/oidc/flow.py and no longer here.
             "compare:via messagefoundry.auth.oidc_http",  # BACKLOG #1167: the anchor pin compare
             "compare:via messagefoundry.auth.totp",
             "csprng:secrets.token_urlsafe",
@@ -1226,8 +1235,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
+    # BACKLOG #3176: the expiry scan's CA-file CRL check calls pki.crl_signature_refusal itself, when
+    # a pass finds a hop holding an older copy of a CA file; the INVENTORY row above says the rest.
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
-        {"key_cert:ssl.cert_time_to_seconds", "key_cert:via messagefoundry.pki"}
+        {
+            "sign_verify:via messagefoundry.pki",
+            "key_cert:ssl.cert_time_to_seconds",
+            "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.pki",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
     ),
     # BACKLOG #299: the running-hop CRL reload; the INVENTORY row above says what each token does.
     "messagefoundry/pipeline/crl_reload.py": frozenset(
