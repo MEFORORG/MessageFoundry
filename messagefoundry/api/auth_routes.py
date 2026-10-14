@@ -1725,10 +1725,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupMap:
-        rows = await service.store.list_ad_group_role_map()
-        return AdGroupMap(
-            entries=[AdGroupMapEntry(ad_group=r["ad_group"], role=r["role_id"]) for r in rows]
-        )
+        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
+        pairs = await service.list_ad_group_role_map()
+        return AdGroupMap(entries=[AdGroupMapEntry(ad_group=g, role=r) for g, r in pairs])
 
     @app.put("/ad-group-map", response_model=SimpleMessage)
     async def set_ad_group_map(
@@ -1743,9 +1742,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # so each group that newly maps to it pages, as a promotion does. Read back from the store on
         # both sides, because the store normalises group names and a re-save must not page.
         async def admin_groups() -> set[str]:
-            rows = await service.store.list_ad_group_role_map()
             return {
-                str(r["ad_group"]) for r in rows if str(r["role_id"]) == Role.ADMINISTRATOR.value
+                g
+                for g, r in await service.list_ad_group_role_map()
+                if r == Role.ADMINISTRATOR.value
             }
 
         grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
@@ -1765,10 +1765,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupScopeMap:
-        rows = await service.store.list_ad_group_scope_map()
-        return AdGroupScopeMap(
-            entries=[AdGroupScopeEntry(ad_group=r["ad_group"], channel=r["channel"]) for r in rows]
-        )
+        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
+        pairs = await service.list_ad_group_scope_map()
+        return AdGroupScopeMap(entries=[AdGroupScopeEntry(ad_group=g, channel=c) for g, c in pairs])
 
     @app.put("/ad-group-scope-map", response_model=SimpleMessage)
     async def set_ad_group_scope_map(

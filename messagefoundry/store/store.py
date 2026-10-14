@@ -146,7 +146,9 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
 )
 from messagefoundry.store.row_seal import (
+    ADSET_KIND,
     PASSKEYS_LABEL,
+    ROLE_KIND,
     SEAL_PREFIX,
     SESSION_KIND,
     USER_KIND,
@@ -2386,6 +2388,17 @@ _WEBAUTHN_DELETE_ONE: Final = (
 )
 _WEBAUTHN_DELETE_ALL: Final = "DELETE FROM webauthn_credentials WHERE user_id=?"
 
+# The role write (BACKLOG #2592), every column in `RoleRow` field order. SQLite only: Postgres
+# carries a `$n` twin and SQL Server a MERGE. Used only by `_write_role`; tests/test_role_seal.py
+# keeps it so.
+_ROLE_UPSERT: Final = (
+    "INSERT INTO roles (id, display_name, description, builtin, permissions, seal)"
+    " VALUES (?,?,?,?,?,?)"
+    " ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,"
+    " description=excluded.description, builtin=excluded.builtin,"
+    " permissions=excluded.permissions, seal=excluded.seal"
+)
+
 
 def user_insert_params(record: UserAuthzRecord) -> tuple[object, ...]:
     """The parameters :data:`_USER_INSERT` binds, in order."""
@@ -2852,6 +2865,302 @@ def existing_roles_only(
         len(changed.roles) - len(kept),
     )
     return replace(changed, roles=kept)
+
+
+# --- sealed role definitions and the directory maps (BACKLOG #2592) ----------------------------
+#
+# One seal per ``roles`` row, over the whole row, and one seal over each whole AD directory map (the
+# group-to-role map and the group-to-channel map), stored in ``authority_set_seal`` under the map's
+# name. The store writes them through one helper each per backend (``_write_role``,
+# ``_write_ad_map``); ``AuthService`` checks them where it reads them.
+#
+# A role write and a map write each replace the whole thing from the caller's values:
+# ``upsert_role`` writes every column of one row, and ``set_ad_group_role_map`` and
+# ``set_ad_group_scope_map`` write a whole map. Neither carries a stored value forward, so neither
+# needs the old seal to verify, and each seals exactly what its caller gave. That is the repair route
+# for a role or a map that fails its seal, or carries none: an administrator saves it again. The
+# reads an administrator edits from never show a failing role's permissions or a failing map's
+# pairs, so a re-save cannot copy a change made outside the store into a sealed row. A write that
+# DOES carry stored values forward checks them first and never re-seals a failing one: removing a
+# deleted role's pairs from the role map, and ``rotate-key``'s re-seal.
+
+#: The ``roles`` columns a role seal leaves out, each with its reason (BACKLOG #2592).
+#: ``tests/test_role_seal.py`` pins this list.
+ROLE_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
+
+#: The AD group-to-role map: its table, and the name its seal is stored under in
+#: ``authority_set_seal``. The name is inside the sealed bytes too, so a seal made for one map
+#: never verifies for the other.
+AD_ROLE_MAP: Final = "ad_group_role_map"
+#: The AD group-to-channel map, named the same way.
+AD_SCOPE_MAP: Final = "ad_group_scope_map"
+#: Each sealed directory map, by name, with the label its second column is sealed under.
+AD_MAPS: Final[Mapping[str, str]] = MappingProxyType(
+    {AD_ROLE_MAP: "role_id", AD_SCOPE_MAP: "channel"}
+)
+
+
+class ByName(Protocol):
+    """A read row any backend returns: subscript by column name (a `dict`, an `aiosqlite.Row`,
+    an `asyncpg.Record`)."""
+
+    def __getitem__(self, key: str, /) -> Any: ...
+
+
+@dataclass(frozen=True)
+class RoleRow:
+    """Every column of one ``roles`` row, each in the one type every backend reads it back as
+    (BACKLOG #2592). ``tests/test_role_seal.py`` holds the fields equal to the table's columns."""
+
+    id: str
+    display_name: str
+    description: str | None
+    builtin: bool
+    #: A custom role's JSON permission list; ``None`` on a built-in row, which resolves from code.
+    permissions: str | None
+    #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
+    seal: str
+
+    @classmethod
+    def from_mapping(cls, d: ByName) -> RoleRow:
+        """Hard subscripts, as :meth:`UserRow.from_mapping` has, for the same reason."""
+        return cls(
+            id=str(d["id"]),
+            display_name=str(d["display_name"]),
+            description=_opt_str(d["description"]),
+            builtin=bool(d["builtin"]),
+            permissions=_opt_str(d["permissions"]),
+            seal=str(d["seal"] or ""),
+        )
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        """Every field not in :data:`ROLE_SEAL_EXCLUDED`, in field order."""
+        return tuple(
+            (f.name, getattr(self, f.name))
+            for f in _dc_fields(self)
+            if f.name not in ROLE_SEAL_EXCLUDED
+        )
+
+    def write_params(self) -> tuple[object, ...]:
+        """Every column, in field order, as the role write binds them."""
+        return tuple(getattr(self, f.name) for f in _dc_fields(self))
+
+
+def seal_role(sealer: RowSealer | None, row: RoleRow) -> RoleRow:
+    """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
+    return replace(row, seal="" if sealer is None else sealer.seal(ROLE_KIND, row.seal_fields()))
+
+
+def role_seal_ok(sealer: RowSealer | None, row: RoleRow) -> bool:
+    """Whether ``row`` carries a valid seal under a key this process holds. Always True with no
+    sealer. With one, a missing or empty seal fails like a wrong one."""
+    if sealer is None:
+        return True
+    try:
+        return sealer.verify_held(ROLE_KIND, row.seal_fields(), row.seal)
+    except TypeError:
+        return False
+
+
+def ad_group_keys(groups: Iterable[str]) -> frozenset[str]:
+    """AD group names as the maps store them: stripped, lower-cased, blanks dropped."""
+    return frozenset(g.strip().lower() for g in groups if g.strip())
+
+
+@dataclass(frozen=True)
+class AdMap:
+    """One whole AD directory map and its seal (BACKLOG #2592).
+
+    ``name`` is the map (:data:`AD_MAPS`). ``pairs`` are sorted ``(ad_group, value)``, the value
+    being a role id or a channel; the seal covers them and the name. ``missing`` names mapped role
+    ids with no ``roles`` row when the role map was read. It is not sealed: it is read beside the
+    map so a deleted role is never handed out, on SQL Server especially, where the role map has no
+    role foreign key. The channel map's ``missing`` is always empty."""
+
+    name: str
+    pairs: tuple[tuple[str, str], ...] = ()
+    seal: str = ""
+    missing: frozenset[str] = frozenset()
+
+    @classmethod
+    def of(
+        cls,
+        name: str,
+        pairs: Iterable[tuple[str, str]],
+        seal: str = "",
+        missing: Iterable[str] = (),
+    ) -> AdMap:
+        return cls(name, tuple(sorted(set(pairs))), seal, frozenset(missing))
+
+    @classmethod
+    def from_entries(cls, name: str, entries: Iterable[tuple[str, str]]) -> AdMap:
+        """The map an administrator's entries describe, as the map stores them: group names as
+        :func:`ad_group_keys` keeps them. A channel is stripped and a blank one dropped; a role id
+        is kept as given, and an unknown one is refused by the roles foreign key."""
+        if name == AD_SCOPE_MAP:
+            entries = [(g, v.strip()) for g, v in entries if v.strip()]
+        return cls.of(name, ((g.strip().lower(), v) for g, v in entries if g.strip()))
+
+    @classmethod
+    def from_rows(cls, name: str, rows: Iterable[ByName]) -> AdMap:
+        """The map from each backend's one-statement read: a ``seal`` row, if the map has one, and
+        a ``pair`` row per pair, each with ``live`` saying whether its value is a role with a
+        ``roles`` row (always true for a channel)."""
+        seal = ""
+        pairs: list[tuple[str, str]] = []
+        missing: set[str] = set()
+        for r in rows:
+            if str(r["k"]) == "seal":
+                seal = str(r["a"] or "")
+                continue
+            pair = (str(r["a"]), str(r["b"]))
+            pairs.append(pair)
+            if not r["live"]:
+                missing.add(pair[1])
+        return cls.of(name, pairs, seal, missing)
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        label = AD_MAPS[self.name]
+        out: list[tuple[str, object]] = [("map", self.name), ("pairs", len(self.pairs))]
+        for ad_group, value in self.pairs:
+            out.extend((("ad_group", ad_group), (label, value)))
+        return tuple(out)
+
+    def values_for(self, groups: Iterable[str]) -> set[str]:
+        """The role ids or channels this map gives ``groups``, leaving out a role with no
+        ``roles`` row."""
+        keys = ad_group_keys(groups)
+        return {v for g, v in self.pairs if g in keys and v not in self.missing}
+
+    def without_value(self, value: str) -> AdMap:
+        return replace(self, pairs=tuple(p for p in self.pairs if p[1] != value))
+
+
+def ad_map_seal_ok(sealer: RowSealer | None, current: AdMap) -> bool:
+    """Whether the map carries a valid seal under a key this process holds. Always True with no
+    sealer, and for an empty map, which grants nothing whatever its seal says. With pairs, a missing
+    or empty seal fails like a wrong one."""
+    if sealer is None or not current.pairs:
+        return True
+    try:
+        return sealer.verify_held(ADSET_KIND, current.seal_fields(), current.seal)
+    except TypeError:
+        return False
+
+
+#: A write to one AD map, for a backend's ``_write_ad_map``: a whole replacement map, which keeps
+#: nothing stored and so is never refused, or an edit of the stored map, which is checked first.
+AdMapChange = AdMap | Callable[[AdMap], AdMap]
+
+
+def ad_map_write(sealer: RowSealer | None, current: AdMap, change: AdMapChange) -> AdMap | None:
+    """What a backend's ``_write_ad_map`` writes over ``current``, the map it read inside its
+    transaction: the changed map, sealed, or ``None`` when nothing differs (BACKLOG #2592).
+
+    An edit (a callable) keeps stored pairs, so it raises :class:`RowSealError` when ``current``
+    fails its seal, and pairs written outside the store are never sealed in. A whole replacement
+    (an :class:`AdMap`) keeps nothing and is not refused; it is how an administrator repairs a map.
+    """
+    if isinstance(change, AdMap):
+        changed = replace(change, name=current.name)
+    elif not ad_map_seal_ok(sealer, current):
+        raise RowSealError(ADSET_KIND)
+    else:
+        changed = change(current)
+    seal = "" if sealer is None else sealer.seal(ADSET_KIND, changed.seal_fields())
+    new = replace(changed, seal=seal)
+    if new.pairs == current.pairs and new.seal == current.seal:
+        return None
+    return new
+
+
+class AdMapSql(NamedTuple):
+    """Postgres's or SQL Server's statements for one AD directory map (BACKLOG #2592), each used
+    only by that backend's ``get_ad_map`` (``read``) or ``_write_ad_map`` (the rest). SQLite names
+    the same statements as module constants (``_AD_ROLE_MAP_READ`` and its siblings), which say why;
+    a statement added here needs its SQLite twin there."""
+
+    #: The map and its seal in ONE statement, so a read never pairs one write's pairs with
+    #: another's seal: a ``seal`` row, then a ``pair`` row per pair with ``live`` saying whether a
+    #: mapped role has a ``roles`` row (always true for a channel). Binds the map's name.
+    read: str
+    #: Every pair, inside the writer's transaction.
+    pairs: str
+    #: The rewrite: clear the map, then insert each pair.
+    clear: str
+    insert: str
+
+
+# SQLite's statements for each AD directory map, the twins of the ``AdMapSql`` tables Postgres and
+# SQL Server carry. Each is a plain named string, and each call site names one directly, because
+# ``tests/test_writer_txn_is_the_only_begin.py`` reads every ``execute`` argument in this module as
+# text and pins how many it cannot read; a statement looked up in a table at run time is one it
+# cannot. ``_AD_*_READ`` is used only by ``get_ad_map``, the rest only by ``_write_ad_map``.
+_AD_ROLE_MAP_READ: Final = (
+    "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal WHERE name=?"
+    " UNION ALL"
+    " SELECT 'pair' AS k, m.ad_group AS a, m.role_id AS b, r.id IS NOT NULL AS live"
+    " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
+)
+_AD_ROLE_MAP_PAIRS: Final = "SELECT ad_group, role_id FROM ad_group_role_map"
+_AD_ROLE_MAP_CLEAR: Final = "DELETE FROM ad_group_role_map"
+_AD_ROLE_MAP_INSERT: Final = "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)"
+_AD_SCOPE_MAP_READ: Final = (
+    "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal WHERE name=?"
+    " UNION ALL"
+    " SELECT 'pair' AS k, ad_group AS a, channel AS b, 1 AS live FROM ad_group_scope_map"
+)
+_AD_SCOPE_MAP_PAIRS: Final = "SELECT ad_group, channel FROM ad_group_scope_map"
+_AD_SCOPE_MAP_CLEAR: Final = "DELETE FROM ad_group_scope_map"
+_AD_SCOPE_MAP_INSERT: Final = "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)"
+
+
+def _is_role_map(name: str) -> bool:
+    """Whether ``name`` is the role map rather than the channel map. Any other name raises, a map
+    added to :data:`AD_MAPS` later included, so a caller can branch on the answer without a name
+    falling through to the channel map's statements."""
+    if name == AD_ROLE_MAP:
+        return True
+    if name == AD_SCOPE_MAP:
+        return False
+    raise KeyError(name)
+
+
+def report_unsealed_role_records(count: int) -> None:
+    """Name, at a keyed open, the custom roles and directory maps that carry no integrity seal
+    (BACKLOG #2592). Each grants nothing until an administrator saves it again, which seals it;
+    nothing seals one automatically, for the reason :func:`report_unsealed_users` gives."""
+    if count:
+        log.warning(
+            "%d custom role(s) or directory map(s) carry no integrity seal and grant nothing"
+            " (BACKLOG #2592); an administrator saves each again through the console or the API"
+            " to seal it",
+            count,
+        )
+
+
+def report_refused_ad_role_map() -> None:
+    """Log a custom-role delete that met an AD group-to-role map failing its seal (BACKLOG #2592).
+    The role's pairs are deleted, which needs no key, and the map is not re-sealed, so it still
+    grants nothing until an administrator saves it again."""
+    log.warning(
+        "the AD group-to-role map failed its integrity seal during a role delete; the role's pairs"
+        " were removed and nothing was re-sealed (BACKLOG #2592)"
+    )
+
+
+def report_role_reseal(resealed: int, refused: int) -> None:
+    """Log what ``rotate-key``'s role and map re-seal pass did (BACKLOG #2592)."""
+    if resealed:
+        log.info(
+            "re-sealed %d role definition(s) and map(s) under the active key (rotation)", resealed
+        )
+    if refused:
+        log.warning(
+            "%d role definition(s) or map(s) failed their integrity seal and were left as they"
+            " are; each grants nothing (BACKLOG #2592)",
+            refused,
+        )
 
 
 # PHI-at-rest encryption is the store's `_cipher` (messagefoundry.store.crypto): identity when no
@@ -6330,7 +6639,15 @@ CREATE TABLE IF NOT EXISTS roles (
     display_name TEXT NOT NULL,
     description  TEXT,
     builtin      INTEGER NOT NULL DEFAULT 1,
-    permissions  TEXT                          -- custom roles (ADR 0045): JSON array of Permission wire values; NULL = built-in (resolves from code)
+    permissions  TEXT,                         -- custom roles (ADR 0045): JSON array of Permission wire values; NULL = built-in (resolves from code)
+    seal         TEXT NOT NULL DEFAULT ''      -- BACKLOG #2592: integrity seal over the whole row. NO COMMA in this comment
+);
+
+-- BACKLOG #2592: one integrity seal per directory map over its sorted pairs. A map with pairs and no
+-- seal grants nothing on a keyed store.
+CREATE TABLE IF NOT EXISTS authority_set_seal (
+    name TEXT PRIMARY KEY,                     -- the map the seal covers: 'ad_group_role_map' or 'ad_group_scope_map'
+    seal TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS user_roles (
@@ -6878,6 +7195,7 @@ class MessageStore:
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
                 report_unsealed_users(await store.count_unsealed_users())
+                report_unsealed_role_records(await store.count_unsealed_role_records())
             if read_only:
                 await store._load_read_only()
             else:
@@ -7615,6 +7933,7 @@ class MessageStore:
         # secrets already under the active key. The loop then rotates the rest, which are accounts
         # whose record has no seal or fails it and is refused anyway.
         report_user_reseal(*await self.reseal_user_records())
+        report_role_reseal(*await self.reseal_role_records())
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
@@ -8047,8 +8366,15 @@ class MessageStore:
         # the column — ALTER it in (NULL on every existing built-in row is byte-identical to today:
         # built-ins resolve from BUILTIN_ROLE_PERMISSIONS, never this column). Idempotent.
         cur = await db.execute("PRAGMA table_info(roles)")
-        if "permissions" not in {row["name"] for row in await cur.fetchall()}:
+        role_cols = {row["name"] for row in await cur.fetchall()}
+        if "permissions" not in role_cols:
             await db.execute("ALTER TABLE roles ADD COLUMN permissions TEXT")
+        # BACKLOG #2592: the role's integrity seal. An existing row gets an empty seal: a keyed
+        # store grants nothing from a custom role carrying one until an administrator saves it
+        # again, and the built-in rows are re-sealed by the service's role seed at every start.
+        # `report_unsealed_role_records` names the count at open.
+        if "seal" not in role_cols:
+            await db.execute("ALTER TABLE roles ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
         # --- end custom RBAC roles (ADR 0045) --------------------------------
         # MFA (WP-14): a pre-existing DB's users predate the TOTP columns — ALTER them in (NULL/0 on
         # existing rows = "not enrolled", correct). Idempotent: skipped once present.
@@ -14369,16 +14695,21 @@ class MessageStore:
         builtin: bool = True,
         permissions: str | None = None,
     ) -> None:
+        row = RoleRow(role_id, display_name, description, bool(builtin), permissions, "")
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "INSERT INTO roles (id, display_name, description, builtin, permissions)"
-                " VALUES (?,?,?,?,?)"
-                " ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,"
-                " description=excluded.description, builtin=excluded.builtin,"
-                " permissions=excluded.permissions",
-                (role_id, display_name, description, 1 if builtin else 0, permissions),
-            )
+            await self._write_role(row)
             await self._commit()
+
+    async def _write_role(self, row: RoleRow) -> None:
+        """The one writer of a ``roles`` row (BACKLOG #2592): every column of ``row``, sealed under
+        the active key. Call it inside an open write.
+
+        It replaces the whole row from ``row`` and keeps nothing from the row it replaces, so it
+        does not check that row's seal: an administrator's re-save is how a role that fails is
+        repaired (the comment above :data:`ROLE_SEAL_EXCLUDED` says why that copies nothing in). A
+        caller that builds ``row`` from a stored one checks it first, as
+        :meth:`reseal_role_records` does."""
+        await self._db.execute(_ROLE_UPSERT, seal_role(self._row_sealer, row).write_params())
 
     async def list_roles(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -14417,7 +14748,13 @@ class MessageStore:
                     await self._db.execute(
                         "DELETE FROM user_roles WHERE role_id=? AND user_id=?", (role_id, holder)
                     )
-            await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
+            # The map keeps its other pairs, so it is re-sealed only when it verifies; a map that
+            # fails loses this role's pairs, which needs no key, and stays failing.
+            try:
+                await self._write_ad_map(AD_ROLE_MAP, lambda m: m.without_value(role_id))
+            except RowSealError:
+                report_refused_ad_role_map()
+                await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))
             await self._commit()
             return True
@@ -14673,16 +15010,17 @@ class MessageStore:
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
+        """The role ids the role map gives ``groups``, its seal UNCHECKED. The service reads each
+        map through its own loader, which checks the seal (BACKLOG #2592)."""
+        return (await self.get_ad_map(AD_ROLE_MAP)).values_for(groups)
+
+    async def get_ad_map(self, name: str) -> AdMap:
         async with self._read() as db:
-            cur = await db.execute(
-                f"SELECT DISTINCT role_id FROM ad_group_role_map WHERE ad_group IN ({placeholders})",
-                tuple(normalized),
-            )
-            return {str(r["role_id"]) for r in await cur.fetchall()}
+            if _is_role_map(name):
+                cur = await db.execute(_AD_ROLE_MAP_READ, (name,))
+            else:
+                cur = await db.execute(_AD_SCOPE_MAP_READ, (name,))
+            return AdMap.from_rows(name, await cur.fetchall())
 
     async def list_ad_group_role_map(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -14692,30 +15030,108 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
+        await self._replace_ad_map(AdMap.from_entries(AD_ROLE_MAP, entries))
+
+    async def _replace_ad_map(self, replacement: AdMap) -> None:
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM ad_group_role_map")
-            for ad_group, role_id in pairs:
-                await self._db.execute(
-                    "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
-                    (ad_group, role_id),
-                )
+            await self._write_ad_map(replacement.name, replacement)
             await self._commit()
 
-    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        """Channels mapped to a user's AD groups (per-channel RBAC C3). May include the sentinel
-        ``'*'`` (all). Empty = no group mapping matched; the AD login sync then keeps a manual scope
-        and withdraws any other (BACKLOG #1927)."""
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
+    async def _write_ad_map(self, name: str, change: AdMapChange) -> bool:
+        """The one writer of an AD directory map and its seal (BACKLOG #2592). Call it inside an
+        open write transaction. Reads the map, applies ``change`` and writes the result, sealed;
+        :func:`ad_map_write` says when it refuses, raising :class:`RowSealError` and writing
+        nothing. Returns whether anything was written."""
+        # Each statement is named at its call, not looked up; the module constants say why.
+        role = _is_role_map(name)
+        cur = await self._db.execute("SELECT seal FROM authority_set_seal WHERE name=?", (name,))
+        seal_row = await cur.fetchone()
+        if role:
+            cur = await self._db.execute(_AD_ROLE_MAP_PAIRS)
+        else:
+            cur = await self._db.execute(_AD_SCOPE_MAP_PAIRS)
+        current = AdMap.of(
+            name,
+            [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
+            "" if seal_row is None else str(seal_row["seal"] or ""),
+        )
+        new = ad_map_write(self._row_sealer, current, change)
+        if new is None:
+            return False
+        if new.pairs != current.pairs:
+            if role:
+                await self._db.execute(_AD_ROLE_MAP_CLEAR)
+                for pair in new.pairs:
+                    await self._db.execute(_AD_ROLE_MAP_INSERT, pair)
+            else:
+                await self._db.execute(_AD_SCOPE_MAP_CLEAR)
+                for pair in new.pairs:
+                    await self._db.execute(_AD_SCOPE_MAP_INSERT, pair)
+        await self._db.execute(
+            "INSERT INTO authority_set_seal (name, seal) VALUES (?,?)"
+            " ON CONFLICT(name) DO UPDATE SET seal=excluded.seal",
+            (name, new.seal),
+        )
+        return True
+
+    async def count_unsealed_role_records(self) -> int:
+        """How many custom roles carry no integrity seal, plus one for each AD directory map that
+        has pairs and no seal (BACKLOG #2592). See :func:`report_unsealed_role_records`."""
+        async with self._read() as db:
+            cur = await db.execute("SELECT COUNT(*) FROM roles WHERE builtin = 0 AND seal = ''")
+            row = await cur.fetchone()
+        unsealed = int(row[0]) if row else 0
+        for name in AD_MAPS:
+            current = await self.get_ad_map(name)
+            unsealed += 1 if current.pairs and not current.seal else 0
+        return unsealed
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and both AD directory maps under the active key, for
+        ``rotate-key`` (BACKLOG #2592), as :meth:`reseal_user_records` does for accounts. Each is
+        checked under the key its seal names first; one that fails is left as it is and counted.
+        Returns ``(re-sealed, refused)``."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
         async with self._read() as db:
             cur = await db.execute(
-                f"SELECT DISTINCT channel FROM ad_group_scope_map WHERE ad_group IN ({placeholders})",
-                tuple(normalized),
+                "SELECT id FROM roles WHERE seal <> '' AND seal NOT LIKE ? ORDER BY id",
+                (f"{SEAL_PREFIX}{sealer.key_id}:%",),
             )
-            return {str(r["channel"]) for r in await cur.fetchall()}
+            ids = [str(r["id"]) for r in await cur.fetchall()]
+        resealed = refused = 0
+        for role_id in ids:
+            async with _writer_guard(self._db, self._lock):
+                cur = await self._db.execute("SELECT * FROM roles WHERE id=?", (role_id,))
+                found = await cur.fetchone()
+                if found is None:
+                    continue
+                row = RoleRow.from_mapping(found)
+                if not role_seal_ok(sealer, row):
+                    refused += 1
+                    continue
+                await self._write_role(row)
+                await self._commit()
+                resealed += 1
+        for name in AD_MAPS:
+            current = await self.get_ad_map(name)
+            if not current.seal or sealer.is_active(current.seal):
+                continue
+            try:
+                async with _writer_txn(self._db, self._lock):
+                    resealed += await self._write_ad_map(name, lambda m: m)
+                    await self._commit()
+            except RowSealError:
+                refused += 1
+        return resealed, refused
+
+    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """Channels mapped to a user's AD groups (per-channel RBAC C3), the map's seal UNCHECKED;
+        the service reads it through its own loader (BACKLOG #2592). May include the sentinel
+        ``'*'`` (all). Empty = no group mapping matched; the AD login sync then keeps a manual scope
+        and withdraws any other (BACKLOG #1927)."""
+        return (await self.get_ad_map(AD_SCOPE_MAP)).values_for(groups)
 
     async def list_ad_group_scope_map(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -14725,17 +15141,7 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted(
-            {(g.strip().lower(), c.strip()) for g, c in entries if g.strip() and c.strip()}
-        )
-        async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM ad_group_scope_map")
-            for ad_group, channel in pairs:
-                await self._db.execute(
-                    "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)",
-                    (ad_group, channel),
-                )
-            await self._commit()
+        await self._replace_ad_map(AdMap.from_entries(AD_SCOPE_MAP, entries))
 
     async def create_session(
         self,
