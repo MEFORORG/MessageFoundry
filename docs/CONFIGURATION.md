@@ -138,8 +138,9 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
-  Windows service, `serve` and `supervise` refuse to start without `--service-config`**, so the
-  service never reads whatever file sits in its working directory. A start from a shell keeps the
+  Windows service, `serve` and `supervise` refuse to start without an absolute `--service-config`**,
+  so the service never reads a settings file from its working directory. A relative one under
+  `--project-root` counts, since it resolves under the root. A start from a shell keeps the
   default. [SERVICE.md, *Install*](SERVICE.md#install) says how to register the file.
 - **Secrets** (e.g. a DB password) should come from **env** (or a secret reference), never plaintext
   in the file — env wins over the file so a deployment can inject them.
