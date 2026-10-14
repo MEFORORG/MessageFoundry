@@ -2537,7 +2537,7 @@ class Engine:
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by
         :meth:`_resolve_reload_target`, and refused with ``FileNotFoundError`` when it is not a
-        directory or no directory can have its name (``is_invalid_name``), or
+        directory or no directory can have its name (``is_missing_directory``), or
         :class:`ConfigDirUnreadable` when resolving or listing it raises another ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
@@ -2546,7 +2546,7 @@ class Engine:
 
     def _existing_reload_target_blocking(self, config_dir: str | Path | None) -> Path:
         """:meth:`_existing_reload_target` on a worker thread, in one hop."""
-        from messagefoundry.config.fingerprint import is_invalid_name
+        from messagefoundry.config.fingerprint import is_missing_directory
 
         try:
             path = self._resolve_reload_target(config_dir)
@@ -2556,10 +2556,10 @@ class Engine:
             # swallows the listing error.
             with os.scandir(path):
                 pass
-        except (FileNotFoundError, NotADirectoryError):
-            missing = True
         except OSError as exc:
-            if not is_invalid_name(exc):
+            # Gone, not a directory, or a name no directory can have, such as ``sub?`` on Windows.
+            missing = is_missing_directory(exc)
+            if not missing:
                 # Not a missing directory: a parent the service account cannot traverse, say, or a
                 # directory it cannot list. Refused as its own case, so the routes and the
                 # dual-control release audit it rather than answering a 500 with no row, or
@@ -2570,9 +2570,6 @@ class Engine:
                     scrub_log_argument(safe_exc(exc)),
                 )
                 raise ConfigDirUnreadable() from exc
-            # No directory can have this name, such as ``sub?`` on Windows, so it is missing, as
-            # is_dir would say.
-            missing = True
         else:
             missing = False
         if missing:

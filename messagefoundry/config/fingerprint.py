@@ -37,7 +37,7 @@ __all__ = [
     "config_fingerprint",
     "config_fingerprint_detail",
     "fingerprint_matches",
-    "is_invalid_name",
+    "is_missing_directory",
 ]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
@@ -78,13 +78,17 @@ class ConfigDirMissing(FileNotFoundError):
 _INVALID_NAME_WINERRORS: frozenset[int] = frozenset({123, 161, 206})
 
 
-def is_invalid_name(exc: OSError) -> bool:
-    """Whether ``exc`` refuses the name it was given, so no directory by that name can exist: a name
+def is_missing_directory(exc: OSError) -> bool:
+    """Whether ``exc``, raised listing a directory, says there is no directory there: nothing by
+    that name, a file rather than a directory, or a name no directory can have. The last is a name
     too long for the filesystem (ENAMETOOLONG), or one Windows refuses, such as ``sub?``.
-    ``Path.is_dir`` answers ``False`` for both, so a caller that lists a directory instead reports
-    them as missing too (vault BACKLOG #2596)."""
+    ``Path.is_dir`` answers ``False`` for all of them, so a caller that lists the directory instead
+    reports them as missing too (vault BACKLOG #2596). Any other error, such as access denied, is
+    not a missing directory."""
     return (
-        exc.errno == errno.ENAMETOOLONG or getattr(exc, "winerror", None) in _INVALID_NAME_WINERRORS
+        isinstance(exc, (FileNotFoundError, NotADirectoryError))
+        or exc.errno == errno.ENAMETOOLONG
+        or getattr(exc, "winerror", None) in _INVALID_NAME_WINERRORS
     )
 
 
@@ -130,16 +134,14 @@ def _require_listable(base: Path) -> None:
     ``glob`` swallows a listing error, so a missing or unlistable directory would digest as an empty
     bundle, and an unlistable ``codesets`` folder as a bundle without it. A missing ``base`` raises
     :class:`ConfigDirMissing`, and so does one whose name no directory can have
-    (:func:`is_invalid_name`); any other fault raises its own ``OSError``. A sub-folder that does
-    not exist is fine: there is nothing in it to leave out."""
+    (:func:`is_missing_directory`); any other fault raises its own ``OSError``. A sub-folder that
+    does not exist is fine: there is nothing in it to leave out."""
     missing = False
     try:
         with os.scandir(base):
             pass
-    except (FileNotFoundError, NotADirectoryError):
-        missing = True
     except OSError as exc:
-        if not is_invalid_name(exc):
+        if not is_missing_directory(exc):
             raise
         missing = True
     if missing:
