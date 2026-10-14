@@ -2536,8 +2536,8 @@ class Engine:
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by
         :meth:`_resolve_reload_target`, and refused with ``FileNotFoundError`` when it is not a
-        directory, or :class:`ConfigDirUnreadable` when resolving or listing it raises another
-        ``OSError``.
+        directory or no directory can have its name (``is_invalid_name``), or
+        :class:`ConfigDirUnreadable` when resolving or listing it raises another ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
         #2581)."""
@@ -2545,6 +2545,8 @@ class Engine:
 
     def _existing_reload_target_blocking(self, config_dir: str | Path | None) -> Path:
         """:meth:`_existing_reload_target` on a worker thread, in one hop."""
+        from messagefoundry.config.fingerprint import is_invalid_name
+
         try:
             path = self._resolve_reload_target(config_dir)
             # List it, not is_dir: is_dir answers False for a target it cannot stat, which would
@@ -2556,16 +2558,20 @@ class Engine:
         except (FileNotFoundError, NotADirectoryError):
             missing = True
         except OSError as exc:
-            # Not a missing directory: a parent the service account cannot traverse, say, or a
-            # directory it cannot list. Refused as its own case, so the routes and the dual-control
-            # release audit it rather than answering a 500 with no row, or invalid_config for an
-            # empty listing. The error can carry a client's config_dir, so it is scrubbed for
-            # py/log-injection.
-            log.warning(
-                "config reload target could not be resolved or listed: %s",
-                scrub_log_argument(safe_exc(exc)),
-            )
-            raise ConfigDirUnreadable() from exc
+            if not is_invalid_name(exc):
+                # Not a missing directory: a parent the service account cannot traverse, say, or a
+                # directory it cannot list. Refused as its own case, so the routes and the
+                # dual-control release audit it rather than answering a 500 with no row, or
+                # invalid_config for an empty listing. The error can carry a client's config_dir,
+                # so it is scrubbed for py/log-injection.
+                log.warning(
+                    "config reload target could not be resolved or listed: %s",
+                    scrub_log_argument(safe_exc(exc)),
+                )
+                raise ConfigDirUnreadable() from exc
+            # No directory can have this name, such as ``sub?`` on Windows, so it is missing, as
+            # is_dir would say.
+            missing = True
         else:
             missing = False
         if missing:

@@ -54,7 +54,7 @@ from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
-from tests.test_config_fingerprint import _unreadable
+from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
 from tests.test_trust_anchors import _block
 
 PW = "a-strong-test-passphrase"
@@ -1788,3 +1788,46 @@ async def test_a_digest_refusal_after_a_failed_load_does_not_carry_the_load_erro
         await engine.reload_detail(dry_run=False, approval=approval)
     assert refused.value.__cause__ is None
     assert refused.value.__context__ is None
+
+
+# --- vault BACKLOG #2596, PR 2239 review: a name no directory can have is missing -------------
+
+
+@pytest.mark.parametrize("name", INVALID_DIR_NAMES)
+@pytest.mark.parametrize("approvals", [GATED, NOT_GATED], ids=["held", "inline"])
+async def test_a_name_no_directory_can_have_is_refused_as_missing(
+    engine: Engine, tmp_path: Path, approvals: ApprovalsSettings, name: str
+) -> None:
+    """``is_dir`` answered False for such a name, so the reload answered 404 ``not_found``. Listing
+    the target instead raised the OS error, and the reload answered 422 ``unreadable``. No
+    directory can have the name, so it is missing again, held or inline, and no hold is filed."""
+    config_dir = str(tmp_path / "cfg" / name)
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, approvals, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        r = await c.post("/config/reload", json={"config_dir": config_dir}, headers=op)
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"] == "config directory not found"
+    assert await engine.store.list_pending_approvals(now=0.0, limit=10) == []
+    assert await _failed_reload_rows(engine) == [
+        {"requested": config_dir, "dry_run": False, "reason": "not_found"}
+    ]
+
+
+@pytest.mark.parametrize("name", INVALID_DIR_NAMES)
+async def test_the_gated_engine_path_refuses_a_name_no_directory_can_have_as_missing(
+    engine: Engine, tmp_path: Path, name: str
+) -> None:
+    """The request-time digest and an approval-bound reload both raise ``FileNotFoundError``, not
+    ``ConfigDirUnreadable`` or ``ConfigDigestUnavailable``. The strict digest itself is pinned in
+    tests/test_config_fingerprint.py."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+    from messagefoundry.pipeline import ApprovedConfig
+
+    config_dir = tmp_path / "cfg" / name
+    with pytest.raises(FileNotFoundError):
+        await engine.reload_target_digest(config_dir)
+    approval = ApprovedConfig(config_fingerprint(tmp_path / "cfg"))
+    with pytest.raises(FileNotFoundError):
+        await engine.reload_detail(config_dir, approval=approval)

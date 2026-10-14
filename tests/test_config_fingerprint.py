@@ -17,7 +17,11 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.fingerprint import config_fingerprint, config_fingerprint_detail
+from messagefoundry.config.fingerprint import (
+    ConfigDirMissing,
+    config_fingerprint,
+    config_fingerprint_detail,
+)
 
 _HEXDIGITS = set("0123456789abcdef")
 
@@ -176,6 +180,28 @@ def test_strict_refuses_a_missing_directory_where_the_default_digests_an_empty_b
             config_fingerprint(not_a_dir, strict=True)
     # The control: an empty directory is a directory, and the default digests a missing one as it.
     assert config_fingerprint(empty, strict=True) == config_fingerprint(gone)
+
+
+#: Directory names no directory can have. A 300-character component is past every filesystem's
+#: name limit, so Linux answers ENAMETOOLONG and Windows ERROR_INVALID_NAME. Windows also refuses a
+#: ``?``, the name the PR 2239 review probed; elsewhere that is an ordinary missing name.
+INVALID_DIR_NAMES = [
+    pytest.param("a" * 300, id="too-long"),
+    pytest.param(
+        "sub?",
+        id="question-mark",
+        marks=pytest.mark.skipif(os.name != "nt", reason="only Windows refuses a ? in a name"),
+    ),
+]
+
+
+@pytest.mark.parametrize("name", INVALID_DIR_NAMES)
+def test_strict_refuses_a_name_no_directory_can_have_as_missing(tmp_path: Path, name: str) -> None:
+    """The OS refuses the name with an error that is not ENOENT, so a strict digest raised that
+    error, and a gated reload of the name answered ``digest_unavailable`` or ``unreadable``. No
+    directory can have the name, so it is missing (vault BACKLOG #2596)."""
+    with pytest.raises(ConfigDirMissing):
+        config_fingerprint(tmp_path / name, strict=True)
 
 
 def test_strict_refuses_a_folder_it_cannot_list(
