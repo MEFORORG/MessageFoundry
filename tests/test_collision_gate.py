@@ -1169,22 +1169,43 @@ def test_an_edit_into_a_siblings_tree_collides_with_the_sibling(
         "Short": "5ab1e000",
         "Root": _top(sibling),
     }
+    # With the cwd and without it: the pin names the session either way.
+    for with_cwd in (True, False):
+        payload: dict[str, Any] = {
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(sibling / "a.py")},
+            "session_id": "s1",
+        }
+        if with_cwd:
+            payload["cwd"] = str(wt)
+        got = run_gate(
+            _rooted_overlap_stub(tmp_path, [own, owner]),
+            state_dir=tmp_path / "sib-state",
+            raw_input=json.dumps(payload),
+            cwd=repo,
+        )
+        assert got is not None, (
+            f"cwd={with_cwd}: a live sibling's dirty file was allowed in silence"
+        )
+        reason = got["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "5ab1e000" in reason, reason
+        assert "in linked [linked]" not in reason, "the session met itself"
+
+
+def test_a_row_with_this_sessions_own_id_is_not_a_peer(tmp_path: Path) -> None:
+    """A session can hold a second worktree under its own id. That row is not a collision."""
+    own_elsewhere = {**EDITING_ROW, "Short": "abcdef12", "Worktree": "my-second-wt"}
     payload = {
         "tool_name": "Edit",
-        "tool_input": {"file_path": str(sibling / "a.py")},
-        "cwd": str(wt),
-        "session_id": "s1",
+        "tool_input": {"file_path": "a.py"},
+        "session_id": "abcdef12-0000",
     }
-    got = run_gate(
-        _rooted_overlap_stub(tmp_path, [own, owner]),
-        state_dir=tmp_path / "sib-state",
-        raw_input=json.dumps(payload),
-        cwd=repo,
-    )
-    assert got is not None, "an edit into a live sibling's dirty file was allowed in silence"
-    reason = got["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "5ab1e000" in reason, reason
-    assert "in linked [linked]" not in reason, "the session met itself"
+    stub = make_overlap_stub(tmp_path, [own_elsewhere])
+    assert run_gate(stub, state_dir=tmp_path / "own", raw_input=json.dumps(payload)) is None
+    # The control: the same row under another session's id denies.
+    other = {**payload, "session_id": "99999999-0000"}
+    got = run_gate(stub, state_dir=tmp_path / "own2", raw_input=json.dumps(other))
+    assert got is not None and got["hookSpecificOutput"].get("permissionDecision") == "deny", got
 
 
 def test_after_a_cd_to_another_repository_the_edit_is_checked_and_nothing_is_written_there(

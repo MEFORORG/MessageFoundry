@@ -977,11 +977,11 @@ if ($null -eq $map) {
             $lastSweep = Get-Item -LiteralPath $sweepStamp -ErrorAction SilentlyContinue
             if (-not $lastSweep -or ((Get-Date) - $lastSweep.LastWriteTime).TotalMinutes -ge 60 -or
                 $lastSweep.LastWriteTime -gt (Get-Date)) {
-                Set-Content -LiteralPath $sweepStamp -Value ((Get-Date).ToString("o")) -Encoding ascii
                 $staleBefore = (Get-Date).AddDays(-1)
                 Get-ChildItem -LiteralPath (Split-Path $cacheFile) -Filter *.json -File -ErrorAction SilentlyContinue |
                     Where-Object { $_.LastWriteTime -lt $staleBefore } |
                     Remove-Item -Force -ErrorAction SilentlyContinue
+                Set-Content -LiteralPath $sweepStamp -Value ((Get-Date).ToString("o")) -Encoding ascii
             }
         } catch { }   # a cache we cannot write is a slow hook, not a broken one
     }

@@ -1525,15 +1525,23 @@ def _second_worktree(repo: Path, tmp_path: Path, leaf: str) -> Path:
 def test_after_a_cd_to_a_sibling_the_session_announces_its_own_worktree(
     repo: Path, linked: Path, tmp_path: Path
 ) -> None:
-    """The first run pins the worktree the session is in. A later `cwd` in a sibling is a `cd`, and
+    """SessionStart pins the worktree the session is in. A later `cwd` in a sibling is a `cd`, and
     the hook announces the pinned worktree, never the sibling."""
     sibling = _second_worktree(repo, tmp_path, "sibling")
-    run(
-        repo,
-        tmp_path=tmp_path,
-        state_dir=tmp_path / "s1",
-        rows=[SELF_ROW, PEER],
-        payload_cwd=str(linked),
+    pin = tmp_path / "pin.ps1"
+    pin.write_text(
+        f". '{HOOK.parent / '_hookinput.ps1'}'\n"
+        "$null = Resolve-CcxHookSession -Text (Read-CcxHookInput)\n",
+        encoding="utf-8",
+    )
+    start = {"hook_event_name": "SessionStart", "session_id": SELF_ID, "cwd": str(linked)}
+    subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(pin)],
+        cwd=str(repo),
+        input=json.dumps(start),
+        text=True,
+        check=True,
+        capture_output=True,
     )
     p = run(
         repo,

@@ -281,9 +281,12 @@ if ($hasHelper) {
     if ($rootCommon -and (-not $script:StartCommon -or (Test-CcxSamePath $rootCommon $script:StartCommon))) {
         $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Pinned
         if (-not $self) { $self = $root }
+        $relative = $null
+        try { $relative = [System.IO.Path]::GetRelativePath($root, (ConvertTo-CcxNormPath $abs)) } catch { $relative = $null }
+        if (-not $relative) { $self = $root }   # an absolute path is only meaningful from its own root
         try {
             Set-Location -LiteralPath $self -ErrorAction Stop
-            $target = [System.IO.Path]::GetRelativePath($root, (ConvertTo-CcxNormPath $abs))
+            if ($relative) { $target = $relative }
         }
         catch {
             $degraded = "the gate could not enter $self, this session's worktree ($($_.Exception.Message))"
@@ -366,6 +369,13 @@ if ($partial -and $rows.Count -gt 0 -and $null -ne $rows[0].PSObject.Properties[
         "covering $(Get-SafeForMessage $rows[0].Walked) of $(Get-SafeForMessage $rows[0].Total) worktrees. " +
         "Those were checked; the rest were never looked at"
 }
+
+# A ROW CARRYING THIS SESSION'S OWN ID IS NOT A PEER, whichever worktree it is in. overlap.ps1 skips
+# only the root it runs from, and a session can hold a second worktree under the same id (a subagent
+# with worktree isolation). Short is the first eight characters of the registry session id.
+$selfShort = ''
+if ($hook) { $sid = [string]$hook.session_id; if ($sid.Length -ge 8) { $selfShort = $sid.Substring(0, 8) } }
+if ($selfShort) { $rows = @($rows | Where-Object { [string]$_.Short -ne $selfShort }) }
 
 $live = @($rows | Where-Object { $_.Live })
 
