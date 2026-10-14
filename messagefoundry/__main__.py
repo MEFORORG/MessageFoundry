@@ -2463,6 +2463,21 @@ def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: s
     return False
 
 
+def _missing_service_config_refused(service_config: str | None, *, fleet: str = "") -> bool:
+    """Vault BACKLOG #2626 step 2: True, with the reason printed, when this start is the Windows
+    service and has no ``--service-config``. Called before the settings load, so the service never
+    reads a ``messagefoundry.toml`` from its working directory. A start from a shell is unchanged.
+    ``serve`` and ``supervise`` both call it; ``fleet`` says the supervisor refuses for its
+    engine shards."""
+    from messagefoundry.serviceenv import missing_service_config_refusal, service_env_posture
+
+    refused = missing_service_config_refusal(service_env_posture(), service_config)
+    if refused is None:
+        return False
+    print(f"error: refusing to start: {refused}.{f' {fleet}' if fleet else ''}", file=sys.stderr)
+    return True
+
+
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
     # because a script injected before the hook is in place runs. It is NOT first in the process:
@@ -2532,6 +2547,8 @@ def _serve(args: argparse.Namespace) -> int:
     config_dir = anchor_under_root(args.config, root, cwd=cwd)
     assert config_dir is not None  # args.config always has a string default
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
+    if _missing_service_config_refused(args.service_config):
+        return 2
 
     # Only pass flags the user actually supplied so they override env/file but an unset flag doesn't.
     cli: dict[str, dict[str, object]] = {}
@@ -4844,6 +4861,12 @@ def _supervise(args: argparse.Namespace) -> int:
     # anchor_under_root(None, ...) returns None (config/anchor.py), so this is safe when unset; each child
     # re-anchors the raw --service-config to the same path under the forwarded --project-root.
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
+    # Each engine shard is started with the same --service-config, so each would refuse.
+    if _missing_service_config_refused(
+        args.service_config,
+        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
+    ):
+        return 2
     # `--env` goes into the settings as `serve` puts it (BACKLOG #2356), so one validated value
     # names the environment for every gate below, and a name `serve` refuses at load is refused
     # here. Each engine shard is still started with the flag itself.
