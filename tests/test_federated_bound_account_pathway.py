@@ -42,7 +42,7 @@ from messagefoundry.auth.service import FEDERATED_SIGN_IN_REQUIRED, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine, security_notify
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import AD_ROLE_MAP, MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests.test_auth_oidc_service import (
     DEFAULT_SUB,
@@ -406,19 +406,20 @@ async def test_a_bind_that_lands_during_a_windows_sso_sign_in_leaves_no_session(
         await _windows_sso(service, monkeypatch, "jdoe")  # the row exists and is unbound
         user = await store.get_user_by_username("jdoe")
         assert user is not None
-        real = store.get_ad_group_role_map
+        real = store.get_ad_map
         armed = [True]
         checks_passed = 0
 
-        async def lookup() -> Any:
+        async def lookup(name: str) -> Any:
             nonlocal checks_passed
-            checks_passed += 1
-            if armed.pop() if armed else False:
-                await _bind(service, store, DEFAULT_SUB)
-            return await real()
+            if name == AD_ROLE_MAP:
+                checks_passed += 1
+                if armed.pop() if armed else False:
+                    await _bind(service, store, DEFAULT_SUB)
+            return await real(name)
 
         # The service reads the AD role map through its one sealed loader (BACKLOG #2592).
-        monkeypatch.setattr(store, "get_ad_group_role_map", lookup)
+        monkeypatch.setattr(store, "get_ad_map", lookup)
         raced = await service.authenticate_kerberos(b"spnego-token")
 
         assert checks_passed == 1, "the sign-in was refused before the bind could land"

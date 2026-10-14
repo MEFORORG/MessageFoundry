@@ -138,10 +138,11 @@ from messagefoundry.store.row_seal import (
 )
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
+    AD_SCOPE_MAP,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdMap,
     AdminRemoval,
-    AdRoleMap,
     AuditAppend,
     ChannelScopeSource,
     FederatedUnbind,
@@ -153,7 +154,7 @@ from messagefoundry.store.store import (
     UserRecord,
     VerifiedUser,
     WebAuthnCredential,
-    ad_role_map_seal_ok,
+    ad_map_seal_ok,
     passkey_digest,
     require_notify_email,
     role_seal_ok,
@@ -5433,9 +5434,7 @@ class AuthService:
                 stored_scope=user.channel_scope,
                 stored_source=user.channel_scope_source,
                 # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset()
-                if administrator
-                else frozenset(await self._store.channels_for_ad_groups(groups)),
+                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
                 administrator=administrator,
             )
         )
@@ -6180,6 +6179,10 @@ class AuthService:
         current_roles: dict[str, frozenset[str]] = {}
         target_roles: dict[str, frozenset[str]] = {}
         scopes: dict[str, channel_scope.ScopeInput] = {}
+        # Both directory maps read once for the pass, each through its seal check (BACKLOG #2592),
+        # so every account in the pass is judged against one version of each map.
+        role_map = await self._ad_map(AD_ROLE_MAP)
+        scope_map = await self._ad_map(AD_SCOPE_MAP)
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
@@ -6191,7 +6194,7 @@ class AuthService:
             # the loader, so the roles judged are the ones the account's seal covers (#2592).
             row = await self._load_user(probe.user_id)
             current_roles[probe.user_id] = frozenset(() if row is None else row.role_ids)
-            target = frozenset(await self._ad_roles_for_groups(probe.groups))
+            target = frozenset(role_map.values_for(probe.groups))
             target_roles[probe.user_id] = target
             if row is None:
                 continue  # deleted mid-pass: nothing to decide, and the role re-diff still runs
@@ -6202,9 +6205,7 @@ class AuthService:
                 stored_scope=row.channel_scope,
                 stored_source=row.channel_scope_source,
                 mapped=(
-                    frozenset()
-                    if administrator
-                    else frozenset(await self._store.channels_for_ad_groups(probe.groups))
+                    frozenset() if administrator else frozenset(scope_map.values_for(probe.groups))
                 ),
                 administrator=administrator,
             )
@@ -7811,7 +7812,7 @@ class AuthService:
 
     async def _load_role(self, role_id: str) -> RoleRow | None:
         """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_load_custom_roles`, :meth:`_custom_role_held` and :meth:`_ad_role_map`, the ONLY
+        :meth:`_load_custom_roles`, :meth:`_custom_role_held` and :meth:`_ad_map`, the ONLY
         readers of the store's role and AD role-map readers in this service;
         ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
         it grants nothing."""
@@ -7857,33 +7858,43 @@ class AuthService:
             {"kind": ROLE_KIND, "role_id": role_id},
         )
 
-    async def _ad_role_map(self) -> AdRoleMap | None:
-        """The AD group-to-role map, its seal checked, or ``None`` when it fails, which is reported
-        (BACKLOG #2592). A failing map grants nothing from any of its pairs: the seal covers the
-        set, so a pair added outside the store cannot be told from the rest. The map is read in one
-        statement, so an honest write cannot tear the read."""
-        current = await self._store.get_ad_group_role_map()
-        if ad_role_map_seal_ok(self._store.row_sealer(), current):
+    async def _ad_map(self, name: str) -> AdMap:
+        """The AD directory map ``name`` (the group-to-role or group-to-channel map), its seal
+        checked (BACKLOG #2592). When it fails, an EMPTY map stands in its place, and the failure
+        is reported: a failing map grants nothing from any of its pairs, because the seal covers
+        the set, so a pair added outside the store cannot be told from the rest. The map is read
+        in one statement, so an honest write cannot tear the read."""
+        current = await self._store.get_ad_map(name)
+        if ad_map_seal_ok(self._store.row_sealer(), current):
             return current
         await self._report_seal_failure(
-            f"{ADSET_KIND}:{AD_ROLE_MAP}",
-            f"the {AD_ROLE_MAP} failed its integrity check and grants nothing",
-            {"kind": ADSET_KIND, "map": AD_ROLE_MAP},
+            f"{ADSET_KIND}:{name}",
+            f"the {name} failed its integrity check and grants nothing",
+            {"kind": ADSET_KIND, "map": name},
         )
-        return None
+        return AdMap(name)
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
-        seal. Every directory role decision in this service reads the map through here."""
-        current = await self._ad_role_map()
-        return set() if current is None else current.roles_for(groups)
+        seal. A directory role decision reads the map through here, or through :meth:`_ad_map`
+        once for a whole pass."""
+        return (await self._ad_map(AD_ROLE_MAP)).values_for(groups)
+
+    async def _ad_channels_for_groups(self, groups: Iterable[str]) -> frozenset[str]:
+        """The channels the AD group-to-channel map gives ``groups``; none when the map fails its
+        seal, which withdraws a directory-set scope rather than widening one."""
+        return frozenset((await self._ad_map(AD_SCOPE_MAP)).values_for(groups))
 
     async def list_ad_group_role_map(self) -> list[tuple[str, str]]:
         """The AD group-to-role map's ``(ad_group, role_id)`` pairs, for an administrator to read and
         edit. None when the map fails its seal: an administrator who saves the map again seals what
         they enter, and never re-seals a pair written outside the store (BACKLOG #2592)."""
-        current = await self._ad_role_map()
-        return [] if current is None else list(current.pairs)
+        return list((await self._ad_map(AD_ROLE_MAP)).pairs)
+
+    async def list_ad_group_scope_map(self) -> list[tuple[str, str]]:
+        """:meth:`list_ad_group_role_map`, for the AD group-to-channel map's ``(ad_group, channel)``
+        pairs."""
+        return list((await self._ad_map(AD_SCOPE_MAP)).pairs)
 
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
@@ -7948,11 +7959,7 @@ class AuthService:
         # The scope narrows on the same groups, by the rule login and the reconciler share. Its
         # TARGET roles decide the Administrator short-circuit there; here that is the kept set.
         administrator = Role.ADMINISTRATOR.value in kept
-        mapped = (
-            frozenset()
-            if administrator
-            else frozenset(await self._store.channels_for_ad_groups(answer.groups))
-        )
+        mapped = frozenset() if administrator else await self._ad_channels_for_groups(answer.groups)
         return await self._build_identity(
             _cert_narrowed_scope(user, mapped, administrator=administrator), role_ids=kept
         )

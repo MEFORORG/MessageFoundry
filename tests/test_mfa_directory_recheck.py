@@ -431,11 +431,11 @@ async def test_a_local_account_is_never_role_checked(
     )
     assert confirmed.ok and confirmed.recovery_codes
 
-    async def _never() -> object:
-        raise AssertionError("a local account was compared with the directory group map")
+    async def _never(name: str) -> object:
+        raise AssertionError(f"a local account was compared with the directory map {name}")
 
-    # The service reads the AD role map only through this reader (BACKLOG #2592).
-    monkeypatch.setattr(store, "get_ad_group_role_map", _never)
+    # The service reads the AD directory maps only through this reader (BACKLOG #2592).
+    monkeypatch.setattr(store, "get_ad_map", _never)
 
     verified = await service.verify_mfa(confirmed.token, confirmed.recovery_codes[0])
 

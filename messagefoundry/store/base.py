@@ -66,8 +66,8 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
+    AdMap,
     AdminRemoval,
-    AdRoleMap,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -2642,17 +2642,19 @@ class AuthStore(Protocol):
         """The role ids the AD group-to-role map gives ``groups``, its seal UNCHECKED."""
         ...
 
-    async def get_ad_group_role_map(self) -> AdRoleMap:
-        """The whole AD group-to-role map and its seal, read in one statement (BACKLOG #2592).
-        Unchecked: :class:`AuthService` checks the seal in its one map loader. The map is written
-        whole and sealed, through one helper per backend."""
+    async def get_ad_map(self, name: str) -> AdMap:
+        """One whole AD directory map (``AD_ROLE_MAP`` or ``AD_SCOPE_MAP``) and its seal, read in
+        one statement (BACKLOG #2592). Unchecked: :class:`AuthService` checks the seal in its one
+        map loader. Each map is written whole and sealed, through one helper per backend."""
         ...
 
     async def list_ad_group_role_map(self) -> Sequence[Row]: ...
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
-    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
+    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """The channels the AD group-to-channel map gives ``groups``, its seal UNCHECKED."""
+        ...
 
     async def list_ad_group_scope_map(self) -> Sequence[Row]: ...
 

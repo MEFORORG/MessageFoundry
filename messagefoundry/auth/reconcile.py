@@ -359,8 +359,8 @@ def plan_pass(
     """Turn a pass's probe results into an all-or-nothing plan.
 
     ``current_roles`` / ``target_roles`` are role-id sets keyed by ``user_id``, resolved by the
-    caller from the store (``get_user_role_ids``) and from the probed groups
-    (``roles_for_ad_groups``). They drive the free role re-diff: because ``resolve_principal``
+    caller from the store (``get_user_role_ids``) and from the probed groups (the role map, read
+    through its seal check). They drive the free role re-diff: because ``resolve_principal``
     already returns the group set, a *demotion* in the directory costs no extra bind.
 
     ``prior_outcomes`` is the caller's record of each live candidate's latest outcome, pruned to the

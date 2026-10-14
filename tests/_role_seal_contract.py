@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Cross-backend contract for sealed role definitions and the sealed AD group-to-role map
-(BACKLOG #2592).
+"""Cross-backend contract for sealed role definitions and the two sealed AD directory maps, the
+group-to-role map and the group-to-channel map (BACKLOG #2592).
 
 Deliberately **extra-free**, as ``tests/_user_seal_contract.py`` is: it imports nothing optional,
 so the live Postgres and SQL Server suites import it inside their test functions and run the same
@@ -20,7 +20,13 @@ from typing import Any
 
 from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.store.row_seal import SEAL_PREFIX
-from messagefoundry.store.store import RoleRow, ad_role_map_seal_ok, role_seal_ok
+from messagefoundry.store.store import (
+    AD_ROLE_MAP,
+    AD_SCOPE_MAP,
+    RoleRow,
+    ad_map_seal_ok,
+    role_seal_ok,
+)
 from tests._session_seal_contract import RawSql
 from tests._user_seal_contract import _Harness
 
@@ -151,8 +157,8 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
 
     # --- the AD group-to-role map: the store's own write seals it and it grants ---------------
     await store.set_ad_group_role_map([(_GROUP.upper(), Role.VIEWER.value)])
-    current = await store.get_ad_group_role_map()
-    assert current.seal.startswith(SEAL_PREFIX) and ad_role_map_seal_ok(sealer, current)
+    current = await store.get_ad_map(AD_ROLE_MAP)
+    assert current.seal.startswith(SEAL_PREFIX) and ad_map_seal_ok(sealer, current)
     assert await h.service._ad_roles_for_groups([_GROUP]) == {Role.VIEWER.value}
     alerts_before_map = len(h.alerts)
 
@@ -201,8 +207,8 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
         [(_GROUP, Role.VIEWER.value), (_OTHER_GROUP, mapped), (_OTHER_GROUP, Role.OPERATOR.value)]
     )
     await h.service.delete_custom_role(mapped, actor="contract")
-    kept = await store.get_ad_group_role_map()
-    assert ad_role_map_seal_ok(sealer, kept)  # control: re-sealed without the deleted role
+    kept = await store.get_ad_map(AD_ROLE_MAP)
+    assert ad_map_seal_ok(sealer, kept)  # control: re-sealed without the deleted role
     assert kept.pairs == ((_GROUP, Role.VIEWER.value), (_OTHER_GROUP, Role.OPERATOR.value))
     assert await h.service._ad_roles_for_groups([_OTHER_GROUP]) == {Role.OPERATOR.value}
     doomed = await _role(h, "contract-doomed", ["messages:replay"])
@@ -212,7 +218,43 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
         (_OTHER_GROUP, Role.ADMINISTRATOR.value),
     )
     await h.service.delete_custom_role(doomed, actor="contract")
-    left = await store.get_ad_group_role_map()
+    left = await store.get_ad_map(AD_ROLE_MAP)
     assert doomed not in {r for _, r in left.pairs}  # the role's own pairs are gone
-    assert not ad_role_map_seal_ok(sealer, left)  # and the planted pair was not sealed in
+    assert not ad_map_seal_ok(sealer, left)  # and the planted pair was not sealed in
     assert await h.service._ad_roles_for_groups([_OTHER_GROUP]) == set()
+
+    # --- the AD group-to-channel map: the store's own write seals it and it scopes -------------
+    await store.set_ad_group_scope_map([(_GROUP.upper(), " IB_A ")])
+    scope = await store.get_ad_map(AD_SCOPE_MAP)
+    assert scope.seal.startswith(SEAL_PREFIX) and ad_map_seal_ok(sealer, scope)
+    assert scope.pairs == ((_GROUP, "IB_A"),)
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({"IB_A"})
+    assert await h.service.list_ad_group_scope_map() == [(_GROUP, "IB_A")]
+    alerts_before_scope = len(h.alerts)
+
+    # --- a channel inserted outside the store makes the whole map scope nothing ---------------
+    await raw("INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)", (_GROUP, "*"))
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset()
+    assert len(h.alerts) == alerts_before_scope + 1  # its own report, apart from the role map's
+    assert await h.service.list_ad_group_scope_map() == []
+    # Repair, and the control: the same pair through the store takes effect, sealed.
+    await store.set_ad_group_scope_map([(_GROUP, "IB_A"), (_GROUP, "*")])
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({"IB_A", "*"})
+
+    # --- a channel re-pointed, or the seal deleted, outside the store also scopes nothing -----
+    await store.set_ad_group_scope_map([(_GROUP, "IB_A")])
+    await raw("UPDATE ad_group_scope_map SET channel=? WHERE ad_group=?", ("*", _GROUP))
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset()
+    await store.set_ad_group_scope_map([(_GROUP, "IB_A")])
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({"IB_A"})  # control
+    await raw("DELETE FROM authority_set_seal WHERE name=?", (AD_SCOPE_MAP,))
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset()
+    assert await store.count_unsealed_role_records() == unsealed_before + 1
+
+    # --- one map's seal does not verify as the other's, even over the same pairs -------------
+    await store.set_ad_group_role_map([(_GROUP, Role.VIEWER.value)])
+    await store.set_ad_group_scope_map([(_GROUP, Role.VIEWER.value)])
+    role_map = await store.get_ad_map(AD_ROLE_MAP)
+    assert ad_map_seal_ok(sealer, role_map)
+    await raw("UPDATE authority_set_seal SET seal=? WHERE name=?", (role_map.seal, AD_SCOPE_MAP))
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset()

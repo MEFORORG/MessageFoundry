@@ -60,7 +60,7 @@ class ScopeInput:
 
     stored_scope: str | None
     stored_source: str | None
-    #: The channels the account's groups map to (``channels_for_ad_groups``). May hold
+    #: The channels the account's groups map to (``AuthService._ad_channels_for_groups``). May hold
     #: :data:`ALL_CHANNELS`. Empty means no scope-mapped group matched.
     mapped: frozenset[str]
     #: Whether the account's roles include Administrator. At login these are the roles being
