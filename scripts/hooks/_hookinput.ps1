@@ -222,15 +222,22 @@ function Resolve-CcxHookSession {
           Root    the worktree root Dir sits in; $null with Dir.
           Reason  set only when the input NAMED a cwd and Dir is $null: the fault to say aloud.
           Note    set when Dir is the pinned worktree and not the `cwd`: why the `cwd` was not used.
+          Outside $true when the `cwd` exists but sits in no checkout, which a caller may accept.
 
         The header gives the two checks and the pin. $StartDir is where the hook started, and its
         repository is the one this hook serves. A hook started outside every checkout has no
         repository to compare with and nowhere to keep a pin, so it takes any usable `cwd`, as before.
     #>
-    param([string] $Text, [string] $StartDir = (Get-Location).ProviderPath)
+    param(
+        [string] $Text,
+        [string] $StartDir = (Get-Location).ProviderPath,
+        # Read the pin, never write it. For a hook that promises to write nowhere but its own store
+        # (mail-drain) or runs before every tool call (steer-inject); the SessionStart hooks write it.
+        [switch] $ReadOnly
+    )
     $out = [pscustomobject]@{
         Named = $false; Dir = $null; Root = $null; Reason = ''; Note = ''
-        SessionId = ''; Event = ''; Payload = $null
+        SessionId = ''; Event = ''; Payload = $null; Outside = $false
     }
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         try { $out.Payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { $out.Payload = $null }
@@ -253,7 +260,10 @@ function Resolve-CcxHookSession {
     $root = $null
     if (-not $why) {
         $root = Get-CcxWorktreeRoot $p.Cwd
-        if (-not $root) { $why = "the hook input names cwd $($p.Cwd), which is inside no checkout" }
+        if (-not $root) {
+            $why = "the hook input names cwd $($p.Cwd), which is inside no checkout"
+            $out.Outside = $true
+        }
         else {
             $common = Get-CcxGitCommonDir $root
             if (-not $common) { $why = "the hook input names cwd $($p.Cwd), whose .git names no git directory" }
@@ -282,7 +292,7 @@ function Resolve-CcxHookSession {
 
     # SessionStart names where the session starts, so it always writes the pin. Another event writes
     # one only where none exists: a session that predates the pin, or whose SessionStart did not run.
-    if ($root -and $pinFile -and ($out.Event -eq 'SessionStart' -or -not $pinned)) {
+    if (-not $ReadOnly -and $root -and $pinFile -and ($out.Event -eq 'SessionStart' -or -not $pinned)) {
         try {
             $pinDir = Split-Path -Parent $pinFile
             New-Item -ItemType Directory -Force -Path $pinDir -ErrorAction Stop | Out-Null

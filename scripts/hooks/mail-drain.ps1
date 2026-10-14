@@ -728,8 +728,15 @@ try {
     $session = $null
     if ($hasHelper) {
         $stdinRaw = Read-CcxHookInput
-        $session = Resolve-CcxHookSession -Text $stdinRaw
+        # Read-only: this drain writes nowhere outside its mail root. The SessionStart hooks pin.
+        $session = Resolve-CcxHookSession -Text $stdinRaw -ReadOnly
         $cwdFault = $session.Reason
+        # A cwd in no checkout is the -AnchorRepo case, not a fault: the queue below is located from
+        # the anchor and the box keyed on that cwd, as before.
+        if ($cwdFault -and $session.Outside) {
+            $cwdFault = ''
+            $session.Dir = [string]$session.Payload.cwd
+        }
     }
     elseif ([Console]::IsInputRedirected) { try { $stdinRaw = [Console]::In.ReadToEnd() } catch { $stdinRaw = '' } }
     $hook = $null
@@ -810,7 +817,9 @@ try {
     if ($cwdFault) {
         $emit = $true
         try {
+            # Per session AND per queue, so one repository's notice never silences another's.
             $who = if ($sessionId) { 'sid:' + $sessionId } elseif ($hook -and $hook.cwd) { 'cwd:' + [string]$hook.cwd } else { 'reader:' + $PSScriptRoot }
+            $who += '|' + $root
             $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-mail-nobox/$(Get-CcxShortHash $who).stamp"
             $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
             if ($prev) {

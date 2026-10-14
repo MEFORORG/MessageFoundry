@@ -101,7 +101,7 @@ try {
         $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
         if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
         . $hookInput
-        $s = Resolve-CcxHookSession -Text (Read-CcxHookInput)
+        $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
         if ($s.Root) { $project = $s.Root }
         elseif ($s.Reason) {
             $fault = $s.Reason

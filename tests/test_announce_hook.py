@@ -1479,12 +1479,13 @@ def test_a_cwd_that_does_not_exist_announces_nothing(
     assert outcomes(sd) == ["ERROR"], receipts(sd)
 
 
-def test_a_cwd_in_another_repository_stands_down_whatever_the_shim_resolved(
+def test_a_cwd_in_another_repository_announces_nothing_and_writes_nothing_there(
     repo: Path, tmp_path: Path
 ) -> None:
-    """The shim resolves -CommonDir where the hook STARTED. Once the hook is in the session's own
-    directory, that answer may name a different repository from the one the session is in. The MF
-    guard must judge the session's repository, so a session in a foreign repo is left alone."""
+    """A session that started here and moved its `cwd` into a foreign repository, with no pin to
+    fall back to. The hook must not enter that repository: it neither announces the foreign checkout
+    nor writes into its .git. It says, once, that it announced nothing (the Lander's point 4 on
+    korus#223 was that it printed nothing at all)."""
     foreign = Path(os.path.realpath(tmp_path)) / "foreign"
     foreign.mkdir()
     _git_init(foreign)
@@ -1503,5 +1504,74 @@ def test_a_cwd_in_another_repository_stands_down_whatever_the_shim_resolved(
         payload_cwd=str(foreign),
         extra=("-CommonDir", common),
     )
-    assert p.stdout.strip() == "", p.stdout
-    assert receipts(sd) == [], "a session in a foreign repository left state in this one"
+    assert "[SESSION-ANNOUNCE]" not in p.stdout, p.stdout
+    assert "which is in another repository" in p.stdout, p.stdout
+    assert "announced nothing" in p.stdout, p.stdout
+    assert not (foreign / ".git" / "mefor-coord").exists(), (
+        "state was written into the foreign repo"
+    )
+
+
+def _second_worktree(repo: Path, tmp_path: Path, leaf: str) -> Path:
+    wt = Path(os.path.realpath(tmp_path)) / leaf
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", leaf, str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    return wt
+
+
+def test_after_a_cd_to_a_sibling_the_session_announces_its_own_worktree(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """The first run pins the worktree the session is in. A later `cwd` in a sibling is a `cd`, and
+    the hook announces the pinned worktree, never the sibling."""
+    sibling = _second_worktree(repo, tmp_path, "sibling")
+    run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=tmp_path / "s1",
+        rows=[SELF_ROW, PEER],
+        payload_cwd=str(linked),
+    )
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=tmp_path / "s2",
+        rows=[SELF_ROW, PEER],
+        payload_cwd=str(sibling),
+    )
+    assert f"[SESSION-ANNOUNCE] {_top(linked)} (linked)" in p.stdout, p.stdout
+    assert _top(sibling) not in p.stdout, p.stdout
+
+
+def test_a_session_that_starts_in_the_sibling_announces_the_sibling(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """The control: with no earlier run for this session, the sibling is where it is."""
+    sibling = _second_worktree(repo, tmp_path, "sibling")
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=tmp_path / "s2",
+        rows=[SELF_ROW, PEER],
+        payload_cwd=str(sibling),
+    )
+    assert f"[SESSION-ANNOUNCE] {_top(sibling)} (sibling)" in p.stdout, p.stdout
+
+
+def test_the_no_checkout_notice_is_throttled_and_obeys_the_kill_switch(
+    repo: Path, tmp_path: Path
+) -> None:
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    sd = tmp_path / "state"
+    first = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert "announced nothing" in first.stdout, first.stdout
+    again = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert again.stdout.strip() == "", "the notice repeated inside its cooldown"
+    off = tmp_path / "off-state"
+    off.mkdir()
+    (off / "OFF").write_text("", encoding="utf-8")
+    silenced = run(repo, tmp_path=tmp_path, state_dir=off, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert "announced nothing" not in silenced.stdout, "the kill switch did not silence the notice"

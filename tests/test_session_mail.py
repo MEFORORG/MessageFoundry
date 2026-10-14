@@ -40,6 +40,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -2025,3 +2026,83 @@ def test_the_same_address_escaped_to_ascii_gets_its_mail(
     message is delivered. The arm above differs only in the bytes on stdin."""
     text = _drain_in_primary(repo, accented_worktree, ascii_escaped=True)
     assert "    | addressed to the accented worktree" in text, text
+
+
+# --------------------------------------------------------------------------------------------------
+# After a `cd`, the session's box is still the one of the worktree it started in. The Lander's point 4
+# on korus#223: with `cwd` in a sibling, the drain showed the sibling's box, and Stop filed the
+# sibling's mail as read. The SessionStart hooks pin the starting worktree; the drain only reads it.
+# --------------------------------------------------------------------------------------------------
+
+
+def _pin(repo: Path, wt: Path, tmp_path: Path, session_id: str) -> None:
+    """Pin ``wt`` for the session as a SessionStart hook does, through the real helper."""
+    probe = tmp_path / "pin.ps1"
+    probe.write_text(
+        f". '{HOOKS / '_hookinput.ps1'}'\n"
+        "$null = Resolve-CcxHookSession -Text (Read-CcxHookInput)\n",
+        encoding="utf-8",
+    )
+    payload = {"hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(wt)}
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        cwd=str(repo),
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.fixture
+def two_worktrees(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
+    base = Path(os.path.realpath(tmp_path))
+    mine, sibling = base / "mine-wt", base / "sibling-wt"
+    for wt in (mine, sibling):
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-q", "-b", wt.name, str(wt)],
+            check=True,
+            capture_output=True,
+        )
+    seed(repo, tmp_path, [{"body": "mail for the sibling"}], box_cwd=sibling)
+    seed(repo, tmp_path, [{"body": "mail for mine"}], box_cwd=mine)
+    return mine, sibling
+
+
+def test_after_a_cd_the_drain_shows_the_starting_worktrees_box(
+    repo: Path, tmp_path: Path, two_worktrees: tuple[Path, Path]
+) -> None:
+    mine, sibling = two_worktrees
+    _pin(repo, mine, tmp_path, SELF_ID)
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="SessionStart"))
+    assert "mail for mine" in text, text
+    assert "mail for the sibling" not in text, "the session was shown its sibling's mail"
+
+
+def test_a_session_that_started_in_the_sibling_gets_the_siblings_box(
+    repo: Path, tmp_path: Path, two_worktrees: tuple[Path, Path]
+) -> None:
+    """The control: the same drain, for a session pinned in the sibling."""
+    _, sibling = two_worktrees
+    _pin(repo, sibling, tmp_path, SELF_ID)
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="SessionStart"))
+    assert "mail for the sibling" in text, text
+
+
+def test_the_no_box_notice_is_throttled_and_obeys_the_off_switch(
+    repo: Path, tmp_path: Path
+) -> None:
+    seed(repo, tmp_path, [{"body": "waiting"}])
+    gone = Path(os.path.realpath(tmp_path)) / "deleted-worktree"
+    sid = f"nobox-{uuid.uuid4()}"
+    first = injection(run_drain(repo, cwd=gone, run_from=repo, session_id=sid))
+    assert "NO BOX" in first and "NOTHING WAS READ" in first, first
+    assert injection(run_drain(repo, cwd=gone, run_from=repo, session_id=sid)) == "", (
+        "the NO BOX notice repeated inside its cooldown"
+    )
+    (mail_root(repo) / "OFF").write_text("", encoding="utf-8")
+    other = f"nobox-{uuid.uuid4()}"
+    silenced = injection(run_drain(repo, cwd=gone, run_from=repo, session_id=other))
+    assert "NO BOX" not in silenced and "SUPPRESSED" in silenced, silenced
