@@ -5,7 +5,8 @@
 The behavioural contract is ``tests/_session_seal_contract.py``; the Postgres and SQL Server suites
 run the same one on their own legs. This file runs it on SQLite, and adds what only one place needs
 to hold: the list of columns a seal leaves out, the single reader in the service, the list of every
-statement that writes a session row, and the denial's audit row and alert.
+statement that writes a session row, and the denial's audit row and alert. It also drives the MFA
+verify leg with the store refusing a session stamp for its seal, which must end the session.
 """
 
 from __future__ import annotations
@@ -14,14 +15,15 @@ import ast
 import pathlib
 import sqlite3
 import time
-from collections.abc import AsyncIterator
-from dataclasses import fields
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
+from messagefoundry.auth import totp
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
@@ -31,11 +33,13 @@ from messagefoundry.store.store import (
     SessionRecord,
     session_seal_ok,
 )
+from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._session_seal_contract import (
     assert_session_columns,
     assert_session_seal_contract,
     dollar_placeholders,
 )
+from tests._totp_clock import pin_totp_clock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _STORE_DIR = _ROOT / "messagefoundry" / "store"
@@ -291,6 +295,152 @@ async def test_signing_out_elsewhere_keeps_the_callers_own_session(
     assert await service.revoke_other_sessions(identity, hash_token(tokens[0]), actor="u") == 2
     assert await service.identity_for_token(tokens[0]) is not None
     assert all([await service.identity_for_token(t) is None for t in tokens[1:]])
+
+
+# --- a refused stamp in the MFA verify leg ----------------------------------------------------
+
+
+async def _pending_factor(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str, str, str]:
+    """Enrol TOTP for a local administrator, sign in again so the new session owes its factor, and
+    return ``(user id, that session's token, a code the verify will accept)``.
+
+    The clock is pinned so the enrolment and the verify sit in different steps: enrolment spends
+    the step it activates on (BACKLOG #1021)."""
+    identity, token, password = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enroll.secret, now=t0), token=token
+    )
+    assert confirmed.ok
+    out = await service.login(ADMIN_USERNAME, password)
+    assert out.ok and out.mfa_required and out.token is not None
+    t1 = t0 + totp.DEFAULT_PERIOD
+    pin_totp_clock(monkeypatch, t1)
+    return identity.user_id, out.token, totp.totp(enroll.secret, now=t1)
+
+
+def _spy(
+    calls: list[str],
+    name: str,
+    method: Callable[..., Awaitable[Any]],
+    before: Callable[[], Awaitable[None]] | None,
+) -> Callable[..., Awaitable[Any]]:
+    """Wrap a store method to record its name, run ``before`` if given, then call the real one."""
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(name)
+        if before is not None:
+            await before()
+        return await method(*args, **kwargs)
+
+    return spy
+
+
+_WATCHED = ("mark_session_mfa_verified", "mark_session_reauthed", "record_login_success")
+_COUNTED = ("auth.mfa_verified", "auth.mfa_failed", AUTHORITY_SEAL_FAILED_ACTION)
+
+
+@dataclass
+class _Run:
+    """What one :func:`_verify` run did: the verify's answer, the store writes it asked for in
+    order, the integrity alerts raised, and how many audit rows of each :data:`_COUNTED` action it
+    added."""
+
+    out: Elevation
+    token: str
+    user_id: str
+    calls: list[str]
+    alerts: list[str]
+    added: dict[str, int]
+
+
+async def _verify(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch, *, tamper: str | None
+) -> _Run:
+    """Run ``verify_mfa`` with a good code on a local session that owes its factor.
+
+    With ``tamper`` naming one of the two session stamps, the session row is changed outside the
+    store just before that stamp, so the store's own write helper refuses the stamp for its seal.
+    That is the real refusal path, not an injected exception."""
+    store, path = keyed
+    alerts: list[str] = []
+    service = AuthService(
+        store, AuthSettings(mfa_verify_min_elapsed_seconds=0), integrity_alert=alerts.append
+    )
+    user_id, token, code = await _pending_factor(service, monkeypatch)
+
+    async def tamper_row() -> None:
+        await _raw_for(path)(
+            "UPDATE sessions SET client=? WHERE token_hash=?", ("192.0.2.77", hash_token(token))
+        )
+
+    calls: list[str] = []
+    for name in _WATCHED:
+        before = tamper_row if name == tamper else None
+        monkeypatch.setattr(store, name, _spy(calls, name, getattr(store, name), before))
+    counts = {a: len(await store.list_audit(action=a)) for a in _COUNTED}
+
+    out = await service.verify_mfa(token, code, client="192.0.2.9")
+
+    added = {a: len(await store.list_audit(action=a)) - counts[a] for a in _COUNTED}
+    return _Run(out, token, user_id, calls, alerts, added)
+
+
+async def _assert_session_ended(keyed: tuple[MessageStore, Path], run: _Run) -> None:
+    """The refused-stamp outcome (BACKLOG #2592): the session is gone, nothing records a success,
+    and nothing is charged to the second-step counter."""
+    store, _ = keyed
+    assert run.out.session_lost and not run.out.ok and run.out.token is None
+    row = await store.get_session(hash_token(run.token))
+    assert row is not None and row.revoked_at is not None
+    assert run.added == {
+        "auth.mfa_verified": 0,
+        "auth.mfa_failed": 0,
+        AUTHORITY_SEAL_FAILED_ACTION: 1,
+    }
+    assert len(run.alerts) == 1 and hash_token(run.token)[:12] in run.alerts[0]
+    assert "record_login_success" not in run.calls
+    user = await store.get_user(run.user_id)
+    assert user is not None and user.second_step_failed_attempts == 0
+
+
+async def test_verify_mfa_ends_the_session_when_the_factor_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = await _verify(keyed, monkeypatch, tamper="mark_session_mfa_verified")
+    await _assert_session_ended(keyed, run)
+    # The leg stops at the first refusal: the reauth stamp is never asked for.
+    assert run.calls == ["mark_session_mfa_verified"]
+
+
+async def test_verify_mfa_ends_the_session_when_the_reauth_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = await _verify(keyed, monkeypatch, tamper="mark_session_reauthed")
+    await _assert_session_ended(keyed, run)
+    assert run.calls == ["mark_session_mfa_verified", "mark_session_reauthed"]
+
+
+async def test_verify_mfa_succeeds_when_no_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control for the two tests above: the same flow and the same spies, with no row changed. It
+    # also shows the session takes the non-OIDC branch, so the reauth test reaches its stamp.
+    run = await _verify(keyed, monkeypatch, tamper=None)
+    assert run.out.ok and not run.out.session_lost and run.out.token is not None
+    assert run.calls == list(_WATCHED)
+    assert run.added == {
+        "auth.mfa_verified": 1,
+        "auth.mfa_failed": 0,
+        AUTHORITY_SEAL_FAILED_ACTION: 0,
+    }
+    assert run.alerts == []
+    service = AuthService(keyed[0], AuthSettings())
+    assert await service.mfa_satisfied(run.out.token) is True
 
 
 # --- static guards --------------------------------------------------------------------------

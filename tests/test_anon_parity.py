@@ -77,12 +77,13 @@ _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]
 
 def _load_scan_forbidden() -> object:
     # scripts/security/, not the retired scripts/publish/. The scanner is COMMITTED now, so this skip
-    # should effectively never fire in a source checkout — it remains only for an installed wheel with
-    # no scripts/ tree above it. Leaving the old path here silently skipped the parity assertions
-    # below, which are the only thing keeping tee/anon/leak.py's tables identical to the guard's.
+    # should effectively never fire in a source checkout — it remains only for a tree that has no
+    # scripts/security under its root. Leaving the old path here silently skipped the parity
+    # assertions below, which are the only thing keeping tee/anon/leak.py's tables identical to the
+    # guard's.
     path = _ROOT / "scripts" / "security" / "scan_forbidden.py"
     if not path.exists():
-        pytest.skip("scan_forbidden.py not found above this tree", allow_module_level=True)
+        pytest.skip("scan_forbidden.py not found at scripts/security", allow_module_level=True)
     spec = importlib.util.spec_from_file_location("scan_forbidden", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -118,9 +119,10 @@ def test_leak_token_table_matches_publish_guard() -> None:
 
 
 def test_leak_tables_load_empty_without_the_publish_guard(tmp_path: Path) -> None:
-    # Where no guard is reachable (an installed wheel with no scripts/ above it) the token tables
-    # must load EMPTY -- never a stale or fragmented copy -- so no customer/vendor token ships in
-    # the tee. Exercise the loader against a tree that has no scripts/security above it.
+    # Where no guard is reachable (an installed wheel, which has no scripts/security beside the
+    # package) the token tables must load EMPTY -- never a stale or fragmented copy -- so no
+    # customer/vendor token ships in the tee. Exercise the loader against a tree that has no guard
+    # at that one path.
     # The loader tries one path, under parents[2] of the file it is given (BACKLOG #2344). Shape
     # the stand-in like the package so that folder is inside tmp_path.
     assert tee_leak._load_publish_guard(tmp_path / "root" / "tee" / "anon" / "leak.py") is None
@@ -141,7 +143,7 @@ def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
     """
     guard = tee_leak._load_publish_guard()
     if guard is None:
-        pytest.skip("guard absent (e.g. an installed wheel with no scripts/ above it)")
+        pytest.skip("guard absent (an installed wheel has no scripts/security beside the package)")
     if not getattr(guard, "TOKENS_PRESENT", False):
         pytest.skip(
             "no token source configured (fork CI / fresh clone) — tables legitimately empty"

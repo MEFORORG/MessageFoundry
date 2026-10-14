@@ -29,7 +29,7 @@ from __future__ import annotations
 from messagefoundry.parsing.message import Message
 
 from .keying import Keyer
-from .rules import AnonError, FieldRule, SurrogateKind
+from .rules import AnonError, FieldRule, SurrogateKind, _refuse_unwritable_rules
 from .surrogates import (
     Seps,
     normalized_message,
@@ -43,45 +43,6 @@ from .surrogates import (
 
 def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
-
-
-#: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
-#: id, and 3 in MSH, because MSH-1 and MSH-2 hold the message's own delimiters. With either of
-#: those rewritten the output has no readable header, and the leak-check has no separators to
-#: walk it with.
-_FIRST_REWRITABLE_FIELD = 1
-_FIRST_REWRITABLE_MSH_FIELD = 3
-
-
-def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
-    """Refuse a rule set that would rewrite a segment id, MSH-1 or MSH-2 (a body-free
-    :class:`AnonError`).
-
-    The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
-    path with a stray space or newline are refused like ``MSH-2``. A path whose number ``int()``
-    cannot read is not a whole-field address, and it is not this check's to refuse.
-    ``FieldRule`` refuses every path that is not a whole-field address when the rule is built,
-    field 0 and ``MSH-02`` included (BACKLOG #2330). So for those spellings this check is a
-    second line, and for ``MSH-1`` and ``MSH-2`` it is the only one. A ``KEEP`` rewrites
-    nothing, so it is allowed. The same check runs in both adapters (BACKLOG #2265)."""
-    named: set[str] = set()
-    for rule in rules:
-        if rule.kind == SurrogateKind.KEEP:
-            continue
-        segment, _, number = rule.path.partition("-")
-        try:
-            field = int(number)
-        except ValueError:
-            continue
-        is_msh = segment.upper() == "MSH"
-        if field < (_FIRST_REWRITABLE_MSH_FIELD if is_msh else _FIRST_REWRITABLE_FIELD):
-            named.add(f"{segment}-{field}")
-    if named:
-        raise AnonError(
-            f"a rule names {', '.join(sorted(named))}, which no rule can rewrite: field 0 is the "
-            "segment id, and MSH-1 and MSH-2 hold the message's delimiters. Repair or remove a "
-            "later MSH line that carries data there. Refusing to emit"
-        )
 
 
 def anonymize_message(

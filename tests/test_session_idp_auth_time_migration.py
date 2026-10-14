@@ -6,9 +6,10 @@ The column is what the IdP step-up compares a new ``auth_time`` with. A store op
 file must add it, and an ``oidc`` row already there must read NULL, which the step-up refuses as not
 fresh (``tests/test_oidc_step_up.py`` pins that refusal).
 
-SQLite only. This file does not exercise the Postgres or SQL Server column additions. Their hosted
-legs run ``tests/_session_rotation_contract.py`` against a schema whose CREATE TABLE already carries
-the column, so the gated ``ADD COLUMN`` and the ``COL_LENGTH`` ``ALTER`` do nothing there.
+SQLite only. The Postgres and SQL Server column additions are driven against a table that lacks the
+column by ``test_session_idp_auth_time_column_upgrade_is_idempotent`` in
+``tests/test_postgres_store.py`` and ``tests/test_sqlserver_store.py`` (BACKLOG #3174), which run on
+their hosted legs only.
 """
 
 from __future__ import annotations

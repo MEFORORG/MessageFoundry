@@ -56,7 +56,7 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
 from messagefoundry.transports import bounded_read, build_destination
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     MAX_TOKEN_RESPONSE_BYTES,
@@ -297,11 +297,13 @@ def _dicomweb() -> DicomWebDestination:
 
 def test_rest_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
     """The read still stops one byte past the bound. What an over-cap body then means after a 2xx
-    is vault BACKLOG #2180: with capture off nothing looks inside it, so it comes back empty."""
+    is vault BACKLOG #2180: with capture off nothing looks inside it, so it comes back dropped
+    (vault BACKLOG #3040 item 5)."""
     dest = _rest()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
-    assert dest._post("<payload/>") == ("", 200, {})
+    dropped = ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
+    assert dest._post("<payload/>") == (dropped, 200, {})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
@@ -371,12 +373,13 @@ def test_soap_fault_body_is_bounded_and_the_status_still_classifies(
 
 
 def test_fhir_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
-    """As for REST with capture off: the body comes back empty (vault BACKLOG #2180)."""
+    """As for REST with capture off: the body comes back dropped (vault BACKLOG #2180, #3040)."""
     dest = _fhir()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
     body = json.dumps({"resourceType": "Patient"})
-    assert dest._post(body, "POST", f"{FHIR_BASE}/Patient", {}) == ("", 200, {})
+    dropped = ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
+    assert dest._post(body, "POST", f"{FHIR_BASE}/Patient", {}) == (dropped, 200, {})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
@@ -783,14 +786,28 @@ def test_the_text_variant_refuses_a_truncated_reply_before_decoding_it() -> None
         read_bounded_text(_wire(_FIXED_TRUNCATED), limit=1024, connector="c", encoding="utf-8")
 
 
-def test_rest_post_does_not_report_success_on_a_truncated_reply() -> None:
+def test_rest_post_does_not_report_a_truncated_reply_as_the_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The row's named symptom, end to end: ``REST._post`` returned ``('hello', 200, {})`` for a
-    reply the peer never finished sending, and the delivery worker counts a returned status as
-    delivered. It now raises a retryable DeliveryError instead."""
+    reply the peer never finished sending, so the fragment stood as the partner's answer.
+
+    It raised a retryable ``TruncatedResponseError`` from BACKLOG #1575, which re-sent a request
+    the partner had answered 2xx. Since BACKLOG #2989 the reply follows the over-cap rule: with
+    capture off nothing reads the body, so the fragment is dropped and the message is delivered.
+    ``_post`` hands back a ``ReplyBodyDropped`` that says what was wrong and logs nothing; the
+    delivery worker records it and then logs the WARNING (vault BACKLOG #3040 items 2 and 5).
+    ``tests/test_over_cap_2xx_reply_is_sent_once.py`` covers capture on, and the worker."""
     dest = _rest()
     dest._opener = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
-    with pytest.raises(TruncatedResponseError, match="REST connection 'OB_REST'"):
-        dest._post("<payload/>")
+    with caplog.at_level(logging.WARNING):
+        body, status = dest._post("<payload/>")[:2]
+    assert status == 200
+    assert isinstance(body, ReplyBodyDropped)
+    assert body.status == 200
+    assert body.problem == "ended before its declared length"
+    assert "hello" not in body.detail
+    assert caplog.records == []
 
 
 def test_rest_post_still_returns_a_complete_reply() -> None:

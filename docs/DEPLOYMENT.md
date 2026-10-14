@@ -356,7 +356,7 @@ are an owner act and remain **pending**.
 | **Transport encryption** (12.x) | — *enable* the shipped native API/WSS TLS + MLLP-over-TLS | already built (Gate #4) |
 | **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there. MEFOR authenticates against it, but counts its MFA only through a checked OIDC claim (see note below) | **a native second factor is built and required by default** (ADR 0002 WP-14) — RFC 6238 TOTP, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate. A WebAuthn passkey (WP-14b) is another factor, for the browser only, and it needs the optional `[webauthn]` extra. The factor reaches directory accounts too, on the rule [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
-| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), the **OAuth2 client-credentials token endpoint** (BACKLOG #2112), and the **`fhir_lookup` read hop**, the **DICOM C-STORE SCU over TLS**, the **FTPS upload** and a **credentialed DIRECT relay** (BACKLOG #2193) — are refused at construction on an enforcing PHI instance, unless revocation is **proven in front** (an upstream TLS terminator — API gate only) or **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **That env no longer clears an outbound hop on an enforcing instance.** There, an outbound hop crosses on loopback or on a CRL loaded on that hop. For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, the inbound FTPS poll, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
+| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), the **OAuth2 client-credentials token endpoint** (BACKLOG #2112), and the **`fhir_lookup` read hop**, the **DICOM C-STORE SCU over TLS**, the **FTPS upload** and a **credentialed DIRECT relay** (BACKLOG #2193) — are refused at construction on an enforcing PHI instance. The API bind crosses when revocation is **proven in front** by an upstream TLS terminator, or is **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **An outbound hop has no proven-in-front lever, and that env no longer clears one on an enforcing instance.** There, an outbound hop crosses on loopback, on a CRL loaded on that hop, or, on a connection, with that connection's own `tls_revocation_attested`. For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, the inbound FTPS poll, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
 | **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction ([PHI.md §7](PHI.md#7-logging--phi-redaction)), to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514). **Required under the shipped `enforce`**: `serve` and `supervise` refuse to start without verified TLS to a collector on another host, with `forward_tls_ca_file` and `forward_tls_crl_file` set (BACKLOG #1966); `enforcement = "warn"` only warns. A local agent on 127.0.0.1 does not satisfy it. The collector is an egress destination too: [`[egress].allowed_syslog`](CONFIGURATION.md#egress) says when an unlisted one is refused, under either enforcement value. Steps: [SERVICE.md](SERVICE.md#configure-off-box-log-forwarding-before-the-first-start) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
@@ -565,10 +565,14 @@ self-signed placeholder).
 | **DICOMweb destination** (STOW-RS, ADR 0025) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | optional bearer / basic, refused over plaintext | `[egress].allowed_http` |
 | **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired` — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
 | **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` (relay) + `[egress].allowed_recipient_domains` (recipients and the sender's domain) |
-| **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. **WARNING:** `use_tls=false` is gated by the **raw** `MEFOR_ALLOW_INSECURE_TLS` — it does **not** route through the cleartext-hop authority and is **not clamped** by `enforcement` (AUTH credentials stay refused) | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
+| **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. `use_tls=false` is gated by the clamped `MEFOR_ALLOW_INSECURE_TLS`, read directly — it does **not** route through the cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` are not read (AUTH credentials stay refused). CORRECTED 2026-10-13: this row said the raw variable, not clamped | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
 | **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-enforced or verified** — a hop with no TLS keyword, **or one pinned to a no-TLS value** (`SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and connects anyway, on any posture | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
 | **File destination** | local filesystem | n/a (no network) | n/a | `[egress].allowed_file_dirs` |
-| **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused outright, vault BACKLOG #2636) | username/password or SSH key | `[egress].allowed_remote` |
+| **RemoteFile destination + source** (SFTP / FTPS / FTP) | dials remote host | **Protocol-dependent** — **SFTP** encrypted (SSH host-key verify on by default); **FTPS** explicit TLS; **FTP** plaintext (credentials refused) | username/password or SSH key | `[egress].allowed_remote` |
+
+No escape sends a credential on these rows to a peer the engine has not verified, except on the hops
+that rule does not reach yet (the DATABASE login among them). The rule and those hops are in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
 
 Above and beyond each row: an **off-loopback cleartext outbound hop is decided by one authority** for
 every connector **that routes through `InsecureHopGuard`** (ADR 0092, amended by ADR 0153) — loopback
@@ -597,10 +601,12 @@ REST obey the authority does not settle these:
   the keyword's **value**, so `SSLmode=disable` is reported rather than mistaken for TLS ownership. TLS
   here is operator-owned: set the driver's keyword in `odbc_params` (`SSLmode=verify-full`,
   `SSLMODE=VERIFY_IDENTITY`, …) and treat it as a deployment requirement.
-- **Direct (S/MIME) cleartext SMTP** — `use_tls=false` consults the **raw** `MEFOR_ALLOW_INSECURE_TLS`
-  directly rather than the authority, which is why the escape-hatch list below marks it *Not clamped*.
-  `[security].enforcement` does not reach it. (SMTP AUTH credentials are refused over cleartext either
-  way, and the Direct body is S/MIME-encrypted — but the SMTP envelope metadata is not.)
+- **Direct (S/MIME) cleartext SMTP** — `use_tls=false` reads the clamped `MEFOR_ALLOW_INSECURE_TLS`
+  escape directly rather than the authority. So `[security].enforcement` reaches it only through the
+  clamp: the escape lifts the refusal at `warn` and does nothing at `enforce`. No per-hop declaration
+  is read (`tls_hop_attested` and `cleartext_accepted` change nothing here), and no loopback or PHI
+  distinction is drawn. (SMTP AUTH credentials are refused over cleartext either way, and the Direct
+  body is S/MIME-encrypted — but the SMTP envelope metadata is not.)
 
 ### `tls_allow_expired` — the weakening with no posture gate at all
 
@@ -656,9 +662,9 @@ there is for MLLP:
 
 - **Raw TCP source/destination** — plaintext, arbitrary framing.
 - **X12 source/destination** — plaintext ISA/IEA-framed EDI interchanges.
-- **Plain FTP** (RemoteFile `protocol=ftp`, as opposed to SFTP/FTPS) — cleartext protocol; credentials
-  and file contents cross the wire in the clear (the connector refuses credentials over plain FTP
-  outright, with no escape, vault BACKLOG #2636; an anonymous hop is governed below).
+- **Plain FTP** (RemoteFile `protocol=ftp`, as opposed to SFTP/FTPS) — cleartext protocol; file
+  contents cross the wire in the clear. A credential is refused (see the rule linked above the
+  table); an anonymous hop is governed below.
 
 **Two more channels can carry PHI in cleartext even though they are not "no-TLS" by protocol** — the
 engine will not refuse either one for you:
@@ -684,8 +690,7 @@ responsibility**. On the **outbound** side these are cleartext *hops*, so they a
 authority instead: off-loopback they **refuse** on an enforcing instance unless the connection declares
 `cleartext_accepted` + `cleartext_reason`. For raw TCP and X12 that declaration is **permanent, not
 transitional** — there is no `tls = true` for them to migrate to ([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
-decision 4; TLS support for them is BACKLOG #311). Credentialed plain FTP is refused outright in
-every posture, with no escape (it puts the credential itself on the wire; vault BACKLOG #2636).
+decision 4; TLS support for them is BACKLOG #311).
 
 ---
 
@@ -695,34 +700,29 @@ Several connectors **fail closed** on a weakened-TLS or cleartext configuration 
 environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. It exists for **dev / trusted-lab** use
 only.
 
-Two connector logins are absent from the list below because the escape cannot release them. SMTP
-AUTH on an `Email` or `Direct` destination is refused outright over cleartext, or over a TLS session
-with the certificate or hostname check off. So is an FTP or FTPS `username`/`password` (vault
-BACKLOG #2636). **This is not a rule that no credential crosses an unverified or cleartext hop.** At
-least these still can, wherever the escape or another lever releases the cell that carries them
-(a per-connection `cleartext_accepted` or `tls_hop_attested` declaration with its reason, or a named
-service setting): a REST/SOAP auth header over plain `http` under `cleartext_accepted`, or over
-`https` under `verify_tls = false`; a SQL Server login under `TrustServerCertificate=true` or
-`Encrypt=false`; the AD service-account and user binds under `ad_tls_verify = false`, or over plain
-`ldap://` under `ad_allow_insecure_ldap = true`; the `[alerts]` SMTP relay login under
-`email_tls_verify = false` (it is refused over cleartext); and an SFTP password sent to an unknown
-host key.
+The escape does not release a credential to a peer the engine has not verified, except on the hops
+that rule does not reach yet. The rule and those hops are stated once in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
+Each bullet below releases a hop with no credential, unless it says otherwise.
 
 With `MEFOR_ALLOW_INSECURE_TLS` set, these otherwise-refused settings become permitted (each logs a
 loud warning):
 
-- REST/SOAP `verify_tls = false`. *(Clamped.)*
-- MLLP outbound `tls_verify = false`; FTPS `tls_verify = false` on an **anonymous** hop. *(Clamped.
-  A credentialed FTPS hop with `tls_verify = false` or `tls_check_hostname = false` stays refused
-  outright either way, vault BACKLOG #2636.)*
+- REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped.)*
+- MLLP outbound `tls_verify = false`; FTPS `tls_verify = false`. *(Clamped.)*
 - DATABASE destination / store: `Encrypt=false` or `TrustServerCertificate=true` (SQL Server),
-  `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped.)*
-- RemoteFile SFTP: accepting an unknown host key. *(Clamped since #329.)*
-- Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Not clamped; AUTH credentials over
-  cleartext stay refused outright either way.)*
+  `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped. These carry the
+  database login, and the credential rule does not reach them yet.)*
+- RemoteFile SFTP: accepting an unknown host key on a login with no `password`. *(Clamped since
+  #329.)*
+- Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
+  rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop, plus LDAPS, the webhook alert sink and the
-  AI-broker endpoint. *(All clamped — LDAPS / the webhook sink / the AI broker since #329.)*
+  forwarder and the API PHI-read serve hop, plus the webhook alert sink and the AI-broker endpoint.
+  *(All clamped — the webhook sink and the AI broker since #329. The AI broker hop carries
+  `[ai].api_key`, and a webhook URL can carry a path secret; the credential rule does not reach
+  either yet. LDAPS was on this list until vault BACKLOG #3230 made `ad_tls_verify = false` a
+  refusal with no escape.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -734,9 +734,9 @@ the opposite claim, "secure by other means", and ALLOWs the hop. It is reported 
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`, and for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-LDAPS, the SFTP host key, the webhook sink and the AI broker — the clamp additionally requires the
+the SFTP host key, the webhook sink and the AI broker — the clamp additionally requires the
 instance to be PHI, which is also the default. Either way, on the shipped posture those cells are inert;
-the bullets marked *not clamped* are the exceptions that still honour the raw variable.
+no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
 
 **Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** Its presence is the single **environment-variable**
 switch that turns the remaining fail-closed verification checks into best-effort.
@@ -911,7 +911,7 @@ bind-guard ladder above:
   (`[api].tls_cert_file`). Loopback binds and proxy-terminated binds never reach this and start
   unchanged.
 - **Outbound** — at least nine verifying outbound TLS hops are **refused at construction** (`messagefoundry
-  check` / dry-run / reload / the serve pre-flight) on an instance under
+  check`, dry-run, reload, and the live build when `serve` starts) on an instance under
   **`enforcement = enforce`**, when the hop is off-loopback: **MLLP-over-TLS, REST, SOAP, FHIR,
   DICOMweb (https), SMTP/EMAIL, the PostgreSQL store hop, the SMART token endpoint, and the
   `[logging]` TLS syslog forwarder**. Since BACKLOG #2193 four more are refused the same way:
@@ -980,7 +980,7 @@ attestation:
    itself and the listener gate never fires. **There is no outbound equivalent you can configure.** The
    authority has a "declared revocation-checking egress terminator" input, but no call site ever sets it
    — routing your egress through such a proxy is good practice and does not change the engine's
-   decision, so an outbound hop still needs option 2 or 3.
+   decision, so an outbound hop still needs option 2's per-connection attestation or option 3.
 2. **Attest it** — set the environment variable `MEFOR_TLS_REVOCATION_ATTESTED=1`. **It no longer
    clears the OUTBOUND gate on an enforcing instance, and this bullet said for a while that it did.**
    BACKLOG #299 clamped it: the env is held apart from a per-connection attestation and ranks *below*

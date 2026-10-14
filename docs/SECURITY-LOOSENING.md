@@ -35,6 +35,68 @@ section reference.
 
 ---
 
+## No escape sends a credential to an unverified peer
+
+On the hops in the table below, the engine will not send a credential to a peer whose identity it
+has not checked. The rule does not yet reach every hop or every kind of credential: at least the
+cases in *The rule does not reach every hop yet*, below, still cross. This section is the one
+statement of that rule; other pages link here.
+
+A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
+or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
+or starts the service, except SFTP: the host key is known only once the server answers, so that
+refusal comes at connect, before the password is sent. **No lever in this guide lifts a refusal in
+the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
+`tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
+the `[auth]` setting for the AD bind, and offers only settings that do fix it. `Email` and `Direct`
+check the credential before the cleartext and verify-off checks, so a credentialed hop is never
+pointed at one of those levers.
+
+| Hop | Refused when it carries a credential and | What fixes it |
+|---|---|---|
+| `Email`, `Direct` (SMTP AUTH) | the hop is cleartext, or `tls_verify` or `tls_check_hostname` is off | turn TLS and both checks on; pin a private CA with `tls_ca_file` |
+| `Ftp` | it is plain FTP (`tls = false`) | use FTPS (`tls = true`) or `Sftp` |
+| `Ftp` with `tls = true` (FTPS) | `tls_verify` or `tls_check_hostname` is off | turn both checks on; pin a private CA with `tls_ca_file` |
+| `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
+| `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
+| `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
+
+A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
+pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
+a static header that settings views would mask, such as `Authorization` or an API key. That last
+test leans toward caution: a header named like a key, such as `X-Routing-Key`, also counts. The
+HTTP family reads its auth-setting credentials from the same reader as the static-credential
+inventory. That inventory does not yet count a static header or a `url` query credential, so for
+those two kinds this rule is the wider of the two. A hop with no credential is not refused by this
+rule. Its own loosening entry decides it.
+
+An AD bind always carries a credential, because the service account must bind first. So
+`ad_tls_verify = false` over LDAPS is refused in every case.
+
+**The rule does not reach every hop yet.** At least these still send a credential to a peer the
+engine has not verified, when the lever named beside each is set:
+
+- an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
+- an HTTP-family secret the refusal cannot see as a credential, on a `verify_tls = false` hop or
+  over plain `http`, under that hop's own levers. That covers at least a static header with a
+  neutral name, such as `X-Session`, and a secret in the path of the `url`. The test for a
+  credential header reads the header's name, and the `url` test reads only its query;
+- the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
+- a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
+  `encrypt = false`;
+- the AD binds over plain `ldap://`, under `ad_allow_insecure_ldap = true`;
+- the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
+- the AI broker's `[ai].api_key` over a plain `http` endpoint, and a secret in the path of an
+  alert webhook URL over `http`, each under `MEFOR_ALLOW_INSECURE_TLS` at
+  `[security].enforcement = warn`;
+- a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
+  false` hop. The refusal reads settings, so it cannot see one.
+
+An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
+leaves the engine.
+
+---
+
 ## The switches
 
 | Group | Switch | Secure default |
@@ -561,9 +623,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
   (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
   (ASVS 11.3.3, BACKLOG #1169).
-- **When acceptable:** a store that holds legitimate unmarked values beside ciphertext in one column —
-  for example rows written by a keyless run of a store that was keyed before. Turn it on for one keyed
-  open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+- **When acceptable:** a store that holds legitimate unmarked values in a column that is already
+  sealed. One example is rows written by a keyless run of a store that was keyed before. Since
+  BACKLOG #3383, a keyed open records each column in `keyed_surface`. A recorded column stays sealed
+  even with no ciphertext in it, so this covers a table that had emptied out too. Turn it on for one
+  keyed open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
 - **Compensating controls:** database-level access control, because planting a row needs store write
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
@@ -1189,8 +1253,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   At least the connector verify-off cells keep the clamped `MEFOR_ALLOW_INSECURE_TLS` escape; the
   `[alerts]` SMTP hop is governed instead by the `allow_unverified_alert_smtp_tls` acknowledgment above
   (its construction sits outside the posture scope the clamp reads), so "the clamped escape" is not a
-  universal statement about verify-off hops and should not be read as one. Nor does this declaration
-  reach an SMTP `AUTH` over cleartext, which is refused outright.
+  universal statement about verify-off hops and should not be read as one. Nor does it lift a
+  credential refusal: see [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
 
 ### `tls_hop_attested = true` on a connection — a hop attested secure by means the engine cannot see
 > **Connection-scoped**, like `cleartext_accepted` above, and settable in both directions. It is a
@@ -1203,7 +1267,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
   and nothing about the hop looks wrong afterwards.
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
@@ -1226,7 +1290,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `messagefoundry security show` never loads the connection graph, and the `serve`-time warning fires
   before the graph loads. Both say so in their scope text.
 - **What it cannot do:** it does not reach a revocation refusal. That is `tls_revocation_attested`, a
-  different claim. It does not permit SMTP `AUTH` over cleartext, which is refused outright.
+  different claim. It does not lift a credential refusal: see
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
+  CORRECTED 2026-10-12 (vault BACKLOG #3230): it used to let a credentialed `verify_tls = false`
+  HTTP-family hop cross.
 
 ### `tls_allow_expired = true` on a connection — an expired certificate accepted indefinitely
 > **Connection-scoped**, like `cleartext_accepted` above: a parameter on one outbound connection —
@@ -1281,15 +1348,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **When acceptable:** a partner whose certificate names a different host than the one you dial, such
   as an IP address, while they reissue it. Prefer a private trust anchor in `tls_ca_file`, which narrows
   "any certificate from the anchor" to the partner's own CA.
-- **Compensating controls:** a private `tls_ca_file` is the one that matters. With credentials it is
-  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential,
-  and FTPS refuses it outright, in both directions, when a `username` or `password` is set (vault
-  BACKLOG #2636). No escape variable or posture unlocks either refusal. CORRECTED 2026-10-06: FTPS
-  was warned and not refused here, so a credentialed FTPS hop with the name check off would have
-  sent its login to any peer holding a certificate from the anchor. The weaker FTPS posture is
-  refused the same way: a credentialed FTPS hop with `tls_verify = false` is refused outright, as
-  `Email` and `Direct` refuse it, and the clamped `MEFOR_ALLOW_INSECURE_TLS` escape governs only an
-  anonymous FTPS hop.
+- **Compensating controls:** a private `tls_ca_file` is the one that matters. On a hop that carries
+  a credential this loosening is not available at all: see
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
+  CORRECTED 2026-10-06 (vault BACKLOG #2636): FTPS was warned and not refused here.
 - **It is never silent:** a WARNING at each construction naming the connection and the host; a
   `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
   and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a
@@ -1302,7 +1364,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   fires before the graph is loaded, as for `tls_allow_expired`.
 - **What it cannot do:** on a hop with no credential it is **advisory only**, on the
   `tls_allow_expired` precedent. No posture gate keys on it, and `[security].enforcement = enforce`
-  does not refuse it. The credentialed refusals above are absolute and do not depend on enforcement. Where it is NOT reported is the
+  does not refuse it. Where it is NOT reported is the
   same list as `cleartext_accepted` above: `messagefoundry security show` and a graphless
   `GET /security/posture` say so in `loosenings_scope`.
 
@@ -1324,8 +1386,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
   revocation in the engine and needs no attestation.
 - **What it cannot do:** it never reaches a cleartext or verify-off hop, which keep their own
-  refusals. It is a claim about one named hop, which is why it crosses an enforcing instance where the
-  process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299).
+  refusals. It is a claim about one named connection, which is why it crosses an enforcing instance
+  where the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299). That is one hop on
+  a connection with no token endpoint. It is two on any connection that signs in to a SMART or
+  OAuth2 token endpoint, a `FhirLookup` included, so the reason has to hold for both.
 - **How it is recorded:** a flag without a reason, a blank reason, or a reason without the flag fails
   at load, on both authoring surfaces. Each time the attestation lets a hop through that an enforcing
   instance would otherwise refuse, the engine logs a WARNING naming the hop and your reason, at every
@@ -1586,7 +1650,13 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   connection secrets and the messages in flight. An application that builds the API without
   `serve` reports this, until something in it imports the command-line module, which installs
   the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  only if another audit hook refused the engine's.
+  in at least two cases. Both need an audit hook that something else added to the process first.
+  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
+  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
+  is there. The engine's hook is then in place and refuses a script, but the entry still reads
+  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
+  refusals. The interpreter reports each one on standard error, with the script's full path. The entry cannot tell the two cases apart, so read
+  it as the first, and look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

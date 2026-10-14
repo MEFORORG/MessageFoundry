@@ -99,6 +99,7 @@ import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
+from messagefoundry.auth.trust_anchors import _has_encryption_header
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     InsecureHopRefused,
@@ -248,6 +249,7 @@ def _narrowed_pool_classes(
                     f"{connector} would open a TLS session that verifies no peer; "
                     "refusing to connect"
                 )
+            self._refuse_encrypted_ca_text()
             self._mefor_proxy_context = self._narrow_the_proxy_leg()
             self.ssl_context = factory()
             super().connect()
@@ -256,8 +258,65 @@ def _narrowed_pool_classes(
                 # leg's SSLSocket, which it names `socket`.
                 self._check_the_proxy_leg(getattr(self.sock, "socket", None))
 
+        def _refuse_encrypted_ca_text(self) -> None:
+            """Refuse CA text with an encryption header before either TLS leg loads it (#3090).
+
+            A ``str`` ``ca_cert_data`` is PEM text, and two calls load it, both as
+            ``load_verify_locations(ca_certs, ca_cert_dir, ca_cert_data)``. urllib3 loads it for the
+            Vault leg of every connection, and :meth:`_narrow_the_proxy_leg` loads it for the leg to
+            an ``https://`` proxy. A ``Proc-Type: 4,ENCRYPTED`` block in that text sends OpenSSL to
+            a password prompt. Measured: that call shape wrote the prompt, and was still waiting
+            when its process was killed. So the text first goes through the check ``anchor_cadata``
+            uses, ``trust_anchors._has_encryption_header``, and a flagged text is refused. ``bytes``
+            are DER, which has no PEM header: measured, the same text as ``bytes`` refused at once.
+            Nothing the engine ships sets ``ca_cert_data`` today, since requests and hvac never pass
+            it, so this guards a later caller.
+
+            **The refusal is a** :class:`VaultHopRefused`, **like every other check on this hop.**
+            urllib3 does not catch that type, so it reaches the caller as it is, and
+            :func:`vault_failure_text` keeps its text. The base ``InsecureHopRefused`` would reach
+            the caller too, but that function would give only its type name;
+            :class:`VaultHopRefused` says why. A urllib3 ``SSLError`` raised here would not reach
+            the caller as it is. Measured with urllib3 2.8.0, one raised before the proxy has
+            connected comes out of requests as a ``ProxyError``. The providers would then report a
+            type name only.
+
+            **A CA file is not checked, because the load itself refuses it.** ``ca_certs`` is a
+            path. Measured, a path load of an encrypted ``CERTIFICATE`` or ``X509 CRL`` block raised
+            ``PEM lib`` at once and wrote no prompt. A check here would also open the file twice.
+            ``tests/test_encrypted_pem_cafile_pin.py`` holds both measurements, with the versions
+            and terminal conditions, and pins them on each platform CI runs.
+
+            **A CA directory is not refused, because it was not seen to wait.** ``ca_cert_dir``
+            reaches OpenSSL as ``capath``. OpenSSL reads a directory's files when it verifies a
+            peer, not when the directory is named, so a check of the text handed to the load,
+            like the one above, does not cover one. So it was measured, for Python's ``ssl`` only,
+            with a real handshake (2026-10-12), on CPython 3.14.6 / OpenSSL 3.5.7 on
+            Windows and, off-version, on CPython 3.12.3 / OpenSSL 3.0.13 on Linux. A directory
+            file holding an encrypted ``CERTIFICATE`` or ``X509 CRL`` block, under the name
+            OpenSSL looks up, wrote no prompt and never waited, in every terminal condition
+            tried, a pseudo-terminal among them. The handshake refused the peer at once with a
+            verification error, so the hop fails closed. ``tests/test_encrypted_pem_capath_pin.py``
+            holds that table and its controls, and pins it on each platform CI runs. A directory
+            does reach both loads today. With neither ``MEFOR_STORE_VAULT_CA_FILE`` nor
+            ``MEFOR_SECRETS_VAULT_CA_FILE`` set, hvac and requests choose the CA. At least two
+            routes can name a directory: hvac's ``VAULT_CAPATH``, used when ``VAULT_CACERT`` is not
+            set, and requests' ``REQUESTS_CA_BUNDLE`` or ``CURL_CA_BUNDLE``. requests passes a
+            directory on as ``ca_cert_dir``. A refusal here would break a hop that works and stop
+            nothing that was seen to wait, so the directory is loaded as before."""
+            if isinstance(self.ca_cert_data, str) and _has_encryption_header(self.ca_cert_data):
+                # Fixed text: it names no part of the CA text it refuses.
+                raise VaultHopRefused(
+                    f"{connector}: the CA text for this hop holds a PEM block with an encryption "
+                    "header (Proc-Type or DEK-Info). Loading it can make the TLS library wait for "
+                    "a password; refusing to load it (BACKLOG #3090)"
+                )
+
         def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:
-            """Give the TLS leg to an https proxy its own context, or ``None`` if it has none."""
+            """Give the TLS leg to an https proxy its own context, or ``None`` if it has none.
+
+            :meth:`_refuse_encrypted_ca_text` has already run, and says what this load is and is
+            not protected from."""
             if (
                 self.proxy is None
                 or self.proxy.scheme != "https"

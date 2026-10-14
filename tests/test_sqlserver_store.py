@@ -89,6 +89,9 @@ async def store() -> AsyncIterator[object]:
                 "message_events",
                 "audit_log",
                 "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
+                "keyed_surface",  # BACKLOG #3383 markers (no FK): a keyed test leaves every surface
+                #                   marked, and a later keyless-then-keyed migration would then
+                #                   refuse, not seal
                 "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across
                 #                      runs and break the key-rotation reencrypt scan (persistent contamination)
                 "state",
@@ -114,6 +117,7 @@ async def store() -> AsyncIterator[object]:
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "user_roles",
                 "ad_group_role_map",
+                "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it
                 "users",
                 "roles",
             ):
@@ -769,6 +773,12 @@ async def test_auth_users_roles_sessions(store) -> None:
 
     await store.set_ad_group_role_map([("CN=Ops,DC=x", "operator")])
     assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
+    # BACKLOG #2592: this map has no role foreign key, so it can name a deleted role. That id is
+    # not handed to a sign-in, whose role write would refuse it; the live role still is.
+    await store.set_ad_group_role_map(
+        [("CN=Ops,DC=x", "operator"), ("CN=Ops,DC=x", "custom:no-such-role")]
+    )
+    assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
 
     await store.record_login_failure("u1", failed_attempts=2, locked_until=500.0, now=10.0)
     assert (await store.get_user("u1")).locked_until == 500.0
@@ -786,6 +796,13 @@ async def test_auth_users_roles_sessions(store) -> None:
     await store.delete_user("u1")
     assert await store.get_user("u1") is None
     assert await store.get_user_role_ids("u1") == []
+
+
+async def test_group_map_keys_at_the_api_widths_store(store) -> None:
+    """BACKLOG #3187: the contract is in ``tests/_ad_group_map_store_contract.py``."""
+    from tests._ad_group_map_store_contract import assert_group_map_keys_at_width_store
+
+    await assert_group_map_keys_at_width_store(store)
 
 
 async def test_last_admin_guard_contract(store) -> None:
@@ -1284,6 +1301,68 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
     assert again is not None and again.id == "dir-upgrade"
 
 
+async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None:
+    """The COL_LENGTH-gated ADD for ``sessions.idp_auth_time`` (BACKLOG #2143) on a database from
+    before it.
+
+    BACKLOG #3174: only the SQLite migration was tested against an existing table. Driven against a
+    table that really lacks the column, with the ``schema_meta`` marker cleared, for the reasons
+    ``test_directory_object_id_column_upgrade_is_idempotent`` gives. FLOAT is 8 bytes; asserting the
+    width, and a fractional value's round trip, rules out a differently-typed column."""
+
+    async def _col_length() -> int | None:
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT COL_LENGTH('sessions','idp_auth_time')")
+            row = await cur.fetchone()
+            await cur.close()
+        return None if row[0] is None else int(row[0])
+
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("ALTER TABLE sessions DROP COLUMN idp_auth_time")
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await _col_length() is None  # positive control: the column really is gone
+
+    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    assert await _col_length() == 8
+
+    await store.create_user(
+        user_id="idp-upgrade",
+        username="idp-upgrade",
+        auth_provider="ad",
+        directory_object_id="guid-idp-upgrade",
+        now=1.0,
+        password_generated=False,
+    )
+    await store.create_session(
+        token_hash="i" * 64,
+        user_id="idp-upgrade",
+        expires_at=9e9,
+        now=2.0,
+        auth_mechanism="oidc",
+        idp_auth_time=1.25,
+    )
+    created = await store.get_session("i" * 64)
+    assert created is not None and created.idp_auth_time == 1.25
+    await store.mark_session_reauthed("i" * 64, now=3.0, idp_auth_time=2.75)
+    moved = await store.get_session("i" * 64)
+    assert moved is not None and moved.idp_auth_time == 2.75
+
+    # A second full run against the migrated table skips the ADD and leaves the value alone.
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await store._ensure_schema() is True
+    assert await _col_length() == 8
+    again = await store.get_session("i" * 64)
+    assert again is not None and again.idp_auth_time == 2.75
+
+
 async def test_mark_session_reauthed_reanchors_client(store) -> None:
     """WP-L3-13: mark_session_reauthed(client=) re-anchors the session's client address via COALESCE;
     a None client leaves it unchanged while still refreshing reauth_at. Exercises the new COALESCE
@@ -1314,13 +1393,11 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
 async def test_set_password_claim_stamp_round_trip(store) -> None:
     """BACKLOG #1245 ``users.password_claimed_at`` on the real SQL Server backend.
 
-    ``password_claim_set`` is shared by all three backends, so the SQL TEXT of the claim term is
-    single-sourced — but the ARGUMENT BINDING around it is hand-written per backend and nothing
-    else on this leg executes ``set_password`` at all. This backend is the sharp one: the claim
-    value is spliced POSITIONALLY into the MIDDLE of a ``?`` list, between the
-    ``must_change_password`` bind and the ``updated_at`` bind. An arity mismatch between the term
-    and its argument shifts every later bind by one, which would write the claim timestamp into a
-    neighbouring column (or the user id into a FLOAT one) rather than failing outright.
+    The claim rule is ``store.password_change``, shared by all three backends since BACKLOG #2592,
+    and the write is the sealed user record's one whole-row ``?`` statement -- nothing else on this
+    leg executes ``set_password`` at all. An arity mismatch in that statement shifts every later
+    bind by one, which would write the claim timestamp into a neighbouring column (or the user id
+    into a FLOAT one) rather than failing outright.
 
     Every assertion below compares against the EXACT timestamp passed, never merely ``is not
     None``: a shifted bind that landed the ``must_change_password`` flag in the column would still
@@ -2786,6 +2863,45 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -
         with pytest.raises(CipherError, match=r"messages\.raw"):
             await reopened.get_message(planted)
         assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
+    finally:
+        await reopened.close()
+
+
+async def test_a_plant_on_a_never_written_keyed_surface_is_refused_ss(store) -> None:
+    """BACKLOG #3383 (owner ruling 2026-10-10), the ``sqlserver-store`` twin of the same-named test
+    in ``tests/test_store_strict_ciphertext.py``. ``messages.error`` is never written here, so it
+    holds no ciphertext. The keyed open still writes its ``keyed_surface`` marker, the marker
+    survives a restart, and a plant written there afterwards is refused rather than sealed."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher, CipherError
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    plant = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\r"
+    keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(bytearray(b"k" * 32)))
+    try:
+        mid = await keyed.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
+        )
+        row = (await keyed._fetchall("SELECT error FROM messages WHERE id=?", (mid,)))[0]
+        assert row["error"] in (None, "")  # the surface holds no ciphertext
+        await keyed._execute("UPDATE messages SET error=? WHERE id=?", (plant, mid))
+    finally:
+        await keyed.close()
+    rows = await store._fetchall("SELECT surface_table, surface_column FROM keyed_surface")
+    marks = {(r["surface_table"], r["surface_column"]) for r in rows}
+    assert {("messages", "error"), ("messages", "raw")} <= marks  # survived the close
+
+    cipher = AesGcmCipher(bytearray(b"k" * 32))
+    refused: list[tuple[str, str]] = []
+    cipher.set_refusal_hook(lambda t, c: refused.append((t, c)))
+    reopened = await SqlServerStore.open(settings, cipher=cipher)
+    try:
+        assert refused == [("messages", "error")], "the open must find the plant once"
+        row = (await reopened._fetchall("SELECT error FROM messages WHERE id=?", (mid,)))[0]
+        assert row["error"] == plant, "the keyed reopen sealed a plant on a keyed surface"
+        with pytest.raises(CipherError, match=r"messages\.error"):
+            await reopened.get_message(mid)
     finally:
         await reopened.close()
 
@@ -5450,6 +5566,65 @@ async def test_session_seal_contract(store) -> None:
 
         await assert_session_seal_contract(keyed, raw)
         assert_session_columns(await columns())
+    finally:
+        await keyed.close()
+
+
+async def test_user_seal_contract(store) -> None:
+    """BACKLOG #2592: the sealed user record, the same contract the SQLite suite runs, on a keyed
+    handle, with the round trip that pins the canonical bytes (AC-19). ``raw`` runs each statement
+    on a pooled connection, outside the store's helpers. The fixture clears the user and role
+    tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._user_seal_contract import (
+        assert_user_columns,
+        assert_user_record_round_trips,
+        assert_user_seal_contract,
+    )
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        async def columns() -> set[str]:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(
+                    "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('users')"
+                )
+                return {str(r[0]) for r in await cur.fetchall()}
+
+        assert_user_columns(await columns())
+        await assert_user_record_round_trips(keyed)
+        await assert_user_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
+    """BACKLOG #2592: this backend has the ``user_roles`` role foreign key too, so a grant that
+    commits while its custom role is deleted fails the delete rather than leaving a sealed role row
+    with no role behind it. The race is made, not hoped for: ``tests/_user_seal_contract.py`` runs
+    the grant on a second connection inside the delete."""
+    import pyodbc
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._user_seal_contract import assert_role_delete_race_refused
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+        await assert_role_delete_race_refused(keyed, pyodbc.IntegrityError)
     finally:
         await keyed.close()
 
