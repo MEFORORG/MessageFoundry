@@ -2059,11 +2059,12 @@ row is still read from the engine's live state when it is written.
 **A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
 digest of the target directory, taken at request time. An approver sees it in the queue. The
-release takes the digest again twice. The first check runs before any config module runs. The
-second runs right after the load, and before the checks that refuse an invalid graph. A load that
-fails as an invalid config is checked too. So an edit that also breaks the graph is recorded as
-an edit. The second digest is the one the `config_reload` row records. If either differs from the
-approved one, nothing loads past that point and nothing swaps. The running graph keeps the
+release checks the directory against it before any config module runs. After a load that
+succeeds, it checks again, before the checks that refuse an invalid graph. That check takes the
+fail-closed digest, and then compares the digest the `config_reload` row records, when the engine
+could take one. After a load that fails as an invalid config, it checks the fail-closed digest
+once more, so an edit that also breaks the graph is recorded as an edit. If any check differs
+from the approved digest, nothing loads past that point and nothing swaps. The running graph keeps the
 environment values it had. A reload applies the values it re-read only with the swap, and a
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
@@ -2074,8 +2075,12 @@ cause at WARNING. The requester asks again, and a second approver reviews the ne
 
 This digest fails closed, unlike the provenance fingerprint, which skips what it cannot read. A
 file or folder it covers that cannot be read gives no digest at all, never the digest of the rest.
-A directory gone by the time the digest reads it is refused as missing, never digested as an empty
-bundle. After the load the release checks this digest first, and then the one the row records.
+A directory that is gone when the digest first lists it is refused as missing, and so is a name no
+directory can have. A directory removed after that first listing is not refused as missing. The
+digest covers the files it still finds, down to an empty bundle, and that digest does not match
+an approved bundle that held files, so the release is refused as `digest_mismatch`. A file that
+goes between its stat and its read gives `digest_unavailable` instead. After the load the
+release checks this digest first, and then the one the row records.
 
 At least these requests file no hold, because their release could only be refused. Each is
 answered and audited at once, as an inline reload's refusal is:
@@ -2101,7 +2106,8 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 - the request-time digest is taken before the route checks its step-up proof;
 - the digest checks that each folder it reads can be listed, and then lists it again. A folder
   that becomes unlistable between the two is left out of the digest;
-- a directory moved away during a release is recorded as `not_found`, not as an edit;
+- a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
+  move lands while a digest is reading it;
 - a swap that fails while reconciling outbound connections does not roll those connections back.
   Any it already rebuilt keep the new graph's settings and values;
 - a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held

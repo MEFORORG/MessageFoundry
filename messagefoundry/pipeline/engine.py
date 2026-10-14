@@ -2502,8 +2502,9 @@ class Engine:
     async def _content_digest(self, path: Path) -> str | None:
         """The ADR 0041 D1 content digest of ``path`` alone, for an approval to bind, or ``None``
         when it cannot be taken. It fails closed: a file or folder it covers that cannot be read
-        gives ``None``, not the digest of the rest, and a directory that is gone raises
-        ``FileNotFoundError``, not the digest of an empty bundle (vault BACKLOG #2596).
+        gives ``None``, not the digest of the rest, and a directory that is gone, or whose name no
+        directory can have, when the digest first lists it raises ``FileNotFoundError``. One
+        removed after that listing digests as the files still found (vault BACKLOG #2596).
 
         Not :meth:`fingerprint_bundle`, whose detail is lost whole when only its advisory VCS head
         cannot be read. An approval binds content, so that failure must not refuse a release. That
@@ -2684,14 +2685,15 @@ class Engine:
 
         ``approval`` binds the reload to the digest a dual-control approval named (vault BACKLOG
         #2596, step 3; :meth:`reload_target_digest` took it at request time). The bundle's digest is
-        checked against it twice: before ``load_config`` runs any config module, and again right
-        after the load with the digest the audit row records, before any check that can refuse the
-        graph as invalid. A load that fails is checked too, so an edit that breaks the graph is
-        refused as an edit. A miss raises :class:`ConfigDigestMismatch`, or
+        checked against it before ``load_config`` runs any config module. After a load that
+        succeeds it is checked again, before any check that can refuse the graph as invalid: the
+        fail-closed digest, then the digest the audit row records when one was taken. After a load
+        that fails, the fail-closed digest is checked once more, so an edit that breaks the graph
+        is refused as an edit. A miss raises :class:`ConfigDigestMismatch`, or
         :class:`ConfigDigestUnavailable` when no digest can be taken now, with nothing swapped. The
         digest fails closed (:meth:`_content_digest`): a file or folder it cannot read gives
-        :class:`ConfigDigestUnavailable`, and a directory gone since the resolve gives
-        ``FileNotFoundError``. ``None`` binds nothing: an ungated reload, a convergence reload and a
+        :class:`ConfigDigestUnavailable`, and a directory gone since the resolve, when a digest
+        lists it, gives ``FileNotFoundError``. ``None`` binds nothing: an ungated reload, a convergence reload and a
         dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint` hashes
         and no more.
 
@@ -2702,8 +2704,10 @@ class Engine:
         environment value file this reload could not read) — the caller maps these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
         live graph is the one that was already running. A reload applies the environment values it
-        re-read only with the swap, and a dry run never applies them, so a raise also leaves the
-        running values as they were.
+        re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
+        run never applies them, so a raise of one of these leaves the running values as they were.
+        A cancellation is not one of them: one that lands after the swap committed keeps the new
+        values, and so does one during a first load's runner start.
         """
         failures: list[ReloadStepFailure] = []
         if not dry_run:
