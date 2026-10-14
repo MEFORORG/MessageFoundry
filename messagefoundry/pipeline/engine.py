@@ -73,6 +73,7 @@ from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.pipeline.remote_debug_watch import RemoteDebugRefusalWatch
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
@@ -422,6 +423,7 @@ class Engine:
         self._cert_expiry_runner: CertExpiryRunner | None = None
         self._crl_reload_runner: CrlReloadRunner | None = None
         self._log_forward_watch: LogForwardWatch | None = None
+        self._remote_debug_watch: RemoteDebugRefusalWatch | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
@@ -1757,6 +1759,14 @@ class Engine:
             node=self.instance_identity,
         )
         self._crl_reload_runner.start()
+        # Vault BACKLOG #2742: write one audit row for the scripts the remote-debugging guard
+        # refused since the last pass. Not leader-gated: the count is this process's own, so a
+        # standby reports its own too. Only `serve` builds an engine, so only `serve` runs this.
+        if self._remote_debug_watch is None:
+            self._remote_debug_watch = RemoteDebugRefusalWatch(
+                self.store, node=self.instance_identity
+            )
+            self._remote_debug_watch.start()
         # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and
         # alarm at 2**31 (half the fail-closed 2**32 birthday ceiling). A no-op when the store carries no
         # bounded cipher (keyless / `vault_transit`). NOT leader-gated and NOT settings-gated: every
@@ -3037,6 +3047,10 @@ class Engine:
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
             self._log_forward_watch = None
+        # Its last pass may write an audit row, so it stops here, well before the store closes.
+        if self._remote_debug_watch is not None:
+            await self._remote_debug_watch.stop()
+            self._remote_debug_watch = None
         if self._secret_rotation_runner is not None:
             await self._secret_rotation_runner.stop()
         if self._update_check_runner is not None:
