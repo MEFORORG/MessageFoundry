@@ -112,6 +112,42 @@ async def test_the_role_row_matches_the_roles_table(keyed: tuple[MessageStore, P
     assert set_columns == {"name", "seal"}
 
 
+async def test_a_builtin_row_with_a_custom_id_is_not_edited_or_deleted_as_custom(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """The service's custom-role test reads the ``builtin`` column as the store does, so a row the
+    store treats as built-in is never rewritten as custom, nor reported deleted when it was not."""
+    store, path = keyed
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    role = await service.create_custom_role(
+        display_name="Flagged", description=None, permissions=["messages:replay"], actor="admin"
+    )
+    await service.update_custom_role(  # control: a custom row is edited
+        role.id,
+        display_name="Flagged",
+        description="ok",
+        permissions=["messages:replay"],
+        actor="admin",
+    )
+    await _raw_for(path)("UPDATE roles SET builtin=1 WHERE id=?", (role.id,))
+    for act in (
+        service.update_custom_role(
+            role.id,
+            display_name="Flagged",
+            description=None,
+            permissions=["messages:replay"],
+            actor="admin",
+        ),
+        service.delete_custom_role(role.id, actor="admin"),
+    ):
+        with pytest.raises(ValueError, match="no such custom role"):
+            await act
+    found = await store.get_role(role.id)
+    assert found is not None and bool(found["builtin"])
+    assert await store.list_audit(action="role.deleted") == []
+
+
 async def test_a_keyless_store_writes_no_seal_and_checks_none(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "plain.db")
     try:

@@ -7930,8 +7930,13 @@ class AuthService:
     async def _custom_role_held(self, role_id: str) -> bool:
         """Whether a custom role row holds ``role_id``, sealed or not (BACKLOG #2592). An existence
         question, as :meth:`_username_held` is: a role that fails its seal can still be saved again,
-        which re-seals it, or deleted. Only a ``bool`` leaves here, never the unchecked row."""
-        return is_custom_role_id(role_id) and await self._store.get_role(role_id) is not None
+        which re-seals it, or deleted. Only a ``bool`` leaves here, never the unchecked row. A row
+        whose ``builtin`` column is set is not a custom role, whatever its id says: the store's own
+        delete and its unsealed count read that column, so this answer must match theirs."""
+        if not is_custom_role_id(role_id):
+            return False
+        found = await self._store.get_role(role_id)
+        return found is not None and not bool(found["builtin"])
 
     async def _role_seal_failed(self, role_id: str) -> None:
         """Report a custom role whose row failed its integrity seal (BACKLOG #2592), through
@@ -11500,7 +11505,7 @@ class AuthService:
                     id=row.id,
                     display_name=row.display_name,
                     description=row.description,
-                    permissions=frozenset(perms),
+                    permissions=perms,
                 )
             )
         return out

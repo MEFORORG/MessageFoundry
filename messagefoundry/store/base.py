@@ -2407,7 +2407,7 @@ class AuthStore(Protocol):
         ...
 
     async def count_unsealed_role_records(self) -> int:
-        """How many custom roles carry no integrity seal, plus one when the AD group-to-role map
+        """How many custom roles carry no integrity seal, plus one for each AD directory map that
         has pairs and no seal (BACKLOG #2592)."""
         ...
 
