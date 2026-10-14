@@ -11,8 +11,10 @@ rise into one ``remote_debug_refused`` audit row and one ``remote_debug_refused`
 **One row and one alert for each pass, with a count.** The injecting process chooses how often it
 tries. However many scripts were refused since the last pass, the pass writes one row and raises
 one alert, and each says how many. A pass runs when the watch starts, every
-:data:`CHECK_INTERVAL_SECONDS` after that, and once more as it stops. So the audit log gains at most
-one row, and the sink one alert, for each pass, whatever the rate.
+:data:`CHECK_INTERVAL_SECONDS` after that, and once more as it stops. The interval starts when a
+pass ends, and a pass may wait :data:`_ROW_SECONDS` for its row, so a hung store spaces passes, and
+alerts, about twice the interval apart. So the audit log gains at most one row, and the sink one
+alert, for each pass, whatever the rate.
 
 **No file name.** The injecting process chooses the script's name too, so neither the row nor the
 alert carries it. The name stays in the guard's WARNING line, which bounds and escapes it.
@@ -29,6 +31,10 @@ earlier refusals again. An engine builds one, and ``serve`` builds one engine.
 and no notifier, so a refusal there is the guard's WARNING line and nothing more, even where the
 command opens the store itself, as ``rotate-key`` and ``backup`` do. An engine
 shard starts with the interface off (``messagefoundry/childenv.py``), so its count never moves.
+An application that builds its own engine runs this watch too, but the count rises only where the
+guard is in the process. Importing ``messagefoundry.__main__`` installs it, and so does calling
+``install_remote_debug_guard``. Without either, such an application's count stays at 0, so it
+writes no row and raises no alert.
 
 **It reads the count, not whether the guard answers.** The count rises wherever the hook runs. That
 includes the state where an earlier audit hook raises on the engine's probe event: the posture then
@@ -40,9 +46,12 @@ counted.
 once its own call succeeded. The alert is raised first, because it does not block: a slow or
 refusing store cannot hold back the page. A store that refuses the row leaves the row's mark where
 it was, and the next pass writes one row with the larger count; the alert is not raised again for
-those refusals. A sink that raises is retried the same way. A notifier whose queue is full drops
-the event without raising, so the alert mark moves anyway; its alert-instance row is still written
-before the queue is tried.
+those refusals. A sink that raises is retried the same way. The pass at stop has no next pass, so
+a row it cannot write is lost, and :meth:`RemoteDebugRefusalWatch.stop` cancels that pass after
+:data:`_STOP_SECONDS`. Rows' ``count`` values can overlap, because a write cut off after it
+committed is written again, so the latest row's ``total`` is the figure to read. A notifier whose
+queue is full drops the event without raising, so the alert mark moves anyway; its alert-instance
+row is still written before the queue is tried.
 
 **The alert has no inverse.** A refusal is an event, not a state that can clear, so nothing
 resolves the alert instance. An operator does.
