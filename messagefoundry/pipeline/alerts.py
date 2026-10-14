@@ -144,8 +144,8 @@ def remote_debug_refused_detail(*, count: int, total: int) -> str:
     count leads."""
     return (
         f"refused {count} script(s) another process injected through the interpreter's remote "
-        f"debugging ({total} since this process started). None ran. The engine log's WARNING "
-        "lines name the files."
+        f"debugging ({total} since this process started). None ran. WARNING lines in the engine "
+        "log may name the files."
     )
 
 

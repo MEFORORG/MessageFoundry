@@ -581,6 +581,51 @@ async def test_a_last_pass_that_hangs_is_cancelled(
     assert task.cancelled()
 
 
+async def test_a_pass_whose_cancel_hangs_too_does_not_hold_the_stop(
+    refuse: Callable[..., None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A driver call can take as long to unwind a cancel as it took to hang. The engine's stop
+    must still reach the store's close, so the wait after the cancel is bounded as well."""
+
+    class _Stubborn(_RefusingStore):
+        async def record_audit(self, action: str, **_kw: Any) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.Event().wait()
+
+    monkeypatch.setattr(remote_debug_watch, "_STOP_SECONDS", 0.05)
+    watch = _on(_Stubborn(), interval_seconds=3600.0)
+    refuse()
+    watch.start()
+    await asyncio.sleep(0)
+    task = watch._task
+    assert task is not None
+    await asyncio.wait_for(watch.stop(), 5.0)  # returns, though the task has not ended
+    assert not task.done()
+    task.cancel()  # the test's own clean-up: the second cancel ends the unwind
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_a_store_that_hangs_does_not_hold_back_the_alert(
+    refuse: Callable[..., None],
+) -> None:
+    class _Hung(_RefusingStore):
+        async def record_audit(self, action: str, **_kw: Any) -> None:
+            await asyncio.Event().wait()
+
+    sink = _Sink()
+    watch = _on(_Hung(), alert_sink=sink)
+    refuse(times=2)
+    task = asyncio.create_task(watch.run_once())
+    try:
+        await until(lambda: bool(sink.alerts), "the alert ahead of the hung row")
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert sink.alerts == [("remote_debug:refused", 2, 2)]
+
+
 async def test_a_loop_task_cancelled_elsewhere_does_not_cancel_the_stop(
     refuse: Callable[..., None],
 ) -> None:

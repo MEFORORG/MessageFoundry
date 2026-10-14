@@ -10,8 +10,9 @@ rise into one ``remote_debug_refused`` audit row and one ``remote_debug_refused`
 
 **One row and one alert for each pass, with a count.** The injecting process chooses how often it
 tries. However many scripts were refused since the last pass, the pass writes one row and raises
-one alert, and each says how many. So the audit log gains at most one row, and the sink one alert,
-every :data:`CHECK_INTERVAL_SECONDS`, whatever the rate.
+one alert, and each says how many. A pass runs when the watch starts, every
+:data:`CHECK_INTERVAL_SECONDS` after that, and once more as it stops. So the audit log gains at most
+one row, and the sink one alert, for each pass, whatever the rate.
 
 **No file name.** The injecting process chooses the script's name too, so neither the row nor the
 alert carries it. The name stays in the guard's WARNING line, which bounds and escapes it.
@@ -24,8 +25,9 @@ process and each watch keeps its own marks, so a second watch in one process wou
 earlier refusals again. An engine builds one, and ``serve`` builds one engine.
 
 **``serve`` only.** The engine starts this watch, and of the ``messagefoundry`` commands only
-``serve`` builds an engine. ``supervise``, ``rotate-key``, ``backup`` and the rest hold no open
-store and no notifier, so a refusal there is the guard's WARNING line and nothing more. An engine
+``serve`` builds an engine. ``supervise``, ``rotate-key``, ``backup`` and the rest build no engine
+and no notifier, so a refusal there is the guard's WARNING line and nothing more, even where the
+command opens the store itself, as ``rotate-key`` and ``backup`` do. An engine
 shard starts with the interface off (``messagefoundry/childenv.py``), so its count never moves.
 
 **It reads the count, not whether the guard answers.** The count rises wherever the hook runs. That
@@ -35,9 +37,12 @@ row and the alert still come. Where the hook is truly missing nothing is refused
 counted.
 
 **Each is owed each refusal once.** The row and the alert keep a mark each, and a mark moves only
-once its own call succeeded. A store that refuses the row leaves the row's mark where it was, and
-the next pass writes one row with the larger count. The alert was raised meanwhile, and is not
-raised again for those refusals. A sink that raises is retried the same way.
+once its own call succeeded. The alert is raised first, because it does not block: a slow or
+refusing store cannot hold back the page. A store that refuses the row leaves the row's mark where
+it was, and the next pass writes one row with the larger count; the alert is not raised again for
+those refusals. A sink that raises is retried the same way. A notifier whose queue is full drops
+the event without raising, so the alert mark moves anyway; its alert-instance row is still written
+before the queue is tried.
 
 **The alert has no inverse.** A refusal is an event, not a state that can clear, so nothing
 resolves the alert instance. An operator does.
@@ -133,7 +138,9 @@ class RemoteDebugRefusalWatch:
             raise
         if not done:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            # Bounded too: a driver call can take as long to unwind a cancel as it took to hang,
+            # and the engine's stop must still reach the store's close.
+            await asyncio.wait({task}, timeout=_STOP_SECONDS)
             log.warning(
                 "remote-debug refusal watch: the last pass did not finish in %.0f s and was "
                 "cancelled, so a refusal since the pass before it may have no audit row",
@@ -156,16 +163,17 @@ class RemoteDebugRefusalWatch:
             log.exception("remote-debug refusal check failed; the next pass retries")
 
     async def run_once(self) -> None:
-        """One pass: a row, then an alert, for the refusals each has not reported yet.
+        """One pass: an alert, then a row, for the refusals each has not reported yet. The alert
+        does not block, so it goes first, and a store that hangs cannot hold back the page.
 
         Passes take turns. A mark moves after its call, so two passes running at once would each
         write a row for the same refusals."""
         async with self._passing:
             total = self._read()
-            if total > self._audited and await self._record(total - self._audited, total):
-                self._audited = total
             if total > self._alerted and self._raise(total - self._alerted, total):
                 self._alerted = total
+            if total > self._audited and await self._record(total - self._audited, total):
+                self._audited = total
 
     async def _record(self, count: int, total: int) -> bool:
         """Write the row, and say whether it was written. Counts and this process's own label
@@ -175,8 +183,8 @@ class RemoteDebugRefusalWatch:
             sort_keys=True,
         )
         # ``actor="system"``: no user acted, as for the other rows a background task writes.
-        # ``defects=()``: a raise here would skip the alert below, and the next pass retries the
-        # row whatever stopped it.
+        # ``defects=()``: the next pass retries the row whatever stopped it, so a raise here would
+        # only end this pass early.
         return await write_audit_soft(
             lambda: self._store.record_audit(AUDIT_ACTION, actor="system", detail=detail),
             log=log,

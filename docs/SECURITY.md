@@ -5602,7 +5602,7 @@ Three controls answer it, and they differ in strength:
   console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
   installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
-  interpreter drops the script. Each refusal is logged. Under `serve` the engine also writes a
+  interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
   `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).
 
 The hook is the weakest of the three, so an engine that starts with the interface on reports it
