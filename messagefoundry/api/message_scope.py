@@ -75,14 +75,21 @@ async def read_scoped_message(
     their tag was refused, alerted and audited by the store (BACKLOG #2593). Out of scope it reads as
     any other refused row, so the answer never says the message exists. In scope it is ``None`` for
     a caller that skips (the export stream), or, with ``refuse_integrity``, a 423."""
+    integrity_refused = False
     try:
         row = await engine.store.get_message(message_id)
     except CellTagError as err:
         if not identity.can_access_channel(err.channel_id):
             await audit_channel_denied(engine, identity, err.channel_id, client_ip(request))
-        elif refuse_integrity:
-            raise HTTPException(423, _INTEGRITY_REFUSED) from None
-        return None
+            return None
+        if not refuse_integrity:
+            return None
+        integrity_refused = True
+    if integrity_refused:
+        # Raised after the handler, so the 423 chains nothing (BACKLOG #1796). Inside it, even with
+        # `from None`, __context__ would keep the CellTagError, the cipher's error under it, and
+        # through their tracebacks the store frame holding the cells it had already opened.
+        raise HTTPException(423, _INTEGRITY_REFUSED)
     if row is None:
         return None
     if not identity.can_access_channel(row["channel_id"]):

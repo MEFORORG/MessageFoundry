@@ -45,6 +45,7 @@ from starlette.requests import Request
 
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.api import app as api_app
+from messagefoundry.api.message_scope import read_scoped_message
 from messagefoundry.api.models import ChannelInfo
 from messagefoundry.apiclient.client import ApiError, _decode
 from messagefoundry.auth.oidc.jwks import JwksError, parse_jwks
@@ -77,6 +78,7 @@ from messagefoundry.pipeline.ingress_guards import (
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.backup_codec import MAGIC, BackupCodecError, read_header
+from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.crypto import (
     CipherError,
     StoreKeylessError,
@@ -902,3 +904,27 @@ async def test_the_reload_guard_keeps_the_value_file_off_the_chain(
         _assert_bare(caught.value)
     finally:
         await eng.stop()
+
+
+# ---- api/message_scope.py: the integrity 423 chains no cell-tag failure (BACKLOG #2593) -------
+
+
+async def test_an_integrity_refused_message_423_carries_no_chain() -> None:
+    """The 423 is raised after the handler, so neither the CellTagError nor the cipher's error under
+    it, nor through their tracebacks the store frame that opened the row's other cells, is on it."""
+
+    async def _get_message(_message_id: str) -> dict[str, Any] | None:
+        try:
+            raise CipherError(_PLANTED)
+        except CipherError as exc:
+            raise CellTagError("messages", "summary", "m-1", "IB_A") from exc
+
+    engine: Any = SimpleNamespace(store=SimpleNamespace(get_message=_get_message))
+    identity: Any = SimpleNamespace(can_access_channel=lambda _channel: True)
+    request: Any = None
+    with pytest.raises(HTTPException) as caught:
+        await read_scoped_message(engine, identity, "m-1", request, refuse_integrity=True)
+    assert caught.value.status_code == 423
+    _assert_bare(caught.value)
+    # Control: without refuse_integrity the same row reads as absent, as before.
+    assert await read_scoped_message(engine, identity, "m-1", request) is None
