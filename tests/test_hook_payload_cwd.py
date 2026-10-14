@@ -132,12 +132,14 @@ def test_the_helper_says_no_cwd_is_not_a_fault(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def _resolve(repo: Path, tmp_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def _resolve(
+    repo: Path, tmp_path: Path, payload: dict[str, Any], flags: str = ""
+) -> dict[str, Any]:
     probe = tmp_path / "resolve.ps1"
     probe.write_text(
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         f". '{HELPER}'\n$t = Read-CcxHookInput\n"
-        "$r = Resolve-CcxHookSession -Text $t\n"
+        f"$r = Resolve-CcxHookSession -Text $t {flags}\n"
         "[pscustomobject]@{ Dir = $r.Dir; Reason = $r.Reason; Note = $r.Note } | ConvertTo-Json -Compress\n",
         encoding="utf-8",
     )
@@ -213,6 +215,48 @@ def test_after_a_cd_to_another_repository_the_hook_answers_for_the_pinned_worktr
     assert not (other / ".git" / "mefor-coord").exists(), (
         "nothing may be written into that repository"
     )
+
+
+def test_a_compact_after_a_cd_does_not_move_the_pin(tmp_path: Path) -> None:
+    """SessionStart also fires on /compact and /clear, wherever a `cd` left the cwd. Only a launch
+    (startup, resume, or no source) rewrites the pin."""
+    repo, wt = _primary_with(tmp_path, "linked")
+    sibling = Path(os.path.realpath(tmp_path)) / "sibling"
+    _git(repo, "worktree", "add", "-q", "-b", "sibling", str(sibling))
+    start = {"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup"}
+    _resolve(repo, tmp_path, {**start, "cwd": str(wt)})
+    _resolve(repo, tmp_path, {**start, "cwd": str(sibling), "source": "compact"})
+    got = _resolve(
+        repo, tmp_path, {"cwd": str(sibling), "session_id": "s1", "hook_event_name": "Stop"}
+    )
+    assert got["Dir"] and _same_dir(got["Dir"], wt), (
+        "a compaction re-pinned the session to its sibling"
+    )
+    # The control: a resume does rewrite it.
+    _resolve(repo, tmp_path, {**start, "cwd": str(sibling), "source": "resume"})
+    got = _resolve(
+        repo, tmp_path, {"cwd": str(sibling), "session_id": "s1", "hook_event_name": "Stop"}
+    )
+    assert got["Dir"] and _same_dir(got["Dir"], sibling), got
+
+
+def test_allow_outside_still_prefers_the_pin(tmp_path: Path) -> None:
+    """A pinned session that ran `cd` into a scratch directory keeps its own worktree. Only a
+    session with nothing pinned is answered for where it stands."""
+    repo, wt = _primary_with(tmp_path, "linked")
+    scratch = Path(os.path.realpath(tmp_path)) / "scratch"
+    scratch.mkdir()
+    _resolve(
+        repo, tmp_path, {"cwd": str(wt), "session_id": "s1", "hook_event_name": "SessionStart"}
+    )
+    got = _resolve(
+        repo, tmp_path, {"cwd": str(scratch), "session_id": "s1"}, "-ReadOnly -AllowOutside"
+    )
+    assert got["Dir"] and _same_dir(got["Dir"], wt), got
+    other = _resolve(
+        repo, tmp_path, {"cwd": str(scratch), "session_id": "s2"}, "-ReadOnly -AllowOutside"
+    )
+    assert other["Dir"] and _same_dir(other["Dir"], scratch), other
 
 
 def test_a_pin_naming_a_removed_worktree_is_ignored(tmp_path: Path) -> None:

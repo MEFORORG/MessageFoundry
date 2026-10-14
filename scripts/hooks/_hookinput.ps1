@@ -62,15 +62,19 @@ function Read-CcxHookInput {
         AND BOUNDED IN TIME. IsInputRedirected is True from an agent shell with no pipe at all
         (announce-session.ps1 measured it), and a caller that leaves stdin open would hang an
         unbounded read. The harness writes its JSON and closes the pipe, so it never meets the bound.
-        A read that does meet it says so on stderr, so "no input" and "input still open" differ.
+        A read that does meet it says so on stderr, so "no input" and "input still open" differ. It
+        also sets $script:CcxHookInputTimedOut, and Resolve-CcxHookSession then reports a fault rather
+        than "no cwd": a hook that fell back in silence would answer for the primary.
     #>
     param([int] $TimeoutMs = 2000)
+    $script:CcxHookInputTimedOut = $false
     try {
         if (-not [Console]::IsInputRedirected) { return '' }
         $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
         $read = $reader.ReadToEndAsync()
         if ($read.Wait($TimeoutMs)) { return $read.Result }
         [Console]::Error.WriteLine("[hook-input] stdin was still open after $TimeoutMs ms, so the hook read no input and answers for $($PWD.Path).")
+        $script:CcxHookInputTimedOut = $true
         return ''
     }
     catch { return '' }
@@ -233,6 +237,7 @@ function Resolve-CcxHookSession {
           Root    the worktree root Dir sits in; $null with Dir.
           Reason  set only when the input NAMED a cwd and Dir is $null: the fault to say aloud.
           Note    set when Dir is the pinned worktree and not the `cwd`: why the `cwd` was not used.
+          Pinned  the worktree the session started in, when a pin records it; otherwise $null.
 
         The header gives the two checks and the pin. $StartDir is where the hook started, and its
         repository is the one this hook serves. A hook started outside every checkout has no
@@ -250,16 +255,25 @@ function Resolve-CcxHookSession {
     )
     $out = [pscustomobject]@{
         Named = $false; Dir = $null; Root = $null; Reason = ''; Note = ''
-        SessionId = ''; Event = ''; Payload = $null
+        SessionId = ''; Event = ''; Payload = $null; Pinned = $null
+    }
+    # Stdin still open at the bound is not "no cwd": falling back in silence would answer for where
+    # the hook started, the primary under the desktop app.
+    if ([string]::IsNullOrWhiteSpace($Text) -and $script:CcxHookInputTimedOut) {
+        $out.Named = $true
+        $out.Reason = 'the hook input was still open when the hook stopped waiting for it, so it names no cwd'
+        return $out
     }
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         try { $out.Payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { $out.Payload = $null }
     }
     # Through PSObject.Properties, because a caller under Set-StrictMode throws on a missing member.
+    $source = ''
     if ($out.Payload -is [pscustomobject]) {
         $props = $out.Payload.PSObject.Properties
         if ($props['session_id']) { $out.SessionId = [string]$props['session_id'].Value }
         if ($props['hook_event_name']) { $out.Event = [string]$props['hook_event_name'].Value }
+        if ($props['source']) { $source = [string]$props['source'].Value }
     }
 
     $p = Get-CcxHookPayloadCwd -Payload $out.Payload
@@ -271,13 +285,11 @@ function Resolve-CcxHookSession {
     # The candidate: the `cwd`, if it sits in a real worktree of the repository this hook serves.
     $why = $p.Reason
     $root = $null
+    $outside = $false
     if (-not $why) {
         $root = Get-CcxWorktreeRoot $p.Cwd
         if (-not $root) {
-            if ($AllowOutside) {
-                $out.Dir = $p.Cwd
-                return $out
-            }
+            $outside = $true
             $why = "the hook input names cwd $($p.Cwd), which is inside no checkout"
         }
         else {
@@ -306,13 +318,20 @@ function Resolve-CcxHookSession {
         } catch { $pinned = $null }
     }
 
-    # SessionStart names where the session starts, so it always writes the pin. Another event writes
-    # one only where none exists: a session that predates the pin, or whose SessionStart did not run.
-    if (-not $ReadOnly -and $root -and $pinFile -and ($out.Event -eq 'SessionStart' -or -not $pinned)) {
+    # A SessionStart that STARTS the process (startup, resume, or no source given) names where the
+    # session starts, so it writes the pin. A SessionStart from /clear or /compact fires wherever a
+    # `cd` left the cwd, and so does every other event: those write a pin only where none exists, for
+    # a session that predates the pin or whose SessionStart did not run.
+    $launch = ($out.Event -eq 'SessionStart') -and ($source -notin @('clear', 'compact'))
+    if (-not $ReadOnly -and $root -and $pinFile -and ($launch -or -not $pinned)) {
         try {
             $pinDir = Split-Path -Parent $pinFile
             New-Item -ItemType Directory -Force -Path $pinDir -ErrorAction Stop | Out-Null
-            Set-Content -LiteralPath $pinFile -Value $root -Encoding utf8 -ErrorAction Stop
+            # Written beside the pin and renamed over it, so a hook reading at the same moment sees
+            # the old pin or the new one, never a truncated file.
+            $tmp = "$pinFile.$PID.tmp"
+            Set-Content -LiteralPath $tmp -Value $root -Encoding utf8 -ErrorAction Stop
+            Move-Item -LiteralPath $tmp -Destination $pinFile -Force -ErrorAction Stop
             $pinned = $root
             # One small file per session ever started, so SessionStart sweeps those a month old.
             if ($out.Event -eq 'SessionStart') {
@@ -324,6 +343,7 @@ function Resolve-CcxHookSession {
         } catch { }
     }
 
+    $out.Pinned = $pinned
     if ($root -and (-not $pinned -or (Test-CcxSamePath $root $pinned))) {
         $out.Dir = $p.Cwd
         $out.Root = $root
@@ -334,6 +354,12 @@ function Resolve-CcxHookSession {
         $out.Root = $pinned
         $out.Note = if ($why) { "$why; this hook answers for $pinned, the worktree the session started in" }
                     else { "the hook input names cwd $($p.Cwd), outside the worktree the session started in; this hook answers for $pinned" }
+        return $out
+    }
+    # Checked AFTER the pin, so a pinned session that ran `cd` into a scratch directory keeps its own
+    # worktree; only a session with nothing pinned is answered for where it stands.
+    if ($outside -and $AllowOutside) {
+        $out.Dir = $p.Cwd
         return $out
     }
     $out.Reason = $why
@@ -349,8 +375,8 @@ function Enter-CcxHookSession {
         PowerShell starts native children in the current location, so a git call or a child pwsh
         launched after this answers for the session too. A Dir it cannot enter becomes the Reason.
     #>
-    param([string] $Text)
-    $s = Resolve-CcxHookSession -Text $Text
+    param([string] $Text, [switch] $ReadOnly)
+    $s = Resolve-CcxHookSession -Text $Text -ReadOnly:$ReadOnly
     if ($s.Dir) {
         try { Set-Location -LiteralPath $s.Dir -ErrorAction Stop }
         catch {

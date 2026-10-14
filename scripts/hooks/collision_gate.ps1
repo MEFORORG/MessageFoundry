@@ -250,9 +250,13 @@ if (-not $target) {
 }
 if (-not $target) { exit 0 }
 
-# CHECK FROM THE WORKTREE THE TARGET FILE SITS IN. See the header: overlap.ps1 reads -File against the
-# root it runs in and skips that root's own row, so it must run in the edit's worktree. The file names
-# that worktree whatever directory the session has `cd`-ed into, which the payload `cwd` does not.
+# THE FILE NAMES THE PATH; THE SESSION NAMES WHO IS ASKING. overlap.ps1 skips the row of the root it
+# runs in ("not a collision with yourself"), and matches -File against every other row by its path
+# within the repository. So the gate hands it the edit's path relative to the worktree the file sits
+# in, which holds whatever directory the session has `cd`-ed into, and runs it from the SESSION's own
+# worktree: the one its pin records (scripts/hooks/_hookinput.ps1), else the file's. Run from the
+# file's worktree instead, an edit into a sibling's tree would skip the sibling's row, the one row
+# that can collide.
 #
 # A file in another repository, or in no checkout, is left where the gate started: no worktree of the
 # repository this gate guards can hold it, so the walk's "nobody" is true there, and the gate writes
@@ -273,14 +277,19 @@ if ($hasHelper) {
     }
     $root = Get-CcxWorktreeRoot (Split-Path -Parent $abs)
     $rootCommon = if ($root) { Get-CcxGitCommonDir $root } else { $null }
+    $target = $abs
     if ($rootCommon -and (-not $script:StartCommon -or (Test-CcxSamePath $rootCommon $script:StartCommon))) {
-        try { Set-Location -LiteralPath $root -ErrorAction Stop }
+        $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Pinned
+        if (-not $self) { $self = $root }
+        try {
+            Set-Location -LiteralPath $self -ErrorAction Stop
+            $target = [System.IO.Path]::GetRelativePath($root, (ConvertTo-CcxNormPath $abs))
+        }
         catch {
-            $degraded = "the gate could not enter $root, the worktree this edit is in ($($_.Exception.Message))"
+            $degraded = "the gate could not enter $self, this session's worktree ($($_.Exception.Message))"
             $slug = 'worktree-unenterable'
         }
     }
-    $target = $abs
 }
 
 # A degraded run's throttle stamp names the SESSION. Keyed on where the gate stands, which is where it

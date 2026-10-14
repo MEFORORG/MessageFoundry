@@ -1135,6 +1135,58 @@ def test_after_a_cd_to_a_sibling_the_sessions_own_edit_is_still_checked(
     _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, str(sibling)))
 
 
+def test_an_edit_into_a_siblings_tree_collides_with_the_sibling(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The session pinned in ``wt`` edits the SIBLING's a.py while the sibling has it dirty. Run
+    from the file's worktree, the walk would skip the sibling's row as "yourself" and allow."""
+    repo, wt = primary_and_worktree
+    sibling = Path(os.path.realpath(tmp_path)) / "sibling"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "sibling", str(sibling)],
+        check=True,
+        capture_output=True,
+    )
+    pin = tmp_path / "pin.ps1"
+    pin.write_text(
+        f". '{ROOT / 'scripts' / 'hooks' / '_hookinput.ps1'}'\n"
+        "$null = Resolve-CcxHookSession -Text (Read-CcxHookInput)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(pin)],
+        cwd=str(repo),
+        input=json.dumps({"hook_event_name": "SessionStart", "session_id": "s1", "cwd": str(wt)}),
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    own = {**EDITING_ROW, "Worktree": "linked", "Branch": "linked", "Root": _top(wt)}
+    owner = {
+        **EDITING_ROW,
+        "Worktree": "sibling",
+        "Branch": "sibling",
+        "Short": "5ab1e000",
+        "Root": _top(sibling),
+    }
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(sibling / "a.py")},
+        "cwd": str(wt),
+        "session_id": "s1",
+    }
+    got = run_gate(
+        _rooted_overlap_stub(tmp_path, [own, owner]),
+        state_dir=tmp_path / "sib-state",
+        raw_input=json.dumps(payload),
+        cwd=repo,
+    )
+    assert got is not None, "an edit into a live sibling's dirty file was allowed in silence"
+    reason = got["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "5ab1e000" in reason, reason
+    assert "in linked [linked]" not in reason, "the session met itself"
+
+
 def test_after_a_cd_to_another_repository_the_edit_is_checked_and_nothing_is_written_there(
     primary_and_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:

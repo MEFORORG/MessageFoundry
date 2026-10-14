@@ -971,11 +971,18 @@ if ($null -eq $map) {
                 ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
             # One file per root, and roots come and go with worktrees. A file a day old is far past
             # -CacheSeconds, so nothing reads it again; sweep those rather than keep one per worktree
-            # ever made.
-            $staleBefore = (Get-Date).AddDays(-1)
-            Get-ChildItem -LiteralPath (Split-Path $cacheFile) -Filter *.json -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -lt $staleBefore } |
-                Remove-Item -Force -ErrorAction SilentlyContinue
+            # ever made. At most once an hour, by a stamp the *.json filter never matches, because this
+            # write sits on the gate's path.
+            $sweepStamp = Join-Path (Split-Path $cacheFile) '.swept'
+            $lastSweep = Get-Item -LiteralPath $sweepStamp -ErrorAction SilentlyContinue
+            if (-not $lastSweep -or ((Get-Date) - $lastSweep.LastWriteTime).TotalMinutes -ge 60 -or
+                $lastSweep.LastWriteTime -gt (Get-Date)) {
+                Set-Content -LiteralPath $sweepStamp -Value ((Get-Date).ToString("o")) -Encoding ascii
+                $staleBefore = (Get-Date).AddDays(-1)
+                Get-ChildItem -LiteralPath (Split-Path $cacheFile) -Filter *.json -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -lt $staleBefore } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+            }
         } catch { }   # a cache we cannot write is a slow hook, not a broken one
     }
 }

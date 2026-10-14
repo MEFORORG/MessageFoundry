@@ -353,7 +353,8 @@ try {
     }
     $moved = $false
     if ($hasHelper -and $raw) {
-        $session = Enter-CcxHookSession -Text $raw
+        # -SelfTest is a diagnostic, so it reads the session pin and never writes one.
+        $session = Enter-CcxHookSession -Text $raw -ReadOnly:$SelfTest
         $cwdFault = $session.Reason
         $moved = [bool]$session.Dir
     }
