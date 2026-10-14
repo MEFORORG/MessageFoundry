@@ -292,7 +292,7 @@ def test_the_alert_type_is_routable_and_takes_no_control_action() -> None:
 
 
 async def test_a_loss_after_a_regrant_is_not_held_back_by_the_cooldown() -> None:
-    """A sign-in's Administrator grant ends the account's cooldown, so a second loss is paged.
+    """A sign-in's Administrator grant ends the account's cooldown in this sink, so a second loss is sent.
 
     Both keys come from the real producers, so a drift in either one's key grammar fails here."""
     from types import SimpleNamespace
