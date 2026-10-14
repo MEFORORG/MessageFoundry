@@ -36,7 +36,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
-from typing import TYPE_CHECKING, Any, Concatenate, Final, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol
 
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
@@ -58,6 +58,7 @@ __all__ = [
     "PRESET_TAG_FAILED_ACTION",
     "CellTagError",
     "CellTagSink",
+    "CorruptCellError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
     "dead_letters_on_cell_tag",
@@ -175,6 +176,10 @@ class CellTagError(CipherError):
     A subclass of :class:`CipherError`, so every path that already refuses an undecryptable cell
     refuses this one the same way. Names the cell and a short row-id prefix, never a row value."""
 
+    #: Whether this is tag drift: the cell was sealed for another row. Only drift raises the
+    #: ``integrity_drift`` alert and writes the tag-failed audit row.
+    drift: ClassVar[bool] = True
+
     def __init__(self, table: str, column: str, row_id: str, channel_id: str | None) -> None:
         self.table = table
         self.column = column
@@ -182,9 +187,29 @@ class CellTagError(CipherError):
         self.channel_id = channel_id
         #: Set once the audit row is written, so nested boundaries write it once.
         self.audited = False
-        super().__init__(
-            f"integrity: the {table}.{column} cell of row {self.row_ref} does not open under its"
-            " own row's tag"
+        super().__init__(self._describe())
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} does not open"
+            " under its own row's tag"
+        )
+
+
+class CorruptCellError(CellTagError):
+    """A cell under a key this process holds that no tag check can judge, because the row is corrupt:
+    bad base64, or a plaintext whose tag VERIFIED but is not UTF-8 (BACKLOG #2308).
+
+    It is not drift, so it raises no ``integrity_drift`` alert and writes no tag-failed audit row. It
+    is still a :class:`CellTagError`, so every read and handoff contains it the same way: a list
+    withholds the row, a handoff dead-letters it rather than re-pending a row that fails forever."""
+
+    drift = False
+
+    def _describe(self) -> str:
+        return (
+            f"the {self.table}.{self.column} cell of row {self.row_ref} is corrupt and cannot be"
+            " read under the key it names"
         )
 
 
@@ -202,14 +227,15 @@ def open_tagged_cell(
     the cipher's own policy, as the store's ``_dec`` does.
 
     A marked value whose AEAD tag fails under a key this process holds (:func:`is_tag_failure`)
-    raises :class:`CellTagError` and raises the ``integrity_drift`` alert. A key or format problem
-    raises the cipher's own error, and so does a corrupt row: bad base64, or a verified plaintext
-    that is not UTF-8. Neither is drift, and the cipher's error already names it."""
+    raises :class:`CellTagError` and raises the ``integrity_drift`` alert. Under such a key, a
+    corrupt row (bad base64, or a verified plaintext that is not UTF-8) raises
+    :class:`CorruptCellError`, which is contained the same way but is not drift. A key or format
+    problem raises the cipher's own error."""
     if stored is None:
         return None
     try:
         return cipher.decrypt(stored, aad=aad)
-    except CipherAuthenticationError as exc:
+    except CipherError as exc:
         # Only an in-process keyring can say it holds the key a marker names. A cipher that cannot
         # (Vault Transit) also wraps an unreachable provider in CipherError, so there a failure keeps
         # the cipher's own error rather than reading as an integrity failure.
@@ -217,7 +243,9 @@ def open_tagged_cell(
             cipher, stored
         ):
             raise
-        err = CellTagError(table, column, row_id, channel_id)
+        # Only a tag that failed under every held key can mean the cell was sealed elsewhere.
+        kind = CellTagError if isinstance(exc, CipherAuthenticationError) else CorruptCellError
+        err = kind(table, column, row_id, channel_id)
         _alert(cipher, err)
         raise err from exc
 
@@ -305,9 +333,12 @@ def _first_in_interval(memo: dict[tuple[str, str, str], float], err: CellTagErro
 
 
 def _alert(cipher: object, err: CellTagError) -> None:
-    """Log a WARNING and raise ``integrity_drift`` through the cipher's tag-failure hook, once per
-    cell per interval. Never raises."""
+    """Log a WARNING and, for drift, raise ``integrity_drift`` through the cipher's tag-failure hook,
+    once per cell per interval. Never raises."""
     if not _first_in_interval(_reported, err):
+        return
+    if not err.drift:
+        _log.warning("%s; the read was refused", err)
         return
     reason = f"a {err.table}.{err.column} cell failed its integrity tag (row {err.row_ref})"
     _log.warning("%s; the read was refused", reason)
@@ -331,8 +362,9 @@ class _AuditSink(Protocol):
 
 async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
     """Write the audit row for ``err``, once. The alert was raised when the read was refused. An
-    audit failure is logged and swallowed: reporting must never change what the read did."""
-    if err.audited:
+    audit failure is logged and swallowed: reporting must never change what the read did. A corrupt
+    cell is not drift, so it writes no tag-failed row; its WARNING was logged at the read."""
+    if err.audited or not err.drift:
         return
     err.audited = True
     if not _first_in_interval(_reported_audit, err):

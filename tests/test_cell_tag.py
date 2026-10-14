@@ -24,12 +24,16 @@ import messagefoundry
 from messagefoundry.store import MessageStore
 from messagefoundry.store.cell_tag import (
     MESSAGE_TAG_CELLS,
+    MESSAGE_TAG_FAILED_ACTION,
     CellTagError,
+    CorruptCellError,
     message_cell_aad,
     open_message_cell,
     preset_criteria_aad,
+    report_cell_tag_failure,
     row_tag_aad,
     row_tag_columns,
+    withhold_message_cells,
 )
 from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
 from messagefoundry.store.crypto import (
@@ -104,12 +108,13 @@ def test_open_message_cell_refuses_a_moved_cell_and_alerts() -> None:
     assert not isinstance(missing.value, CellTagError)
 
 
-def test_only_a_failed_tag_is_drift_and_a_corrupt_row_keeps_the_ciphers_error() -> None:
-    """A corrupt cell under a held key is not drift: no alert, and the cipher's own error names it.
+def test_only_a_failed_tag_is_drift_and_a_corrupt_row_is_contained_without_it() -> None:
+    """A corrupt cell under a held key is not drift: no alert, but still a contained refusal.
 
     Attack arm: a cell opened under another row's tag fails its AEAD tag and is drift. Controls:
     bad base64, and a plaintext whose tag VERIFIED but is not UTF-8, both under a held key, are a
-    corrupt row (BACKLOG #2308), so they must not read as a moved cell."""
+    corrupt row (BACKLOG #2308). They must not read as a moved cell, and they stay a CellTagError
+    so a handoff dead-letters them and a list withholds them."""
     key_b64 = generate_key()
     cipher = make_cipher(key_b64, write_v2=True)
     assert isinstance(cipher, AesGcmCipher)
@@ -118,15 +123,17 @@ def test_only_a_failed_tag_is_drift_and_a_corrupt_row_keeps_the_ciphers_error() 
     sealed = cipher.encrypt("SYNTH", aad=message_cell_aad("raw", message_id="cr1", channel_id="A"))
     with pytest.raises(CellTagError) as moved:
         open_message_cell(cipher, "raw", sealed, message_id="cr1", channel_id="B")
+    assert moved.value.drift and not isinstance(moved.value, CorruptCellError)
     assert isinstance(moved.value.__cause__, CipherAuthenticationError)
     assert len(seen) == 1
 
     # One extra base64 character leaves a length that cannot decode.
     bad_b64 = sealed + "A"
     assert cipher.holds_key_for(bad_b64)  # the marker still names a held key
-    with pytest.raises(CipherError, match="bad base64") as corrupt:
+    with pytest.raises(CorruptCellError, match="is corrupt") as corrupt:
         open_message_cell(cipher, "raw", bad_b64, message_id="cr2", channel_id="A")
-    assert not isinstance(corrupt.value, CellTagError)
+    assert not corrupt.value.drift
+    assert "bad base64" in str(corrupt.value.__cause__)
 
     # v1 seals with no associated data, so a hand-built value can hold bytes that are not UTF-8.
     key_id = make_cipher(key_b64).encrypt("x").split(":")[2]
@@ -134,10 +141,33 @@ def test_only_a_failed_tag_is_drift_and_a_corrupt_row_keeps_the_ciphers_error() 
     blob = AESGCM(base64.b64decode(key_b64)).encrypt(nonce, b"SYNTH" + bytes([0xFF]), None)
     not_utf8 = f"mfenc:v1:{key_id}:{base64.b64encode(nonce + blob).decode('ascii')}"
     assert cipher.holds_key_for(not_utf8)
-    with pytest.raises(CipherError, match="not valid UTF-8") as undecodable:
+    with pytest.raises(CorruptCellError) as undecodable:
         open_message_cell(cipher, "raw", not_utf8, message_id="cr3", channel_id="A")
-    assert not isinstance(undecodable.value, CellTagError)
+    assert "not valid UTF-8" in str(undecodable.value.__cause__)
     assert len(seen) == 1  # neither corrupt row alerted
+
+    # A list-shaped read still withholds the corrupt row rather than failing the whole page.
+    record: dict[str, Any] = {"raw": bad_b64, "summary": None}
+    failures: list[CellTagError] = []
+    withhold_message_cells(
+        cipher, record, ("raw", "summary"), message_id="cr4", channel_id="A", failures=failures
+    )
+    assert record == {"raw": None, "summary": None}
+    assert [type(f) for f in failures] == [CorruptCellError]
+
+
+async def test_a_corrupt_cell_writes_no_tag_failed_audit_and_drift_does() -> None:
+    """Containment reports drift alone: the audit sink sees the moved cell, never the corrupt one."""
+    rows: list[str] = []
+
+    class _Sink:
+        async def record_audit(self, action: str, **_kwargs: object) -> None:
+            rows.append(action)
+
+    await report_cell_tag_failure(_Sink(), CorruptCellError("messages", "raw", "au-corrupt", "A"))
+    assert rows == []
+    await report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-drift", "A"))
+    assert rows == [MESSAGE_TAG_FAILED_ACTION]
 
 
 class _NoKeyringView:

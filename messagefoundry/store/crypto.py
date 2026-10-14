@@ -561,10 +561,11 @@ class CipherError(Exception):
 class CipherAuthenticationError(CipherError):
     """No configured key's AEAD tag verified the value (BACKLOG #2593).
 
-    The one :class:`CipherError` that can mean the cell was sealed for another place: wrong
-    associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is not
-    UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
-    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift."""
+    :class:`AesGcmCipher` raises it, and only it can mean the cell was sealed for another place:
+    wrong associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is
+    not UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift. The Vault
+    Transit cipher does not raise it; ``open_tagged_cell`` never reads a Transit failure as drift."""
 
 
 class AuditKeyVersionRefusedError(CipherError):
