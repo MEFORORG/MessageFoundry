@@ -1625,7 +1625,8 @@ def require_step_up_action(
     is at least the permissions, pacing, the MFA gate, the new-address check and the
     factor-binding refusal. At least purge, reload (vault BACKLOG #2625), export and edit-resend
     use it; export and edit-resend spend after their own input checks (owner ruling 2026-10-13,
-    #3241 R1 and R2). ``grep proof_in_route=True`` finds the live set. A repeat that only
+    #3241 R1 and R2). ``_proof_in_route_routes`` in ``tests/test_bound_step_up_hold_rejoin.py``
+    pins the live set. A repeat that only
     rejoins the requester's open dual-control hold then needs a live session window
     (:func:`step_up_window_live`), and no new proof. ``tests/test_bound_step_up_hold_rejoin.py``
     pins what each such route may do before its spend."""
@@ -1678,7 +1679,9 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     Spends the caller's single-use grant for ``action``, or reads the session window when the org
     opted out, and refuses as the dependency would: 403 with ``X-Step-Up-Action``. A route calls it
     before it holds or runs anything. A refusal the route makes after the spend, such as a 404 or
-    a 409, still costs the proof. With no auth service attached it does nothing, as the dependency
+    a 409, still costs the proof, unless the route gives it back with
+    ``AuthService.refund_action_step_up``, as edit-resend does for a refusal before its store write
+    (owner ruling 2026-10-13, #3241 R1). With no auth service attached it does nothing, as the dependency
     does."""
     auth = get_auth(request)
     if auth is None:

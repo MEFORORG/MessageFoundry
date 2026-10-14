@@ -1500,5 +1500,7 @@ The console calls the handler in-process after its own spend, so the refund reac
 expired grant. Only a request refused before its message-store write is refunded. Such a request
 may still have written an audit row, such as `message_edit_resend_reject` or
 `auth.channel_denied`, so one proof can drive repeated audited refusals, each limited by the
-admin-write pacing. Single use still holds: the message-store write spends the proof. `tests/test_bound_step_up_injection.py` pins a pre-write refusal refunding
-and a store-call refusal keeping the spend.
+admin-write pacing. Single use still holds: the route spends the proof at its top, and once it
+reaches the store call it keeps the spend, even when that call refuses without writing.
+`tests/test_bound_step_up_injection.py` pins a pre-write refusal refunding and a store-call
+refusal keeping the spend.

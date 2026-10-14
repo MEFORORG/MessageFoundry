@@ -380,5 +380,8 @@ minted the action-bound grant for any registered unlock page its `next` named. S
 Now a gate that refuses a request records an unlock page as issued to that session, on a GET or a
 POST that passes the origin check, and `/ui/reauth` mints the grant only for an issued page, once.
 An issued page's re-auth redirects back to it, as before. A re-auth toward a page that was not
-issued mints nothing and ends on the page that says nothing ran, which is what the re-auth form
-told the operator.
+issued mints nothing. A password re-auth then ends on the page that says nothing ran, which is
+what the re-auth form told the operator; a federated one lands on the console's landing page.
+A GET with `Sec-Fetch-Site: none` issues nothing. A browser that sends no Fetch Metadata is
+judged only by the origin check, which accepts a top-level GET, so on such a browser a crafted
+link to the page itself still issues it. The operator must still confirm on the page.

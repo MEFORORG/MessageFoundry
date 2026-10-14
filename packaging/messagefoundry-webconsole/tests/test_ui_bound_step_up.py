@@ -39,6 +39,7 @@ from messagefoundry.auth import Role
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole._auth import (
+    _ISSUED_CONTINUATIONS,
     _issue_continuation,
     continuation_issued,
     lookup_ui_action,
@@ -476,10 +477,11 @@ async def test_a_crafted_reauth_toward_an_unlock_page_mints_nothing_bound(engine
 async def test_an_unlock_page_issued_during_a_crafted_reauth_keeps_its_issue(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A re-auth toward an unlock page that was not issued when it started mints nothing. If another
-    tab is issued that page while the password check runs, this re-auth must neither spend that
-    issue nor answer with the auto-submit form, which is only for a body-less POST action. The other
-    tab's own re-auth then still mints and redirects to the page."""
+    """A re-auth toward an unlock page that was not issued when its POST arrived mints nothing. If
+    another tab is issued that page while the password check runs, this re-auth must neither spend
+    that issue nor answer with the auto-submit form, which is only for a body-less POST action. The
+    other tab's own re-auth then still mints and redirects to the page. This covers the password
+    check's await only; an issue made between the form's GET and its POST is read at the POST."""
     service = await auth_service(engine)
     await provision(service, "op", [Role.OPERATOR.value])
     page = "/ui/connections/purge-confirm"
@@ -503,12 +505,66 @@ async def test_an_unlock_page_issued_during_a_crafted_reauth_keeps_its_issue(
         assert (await c.get(page)).status_code == 200
 
 
+async def test_an_auto_retry_issued_during_a_crafted_reauth_is_not_submitted(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auto-retry twin of the test above: a crafted re-auth toward a body-less POST action that
+    another tab is issued during the password check ends on "nothing ran", not on the auto-submit
+    form, and leaves the issue for the other tab."""
+    service = await auth_service(engine)
+    await provision(service, "adm", [Role.ADMINISTRATOR.value])
+    action = "/ui/config/reload"
+    real_reauth = service.reauth
+
+    async def reauth_while_another_tab_is_issued(*args: Any, **kwargs: Any) -> Any:
+        _ISSUED_CONTINUATIONS.issue(kwargs["token"], action)
+        return await real_reauth(*args, **kwargs)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "adm")
+        monkeypatch.setattr(service, "reauth", reauth_while_another_tab_is_issued)
+        crafted = await c.post(
+            "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert crafted.status_code == 200 and "Nothing ran" in crafted.text
+        monkeypatch.setattr(service, "reauth", real_reauth)
+        other = await c.post(
+            "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert other.status_code == 200 and "Nothing ran" not in other.text  # the auto-submit
+
+
+async def test_an_auto_retry_entry_that_lapses_during_the_reauth_leaves_no_armed_grant(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An issued auto-retry action whose entry lapses while the password check runs mints a grant
+    and then ends on "nothing ran". That exit spends the grant, so the next submit asks again."""
+    service = await auth_service(engine)
+    await provision(service, "adm", [Role.ADMINISTRATOR.value])
+    action = "/ui/config/reload"
+    real_reauth = service.reauth
+
+    async def reauth_while_the_entry_lapses(*args: Any, **kwargs: Any) -> Any:
+        _ISSUED_CONTINUATIONS.consume(kwargs["token"], action)
+        return await real_reauth(*args, **kwargs)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "adm")
+        assert _reauth_next(await c.post(action, headers=SAME_ORIGIN)) == action  # issued
+        monkeypatch.setattr(service, "reauth", reauth_while_the_entry_lapses)
+        lapsed = await c.post(
+            "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert lapsed.status_code == 200 and "Nothing ran" in lapsed.text
+        assert _reauth_next(await c.post(action, headers=SAME_ORIGIN)) == action
+
+
 def _get_request(path: str, token: str) -> Request:
     """A same-origin GET for ``path`` on the session ``token``, as a gate refusal sees it."""
     return Request(
         {
             "type": "http",
-            "app": FastAPI(),  # a bare app: no public_origin, so the Host fallback judges
+            "app": FastAPI(),  # Sec-Fetch-Site: same-origin settles the origin check
             "method": "GET",
             "scheme": "http",
             "path": path,
@@ -555,22 +611,7 @@ def test_a_window_only_unlock_page_is_never_issued() -> None:
     assert bound_action is not None and bound_action.unlock and bound_action.action is not None
 
     def _get(path: str) -> Request:
-        return Request(
-            {
-                "type": "http",
-                "app": FastAPI(),  # a bare app: no public_origin, so the Host fallback judges
-                "method": "GET",
-                "scheme": "http",
-                "path": path,
-                "query_string": b"",
-                "server": ("127.0.0.1", 8765),
-                "headers": [
-                    (b"host", b"127.0.0.1:8765"),
-                    (b"sec-fetch-site", b"same-origin"),
-                    (b"cookie", f"mf_session={token}".encode()),
-                ],
-            }
-        )
+        return _get_request(path, token)
 
     _issue_continuation(_get(window_only), window_only)
     assert not continuation_issued(token, window_only)

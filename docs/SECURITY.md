@@ -1666,8 +1666,12 @@ else would need its own authorization rule stated here.
    [ADR 0065](adr/0065-web-ops-dashboard.md) amendment of 2026-10-06). An unlock page (a confirm
    page or the editor) follows the same rule for its action-bound grant: the re-auth mints it only
    when a gate issued that page to this session, once. A crafted `/ui/reauth?next=<unlock page>`
-   mints nothing and ends on the page saying nothing ran; the operator opens the page again from
-   the console (owner ruling 2026-10-13, #3241 R3).
+   mints nothing. A password re-auth then ends on the page saying nothing ran; a federated one
+   lands on the console's landing page (owner ruling 2026-10-13, #3241 R3). A link opened from
+   outside the browser issues nothing when the browser sends `Sec-Fetch-Site: none`. **A browser
+   that sends no Fetch Metadata is judged only by the origin check, which accepts a top-level GET,
+   so there a crafted link to the page itself still issues it and the re-auth mints the grant.**
+   The operator must still confirm on the page.
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).

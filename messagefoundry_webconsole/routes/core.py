@@ -1905,11 +1905,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Vault BACKLOG #2764: only for a continuation that will run. A `next` the console did not
         # issue to this session takes no grant, because ADR 0077 derives the grant's purpose from
         # `next` itself, and a forged one would otherwise bind the proof to the forged action.
-        # Read once, before the await: the unlock branch below follows what was minted, so an unlock
-        # entry that lapses or is evicted during the re-auth still redirects to the page its grant
-        # names. The auto-retry branch keys on the later spend instead, so an auto-retry entry that
-        # lapses during the await leaves its single-use grant unspent behind the "nothing ran" page,
-        # until the grant's own lifetime ends.
+        # Read once, before the await: what follows keys on what was minted. An unlock entry that
+        # lapses or is evicted during the re-auth still redirects to the page its grant names. An
+        # auto-retry entry that lapses the same way ends on "nothing ran", and that exit discards the
+        # grant it minted, so no armed grant sits behind a page saying nothing ran.
         continues = continues_after_reauth(action, token, next_)
         pre_rotation = token
         pw_elevation = await auth.reauth(
@@ -1969,18 +1968,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # 2026-10-13, #3241 R3), and spends the issue here, so one issue mints one grant. An
         # unissued one ends on the page that says nothing ran, which is what the re-auth form told
         # the operator. A window-only unlock page always continues; it has no grant to pre-arm.
-        # The unlock branch follows `continues`, what was minted, not the spend; the auto-retry
-        # branch keys on the spend, so two tabs racing one issue auto-submit it once. An unlock page
-        # that minted nothing spends nothing: another tab may have been issued that page during the
-        # await, and its own re-auth needs the issue. An unlock page never takes the auto-submit
-        # form, which is only for a body-less POST action.
-        unlock = is_unlock_action(next_)
-        issued = (continues or not unlock) and consume_continuation(pre_rotation, next_)
+        # A re-auth that minted nothing (`continues` false) spends no issue: another tab may have
+        # been issued the same `next` during the await, and its own re-auth needs it. The unlock
+        # branch follows `continues`; the auto-retry branch also needs the spend, so two tabs racing
+        # one issue auto-submit it once.
+        issued = continues and consume_continuation(pre_rotation, next_)
         rekey_continuations(pre_rotation, token)
-        if unlock and continues:
+        if is_unlock_action(next_) and continues:
             return _keep_session(RedirectResponse(next_, status_code=303), token)
-        if issued and not unlock:
+        if issued:
             return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)
+        if continues and action.action is not None:
+            # The entry lapsed or a racing tab spent it during the await, so this page says nothing
+            # ran: spend the grant this re-auth minted, so none stays armed behind that page.
+            await auth.has_action_step_up(token, action.action)
         return _keep_session(
             HTMLResponse(pages.reauth_nothing_ran(action.label, reauth_landing(identity))), token
         )
