@@ -19,7 +19,9 @@ alert carries it. The name stays in the guard's WARNING line, which bounds and e
 **Counted from the start of the process.** The first pass reports every refusal since the process
 started, so one made before the engine opened its store is recorded. The loop makes one more pass
 as it stops, for a refusal in the last interval. A process that is killed loses at most the
-refusals since its last pass; the guard's WARNING lines still have them.
+refusals since its last pass; the guard's WARNING lines still have them. The count belongs to the
+process and each watch keeps its own marks, so a second watch in one process would report the
+earlier refusals again. An engine builds one, and ``serve`` builds one engine.
 
 **``serve`` only.** The engine starts this watch, and of the ``messagefoundry`` commands only
 ``serve`` builds an engine. ``supervise``, ``rotate-key``, ``backup`` and the rest hold no open
@@ -122,9 +124,16 @@ class RemoteDebugRefusalWatch:
         task, self._task = self._task, None
         if task is None:
             return
+        # ``wait``, not ``wait_for``: a loop task that something else cancelled must not make
+        # this call look cancelled, which would end the engine's stop before it closed the store.
         try:
-            await asyncio.wait_for(task, _STOP_SECONDS)
-        except TimeoutError:
+            done, _pending = await asyncio.wait({task}, timeout=_STOP_SECONDS)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not done:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
             log.warning(
                 "remote-debug refusal watch: the last pass did not finish in %.0f s and was "
                 "cancelled, so a refusal since the pass before it may have no audit row",

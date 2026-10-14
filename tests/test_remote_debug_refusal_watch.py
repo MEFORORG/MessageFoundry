@@ -619,6 +619,21 @@ async def test_a_last_pass_that_hangs_is_cancelled(
     assert task.cancelled()
 
 
+async def test_a_loop_task_cancelled_elsewhere_does_not_cancel_the_stop(
+    refuse: Callable[..., None],
+) -> None:
+    """The engine awaits this stop on its way to closing the store. A stop that raised
+    ``CancelledError`` for a task something else cancelled would end the engine's stop there."""
+    watch = _on(_RefusingStore(), interval_seconds=3600.0)
+    watch.start()
+    await asyncio.sleep(0)
+    task = watch._task
+    assert task is not None
+    task.cancel()
+    await watch.stop()  # returns: no CancelledError
+    assert task.cancelled()
+
+
 def test_the_interval_is_the_one_the_documents_state() -> None:
     """One row a pass, so the interval is the bound on rows. ``docs/SECURITY-LOOSENING.md`` gives
     it as 30 seconds, and a shorter one would let the injecting process add rows faster."""
@@ -647,7 +662,10 @@ async def test_the_engine_writes_the_row_on_its_own_store(
         assert watch._alert_sink is sink
         refuse(times=3)
         await watch.run_once()
-        refuse(times=2)  # left for the pass the engine's stop makes
+        # Passes take turns in the order they asked. This one finishes after the loop's first
+        # pass, which leaves the loop in its 30-second wait.
+        await watch.run_once()
+        refuse(times=2)  # so only the pass the engine's stop makes can report these
     finally:
         await engine.stop()  # which closes the store, so the rows are read from a second open
     assert engine._remote_debug_watch is None
