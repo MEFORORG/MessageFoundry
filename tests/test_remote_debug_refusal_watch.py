@@ -626,6 +626,31 @@ async def test_a_store_that_hangs_does_not_hold_back_the_alert(
     assert sink.alerts == [("remote_debug:refused", 2, 2)]
 
 
+async def test_a_store_that_keeps_hanging_does_not_stop_later_alerts(
+    refuse: Callable[..., None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Passes run one after another, so a row write with no bound would hold every later pass,
+    and with it every later alert."""
+
+    class _Hung(_RefusingStore):
+        async def record_audit(self, action: str, **_kw: Any) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(remote_debug_watch, "_ROW_SECONDS", 0.05)
+    monkeypatch.setattr(remote_debug_watch, "_STOP_SECONDS", 0.2)
+    sink = _Sink()
+    watch = _on(_Hung(), alert_sink=sink, interval_seconds=0.01)
+    refuse()
+    watch.start()
+    try:
+        await until(lambda: len(sink.alerts) == 1, "the first alert")
+        refuse(times=2)
+        await until(lambda: len(sink.alerts) == 2, "the alert after a hung row")
+    finally:
+        await watch.stop()
+    assert [(count, total) for _name, count, total in sink.alerts] == [(1, 1), (2, 3)]
+
+
 async def test_a_loop_task_cancelled_elsewhere_does_not_cancel_the_stop(
     refuse: Callable[..., None],
 ) -> None:

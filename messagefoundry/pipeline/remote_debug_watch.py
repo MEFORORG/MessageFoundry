@@ -61,7 +61,7 @@ import logging
 import os
 from collections.abc import Callable
 
-from messagefoundry.audit_write import write_audit_soft
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject
 from messagefoundry.remotedebug import remote_debug_posture
@@ -79,6 +79,8 @@ ALERT_SUBJECT = "remote_debug:refused"
 CHECK_INTERVAL_SECONDS = 30.0
 #: How long :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it.
 _STOP_SECONDS = 5.0
+#: How long one audit row may take before the pass gives it up for the next pass to retry.
+_ROW_SECONDS = CHECK_INTERVAL_SECONDS
 
 
 def _refused_scripts() -> int:
@@ -183,17 +185,23 @@ class RemoteDebugRefusalWatch:
             sort_keys=True,
         )
         # ``actor="system"``: no user acted, as for the other rows a background task writes.
-        # ``defects=()``: the next pass retries the row whatever stopped it, so a raise here would
-        # only end this pass early.
+        # Bounded: passes run one after another, so a write that hung would stop every later
+        # alert. A write cut off by the bound is retried by the next pass; one that committed as
+        # it was cut off is written twice, the safer of the two failures.
+        # AUDIT_WRITE_DEFECTS: the alert has gone already, so a defect may raise. ``_pass`` logs
+        # it as a failed check rather than as a store that refused the row.
         return await write_audit_soft(
-            lambda: self._store.record_audit(AUDIT_ACTION, actor="system", detail=detail),
+            lambda: asyncio.wait_for(
+                self._store.record_audit(AUDIT_ACTION, actor="system", detail=detail),
+                _ROW_SECONDS,
+            ),
             log=log,
             message=(
                 "remote-debug refusal watch: the remote_debug_refused audit row failed, and the "
                 "next pass writes it with the count so far. Unwritten row: detail=%s"
             ),
             args=(detail,),
-            defects=(),
+            defects=AUDIT_WRITE_DEFECTS,
         )
 
     def _raise(self, count: int, total: int) -> bool:

@@ -758,7 +758,8 @@ class AlertSink(Protocol):
         Raised at most once per pass of
         :class:`~messagefoundry.pipeline.remote_debug_watch.RemoteDebugRefusalWatch`, on the event
         loop, however many scripts were refused, so the injecting process does not set the rate.
-        Only ``serve`` runs that watch. It is not a connection-scoped event, so no rule's
+        The engine runs that watch, so of the commands only ``serve`` raises this; an application
+        that builds its own engine raises it too. It is not a connection-scoped event, so no rule's
         ``control_action`` fires on it, and the colon keeps ``name`` outside the connection-name
         grammar. Nothing resolves it: a refusal is an event, not a state that can clear, so an
         operator resolves the instance. The ``remote_debug_refused`` audit row is the durable

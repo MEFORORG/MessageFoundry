@@ -1647,21 +1647,23 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     is killed leaves no row for the refusals since its last read. Their WARNING lines remain, up
     to the backlog above.
   - **The row.** Its actor is `system`. Its detail holds the two counts, the engine process's
-    label (`node:<node_id>`, `shard:<id>`, or nothing on a lone engine) and its process id. If
-    the store refuses the row, the engine logs an ERROR and writes the row at a later read,
-    with the count so far. The alert is raised first and does not wait for the row.
+    label as `process` (`node:<node_id>`, `shard:<id>`, or null on a lone engine) and its
+    process id. If the store refuses the row, or does not answer within 30 seconds, the engine
+    logs an ERROR and writes the row at a later read, with the count so far. The alert is raised first and does not wait for the row.
   - **The alert.** Its `connection` is `remote_debug:refused`, with `@node:<node_id>` or
     `@shard:<id>` appended where several engine processes share the store. A rule can match
     `event_type = "remote_debug_refused"`. With no `[alerts]` transport it is a WARNING line.
     Nothing resolves it, because a refusal is an event and not a state that can clear. An
     operator resolves it. A second alert inside the notifier's cooldown updates the open alert
-    and does not page again, so a page's `count` covers only its own read. The audit rows have
-    every read; add them up for the full number. The alert list's own count is the number of
-    reads that raised it, not the number of scripts.
-  - **Only `serve`.** Only `serve` builds the engine, which runs the reads and holds the
-    notifier. `supervise`, `rotate-key`, `backup`, `restore` and the other commands build
-    neither, though `rotate-key` and `backup` open the store. A refusal there leaves the WARNING
-    line and nothing else.
+    and does not page again, so a page's `count` covers only its own read. The audit rows cover
+    every refusal; add up their counts for the full number. The alert list's own count is the
+    number of reads that raised it, not the number of scripts.
+  - **`serve`, and not the other commands.** The engine runs the reads and holds the notifier.
+    Of the `messagefoundry` commands, only `serve` builds one. An application that builds an
+    engine itself, through `create_managed_app` or `Engine.create`, runs the reads too.
+    `supervise`, `rotate-key`, `backup`, `restore` and the other commands build no engine,
+    though `rotate-key` and `backup` open the store. A refusal there leaves the WARNING line and
+    nothing else.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
