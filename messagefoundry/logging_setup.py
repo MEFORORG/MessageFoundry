@@ -306,8 +306,77 @@ class RedactionFilter(logging.Filter):
 #: **Cite the ruling, not this sentence.**
 _CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
 
+#: The label words ``secretscrub`` redacts a value under: its credential, token and key-material
+#: words. A COPY, because those tuples are private to that module. ``tests/test_logging.py`` holds
+#: this copy, the ``MEFOR_`` prefix and the label prefix below to their sources there, so a change
+#: made there and not here goes red.
+_QUERY_STOP_WORDS = (
+    "password",
+    "passwd",
+    "passphrase",
+    "pass",
+    "pwd",
+    "secret",
+    "credential",
+    "authorization",
+    "bearer",
+    "token",
+    "session",
+    "api_key",
+    "api-key",
+    "apikey",
+    "encryption_keys_retired",
+    "encryption_key",
+    "private_key",
+    "intake_api_key_next",
+)
+
+#: A credential label whose value starts where a query value ends (BACKLOG #3002). The label is a
+#: word above, or a ``MEFOR_`` name, with an optional dotted, hyphenated or underscored prefix of
+#: at most six segments, ``secretscrub``'s bound. Unlike there, the walk starts at the separator
+#: and cannot restart later, so a label with a deeper dotted or hyphenated prefix is not stopped
+#: for. Then an optional quote, its ":" or "=", and a QUOTE that opens its value, with optional
+#: spaces around the ":" or "=". So the label's value lies outside the query value, and the label
+#: is all the stop leaves behind.
+#:
+#: THE QUOTE IS REQUIRED, as it is for ``secretscrub``'s own stop. Without it the stop fired on a
+#: label with an empty value, and a credential such as a base64 code whose tail reads ``/Pwd=``
+#: printed that tail, which the query value used to hide. Measured in review, 2026-10-12.
+_LABEL_WITH_ITS_VALUE_OUTSIDE = (
+    r"\b(?:(?-i:MEFOR_[A-Z0-9_]+)|(?:[A-Za-z0-9]+[._-]){0,6}(?:"
+    + "|".join(re.escape(word) for word in sorted(_QUERY_STOP_WORDS, key=len, reverse=True))
+    + r"))\b['\"]?\s*[:=]\s*['\"]"
+)
+
+#: A query value: every character up to "&", whitespace or a quote, as before, except that it stops
+#: BEFORE A SEPARATOR FOLLOWED BY SUCH A LABEL (BACKLOG #3002). Until then the value ran on through
+#: ``;password=`` and ended at the quote that opened the password's value. The label went with it,
+#: so ``CredentialScrubFilter`` after this filter found no label, and ``token=a;password="v w"``
+#: printed "v w" on every configured sink.
+#:
+#: A separator is any value character a label cannot hold, so at least ";", ",", ":", "=", "|", "/"
+#: and "+". Where the label's value is not quoted, as in ``token=a;password=b`` or
+#: ``token=a;password=``, the value runs on and is hidden whole, as before. A single value holding
+#: a bare ";" or "," is hidden whole too. The ".", "-" and "_" are label characters, so a label glued on by one of them still goes
+#: with the value: ``token=a.password="v w"`` still prints "v w". That residual is #2966's and
+#: #3122's, not this filter's.
+#:
+#: Other shapes still print the later value, at least these, and each printed the same before:
+#: a braced value (``;PWD={p w}``, also #2966's); an unquoted value after a space
+#: (``;password= v``); a label deeper than the prefix bound above; a ``MEFOR_`` name with any
+#: prefix; a bare ``Bearer`` scheme word; a token-word label quoted before its ":" or "=", which
+#: ``secretscrub`` does not read either; and a separator that is a Unicode letter or a
+#: percent-encoded one, where the label has no ``\b``.
+#:
+#: LINEAR. The two branches take disjoint characters and are possessive. The lookahead runs only at a
+#: separator. It walks at most six label segments and the label's word, so it ends at the next
+#: separator. Past a quote or a space it walks one run of spaces, and then the value has ended.
+_QUERY_VALUE = (
+    r"(?:[A-Za-z0-9._\-]++|[^A-Za-z0-9._\-&\s\"'](?!" + _LABEL_WITH_ITS_VALUE_OUTSIDE + r"))++"
+)
+
 _CREDENTIAL_QUERY_RE = re.compile(
-    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=[^&\s\"']+",
+    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _QUERY_VALUE,
 )
 
 
@@ -373,12 +442,26 @@ class JsonFormatter(_SafeExcFormatter):
     PHI redaction + control-char scrubbing run upstream as **handler filters** (see
     :func:`configure_logging`), so by the time ``format`` runs ``record.getMessage()`` and
     ``record.exc_text`` are already redacted; ``json.dumps`` additionally escapes any residual C0
-    control, so a record can never break the one-object-per-line framing (ASVS 16.4.1). It leaves the
-    C1 controls and U+2028/U+2029 raw under ``ensure_ascii=False``, so a filter-less handler gets no
-    escape for those (vault BACKLOG #2815); the configured handlers' scrub filter covers them. UTC ``Z``
-    timestamps match the text formatter (16.2.2). The exception/stack fields are populated **and
-    already redacted** by :class:`RedactionFilter` (which clears ``exc_info`` after rendering), so they
-    are emitted from ``exc_text``/``stack_info`` without re-rendering the raw exception."""
+    control, so a record cannot put a raw newline into the one-object-per-line framing (ASVS 16.4.1).
+    UTC ``Z`` timestamps match the text formatter (16.2.2). The exception/stack fields are populated
+    **and already redacted** by :class:`RedactionFilter` (which clears ``exc_info`` after rendering),
+    so they are emitted from ``exc_text``/``stack_info`` without re-rendering the raw exception.
+
+    **A handler with this formatter and no filters is not safe** (BACKLOG #2976 item 3). Under
+    ``ensure_ascii=False``, ``json.dumps`` escapes the C0 controls and nothing else in the log
+    alphabet. It writes the rest raw: at least DEL, the C1 controls, the format characters such as a
+    bidirectional override, U+2028 and U+2029, a lone surrogate, and the private-use and unassigned
+    code points (vault BACKLOG #2815). Such a handler also leaves the message, its arguments and
+    ``stack_info`` unredacted, and scrubs no credential anywhere. The ``exc_info`` branch below is
+    the only PHI redaction on it, and it runs only when no earlier formatter on the same record has
+    already cached a raw traceback in ``exc_text``. Every handler :func:`configure_logging` builds
+    carries the filters, so none of this reaches a configured sink. Use this formatter only on a
+    handler that carries the same filters.
+
+    The limit is kept on purpose, by a Manager ruling on BACKLOG #2976 item 3. Escaping alone would
+    still leave the message unredacted, so it would not make such a handler safe. Any escape added
+    here must also keep the JSON-valid spelling the audit tee's document relies on (vault BACKLOG
+    #3012, #3032). ``tests/test_logging.py`` pins this paragraph and the raw characters together."""
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -392,8 +475,10 @@ class JsonFormatter(_SafeExcFormatter):
             payload["exception"] = record.exc_text
         elif record.exc_info:
             # Defensive: RedactionFilter normally pre-renders + redacts exc_text and clears exc_info,
-            # so this branch is dead on the configured handlers. If JsonFormatter is ever attached to a
-            # filter-less handler, redact here too so PHI safety doesn't depend on call-site discipline.
+            # so this branch is dead on the configured handlers. On a filter-less handler it redacts
+            # the rendered traceback, the likeliest PHI carrier, unless an earlier formatter already
+            # cached it raw in exc_text. It does not make that handler safe; the class docstring
+            # lists what still passes.
             # Bounded for the same reason and on the same terms as the filter's own call (#1576): a
             # filter-less handler is exactly the one with nothing upstream to have clamped it already.
             payload["exception"] = redact_untrusted(self.formatException(record.exc_info))

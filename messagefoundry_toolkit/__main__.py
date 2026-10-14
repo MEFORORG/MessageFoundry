@@ -33,6 +33,7 @@ from messagefoundry.cli_common import (
 )
 from messagefoundry.cli_surface import TOOLKIT_COMMAND
 from messagefoundry.console_streams import harden_console_streams
+from messagefoundry.controlchars import CONTROL_CATEGORIES
 
 #: The two distributions whose versions must match (ADR 0201 section 1). The toolkit's distribution
 #: and command share one name, held in ``cli_surface`` so the engine's refusal names the same one.
@@ -180,18 +181,21 @@ def _adr_analyze(args: argparse.Namespace) -> int:
     return 1 if args.strict and not result.ok else 0
 
 
-#: Unicode categories escaped before record text reaches a terminal: C0 and C1 controls (an ANSI
-#: escape, a bell, a NUL), format characters (a bidirectional override that reorders the line) and
-#: the line and paragraph separators. An ADR is read as data, and a terminal acts on these.
-#: ``messagefoundry.controlchars.scrub_control_chars`` is not reused: it does not double a
-#: backslash, so record text spelling ``\x1b`` out would read as an escaped ESC.
-_ESCAPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
-
-
 def _print_record_line(line: str) -> None:
     """``_safe_print`` a line that carries record text, with each character a terminal would act
     on written as its Python escape (BACKLOG #2516). Every human line goes through here, so a new
     one cannot forget the escape.
+
+    The categories are the engine's own ``CONTROL_CATEGORIES``, imported rather than copied, so the
+    terminal and the log escape the same categories (BACKLOG #2976). They do not render alike. At
+    least these differ: this escapes a tab, which the log keeps; it doubles a backslash, which the
+    log does not; and it writes Python's escapes, where the log writes JSON's. An ADR is read as
+    data, and a terminal acts on a C0 or C1 control, a format character such as a bidirectional
+    override, or a line or paragraph separator. A lone surrogate, a private-use code point or an
+    unassigned one is escaped too, so it prints as text rather than as ``?`` or whatever the
+    terminal makes of it. ``messagefoundry.controlchars.scrub_control_chars`` is not reused: it
+    does not double a backslash, so record text spelling an escape out, such as ``\\u001b``, would
+    read the same as the escaped character.
 
     Local to the toolkit on purpose. ``_safe_print`` serves every engine command too, and its job
     is the console codec, not what the line says. The JSON output needs nothing: ``json.dumps``
@@ -201,7 +205,7 @@ def _print_record_line(line: str) -> None:
     one that holds the escape character itself."""
     _safe_print(
         "".join(
-            ascii(ch)[1:-1] if ch == "\\" or unicodedata.category(ch) in _ESCAPED_CATEGORIES else ch
+            ascii(ch)[1:-1] if ch == "\\" or unicodedata.category(ch) in CONTROL_CATEGORIES else ch
             for ch in line
         )
     )
