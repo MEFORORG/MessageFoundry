@@ -143,11 +143,17 @@ def _step_up_landing(
         # issue (#2764), so a fresh flow started from this page continues only to an unlock target;
         # the page says so. (After a state mismatch the original flow is still staged and its real
         # return would still continue -- the conservative wording errs toward "nothing will run".)
+        # An unlock page that binds an action continues only when issued (owner ruling
+        # 2026-10-13, #3241 R3), and this cross-site return carries no session cookie to ask with,
+        # so only a window-only unlock page is promised a continuation here.
+        refused_action = lookup_ui_action(next_)
         resp = reauth_idp_response(
             deps,
             auth,
             next_,
-            continues=is_unlock_action(next_),
+            continues=refused_action is not None
+            and refused_action.unlock
+            and refused_action.action is None,
             error=outcome.error,
             status_code=403,
         )
@@ -432,7 +438,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui", status_code=303)
         # Spent only once the flow is staged, so a refusal above leaves it for a retry. From here
         # the single-use flow is the binding; the callback cannot read this session's cookie.
-        consume_continuation(token, next_)
+        # An unlock page's issue is left in place (owner ruling 2026-10-13, #3241 R3): spending it
+        # here would strand the retry the IdP's refusal page offers. It cannot mint a second grant
+        # after a success, because the callback rotates the token without re-keying this table.
+        if not is_unlock_action(next_):
+            consume_continuation(token, next_)
         resp = RedirectResponse(authorization_url, status_code=303)
         set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
         return resp

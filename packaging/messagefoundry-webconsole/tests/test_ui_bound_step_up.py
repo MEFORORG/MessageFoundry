@@ -421,6 +421,10 @@ async def test_a_crafted_reauth_toward_an_unlock_page_mints_nothing_bound(engine
         )
         assert issued.status_code == 303 and issued.headers["location"] == page
         assert (await c.get(page)).status_code == 200
+        # One issue mints one grant: the password re-auth spent it, so a second crafted re-auth
+        # with no new refusal in between ends on the page that says nothing ran.
+        again = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert again.status_code == 200 and "Nothing ran" in again.text
 
 
 async def test_a_link_opened_from_outside_the_browser_issues_nothing(engine: Engine) -> None:

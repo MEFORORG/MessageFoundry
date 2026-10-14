@@ -55,10 +55,10 @@ from harness.load import rigadmin
 from harness.load.metrics import Counters
 from messagefoundry.apiclient import ApiError, EngineClient
 
-#: Hosts whose engine this harness could have spawned itself. Mirrors apiclient's own loopback set;
-#: kept local rather than importing a private name from that package.
 _log = logging.getLogger(__name__)
 
+#: Hosts whose engine this harness could have spawned itself. Mirrors apiclient's own loopback set;
+#: kept local rather than importing a private name from that package.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 _T = TypeVar("_T")

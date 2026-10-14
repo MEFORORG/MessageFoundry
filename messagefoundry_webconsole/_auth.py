@@ -1075,11 +1075,9 @@ def continuation_issued(token: str | None, next_path: str) -> bool:
 def consume_continuation(token: str | None, next_path: str) -> bool:
     """Spend the continuation issued to this session for ``next_path``; True only once.
 
-    An unlock page's issue is NOT spent, only read: it lapses on its TTL. Spending it would strand
-    a retry after a refused federated step-up, whose start spends the issue before the IdP answers
-    (owner ruling 2026-10-13, #3241 R3)."""
-    if is_unlock_action(next_path):
-        return _ISSUED_CONTINUATIONS.issued(token, next_path)
+    The password re-auth spends an unlock page's issue as it mints the grant, so one issue mints
+    one grant. The federated start leg does not call this for an unlock page; see the comment
+    there (owner ruling 2026-10-13, #3241 R3)."""
     return _ISSUED_CONTINUATIONS.consume(token, next_path)
 
 
@@ -1126,8 +1124,11 @@ def _issue_continuation(request: Request, next_path: str) -> None:
       a bookmark, or a link opened from outside the browser, such as one in an email, and a crafted
       link of that kind must not pre-arm a grant. The page asks again, and the re-auth from the
       console's own navigation then issues it. A client that sends no ``Sec-Fetch-Site`` at all is
-      judged by its ``Origin``, as the origin check judges it."""
+      judged by its ``Origin``, as the origin check judges it. A window-only unlock page (one that
+      binds no action) is never issued: it always continues, so an entry would only fill the
+      per-session cap and evict a pending ``auto_retry`` issue."""
     token = session_token(request)
+    action = lookup_ui_action(next_path)
     if (
         token
         # GET /ui/reauth answers 422 past its cap, so a longer entry could never be consumed.
@@ -1135,7 +1136,9 @@ def _issue_continuation(request: Request, next_path: str) -> None:
         and (
             (request.method == "POST" and is_safe_ui_action(next_path))
             or (
-                is_unlock_action(next_path)
+                action is not None
+                and action.unlock
+                and action.action is not None
                 and not (
                     request.method == "GET" and request.headers.get("sec-fetch-site") == "none"
                 )

@@ -6555,23 +6555,6 @@ def create_app(
             )
         ),
     ) -> EditResendResult:
-        """The route over :func:`_edit_resend_core`. Its proof is spent HERE, after FastAPI has
-        validated the body, so a 422 costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); the
-        core gives the proof back for a refusal it raises before its store write. The console calls
-        the core in-process after its own spend."""
-        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
-        return await _edit_resend_core(
-            message_id, body=body, engine=engine, identity=identity, request=request
-        )
-
-    async def _edit_resend_core(
-        message_id: str,
-        *,
-        body: EditResendRequest,
-        request: Request,
-        engine: Engine,
-        identity: Identity,
-    ) -> EditResendResult:
         """Edit a stored message and resubmit the EDITED body (ADR 0090 §9, BACKLOG #153). The edit is
         client-side + ephemeral (no server draft); this endpoint receives the final edited ``raw``. By
         default (``reroute``, no ``to``) it re-ingresses the edited body as a fresh, correlated
@@ -6585,7 +6568,26 @@ def create_app(
         The audit row also carries keyed digests of the original and the edited body, and the new
         message records its origin as ``operator_edit`` with the acting user, so the edited body can
         be proved after retention has blanked both bodies (vault BACKLOG #2615,
-        :func:`_edit_resend_provenance`)."""
+        :func:`_edit_resend_provenance`).
+
+        The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
+        costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
+        store write gives the proof back."""
+        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+        return await _edit_resend_core(
+            message_id, body=body, engine=engine, identity=identity, request=request
+        )
+
+    async def _edit_resend_core(
+        message_id: str,
+        *,
+        body: EditResendRequest,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+    ) -> EditResendResult:
+        """The body of :func:`edit_resend_message` after its spend, whose docstring is the contract.
+        The console calls this in-process after its own spend."""
         # Owner ruling 2026-10-13 (#3241 R1): a refusal raised BEFORE the store write gives back the
         # proof the gate spent (ADR 0197 Amendment C), so an edit the engine refused costs the
         # operator no password and the console can re-open the editor without a re-auth. `written`

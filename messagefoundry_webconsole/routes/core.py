@@ -1960,7 +1960,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # the session's OTHER issued entries follow the rotation -- before any branch returns, so
         # an unlock re-auth in one tab does not strand an action another tab is confirming.
         # An unlock page that binds an action continues only when it was issued (owner ruling
-        # 2026-10-13, #3241 R3); its issue is read, not spent (consume_continuation says why). An
+        # 2026-10-13, #3241 R3), and spends the issue here, so one issue mints one grant. An
         # unissued one ends on the page that says nothing ran, which is what the re-auth form told
         # the operator. A window-only unlock page always continues; it has no grant to pre-arm.
         issued = consume_continuation(pre_rotation, next_)
