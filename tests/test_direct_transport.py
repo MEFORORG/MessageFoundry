@@ -437,6 +437,13 @@ def test_cleartext_refusals(monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
     assert d.use_tls is False
 
 
+def test_an_explicit_none_tls_setting_takes_its_default(pki: dict[str, Any]) -> None:
+    """Vault BACKLOG #3230: ``None`` used to read as off, which would have dropped STARTTLS, the
+    certificate check and the name check. It now takes each default, as absence does."""
+    d = DirectDestination(_dest(pki, use_tls=None, tls_verify=None, tls_check_hostname=None))
+    assert (d.use_tls, d.tls_verify, d.tls_check_hostname) == (True, True, True)
+
+
 # --- the SMTP envelope on the wire (vault BACKLOG #2870) ---------------------------------------------
 #
 # Each test reads the MAIL and RCPT lines a loopback listener received, so it checks what a relay
@@ -841,6 +848,24 @@ def test_credentials_over_a_fully_verified_hop_still_construct(pki: dict[str, An
     # POSITIVE CONTROL: proves the new gate can be PASSED, so the refusal test above is not green
     # merely because DirectDestination rejects every credentialed construction.
     DirectDestination(_dest(pki, username="svc", password="pw"))
+
+
+@pytest.mark.parametrize(
+    "weak",
+    [{"use_tls": False}, {"tls_verify": False}, {"tls_check_hostname": False}],
+    ids=["cleartext", "verify-off", "name-off"],
+)
+def test_a_credential_refusal_names_the_connection_and_no_escape(
+    pki: dict[str, Any], weak: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3230: the credential refusal runs before the body refusal, which offers the
+    escape, so an enforcing instance is told the fix that works rather than one that does not."""
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with pytest.raises(ValueError, match="authentication credentials") as info:
+        DirectDestination(_dest(pki, username="svc", password="synthetic", **weak))
+    message = str(info.value)
+    assert "connection 'OB_DIRECT'" in message and "tls_ca_file" in message
+    assert INSECURE_TLS_ESCAPE_ENV not in message and "synthetic" not in message
 
 
 # --- signature_padding: the ASVS 11.3.1 operator choice (BACKLOG #1168) ------------------------------

@@ -8344,9 +8344,9 @@ class RegistryRunner:
                 # PHASE (b): the store completion round-trip (plain mark_done — the non-capturing path).
                 _done_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 # vault BACKLOG #3040 items 2 and 5: a ReplyBodyDropped means the partner answered
-                # 2xx and its reply body was dropped over the byte bound. The reply_dropped event
-                # commits with the DONE flip, and the WARNING follows that write and says what it
-                # did. Status, bound and names only.
+                # 2xx and its reply body was dropped: over the byte bound, or (BACKLOG #2989) cut
+                # short or misframed. The reply_dropped event commits with the DONE flip, and the
+                # WARNING follows that write and says what it did. Status, problem and names only.
                 dropped = response if isinstance(response, ReplyBodyDropped) else None
                 if dropped is None:
                     await self.store.mark_done(item.id)
@@ -8357,12 +8357,12 @@ class RegistryRunner:
                 if dropped is not None:
                     log.warning(
                         "delivery worker %r: outbox row %s (message %s) answered with status %s "
-                        "and a response body over the %d-byte bound; the body is dropped, and %s",
+                        "and a response body %s; the body is dropped, and %s",
                         name,
                         item.id,
                         item.message_id,
                         dropped.status,
-                        dropped.limit,
+                        dropped.problem,
                         "the row is recorded as delivered with a reply_dropped event"
                         if recorded
                         else "the store recorded nothing: the row was gone or the write was fenced",

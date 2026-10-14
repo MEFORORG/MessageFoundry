@@ -465,10 +465,13 @@ class AdGroupMap(RequestModel):
 
 
 class AdGroupScopeEntry(RequestModel):
-    """Maps an AD group to one allowed channel; channel ``*`` = all channels (per-channel RBAC C3)."""
+    """Maps an AD group to one allowed channel; channel ``*`` = all channels (per-channel RBAC C3).
+
+    ``channel`` takes the rule ``ChannelScope.channels`` takes (BACKLOG #3187). Its 256 ASCII
+    characters are 256 UTF-16 units, which is what SQL Server's ``channel NVARCHAR(256)`` counts."""
 
     ad_group: str = Field(max_length=_GROUP_MAX)
-    channel: str = Field(max_length=_NAME_MAX)
+    channel: ChannelScopeEntry
 
 
 class AdGroupScopeMap(RequestModel):

@@ -62,6 +62,7 @@ from typing import Any, Literal, NamedTuple, overload
 from messagefoundry.config.models import (
     ConnectorType,
     Destination,
+    bool_setting,
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import EgressSettings
@@ -112,6 +113,7 @@ from messagefoundry.transports.rest import (
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
     find_outbound_length_violation,
+    http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
@@ -891,7 +893,8 @@ class FhirDestination(DestinationConnector):
                 connection=config.name,
             )
 
-        if bool(s.get("verify_tls", True)):
+        verify = bool_setting(s, "verify_tls", default=True)
+        if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
@@ -917,6 +920,7 @@ class FhirDestination(DestinationConnector):
                 self.base_url,
                 connector="FHIR destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.FHIR, s),
                 attested=attested,
             )
             if guard is not None:
@@ -928,7 +932,7 @@ class FhirDestination(DestinationConnector):
             self._opener = _insecure_opener(*proxy_handlers)
         # #65: HTTP Digest — fold the challenge-answering handler into a per-connection opener (never the
         # shared one). None (default) → byte-identical. Mutually exclusive with a bearer provider.
-        from messagefoundry.transports.http_auth import HttpAuthError, digest_handler_from_settings
+        from messagefoundry.transports.http_auth import digest_handler_from_settings
 
         digest = digest_handler_from_settings(s, url=self.base_url)
         if digest is not None:
@@ -943,7 +947,7 @@ class FhirDestination(DestinationConnector):
                 # cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
-        if bool(s.get("verify_tls", True)):
+        if verify:
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the FHIR-server cert but does
             # no OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless
             # revocation is attested or this hop's own opener checks a CRL (composes with #200).
@@ -1240,7 +1244,8 @@ class FhirDestination(DestinationConnector):
         # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
         # a None guard (secure/loopback base) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send_url(self.base_url)
+            # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
+            self._hop_guard.assert_delivery_url(self.base_url, connector="FHIR")
         data = encode_wire_body(payload, self.encoding, transport="FHIR")
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:
@@ -1635,7 +1640,7 @@ class FhirLookupExecutor:
             enforce_outbound_length_limits(url, headers)
             self._headers[cname] = headers
             self._token[cname] = token
-            if bool(s.get("verify_tls", True)):
+            if bool_setting(s, "verify_tls", default=True):
                 # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
                 # server is the most on-point instance of 12.3.4's condition in the product, and it
                 # could not name an anchor at all.
@@ -1667,6 +1672,8 @@ class FhirLookupExecutor:
                     revocation_attested_reason=rev_reason,
                     opener=self._opener[cname],
                     connection=label,
+                    description="sends read requests over verified https, with no certificate "
+                    "revocation checking,",
                 )
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
@@ -1675,6 +1682,7 @@ class FhirLookupExecutor:
                     url,
                     connector=f"FhirLookup {cname!r}",
                     connection=label,
+                    credentials=http_credentials_sent(ConnectorType.FHIR, s, lookup=True),
                     attested=attested,
                 )
                 if guard is not None:

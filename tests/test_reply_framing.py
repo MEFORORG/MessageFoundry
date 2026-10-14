@@ -39,6 +39,7 @@ from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
+    REPLY_MISFRAMED_CODE,
     AmbiguousFramingError,
     EgressReplyError,
     MalformedReplyHeadError,
@@ -211,6 +212,22 @@ def _assert_framing_refusal(exc: BaseException) -> None:
         assert "framed its response body ambiguously" in str(exc)
 
 
+def _assert_captured_2xx_refusal(exc: BaseException) -> None:
+    """What a send with ``capture_response`` on raises for a misframed 2xx reply.
+
+    A bad head is refused while it is read, before any status can be trusted, so it stays the
+    retryable refusal above. A body misframed under a 2xx head is a permanent refusal since
+    BACKLOG #2989: the request is not sent again, and the body is needed here. The reason is the
+    same fixed text the retryable refusal carried."""
+    if isinstance(exc, MalformedReplyHeadError):
+        _assert_framing_refusal(exc)
+        return
+    assert isinstance(exc, NegativeAckError)
+    assert (exc.code, exc.permanent, exc.config_fault) == (REPLY_MISFRAMED_CODE, True, False)
+    assert f"{REPLY_MISFRAMED_CODE}, not sent again" in str(exc)
+    assert exc.__context__ is None
+
+
 # --- the shared reader --------------------------------------------------------------------------
 
 
@@ -236,14 +253,13 @@ def test_read_bounded_reads_unambiguous_framing(shape: str) -> None:
 
 @pytest.mark.parametrize("shape", list(_AMBIGUOUS), ids=list(_AMBIGUOUS))
 def test_soap_captured_reply_refuses_ambiguous_framing(shape: str) -> None:
-    """The SOAP captured-reply path: the refusal is a DeliveryError, so the delivery worker records
-    it on the row, retries it and dead-letters it. It never becomes a captured reply."""
+    """The SOAP captured-reply path. It never becomes a captured reply: see
+    :func:`_assert_captured_2xx_refusal` for which refusal it is."""
     with _serve(_AMBIGUOUS[shape]) as url:
         dest = _soap(url)
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send("<soap:Envelope/>"))
-    _assert_framing_refusal(raised.value)
-    assert not isinstance(raised.value, NegativeAckError)
+    _assert_captured_2xx_refusal(raised.value)
 
 
 @pytest.mark.parametrize("shape", list(_AMBIGUOUS), ids=list(_AMBIGUOUS))
@@ -252,7 +268,7 @@ def test_rest_reply_refuses_ambiguous_framing(shape: str) -> None:
         dest = _rest(url)
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send('{"a": 1}'))
-    _assert_framing_refusal(raised.value)
+    _assert_captured_2xx_refusal(raised.value)
 
 
 @pytest.mark.parametrize("shape", list(_CONTROLS), ids=list(_CONTROLS))
@@ -659,8 +675,8 @@ def test_soap_captured_reply_refuses_a_header_block_that_did_not_parse(shape: st
         dest = _soap(url)
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send("<soap:Envelope/>"))
-    _assert_header_refusal(raised.value)
-    assert not isinstance(raised.value, NegativeAckError)
+    _assert_captured_2xx_refusal(raised.value)
+    assert "header" in str(raised.value)
 
 
 @pytest.mark.parametrize("shape", list(_BAD_HEADERS), ids=list(_BAD_HEADERS))
@@ -669,7 +685,8 @@ def test_rest_reply_refuses_a_header_block_that_did_not_parse(shape: str) -> Non
         dest = _rest(url)
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send('{"a": 1}'))
-    _assert_header_refusal(raised.value)
+    _assert_captured_2xx_refusal(raised.value)
+    assert "header" in str(raised.value)
 
 
 def test_a_header_defect_is_refused_even_on_a_bodyless_reply() -> None:
@@ -838,8 +855,7 @@ def test_soap_captured_reply_refuses_malformed_chunk_framing(shape: str) -> None
         dest = _soap(url)
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send("<soap:Envelope/>"))
-    _assert_framing_refusal(raised.value)
-    assert not isinstance(raised.value, NegativeAckError)
+    _assert_captured_2xx_refusal(raised.value)
 
 
 @pytest.mark.parametrize("shape", list(_BAD_CHUNKS), ids=list(_BAD_CHUNKS))
@@ -848,7 +864,7 @@ def test_rest_reply_refuses_malformed_chunk_framing(shape: str) -> None:
         dest = _rest(url)
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send('{"a": 1}'))
-    _assert_framing_refusal(raised.value)
+    _assert_captured_2xx_refusal(raised.value)
 
 
 @pytest.mark.parametrize("shape", list(_CHUNK_CONTROLS), ids=list(_CHUNK_CONTROLS))

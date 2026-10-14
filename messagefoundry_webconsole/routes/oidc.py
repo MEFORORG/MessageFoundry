@@ -58,7 +58,7 @@ from messagefoundry.api.security import (
     public_route,
 )
 from messagefoundry.auth.oidc import FlowCacheFullError, FlowError
-from messagefoundry.auth.service import AuthService, OidcStepUp
+from messagefoundry.auth.service import AuthService, LoginOutcome, OidcStepUp
 
 from .. import pages
 from .._auth import (
@@ -151,9 +151,10 @@ def _step_up_landing(
             error=outcome.error,
             status_code=403,
         )
-        if outcome.reason != "state_mismatch":
-            # A state mismatch consumed nothing: the flow waits for the real IdP return, which
-            # needs this browser's flow cookie. Every other refusal ended the flow.
+        if outcome.flow_consumed:
+            # The refusal ended the flow, so its cookie goes too. One that consumed nothing (a
+            # state mismatch) skips this: the flow waits for the real IdP return, which needs the
+            # cookie (BACKLOG #3198).
             clear_oidc_flow_cookie(resp, request)
         return resp
     if next_ == "/ui" or is_unlock_action(next_):
@@ -200,10 +201,12 @@ _REASON_TO_CODE = {
 }
 
 
-def _fail(request: Request, code: str) -> Response:
-    """A terminal callback failure: 303 to the login page AND clear the single-use flow cookie."""
+def _fail(request: Request, code: str, *, keep_flow: bool = False) -> Response:
+    """A callback failure: 303 to the login page AND, unless ``keep_flow``, clear the single-use
+    flow cookie. ``keep_flow`` is for a refusal that consumed nothing (BACKLOG #3198)."""
     resp = RedirectResponse(f"/ui/login?e={code}", status_code=303)
-    clear_oidc_flow_cookie(resp, request)
+    if not keep_flow:
+        clear_oidc_flow_cookie(resp, request)
     return resp
 
 
@@ -455,7 +458,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
             await auth.audit_oidc_reject("non_navigation_fetch", client=client)
-            return _fail(request, "oidc_failed")
+            # Consumed nothing, so the cookie stays for the real IdP return (BACKLOG #3198).
+            return _fail(request, "oidc_failed", keep_flow=True)
         # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".
 
         flow_id = request.cookies.get(oidc_flow_cookie_name(request))
@@ -486,15 +490,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 )
             )
             return _step_up_landing(request, deps, auth, step_up)
-        if error is not None:
-            # The IdP reported a failure. Audit a fixed slug; never the IdP's own string.
-            await auth.audit_oidc_reject("idp_error", client=client)
-            return _fail(request, "oidc_failed")
-        if not code or not state:
-            await auth.audit_oidc_reject("malformed_callback", client=client)
-            return _fail(request, "oidc_failed")
+        if error is not None or not code or not state:
+            # The IdP reported a failure, or the callback is malformed. The service checks
+            # `state` before it ends the flow (BACKLOG #3198), so a forged `error=` cannot cancel
+            # a sign-in in flight. It audits a fixed slug, never the IdP's own string.
+            consumed = await auth.abandon_oidc_login(
+                flow_id,
+                state=state,
+                reason="idp_error" if error is not None else "malformed_callback",
+                client=client,
+            )
+            return _fail(request, "oidc_failed", keep_flow=not consumed)
 
-        outcome = await auth.complete_oidc_login(
+        # Typed so the seam discovery sees LoginOutcome, whose `flow_consumed` this route reads.
+        outcome: LoginOutcome = await auth.complete_oidc_login(
             flow_id=flow_id,
             state=state,
             code=code,
@@ -507,7 +516,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not outcome.ok or outcome.token is None:
             # complete_oidc_login already audited the closed-set reason; map it to an allow-listed
             # short code, defaulting to the generic one so an unrecognised slug is never reflected.
-            return _fail(request, _REASON_TO_CODE.get(outcome.reason or "", "oidc_failed"))
+            return _fail(
+                request,
+                _REASON_TO_CODE.get(outcome.reason or "", "oidc_failed"),
+                keep_flow=not outcome.flow_consumed,
+            )
         resp = HTMLResponse(pages.oidc_landing(), status_code=200)
         set_session_cookie(resp, outcome.token, request=request)
         clear_oidc_flow_cookie(resp, request)

@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 # api._ui_seam — never the console package), so it imports and the engine boots with the console ABSENT.
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
+    _GROUP_MAX,
     AdGroupMap,
     AdGroupMapEntry,
     AdGroupScopeEntry,
@@ -397,10 +398,10 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
 #: How many refused group keys the 400 names before it only counts the rest.
 _GROUPS_NAMED = 3
 
-#: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(256)``.
-#: The request model allows 512 characters, and canonical form can be longer than what was typed,
-#: so a key past this would fail inside the store's write with a 500 rather than a 400.
-_STORED_GROUP_MAX = 256
+#: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(512)``,
+#: the request model's cap (BACKLOG #3187). Canonical form can outgrow what was typed, so the
+#: route checks it again; past this, the store's write would fail with a 500, not a 400.
+_STORED_GROUP_MAX = _GROUP_MAX
 
 
 def _canonical_group_dns(groups: list[str]) -> list[str]:

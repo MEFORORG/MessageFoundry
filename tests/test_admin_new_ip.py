@@ -120,7 +120,11 @@ async def test_new_ip_flags_audits_and_notifies() -> None:
             e.event_type == ADMIN_NEW_IP and e.client_ip == "10.2.2.2" for e in notifier.events
         )
         rows = await store.list_audit(limit=20)
-        assert any(r["action"] == "auth.admin_action_new_ip" for r in rows)
+        [flagged] = [r for r in rows if r["action"] == "auth.admin_action_new_ip"]
+        # Vault BACKLOG #3197: the address is in the client column, not only in the detail, so a
+        # search or export by address finds the row.
+        assert flagged["client"] == "10.2.2.2"
+        assert json.loads(flagged["detail"])["seen_ip"] == "10.2.2.2"
     finally:
         await store.close()
 

@@ -74,16 +74,21 @@ def _export_note(export_limit: int | None) -> Markup:
 
 
 def audit_log(data: AuditList, *, export_limit: int | None = None) -> Markup:
-    """One page of the audit trail (``audit:read``): actor, action, channel, PHI-free detail.
+    """One page of the audit trail (``audit:read``): actor, client address, action, channel, and
+    PHI-free detail.
 
     Newest first, paged by ``offset`` against ``data.total`` (BACKLOG #2438). The total is the
     caller's own: it is counted under the same lock-row exclusion as the rows (BACKLOG #1131), and
     ``data.withheld`` says so in words (BACKLOG #2446), or a short trail would read as the whole.
 
     ``export_limit`` is the console export's default cap for a caller holding ``audit:export``, and
-    ``None`` for one who does not, who is shown no export link."""
+    ``None`` for one who does not, who is shown no export link.
+
+    The client column is the address the engine recorded for the entry (vault BACKLOG #3197), the
+    "from where" an incident responder traces a refused sign-in by. A dash means no client was in
+    scope, such as an engine-internal write."""
     rows = [
-        [_ts(e.ts), e.actor or "—", e.action, e.channel_id or "—", e.detail or ""]
+        [_ts(e.ts), e.actor or "—", e.client or "—", e.action, e.channel_id or "—", e.detail or ""]
         for e in data.entries
     ]
     return page(
@@ -96,7 +101,7 @@ def audit_log(data: AuditList, *, export_limit: int | None = None) -> Markup:
         ),
         el("p", WITHHELD_NOTE, class_="banner") if data.withheld else Markup(""),
         _export_note(export_limit),
-        rows_table(["When", "Actor", "Action", "Channel", "Detail"], rows),
+        rows_table(["When", "Actor", "Client", "Action", "Channel", "Detail"], rows),
         _pager(
             path="/ui/audit",
             total=data.total,

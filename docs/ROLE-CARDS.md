@@ -201,6 +201,15 @@ works in it -- the Lander's standing authority, and since 2026-09-23 the Manager
 Wired once at `SessionStart` in `.claude/settings.json`, beside `seat-declare-prompt.ps1` and
 `precompact-reprime.ps1`, passing `-WorktreeRoot ${CLAUDE_PROJECT_DIR}`.
 
+**That argument is a fallback now. The hook reads its worktree from the hook input's `cwd`.**
+Measured 2026-10-12: the desktop app starts a worktree session with `--project-config-root` set to
+the primary checkout. A hook's working directory and `CLAUDE_PROJECT_DIR` then both name the
+primary, and only the input's `cwd` names the worktree.
+
+So every desktop worktree session read the primary's marker. Session 07991bb9 declared Lander and
+got the Builder card at five compactions running. The hook also reads the roster and card from that
+worktree when it has them. `TheHookReadsTheSessionsOwnWorktree` pins both.
+
 It resolves the seat, reads that card, and injects it. It also writes the resolved card to
 `.claude/ROLE.local.md`, git-ignored, so a session can re-read it after a compaction. **That write
 is not proof of an injection either way:** it sits in its own try/catch that prints and falls
@@ -475,6 +484,8 @@ asserted by reading the source rather than by driving it, and the table says whi
 | No marker, whatever the worktree is called | **Tested by source absence**, not by a run. The resolution order ends at rung 3; the designed fourth rung was cut. |
 | The hook is wired **exactly once** at SessionStart | **Tested**, across every hook group and across both the `args` and `command` fields of this file. |
 | The wiring passes `-WorktreeRoot` spelled in full, and nothing else | **Tested positively**: the tokens after the script path must be exactly `-WorktreeRoot ${CLAUDE_PROJECT_DIR}`. |
+| The hook input's `cwd` wins over `-WorktreeRoot` | **Tested by a run**, in a planted primary and worktree with different markers, with a no-input control that reads the primary. Added 2026-10-12. |
+| The user-scope wrapper stands down where the project row runs the hook | **Tested on the installed copies**, which this suite reads but cannot install. Added 2026-10-12, when none of the eight copies carried it, so the arm is red on a box until they do. CI has no copies and skips it. |
 
 The card budget is enforced twice, in the suite and again in the hook, so a card edited in a
 worktree that never runs the tests still cannot cost every session. The resolution order has the

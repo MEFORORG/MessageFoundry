@@ -2311,11 +2311,14 @@ _SCHEMA: list[str] = [
     """IF INDEXPROPERTY(OBJECT_ID('user_roles'),'ix_user_roles_role','IndexID') IS NULL
         CREATE INDEX ix_user_roles_role ON user_roles(role_id)""",
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
-        ad_group NVARCHAR(256) NOT NULL, role_id NVARCHAR(64) NOT NULL,
-        CONSTRAINT pk_ad_group_role_map PRIMARY KEY (ad_group, role_id))""",
+        -- BACKLOG #3187: 512 is the API's canonical group-DN cap. NONCLUSTERED because the key,
+        -- 2 x (512 + 64) bytes, is past a clustered key's 900 and inside a nonclustered one's 1700.
+        ad_group NVARCHAR(512) NOT NULL, role_id NVARCHAR(64) NOT NULL,
+        CONSTRAINT pk_ad_group_role_map PRIMARY KEY NONCLUSTERED (ad_group, role_id))""",
     """IF OBJECT_ID('ad_group_scope_map','U') IS NULL CREATE TABLE ad_group_scope_map (
-        ad_group NVARCHAR(256) NOT NULL, channel NVARCHAR(256) NOT NULL,
-        CONSTRAINT pk_ad_group_scope_map PRIMARY KEY (ad_group, channel))""",
+        -- BACKLOG #3187: NONCLUSTERED for the same reason; this key is 2 x (512 + 256) bytes.
+        ad_group NVARCHAR(512) NOT NULL, channel NVARCHAR(256) NOT NULL,
+        CONSTRAINT pk_ad_group_scope_map PRIMARY KEY NONCLUSTERED (ad_group, channel))""",
     """IF OBJECT_ID('sessions','U') IS NULL CREATE TABLE sessions (
         token_hash NVARCHAR(64) NOT NULL PRIMARY KEY, user_id NVARCHAR(64) NOT NULL,
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,

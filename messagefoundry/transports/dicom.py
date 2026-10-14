@@ -1207,7 +1207,8 @@ def _client_ssl_context(
     1.2+ floor. Built once at construction so a bad cert/key fails at build (dry-run/``check``), not at
     the first delivery — the client mirror of :func:`_server_ssl_context`. ``tls_key_password`` decrypts
     a passphrase-encrypted mTLS client key (``env()``-sourced, mirroring MLLP). ``name`` is the
-    connection's, for a refusal of an unreadable ``tls_ca_file`` to name (vault BACKLOG #2370).
+    connection's, for a refusal of an unreadable ``tls_ca_file`` to name (vault BACKLOG #2370), and
+    a suite refusal too (BACKLOG #3096).
 
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
     the connection names no ``tls_ca_file`` of its own: an internal hop verifies against the org internal
@@ -1237,9 +1238,12 @@ def _client_ssl_context(
         # empty-bytes callback as the backstop, so no client key reaches OpenSSL's TTY prompt.
         load_connection_cert_chain(ctx, cert, key, s.get("tls_key_password"))
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    # BACKLOG #3096: a suite refusal names the connection when the caller passed one, as the runner
+    # does, so an operator with several DICOM destinations knows which one to fix.
+    connector = f"DICOM destination {name!r}" if name else "DICOM destination"
     # See the SCP listener above: narrow first (ADR 0188), assert second, both visible here.
-    apply_connection_tls_ciphers(ctx, s, connector="DICOM destination")  # opt-in per-hop suite list
-    harden_cipher_suites(ctx, connector="DICOM destination")  # assert forward secrecy (ASVS 12.1.2)
+    apply_connection_tls_ciphers(ctx, s, connector=connector)  # opt-in per-hop suite list
+    harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
     # #129 (ADR 0094): opt-in granular expiry-only relaxation — honour an expired downstream PACS cert
     # while STILL validating chain + hostname (verification stays ON; default off = byte-identical).
