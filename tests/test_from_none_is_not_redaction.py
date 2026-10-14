@@ -113,6 +113,11 @@ _UPLOAD_MISS = (
     "UnicodeDecodeError that cannot hold stored content while both upload writers store ASCII "
     "(base64 body, json.dumps metadata)"
 )
+_CELL_TAG = (
+    "CellTagError's fixed text names the table, the column and a 12-character row-id prefix, never "
+    "a value; below it sits AesGcmCipher's fixed-text CipherError naming the key fingerprint, and at "
+    "most a binascii.Error that names a count or a rule, never the ciphertext bytes"
+)
 
 #: One entry per (site key, count). Read the module docstring before adding one.
 _ALLOWED: tuple[_Allowed, ...] = (
@@ -306,6 +311,14 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + _UPLOAD_MISS,
     ),
     _Allowed(f"{_APP}.delete_uploaded_file::UploadUnreadableError" + _HTTP, _SAFE + _UPLOAD_MISS),
+    _Allowed(
+        f"{_APP}.layered_search::CellTagError" + _HTTP,
+        _SAFE + _CELL_TAG + "; the 423 detail quotes the caller's own preset id",
+    ),
+    _Allowed(
+        "messagefoundry/api/message_scope.py::read_scoped_message::CellTagError" + _HTTP,
+        _SAFE + _CELL_TAG + "; the 423 detail is fixed text",
+    ),
 )
 
 
