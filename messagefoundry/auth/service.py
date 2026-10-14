@@ -7331,7 +7331,7 @@ class AuthService:
 
     async def _report_directory_admin_loss(
         self,
-        user: UserRecord | None,
+        user: UserRecord,
         *,
         before: Iterable[str],
         after: Iterable[str],
@@ -7363,7 +7363,7 @@ class AuthService:
         lets the row be written, and a fault writing the row comes after the alert.
         """
         admin = Role.ADMINISTRATOR.value
-        if user is None or user.disabled or admin not in set(before) or admin in set(after):
+        if user.disabled or admin not in set(before) or admin in set(after):
             return
         try:
             if await self.has_enabled_administrator():

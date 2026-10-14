@@ -402,7 +402,7 @@ async def test_a_like_named_local_row_breaks_no_tie(
 ) -> None:
     """Only a directory row's id steers the lookup. A local row carrying an id is ignored, and
     the id is read through the sealed loader (BACKLOG #2592), never the raw store reader. The
-    real seal check is the next test."""
+    real seal check is the test before this one."""
     from types import SimpleNamespace
 
     from messagefoundry.auth.identity import AuthProvider

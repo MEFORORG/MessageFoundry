@@ -289,3 +289,24 @@ def test_the_alert_callable_keys_on_the_account_and_never_raises() -> None:
 def test_the_alert_type_is_routable_and_takes_no_control_action() -> None:
     assert "no_enabled_administrator" in _ALERT_EVENT_TYPES
     assert "no_enabled_administrator" not in _ALERT_CONTROL_EVENT_TYPES
+
+
+async def test_a_loss_after_a_regrant_is_not_held_back_by_the_cooldown() -> None:
+    """A grant ends the account's cooldown, so a second loss after a fix is paged again."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+    from tests.test_alert_sinks import _drain, _RecordingTransport
+
+    transport = _RecordingTransport("webhook")
+    sink = NotifierAlertSink([transport])  # the default cooldown, far longer than this test
+
+    sink.no_enabled_administrator("user:jdoe", via="ad-sync")
+    sink.administrator_granted("user:jdoe", via="ad-sync", granted_by="<directory>")
+    sink.no_enabled_administrator("user:jdoe", via="ad-sync")
+    # The control: with no grant between them, the second loss is throttled.
+    sink.no_enabled_administrator("user:asmith", via="ad-reconcile")
+    sink.no_enabled_administrator("user:asmith", via="ad-reconcile")
+    await _drain(sink)
+
+    losses = [e["connection"] for e in transport.events if e["type"] == "no_enabled_administrator"]
+    assert losses.count("user:jdoe") == 2
+    assert losses.count("user:asmith") == 1

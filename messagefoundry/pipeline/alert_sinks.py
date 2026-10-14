@@ -1153,6 +1153,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
+        # Vault BACKLOG #3229: a grant ends the account's no_enabled_administrator cooldown, so a
+        # second loss after a fix is paged rather than throttled, as crl_reload_applied does.
+        self._last_sent.pop(f"no_enabled_administrator:{name}", None)
         self._emit(
             {
                 "type": "administrator_granted",
