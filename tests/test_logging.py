@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import importlib.util
 import io
 import json
@@ -54,7 +55,11 @@ SYNTHETIC_PHI = "PID|1||100^^^H^MR||DOE^JANE^Q||19800101|F"
 @pytest.fixture(autouse=True)
 def _restore_root_logger() -> Iterator[None]:
     """configure_logging mutates the global root logger and uvicorn's named loggers; snapshot and
-    restore both, so no test in this file leaves an order dependence behind."""
+    restore both, so no test in this file leaves an order dependence behind.
+
+    ``tests/conftest.py`` puts back only the ``uvicorn`` parent's level and propagation, not its
+    handlers and not ``uvicorn.error`` or ``uvicorn.access``. Widening that suite-wide restore would
+    cover the other files that call configure_logging; it is outside this file."""
     root = logging.getLogger()
     saved_handlers = root.handlers[:]
     saved_set = set(saved_handlers)
@@ -2193,7 +2198,9 @@ def test_the_access_arm_constants_mirror_the_scan_arm() -> None:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
             if isinstance(target, ast.Name) and target.id in _MIRRORED_CONSTANTS:
-                found[target.id] = ast.literal_eval(node.value)
+                # A computed value is not a literal; leave it out so the key check below names it.
+                with contextlib.suppress(ValueError):
+                    found[target.id] = ast.literal_eval(node.value)
     assert found.keys() == _MIRRORED_CONSTANTS.keys(), (
         f"found only {sorted(found)} of {sorted(_MIRRORED_CONSTANTS)} as module-level literals in "
         "test_log_redaction_secret_domain.py; a renamed or computed constant leaves its mirror unpinned"
@@ -2278,8 +2285,8 @@ class _CountingPattern:
 
     It overlaps ``_RecordingPattern`` in ``tests/test_log_redaction_secret_domain.py`` on purpose. That
     one counts every application, which suits its direct calls; this one must filter by needle, for
-    the reason below. Sharing one would add an import between test modules, which the mirrored
-    constants above avoid for the same reason they are copied.
+    the reason below. It is kept here for the reason the constants above are copied: this arm should
+    not move when that file is rewired.
 
     The swap is process-wide, so a record another thread logs during the window would be counted too
     if every application were. Counting only text that holds this test's own run keeps such a record
@@ -2353,8 +2360,9 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     and no forwarder. The record is emitted on ``uvicorn.access`` with uvicorn's own format and
     argument tuple, so every filter on every installed handler runs on it. That default install has
     ONE filtered handler, so the count below, one DSN pass per filtered handler, only ever runs with
-    one. It reads ``len(filtered)`` rather than a literal, but it does not exercise a second sink:
-    adding a file or forwarder here would time a different chain from the one this arm names.
+    one, and the arm asserts that rather than assuming it. It does not exercise a second sink: adding
+    a file or forwarder here would time a different chain from the one this arm names, and a second
+    handler's filters read a record the first one already rewrote.
 
     One measurement covers both halves of the item. The emit runs on a running event loop and is
     synchronous there, so its growth across lengths is the growth of the loop stall a client could
@@ -2388,7 +2396,11 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         for handler in logging.getLogger().handlers
         if any(isinstance(f, CredentialScrubFilter) for f in handler.filters)
     ]
-    assert filtered, "configure_logging installed no handler carrying the credential scrub"
+    assert len(filtered) == 1, (
+        f"configure_logging installed {len(filtered)} handler(s) carrying the credential scrub. This "
+        "arm times the one-handler default and reads the gate input of that one handler; revisit "
+        "both, and the docstring, before changing the expected count."
+    )
 
     # The structural arms first: they say what the timings below are about. The recorder can only
     # count a method it wraps, so a public re.Pattern callable missing from the set would read as a
@@ -2436,8 +2448,8 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         m.setattr(secretscrub, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
         # Three rounds, against five for the arm under test: the control only has to clear the bound.
         # Measured 2026-10-13 on a dev box, it read 70x in 2.0 s at three rounds and 112x in 0.6 s at
-        # one. Three keeps more than one minimum per endpoint, so a single slow short emit under load
-        # cannot pull the reading under the bound and red a sound harness.
+        # one. Each endpoint keeps the minimum of three samples, so one slow short emit under load is
+        # discarded rather than pulling the reading under the bound and redding a sound harness.
         before_growth = _access_growth(rounds=3)
     assert before_growth > _ACCESS_MAX_GROWTH, (
         f"with the pre-#1547 pattern swapped in, the access chain grew only {before_growth:.1f}x "
