@@ -83,6 +83,9 @@ def _restore_root_logger() -> Iterator[None]:
             lg = logging.getLogger(name)
             lg.setLevel(level)  # setLevel, not assignment: it clears the isEnabledFor cache
             lg.propagate = propagate
+            for handler in lg.handlers[:]:
+                if handler not in handlers:
+                    handler.close()  # as the root half does, for a handler the test added
             lg.handlers[:] = handlers
 
 
@@ -2196,11 +2199,18 @@ def test_the_access_arm_constants_mirror_the_scan_arm() -> None:
     found: dict[str, object] = {}
     for node in ast.parse(source).body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = node.targets[0]
-            if isinstance(target, ast.Name) and target.id in _MIRRORED_CONSTANTS:
-                # A computed value is not a literal; leave it out so the key check below names it.
-                with contextlib.suppress(ValueError):
-                    found[target.id] = ast.literal_eval(node.value)
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if not (isinstance(target, ast.Name) and target.id in _MIRRORED_CONSTANTS):
+            continue
+        # The last assignment wins, as at import. A computed value is not a literal, so it clears
+        # any earlier literal and the key check below names it.
+        found.pop(target.id, None)
+        with contextlib.suppress(ValueError, TypeError, SyntaxError, RecursionError):
+            found[target.id] = ast.literal_eval(value)
     assert found.keys() == _MIRRORED_CONSTANTS.keys(), (
         f"found only {sorted(found)} of {sorted(_MIRRORED_CONSTANTS)} as module-level literals in "
         "test_log_redaction_secret_domain.py; a renamed or computed constant leaves its mirror unpinned"
@@ -2435,6 +2445,17 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         assert secretscrub._admits(secretscrub._gate_fold(text), secretscrub._ANY_HINT), (
             f"the entry gate turns away the token=nothing line as the credential pass sees it, "
             f"ending {text[-40:]!r}, so the token=nothing arm below no longer tests the DSN gate"
+        )
+    # And ``x=nothing`` is only a test of the ENTRY gate if that gate turns it away.
+    entry_inputs = _credential_pass_inputs(monkeypatch, _request_target(longest, "x=nothing"))
+    assert len(entry_inputs) == len(filtered), (
+        f"the credential pass received the x=nothing line {len(entry_inputs)} times across "
+        f"{len(filtered)} filtered handler(s), so the gate check below would read nothing"
+    )
+    for text in entry_inputs:
+        assert not secretscrub._admits(secretscrub._gate_fold(text), secretscrub._ANY_HINT), (
+            f"the entry gate admits the x=nothing line, ending {text[-40:]!r}, so the x=nothing arm "
+            "below now tests the DSN gate a second time instead of the entry gate"
         )
     for query in ("x=nothing", "token=nothing"):
         unmarked_passes = _dsn_passes_during(monkeypatch, _request_target(longest, query))
