@@ -1759,12 +1759,13 @@ class Engine:
             node=self.instance_identity,
         )
         self._crl_reload_runner.start()
-        # Vault BACKLOG #2742: write one audit row for the scripts the remote-debugging guard
-        # refused since the last pass. Not leader-gated: the count is this process's own, so a
-        # standby reports its own too. Only `serve` builds an engine, so only `serve` runs this.
+        # Vault BACKLOG #2742: write one audit row and raise one alert for the scripts the
+        # remote-debugging guard refused since the last pass. Not leader-gated: the count is this
+        # process's own, so a standby reports its own too, and names itself in the alert key as
+        # the intake monitor does. Only `serve` builds an engine, so only `serve` runs this.
         if self._remote_debug_watch is None:
             self._remote_debug_watch = RemoteDebugRefusalWatch(
-                self.store, node=self.instance_identity
+                self.store, alert_sink=self._alert_sink, node=self.instance_identity
             )
             self._remote_debug_watch.start()
         # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and
@@ -3047,7 +3048,8 @@ class Engine:
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
             self._log_forward_watch = None
-        # Its last pass may write an audit row, so it stops here, well before the store closes.
+        # Its last pass may write an audit row and raise an alert, so it stops here, well before
+        # the store closes and before the alert-state drain at the end.
         if self._remote_debug_watch is not None:
             await self._remote_debug_watch.stop()
             self._remote_debug_watch = None
