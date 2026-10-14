@@ -3075,8 +3075,10 @@ def ad_map_write(sealer: RowSealer | None, current: AdMap, change: AdMapChange) 
 
 
 class AdMapSql(NamedTuple):
-    """One backend's statements for one AD directory map (BACKLOG #2592), each used only by that
-    backend's ``get_ad_map`` (``read``) or ``_write_ad_map`` (the rest)."""
+    """Postgres's or SQL Server's statements for one AD directory map (BACKLOG #2592), each used
+    only by that backend's ``get_ad_map`` (``read``) or ``_write_ad_map`` (the rest). SQLite names
+    the same statements as module constants (``_AD_ROLE_MAP_READ`` and its siblings), which say why;
+    a statement added here needs its SQLite twin there."""
 
     #: The map and its seal in ONE statement, so a read never pairs one write's pairs with
     #: another's seal: a ``seal`` row, then a ``pair`` row per pair with ``live`` saying whether a
@@ -3114,11 +3116,14 @@ _AD_SCOPE_MAP_INSERT: Final = "INSERT INTO ad_group_scope_map (ad_group, channel
 
 
 def _is_role_map(name: str) -> bool:
-    """Whether ``name`` is the role map rather than the channel map; any other name raises, so a
-    caller can branch on the answer without an unknown name falling through to the channel map."""
-    if name not in AD_MAPS:
-        raise KeyError(name)
-    return name == AD_ROLE_MAP
+    """Whether ``name`` is the role map rather than the channel map. Any other name raises, a map
+    added to :data:`AD_MAPS` later included, so a caller can branch on the answer without a name
+    falling through to the channel map's statements."""
+    if name == AD_ROLE_MAP:
+        return True
+    if name == AD_SCOPE_MAP:
+        return False
+    raise KeyError(name)
 
 
 def report_unsealed_role_records(count: int) -> None:

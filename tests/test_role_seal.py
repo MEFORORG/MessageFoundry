@@ -366,12 +366,16 @@ def test_the_service_reads_roles_and_the_maps_through_its_loaders() -> None:
     assert not stray, stray
 
 
-#: Where each backend may write the role and map tables: each module-level statement, or table of
-#: statements, and the functions that may use it. Every other INSERT, UPDATE, MERGE or DELETE must
+#: Where each backend may write the role and map tables, or read a map: each module-level
+#: statement, or table of statements, and the functions that may use it. Every other INSERT, UPDATE, MERGE or DELETE must
 #: sit inside a helper or on the delete list below.
 _SEALING: dict[str, dict[str, frozenset[str]]] = {
     "store.py": {
         "_ROLE_UPSERT": frozenset({"_write_role"}),
+        "_AD_ROLE_MAP_READ": frozenset({"get_ad_map"}),
+        "_AD_SCOPE_MAP_READ": frozenset({"get_ad_map"}),
+        "_AD_ROLE_MAP_PAIRS": frozenset({"_write_ad_map"}),
+        "_AD_SCOPE_MAP_PAIRS": frozenset({"_write_ad_map"}),
         "_AD_ROLE_MAP_CLEAR": frozenset({"_write_ad_map"}),
         "_AD_ROLE_MAP_INSERT": frozenset({"_write_ad_map"}),
         "_AD_SCOPE_MAP_CLEAR": frozenset({"_write_ad_map"}),
