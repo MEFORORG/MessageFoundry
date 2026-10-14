@@ -1973,6 +1973,8 @@ def test_a_filter_less_json_formatter_limit_is_real_and_stated() -> None:
     # Either half with no code points would pass its absence check below without testing anything.
     assert len(c0) >= 1, "the classes name no C0 control"
     assert len(others) >= 1, "the classes name no character outside C0"
+    # DEL alone would keep the second half non-empty; the docstring's limit is about non-ASCII too.
+    assert len([code for code in others if code >= 0x80]) >= 1, "the classes name no non-ASCII"
     # CR and LF are not in the classes; they are added so the framing assertion has input to fail on.
     codes = sorted({0x0A, 0x0D, *class_codes})
     message = "a" + "".join(chr(code) for code in codes) + f"z password=pw-Jf_A-91 {SYNTHETIC_PHI}"
