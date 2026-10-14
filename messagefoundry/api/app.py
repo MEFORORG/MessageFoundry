@@ -432,6 +432,7 @@ from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
+from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -7580,9 +7581,22 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            row = await engine.store.get_search_preset(
-                preset_id=preset_id, owner_user_id=identity.user_id
-            )
+            integrity_refused = False
+            try:
+                row = await engine.store.get_search_preset(
+                    preset_id=preset_id, owner_user_id=identity.user_id
+                )
+            except CellTagError:
+                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
+                # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
+                # never a 500.
+                integrity_refused = True
+            if integrity_refused:
+                # Raised after the handler, so the 423 chains nothing (BACKLOG #1796): `from None`
+                # would still leave the CellTagError and the cipher's error on __context__.
+                raise HTTPException(
+                    423, f"preset {preset_id} failed its integrity check and cannot be used"
+                )
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a

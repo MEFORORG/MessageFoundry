@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus, OutboxStatus
 from messagefoundry.store.base import ReingressOriginMissing, ResendKeyConflict, ResendSourceEmpty
-from messagefoundry.store.crypto import cell_aad
+from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.store import REINGRESS_TARGET_PREFIX, MessageStore, Stage
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -85,11 +85,19 @@ async def _seed_error(store: MessageStore, mid: str, error: str) -> None:
             "UPDATE messages SET status=?, error=? WHERE id=?",
             (
                 MessageStatus.ERROR.value,
-                store._enc(error, aad=cell_aad("messages", "error", mid)),
+                store._enc(error, aad=await _cell_tag(store, "error", mid)),
                 mid,
             ),
         )
         await store._db.commit()
+
+
+async def _cell_tag(store: MessageStore, column: str, mid: str) -> bytes:
+    """The tag ``column`` of message ``mid`` is sealed under: its id and its channel (#2593)."""
+    cur = await store._db.execute("SELECT channel_id FROM messages WHERE id=?", (mid,))
+    row = await cur.fetchone()
+    assert row is not None
+    return message_cell_aad(column, message_id=mid, channel_id=row[0])
 
 
 # --- store: RE-ROUTE re-ingress (the default path) ---------------------------
@@ -143,7 +151,7 @@ async def test_reingress_after_retention_purge_rebases_the_lineage(store: Messag
                         "correlation_depth": 4,
                     }
                 ),
-                aad=cell_aad("messages", "metadata", origin),
+                aad=await _cell_tag(store, "metadata", origin),
             ),
             origin,
         ),

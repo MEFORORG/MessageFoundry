@@ -97,14 +97,15 @@ async def _payload(store: MessageStore, outbox_id: str) -> str:
 
 async def _set_meta(store: MessageStore, message_id: str, bag: dict[str, object]) -> None:
     """Attach a metadata bag the way ``transform_handoff`` does (encrypted, cell-AAD bound)."""
-    from messagefoundry.store.crypto import cell_aad
+    from messagefoundry.store.cell_tag import message_cell_aad
 
+    cur = await store._db.execute("SELECT channel_id FROM messages WHERE id=?", (message_id,))
+    row = await cur.fetchone()
+    assert row is not None
+    tag = message_cell_aad("metadata", message_id=message_id, channel_id=row[0])
     await store._db.execute(
         "UPDATE messages SET metadata=? WHERE id=?",
-        (
-            store._enc(json.dumps(bag), aad=cell_aad("messages", "metadata", message_id)),
-            message_id,
-        ),
+        (store._enc(json.dumps(bag), aad=tag), message_id),
     )
     await store._commit()
 

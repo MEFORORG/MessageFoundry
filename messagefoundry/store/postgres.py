@@ -48,6 +48,7 @@ lazily in :meth:`PostgresStore.open` so SQLite-only installs never touch it. Pla
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -105,6 +106,20 @@ from messagefoundry.store.base import (
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
+)
+from messagefoundry.store.cell_tag import (
+    CellTagError,
+    audits_cell_tag,
+    dead_letters_on_cell_tag,
+    is_row_tagged,
+    message_cell_aad,
+    open_message_cell,
+    open_preset_criteria,
+    preset_criteria_aad,
+    report_cell_tag_failures,
+    row_tag_aad,
+    row_tag_columns,
+    withhold_message_cells,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -2784,7 +2799,15 @@ class PostgresStore:
         like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
         for table, column in self._CIPHER_COLUMNS:
-            total += await self._seal_surface(table, column, like, aad_cols=("id",))
+            # A message cell binds its channel and a preset's criteria its owner (#2593).
+            total += await self._seal_surface(
+                table,
+                column,
+                like,
+                aad_cols=row_tag_columns(table, column),
+                key_cols=("id",),
+                aad_of=functools.partial(row_tag_aad, table, column),
+            )
         # The `queue.payload` cell binds the row's routing fields (BACKLOG #2593).
         total += await self._seal_surface(
             "queue",
@@ -2949,23 +2972,29 @@ class PostgresStore:
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
 
-    async def _reencrypt_queue_payload_to_active(
-        self, cipher: AesGcmCipher, active_like: str, batch: int
+    async def _reencrypt_tagged_to_active(
+        self,
+        cipher: AesGcmCipher,
+        active_like: str,
+        batch: int,
+        *,
+        table: str,
+        column: str,
+        select: str,
+        aad_of: Callable[[Any], bytes],
     ) -> int:
-        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
-        (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
-        selected so the decrypt and the encrypt share one tag.
-        A cell that does not open under its own tag with a key this process holds
-        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
-        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
-        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
-        ``id``, since a skipped row still matches the marker filter."""
+        """Re-seal an id-keyed cell whose tag binds more than the row id under the active key,
+        rebinding each row's tag (``queue.payload``'s routing tag, a message cell's channel, a
+        preset's owner; BACKLOG #2593). The SQLite twin documents it: ``select`` names the tag's
+        columns, ``id`` among them; a cell that fails its own tag under a held key is left and counted
+        in a WARNING; any other failure still stops the rotation; pages by ``id``. All identifiers are
+        code constants."""
         total = skipped = 0
         after = ""
         while True:
             rows = await self._fetchall(
-                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
-                " WHERE payload NOT LIKE $1 AND payload <> '' AND id > $2 ORDER BY id LIMIT $3",
+                f"SELECT {select}, {column} AS v FROM {table}"
+                f" WHERE {column} NOT LIKE $1 AND {column} <> '' AND id > $2 ORDER BY id LIMIT $3",
                 active_like,
                 after,
                 batch,
@@ -2976,26 +3005,26 @@ class PostgresStore:
             updates: list[tuple[str, str]] = []
             for r in rows:
                 try:
-                    updates.append(
-                        (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
-                    )
+                    updates.append((self._reencrypt_value(cipher, r["v"], aad_of(r)), r["id"]))
                 except CipherError:
-                    if not is_tag_failure(cipher, r["payload"]):
+                    if not is_tag_failure(cipher, r["v"]):
                         raise
                     skipped += 1
             if updates:
                 async with self._timed_acquire() as conn, conn.transaction():
                     for new_value, rid in updates:
                         await conn.execute(
-                            "UPDATE queue SET payload=$1 WHERE id=$2", new_value, rid
+                            f"UPDATE {table} SET {column}=$1 WHERE id=$2", new_value, rid
                         )
                 await self._charge_bound_batch()
                 total += len(updates)
         if skipped:
             log.warning(
-                "rotation left %d queue row(s) whose payload does not open under its own tag"
-                " under a held key; no claim or read opens them (BACKLOG #2593)",
+                "rotation left %d %s.%s value(s) that do not open under their own row's tag"
+                " under a held key; no read opens them (BACKLOG #2593)",
                 skipped,
+                table,
+                column,
             )
         return total
 
@@ -3037,6 +3066,18 @@ class PostgresStore:
         report_role_reseal(*await self.reseal_role_records())
         total = 0
         for table, column in self._CIPHER_COLUMNS:
+            if is_row_tagged(table, column):
+                # A message cell or a preset's criteria rebinds its row tag (BACKLOG #2593).
+                total += await self._reencrypt_tagged_to_active(
+                    cipher,
+                    active_like,
+                    batch,
+                    table=table,
+                    column=column,
+                    select=", ".join(row_tag_columns(table, column)),
+                    aad_of=functools.partial(row_tag_aad, table, column),
+                )
+                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT id, {column} AS v FROM {table}"
@@ -3064,7 +3105,15 @@ class PostgresStore:
                 await self._charge_bound_batch()
                 total += len(rows)
         # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
-        total += await self._reencrypt_queue_payload_to_active(cipher, active_like, batch)
+        total += await self._reencrypt_tagged_to_active(
+            cipher,
+            active_like,
+            batch,
+            table="queue",
+            column="payload",
+            select=QUEUE_TAG_SELECT,
+            aad_of=queue_row_aad,
+        )
         total += await self._reencrypt_composite(
             cipher, "state", ("namespace", "key"), active_like, batch
         )
@@ -3352,12 +3401,19 @@ class PostgresStore:
             source_type,
             control_id,
             message_type,
-            self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+            # BACKLOG #2593: every message cell is bound to the row's id AND its channel.
+            self._cipher.encrypt(
+                raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+            ),
             status,
-            self._enc(error, aad=cell_aad("messages", "error", mid)),
+            self._enc(error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)),
             # EF-3: MRN/name is PHI — ciphered at rest like the body
-            self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-            self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+            self._enc(
+                summary, aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id)
+            ),
+            self._enc(
+                metadata, aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id)
+            ),
             # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
             origin.value,
             origin_actor,
@@ -3891,6 +3947,7 @@ class PostgresStore:
             await self._event(conn, message_id, event, None, f"{len(handlers)} handler(s)", now)
         return True
 
+    @dead_letters_on_cell_tag
     async def transform_handoff(
         self,
         *,
@@ -3946,17 +4003,22 @@ class PostgresStore:
                 # depth 0).
                 # Read the message's current metadata ONCE if either PT re-ingress or SetMeta needs it.
                 pmeta_json: str | None = None
+                # Bound to the message row's own channel (BACKLOG #2593); a cell that fails that
+                # tag raises CellTagError, and the decorator dead-letters the routed row.
+                msg_channel = channel_id
                 if pt_deliveries or meta_ops:
                     prow = await conn.fetchrow(
-                        "SELECT metadata FROM messages WHERE id=$1", message_id
+                        "SELECT channel_id, metadata FROM messages WHERE id=$1", message_id
                     )
-                    pmeta_json = (
-                        self._dec(
-                            prow["metadata"], aad=cell_aad("messages", "metadata", message_id)
+                    if prow is not None:
+                        msg_channel = str(prow["channel_id"])
+                        pmeta_json = open_message_cell(
+                            self._cipher,
+                            "metadata",
+                            prow["metadata"],
+                            message_id=message_id,
+                            channel_id=msg_channel,
                         )
-                        if prow
-                        else None
-                    )
                 if pt_deliveries:
                     parent_meta: dict[str, Any] = {}
                     if pmeta_json:
@@ -3987,7 +4049,12 @@ class PostgresStore:
                     merged = merge_user_metadata(pmeta_json, meta_ops)
                     await conn.execute(
                         "UPDATE messages SET metadata=$1 WHERE id=$2",
-                        self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                        self._enc(
+                            merged,
+                            aad=message_cell_aad(
+                                "metadata", message_id=message_id, channel_id=msg_channel
+                            ),
+                        ),
                         message_id,
                     )
                 # Track B Step 6b: bump each DISTINCT namespace's version IN THE SAME txn as its writes —
@@ -5062,6 +5129,7 @@ class PostgresStore:
         # *admits* a message, and fencing it would convert a permitted duplicate into a LOST re-ingress,
         # breaking count-and-log.
         guard, guard_args = self._resolve_guard(6)
+        tag_failures: list[CellTagError] = []
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
@@ -5075,37 +5143,41 @@ class PostgresStore:
                     if wr is None:
                         raise _Noop()  # already consumed by a committed prior run
                     origin_id = wr["message_id"]
-                    try:
-                        ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
-                        origin_msg_id, dest, seq_s = ref.split("\x1f")
-                        seq = int(seq_s)
-                    except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
-                        # A corrupt/undecryptable work-row reference can never be re-ingressed: dead-letter
-                        # the token + ERROR the origin in THIS transaction and CONSUME it (return True ⇒
-                        # the conn.transaction() commits) — never re-loop. Mirrors the SQLite branch and
-                        # the depth-cap branch (NOT the _Noop rollback, which would leave the token live).
+
+                    async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                        # An unrecoverable token: dead-letter it + ERROR the origin in THIS
+                        # transaction and CONSUME it (return True ⇒ the conn.transaction() commits)
+                        # — never re-loop (NOT the _Noop rollback, which would leave the token live).
                         await self._exec_terminal(
                             conn,
-                            "ingress_handoff(corrupt-ref)",
+                            label,
                             (response_row_id,),
                             "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
                             " updated_at=$4 WHERE id=$5" + guard,
                             OutboxStatus.DEAD.value,
-                            self._enc(
-                                "re-ingress work-row reference is corrupt/unparseable",
-                                aad=cell_aad("queue", "last_error", response_row_id),
-                            ),
+                            self._enc(error, aad=cell_aad("queue", "last_error", response_row_id)),
                             now,
                             now,
                             response_row_id,
                             *guard_args,
                             checked=bool(guard),
                         )
-                        await self._event(
-                            conn, origin_id, "dead", None, "re-ingress ref corrupt", now
-                        )
+                        await self._event(conn, origin_id, "dead", None, event_detail, now)
                         await self._maybe_finalize_message(conn, origin_id, now)
                         return True
+
+                    try:
+                        ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
+                        origin_msg_id, dest, seq_s = ref.split("\x1f")
+                        seq = int(seq_s)
+                    except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                        # A corrupt/undecryptable work-row reference can never be re-ingressed.
+                        # Mirrors the SQLite branch and the depth-cap branch.
+                        return await _consume_dead(
+                            "ingress_handoff(corrupt-ref)",
+                            "re-ingress work-row reference is corrupt/unparseable",
+                            "re-ingress ref corrupt",
+                        )
                     art = await conn.fetchrow(
                         "SELECT body FROM response"
                         " WHERE message_id=$1 AND destination_name=$2 AND response_seq=$3",
@@ -5123,15 +5195,30 @@ class PostgresStore:
                     )
                     body = body or ""
                     mrow = await conn.fetchrow(
-                        "SELECT metadata FROM messages WHERE id=$1", origin_id
+                        "SELECT channel_id, metadata FROM messages WHERE id=$1", origin_id
                     )
                     origin_meta: dict[str, Any] = {}
-                    # EF-3: ciphered, bound to the origin message's metadata cell
-                    meta_json = (
-                        self._dec(mrow["metadata"], aad=cell_aad("messages", "metadata", origin_id))
-                        if mrow
-                        else None
-                    )
+                    # EF-3: ciphered, bound to the origin message's metadata cell and its channel
+                    # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+                    try:
+                        meta_json = (
+                            open_message_cell(
+                                self._cipher,
+                                "metadata",
+                                mrow["metadata"],
+                                message_id=origin_id,
+                                channel_id=mrow["channel_id"],
+                            )
+                            if mrow
+                            else None
+                        )
+                    except CellTagError as err:
+                        tag_failures.append(err)  # audited once the transaction has closed
+                        return await _consume_dead(
+                            "ingress_handoff(origin-tag)",
+                            str(err),
+                            "re-ingress origin failed its integrity check",
+                        )
                     if meta_json:
                         loaded = json.loads(meta_json)
                         if isinstance(loaded, dict):
@@ -5265,6 +5352,9 @@ class PostgresStore:
             # the response worker's next claim is itself fenced — so there is no hot spin.
             await self._after_fenced_write(exc)
             return False
+        finally:
+            # BACKLOG #2593: after the transaction, never inside it.
+            await report_cell_tag_failures(self, tag_failures)
         return True
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
@@ -5545,7 +5635,11 @@ class PostgresStore:
                 name,
             )
             effective_id = str(existing) if existing is not None else preset_id
-            enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
+            # Bound to the row id and its owner (BACKLOG #2593).
+            enc = self._enc(
+                criteria,
+                aad=preset_criteria_aad(preset_id=effective_id, owner_user_id=owner_user_id),
+            )
             if existing is not None:
                 await conn.execute(
                     "UPDATE search_presets SET criteria=$1, updated_at=$2 WHERE id=$3",
@@ -5574,6 +5668,7 @@ class PostgresStore:
         )
         return [dict(r) for r in rows]
 
+    @audits_cell_tag
     async def get_search_preset(
         self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
@@ -5586,8 +5681,10 @@ class PostgresStore:
         if row is None:
             return None
         out = dict(row)
-        out["criteria"] = self._dec(
-            row["criteria"], aad=cell_aad("search_presets", "criteria", preset_id)
+        # Bound to the row id and its owner (BACKLOG #2593): a preset moved to another owner outside
+        # the store refuses here.
+        out["criteria"] = open_preset_criteria(
+            self._cipher, row["criteria"], preset_id=preset_id, owner_user_id=owner_user_id
         )
         # #306: stamp last-USED, best-effort and AFTER the read — a usage hint must never fail the
         # recall it annotates (SQLite parity). The returned dict carries the PRE-stamp value.
@@ -6801,6 +6898,7 @@ class PostgresStore:
             outbox_id=row["outbox_id"],
         )
 
+    @audits_cell_tag
     async def resend_to(
         self,
         *,
@@ -6887,8 +6985,12 @@ class PostgresStore:
                             f"message {message_id} edited body is empty -- cannot resend"
                         )
                     # Correlate the child to the origin (mirrors `reingress`).
-                    raw_meta = self._dec(
-                        orow["metadata"], aad=cell_aad("messages", "metadata", message_id)
+                    raw_meta = open_message_cell(
+                        self._cipher,
+                        "metadata",
+                        orow["metadata"],
+                        message_id=message_id,
+                        channel_id=src_channel,
                     )
                     try:
                         parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -7007,6 +7109,7 @@ class PostgresStore:
                 await self._append_operator_audit(conn, written, audit, outcome)
                 return outcome
 
+    @audits_cell_tag
     async def reingress(
         self,
         *,
@@ -7071,8 +7174,12 @@ class PostgresStore:
                     )
                     await self._append_operator_audit(conn, written, audit, outcome)
                     return outcome
-                raw_meta = self._dec(
-                    orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
+                raw_meta = open_message_cell(
+                    self._cipher,
+                    "metadata",
+                    orow["metadata"],
+                    message_id=origin_message_id,
+                    channel_id=channel_id,
                 )
                 try:
                     parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -7290,28 +7397,37 @@ class PostgresStore:
 
     # --- read helpers (API / console) ----------------------------------------
 
+    @audits_cell_tag
     async def get_message(self, message_id: str) -> dict[str, Any] | None:
         record = await self._fetchone("SELECT * FROM messages WHERE id=$1", message_id)
         if record is None:
             return None
         d = dict(record)
-        mid = d["id"]
-        # decrypt the body for display, bound to the messages cell (ASVS 11.3.3)
-        d["raw"] = self._cipher.decrypt(d["raw"], aad=cell_aad("messages", "raw", mid))
-        # error may embed raw HL7 fragments (WP-5)
-        d["error"] = self._dec(d["error"], aad=cell_aad("messages", "error", mid))
-        # EF-3: MRN/name PHI, ciphered at rest
-        d["summary"] = self._dec(d["summary"], aad=cell_aad("messages", "summary", mid))
-        d["metadata"] = self._dec(d["metadata"], aad=cell_aad("messages", "metadata", mid))  # EF-3
+        # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, WP-5), summary and
+        # metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3, BACKLOG
+        # #2593), so a cell that fails that tag refuses the whole read.
+        for column in ("raw", "error", "summary", "metadata"):
+            d[column] = open_message_cell(
+                self._cipher, column, d[column], message_id=d["id"], channel_id=d["channel_id"]
+            )
         return d
 
+    @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
         # #68: decrypt ONLY the metadata column (never the raw PHI body) for the delivery worker's
         # per-message dynamic headers. Off the perf-critical claim path; read only for opted-in outbounds.
-        record = await self._fetchone("SELECT metadata FROM messages WHERE id=$1", message_id)
+        record = await self._fetchone(
+            "SELECT channel_id, metadata FROM messages WHERE id=$1", message_id
+        )
         if record is None:
             return None
-        return self._dec(record["metadata"], aad=cell_aad("messages", "metadata", message_id))
+        return open_message_cell(
+            self._cipher,
+            "metadata",
+            record["metadata"],
+            message_id=message_id,
+            channel_id=record["channel_id"],
+        )
 
     async def list_messages(
         self,
@@ -7350,10 +7466,23 @@ class PostgresStore:
             limit,
             offset,
         )
-        return [
-            self._decode_record(r, "messages", (r["id"],), "error", "summary", "metadata")
-            for r in rows
-        ]
+        # Each row's cells open under its tag (BACKLOG #2593). A row that fails still lists by its
+        # plaintext columns with its cells withheld; drift is alerted and audited (the SQLite twin).
+        failures: list[CellTagError] = []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            withhold_message_cells(
+                self._cipher,
+                d,
+                ("error", "summary", "metadata"),
+                message_id=d["id"],
+                channel_id=d["channel_id"],
+                failures=failures,
+            )
+            out.append(d)
+        await report_cell_tag_failures(self, failures)
+        return out
 
     async def count_messages(
         self,
@@ -7408,14 +7537,22 @@ class PostgresStore:
             *params,
             spec.fetch_limit,
         )
-        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
+        failures: list[CellTagError] = []
+        result = await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit, failures)
+        await report_cell_tag_failures(self, failures)
+        return result
 
     def _scan_rows(
-        self, spec: SearchSpec, candidates: Sequence[Any], limit: int
+        self,
+        spec: SearchSpec,
+        candidates: Sequence[Any],
+        limit: int,
+        failures: list[CellTagError],
     ) -> MessageSearchResult:
         """Off-loop decrypt+match loop (mirrors ``MessageStore._scan_rows``). Bounded by
         ``spec.scan_limit`` decrypts and ``limit`` matches; returns metadata-only rows (the decrypted
-        ``raw`` is dropped, so the PHI surface equals ``list_messages``)."""
+        ``raw`` is dropped, so the PHI surface equals ``list_messages``). A candidate whose cells fail
+        the row's tag is left out, and its error goes to ``failures`` (BACKLOG #2593)."""
         out: list[dict[str, Any]] = []
         scanned = 0
         truncated = False
@@ -7424,15 +7561,23 @@ class PostgresStore:
                 truncated = True
                 break
             scanned += 1
-            cid = cand["id"]
-            raw = self._dec(cand["raw"], aad=cell_aad("messages", "raw", cid))
-            summary = self._dec(cand["summary"], aad=cell_aad("messages", "summary", cid))
-            if row_matches(spec, raw=raw, summary=summary):
-                d = self._decode_record(cand, "messages", (cid,), "error", "summary", "metadata")
-                d.pop("raw", None)
-                out.append(d)
-                if len(out) >= limit:
-                    break
+            d = dict(cand)
+            stored_raw = d.pop("raw", None)
+
+            tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
+            try:
+                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
+                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                if not row_matches(spec, raw=raw, summary=d["summary"]):
+                    continue
+                for column in ("error", "metadata"):
+                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
+            except CellTagError as err:
+                failures.append(err)
+                continue
+            out.append(d)
+            if len(out) >= limit:
+                break
         return MessageSearchResult(rows=out, scanned=scanned, matched=len(out), truncated=truncated)
 
     async def list_dead(
@@ -7451,7 +7596,8 @@ class PostgresStore:
         rows = await self._fetchall(
             "SELECT o.id AS outbox_id, o.message_id, o.channel_id, o.destination_name,"
             " o.attempts, o.last_error, o.updated_at,"
-            " m.control_id, m.message_type, m.received_at, m.summary"
+            " m.control_id, m.message_type, m.received_at, m.summary,"
+            " m.channel_id AS message_channel_id"
             f" FROM queue o JOIN messages m ON m.id = o.message_id{where}"
             f" ORDER BY o.updated_at DESC, o.id DESC LIMIT ${n + 1} OFFSET ${n + 2}",
             *params,
@@ -7459,14 +7605,22 @@ class PostgresStore:
             offset,
         )
         # Mixed-table join: last_error is queue's (o.id, aliased outbox_id), summary is the joined
-        # messages row's (keyed by message_id) — each binds to its own cell (ASVS 11.3.3).
+        # messages row's (keyed by message_id and bound to the message's own channel, BACKLOG #2593)
+        # — each binds to its own cell (ASVS 11.3.3).
+        failures: list[CellTagError] = []
         out: list[dict[str, Any]] = []
         for r in rows:
             d = self._decode_record(r, "queue", (r["outbox_id"],), "last_error")
-            d["summary"] = self._dec(
-                r["summary"], aad=cell_aad("messages", "summary", r["message_id"])
+            withhold_message_cells(
+                self._cipher,
+                d,
+                ("summary",),
+                message_id=r["message_id"],
+                channel_id=d.pop("message_channel_id"),
+                failures=failures,
             )
             out.append(d)
+        await report_cell_tag_failures(self, failures)
         return out
 
     async def count_dead(
@@ -9699,24 +9853,35 @@ class PostgresStore:
             docs = 0
             reclaimed = 0
             updates: list[tuple[str, float, str]] = []
+            failures: list[CellTagError] = []
             for row in rows:
                 cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
                 if row["received_at"] >= cutoff:
                     continue
                 try:
-                    raw = self._cipher.decrypt(
-                        row["raw"], aad=cell_aad("messages", "raw", row["id"])
+                    raw = open_message_cell(
+                        self._cipher,
+                        "raw",
+                        row["raw"],
+                        message_id=row["id"],
+                        channel_id=row["channel_id"],
                     )
                 except CipherError as exc:
                     # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
                     # must not abort the whole retention pass. The row is left exactly as found; the
                     # message names only the cell and the message id, never the body (BACKLOG #1169).
+                    if isinstance(exc, CellTagError):
+                        # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
+                        # audited below. No second WARNING on every pass.
+                        failures.append(exc)
+                        continue
                     log.warning(
                         "document strip skipped message %s: its body could not be read: %s",
                         row["id"],
                         exc,
                     )
                     continue
+                assert raw is not None  # raw is NOT NULL
                 new_raw, n_docs, n_bytes = _strip_documents(
                     raw,
                     pruned_at=now,
@@ -9727,7 +9892,12 @@ class PostgresStore:
                     continue
                 updates.append(
                     (
-                        self._cipher.encrypt(new_raw, aad=cell_aad("messages", "raw", row["id"])),
+                        self._cipher.encrypt(
+                            new_raw,
+                            aad=message_cell_aad(
+                                "raw", message_id=row["id"], channel_id=row["channel_id"]
+                            ),
+                        ),
                         now,
                         row["id"],
                     )
@@ -9740,6 +9910,7 @@ class PostgresStore:
                     await conn.executemany(
                         "UPDATE messages SET raw=$1, documents_pruned=$2 WHERE id=$3", updates
                     )
+        await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
         )
