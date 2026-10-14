@@ -940,11 +940,10 @@ def _drop_truncated_userinfo(text: str, cut: int) -> int:
     of the gap between opener and terminator, in steps of 5 from 0 to 125, on 64 KiB of nothing but
     credential spans: the worst is a 75-character gap at **348 passes**. A gap of 120 or more takes
     ONE pass -- past that the span cannot reach an ``@`` beyond the cut at all -- so the cost is not
-    monotone in the gap and a single sample of it measures nothing. Re-measured 2026-10-13 on that
-    worst gap: 5.8 to 7.0 ms of CPU time at the shipped window, and 7.3 to 9.1 times the cost at an
-    eighth of it, which is linear. The earlier 1.6 ms figure did not survive re-measurement. Pinned in
-    ``tests/test_redaction.py`` under *bounding the input*, as that CPU-time ratio plus a 0.5 s
-    ceiling (BACKLOG #2958)."""
+    monotone in the gap and a single sample of it measures nothing. Pinned in
+    ``tests/test_redaction.py`` by ``test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer``,
+    which holds the measured cost; an earlier 1.6 ms figure here did not survive re-measurement
+    (BACKLOG #2958)."""
     while cut:
         start = _first_truncated_userinfo(text, cut)
         if start < 0:

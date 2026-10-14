@@ -224,9 +224,11 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
 #: about 8% of the sample.
 _CPU_SAMPLE_FLOOR_SECONDS = 0.2
 
-#: The line the CPU-time cost arms share, the one ``test_the_mrn_pass_stays_linear_and_affordable``
-#: already uses. Each arm divides a large input's CPU time by a small one's, and the sizes are chosen
-#: so the shipped code and the regression it guards land on opposite sides of 24, each with room.
+#: The line the CPU-time cost arms share. Each arm divides a large input's CPU time by a small one's,
+#: and the sizes are chosen so the shipped code and the regression it guards land on opposite sides
+#: of 24, each with room. **The number is borrowed, the clock is not:**
+#: ``test_the_mrn_pass_stays_linear_and_affordable`` reads the same 24 off a WALL-clock ratio, and
+#: this change does not move it.
 _CPU_GROWTH_LINE = 24.0
 
 #: The absolute ceiling those arms also read, in CPU seconds for the large input. **Ten times the
@@ -241,7 +243,9 @@ def _cpu_seconds(work: Callable[[], object], reps: int = 3) -> float:
 
     **CPU time rather than wall time, for the arms whose margin a loaded runner can eat (BACKLOG
     #2958).** A busy host delays a process without charging it the delay, so the clock this reads
-    stops while the runner is away. It does not stop everything: a shared core still slows each
+    stops while the runner is away. **It counts every thread in the process, not only this one**, so
+    a thread an earlier test left running is charged here too. It does not stop everything: a shared
+    core still slows each
     instruction through the cache, which is why the arms read a RATIO between two sizes timed back to
     back, under one load, rather than a fixed number of seconds. A wall-clock ratio was built and
     withdrawn in PR 2000, red 12 times in 25 on a shared Linux core; this is not that instrument.
@@ -554,7 +558,7 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
 
     **Kept on the budget because the margins are wide (BACKLOG #2958).** Measured 2026-10-13, three
     runs on an unloaded Windows box: 1.6 to 1.8 ms for the ops text and 0.66 to 0.79 ms for the custom
-    message, at least 28 and 63 times under the line."""
+    message, at least 27 and 63 times under the line."""
     ops_block = "\n".join(_OPERATIONAL_LINES * 40)  # about 10 KB, no MSH anywhere
     assert len(ops_block) > 9_000
     custom = _custom_delimiter_message(300)
@@ -1099,9 +1103,12 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     ratio of 7.3 to 9.1, and 5.8 to 7.0 ms at the shipped window, under ``_CPU_CEILING_SECONDS`` by
     about 70 times. The control below reads 62 to 76 for a search that restarts at index 0.
 
-    **The absolute bound stays, at ten times the old line.** BACKLOG #2952 limit 3 names this arm and
-    the frame-cap prose arm as the only absolute bounds on one clamp's cost. A pure ratio would give
-    that up, so the shipped window is also held under ``_CPU_CEILING_SECONDS``."""
+    **An absolute bound is kept, but it is ten times looser than the old one.** BACKLOG #2952 limit 3
+    names this arm and the frame-cap prose arm as the only absolute bounds on one clamp's cost. A pure
+    ratio would give that up, so the shipped window is also held under ``_CPU_CEILING_SECONDS``. That
+    ceiling passes a walk that stays linear but costs up to about 70 times today's, where the old
+    budget caught about 8 times. The batch plan's ruling chose that trade, so this arm cannot fail on
+    a loaded runner the way #2896 did."""
     growth, large = _credential_walk_growth()
     assert growth < _CPU_GROWTH_LINE, (
         f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
@@ -1292,7 +1299,7 @@ def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> No
 
     **Kept on the budget because the margins are wide (BACKLOG #2958).** Measured best-of-3 on
     2026-10-13, three runs on an unloaded Windows box: 2.0 to 3.0 ms for the segment shape and 0.06
-    to 0.09 ms for the solid run. A runner would have to inflate them at least 17 and 550 times to
+    to 0.09 ms for the solid run. A runner would have to inflate them at least 16 and 550 times to
     fake a red. The token walk that failed #2896 had about 7 times. Prose is the third shape, and it moved to
     ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``."""
     text = _FRAME_CAP_SHAPES[label]()
@@ -1301,6 +1308,21 @@ def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> No
     assert best < _SCAN_BUDGET_SECONDS, (
         f"safe_text on {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
         f"a {_SCAN_BUDGET_SECONDS}s budget"
+    )
+
+
+@pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
+def test_control_the_budget_shapes_are_expensive_unbounded(label: str) -> None:
+    """Non-vacuity for the budget arm above, on the SAME fixture and the SAME line. Without it, a fast
+    ``safe_text`` would be equally consistent with a fixture too cheap to measure anything.
+    ``redact`` is called directly, which is what ``safe_text`` did before the bound. Measured
+    2026-10-13, five single samples each: 1.24 to 1.56 s for the solid run and 0.59 to 1.03 s for
+    the segment shape. One sample, because noise can only make it slower."""
+    text = _FRAME_CAP_SHAPES[label]()
+    best = _best_of(lambda: redact(text), 1)
+    assert best > _SCAN_BUDGET_SECONDS, (
+        f"the unbounded scan of {label} cost only {best:.4f}s, under the {_SCAN_BUDGET_SECONDS}s "
+        f"budget the bounded arm clears -- this fixture no longer discriminates"
     )
 
 
@@ -1330,8 +1352,9 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
     cap, under ``_CPU_CEILING_SECONDS`` by about 90 times. The control below reads 282 to 320 for the
     unbounded scan.
 
-    **The ceiling is the absolute bound BACKLOG #2952 limit 3 asks to keep**, at ten times the old
-    line. ``safe_text`` runs the whole clamp on this input, the name walk included."""
+    **The ceiling is the absolute bound BACKLOG #2952 limit 3 asks to keep**, ten times looser than
+    the old line: it passes a scan up to about 90 times today's. ``safe_text`` runs the whole clamp on
+    this input, the name walk included."""
     growth, large = _frame_cap_prose_growth(safe_text)
     assert growth < _CPU_GROWTH_LINE, (
         f"safe_text on the frame-cap prose cost {growth:.1f} times one window of it, over the "
@@ -1489,9 +1512,11 @@ class _MeteredText(str):
     ``+`` (BACKLOG #2952 limit 2). ``str(text)`` was the second way past the meter, a plain copy any
     search could then read for free.
 
-    **WHAT IT STILL CANNOT SEE, which is more than the floor in ``_walk_cost`` covers.** A read made
-    by the regex engine, and an unbound call such as ``str.rfind(text, ...)`` or
-    ``str.__str__(text)``, which reach the C code without passing through this class. The floor
+    **WHAT IT STILL CANNOT SEE, which is more than the floor in ``_walk_cost`` covers.** At least
+    these: a read made by the regex engine; an unbound call such as ``str.rfind(text, ...)`` or
+    ``str.__str__(text)``; and an operator with a plain ``str`` on its left or none of its own here,
+    such as ``"" + text``, ``"".join([text])``, ``text * 2`` or ``text == other``. Each reaches the
+    C code without passing through this class. The floor
     refuses a walk charged less than one touch per character it dropped. It passes a walk that
     charges that much and then does unbounded work through one of those routes. So the walk arms show
     that the shipped spelling is linear and that the spellings they name are caught. They do not show
@@ -1692,12 +1717,14 @@ def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
 
     **No absolute bound is added here, and that is BACKLOG #2952 limit 3 answered by a reason rather
     than by code.** Any absolute bound is a number of seconds, and seconds on this walk are what
-    #2896 removed. The absolute bound on one clamp lives in two CPU-time arms instead, each held under
-    ``_CPU_CEILING_SECONDS``: ``test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer``
-    and ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``. Neither drives the name walk
-    hard, because neither wall is name-shaped. So a name walk that stays linear but carries a large
-    constant still passes everything here. That gap is accepted, and it is recorded rather than
-    closed."""
+    #2896 removed. Absolute bounds on one clamp live in at least these arms instead: the two CPU-time
+    arms under ``_CPU_CEILING_SECONDS``
+    (``test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer`` and
+    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``), and the two frame-cap shapes
+    still under ``_SCAN_BUDGET_SECONDS``. None of their walls is name-shaped where the cut lands, so
+    none drives the name walk past a token or two. So a name walk that stays linear but carries a
+    large constant still passes everything here. That gap is accepted, and it is recorded rather
+    than closed."""
     growth = _walk_growth()
     assert growth < _WALK_GROWTH_LINE, (
         f"doubling the window multiplied the characters the walk touches by {growth:.2f}, over the "
