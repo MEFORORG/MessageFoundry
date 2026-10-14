@@ -146,6 +146,10 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
     $emit = $true
     try {
         $dir = $StateDir
+        # The repository the gate STARTED in, captured before it moved. Asked from where the gate is
+        # now, git answers nothing in a directory outside every checkout, so the notice was never
+        # throttled, and in another repository it would stamp that repository's .git.
+        if (-not $dir -and $script:StartCommon) { $dir = Join-Path $script:StartCommon "mefor-coord" }
         if (-not $dir) {
             $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
             if ($LASTEXITCODE -eq 0 -and $common) { $dir = Join-Path ([string]$common).Trim() "mefor-coord" }
@@ -220,13 +224,24 @@ if (-not $target) {
     # INTO THE SESSION'S OWN DIRECTORY, BEFORE ANY GIT CALL. See the header: this process may have
     # started in the primary checkout. Moving here is what makes overlap.ps1, a CHILD started in this
     # location, read the edit's path against the session's own worktree.
+    $startCommon = "$(& git rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+    if ($startCommon) { $script:StartCommon = $startCommon }
     if ($hasHelper) {
         $cwdFault = Enter-CcxHookCwd -Text $raw
         # A directory that exists but sits in no checkout is entered without complaint, and overlap.ps1
-        # then finds no repository and prints "[]", the bytes of an all-clear.
+        # then finds no repository and prints "[]", the bytes of an all-clear. A directory in ANOTHER
+        # repository is worse: overlap.ps1 walks that repository, prints "[]", and leaves its cache in
+        # that repository's .git. Either way the gate cannot read this edit against the session's own
+        # worktree in the repository it guards.
         if (-not $cwdFault) {
             $wt = Get-CcxHookWorktree -Text $raw
             if ($wt.Named -and -not $wt.Root) { $cwdFault = $wt.Reason }
+            elseif ($wt.Named -and $startCommon) {
+                $hereCommon = "$(& git rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+                if ($hereCommon -and ($hereCommon.TrimEnd('/') -ine $startCommon.TrimEnd('/'))) {
+                    $cwdFault = "the hook input names cwd $($wt.Root), which is in another repository"
+                }
+            }
         }
     }
     try { $hook = $raw | ConvertFrom-Json -ErrorAction Stop } catch {
@@ -245,14 +260,20 @@ if (-not $target) {
     if (-not $target) { $target = [string]$hook.tool_input.notebook_path }
     # The stamp is keyed on the cwd the input named, so each session keeps its own notice. See
     # Write-Unresolved for why a shared stamp is a false all-clear.
+    # With no cwd named, the session id keys it, for the same reason.
     if ($cwdFault) {
         $named = ''
+        $kind = 'cwd'
         try { $named = [string]$hook.cwd } catch { $named = '' }
+        if (-not $named) {
+            try { $named = [string]$hook.session_id } catch { $named = '' }
+            $kind = 'sid'
+        }
         if ($named) {
             $sha = [System.Security.Cryptography.SHA256]::Create()
             $h = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($named))[0..3] | ForEach-Object { $_.ToString('x2') })
             $sha.Dispose()
-            $script:StampWho = "cwd-$h"
+            $script:StampWho = "$kind-$h"
         }
     }
 }

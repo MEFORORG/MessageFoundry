@@ -225,6 +225,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # The send-time check in mail.ps1 is advisory only: anyone who can write a file into the inbox skips
 # it entirely. The numbers and the reasoning that anchors them are in docs/SESSION-MAIL.md,
 # "Receiver-side caps"; these constants are the ENFORCING copy.
+$NO_BOX_COOLDOWN_MINUTES = 30  # how often a session is told its box could not be found
 $MAX_MESSAGES = 5       # rendered per injection
 $MAX_BODY_BYTES = 2000  # per message body, measured AFTER the sanitiser has scrubbed it to ASCII
 # 12800 = MAX_MESSAGES * (MAX_BODY_BYTES + FRAME_OVERHEAD_BYTES), AND THAT ARITHMETIC IS THE FIX FOR
@@ -745,11 +746,36 @@ try {
     # the input as UTF-8. Showing any other box here would be showing another session's mail, and on
     # Stop this session would then file it as read. So nothing is read, and the reader is told that
     # this silence is not an empty box.
+    #
+    # ONCE PER $NO_BOX_COOLDOWN_MINUTES FOR EACH SESSION, not at every SessionStart and Stop: a fault
+    # that persists would otherwise put this line in front of the session at the end of every turn.
+    # The stamp is outside the mail root, which the receipt sweep owns. A stamp that cannot be read or
+    # written means the line is said: noise is the safe failure of a silencer.
     if ($cwdFault) {
-        Write-Injection -Event $eventName -Text (
-            "[mefor-mail] NO BOX. $((Get-Clean $cwdFault 300)), so this drain cannot tell which box is this " +
-            "session's and NOTHING WAS READ. This is not an empty box. As of $([DateTime]::UtcNow.ToString('o'))."
-        )
+        $emit = $true
+        try {
+            $key = if ($hook -and $hook.cwd) { 'cwd:' + [string]$hook.cwd } elseif ($sessionId) { 'sid:' + $sessionId } else { 'reader:' + $PSScriptRoot }
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $h = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($key))[0..3] | ForEach-Object { $_.ToString('x2') })
+            $sha.Dispose()
+            $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-mail-nobox/$h.stamp"
+            $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
+            if ($prev) {
+                $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
+                if ($mins -ge 0 -and $mins -lt $NO_BOX_COOLDOWN_MINUTES) { $emit = $false }
+            }
+            if ($emit) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $stamp) | Out-Null
+                Set-Content -LiteralPath $stamp -Value ((Get-Date).ToString('o')) -Encoding ascii
+            }
+        } catch { $emit = $true }
+        if ($emit) {
+            Write-Injection -Event $eventName -Text (
+                "[mefor-mail] NO BOX. $((Get-Clean $cwdFault 300)), so this drain cannot tell which box is this " +
+                "session's and NOTHING WAS READ. This is not an empty box. As of $([DateTime]::UtcNow.ToString('o')). " +
+                "Said once per $NO_BOX_COOLDOWN_MINUTES minutes while it lasts."
+            )
+        }
         exit 0
     }
 
