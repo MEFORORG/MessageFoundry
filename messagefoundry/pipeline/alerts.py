@@ -751,20 +751,20 @@ class AlertSink(Protocol):
         ``count`` is how many scripts were refused since this alert was last raised, and
         ``total`` how many since the process started.
 
-        **Never a script's file name.** The injecting process chooses it, so it stays in the
-        guard's WARNING line in the engine log. Counts and this process's own label only: no
-        message content, no PHI.
+        **Never a script's file name.** The injecting process chooses it, so it is only in the
+        guard's WARNING line in the engine log, where there is one. Counts and this process's own
+        label only: no message content, no PHI.
 
         Raised at most once per pass of
         :class:`~messagefoundry.pipeline.remote_debug_watch.RemoteDebugRefusalWatch`, on the event
         loop, however many scripts were refused, so the injecting process does not set the rate.
         The engine runs that watch. Of the commands, only ``serve`` builds an engine, so only
-        ``serve`` raises this. The watch's module docstring says when an application that builds
-        its own engine raises it too. It is not a connection-scoped event, so no rule's
-        ``control_action`` fires on it, and the colon keeps ``name`` outside the connection-name
-        grammar. Nothing resolves it: a refusal is an event, not a state that can clear, so an
-        operator resolves the instance. The ``remote_debug_refused`` audit row is the durable
-        record."""
+        ``serve`` raises this. An application that builds its own engine may have no guard at
+        all; docs/SECURITY-LOOSENING.md says what that means. It is not a connection-scoped event,
+        so no rule's ``control_action`` fires on it. The colon keeps ``name`` outside the
+        connection-name grammar. Nothing resolves it: a refusal is an event, not a state that can
+        clear, so an operator resolves the instance. The ``remote_debug_refused`` audit row is the
+        durable record."""
         ...
 
 

@@ -1633,53 +1633,69 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Under `serve`, a refusal also writes an audit row and raises an alert** (vault BACKLOG
   #2742, owner ruling 2026-10-13). Both are named `remote_debug_refused`.
   - **One row and one alert for each read, with a count.** The engine reads the count of
-    refusals as it starts, every 30 seconds after that, and once more as it stops. When the count
-    has risen, the engine raises one alert and writes one audit row, however many scripts were
-    refused in between. Each carries `count`, the number refused since the last one, and
-    `total`, the number since the process started. The injecting process chooses how often it
-    tries, so this keeps it from filling the audit log or the pager: at most one row and one
-    alert for each read. A caller who can restart the engine adds a read at each start and stop.
-    The 30 seconds start when a read ends. Where the store hangs, a read also waits out the row's
-    time limit, given below. Reads then come about 60 seconds apart.
+    refusals as it starts, every 30 seconds after that, and once more as it stops. The read at
+    stop can be cut off, as the point on stopping says. When the count has risen, the engine
+    raises one alert and writes one audit row, however many scripts were refused in between.
+    Each carries `count` and `total`, which the point on counting defines. The injecting process
+    chooses how often it tries. So this keeps it from filling the audit log or the pager: at most
+    one row and one alert for each read. A caller who can restart the engine adds a read at each
+    start and stop.
   - **No file name.** The injecting process chooses the script's name, so neither the row nor
-    the alert carries it. The name is in the WARNING line only, where there is one: not in the
-    case below where the guard reads as missing, and not past the backlog of 64.
+    the alert carries it. The name is in the refusal's WARNING line only. At least three cases
+    have no such line: the case below where the guard reads as missing, a refusal past the
+    backlog of 64, and a refusal still waiting to be logged when the process exits.
   - **Counted from the start of the process.** The first read reports every refusal since the
     process started, so one made before the engine opened its store is recorded. A process that
-    is killed leaves no row for the refusals since its last read. Their WARNING lines remain, up
-    to the backlog above.
+    is killed leaves no row and no alert for the refusals since its last read. Their WARNING
+    lines may remain, within the limits the point above gives.
   - **The row.** Its actor is `system`. Its detail holds the two counts, the engine process's
     label as `process` (`node:<node_id>`, `shard:<id>`, or null on a lone engine) and its
-    process id. The alert is raised first and does not wait for the row. If the store refuses
-    the row, or does not answer within 30 seconds, the engine logs an ERROR. The next read then
-    writes the row with the count so far.
+    process id. The alert is raised first and does not wait for the row. The engine gives up on
+    a row the store refuses, or has not taken within 30 seconds. It cancels the write, then
+    waits for the store's driver to let go of it. A driver can take as long to let go as it took
+    to hang. The engine then logs an ERROR. Each later read tries the row again, with the count
+    so far, until the store takes it. While a row is owed and the store hangs, each read waits
+    like this. The 30 seconds between reads start only when a read ends. So reads then come at
+    least about 60 seconds apart.
   - **The alert.** Its `connection` is `remote_debug:refused`, with `@node:<node_id>` or
     `@shard:<id>` appended where several engine processes share the store. A rule can match
     `event_type = "remote_debug_refused"`. With no `[alerts]` transport it is a WARNING line.
-    If the alert cannot be raised, the engine logs an ERROR. The next read then raises it with
-    the count so far. Nothing resolves it, because a refusal is an event and not a state that
-    can clear. An operator resolves it. A second alert inside the notifier's cooldown updates
-    the open alert and does not page again, so a page's `count` covers only its own read. The
-    alert list's own count is the number of reads that raised it, not the number of scripts.
-  - **The read at stop has no next read.** A row or an alert that read cannot deliver is lost,
-    though its ERROR line still says the next pass writes or raises it. The engine also waits
-    only about 5 seconds for the reads to finish once it starts to stop. Then it cancels them
-    and logs a WARNING that a row may be missing. Refusals that no read had reached by then also
-    get no alert. Either way, the WARNING lines of the refusals remain, as for a killed process.
-  - **Count from the latest row's `total`, not from a sum of `count`.** A sum can count some
-    refusals twice. At least one case does: a row whose write timed out after the store had
-    committed it is written again by the next read. Take the latest `total` for each engine
-    process instead. A restart starts the count again at 0. A row's `process` and `pid` say
-    which process wrote it.
+    If the alert cannot be raised, the engine logs an ERROR. Each later read raises it again,
+    with the count so far, until it goes. Nothing resolves it, because a refusal is an event and
+    not a state that can clear. An operator resolves it. A second alert inside the notifier's
+    cooldown updates the open alert and does not page again. So a page's `count` covers only its
+    own read. The alert list's own count is the number of reads that raised it, not the number
+    of scripts.
+  - **Stopping can lose the last row and the last alert.** The read at stop has no later read.
+    A row or an alert it cannot deliver is lost, though its ERROR line still says the next pass
+    will retry. When the engine starts to stop, it gives its reads about 5 seconds to finish.
+    That covers a read already in progress as well as the read at stop. If they have not
+    finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING that
+    a row may be missing. It then goes on stopping, even if a read is still running. A read in
+    progress that is cancelled this way keeps the read at stop from running at all. Refusals
+    that no read had reached then get neither a row nor an alert. Their WARNING lines may
+    remain, within the limits the **No file name** point gives.
+  - **Count from the latest row's `total`, not from a sum of `count`.** In a row, `count` is the
+    number refused since the last row the engine saw written. In an alert, it is the number
+    since the last alert the sink took. `total` is the number since the process started. A sum
+    of `count` can count some refusals twice. At least one case does: a row whose write timed
+    out after the store had committed it is written again by a later read. So take the latest
+    row's `total` for each run of an engine process. It is a lower bound, because refusals after
+    the last row the store took have no row. A row's `process` and `pid` cannot always tell two
+    runs apart. On a lone engine `process` is null, and the operating system can reuse a process
+    id. A restart starts `total` again at 0.
   - **Of the commands, only `serve` raises it.** The engine runs the reads and holds the
     notifier, and no other `messagefoundry` command builds an engine. So a refusal under
     `supervise`, `rotate-key`, `backup`, `restore` or the rest leaves the WARNING line and
-    nothing else. That holds even for `rotate-key` and `backup`, which open the store. An
-    application that builds an engine itself, through `create_managed_app` or `Engine.create`,
-    runs the reads too. Unless the guard is in its process, its count stays at 0, and it writes
-    no row and raises no alert. The `remote_debug_unguarded` point below names one way the
-    guard gets there. A call to `messagefoundry.remotedebug.install_remote_debug_guard()` is
-    another.
+    nothing else. That holds even for `rotate-key` and `backup`, which open the store.
+  - **An application that builds its own engine can run with no guard.** It runs the reads too,
+    through `create_managed_app` or `Engine.create`. Only the guard refuses a script and counts
+    it. Where the remote-debugging interface is on and the guard is not in the process, an
+    injected script is not refused at all: it runs. The count then stays at 0, so there is no
+    row and no alert. The `remote_debug_unguarded` entry below says how such an application
+    reports this, and how the guard gets in. A call to
+    `messagefoundry.remotedebug.install_remote_debug_guard()` also adds it, though an audit hook
+    added earlier can still refuse it.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
