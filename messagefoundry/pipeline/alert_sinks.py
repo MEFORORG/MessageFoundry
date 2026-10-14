@@ -1153,10 +1153,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
-        # Vault BACKLOG #3229: every administrator_granted call pops the _last_sent key
-        # `no_enabled_administrator:<name>`. Only a `user:<name>` key can match one, so an
-        # `ad-group:` grant pops nothing. _last_sent is per process, so the pop clears the cooldown
-        # in this process only. _occurrences is kept. Unlike crl_reload_applied, this resolves nothing.
+        # Vault BACKLOG #3229: every administrator_granted call pops the _last_sent key built from
+        # the no_enabled_administrator alert type and the granted target, as `_emit` builds it. Only
+        # a `user:` target can match a loss key, so an `ad-group:` grant pops nothing. _last_sent is
+        # per process, so this clears the cooldown in this process only. _occurrences and _suspended
+        # are kept. Unlike crl_reload_applied, this resolves no open instance.
         self._last_sent.pop(f"no_enabled_administrator:{name}", None)
         self._emit(
             {
