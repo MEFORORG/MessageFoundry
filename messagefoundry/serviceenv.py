@@ -47,7 +47,7 @@ import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import PureWindowsPath
+from pathlib import Path
 from typing import Protocol
 
 from messagefoundry.service_status import is_safe_service_name
@@ -412,14 +412,13 @@ def missing_service_config_refusal(
     directory. A service should start from the settings file it was registered with, by absolute
     path. The refusal applies only when the reading found the service, so a start from a shell, the
     developer loop, is unchanged. An ``UNOBSERVABLE`` reading with no service name settles nothing
-    either way and does not refuse, for the reason the module docstring gives. A service runs only
-    on Windows, so the path is read as a Windows path on every platform."""
+    either way and does not refuse, for the reason the module docstring gives."""
     if posture.service_name is None:
         return None
     if service_config is None:
         started = "no --service-config"
-    elif not PureWindowsPath(service_config).is_absolute():
-        started = f"the relative --service-config {service_config!r} and no --project-root"
+    elif not Path(service_config).is_absolute():
+        started = f"--service-config {service_config!r}, which is not an absolute path"
     else:
         return None
     return (

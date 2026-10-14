@@ -588,16 +588,16 @@ def test_only_a_known_service_with_no_settings_flag_is_refused() -> None:
         assert (reason is not None) is refused, posture
         if reason is not None:
             assert "'MessageFoundry'" in reason and "-ServiceConfig <path>" in reason
-        assert missing_service_config_refusal(posture, r"C:\mf\messagefoundry.toml") is None
+        assert missing_service_config_refusal(posture, str(_SAMPLES_CONFIG / "x.toml")) is None
 
 
 def test_a_service_refuses_a_relative_settings_flag() -> None:
     """A relative --service-config with no --project-root is read from the working directory, the
     file the flag refusal exists to keep out. The caller passes the flag anchored under the root,
     so a relative flag with a root arrives absolute."""
-    for relative in ("messagefoundry.toml", r"settings\messagefoundry.toml", r"\mf\settings.toml"):
+    for relative in ("messagefoundry.toml", str(Path("settings", "messagefoundry.toml"))):
         reason = missing_service_config_refusal(_A_SERVICE, relative)
-        assert reason is not None and "the relative --service-config" in reason, relative
+        assert reason is not None and "which is not an absolute path" in reason, relative
         assert missing_service_config_refusal(_A_SHELL, relative) is None
 
 
