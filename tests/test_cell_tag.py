@@ -21,7 +21,7 @@ import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import messagefoundry
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, cell_tag
 from messagefoundry.store.cell_tag import (
     MESSAGE_TAG_CELLS,
     MESSAGE_TAG_FAILED_ACTION,
@@ -108,13 +108,16 @@ def test_open_message_cell_refuses_a_moved_cell_and_alerts() -> None:
     assert not isinstance(missing.value, CellTagError)
 
 
-def test_only_a_failed_tag_is_drift_and_a_corrupt_row_is_contained_without_it() -> None:
+def test_only_a_failed_tag_is_drift_and_a_corrupt_row_is_contained_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A corrupt cell under a held key is not drift: no alert, but still a contained refusal.
 
     Attack arm: a cell opened under another row's tag fails its AEAD tag and is drift. Controls:
     bad base64, and a plaintext whose tag VERIFIED but is not UTF-8, both under a held key, are a
     corrupt row (BACKLOG #2308). They must not read as a moved cell, and they stay a CellTagError
     so a handoff dead-letters them and a list withholds them."""
+    monkeypatch.setattr(cell_tag, "_reported", {})  # an earlier report must not mute this one
     key_b64 = generate_key()
     cipher = make_cipher(key_b64, write_v2=True)
     assert isinstance(cipher, AesGcmCipher)
@@ -144,7 +147,19 @@ def test_only_a_failed_tag_is_drift_and_a_corrupt_row_is_contained_without_it() 
     with pytest.raises(CorruptCellError) as undecodable:
         open_message_cell(cipher, "raw", not_utf8, message_id="cr3", channel_id="A")
     assert "not valid UTF-8" in str(undecodable.value.__cause__)
-    assert len(seen) == 1  # neither corrupt row alerted
+
+    # A body too short for a nonce and a tag: AESGCM would raise a bare ValueError, uncontained.
+    marker = sealed.rsplit(":", 1)[0]
+    for body in ("", "AAAA"):
+        with pytest.raises(CorruptCellError) as short:
+            open_message_cell(cipher, "raw", f"{marker}:{body}", message_id="cr5", channel_id="A")
+        assert "too short" in str(short.value.__cause__)
+    assert len(seen) == 1  # no corrupt row alerted
+
+    # A corrupt read of a cell does not mute a later drift alert on that same cell.
+    with pytest.raises(CellTagError):
+        open_message_cell(cipher, "raw", sealed, message_id="cr5", channel_id="A")
+    assert len(seen) == 2
 
     # A list-shaped read still withholds the corrupt row rather than failing the whole page.
     record: dict[str, Any] = {"raw": bad_b64, "summary": None}

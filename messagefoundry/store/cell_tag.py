@@ -22,7 +22,9 @@ frame for the cell, so :func:`~messagefoundry.store.crypto.aad_cell_name` still 
 :func:`open_tagged_cell` raises :class:`CellTagError` and raises the ``integrity_drift`` alert through
 the cipher's tag-failure hook. The store writes the audit row once the read has left any writer
 transaction (:func:`audits_cell_tag`). A list-shaped read withholds the failed row's cells and keeps the
-row, so its plaintext columns still list and nothing is silently dropped.
+row, so its plaintext columns still list and nothing is silently dropped. A corrupt cell under a held
+key raises :class:`CorruptCellError`: it is contained the same way, but only logged, since it is not
+drift.
 
 **The store id.** No store id is minted yet, so every tag carries
 :data:`~messagefoundry.store.crypto.NO_STORE_ID`, as the queue tag does.
@@ -310,16 +312,16 @@ def withhold_message_cells(
 _REPORT_INTERVAL_S: Final = 3600.0
 #: The most cells remembered; the oldest is forgotten first.
 _REPORTED_MAX: Final = 4096
-_reported: dict[tuple[str, str, str], float] = {}
-_reported_audit: dict[tuple[str, str, str], float] = {}
+_reported: dict[tuple[str, str, str, bool], float] = {}
+_reported_audit: dict[tuple[str, str, str, bool], float] = {}
 #: The memos are touched from the event loop and from worker threads (the content-search scan, the
 #: SQL Server fused handoff), so every read-modify-write holds this lock.
 _reported_lock = threading.Lock()
 
 
-def _first_in_interval(memo: dict[tuple[str, str, str], float], err: CellTagError) -> bool:
+def _first_in_interval(memo: dict[tuple[str, str, str, bool], float], err: CellTagError) -> bool:
     """Whether ``err``'s cell has not been reported in ``memo`` within the interval; records it."""
-    key = (err.table, err.column, err.row_ref)
+    key = (err.table, err.column, err.row_ref, err.drift)  # a corrupt read never mutes drift
     now = time.monotonic()
     with _reported_lock:
         last = memo.get(key)

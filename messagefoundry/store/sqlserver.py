@@ -7451,7 +7451,7 @@ class SqlServerStore:
                     return await _consume_dead(
                         "ingress_handoff(origin-tag)",
                         str(err),
-                        "re-ingress origin failed its integrity tag",
+                        "re-ingress origin failed its integrity check",
                     )
                 loaded = json.loads(meta_json) if meta_json else {}
                 origin_meta = loaded if isinstance(loaded, dict) else {}
@@ -11408,7 +11408,7 @@ class SqlServerStore:
             (*params, offset, limit),
         )
         # error (H4) and summary/metadata (EF-3) open under the row's tag (BACKLOG #2593). A row that
-        # fails still lists by its plaintext columns with its cells withheld, alerted and audited.
+        # fails still lists by its plaintext columns with its cells withheld; drift is alerted and audited.
         failures: list[CellTagError] = []
         for r in rows:
             withhold_message_cells(

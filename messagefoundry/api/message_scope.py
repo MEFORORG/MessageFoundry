@@ -72,7 +72,8 @@ async def read_scoped_message(
 
     An out-of-scope row is audited as ``auth.channel_denied`` before ``None`` comes back, so a caller
     that skips it (the export stream) still leaves the refusal on the record. A row whose cells fail
-    their tag was refused, alerted and audited by the store (BACKLOG #2593). Out of scope it reads as
+    their tag, or are corrupt, was refused by the store, which alerts and audits drift and logs a
+    corrupt cell (BACKLOG #2593). Out of scope it reads as
     any other refused row, so the answer never says the message exists. In scope it is ``None`` for
     a caller that skips (the export stream), or, with ``refuse_integrity``, a 423."""
     integrity_refused = False

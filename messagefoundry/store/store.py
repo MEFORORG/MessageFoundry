@@ -10744,7 +10744,7 @@ class MessageStore:
                 )
             except CellTagError as err:
                 tag_failures.append(err)  # audited by ingress_handoff once the lock is released
-                return await _consume_dead(str(err), "re-ingress origin failed its integrity tag")
+                return await _consume_dead(str(err), "re-ingress origin failed its integrity check")
             if meta_json:
                 loaded = json.loads(meta_json)
                 if isinstance(loaded, dict):

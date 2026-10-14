@@ -7452,8 +7452,9 @@ def create_app(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
             except CellTagError:
-                # BACKLOG #2593: the criteria fail their owner tag; the store refused, alerted
-                # and audited. The caller's own preset exists, so a refusal, never a 500.
+                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
+                # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
+                # never a 500.
                 integrity_refused = True
             if integrity_refused:
                 # Raised after the handler, so the 423 chains nothing (BACKLOG #1796): `from None`

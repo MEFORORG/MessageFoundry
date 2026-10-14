@@ -5156,7 +5156,7 @@ class PostgresStore:
                         return await _consume_dead(
                             "ingress_handoff(origin-tag)",
                             str(err),
-                            "re-ingress origin failed its integrity tag",
+                            "re-ingress origin failed its integrity check",
                         )
                     if meta_json:
                         loaded = json.loads(meta_json)
@@ -7406,7 +7406,7 @@ class PostgresStore:
             offset,
         )
         # Each row's cells open under its tag (BACKLOG #2593). A row that fails still lists by its
-        # plaintext columns with its cells withheld, alerted and audited (the SQLite twin).
+        # plaintext columns with its cells withheld; drift is alerted and audited (the SQLite twin).
         failures: list[CellTagError] = []
         out: list[dict[str, Any]] = []
         for r in rows:
