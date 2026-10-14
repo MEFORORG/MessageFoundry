@@ -1624,11 +1624,46 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   toolkit (`messagefoundry-toolkit`) start through their own entry points and install none.
   The interpreter raises an event before it runs an injected script. The hook raises on that
   event, and the interpreter then drops the script. A refusal logs a WARNING with the script's
-  file name, and no audit row. The name is written in printable ASCII. Every other character,
+  file name. Under `serve` it is also audited and it raises an alert, as the next point says.
+  The name is written in printable ASCII. Every other character,
   and the backslash itself, is written as a backslash escape. So a character a log sink cannot
   encode does not keep the line out of that sink. Where refusals arrive faster than they are
   logged, lines past a backlog of 64 are dropped. Every refusal is counted, and once one has
   been refused the entry carries the count.
+- **Under `serve`, a refusal also writes an audit row and raises an alert** (vault BACKLOG
+  #2742, owner ruling 2026-10-13). Both are named `remote_debug_refused`.
+  - **One row and one alert for each read, with a count.** The engine reads the count of
+    refusals as it starts, every 30 seconds after that, and once more as it stops. When the count
+    has risen, the engine raises one alert and writes one audit row, however many scripts were
+    refused in between. Each carries `count`, the number refused since the last one, and
+    `total`, the number since the process started. The injecting process chooses how often it
+    tries, so this keeps it from filling the audit log or the pager: at most one row and one
+    alert for each read. A caller who can restart the engine adds a read at each start and stop.
+  - **No file name.** The injecting process chooses the script's name, so neither the row nor
+    the alert carries it. The name is in the WARNING line only, where there is one: not in the
+    case below where the guard reads as missing, and not past the backlog of 64.
+  - **Counted from the start of the process.** The first read reports every refusal since the
+    process started, so one made before the engine opened its store is recorded. A process that
+    is killed leaves no row for the refusals since its last read. Their WARNING lines remain, up
+    to the backlog above.
+  - **The row.** Its actor is `system`. Its detail holds the two counts, the engine process's
+    label as `process` (`node:<node_id>`, `shard:<id>`, or null on a lone engine) and its
+    process id. If the store refuses the row, or does not answer within 30 seconds, the engine
+    logs an ERROR and writes the row at a later read, with the count so far. The alert is raised first and does not wait for the row.
+  - **The alert.** Its `connection` is `remote_debug:refused`, with `@node:<node_id>` or
+    `@shard:<id>` appended where several engine processes share the store. A rule can match
+    `event_type = "remote_debug_refused"`. With no `[alerts]` transport it is a WARNING line.
+    Nothing resolves it, because a refusal is an event and not a state that can clear. An
+    operator resolves it. A second alert inside the notifier's cooldown updates the open alert
+    and does not page again, so a page's `count` covers only its own read. The audit rows cover
+    every refusal; add up their counts for the full number. The alert list's own count is the
+    number of reads that raised it, not the number of scripts.
+  - **`serve`, and not the other commands.** The engine runs the reads and holds the notifier.
+    Of the `messagefoundry` commands, only `serve` builds one. An application that builds an
+    engine itself, through `create_managed_app` or `Engine.create`, runs the reads too.
+    `supervise`, `rotate-key`, `backup`, `restore` and the other commands build no engine,
+    though `rotate-key` and `backup` open the store. A refusal there leaves the WARNING line and
+    nothing else.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
@@ -1655,7 +1690,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
   is there. The engine's hook is then in place and refuses a script, but the entry still reads
   as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
-  refusals. The interpreter reports each one on standard error, with the script's full path. The entry cannot tell the two cases apart, so read
+  refusals. The interpreter reports each one on standard error, with the script's full path.
+  The refusal is still counted, so under `serve` the `remote_debug_refused` audit row and alert
+  still come. In the first case nothing is refused, so there is no row and no alert. The entry cannot tell the two cases apart, so read
   it as the first, and look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.

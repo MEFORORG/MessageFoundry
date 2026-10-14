@@ -36,6 +36,7 @@ __all__ = [
     "crl_expiry_detail",
     "crl_reload_refused_detail",
     "intake_pause_detail",
+    "remote_debug_refused_detail",
 ]
 
 log = logging.getLogger(__name__)
@@ -134,6 +135,18 @@ def crl_reload_refused_detail(
         parts.append(f"{remedy}.")
     parts.append("The crl_reload ERROR line in the engine log gives the reason.")
     return " ".join(parts)
+
+
+def remote_debug_refused_detail(*, count: int, total: int) -> str:
+    """The one-line description of a ``remote_debug_refused`` alert both sinks show (vault BACKLOG
+    #2742). Counts and fixed words: never a script's file name, which the injecting process
+    chooses. The alert instance's reason column keeps only about the first 200 characters, so the
+    count leads."""
+    return (
+        f"refused {count} script(s) another process injected through the interpreter's remote "
+        f"debugging ({total} since this process started). None ran. WARNING lines in the engine "
+        "log may name the files."
+    )
 
 
 class AlertSink(Protocol):
@@ -725,6 +738,34 @@ class AlertSink(Protocol):
         one."""
         ...
 
+    # --- vault BACKLOG #2742: a script the remote-debugging guard refused ----------------------
+
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        """The engine's remote-debugging guard refused one or more scripts that another process
+        injected into this process (vault BACKLOG #2742, :mod:`messagefoundry.remotedebug`).
+        Nothing in them ran. It still means a process on this host was allowed to attach to the
+        engine and tried to run code inside it.
+
+        ``name`` is ``remote_debug:refused``, with ``@node:<id>`` or ``@shard:<id>`` appended
+        where several engine processes share the store, because the count is each process's own.
+        ``count`` is how many scripts were refused since this alert was last raised, and
+        ``total`` how many since the process started.
+
+        **Never a script's file name.** The injecting process chooses it, so it stays in the
+        guard's WARNING line in the engine log. Counts and this process's own label only: no
+        message content, no PHI.
+
+        Raised at most once per pass of
+        :class:`~messagefoundry.pipeline.remote_debug_watch.RemoteDebugRefusalWatch`, on the event
+        loop, however many scripts were refused, so the injecting process does not set the rate.
+        The engine runs that watch, so of the commands only ``serve`` raises this; an application
+        that builds its own engine raises it too. It is not a connection-scoped event, so no rule's
+        ``control_action`` fires on it, and the colon keeps ``name`` outside the connection-name
+        grammar. Nothing resolves it: a refusal is an event, not a state that can clear, so an
+        operator resolves the instance. The ``remote_debug_refused`` audit row is the durable
+        record."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -1162,6 +1203,15 @@ class LoggingAlertSink:
 
     def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
         log.warning("ALERT %s: %r %s (count %d)", signal, name, detail, count)
+
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        # The guard has already logged one WARNING for each refusal, with the script's file name.
+        # This line is the alert's own record on this stream, and it carries no name.
+        log.warning(
+            "ALERT remote_debug_refused: %r %s",
+            name,
+            remote_debug_refused_detail(count=count, total=total),
+        )
 
 
 #: The ``integrity_drift`` subject for a store-cipher refusal (BACKLOG #1169). Its own subject so it
