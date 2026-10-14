@@ -4044,6 +4044,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $serviceConfig) | Out-Null
           [System.IO.File]::WriteAllText($serviceConfig, "# windows-service-smoke: set through the service's environment.`n")
           .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -Config samples\config -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
+          # The installer only warns when it cannot lock a folder, and `serve` would then refuse the
+          # settings file at start. Fail here, by name, rather than as a service that never comes up.
+          $settingsDir = Split-Path -Parent $serviceConfig
+          $usersWrite = @((Get-Acl -LiteralPath $settingsDir).Access | Where-Object {
+            $_.AccessControlType -eq 'Allow' -and $_.IdentityReference -match '\\Users$' -and
+            ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]'CreateFiles, WriteData, AppendData')
+          })
+          if ($usersWrite) { throw "-LockConfigDir did not lock the settings folder '$settingsDir': Users can still write it" }
           # vault BACKLOG #2702: that install gives the service a restricted token. The samples
           # graph has File connections under the working directory (in\, dev-inbox\, out\), and a
           # grant to Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator

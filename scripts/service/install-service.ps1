@@ -43,7 +43,8 @@ param(
     [string]$Config,
     # The service settings file (messagefoundry.toml), registered as an absolute --service-config.
     # Without it, the installer registers <ProjectRoot or working directory>\messagefoundry.toml
-    # when that file exists, which is the file `serve` would read from its working directory.
+    # when that file exists, and refuses when it does not: `serve` as the service refuses to start
+    # with no --service-config (vault BACKLOG #2626).
     [string]$ServiceConfig,
     # The config-repo root the value file environments\<env>.toml resolves under, registered as
     # --project-root. Without it, a service on the default install root uses the folder above
@@ -1487,6 +1488,11 @@ elseif ($UsesDefaultInstall) { $ProjectRoot = Split-Path -Parent $Config }
 $ValuesAnchor = if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }
 if ($ServiceConfig) { $ServiceConfig = Resolve-AbsolutePath $ServiceConfig }
 else { $ServiceConfig = Get-DefaultServiceConfig -Anchor $ValuesAnchor }
+if (-not $ServiceConfig) {
+    throw ("no settings file to register: pass -ServiceConfig <path>, or put messagefoundry.toml " +
+        "in '$ValuesAnchor'. 'serve' refuses to start as the service with no --service-config " +
+        "(vault BACKLOG #2626).")
+}
 # Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
@@ -1503,7 +1509,7 @@ if (-not (Test-ListenHost $ListenHost)) {
 }
 $AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath) --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
 # Absolute, so the file the service reads does not depend on its working directory (vault BACKLOG
-# #2626). Empty when there is none to name: `serve` then reads its settings from the environment.
+# #2626). Never empty here: the install refuses above when there is none to name.
 if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $ServiceConfig)" }
 if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
 # The paths stored outside the arguments: the log paths sit under -DataDir, and the SCM expands the
