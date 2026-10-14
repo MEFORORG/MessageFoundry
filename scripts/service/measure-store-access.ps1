@@ -788,8 +788,15 @@ try {
     $CurrentPhase = "setup"
 
     # --- install under the DEFAULT virtual account (no -ServiceAccount, no -AllowLocalSystem) ------
+    # The service refuses to start with no --service-config (vault BACKLOG #2626 step 2). This arm
+    # sets everything through the environment, so the file holds only a comment. It sits in a folder
+    # of its own beside the data directory, which -LockConfigDir locks.
+    $ServiceConfig = Join-Path "$($DataDir.TrimEnd('\'))-settings" "messagefoundry.toml"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ServiceConfig) | Out-Null
+    [System.IO.File]::WriteAllText($ServiceConfig, "# ADR 0183 store-access arm: set through the service's environment.`n")
     & (Join-Path $PSScriptRoot "install-service.ps1") -ServiceName $ServiceName -AppExe $AppExe `
-        -NssmDir $NssmDir -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
+        -NssmDir $NssmDir -Config $ConfigDir -ServiceConfig $ServiceConfig -DataDir $DataDir -Port $Port `
+        -LogLevel INFO -Environment prod -LockConfigDir
     $startName = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").StartName
     Add-Reading "SCM run-as account for '$ServiceName' is '$startName'"
     # The engine's store rule reads the data directory's OWNER as well as its DACL, so record it.
