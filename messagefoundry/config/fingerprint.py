@@ -79,12 +79,12 @@ _INVALID_NAME_WINERRORS: frozenset[int] = frozenset({123, 161, 206})
 
 
 def is_missing_directory(exc: OSError) -> bool:
-    """Whether ``exc``, raised listing a directory, says there is no directory there: nothing by
-    that name, a file rather than a directory, or a name no directory can have. The last is a name
-    too long for the filesystem (ENAMETOOLONG), or one Windows refuses, such as ``sub?``.
-    ``Path.is_dir`` answers ``False`` for all of them, so a caller that lists the directory instead
-    reports them as missing too (vault BACKLOG #2596). Any other error, such as access denied, is
-    not a missing directory."""
+    """Whether ``exc``, raised resolving or listing a directory, says no directory can be opened by
+    that path: nothing by that name, a file rather than a directory, a name or whole path too long
+    for the filesystem (ENAMETOOLONG, or Windows error 206), or a name Windows refuses, such as
+    ``sub?``. ``Path.is_dir`` answers ``False`` for all of them, so a caller that lists the
+    directory instead reports them as missing too (vault BACKLOG #2596). Any other error, such as
+    access denied, is not a missing directory."""
     return (
         isinstance(exc, (FileNotFoundError, NotADirectoryError))
         or exc.errno == errno.ENAMETOOLONG
@@ -135,7 +135,7 @@ def _require_listable(base: Path) -> None:
     bundle, and an unlistable ``codesets`` folder as a bundle without it. A missing ``base`` raises
     :class:`ConfigDirMissing`, and so does one whose name no directory can have
     (:func:`is_missing_directory`); any other fault raises its own ``OSError``. A sub-folder that
-    does not exist is fine: there is nothing in it to leave out."""
+    is missing by the same rule is fine: there is nothing in it to leave out."""
     missing = False
     try:
         with os.scandir(base):
@@ -151,8 +151,10 @@ def _require_listable(base: Path) -> None:
         try:
             with os.scandir(base / folder):
                 pass
-        except (FileNotFoundError, NotADirectoryError):
-            pass
+        except OSError as exc:
+            # The same rule as base: a folder no path can open holds nothing the loader reads.
+            if not is_missing_directory(exc):
+                raise
 
 
 def _is_file(path: Path, *, strict: bool) -> bool:

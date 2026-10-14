@@ -2557,7 +2557,8 @@ class Engine:
             with os.scandir(path):
                 pass
         except OSError as exc:
-            # Gone, not a directory, or a name no directory can have, such as ``sub?`` on Windows.
+            # Gone, not a directory, or a name or path the filesystem refuses, such as ``sub?`` on
+            # Windows. The resolve's errors are judged by the same rule.
             missing = is_missing_directory(exc)
             if not missing:
                 # Not a missing directory: a parent the service account cannot traverse, say, or a

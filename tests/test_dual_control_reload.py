@@ -1819,8 +1819,9 @@ async def test_a_name_no_directory_can_have_is_refused_as_missing(
 async def test_the_gated_engine_path_refuses_a_name_no_directory_can_have_as_missing(
     engine: Engine, tmp_path: Path, name: str
 ) -> None:
-    """The request-time digest and an approval-bound reload both raise ``FileNotFoundError``, not
-    ``ConfigDirUnreadable`` or ``ConfigDigestUnavailable``. The strict digest itself is pinned in
+    """:meth:`Engine.reload_target_digest` and an approval-bound reload both raise
+    ``FileNotFoundError``, not ``ConfigDirUnreadable``. Both refuse at the target check, before any
+    digest is taken. The strict digest's own rule for such a name is pinned in
     tests/test_config_fingerprint.py."""
     from messagefoundry.config.fingerprint import config_fingerprint
     from messagefoundry.pipeline import ApprovedConfig
