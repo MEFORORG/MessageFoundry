@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import contextlib
 import importlib.util
 import io
 import json
@@ -22,7 +24,6 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from uvicorn.protocols.utils import get_path_with_query_string
 
 from messagefoundry import __main__, logging_setup, secretscrub
 from messagefoundry.controlchars import has_lone_surrogate
@@ -53,11 +54,21 @@ SYNTHETIC_PHI = "PID|1||100^^^H^MR||DOE^JANE^Q||19800101|F"
 
 @pytest.fixture(autouse=True)
 def _restore_root_logger() -> Iterator[None]:
-    """configure_logging mutates the global root logger; snapshot and restore it."""
+    """configure_logging mutates the global root logger and uvicorn's named loggers; snapshot and
+    restore both, so no test in this file leaves an order dependence behind.
+
+    ``tests/conftest.py`` puts back only the ``uvicorn`` parent's level and propagation, not its
+    handlers and not ``uvicorn.error`` or ``uvicorn.access``. Widening that suite-wide restore would
+    cover the other files that call configure_logging; it is outside this file."""
     root = logging.getLogger()
     saved_handlers = root.handlers[:]
     saved_set = set(saved_handlers)
     saved_level = root.level
+    saved_uvicorn = {
+        name: (lg.level, lg.propagate, lg.handlers[:])
+        for name in logging_setup._UVICORN_LOGGERS
+        for lg in (logging.getLogger(name),)
+    }
     try:
         yield
     finally:
@@ -68,6 +79,14 @@ def _restore_root_logger() -> Iterator[None]:
         for handler in saved_handlers:
             root.addHandler(handler)
         root.setLevel(saved_level)
+        for name, (level, propagate, handlers) in saved_uvicorn.items():
+            lg = logging.getLogger(name)
+            lg.setLevel(level)  # setLevel, not assignment: it clears the isEnabledFor cache
+            lg.propagate = propagate
+            for handler in lg.handlers[:]:
+                if handler not in handlers:
+                    handler.close()  # as the root half does, for a handler the test added
+            lg.handlers[:] = handlers
 
 
 # --- configure_logging -------------------------------------------------------
@@ -2157,10 +2176,51 @@ def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
 # The next three constants MIRROR ``_GROWTH_LENGTHS``, ``_MAX_GROWTH`` and ``_SHIPPED_BEFORE_DSN`` in
 # that file. They are copied rather than imported so this arm does not move when that file is
 # rewired. The reasoning behind each value is recorded there and not repeated here; if that file
-# retunes one, retune its mirror in the same change.
+# retunes one, retune its mirror in the same change. ``test_the_access_arm_constants_mirror_the_scan_arm``
+# reds when the two drift apart.
 _ACCESS_GROWTH_LENGTHS = (2048, 16384)
 _ACCESS_MAX_GROWTH = 24.0
 _PRE_1547_DSN_PASSWORD = r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
+
+#: Each mirror above, keyed by the name of the constant it copies in the scan arm's file.
+_MIRRORED_CONSTANTS: dict[str, object] = {
+    "_GROWTH_LENGTHS": _ACCESS_GROWTH_LENGTHS,
+    "_MAX_GROWTH": _ACCESS_MAX_GROWTH,
+    "_SHIPPED_BEFORE_DSN": _PRE_1547_DSN_PASSWORD,
+}
+
+
+def test_the_access_arm_constants_mirror_the_scan_arm() -> None:
+    """The three mirrors above equal the constants they copy. Read from the other file's source, not
+    imported, so this file still does not depend on that module importing cleanly."""
+    source = (Path(__file__).parent / "test_log_redaction_secret_domain.py").read_text(
+        encoding="utf-8"
+    )
+    found: dict[str, object] = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if not (isinstance(target, ast.Name) and target.id in _MIRRORED_CONSTANTS):
+            continue
+        # The last assignment wins, as at import. A computed value is not a literal, so it clears
+        # any earlier literal and the key check below names it.
+        found.pop(target.id, None)
+        with contextlib.suppress(ValueError, TypeError, SyntaxError, RecursionError):
+            found[target.id] = ast.literal_eval(value)
+    assert found.keys() == _MIRRORED_CONSTANTS.keys(), (
+        f"found only {sorted(found)} of {sorted(_MIRRORED_CONSTANTS)} as module-level literals in "
+        "test_log_redaction_secret_domain.py; a renamed or computed constant leaves its mirror unpinned"
+    )
+    for name, mirror in _MIRRORED_CONSTANTS.items():
+        assert found[name] == mirror, (
+            f"test_log_redaction_secret_domain.py's {name} is {found[name]!r} and its mirror here is "
+            f"{mirror!r}. Retune the mirror in the same change."
+        )
+
 
 #: uvicorn's access-log format, as ``h11_impl`` and ``httptools_impl`` pass it to
 #: ``access_logger.info``. With ``log_config=None`` no ``AccessFormatter`` is installed, so the root
@@ -2233,6 +2293,11 @@ class _CountingPattern:
     """A compiled pattern that counts each time it is applied to text holding ``needle``, and is
     otherwise the real one.
 
+    It overlaps ``_RecordingPattern`` in ``tests/test_log_redaction_secret_domain.py`` on purpose. That
+    one counts every application, which suits its direct calls; this one must filter by needle, for
+    the reason below. It is kept here for the reason the constants above are copied: this arm should
+    not move when that file is rewired.
+
     The swap is process-wide, so a record another thread logs during the window would be counted too
     if every application were. Counting only text that holds this test's own run keeps such a record
     out of the reading."""
@@ -2273,27 +2338,28 @@ def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
     return len(seen)
 
 
-@pytest.fixture
-def _uvicorn_loggers_restored() -> Iterator[None]:
-    """``configure_logging`` sets level, propagation and handlers on uvicorn's named loggers, which
-    neither root-logger restore puts back. Put them back, so these arms leave no order dependence."""
-    names = ("uvicorn", "uvicorn.error", "uvicorn.access")
-    saved = {
-        name: (lg.level, lg.propagate, lg.handlers[:])
-        for name in names
-        for lg in (logging.getLogger(name),)
-    }
-    try:
-        yield
-    finally:
-        for name, (level, propagate, handlers) in saved.items():
-            lg = logging.getLogger(name)
-            lg.setLevel(level)  # setLevel, not assignment: it clears the isEnabledFor cache
-            lg.propagate = propagate
-            lg.handlers[:] = handlers
+def _credential_pass_inputs(monkeypatch: pytest.MonkeyPatch, target: str) -> list[str]:
+    """The text ``CredentialScrubFilter`` hands ``scrub_credentials`` for one access record on ``target``.
+
+    That is the formatted line AFTER ``RedactionFilter`` and ``CredentialQueryScrubFilter`` have run,
+    which is what the admission gate inside ``scrub_credentials`` reads. The filter resolves
+    ``scrub_credentials`` from the ``logging_setup`` module global on every call, so swapping the
+    global reaches the installed filter. The needle is the same as ``_dsn_passes_during``'s."""
+    needle = target[:64]
+    seen: list[str] = []
+    real = secretscrub.scrub_credentials  # the object logging_setup imports by name
+
+    def recorded(text: str, **kwargs: Any) -> str:
+        if needle in text:
+            seen.append(text)
+        return real(text, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(logging_setup, "scrub_credentials", recorded)
+        _emit_access(target)
+    return seen
 
 
-@pytest.mark.usefixtures("_uvicorn_loggers_restored")
 def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2302,8 +2368,11 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     ``configure_logging`` builds the root handler and routes ``uvicorn.access`` into it, as ``serve``
     does with ``log_config=None``. This arm installs the default stdout sink only, with no log file
     and no forwarder. The record is emitted on ``uvicorn.access`` with uvicorn's own format and
-    argument tuple, so every filter on every installed handler runs on it. Each further filtered sink
-    repeats the pass, which the count below asserts as one pass per filtered handler.
+    argument tuple, so every filter on every installed handler runs on it. That default install has
+    ONE filtered handler, so the count below, one DSN pass per filtered handler, only ever runs with
+    one, and the arm asserts that rather than assuming it. It does not exercise a second sink: adding
+    a file or forwarder here would time a different chain from the one this arm names, and a second
+    handler's filters read a record the first one already rewrote.
 
     One measurement covers both halves of the item. The emit runs on a running event loop and is
     synchronous there, so its growth across lengths is the growth of the loop stall a client could
@@ -2337,7 +2406,11 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         for handler in logging.getLogger().handlers
         if any(isinstance(f, CredentialScrubFilter) for f in handler.filters)
     ]
-    assert filtered, "configure_logging installed no handler carrying the credential scrub"
+    assert len(filtered) == 1, (
+        f"configure_logging installed {len(filtered)} handler(s) carrying the credential scrub. This "
+        "arm times the one-handler default and reads the gate input of that one handler; revisit "
+        "both, and the docstring, before changing the expected count."
+    )
 
     # The structural arms first: they say what the timings below are about. The recorder can only
     # count a method it wraps, so a public re.Pattern callable missing from the set would read as a
@@ -2360,10 +2433,30 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         "filtered handler(s). Zero means the record never reached the pass, so the timings below would "
         "be about other filters; more than one per handler means the pass now runs repeatedly."
     )
-    # ``token=nothing`` is only a test of the DSN gate if the entry gate lets it through.
-    assert secretscrub._admits(
-        _request_target(longest, "token=nothing").casefold(), secretscrub._ANY_HINT
+    # ``token=nothing`` is only a test of the DSN gate if the entry gate lets it through. Ask the
+    # gate about the text it actually reads: the query filter has rewritten the value by then, so
+    # the line ends ``?token=<redacted> HTTP/1.1" 401``, not the raw target.
+    gate_inputs = _credential_pass_inputs(monkeypatch, _request_target(longest, "token=nothing"))
+    assert len(gate_inputs) == len(filtered), (
+        f"the credential pass received the token=nothing line {len(gate_inputs)} times across "
+        f"{len(filtered)} filtered handler(s), so the gate check below would read the wrong text"
     )
+    for text in gate_inputs:
+        assert secretscrub._admits(secretscrub._gate_fold(text), secretscrub._ANY_HINT), (
+            f"the entry gate turns away the token=nothing line as the credential pass sees it, "
+            f"ending {text[-40:]!r}, so the token=nothing arm below no longer tests the DSN gate"
+        )
+    # And ``x=nothing`` is only a test of the ENTRY gate if that gate turns it away.
+    entry_inputs = _credential_pass_inputs(monkeypatch, _request_target(longest, "x=nothing"))
+    assert len(entry_inputs) == len(filtered), (
+        f"the credential pass received the x=nothing line {len(entry_inputs)} times across "
+        f"{len(filtered)} filtered handler(s), so the gate check below would read nothing"
+    )
+    for text in entry_inputs:
+        assert not secretscrub._admits(secretscrub._gate_fold(text), secretscrub._ANY_HINT), (
+            f"the entry gate admits the x=nothing line, ending {text[-40:]!r}, so the x=nothing arm "
+            "below now tests the DSN gate a second time instead of the entry gate"
+        )
     for query in ("x=nothing", "token=nothing"):
         unmarked_passes = _dsn_passes_during(monkeypatch, _request_target(longest, query))
         assert unmarked_passes == 0, (
@@ -2374,6 +2467,10 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
 
     with monkeypatch.context() as m:
         m.setattr(secretscrub, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
+        # Three rounds, against five for the arm under test: the control only has to clear the bound.
+        # Measured 2026-10-13 on a dev box, it read 70x in 2.0 s at three rounds and 112x in 0.6 s at
+        # one. Each endpoint keeps the minimum of three samples, so one slow short emit under load is
+        # discarded rather than pulling the reading under the bound and redding a sound harness.
         before_growth = _access_growth(rounds=3)
     assert before_growth > _ACCESS_MAX_GROWTH, (
         f"with the pre-#1547 pattern swapped in, the access chain grew only {before_growth:.1f}x "
@@ -2390,7 +2487,6 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     )
 
 
-@pytest.mark.usefixtures("_uvicorn_loggers_restored")
 @pytest.mark.parametrize(
     "lead",
     ("", "9-", "x" * 200),
@@ -2432,6 +2528,9 @@ def test_the_access_format_this_file_copies_is_uvicorns(module: str) -> None:
     source, so an upgrade that changes the format reds here rather than leaving the arm measuring a
     record uvicorn no longer writes. Read as text, because importing ``httptools_impl`` needs the
     optional ``httptools`` package."""
+    # Imported here, not at module level: it is a uvicorn internal, and only this test needs it.
+    from uvicorn.protocols.utils import get_path_with_query_string
+
     spec = importlib.util.find_spec(f"uvicorn.protocols.http.{module}")
     assert spec is not None and spec.origin is not None, f"uvicorn has no {module}"
     source = Path(spec.origin).read_text(encoding="utf-8")
