@@ -95,6 +95,12 @@ _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 # ``tls_key_password`` — two prefix segments each) and nothing in this tree comes close.
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
+# Where a label may start: at a word boundary, or right after a percent-encoded character, whose
+# trailing hex digit leaves no boundary before a glued label (BACKLOG #2999). Why, what it costs,
+# and why ``_MEFOR_SECRET`` keeps ``\b``, are stated once, on the same constant in
+# ``messagefoundry/secretscrub.py``.
+_LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
+
 # The quoted and braced value fragments (BACKLOG #1685). ``_ODBC_BRACED`` and the overrun are
 # ``_CREDENTIAL_KV``'s only, and its quoted value is ``_KV_QUOTED_VALUE``, whose fast path is the plain
 # quoted form; no pattern uses the plain form on its own.
@@ -130,7 +136,7 @@ _LABEL_HEAD = (
     r"(?=(?i:[abceipst]))"
     r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
     r"|intake_api_key_next)\b['\"]?\s*+[:=]\s*+"
-    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b\s*+[:=]\s*+"
+    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b(?:['\"]\s*+:|\s*+[:=])\s*+"
     r"(?:(?i:bearer|basic|digest)\s++)?"
     r")"
 )
@@ -233,8 +239,9 @@ _PLAIN_SCHEME_VALUE = (
 # had it wrong. Measured on this interpreter: ``[A-Za-z0-9]`` compiles to 28 code words plain and 99
 # under IGNORECASE, because the fold turns a small CHARSET into a Unicode-folding BIGCHARSET walked at
 # every start position — ``_LABEL_PREFIX`` alone costs 74 percent more folded (0.69 ms against 1.20 ms
-# on a 6 KB hyphen run). ``_compile_info`` contributes NOTHING here: all three patterns start with
-# ``\b``, so its INFO flags word reads 0 both before and after, measured. The distinction is load
+# on a 6 KB hyphen run). ``_compile_info`` contributes NOTHING here: all three patterns start with a
+# zero-width assertion, ``\b`` and since BACKLOG #2999 ``_LABEL_START``, so its INFO flags word reads 0
+# both before and after, measured, and again under ``_LABEL_START``. The distinction is load
 # bearing rather than pedantic — it is what says WHICH patterns this trick pays on. A pattern with no
 # scanned class under the fold gains nothing, which is why ``_AUTH_SCHEME`` is left alone below.
 #
@@ -275,10 +282,12 @@ _PLAIN_SCHEME_VALUE = (
 # the AUTH SCHEME rather than the credential, so "Authorization: Bearer <tok>" redacted the word
 # "Bearer" and emitted <tok> verbatim. Making the group optional keeps the plain "token=<tok>" shape
 # working. A QUOTED value is taken whole when ``_GUARDED_QUOTED_VALUE`` allows it, and a BRACED one
-# never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote.
+# never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote. A
+# QUOTED KEY is a label when a colon follows the quote, here and in ``_LABEL_HEAD`` (BACKLOG #3038);
+# why the colon only is on the same pattern in ``messagefoundry/secretscrub.py``.
 _BEARER = re.compile(
-    r"\b(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
-    r"\s*[:=]\s*(?:(?i:bearer|basic|digest)\s+)?"
+    _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?i:bearer|basic|digest)\s+)?"
     r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
 )
 
@@ -299,7 +308,9 @@ _BEARER = re.compile(
 # floor: asked of the stopped run, ``Bearer ab:password="v w"`` would fail the floor and print "ab".
 # Where the first run is itself a quoted label the stop does refuse the match, on purpose; why is on
 # the same pattern in ``messagefoundry/secretscrub.py``.
-_AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE)
+_AUTH_SCHEME = re.compile(
+    r"(?i)" + _LABEL_START + r"(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE
+)
 
 # A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
 # optional quotes match the shape an error string produces — "(env 'MEFOR_VALUE_PW'='<value>')" — which
@@ -365,7 +376,7 @@ _MEFOR_SECRET = re.compile(
 # printing values. The fragments themselves sit above ``_BEARER``, because every label pattern uses
 # them.
 _CREDENTIAL_KV = re.compile(
-    r"\b(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
+    _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _ODBC_BRACED
@@ -446,7 +457,7 @@ _CREDENTIAL_KV = re.compile(
 # 6 KB line this pattern runs 0.150 ms against 33.8 ms for the shared PHI pass beside it in the same
 # call — 225x. Do not re-derive this and take it.
 _KEY_MATERIAL = re.compile(
-    r"\b(" + _LABEL_PREFIX + r"(?i:encryption_key(?:s_retired)?|private_key"
+    _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:encryption_key(?:s_retired)?|private_key"
     r"|intake_api_key_next))\b['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_VALUE
