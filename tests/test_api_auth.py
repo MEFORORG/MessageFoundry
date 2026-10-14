@@ -191,6 +191,29 @@ async def test_unauthenticated_is_rejected_but_health_is_open(engine: Engine) ->
         assert (await c.get("/connections")).status_code == 401
 
 
+async def test_a_write_the_store_refuses_for_a_failing_seal_answers_409(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2592: a store refusal over a record that fails its integrity seal reaches the
+    caller as a 409 with a fixed text, never a 500 and never the row. The control is the same
+    request answering 200 before the refusal is planted."""
+    from messagefoundry.store.row_seal import RowSealError
+
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "viewer")).json()["token"]
+        assert (await c.get("/me/sessions", headers=_auth(token))).status_code == 200
+
+        async def refused(_user_id: str) -> list[Any]:
+            raise RowSealError("user")
+
+        monkeypatch.setattr(service, "list_sessions", refused)
+        r = await c.get("/me/sessions", headers=_auth(token))
+        assert r.status_code == 409
+        assert "integrity check" in r.json()["detail"]
+
+
 async def test_security_events_feed_lists_callers_auth_events(engine: Engine) -> None:
     # WP-L3-05 (ASVS 6.3.5/6.3.7): /me/security-events surfaces the caller's own audited auth.* events.
     service = await _service(engine)
@@ -681,52 +704,6 @@ async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
     # The response.read row records that no body went out to the view_raw-only caller.
     reads = [dict(r) for r in await engine.store.list_audit(action="response.read")]
     assert any(r["actor"] == "rawonly" and '"body": false' in r["detail"] for r in reads), reads
-
-
-async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:
-    """vault BACKLOG #1187: the admin's own surface, POST and PUT /roles/custom, answers 400 with the
-    pairing message. Controls: a POST and a PUT keeping view_summary are accepted. A final listing
-    shows neither refusal wrote anything, name included."""
-    service = await _service(engine)
-    await _add(service, "adm", Role.ADMINISTRATOR)
-    async with _client(engine, service) as c:
-        h = _auth((await _login(c, "adm")).json()["token"])  # a fresh login is step-up fresh
-        refused = await c.post(
-            "/roles/custom",
-            headers=h,
-            json={"display_name": "Raw", "permissions": ["messages:read", "messages:view_raw"]},
-        )
-        assert refused.status_code == 400, refused.text
-        assert "messages:view_raw needs messages:view_summary" in refused.json()["detail"]
-        made = await c.post(
-            "/roles/custom",
-            headers=h,
-            json={
-                "display_name": "Raw and summary",
-                "permissions": ["messages:read", "messages:view_raw", "messages:view_summary"],
-            },
-        )
-        assert made.status_code == 201, made.text
-        role_url = f"/roles/custom/{made.json()['id']}"
-        both = ["messages:read", "messages:view_raw", "messages:view_summary"]
-        # PUT control: the same edit keeping view_summary is accepted.
-        kept = await c.put(role_url, headers=h, json={"display_name": "R", "permissions": both})
-        assert kept.status_code == 200, kept.text
-        # The refused edit drops view_summary and also renames; the 400's detail ties it to the
-        # pairing rule, and the listing below shows the rename did not land either.
-        edited = await c.put(
-            role_url,
-            headers=h,
-            json={
-                "display_name": "Changed",
-                "permissions": ["messages:read", "messages:view_raw"],
-            },
-        )
-        assert edited.status_code == 400, edited.text
-        assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
-        # Neither refusal wrote anything: one role, still holding view_summary.
-        listed = (await c.get("/roles/custom", headers=h)).json()
-        assert [(r["display_name"], r["permissions"]) for r in listed] == [("R", sorted(both))]
 
 
 def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:

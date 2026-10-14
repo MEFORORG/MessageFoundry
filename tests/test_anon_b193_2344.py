@@ -20,7 +20,9 @@ from types import ModuleType
 import pytest
 
 from messagefoundry.anon import leak as engine_leak
+from messagefoundry.anon import surrogates as engine_surrogates
 from tee.anon import leak as tee_leak
+from tee.anon import surrogates as tee_surrogates
 
 _GUARD_PARTS = ("scripts", "security", "scan_forbidden.py")
 _CHECKOUT_GUARD = Path(__file__).resolve().parents[1].joinpath(*_GUARD_PARTS)
@@ -166,10 +168,16 @@ def _loops_over_parents(source: str) -> list[int]:
     ]
 
 
-@pytest.mark.parametrize("module", [engine_leak, tee_leak], ids=["engine", "tee"])
-def test_neither_leak_module_loops_over_its_parents(module: ModuleType) -> None:
+@pytest.mark.parametrize(
+    "module",
+    [engine_leak, tee_leak, engine_surrogates, tee_surrogates],
+    ids=["engine leak", "tee leak", "engine surrogates", "tee surrogates"],
+)
+def test_no_anon_loader_module_loops_over_its_parents(module: ModuleType) -> None:
     """A cheap tripwire for the old loop's shape only. The planted-file tests above are the real
-    check: any search that tries the nearest folder first runs one of their guards."""
+    check: any search that tries the nearest folder first runs one of their guards. The two
+    ``surrogates`` modules read the token file the same way (BACKLOG #2995); their planted-file
+    tests are in ``tests/test_anon_b254_2995.py``."""
     source = Path(str(module.__file__)).read_text(encoding="utf-8")
     assert _loops_over_parents(source) == []
 

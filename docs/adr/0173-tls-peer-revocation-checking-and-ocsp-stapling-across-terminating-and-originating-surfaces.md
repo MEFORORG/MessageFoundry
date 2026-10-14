@@ -711,7 +711,8 @@ OAuth2 token hop. Two reasons:
   instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
 
 **The refusal on the ECH arm names the attestation alone.** The default text offers
-`[tls].crl_file` and an egress proxy, and neither can cross an ECH hop. So
+`[tls].crl_file`, which cannot cross an ECH hop. (It also offered an egress proxy, which no call
+site could set, until BACKLOG #2987 removed it.) So
 `refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
 `ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
 crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`
@@ -961,7 +962,7 @@ proposed accept, and only an owner ruling makes it one.
 | `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm, as used by `RemoteFileDestination` (the FTPS upload) | message files, the FTP login | **Guarded** | `RevocationHopGuard.capture` in `RemoteFileDestination.__init__`, called after the client is built and handed that client's own context, taken only when the context verifies. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP". The row named no caller until then.)* **`RemoteFileSource`, the inbound FTPS poll, builds its context through the same function and still NEEDS A GUARD.** It is not covered by this grade, and it stays tracked by #2193's FTPS line, which is open for the poll. A CRL can reach that context now: on the verifying arm, `[tls].crl_file` loads onto it for any non-loopback host. Nothing refuses the poll when no CRL is set, so the guard is still needed. *(Corrected 2026-10-07: engine PR 2065, vault BACKLOG #2370, gave `Source` a `trust_anchor_policy`, which the runner's `_source_config` fills and `RemoteFileSource` passes to `_make_client`. The text this replaces read: "No CRL can reach that context today: the poll passes no trust policy, and `Source` carries none".)* |
 | `transports/remotefile.py`, `_ftps_ssl_context`, `tls_verify=false` arm | message files of an anonymous hop | **Verify-off** | refused on an enforcing instance even with the escape set. A credentialed hop is refused outright in every posture, so no FTP login crosses this arm (vault BACKLOG #2636, CORRECTED 2026-10-06: this row listed the FTP login) |
 | `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Needs a guard, tracked by #2193** | a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.** This read "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context, and it simply loads no CRL (CORRECTED 2026-09-30) |
-| `auth/ldap.py`, `ad_tls_verify=false` | the same passwords | **Verify-off** | refused on an enforcing instance (#329) |
+| `auth/ldap.py`, `ad_tls_verify=false` | the same passwords | **Verify-off** | refused in every posture, with no escape (vault BACKLOG #3230, CORRECTED 2026-10-12: this read "refused on an enforcing instance (#329)") |
 | `config/tls_policy.py`, `assert_ldap3_tls_suites` | the same passwords | **Not a separate hop** | since BACKLOG #2494 it builds the context the LDAPS row above handshakes on; it was a replica that never handshook (CORRECTED 2026-09-30) |
 | `pipeline/alert_sinks.py`, `send_plain_email`, through `build_smtp_tls_context` | alert bodies and per-user security-event notices (`pipeline/security_notify.py` sends through it too), the SMTP AUTH credential | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard, built outside the connector gate |
 | `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard |
@@ -1198,7 +1199,8 @@ the peer, refuses the peer in either load order. Locate it by symbol: `reload_re
 **It fails closed.** A replacement must pass the start rules (`judge_crl_bytes`), carry no certificate
 the hop does not already trust (proved on a scratch context first, because a load cannot be undone),
 have each CRL's signature verify against a CA certificate the hop lists for its issuer (OpenSSL
-checks it only at the handshake, so a badly signed CRL would load and then fail every handshake), and
+checks it only at the handshake, so without this a badly signed CRL would be applied and then fail
+every handshake), and
 supersede every CRL the hop holds. Otherwise the hop keeps its copy, an ERROR names the reason, and
 the expiry monitor keeps judging the held copy. The start rules now also refuse a file whose only CRL
 for some issuer is not in effect yet, at a start and at a reload, because OpenSSL would pick it and
@@ -1207,6 +1209,18 @@ check sees only the hop's own trust store, so a CRL issued by an intermediate th
 refused, retried every pass, and applied by a restart. A context only gains CRLs, so `[cert_monitor].crl_max_reloads` (default 10,000)
 caps the reloads one context takes for one file; past it, a restart applies the file. Nothing is fetched: this reads the configured file
 only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are untouched.
+
+**CORRECTED 2026-10-12 (vault BACKLOG #2905, owner ruling 2026-10-05).** The paragraph above said a
+badly signed CRL "would load and then fail every handshake". That described a start as well as
+OpenSSL, and a start has changed. `harden_crl_check` now checks each CRL's signature against the
+hop's own CA list. It refuses one case only: the CRL names a listed CA's key by key identifier, and
+that key did not sign it. Anything short of that proof loads with a WARNING, at least an issuer the
+hop does not list, a CRL that names no key, and a key the engine cannot check with. `docs/CONFIGURATION.md`,
+under "CRL files", is the one place that says how often it is logged and what a refusal stops.
+So the reload refuses more than a start does, on purpose. The ruling's reason is a CA that
+renewed its key: its CRL can fail the engine's check while handshakes still pass, because OpenSSL
+takes a CRL's issuer from the peer's chain. That was measured for one chain shape, not for every one.
+There is no setting for this check. Locate it by symbol: `_check_crl_signatures`.
 
 **What this does to §6 trigger 4.** Its second clause names *"an in-engine CRL refresh that does not
 fetch"*. A reload from the configured file is that, for every hop whose load is recorded. This note

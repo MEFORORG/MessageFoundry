@@ -395,12 +395,21 @@ from typing import Any
 #: before each page, and ``/ui/audit/export`` passes its cookie session. The digest did not move,
 #: for the same reason. A call without ``token`` raises TypeError before any row is read.
 #:
+#: Vault BACKLOG #3198: ``AuthService`` gained ``abandon_oidc_login``, which the ``/ui/oidc``
+#: callback calls for an ``error=`` or malformed sign-in callback, so a forged one cannot end a
+#: sign-in in flight. It returns whether the flow was consumed. ``LoginOutcome`` and ``OidcStepUp``
+#: gained ``flow_consumed``, which the route reads to keep the flow cookie when a refusal consumed
+#: nothing. The route types its ``LoginOutcome`` so discovery sees that class (and ``RolesGained``,
+#: one of its field types), which it did not before. The digest moved because the
+#: surface grew. An older console on this engine is refused at mount; a newer console on an older
+#: engine would call a method that does not exist.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "05d283512c738b8b"
+ENGINE_UI_SEAM: str = "c96bfcbec6050c00"
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,7 +19,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.audit_visibility import AUDIT_WITHHELD_HEADER
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole._html import text
-from messagefoundry_webconsole.pages.audit import ADMIN_CHANGES_NOTE, WITHHELD_NOTE
+from messagefoundry_webconsole.pages.audit import ADMIN_CHANGES_NOTE, WITHHELD_NOTE, audit_log
 
 
 def _rendered(sentence: str) -> str:
@@ -42,6 +42,31 @@ async def test_the_audit_page_says_rows_are_withheld_by_permission_not_by_rows(
         assert r.status_code == 200, r.text
         assert (_rendered(WITHHELD_NOTE) in r.text) is told, who
         assert 'href="/ui/audit/export"' in r.text, who
+
+
+def test_the_audit_page_shows_each_entrys_client_address() -> None:
+    """Vault BACKLOG #3197. RED when: the audit page drops ``AuditEntry.client``, so an operator
+    tracing a spray of refused sign-ins sees no source. A row with no client shows a dash, the
+    page's mark for an empty cell, beside its own row rather than borrowing another's address."""
+    from messagefoundry.api.auth_models import AuditEntry, AuditList
+
+    data = AuditList(
+        entries=[
+            AuditEntry(ts=200.0, actor="<oidc>", action="auth.login_failed", client="192.0.2.48"),
+            AuditEntry(ts=100.0, actor="engine", action="engine.start"),
+        ],
+        total=2,
+        limit=50,
+        offset=0,
+        as_of=200.0,
+        withheld=False,
+    )
+    html = str(audit_log(data))
+    assert "<th>Client</th>" in html, html
+    rows = html.split("<tr>")[2:]
+    assert len(rows) == 2, rows
+    assert "192.0.2.48" in rows[0] and "auth.login_failed" in rows[0]
+    assert "192.0.2.48" not in rows[1] and "—" in rows[1]
 
 
 async def test_no_export_link_without_audit_export_and_the_route_refuses(engine: Engine) -> None:

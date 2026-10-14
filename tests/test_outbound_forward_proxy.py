@@ -513,7 +513,9 @@ def test_parameter_names_are_matched_case_insensitively() -> None:
 def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
     """The OAuth2/SMART token opener carries the same proxy Digest handler. Its refusal is an
     HttpAuthError, which is a ValueError, and that escaped the token reply's DeliveryError contract.
-    Any other ValueError is an unencodable request and keeps its own type."""
+    Any other ValueError is an unencodable request and keeps its own type. Since BACKLOG #2989 the
+    refusal is the permanent configuration fault the delivery hop raises, which is still a
+    DeliveryError; ``tests/test_digest_refusal_classification.py`` pins its code."""
     from messagefoundry.transports.base import DeliveryError
     from messagefoundry.transports.smart import request_token
 
@@ -526,7 +528,7 @@ def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
 
     req = urllib.request.Request("http://127.0.0.1:9/token")
     refused = HttpAuthError("the web proxy's HTTP Digest challenge names algorithm 'MD5'")
-    with pytest.raises(DeliveryError, match="challenge was refused") as refused_ei:
+    with pytest.raises(DeliveryError, match="will not answer it") as refused_ei:
         request_token(_Opener(refused), req, timeout=1, endpoint="tok", connector="c")  # type: ignore[arg-type]
     # The peer's algorithm token stays on the cause, off the stored last_error text.
     assert "MD5" not in str(refused_ei.value)

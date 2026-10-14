@@ -747,6 +747,9 @@ async def test_a_second_administrator_acting_on_a_stale_read_is_refused(
                     "username": "jdoe",
                     **requested,
                     **seen_by_second,
+                    # BACKLOG #3174: and the pair the row held, the first administrator's.
+                    "held_issuer": ISSUER,
+                    "held_subject": "S-1-b",
                     "reason": FEDERATED_BINDING_CHANGED,
                 },
             )
@@ -1134,6 +1137,9 @@ async def test_a_bind_raced_between_its_read_and_its_clear_is_audited(
                 "issuer": ISSUER,
                 "subject": "S-1-mine",
                 **UNBOUND,
+                # BACKLOG #3174: the clear read the pair the other bind wrote.
+                "held_issuer": ISSUER,
+                "held_subject": "S-1-other",
                 "reason": FEDERATED_BINDING_CHANGED,
             },
         )

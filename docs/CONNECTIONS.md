@@ -276,8 +276,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > certificate revocation checking** — stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately
 > attempts none — so on the **shipped default** (a PHI-classified instance at
 > `[security].enforcement = enforce`) a **verifying** outbound TLS hop to a **non-loopback** host is
-> **refused at construction** (`messagefoundry check` / dry-run / reload / the `serve` pre-flight), not
-> merely warned. **At least nine** hops carry that gate — the connection-level ones are
+> **refused at construction** (`messagefoundry check`, dry-run, reload, and the live build when
+> `serve` starts), not merely warned. **At least nine** hops carry that gate — the connection-level ones are
 > **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), EMAIL/SMTP, and a connection's SMART token
 > endpoint**, and since BACKLOG #2193 **the DICOM C-STORE SCU with `tls=true`, an FTPS upload, a
 > `Direct()` relay that sets a `username`, and an https `FhirLookup` read**, plus some that are not
@@ -1276,17 +1276,15 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `weakened_tls_escape_permitted_here()`** — like the `tls_verify` / `encrypt` cells elsewhere in this
   document, so on a production-PHI enforcing instance the escape is inert and an unknown host key stays
   refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
-  instance.
+  instance. A login with a `password` never takes the escape: its unknown host key is refused in
+  every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)).
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
-  A hand-built spec that turns either check off (`tls_verify = false` or `tls_check_hostname = false`)
-  while a `username` or `password` is set is **refused outright**, with no escape variable or posture
-  to unlock it (vault BACKLOG #2636, as `Email`/`Direct` refuse a credentialed hop; they key on
-  `username` alone, FTP on either half); the escape governs only an anonymous FTPS hop.
-  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused outright**, with
-  no escape variable or posture to unlock it (the credential itself would cross in the clear; vault
-  BACKLOG #2636) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
+  A `username` or `password` is refused over plain FTP, and over FTPS with either check off
+  (`tls_verify = false` or `tls_check_hostname = false`, from a hand-built spec). Either half
+  counts. The rule is in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
+  Use FTPS or `Sftp(...)` instead; an *anonymous* plain-FTP hop is governed by
   the [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) declaration below.
 
 | Setting | Dir | Default | Meaning |
@@ -1300,7 +1298,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS poll has no such gate |
-| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false`, which is refused outright when a `username` or `password` is set (#129, ADR 0094; vault BACKLOG #2636). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` on an anonymous login (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | both | — | **`Ftp` only, FTPS** (vault BACKLOG #2371) — the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
@@ -1477,7 +1475,7 @@ one.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
@@ -1496,12 +1494,12 @@ the four HTTP destinations, and their own sections point here.
 
 | Destination | Write | `capture_response` | An over-size body after a 2xx |
 |---|---|---|---|
-| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped. The message gets a `reply_dropped` event, and then a WARNING names the connection and the message |
 | REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
 | SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
 | DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
 | FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
-| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | off | **delivered**, with the same event and WARNING |
 | FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
 
 **Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
@@ -1520,8 +1518,18 @@ its entry statuses.
 
 A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
 may have applied it. On SOAP, on DICOMweb, and on a FHIR update sent as a transaction, the unread
-body may instead have held a rejection. Its stored error carries the code `reply-too-large`. Check the partner's own record before you replay it. A
-reply that is cut short or misframed after a 2xx is a separate case, and the lane still retries it.
+body may instead have held a rejection. Its stored error carries the code `reply-too-large`. Check the partner's own record before you replay it.
+
+**A 2xx reply cut short or misframed (BACKLOG #2989).** A body that ends before the length the
+partner declared, or one framed in a way RFC 9112 does not allow, follows the same table. Where the
+table says delivered, the body is dropped, the message gets a `reply_dropped` event that says
+what was wrong with it, and then a WARNING says the same. Where it says
+permanent refusal, the code is `reply-truncated` or `reply-misframed` instead of `reply-too-large`.
+Either way the request is sent once. A partner or a middlebox that closes the connection cleanly
+before the declared length counts as cut short, so where the body is needed that message
+dead-letters once. The owner's ruling covers the over-size body only; who decided these two, and
+on what authority, is recorded in ADR 0095 Amendment B.1. At least a read that times out, or one
+that a connection reset cuts off, is a separate case, and the lane still retries it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
@@ -1559,9 +1567,11 @@ connection's `proxy_url` and still follows a proxy from the environment.
 A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
 proxy override list) sends direct with no proxy credential, and logs a WARNING (vault BACKLOG
 #3442). A connection that sets `proxy_user` and also writes a `Proxy-Authorization` into `headers`
-fails to build (vault BACKLOG #3443). Its proxy handler admits any caller-set header once the
-`proxy_user` credential passes, so it could not tell the static header from its own. The rule is
-on [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
+fails to build (vault BACKLOG #3443). Its proxy handler admits a caller-set `Proxy-Authorization`
+in the plain spelling once the `proxy_user` credential passes, so it could not tell a static
+header spelled that way from its own. A static header in any other spelling of that name fails
+the build too, and the opener never admits one. The rule is on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
 
 Which legs reach the proxy with no TLS is in
 [CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
@@ -2267,7 +2277,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
 | `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`). Setting a `username` makes the relay a credential hop: to an off-box host it is then **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). With no `username` the relay carries no revocation gate |
-| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set, and SMTP `AUTH` over cleartext is **refused outright**. **WARNING: this is not the same posture as `Email(...)` — the shipped enforcing default does not close it.** `Direct()` consults the **raw** escape variable directly: it does **not** route through the shared cleartext-hop authority, so `[security].enforcement = enforce` does **not** clamp it and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). With the variable set, a cleartext-SMTP Direct hop crosses on a production-PHI enforcing instance. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
+| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set on an instance at `[security].enforcement = warn`, and SMTP `AUTH` over cleartext is **refused outright**. This is not the same posture as `Email(...)`: `Direct()` reads that clamped escape directly and does **not** route through the shared cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). CORRECTED 2026-10-13: this row said the escape was read raw, so that an enforcing instance would not close the hop; the read has been clamped since #323. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
 | `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
 | `encoding` | `utf-8` | charset the body is encoded with before signing |
 
@@ -3221,7 +3231,7 @@ outbound(
 | Does it turn any check off? | No. Chain, host name and expiry checks stay on. It only chooses which CAs do the verifying. |
 | What about `[tls].crl_file`? | On a hop that reads the `[tls]` block, it still applies and turns on leaf revocation checking. That CRL file must then carry a CRL from this CA too, or every handshake on the hop fails. An inbound `Ftp()` poller reads the `[tls]` block too, since vault BACKLOG #2370, so this applies to it as well. |
 | Does it reach a token endpoint? | Yes. Where a connection signs in through SMART or OAuth2, the token hop trusts the same file, even when `verify_tls = false`. If the authorization server chains to a different CA, put that CA in the same PEM file. That also widens the data hop to it. No separate token-hop setting exists, by decision for now (vault BACKLOG #2370). |
-| What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop still reads it, as the row above says. |
+| What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop would still read it, but a connection that signs in through SMART or OAuth2 with `verify_tls = false` is refused at build, because the minted bearer would cross the unverified data hop ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). So that pairing now matters only over an `http://` data url. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
 | What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
@@ -3921,10 +3931,10 @@ reading this page already applies to a file the scan never opened.
 | SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on opening the SFTP session (BACKLOG #1936), on **each read** from the established SFTP channel, and on each step of an upload that stops making progress (BACKLOG #2082). All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where a gap is left | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, a rejected host key is **permanent**, and an authentication refusal is permanent and flagged as a credential fault. A banner, key-exchange or authentication timeout, a connection dropped before the key exchange completes, and an `OSError`/`EOFError` are transient (BACKLOG #1999; the bullet under [Remote file](#remote-file--sftp--ftp) says where the rules are stated). After connect, a missing remote path is permanent, and at least the session-open and read timeouts are transient. With `validate_directory` on, the pre-upload directory check re-raises any failure but a credential refusal as transient, these included. A write that stops making progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per step, BACKLOG #2082), an `EOFError` and a helper thread that cannot start are transient; a `paramiko.SFTPError` is permanent. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient, with at least two exceptions: a 5xx reply, and a 4xx at the login that names the credential. While the session opens, both are classed as the bullet under [Remote file](#remote-file--sftp--ftp) states (BACKLOG #2083). After it opens, a 5xx is permanent | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
-| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
+| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed. A Digest challenge the engine will not answer (`auth-challenge-refused`, ADR 0095 Amendment B) and a send-time hop refusal (`insecure-hop-refused`) are configuration faults: under the default `credential_fault_policy` the lane stops and the queue stays. A 2xx reply body that is over the bound, cut short or misframed is never sent again; the *A 2xx reply over the byte bound* table under REST says whether it is delivered or refused | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
-| FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | a lookup failure raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
-| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent | `RetryPolicy` |
+| FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
+| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest) | `RetryPolicy` |
 | DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future | the association is released by pynetdicom; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent | `RetryPolicy` |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |

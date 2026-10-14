@@ -9726,11 +9726,12 @@ def create_managed_app(
         # engine is byte-identical when the gate is unset. Stashed for /stats + shut down in finally.
         app.state.connscale_executor = maybe_install_executor_shim(asyncio.get_running_loop())
         # #329: the derived instance hop posture, computed ONCE here for the OUT-OF-GATE cells this
-        # lifespan builds — the alerts webhook sink (notifier_from_settings) and the LDAPS bind
+        # lifespan builds — the alerts webhook sink (notifier_from_settings) and the AD bind
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
-        # current_hop_posture() is None there and their weakened-TLS escape would ship UNCLAMPED (green
-        # and inert) without an explicit posture; threading this makes the ADR-0092 clamp apply on first
-        # deployment. None only for an embedding that passes no [ai] (serve always passes it); since
+        # current_hop_posture() is None there. The webhook sink's weakened-TLS escape would ship
+        # UNCLAMPED without an explicit posture, and the plain ldap:// bind refusal reads it too
+        # (vault BACKLOG #2354); threading this makes both apply on first deployment. The LDAPS
+        # ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only for an embedding that passes no [ai] (serve always passes it); since
         # vault BACKLOG #2354 a None posture fails closed, so there the escape is NOT honoured. Reuses
         # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
@@ -10171,9 +10172,9 @@ def create_managed_app(
                     # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                     # preflight already ran before any listener bound; this keeps the seam consistent.
                     enforcing=trust_anchors_enforcing,
-                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
-                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
-                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                    # Thread the derived instance posture to the AD bind, which is built out of the
+                    # connector-construction gate: its plain ldap:// refusal reads it (vault BACKLOG
+                    # #2354). Its ad_tls_verify=false escape, which #329 clamped here, is gone (#3230).
                     hop_posture=_hop_posture,
                     # BACKLOG #2592: an authority row that fails its integrity seal is denied and
                     # raises integrity_drift on the same sink the cipher refusal uses.

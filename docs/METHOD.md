@@ -1055,6 +1055,24 @@ fleet, so never take them*.
   *"Reading a diff before merging it is still the job; no check now asks whether you did."* The
   owner replaced it because the Builders already run code review.
 
+  **CORRECTED 2026-10-12, added after the move (owner ruling, in session).** The sentence above
+  sends every finding that names a defect the merge would ship to the owner. That was the rule
+  until 2026-10-12. That day, in the Lander's own chat, the Lander proposed,
+  verbatim: *"Let me merge when the open findings are filed as rows and none changes behaviour or
+  weakens a control. I would still bring you anything that does."* The owner replied, verbatim:
+  *"approved"*, and then: *"make that persistent for future landers"*. That was at about 17:40
+  UTC. `CLAUDE.md` section 5 states the rule once, in its merge bullet, so read it there.
+
+  The reason, as the Lander seat reported it: the same day, three pull requests passed code
+  review but listed small known defects. Examples were code comments that a dependency bump had
+  made out of date, and one overstated docstring sentence. Under the old rule each waited for an
+  owner ruling, and two of them waited more than thirteen hours with green checks.
+
+  On 2026-10-12, korus `origin/main` (`189eb42`) still carried the earlier rule in
+  `roles/LANDER.md`, in at least *4a-quinquies* and *Filing never holds a green pull request*. A
+  korus branch, `lander/filed-findings-ruling`, carried this ruling that day and was not yet
+  merged.
+
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
   `BEHIND` or `DIRTY` in preference to `BLOCKED`, so it hides one blocking reason behind another.

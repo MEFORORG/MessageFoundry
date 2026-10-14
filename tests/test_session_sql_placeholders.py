@@ -230,8 +230,16 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
     driver it would be ``-1`` whether three sessions were revoked or none."""
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _nocount_store(seen, [(f"{n:064x}",) for n in range(revoked)])
+
+    async def bump(cur: Any, user_id: str) -> None:
+        # The epoch is raised through the sealed user write helper, which this fake driver cannot
+        # read a users row for; its own contract runs against a real server (BACKLOG #2592).
+        seen.append(("raise the epoch", (user_id,)))
+
+    store._bump_session_epoch = bump
     assert await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW) == revoked
     # The account's epoch is raised first (BACKLOG #2592); the sweep is the statement that counts.
+    assert seen[0][0] == "raise the epoch"
     assert "OUTPUT inserted.token_hash" in seen[1][0]
 
 

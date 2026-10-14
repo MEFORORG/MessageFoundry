@@ -74,6 +74,7 @@ __all__ = [
     "clear_reload_refusal",
     "crl_fingerprint",
     "crl_path_key",
+    "first_unconfirmed_signature",
     "has_held_copies",
     "held_contexts",
     "held_crl_copies",
@@ -81,6 +82,7 @@ __all__ = [
     "record_crl_load",
     "record_reload_refusal",
     "reload_refusal",
+    "reload_refusals",
     "replace_held_copy",
     "snapshot",
 ]
@@ -123,9 +125,11 @@ class ReloadRefusal:
 
     ``fingerprint`` is the refused file's :func:`crl_fingerprint`, so a refusal stops applying the
     moment the file changes again. ``remedy`` is what the operator does next, in the words both the
-    reload and the expiry monitor log. ``sticky`` is True when nothing but a change to the file can
-    alter the verdict, so the reload does not judge those bytes again; False for a refusal time can
-    lift, such as a CRL not yet in effect."""
+    reload and the expiry monitor log. ``sticky`` is True when the reload treats the verdict as
+    final until the file changes, so it does not judge those bytes again; False while it will judge
+    them again next pass, such as for a CRL not yet in effect. The exact rule is the reload's:
+    ``_Refusals.sticky`` in :mod:`messagefoundry.pipeline.crl_reload` says when a refusal that can
+    lift keeps a pass open, and that "final" is that rule and not a proof."""
 
     fingerprint: tuple[int, int]
     reason: str
@@ -141,6 +145,10 @@ class ReloadRefusal:
 _HELD: weakref.WeakKeyDictionary[ssl.SSLContext, tuple[HeldCrl, ...]] = weakref.WeakKeyDictionary()
 # The latest refusal per path key. Keys are configured CRL paths, so this stays small.
 _REFUSED: dict[str, ReloadRefusal] = {}
+# What a start could not confirm about a CRL file's signatures and has already logged (vault
+# BACKLOG #2905). Per path key: the fingerprint of the bytes judged, and each finding logged for
+# them. One entry per path, replaced when the file changes, so this stays small too.
+_UNCONFIRMED: dict[str, tuple[tuple[int, int], set[tuple[str, ...]]]] = {}
 _LOCK = threading.Lock()
 
 
@@ -168,6 +176,30 @@ def ca_bundle_fingerprint(pem: bytes) -> tuple[int, int]:
     from messagefoundry.pki import crl_pem_blocks
 
     return crl_fingerprint(b"".join(crl_pem_blocks(pem)))
+
+
+def first_unconfirmed_signature(
+    path: str | os.PathLike[str], fingerprint: tuple[int, int], finding: tuple[str, ...]
+) -> bool:
+    """Whether this process now meets ``finding`` for the first time, for the file at ``path``
+    whose bytes have ``fingerprint`` (vault BACKLOG #2905). Records it either way.
+
+    ``finding`` is what a start could not confirm about the signatures of the CRLs in the file:
+    one state per CRL, or a note that the judgment itself failed. ``harden_crl_check`` logs only
+    when this is True. It runs once per TLS context, and the Postgres store builds a context per
+    connection, so a line per call
+    would repeat for as long as the engine runs. This keeps it to one line per process for each
+    version of the file and each finding. Hops with different CA lists can reach different
+    findings for one file, and each of those is logged once. The state is in memory, so every
+    start logs again, and each engine shard logs its own line."""
+    key = _path_key(path)
+    with _LOCK:
+        seen = _UNCONFIRMED.get(key)
+        if seen is None or seen[0] != fingerprint:
+            seen = _UNCONFIRMED[key] = (fingerprint, set())
+        first = finding not in seen[1]
+        seen[1].add(finding)
+        return first
 
 
 def record_crl_load(
@@ -296,6 +328,16 @@ def reload_refusal(
     with _LOCK:
         refusal = _REFUSED.get(_path_key(path))
     return _matching(refusal, fingerprint)
+
+
+def reload_refusals() -> dict[str, ReloadRefusal]:
+    """Every refusal on record now, by path key (:func:`crl_path_key`), as a copy.
+
+    For a caller that must tell a refusal that still stands from one that was cleared, whatever
+    the last reload pass returned (vault BACKLOG #2904). A pass returns nothing for a file it
+    could not read, and nothing when it failed, while the refusal stays on record."""
+    with _LOCK:
+        return dict(_REFUSED)
 
 
 def _matching(refusal: ReloadRefusal | None, fingerprint: tuple[int, int]) -> ReloadRefusal | None:

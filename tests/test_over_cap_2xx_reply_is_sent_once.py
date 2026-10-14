@@ -8,8 +8,9 @@ have sent the request again, and the message would then have dead-lettered when 
 
 The owner ruling of 2026-10-05 judges such a reply by who reads the body:
 
-* nothing looks inside it: the message is delivered, the body is dropped, and a WARNING is logged.
-  REST with capture off, and a plain FHIR write with capture off;
+* nothing looks inside it: the message is delivered and the body is dropped. The message gets a
+  ``reply_dropped`` event, and then a WARNING is logged (vault BACKLOG #3040 items 2 and 5). REST
+  with capture off, and a plain FHIR write with capture off;
 * the engine reads it to know the outcome, or passes it on: a permanent refusal, and no
   re-send. SOAP, DICOMweb and REST with capture on.
 
@@ -27,6 +28,9 @@ Three layers:
   the worker is given the row again and again. This is the layer the item is about: one send, and
   the recorded status the ruling names. The same harness shows a 500 IS sent again, so a count of
   one is not something it reports for every reply.
+
+The last section applies the same rule to a 2xx body cut short of its declared length, or
+misframed (BACKLOG #2989). Each layer above is repeated there for those two.
 
 Synthetic data only.
 """
@@ -54,15 +58,21 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
-from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.base import NegativeAckError, ReplyBodyDropped
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
+    REPLY_MISFRAMED_CODE,
     REPLY_TOO_LARGE_CODE,
+    REPLY_TRUNCATED_CODE,
+    EgressReplyError,
     ResponseTooLargeError,
     TruncatedResponseError,
     read_2xx_reply_text,
 )
-from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp
+from messagefoundry.transports.bounded_read import (
+    logger as _reader_logger,
+)
+from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp, _wire
 from tests.test_digest_refusal_classification import (
     _FACTORY,
     _LABEL,
@@ -81,34 +91,30 @@ _URL_MARKER = "SITE-QUERY-MARKER"
 _PAYLOAD_MARKER = "PAYLOAD-MARKER-7f3a"
 #: The byte an over-cap reply is made of on the wire. A run of it must never reach a log line.
 _REPLY_FILL = b"Z"
-#: The end of the delivered arm's WARNING: the words that say the 2xx stands.
-_TAKEN_AS_ANSWER = "the 2xx is taken as the partner's answer"
+#: The delivery worker's WARNING for a dropped body, which it logs after the row is recorded.
+_RECORDED_AS_DELIVERED = "the row is recorded as delivered with a reply_dropped event"
+#: The logger that WARNING comes from.
+_WORKER_LOGGER = "messagefoundry.pipeline.wiring_runner"
 
 
 # --- the helper -----------------------------------------------------------------------------------
 
 
-def test_an_unused_over_cap_body_reads_as_empty_and_warns(
+def test_an_unused_over_cap_body_is_reported_dropped_and_not_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level(logging.WARNING):
-        text = read_2xx_reply_text(
+    """The helper says what happened and logs nothing. The WARNING is the delivery worker's,
+    after its store write (vault BACKLOG #3040 item 2), so a line here would come first."""
+    with caplog.at_level(logging.DEBUG):
+        got = read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=201),
             limit=64,
             connector="REST connection 'OB_X'",
             encoding="utf-8",
             body_is_needed=False,
         )
-    assert text == ""
-    (record,) = caplog.records
-    assert record.levelno == logging.WARNING
-    message = record.getMessage()
-    assert message.startswith("REST connection 'OB_X' answered with status 201 and")
-    assert "64-byte bound" in message
-    assert message.endswith(_TAKEN_AS_ANSWER)
-    # vault BACKLOG #3040 item 2: the line is logged before the caller's store write, so it claims no record.
-    assert "recorded" not in message
-    assert _REPLY_FILL.decode() * 4 not in message
+    assert got == ReplyBodyDropped(status=201, limit=64)
+    assert caplog.records == []
 
 
 def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
@@ -158,17 +164,22 @@ class _ShortResp(_ExactResp):
 
 
 @pytest.mark.parametrize("body_is_needed", [False, True])
-def test_a_truncated_body_is_still_raised_as_it_was(body_is_needed: bool) -> None:
-    """Only the byte bound is handled. A truncated reply after a 2xx is still a retryable
-    ``TruncatedResponseError``, in both modes: that is a different question, left alone."""
-    with pytest.raises(TruncatedResponseError):
+@pytest.mark.parametrize("status", [404, 500])
+def test_a_truncated_body_on_another_status_is_still_raised_as_it_was(
+    status: int, body_is_needed: bool
+) -> None:
+    """A truncated body after a 2xx follows the same rule as an over-cap one since BACKLOG #2989,
+    and the section at the end of this file covers it. On any other status the helper still
+    changes nothing: the retryable ``TruncatedResponseError`` is raised in both modes."""
+    with pytest.raises(TruncatedResponseError) as ei:
         read_2xx_reply_text(
-            _ShortResp(b"y" * 5),
+            _ShortResp(b"y" * 5, status=status),
             limit=64,
             connector="c",
             encoding="utf-8",
             body_is_needed=body_is_needed,
         )
+    assert not isinstance(ei.value, NegativeAckError)
 
 
 @pytest.mark.parametrize("body_is_needed", [False, True])
@@ -228,17 +239,16 @@ def test_the_status_guard_lets_every_2xx_through(
     status: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     """THE CONTROL for the two tests above: the guard refuses nothing inside 200 to 299."""
-    with caplog.at_level(logging.WARNING):
-        text = read_2xx_reply_text(
+    with caplog.at_level(logging.DEBUG):
+        got = read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=status),
             limit=64,
             connector="c",
             encoding="utf-8",
             body_is_needed=False,
         )
-    assert text == ""
-    (record,) = caplog.records
-    assert f"answered with status {status} and" in record.getMessage()
+    assert got == ReplyBodyDropped(status=status, limit=64)
+    assert caplog.records == []
 
 
 def test_the_stored_refusal_keeps_its_code_and_advice_under_a_long_connection_name() -> None:
@@ -446,9 +456,12 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     resp = _UnboundedResp()
     opener = _FakeOpener(resp)
     dest._opener = opener
+    # Only what send() logs: building a path-form FHIR destination logs its own WARNING.
+    caplog.clear()
     with caplog.at_level(logging.WARNING):
         if side == _DELIVERED:
-            assert await dest.send(_payload(ctype, over)) is None
+            dropped = await dest.send(_payload(ctype, over))
+            assert dropped == ReplyBodyDropped(status=200, limit=DEFAULT_MAX_RESPONSE_BYTES)
         else:
             with pytest.raises(NegativeAckError) as ei:
                 await dest.send(_payload(ctype, over))
@@ -463,15 +476,10 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     # The bound is still enforced on the read: one byte past it, and never the whole body.
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
     assert len(opener.requests) == 1
-    if side == _DELIVERED:
-        (warning,) = [r.getMessage() for r in caplog.records if "over the" in r.getMessage()]
-        assert warning.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} answered")
-        for leaked in (_URL_MARKER, "partner.example.com", _PAYLOAD_MARKER, "\x00\x00"):
-            assert leaked not in warning
-    else:
-        # A refusal is not also logged as a delivery. The delivered cases of this same test show
-        # the capture sees that WARNING when it is logged.
-        assert _TAKEN_AS_ANSWER not in caplog.text
+    # send() logs nothing on either side. The delivered side's WARNING is the delivery worker's,
+    # after its store write (vault BACKLOG #3040 item 2); the wire tests below show it is logged
+    # and that this capture would see it.
+    assert caplog.records == []
 
 
 # --- the delivery worker, on the wire -------------------------------------------------------------
@@ -544,12 +552,52 @@ class _Partner:
 class _Delivery:
     """What the store holds after the worker was offered one row ``_OFFERS`` times."""
 
+    message_id: str
     outcomes: list[_ItemOutcome]
     row_status: str
     last_error: str
     message_status: str
     captured: list[tuple[str, str | None]]
     stopped: list[str]
+    #: Every ``reply_dropped`` row on the message: (destination, detail).
+    dropped_events: list[tuple[str | None, str]]
+    #: The ``mark_done`` calls, and the worker's dropped-body WARNING, in the order they
+    #: happened. A call is entered once it has returned.
+    order: list[str]
+
+
+class _OrderLog(logging.Handler):
+    """Appends ``"WARNING"`` to ``order`` when the worker logs its dropped-body line."""
+
+    def __init__(self, order: list[str]) -> None:
+        super().__init__(logging.WARNING)
+        self._order = order
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if _RECORDED_AS_DELIVERED in record.getMessage():
+            self._order.append("WARNING")
+
+
+def _spy_on_mark_done(store: MessageStore, order: list[str], done: str) -> None:
+    """Wrap ``mark_done`` so each call enters ``order`` once it returns, as ``"mark_done"`` or,
+    when it carries a drop, ``"mark_done+reply_dropped"``. ``done="raise"`` makes it raise before
+    it writes anything, as a store fault would, and enters ``"raised"``. ``done="noop"`` makes it
+    write nothing and return ``False``, as a vanished row or a fenced write does, and enters
+    ``"noop"``."""
+    real_mark_done = store.mark_done
+
+    async def mark_done(*args: Any, **kwargs: Any) -> bool:
+        if done == "raise":
+            order.append("raised")
+            raise OSError("synthetic store fault")
+        if done == "noop":
+            order.append("noop")
+            return False
+        wrote = await real_mark_done(*args, **kwargs)
+        order.append("mark_done+reply_dropped" if kwargs.get("reply_dropped") else "mark_done")
+        return wrote
+
+    store.mark_done = mark_done  # type: ignore[method-assign]
 
 
 #: How often the worker is offered the row. Each offer is past any backoff, so a row that is still
@@ -557,9 +605,12 @@ class _Delivery:
 _OFFERS = 3
 
 
-async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
+async def _deliver(tmp_path: Path, dest: Any, payload: str, *, done: str = "real") -> _Delivery:
     """Queue one outbound row for ``dest`` and offer it to the delivery worker ``_OFFERS`` times."""
     outcomes: list[_ItemOutcome] = []
+    order: list[str] = []
+    order_log = _OrderLog(order)
+    worker_logger = logging.getLogger(_WORKER_LOGGER)
     store = await MessageStore.open(tmp_path / "overcap.db")
     try:
         mid = await store.enqueue_ingress(channel_id=CHANNEL, raw=RAW, now=0.0)
@@ -590,13 +641,22 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
             egress=EgressSettings(deny_by_default=False),
         )
         runner._destinations[DEST] = dest
+        _spy_on_mark_done(store, order, done)
+        worker_logger.addHandler(order_log)
         for offer in range(1, _OFFERS + 1):
             # A day further on each time: past any backoff the last attempt set.
             item = await store.claim_next_fifo(DEST, now=time.time() + offer * 86400.0)
             if item is None:
                 break
-            outcome, _ = await runner._process_delivery_item(DEST, item)
+            try:
+                outcome, _ = await runner._process_delivery_item(DEST, item)
+            except OSError:
+                # Only done="raise" raises. The worker's caller would re-pend the row; this stops.
+                if done != "raise":
+                    raise
+                break
             outcomes.append(outcome)
+        events = await store.events_for(mid)
         cur = await store._db.execute(
             "SELECT status, last_error FROM queue WHERE message_id=? AND stage=?",
             (mid, Stage.OUTBOUND.value),
@@ -606,6 +666,7 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
         message = await store.get_message(mid)
         assert message is not None
         return _Delivery(
+            message_id=mid,
             outcomes=outcomes,
             row_status=str(row["status"]),
             # Plaintext here: the test store has the default identity cipher.
@@ -613,8 +674,15 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
             message_status=str(message["status"]),
             captured=[(c.outcome, c.body) for c in await store.correlate_response(mid)],
             stopped=[name for name, _ in sink.stopped],
+            dropped_events=[
+                (e["destination"], str(e["detail"] or ""))
+                for e in events
+                if e["event"] == "reply_dropped"
+            ],
+            order=order,
         )
     finally:
+        worker_logger.removeHandler(order_log)
         await store.close()
 
 
@@ -642,8 +710,24 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
         assert got.row_status == OutboxStatus.DONE.value
         assert got.message_status == MessageStatus.PROCESSED.value
         assert got.last_error == ""
-        assert any(_TAKEN_AS_ANSWER in r.getMessage() for r in caplog.records)
+        # vault BACKLOG #3040 item 5: the message itself says its reply was dropped.
+        bound = DEFAULT_MAX_RESPONSE_BYTES
+        assert got.dropped_events == [(DEST, f"HTTP 200; reply body over the {bound}-byte bound")]
+        # Item 2: the row is recorded, then the drop, and only then the WARNING.
+        assert got.order == ["mark_done+reply_dropped", "WARNING"]
+        (warning,) = [r for r in caplog.records if _RECORDED_AS_DELIVERED in r.getMessage()]
+        assert warning.levelno == logging.WARNING
+        assert warning.name == _WORKER_LOGGER
+        line = warning.getMessage()
+        assert line.startswith(f"delivery worker {DEST!r}: outbox row ")
+        assert f"(message {got.message_id}) answered" in line
+        assert f"answered with status 200 and a response body over the {bound}-byte" in line
+        assert line.endswith(_RECORDED_AS_DELIVERED)
     else:
+        # A refusal writes no reply_dropped row and no dropped-body WARNING. The delivered side
+        # of this same test shows both are seen when they are written.
+        assert got.dropped_events == []
+        assert "WARNING" not in got.order
         assert got.row_status == OutboxStatus.DEAD.value
         assert got.message_status == MessageStatus.ERROR.value
         # The stored error is the fixed text: the connection, the bound, and nothing of the URL,
@@ -688,9 +772,12 @@ async def test_an_over_cap_2xx_in_another_framing_is_sent_once(
     assert got.outcomes == [_ItemOutcome.PROCESSED]
     if side == _DELIVERED:
         assert (got.row_status, got.last_error) == (OutboxStatus.DONE.value, "")
+        assert len(got.dropped_events) == 1
+        assert got.order == ["mark_done+reply_dropped", "WARNING"]
     else:
         assert got.row_status == OutboxStatus.DEAD.value
         assert f"{REPLY_TOO_LARGE_CODE}, not sent again" in got.last_error
+        assert got.dropped_events == []
 
 
 #: A reply each destination takes as a plain success.
@@ -728,6 +815,55 @@ async def test_an_in_cap_2xx_is_delivered_as_before(
     assert got.message_status == MessageStatus.PROCESSED.value
     assert got.captured == ([("accepted", body.decode())] if capture else [])
     assert not any("over the" in r.getMessage() for r in caplog.records)
+    assert got.dropped_events == []
+    assert "WARNING" not in got.order
+
+
+@pytest.mark.parametrize("case", [c for c in _RULED if c[2] == _DELIVERED], ids=_case_id)
+async def test_no_dropped_body_warning_when_the_store_write_fails(
+    case: tuple[ConnectorType, dict[str, Any], str],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    over_cap_body: bytes,
+) -> None:
+    """Vault BACKLOG #3040 item 2: the WARNING says the row is recorded as delivered, so it must
+    not be logged when the write that records it fails. The delivered side of the matrix above
+    shows the same capture sees the line when the write succeeds."""
+    ctype, over, _ = case
+    with _Partner(200, over_cap_body) as partner:
+        dest = _dest(ctype, f"{partner.url}/x", over)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype, over), done="raise")
+    assert len(partner.requests) == 1, partner.requests
+    assert got.order == ["raised"]
+    assert got.row_status == OutboxStatus.INFLIGHT.value
+    assert got.dropped_events == []
+    assert _RECORDED_AS_DELIVERED not in caplog.text
+
+
+@pytest.mark.parametrize("case", [c for c in _RULED if c[2] == _DELIVERED], ids=_case_id)
+async def test_the_warning_says_so_when_the_store_recorded_nothing(
+    case: tuple[ConnectorType, dict[str, Any], str],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    over_cap_body: bytes,
+) -> None:
+    """``mark_done`` returns ``False`` for a vanished row or a fenced write, and writes nothing.
+    The WARNING follows what it returned, so it does not claim a record (vault BACKLOG #3040
+    item 2). The matrix above is the control: there it returns ``True`` and the line says so."""
+    ctype, over, _ = case
+    with _Partner(200, over_cap_body) as partner:
+        dest = _dest(ctype, f"{partner.url}/x", over)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype, over), done="noop")
+    assert len(partner.requests) == 1, partner.requests
+    assert got.order == ["noop"]
+    assert got.dropped_events == []
+    (warning,) = [r for r in caplog.records if r.name == _WORKER_LOGGER]
+    line = warning.getMessage()
+    assert f"(message {got.message_id}) answered with status 200" in line
+    assert line.endswith("the store recorded nothing: the row was gone or the write was fenced")
+    assert _RECORDED_AS_DELIVERED not in line
 
 
 @pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
@@ -747,3 +883,206 @@ async def test_an_over_cap_body_on_a_500_is_retried_as_before(
     assert "HTTP 500" in got.last_error
     assert REPLY_TOO_LARGE_CODE not in got.last_error
     assert got.captured == []
+
+
+# --- a truncated or misframed 2xx body follows the same rule (BACKLOG #2989) ----------------------
+#
+# The same principle as the ruling above: judge the body by who reads it. ADR 0095 Amendment B.1
+# records who decided it for these two. If that decision changes, these tests and the codes they
+# pin are the ones to change.
+
+#: The peer promised 50 bytes and sent 5, then closed.
+_TRUNCATED_2XX = b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\nConnection: close\r\n\r\nhello"
+#: Two framings at once, which RFC 9112 section 6.1 calls an error. The chunked body is complete.
+_MISFRAMED_2XX = (
+    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    b"\r\n5\r\nhello\r\n0\r\n\r\n"
+)
+_UNREADABLE = {
+    "truncated": (_TRUNCATED_2XX, REPLY_TRUNCATED_CODE, "ended before its declared length"),
+    "misframed": (_MISFRAMED_2XX, REPLY_MISFRAMED_CODE, "is misframed ("),
+}
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+@pytest.mark.parametrize("status", [200, 201, 299])
+def test_an_unreadable_2xx_body_nobody_needs_is_reported_dropped_and_not_logged(
+    kind: str, status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dropped as an over-cap body is: a ``ReplyBodyDropped`` the delivery worker records and then
+    logs (vault BACKLOG #3040 items 2 and 5). It names what was wrong with the body."""
+    raw, _code, said = _UNREADABLE[kind]
+    with caplog.at_level(logging.DEBUG):
+        got = read_2xx_reply_text(
+            _wire(raw.replace(b"200 OK", f"{status} OK".encode(), 1)),
+            connector="REST connection 'OB_X'",
+            encoding="utf-8",
+            body_is_needed=False,
+        )
+    assert isinstance(got, ReplyBodyDropped)
+    assert (got.status, got.limit) == (status, DEFAULT_MAX_RESPONSE_BYTES)
+    assert got.fault is not None
+    assert said in got.fault
+    assert got.detail == f"HTTP {status}; reply body {got.fault}"
+    assert "hello" not in got.detail
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+def test_an_unreadable_2xx_body_that_is_needed_is_a_permanent_refusal(kind: str) -> None:
+    raw, code, said = _UNREADABLE[kind]
+    connector = "SOAP connection 'OB_X'"
+    with pytest.raises(NegativeAckError) as ei:
+        read_2xx_reply_text(
+            _wire(raw),
+            connector=connector,
+            encoding="utf-8",
+            body_is_needed=True,
+        )
+    err = ei.value
+    assert err.code == code
+    # One reply, not the connection: it must not stop the lane.
+    assert (err.permanent, err.credential_fault, err.config_fault) == (True, False, False)
+    # The code and the advice first, the connection last (vault BACKLOG #3040 items 4 and 6).
+    assert str(err).startswith(f"{code}, not sent again. A 2xx reply body")
+    assert said in str(err)
+    assert str(err).endswith(f"Check the partner before a replay ({connector})")
+    assert "hello" not in str(err)
+    assert err.__context__ is None
+    assert err.__cause__ is None
+
+
+@pytest.mark.parametrize("body_is_needed", [False, True])
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+def test_an_unreadable_body_on_a_non_2xx_is_still_raised_as_it_was(
+    kind: str, body_is_needed: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE CONTROL: the 2xx is what decides. On a 500 the retryable error is raised unchanged."""
+    raw, _code, _said = _UNREADABLE[kind]
+    with caplog.at_level(logging.WARNING), pytest.raises(EgressReplyError) as ei:
+        read_2xx_reply_text(
+            _wire(raw.replace(b"200 OK", b"500 Server Error", 1)),
+            connector="c",
+            encoding="utf-8",
+            body_is_needed=body_is_needed,
+        )
+    assert not isinstance(ei.value, NegativeAckError)
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+@pytest.mark.parametrize("case", _RULED, ids=_case_id)
+async def test_send_follows_the_ruling_for_an_unreadable_2xx_body(
+    case: tuple[ConnectorType, dict[str, Any], str], kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each destination's ``_post``, with the opener counted: the request is sent once either way."""
+    ctype, over, side = case
+    raw, code, said = _UNREADABLE[kind]
+    dest = _dest(ctype, f"https://partner.example.com/x?site={_URL_MARKER}", over)
+    opener = _FakeOpener(_wire(raw))
+    dest._opener = opener
+    # Only what send() logs: building a path-form FHIR destination logs its own WARNING.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        if side == _DELIVERED:
+            dropped = await dest.send(_payload(ctype, over))
+            assert isinstance(dropped, ReplyBodyDropped)
+            assert dropped.status == 200
+            assert said in dropped.problem
+            assert _URL_MARKER not in dropped.detail
+        else:
+            with pytest.raises(NegativeAckError) as ei:
+                await dest.send(_payload(ctype, over))
+            assert (ei.value.code, ei.value.permanent) == (code, True)
+            assert ei.value.config_fault is False
+            identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
+            assert str(ei.value).startswith(f"{code}, not sent again")
+            assert str(ei.value).endswith(f"Check the partner before a replay ({identity})")
+            assert _URL_MARKER not in str(ei.value)
+        # The positive control: a WARNING on the reader's own logger reaches caplog here.
+        _reader_logger.warning("positive control")
+    assert len(opener.requests) == 1
+    # send() logs nothing on either side. The delivered side's WARNING is the delivery worker's,
+    # after its store write; the wire test below shows it.
+    assert [r.getMessage() for r in caplog.records] == ["positive control"]
+
+
+class _RawPartner:
+    """A loopback partner that answers every request with the same raw reply bytes, and counts."""
+
+    def __init__(self, raw: bytes) -> None:
+        self.requests: list[str] = []
+        outer = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def _serve(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                outer.requests.append(self.command)
+                self.close_connection = True
+                with contextlib.suppress(OSError):
+                    self.wfile.write(raw)
+
+            do_POST = do_PUT = do_PATCH = _serve
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+
+    def __enter__(self) -> _RawPartner:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE))
+@pytest.mark.parametrize("case", _RULED, ids=_case_id)
+async def test_an_unreadable_2xx_is_sent_once_and_recorded_as_ruled(
+    case: tuple[ConnectorType, dict[str, Any], str],
+    kind: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE ITEM, on the wire. Before BACKLOG #2989 each offer sent the request again."""
+    ctype, over, side = case
+    raw, code, said = _UNREADABLE[kind]
+    with _RawPartner(raw) as partner:
+        dest = _dest(ctype, f"{partner.url}/x?site={_URL_MARKER}", over)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype, over))
+    assert len(partner.requests) == 1, partner.requests
+    assert got.outcomes == [_ItemOutcome.PROCESSED]
+    assert got.stopped == [], "one unreadable reply must not stop the lane"
+    assert got.captured == []
+    if side == _DELIVERED:
+        assert got.row_status == OutboxStatus.DONE.value
+        assert got.message_status == MessageStatus.PROCESSED.value
+        # The message says what was wrong with the body, and the WARNING follows the write.
+        ((where, detail),) = got.dropped_events
+        assert where == DEST
+        assert detail.startswith("HTTP 200; reply body ")
+        assert said in detail
+        assert got.order == ["mark_done+reply_dropped", "WARNING"]
+        (warning,) = [r for r in caplog.records if _RECORDED_AS_DELIVERED in r.getMessage()]
+        assert said in warning.getMessage()
+        assert _URL_MARKER not in warning.getMessage()
+    else:
+        assert got.dropped_events == []
+        assert "WARNING" not in got.order
+        assert got.row_status == OutboxStatus.DEAD.value
+        assert got.message_status == MessageStatus.ERROR.value
+        # The code and the advice come first, so the row's 200-character cut keeps them. The
+        # misframed reason is long enough that the cut can reach the connection name, which comes
+        # last on purpose (vault BACKLOG #3040 items 4 and 6), so only its opening is pinned.
+        assert f"{code}, not sent again" in got.last_error
+        assert "Check the partner before a replay (" in got.last_error
+        for leaked in (_URL_MARKER, "127.0.0.1", _PAYLOAD_MARKER, "hello"):
+            assert leaked not in got.last_error

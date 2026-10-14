@@ -1966,22 +1966,21 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     def owes(
         provider: str, scope: str, roles: frozenset[Role], *, on: bool, enrolled: bool
     ) -> bool:
-        async def role_ids(_user_id: object) -> list[str]:
-            return [r.value for r in roles]
-
         async def second_factor(_user: object) -> bool:
             return enrolled
 
         fake = SimpleNamespace(
             _settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope),
-            _store=SimpleNamespace(get_user_role_ids=role_ids),
             _second_factor_enrolled=second_factor,
         )
         fake._mfa_required_for = functools.partial(
             AuthService._mfa_required_for,
             fake,  # type: ignore[arg-type]
         )
-        account = SimpleNamespace(id="u1", auth_provider=provider)
+        # The roles ride on the checked account record (BACKLOG #2592), not a second store read.
+        account = SimpleNamespace(
+            id="u1", auth_provider=provider, role_ids=tuple(r.value for r in roles)
+        )
         return bool(
             asyncio.run(
                 AuthService._unverified_session_owes_factor(
@@ -2161,6 +2160,36 @@ _H_TABLE_A = "#### Table A — control plane (operator API + web console)"
 
 def _flat(text: str) -> str:
     return " ".join(text.split())
+
+
+#: Sentences CONFIGURATION.md carried about a CRL's signature that the code does not bear out
+#: (vault BACKLOG #3506). ``tests/test_crl_signature_at_start.py`` holds a test for each fact.
+_RETRACTED_CRL_SIGNATURE_CLAIMS = (
+    # Not when the engine cannot check with that key, nor when the name differs only in case.
+    "A start refuses it when the CRL names the CA's key and that key did not sign it",
+    # A version that returns after another that was logged is logged again.
+    "logged once per engine process for each version of the file",
+    # Too wide the other way: a version that returns after one that logged nothing is not.
+    "an earlier version that returns is logged again",
+    # A CA file that a CRL setting also names is signature-checked.
+    "The engine never checks its signature",
+)
+#: Sentences the guide must keep, each for a fact a reader acts on.
+_REQUIRED_CRL_SIGNATURE_SENTENCES = (
+    "an earlier version is logged again when it returns after another version that was logged",
+    "the engine does not check its signature, at a start or at a reload",
+)
+
+
+def test_the_guide_keeps_the_corrected_crl_signature_sentences() -> None:
+    """Here, not beside the behaviour tests, so the docs-only lane runs it (``DOC_GUARDS``)."""
+    text = _flat(_CONFIG_DOC.read_text(encoding="utf-8"))
+    # Control: the guide still has the paragraph these sentences sit in.
+    assert "A start checks each CRL's signature too" in text
+    for claim in _RETRACTED_CRL_SIGNATURE_CLAIMS:
+        assert claim not in text, f"CONFIGURATION.md makes a retracted claim again: {claim!r}"
+    for sentence in _REQUIRED_CRL_SIGNATURE_SENTENCES:
+        assert sentence in text, f"CONFIGURATION.md no longer says: {sentence!r}"
 
 
 def _table_a_row(attribute: str) -> str:
@@ -2362,7 +2391,10 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
         on: bool = True,
     ) -> bool:
         """``_mfa_satisfied_hash`` for one session, on a stand-in self that supplies every read."""
-        account = SimpleNamespace(id="u1", auth_provider=provider)
+        # The roles ride on the checked account record (BACKLOG #2592), not a second store read.
+        account = SimpleNamespace(
+            id="u1", auth_provider=provider, role_ids=tuple(r.value for r in roles)
+        )
         session = SimpleNamespace(
             user_id="u1",
             revoked_at=None,
@@ -2373,19 +2405,17 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
             # The service's one session loader (BACKLOG #2592), which checks the row's seal.
             return session
 
-        async def get_user(_user_id: str) -> object:
+        async def load_user(_user_id: str) -> object:
+            # The service's user loader (BACKLOG #2592), which checks the account's seal.
             return account
-
-        async def role_ids(_user_id: object) -> list[str]:
-            return [r.value for r in roles]
 
         async def second_factor(_user: object) -> bool:
             return enrolled
 
         fake = SimpleNamespace(
             _settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope),
-            _store=SimpleNamespace(get_user=get_user, get_user_role_ids=role_ids),
             _load_session=load_session,
+            _load_user=load_user,
             _second_factor_enrolled=second_factor,
         )
         fake._mfa_required_for = functools.partial(

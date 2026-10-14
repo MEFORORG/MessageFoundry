@@ -844,13 +844,14 @@ def test_a_send_time_refusal_keeps_its_text_through_the_key_provider(
 def test_any_other_failure_still_gives_only_its_type_name() -> None:
     """The fixed-text exception is narrow: a failure that is not the hop's own refusal can echo
     ciphertext, a body or a URL, so it still shrinks to its type name."""
-    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.store.keyprovider_vault import vault_failure_text
     from messagefoundry.transports.bounded_read import ResponseTooLargeError
+    from messagefoundry.transports.strict_requests import VaultHopRefused
 
     assert vault_failure_text(RuntimeError("vault:v1:c3ludGhldGlj")) == "RuntimeError"
     assert vault_failure_text(ValueError("https://vault.example.test")) == "ValueError"
-    assert vault_failure_text(InsecureHopRefused("fixed")) == "fixed"
+    # vault BACKLOG #3247: the hop's marked refusal; tests/test_vault_hop_refusal_marker.py.
+    assert vault_failure_text(VaultHopRefused("fixed")) == "fixed"
     assert vault_failure_text(ResponseTooLargeError("bound")) == "bound"
 
 
