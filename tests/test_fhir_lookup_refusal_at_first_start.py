@@ -322,6 +322,55 @@ async def test_a_failed_lookup_comes_back_by_reload_or_restart_once_the_cause_is
     assert dials == []
 
 
+async def test_the_lookup_alert_fires_after_the_record_and_a_stop_clears_it(
+    store: MessageStore, tmp_path: Path, dials: list[str]
+) -> None:
+    """A sink that reads /status when the alert lands sees the lookup it names. Once the graph
+    stops, the runner no longer names its failures, since teardown keeps the last executor."""
+    runner: RegistryRunner
+
+    class _Reading(_Alerts):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[dict[str, str]] = []
+
+        def connection_stopped(self, name: str, *, detail: str) -> None:
+            super().connection_stopped(name, detail=detail)
+            self.seen.append(runner.degraded_fhir_lookups())
+
+    alerts = _Reading()
+    runner = _runner(_two_feeds(tmp_path, _unattested_lookup()), store, alerts)
+    await runner.start()
+    try:
+        _assert_lookup_isolated(runner, "revocation")
+        assert len(alerts.seen) == 1 and list(alerts.seen[0]) == ["epic"]
+    finally:
+        await runner.stop()
+    assert runner.degraded_fhir_lookups() == {}
+    assert runner.fhir_lookup_failed("epic") is None
+    assert dials == []
+
+
+async def test_a_start_that_unwinds_after_isolating_a_lookup_sends_no_lookup_alert(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dials: list[str]
+) -> None:
+    """The lookup alert says the engine continues. A later graph-wide failure unwinds the start,
+    so that alert would be false, and none is sent."""
+    alerts = _Alerts()
+    runner = _runner(_two_feeds(tmp_path, _unattested_lookup()), store, alerts)
+
+    def boom() -> None:
+        raise RuntimeError("a later graph-wide start failure")
+
+    monkeypatch.setattr(runner, "_recompute_inline_ok", boom)
+    with pytest.raises(RuntimeError, match="later graph-wide"):
+        await runner.start()
+    assert not runner.running
+    assert alerts.stopped == []
+    assert runner.degraded_fhir_lookups() == {}
+    assert dials == []
+
+
 async def test_an_unattested_dicom_tls_outbound_costs_one_lane_and_the_start_continues(
     store: MessageStore, tmp_path: Path, dials: list[str]
 ) -> None:
