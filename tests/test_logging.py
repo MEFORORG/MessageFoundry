@@ -1966,16 +1966,21 @@ def test_a_filter_less_json_formatter_limit_is_real_and_stated() -> None:
     red and the docstring must change with it. If someone softens the docstring, the second half
     goes red. ``test_every_configured_sink_escapes_the_wider_log_alphabet`` is the other side: every
     configured sink escapes the same characters."""
+    class_codes = sorted({code for codes in _LOG_ESCAPED_CLASSES.values() for code in codes})
+    # Split before CR and LF join, so the C0 half is never kept non-empty by those two alone.
+    c0 = [code for code in class_codes if code < 0x20]
+    others = [code for code in class_codes if code >= 0x20]
+    # Either half with no code points would pass its absence check below without testing anything.
+    assert len(c0) >= 1, "the classes name no C0 control"
+    assert len(others) >= 1, "the classes name no character outside C0"
     # CR and LF are not in the classes; they are added so the framing assertion has input to fail on.
-    codes = sorted(
-        {0x0A, 0x0D, *(code for codes in _LOG_ESCAPED_CLASSES.values() for code in codes)}
-    )
+    codes = sorted({0x0A, 0x0D, *class_codes})
     message = "a" + "".join(chr(code) for code in codes) + f"z password=pw-Jf_A-91 {SYNTHETIC_PHI}"
     record = logging.LogRecord("t", logging.INFO, __file__, 1, "%s", (message,), None)
     line = JsonFormatter().format(record)
     assert "\n" not in line and "\r" not in line, "a C0 control broke the one-line framing"
-    c0_left_raw = [hex(code) for code in codes if code < 0x20 and chr(code) in line]
-    others_escaped = [hex(code) for code in codes if code >= 0x20 and chr(code) not in line]
+    c0_left_raw = [hex(code) for code in c0 if chr(code) in line]
+    others_escaped = [hex(code) for code in others if chr(code) not in line]
     assert not c0_left_raw, f"json.dumps no longer escapes the C0 controls {c0_left_raw}"
     assert not others_escaped, (
         f"JsonFormatter now escapes {others_escaped} on its own. Update its docstring's limit "
