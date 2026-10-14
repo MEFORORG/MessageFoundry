@@ -1154,7 +1154,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
         # Vault BACKLOG #3229: a grant ends the account's no_enabled_administrator cooldown, so a
-        # second loss after a fix is paged rather than throttled, as crl_reload_applied does.
+        # second loss after a fix is paged rather than throttled. Unlike crl_reload_applied it
+        # resolves nothing: the open instance stays open for an operator. A reconciler re-grant
+        # raises no administrator_granted, so it does not end the cooldown.
         self._last_sent.pop(f"no_enabled_administrator:{name}", None)
         self._emit(
             {

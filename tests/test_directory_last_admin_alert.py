@@ -292,19 +292,30 @@ def test_the_alert_type_is_routable_and_takes_no_control_action() -> None:
 
 
 async def test_a_loss_after_a_regrant_is_not_held_back_by_the_cooldown() -> None:
-    """A grant ends the account's cooldown, so a second loss after a fix is paged again."""
+    """A sign-in's Administrator grant ends the account's cooldown, so a second loss is paged.
+
+    Both keys come from the real producers, so a drift in either one's key grammar fails here."""
+    from types import SimpleNamespace
+
+    from messagefoundry.api.security import alert_directory_administrator_granted
+    from messagefoundry.auth.service import LoginOutcome, RolesGained
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from tests.test_alert_sinks import _drain, _RecordingTransport
 
     transport = _RecordingTransport("webhook")
     sink = NotifierAlertSink([transport])  # the default cooldown, far longer than this test
+    lose = no_enabled_administrator_alert(sink)
+    state = SimpleNamespace(notifier=sink)
+    regrant = LoginOutcome(
+        ok=True, roles_gained=RolesGained("jdoe", frozenset({Role.ADMINISTRATOR.value}))
+    )
 
-    sink.no_enabled_administrator("user:jdoe", via="ad-sync")
-    sink.administrator_granted("user:jdoe", via="ad-sync", granted_by="<directory>")
-    sink.no_enabled_administrator("user:jdoe", via="ad-sync")
+    lose("jdoe", "ad-sync")
+    alert_directory_administrator_granted(state, regrant, via="directory_sign_in_negotiate")
+    lose("jdoe", "ad-sync")
     # The control: with no grant between them, the second loss is throttled.
-    sink.no_enabled_administrator("user:asmith", via="ad-reconcile")
-    sink.no_enabled_administrator("user:asmith", via="ad-reconcile")
+    lose("asmith", "ad-reconcile")
+    lose("asmith", "ad-reconcile")
     await _drain(sink)
 
     losses = [e["connection"] for e in transport.events if e["type"] == "no_enabled_administrator"]
