@@ -311,10 +311,11 @@ async def test_a_loss_after_a_regrant_is_not_held_back_by_the_cooldown() -> None
     )
 
     lose("jdoe", "ad-sync")
+    # The control: asmith's first loss comes BEFORE jdoe's grant, so a grant that cleared every
+    # account's cooldown would let asmith's second loss through and fail the count below.
+    lose("asmith", "ad-reconcile")
     alert_directory_administrator_granted(state, regrant, via="directory_sign_in_negotiate")
     lose("jdoe", "ad-sync")
-    # The control: with no grant between them, the second loss is throttled.
-    lose("asmith", "ad-reconcile")
     lose("asmith", "ad-reconcile")
     await _drain(sink)
 
