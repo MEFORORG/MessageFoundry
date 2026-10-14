@@ -2444,7 +2444,7 @@ class RegistryRunner:
         isolated.update(errors)
         return executor
 
-    def _record_fhir_lookup_failed(self, name: str, exc: BaseException) -> None:
+    def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
         does for a connection (ADR 0031, vault BACKLOG #3008). The executor keeps the record. The
         alert names the lookup by its record name, so it is not taken for a connection of the same
@@ -2453,7 +2453,7 @@ class RegistryRunner:
             f"fhir lookup {name!r}",
             fhir_lookup_record_name(name),
             "reload or restart; every Handler call to it fails closed meanwhile",
-            safe_exc(exc),
+            reason,
             exc,
         )
 
@@ -5225,11 +5225,27 @@ class RegistryRunner:
                 # is isolated above) must not leave half the graph wired with _running still False:
                 # unwind everything we started so the listeners are released and a retry can rebind (M-8).
                 log.exception("wiring start failed; unwinding the partial start")
+                for lookup_name, lookup_exc in fhir_lookup_isolated.items():
+                    # Vault BACKLOG #3008: logged, so a retry does not hide the refusal, but not
+                    # alerted, since the alert says the engine continues and this start did not.
+                    log.error(
+                        "fhir lookup %r also failed to build during the unwound start: %s",
+                        lookup_name,
+                        safe_exc(lookup_exc),
+                        exc_info=lookup_exc,
+                    )
                 # Explicitly SHUTDOWN (ADR 0157): a partial start is not a demotion — there is no lease
                 # being handed over, so there is nothing to bound and no reason to abandon a listener.
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
                 raise
             self._running = True
+            # Vault BACKLOG #3008: after _running is set, so a sink polling /status reads the record
+            # the alert names, and before anything else here can raise past it.
+            failed_lookups = self.degraded_fhir_lookups()
+            for lookup_name, lookup_exc in fhir_lookup_isolated.items():
+                self._record_fhir_lookup_failed(
+                    lookup_name, failed_lookups[lookup_name], lookup_exc
+                )
             # #147 (ADR 0095): spawn one active-window scheduler task per SCHEDULED connection. Each
             # AUTO-STARTs/STOPs its connection through the same start_inbound/stop_inbound (or
             # start_outbound/stop_outbound) path the API uses — a schedule-park is a clean stop, never a
@@ -5262,10 +5278,6 @@ class RegistryRunner:
                     len(self.filtered_outbound()),
                     self._dr_standby.value,
                 )
-            for lookup_name, lookup_exc in fhir_lookup_isolated.items():
-                # After _running is set, so a sink polling /status reads the record the alert names.
-                self._record_fhir_lookup_failed(lookup_name, lookup_exc)
-            failed_lookups = self.degraded_fhir_lookups()
             if failed_lookups:
                 # Vault BACKLOG #3008: a lookup is not a connection, so it is not in the count below.
                 log.warning(

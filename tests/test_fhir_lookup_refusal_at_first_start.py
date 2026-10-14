@@ -352,10 +352,15 @@ async def test_the_lookup_alert_fires_after_the_record_and_a_stop_clears_it(
 
 
 async def test_a_start_that_unwinds_after_isolating_a_lookup_sends_no_lookup_alert(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dials: list[str]
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    dials: list[str],
 ) -> None:
     """The lookup alert says the engine continues. A later graph-wide failure unwinds the start,
-    so that alert would be false, and none is sent."""
+    so that alert would be false, and none is sent. The refusal is still logged, so a retry that
+    unwinds again does not hide it."""
     alerts = _Alerts()
     runner = _runner(_two_feeds(tmp_path, _unattested_lookup()), store, alerts)
 
@@ -363,10 +368,11 @@ async def test_a_start_that_unwinds_after_isolating_a_lookup_sends_no_lookup_ale
         raise RuntimeError("a later graph-wide start failure")
 
     monkeypatch.setattr(runner, "_recompute_inline_ok", boom)
-    with pytest.raises(RuntimeError, match="later graph-wide"):
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="later graph-wide"):
         await runner.start()
     assert not runner.running
     assert alerts.stopped == []
+    assert any("fhir lookup 'epic' also failed to build" in r.getMessage() for r in caplog.records)
     assert runner.degraded_fhir_lookups() == {}
     assert dials == []
 

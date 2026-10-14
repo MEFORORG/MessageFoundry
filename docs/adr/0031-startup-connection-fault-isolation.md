@@ -354,9 +354,11 @@ CRL and no attestation unwound the whole start. On a clustered node the graph su
 the refusal, logged "will retry" and never ran the graph.
 
 **Decision.** At start, `RegistryRunner.start()` builds the `FhirLookup` executor with per-lookup
-isolation (`_build_fhir_lookup_executor(isolate=True)`). A lookup that fails to build is logged at
-ERROR, alerted as `connection_stopped` under `fhir_lookup:<name>`, kept on the executor as failed,
-and named in `/status` as `fhir_lookups_failed`. Every read on it raises `FhirLookupError` before
+isolation (`_build_fhir_lookup_executor(isolated=...)`). A lookup that fails to build is kept on
+the executor as failed and named in `/status` as `fhir_lookups_failed` while the graph runs. Once
+the start succeeds it is logged at ERROR and alerted as `connection_stopped` under
+`fhir_lookup:<name>`. A start that a later step unwinds still logs it at ERROR, but sends no alert,
+since the alert says the engine continues. Every read on it raises `FhirLookupError` before
 anything is sent, so a Handler that lets the error through takes the error path. A Handler that
 catches `FhirLookupError` decides for itself, as it does for any failed read. The rest of the
 graph starts. A first start, a restart and a clustered node's start on promotion all run this
