@@ -1056,19 +1056,27 @@ def _edit_gate(
     wt: Path,
     cwd_field: str | None,
     state: str = "gate-state",
+    file_path: str | None = None,
+    session_id: str | None = None,
+    peer_files: tuple[str, ...] = ("a.py",),
 ) -> dict[str, Any] | None:
     """The session in ``wt`` edits its a.py. A live PEER has a.py dirty, and so does the session."""
     own = {**EDITING_ROW, "Worktree": "linked", "Branch": "linked", "Root": _top(wt)}
     peer = {
         **EDITING_ROW,
+        "Files": list(peer_files),
+        "Dirty": list(peer_files),
         "Worktree": "peer-wt",
         "Branch": "claude/peer-work",
         "Short": "feedface",
         "Root": "d:/t/peer-wt",
     }
-    payload: dict[str, Any] = {"tool_name": "Edit", "tool_input": {"file_path": str(wt / "a.py")}}
+    target = str(wt / "a.py") if file_path is None else file_path
+    payload: dict[str, Any] = {"tool_name": "Edit", "tool_input": {"file_path": target}}
     if cwd_field is not None:
         payload["cwd"] = cwd_field
+    if session_id is not None:
+        payload["session_id"] = session_id
     return run_gate(
         _rooted_overlap_stub(tmp_path, [own, peer]),
         state_dir=tmp_path / state,
@@ -1077,11 +1085,7 @@ def _edit_gate(
     )
 
 
-def test_a_worktree_edit_is_checked_against_its_peers(
-    primary_and_worktree: tuple[Path, Path], tmp_path: Path
-) -> None:
-    repo, wt = primary_and_worktree
-    got = _edit_gate(tmp_path, repo, wt, str(wt))
+def _assert_denied_by_the_peer(got: dict[str, Any] | None) -> None:
     assert got is not None, "the gate saw no collision, so it read the edit from the wrong root"
     out = got["hookSpecificOutput"]
     assert out.get("permissionDecision") == "deny", out
@@ -1089,53 +1093,199 @@ def test_a_worktree_edit_is_checked_against_its_peers(
     assert "in linked [linked]" not in out["permissionDecisionReason"], "the session met itself"
 
 
-def test_without_a_cwd_the_gate_reads_the_edit_from_where_it_runs(
+def test_a_worktree_edit_is_checked_against_its_peers(
     primary_and_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """The control. From the primary the same edit matches nobody, and the gate is silent: the
-    blind gate the arm above exists to catch."""
     repo, wt = primary_and_worktree
-    assert _edit_gate(tmp_path, repo, wt, None) is None
+    _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, str(wt)))
 
 
-def test_a_cwd_that_does_not_exist_allows_and_says_it_could_not_check(
+def test_without_a_cwd_the_gate_reads_the_edit_from_its_own_worktree(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The target file names its worktree, so a payload with no ``cwd`` is checked there too. The
+    gate at 4b75764d7b read it from the primary and allowed in silence."""
+    repo, wt = primary_and_worktree
+    _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, None))
+
+
+def test_a_file_in_no_checkout_is_allowed_in_silence(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The control for the arms above: the stub denies only on a matching path, so a file no
+    worktree can hold is a true all-clear, and the gate says nothing."""
+    repo, wt = primary_and_worktree
+    outside = Path(os.path.realpath(tmp_path)) / "scratch"
+    outside.mkdir()
+    assert _edit_gate(tmp_path, repo, wt, str(wt), file_path=str(outside / "a.py")) is None
+
+
+def test_after_a_cd_to_a_sibling_the_sessions_own_edit_is_still_checked(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The Lander's point 1 on korus#223: with ``cwd`` in a sibling worktree, main denied this edit
+    and a gate that followed the ``cwd`` allowed it in silence."""
+    repo, wt = primary_and_worktree
+    sibling = Path(os.path.realpath(tmp_path)) / "sibling"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "sibling", str(sibling)],
+        check=True,
+        capture_output=True,
+    )
+    _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, str(sibling)))
+
+
+def test_after_a_cd_to_another_repository_the_edit_is_checked_and_nothing_is_written_there(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    repo, wt = primary_and_worktree
+    other = Path(os.path.realpath(tmp_path)) / "other-repo"
+    other.mkdir()
+    subprocess.run(["git", "-C", str(other), "init", "-q"], check=True, capture_output=True)
+    _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, str(other)))
+    assert not (other / ".git" / "mefor-coord").exists(), "the gate wrote into another repository"
+
+
+def test_a_cwd_that_does_not_exist_does_not_stop_the_check(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """The Lander's point 3: an unusable ``cwd`` gave one notice and then a silent allow. The file
+    still names its worktree, so the check runs and the collision still denies."""
+    repo, wt = primary_and_worktree
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, gone))
+    # Twice, because the old notice was throttled into silence on the second edit.
+    _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, gone))
+
+
+def test_a_relative_path_with_an_unusable_cwd_still_denies_on_a_collision(
+    primary_and_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """Degraded, the check still runs from where the gate started: a collision there denies."""
+    repo, wt = primary_and_worktree
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    got = _edit_gate(tmp_path, repo, wt, gone, file_path="a.py")
+    assert got is not None and got["hookSpecificOutput"].get("permissionDecision") == "deny", got
+
+
+def test_a_relative_path_with_an_unusable_cwd_allows_and_says_it_is_not_an_all_clear(
     primary_and_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
     repo, wt = primary_and_worktree
     gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
-    got = _edit_gate(tmp_path, repo, wt, gone)
-    assert got is not None, "a `cwd` the gate cannot use must not pass as an all-clear"
+    got = _edit_gate(tmp_path, repo, wt, gone, file_path="b.py")
+    assert got is not None, "a check read against the wrong checkout must not pass as an all-clear"
     out = got["hookSpecificOutput"]
     assert "permissionDecision" not in out, f"fail-open: it must allow, not deny: {out}"
     assert "could NOT check this edit (cwd-unusable)" in out["additionalContext"], out
     assert "deleted-worktree, which does not exist" in out["additionalContext"], out
 
 
-def test_a_cwd_in_no_checkout_allows_and_says_it_could_not_check(
+def test_a_relative_path_is_read_against_the_cwd(
     primary_and_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """A directory that exists outside every checkout is entered without complaint, and overlap.ps1
-    would then print "[]", the bytes of an all-clear."""
     repo, wt = primary_and_worktree
-    outside = Path(os.path.realpath(tmp_path)) / "scratch"
-    outside.mkdir()
-    got = _edit_gate(tmp_path, repo, wt, str(outside))
-    assert got is not None, "an edit checked from no checkout must not pass as an all-clear"
-    out = got["hookSpecificOutput"]
-    assert "permissionDecision" not in out, out
-    assert "which is inside no checkout" in out["additionalContext"], out
+    _assert_denied_by_the_peer(_edit_gate(tmp_path, repo, wt, str(wt), file_path="a.py"))
 
 
 def test_one_sessions_notice_does_not_silence_another_sessions(
     primary_and_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """The throttle stamp is keyed on the cwd the input named. Keyed on where the gate runs, every
-    worktree session would share the primary's stamp, and the first notice would silence the rest
-    for the whole cooldown -- read by them as an all-clear."""
+    """A degraded run is stamped by session id. Keyed on where the gate runs, every worktree
+    session would share the primary's stamp, and the first notice would silence the rest for the
+    whole cooldown -- read by them as an all-clear."""
     repo, wt = primary_and_worktree
-    base = Path(os.path.realpath(tmp_path))
-    first = _edit_gate(tmp_path, repo, wt, str(base / "gone-one"), state="shared-state")
-    second = _edit_gate(tmp_path, repo, wt, str(base / "gone-two"), state="shared-state")
-    again = _edit_gate(tmp_path, repo, wt, str(base / "gone-one"), state="shared-state")
+    gone = str(Path(os.path.realpath(tmp_path)) / "gone")
+
+    def degraded(sid: str) -> dict[str, Any] | None:
+        return _edit_gate(
+            tmp_path, repo, wt, gone, state="shared-state", file_path="b.py", session_id=sid
+        )
+
+    first = degraded("session-one")
+    second = degraded("session-two")
+    again = degraded("session-one")
     assert first is not None and second is not None, (first, second)
     assert again is None, "the control: the same session inside its cooldown stays quiet"
+
+
+# --------------------------------------------------------------------------------------------------
+# One case against the REAL overlap.ps1, as the Lander asked on korus#223: the stubs above model its
+# relativisation and self-skip, and only the real script shows the model matches it. A wrapper hands
+# overlap.ps1 a fixture registry holding one live peer (this test process's pid, so it is alive).
+# --------------------------------------------------------------------------------------------------
+
+OVERLAP = ROOT / "scripts" / "coord" / "overlap.ps1"
+
+
+@pytest.fixture
+def live_peer(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    base = Path(os.path.realpath(tmp_path))
+
+    def git(repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    origin = base / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    repo = base / "primary"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "alpha.txt").write_text("base\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "main")
+    mine = base / "mine"
+    peer = base / "peer"
+    git(repo, "worktree", "add", "-q", "-b", "mine", str(mine))
+    git(repo, "worktree", "add", "-q", "-b", "peer", str(peer))
+    (peer / "alpha.txt").write_text("base\nthe peer is editing this\n", encoding="utf-8")
+
+    config = base / "config"
+    (config / "sessions").mkdir(parents=True)
+    record = {
+        "sessionId": "feedface-0000-4000-8000-000000000000",
+        "pid": os.getpid(),
+        "cwd": str(peer),
+    }
+    (config / "sessions" / "peer.json").write_text(json.dumps(record), encoding="utf-8")
+    wrapper = base / "overlap-real.ps1"
+    wrapper.write_text(
+        "param([string]$File,[switch]$Json,[int]$TimeBudgetSeconds)\n"
+        f"& pwsh -NoProfile -NonInteractive -File '{OVERLAP}' -File $File -Json -Refresh "
+        f"-TimeBudgetSeconds $TimeBudgetSeconds -ConfigRoot '{config}' -TasksDir '{base / 'no-tasks'}'\n"
+        "exit $LASTEXITCODE\n",
+        encoding="utf-8",
+    )
+    return repo, mine, peer, wrapper
+
+
+def _real_gate(
+    tmp_path: Path, repo: Path, wrapper: Path, target: Path, cwd_field: str | None
+) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {"tool_name": "Edit", "tool_input": {"file_path": str(target)}}
+    if cwd_field is not None:
+        payload["cwd"] = cwd_field
+    return run_gate(
+        wrapper, state_dir=tmp_path / "real-state", raw_input=json.dumps(payload), cwd=repo
+    )
+
+
+def test_the_real_overlap_walk_denies_an_edit_a_live_peer_is_making(
+    live_peer: tuple[Path, Path, Path, Path], tmp_path: Path
+) -> None:
+    repo, mine, peer, wrapper = live_peer
+    for cwd_field in (str(mine), None, str(peer)):
+        got = _real_gate(tmp_path, repo, wrapper, mine / "alpha.txt", cwd_field)
+        assert got is not None, f"cwd={cwd_field}: the real walk let a live collision through"
+        assert got["hookSpecificOutput"].get("permissionDecision") == "deny", got
+
+
+def test_the_real_overlap_walk_allows_a_file_nobody_else_is_editing(
+    live_peer: tuple[Path, Path, Path, Path], tmp_path: Path
+) -> None:
+    """The control: the same live peer, a file it has not touched, and the gate stays silent."""
+    repo, mine, _, wrapper = live_peer
+    assert _real_gate(tmp_path, repo, wrapper, mine / "beta.txt", str(mine)) is None

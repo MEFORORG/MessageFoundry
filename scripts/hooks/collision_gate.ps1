@@ -37,18 +37,24 @@
     Wired on Edit|Write|MultiEdit|NotebookEdit. The overlap map is cached, so the common case is a
     cache read, not a git walk across every worktree.
 
-    IT CHECKS FROM THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
+    IT CHECKS FROM THE WORKTREE THE EDITED FILE SITS IN, NOT THE ONE IT RUNS IN. The desktop app starts a
     worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
     hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
     overlap.ps1 reads an absolute -File against ITS OWN worktree root. From the primary, a path into a
     sibling worktree is under no root it knows, matches no row's Files, and the walk prints "[]": the
     gate allowed every edit a worktree session made, and said nothing. A blind gate, read as all-clear.
 
-    Only the `cwd` field of the JSON on stdin names the worktree, so the gate moves there
-    (scripts/hooks/_hookinput.ps1) before its first git call and before it starts overlap.ps1. Input
-    with no `cwd` leaves it where it started, as before. A `cwd` it cannot use, one that sits in no
-    checkout, or a missing helper lands on the unresolved notice below: allowed, and said aloud, with
-    its throttle stamp keyed on the cwd the input named.
+    The edited file names its own worktree, so the gate walks up from it to the nearest `.git` and
+    moves there (scripts/hooks/_hookinput.ps1) before it starts overlap.ps1. That holds after the
+    session runs `cd`, which moves the payload `cwd` and not the file: the Lander's verdict on
+    korus#223 measured a gate that followed the `cwd` into a sibling allow, in silence, an edit `main`
+    denied. A file in another repository or in no checkout is checked from where the gate started,
+    and writes nothing into another repository's .git. The `cwd` is read only to resolve a relative
+    path.
+
+    A DEGRADED RUN STILL CHECKS. A missing helper, or a relative path with a `cwd` the gate cannot
+    use, leaves it checking from where it started. A collision found there still denies; an allow
+    lands on the unresolved notice below, with its throttle stamp keyed on the session id.
 #>
 [CmdletBinding()]
 param(
@@ -253,7 +259,6 @@ if (-not $target) { exit 0 }
 # A file in another repository, or in no checkout, is left where the gate started: no worktree of the
 # repository this gate guards can hold it, so the walk's "nobody" is true there, and the gate writes
 # nothing into another repository's .git.
-$entered = $false
 if ($hasHelper) {
     $abs = $target
     if (-not [System.IO.Path]::IsPathRooted($abs)) {
@@ -271,7 +276,7 @@ if ($hasHelper) {
     $root = Get-CcxWorktreeRoot (Split-Path -Parent $abs)
     $rootCommon = if ($root) { Get-CcxGitCommonDir $root } else { $null }
     if ($rootCommon -and (-not $script:StartCommon -or (Test-CcxSamePath $rootCommon $script:StartCommon))) {
-        try { Set-Location -LiteralPath $root -ErrorAction Stop; $entered = $true }
+        try { Set-Location -LiteralPath $root -ErrorAction Stop }
         catch {
             $degraded = "the gate could not enter $root, the worktree this edit is in ($($_.Exception.Message))"
             $slug = 'worktree-unenterable'
@@ -280,10 +285,11 @@ if ($hasHelper) {
     $target = $abs
 }
 
-# The throttle stamp names the SESSION when the gate is not in the edit's worktree: git would answer
-# for where the gate started, the primary under the desktop app, and every worktree session would
-# share one stamp, so one session's notice would silence the rest. See Write-Unresolved.
-if ($degraded -and -not $entered -and $hook) {
+# A degraded run's throttle stamp names the SESSION. Keyed on where the gate stands, which is where it
+# started or the worktree a relative path fell back to (the primary, under the desktop app), every
+# worktree session would share one stamp, and one session's notice would silence the rest. See
+# Write-Unresolved.
+if ($degraded -and $hook) {
     $who = [string]$hook.session_id
     $kind = 'sid'
     if (-not $who) { $who = [string]$hook.cwd; $kind = 'cwd' }

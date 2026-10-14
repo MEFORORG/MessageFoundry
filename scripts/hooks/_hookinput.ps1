@@ -235,9 +235,11 @@ function Resolve-CcxHookSession {
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         try { $out.Payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { $out.Payload = $null }
     }
+    # Through PSObject.Properties, because a caller under Set-StrictMode throws on a missing member.
     if ($out.Payload -is [pscustomobject]) {
-        $out.SessionId = [string]$out.Payload.session_id
-        $out.Event = [string]$out.Payload.hook_event_name
+        $props = $out.Payload.PSObject.Properties
+        if ($props['session_id']) { $out.SessionId = [string]$props['session_id'].Value }
+        if ($props['hook_event_name']) { $out.Event = [string]$props['hook_event_name'].Value }
     }
 
     $p = Get-CcxHookPayloadCwd -Text $Text

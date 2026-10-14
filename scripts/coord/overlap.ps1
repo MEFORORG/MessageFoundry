@@ -969,6 +969,13 @@ if ($null -eq $map) {
             @{ at = (Get-Date).ToString("o"); root = $myRootNorm; head = $myHead; rows = $map
                census = $script:Census } |
                 ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
+            # One file per root, and roots come and go with worktrees. A file a day old is far past
+            # -CacheSeconds, so nothing reads it again; sweep those rather than keep one per worktree
+            # ever made.
+            $staleBefore = (Get-Date).AddDays(-1)
+            Get-ChildItem -LiteralPath (Split-Path $cacheFile) -Filter *.json -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $staleBefore } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
         } catch { }   # a cache we cannot write is a slow hook, not a broken one
     }
 }

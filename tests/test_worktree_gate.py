@@ -414,6 +414,8 @@ def test_the_rest_of_the_shared_git_dir_is_still_denied(
         "test-slots/0.lock",  # the pytest port-slot mutex
         "gate-unresolved/wt.slug.stamp",  # suppresses the collision gate's own warning
         "overlap-cache.json",  # makes the collision gate report a silent all-clear
+        "overlap-cache/0a1b2c3d.json",  # the per-root cache that replaced it
+        "session-root/0a1b2c3d",  # moves a session's mail box and steering note
         "announce/OFF",  # a documented REPO-WIDE kill switch, one Write
         # Found by listing the directory AFTER three adversarial readers had enumerated it, which is
         # why rule 1b cannot rest on its named list alone: announce-session.ps1 exits outright when
