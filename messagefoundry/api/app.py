@@ -7962,6 +7962,13 @@ def create_app(
                 # BACKLOG #1609: a pooled stage whose claimer died reads healthy everywhere
                 # else, so it is named here for the console's nav heart.
                 stages_degraded=rr.degraded_stages() if rr is not None else {},
+                # Vault BACKLOG #3008. A lookup belongs to no channel, so only an estate-wide
+                # caller is shown the names; a channel-scoped one gets an empty list.
+                fhir_lookups_failed=(
+                    sorted(rr.degraded_fhir_lookups())
+                    if rr is not None and _user.allowed_channels is None
+                    else []
+                ),
             ),
             kpis=kpis,
             db=DbInfo(

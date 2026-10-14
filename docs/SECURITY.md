@@ -1843,8 +1843,10 @@ the same permission set on the same method reds CI until it is listed here.
 >   nothing resets. A destination target is one inbound's edge into an outbound, so it passes when
 >   that inbound is in scope, and it resets only that edge. Both refusals are audited
 >   `auth.channel_denied`.
-> - `GET /status` narrows one field by scope. `channels_failed_names` lists only the failed inbounds
->   in the caller's scope. At least `channels_failed`, `channels_total`, `outbox_by_status`, the
+> - `GET /status` narrows two fields by scope. `channels_failed_names` lists only the failed inbounds
+>   in the caller's scope. `fhir_lookups_failed` names an isolated `FhirLookup` to an estate-wide
+>   caller only, because a lookup belongs to no channel (vault BACKLOG #3008). A scoped caller gets
+>   an empty list, which does not mean every lookup started. At least `channels_failed`, `channels_total`, `outbox_by_status`, the
 >   `kpis` block and the `db` message and event counts are not narrowed. So a scoped caller can see
 >   a failure count higher than the names it is shown. Two other fields, `db.audit` and
 >   `logs.size_bytes`, follow a permission rule rather than a scope rule. The `## Audit` section
