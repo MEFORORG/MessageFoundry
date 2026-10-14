@@ -16,6 +16,10 @@ Submodules:
 from __future__ import annotations
 
 from messagefoundry.pipeline.engine import (
+    ApprovedConfig,
+    ConfigDigestMismatch,
+    ConfigDigestUnavailable,
+    ConfigDirUnreadable,
     ConfigReloadDenied,
     Engine,
     ReloadOutcome,
@@ -24,8 +28,12 @@ from messagefoundry.pipeline.engine import (
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
 __all__ = [
-    "Engine",
+    "ApprovedConfig",
+    "ConfigDigestMismatch",
+    "ConfigDigestUnavailable",
+    "ConfigDirUnreadable",
     "ConfigReloadDenied",
+    "Engine",
     "RegistryRunner",
     "ReloadOutcome",
     "ReloadStepFailure",
