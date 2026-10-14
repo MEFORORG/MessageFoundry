@@ -28,6 +28,7 @@ from messagefoundry.redaction import (
     safe_name,
     safe_text,
 )
+from tests.test_log_redaction_secret_domain import PCT_STARTED
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -2266,6 +2267,10 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     pattern = redaction._CREDENTIAL_AHEAD.pattern
     assert secretscrub._LABEL_PREFIX in pattern
     assert secretscrub._ENV_PREFIX in pattern
+    # The one stated exception (BACKLOG #2999): the label arm starts at ``\b`` alone, and does not
+    # take the escape start ``secretscrub`` has. ``_CREDENTIAL_AHEAD``'s comment says why.
+    assert secretscrub._LABEL_START not in pattern
+    assert pattern.startswith(r"\b(?:MEFOR_") and r"(?i:\bbearer)" in pattern
     words = pattern.split(secretscrub._LABEL_PREFIX + "(?:")[1].split(")")[0].split("|")
     assert set(words) == {
         *secretscrub._CREDENTIAL_WORDS,
@@ -2278,11 +2283,27 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
 
 
-def test_the_credential_pattern_matches_every_text_a_credential_filter_changes() -> None:
+def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:
+    """Give ``secretscrub``'s label patterns back the ``\\b`` start ``_CREDENTIAL_AHEAD`` keeps."""
+    for name in PCT_STARTED:
+        pattern: re.Pattern[str] = getattr(secretscrub, name)
+        assert pattern.pattern.count(secretscrub._LABEL_START) == 1, name
+        old = pattern.pattern.replace(secretscrub._LABEL_START, r"\b")
+        patched.setattr(secretscrub, name, re.compile(old, pattern.flags))
+
+
+def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """THE DRIFT GATE, by behaviour. If either credential filter would change a text, the pattern
     must match that text, or the encoded run could apply beside a credential. Seeded, over fragments
     that build each filter's shapes and near misses. THE CONTROL: the filters do change a large
-    share of the corpus, and the pattern does not simply match everything."""
+    share of the corpus, and the pattern does not simply match everything.
+
+    The filters are read with the ``\\b`` start this pattern keeps, which is its one stated
+    exception (BACKLOG #2999). The texts that exception covers are counted apart: this pattern with
+    the escape start added must match each one, so the exception cannot hide any other shape, and
+    there must be some, or the corpus no longer reaches it."""
     fragments = (
         *secretscrub._CREDENTIAL_WORDS,
         *secretscrub._TOKEN_WORDS,
@@ -2290,21 +2311,87 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes()
         *logging_setup._CREDENTIAL_QUERY_KEYS,
         "MEFOR_X", "Basic", "Digest", "db_", "a.b-", "://", "postgres", "user", "host", "abc123",
         ":", "=", " ", " ", "\n", "\t", '"', "'", "{", "}", "@", "/", "?", "&", ";", ",", "x", "9",
-        "_", ".", "-", "%7C",
+        "_", ".", "-", "%7C", "%2C",
     )  # fmt: skip
+    widened = _widened_mirror()
     rand = random.Random(2011)
-    changed = unmatched = 0
-    for _ in range(20_000):
-        text = "".join(rand.choice(fragments) for _ in range(rand.randint(2, 9)))
-        if (
-            secretscrub.scrub_credentials(text) != text
-            or logging_setup._scrub_credential_query(text) != text
-        ):
-            changed += 1
-            assert redaction._CREDENTIAL_AHEAD.search(text) is not None, repr(text)
-        elif redaction._CREDENTIAL_AHEAD.search(text) is None:
-            unmatched += 1
-    assert changed > 500 and unmatched > 2_000, (changed, unmatched)
+    texts = [
+        "".join(rand.choice(fragments) for _ in range(rand.randint(2, 9))) for _ in range(20_000)
+    ]
+    shipped = [secretscrub.scrub_credentials(text) != text for text in texts]
+    changed = unmatched = escape_only = 0
+    with monkeypatch.context() as patched:
+        _start_labels_at_a_word_boundary_alone(patched)
+        for text, shipped_changed in zip(texts, shipped, strict=True):
+            if (
+                secretscrub.scrub_credentials(text) != text
+                or logging_setup._scrub_credential_query(text) != text
+            ):
+                changed += 1
+                assert redaction._CREDENTIAL_AHEAD.search(text) is not None, repr(text)
+            elif shipped_changed:
+                escape_only += 1
+                assert widened.search(text) is not None, repr(text)
+            elif redaction._CREDENTIAL_AHEAD.search(text) is None:
+                unmatched += 1
+    assert changed > 500 and unmatched > 2_000 and escape_only > 5, (
+        changed,
+        unmatched,
+        escape_only,
+    )
+
+
+#: A PHI-bearing encoded run, synthetic, with a credential label glued to it by an escape.
+_PHI_RUN = "MRN4455667%7CZqxdoe%5EVanja"
+
+
+def _widened_mirror() -> re.Pattern[str]:
+    """``_CREDENTIAL_AHEAD`` as it would be with ``secretscrub``'s escape start: the arm left out."""
+    pattern = redaction._CREDENTIAL_AHEAD.pattern
+    start = secretscrub._LABEL_START
+    widened = start + pattern.removeprefix(r"\b")
+    widened = widened.replace(r"(?i:\bbearer)", "(?i:" + start + "bearer)")
+    assert widened != pattern and widened.count(start) == 2
+    return re.compile(widened)
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [f"password={_CREDENTIAL_VALUE}", f"token={_CREDENTIAL_VALUE}", f"MEFOR_X={_CREDENTIAL_VALUE}"],
+)
+def test_a_label_after_an_escape_does_not_switch_the_run_off(
+    credential: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why ``_CREDENTIAL_AHEAD`` keeps ``\\b`` alone (BACKLOG #2999). A label glued to a PHI run by
+    an escape leaves the run on, so the run takes the token whole, credential and all. THE CONTROL:
+    with the escape start in the mirror, the run is off and the PHI prints, which is what the
+    before-and-after differential under #2999 measured."""
+    text = f"GET /fhir/Patient?identifier={_PHI_RUN}%2C{credential} HTTP/1.1"
+    assert redaction._CREDENTIAL_AHEAD.search(text) is None
+    for path, out in _every_log_path(text).items():
+        for value in ("Zqxdoe", "Vanja", "4455667", _CREDENTIAL_VALUE):
+            assert value not in out, f"{path}: {out!r}"
+    with monkeypatch.context() as patched:
+        patched.setattr(redaction, "_CREDENTIAL_AHEAD", _widened_mirror())
+        assert "Zqxdoe" in _through_the_log_filter_chain(text), "the control does not hold"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="RESIDUAL of BACKLOG #2999: the encoded run takes the token holding an escape-glued "
+    "label, so a value in the next token prints on the log chain, as it did before #2999",
+)
+@pytest.mark.parametrize(
+    "credential", [f"password: {_CREDENTIAL_VALUE}", f"bearer {_CREDENTIAL_VALUE}"]
+)
+def test_a_label_after_an_escape_in_the_runs_token_loses_a_spaced_value(credential: str) -> None:
+    """THE STATED PRICE of that choice, pinned so it cannot change unseen: strict, so a fix shows as
+    an unexpected pass. The credential stage alone does read it now, and the PHI stays hidden."""
+    text = f"{_PHI_RUN}%2C{credential}"
+    assert _CREDENTIAL_VALUE not in secretscrub.scrub_credentials(text)
+    out = _through_the_log_filter_chain(text)
+    assert "Zqxdoe" not in out, out
+    assert _CREDENTIAL_VALUE not in out, out
 
 
 @pytest.mark.parametrize(

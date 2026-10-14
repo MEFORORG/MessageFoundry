@@ -136,6 +136,12 @@ audited) must release a reload. The maker-checker machinery already exists; relo
 This is the one *preventive* control that makes the code author and a second authorizer both required for a
 change to go live. **Opt-in / deny-by-default** — single-operator deployments are unchanged until enabled.
 
+> **Amendment (vault BACKLOG #2596, step 3).** As built, the approval named a directory, and the
+> release loaded whatever bytes were there at release time. A held reload now carries the D1
+> digest taken at request time, and the release refuses bytes with any other digest. What it binds,
+> and the limits that remain, are stated once in [SECURITY.md](../SECURITY.md), under *A released
+> reload loads only the config its approval named*.
+
 ### D3 — Startup self-attestation on a non-editable wheel  *(BUILT — BACKLOG #54, shipped in 0.2.9; drafted as "planned")*
 
 At startup hash the loaded `messagefoundry` module files against the wheel's

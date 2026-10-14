@@ -2159,6 +2159,31 @@ then printed plain to stderr. It says the denylist tables were live only when th
 passed the floor check on every message. Read that list before you share a dataset. Map any
 field that carries PHI in an `anon.toml` overlay, then run again.
 
+### A captured record's id follows the rules, and its time is the real capture time
+
+Both capture writers put two values beside each anonymized body: `control_id` and `received_at`.
+The writers are the harness `CaptureSink` and `python -m tee anonymize-captures` (BACKLOG #2994).
+
+- **`control_id` is read from the anonymized body**, not from the message as received. The
+  default rules keep `MSH-10`, so the id is the sender's own and a record still matches its
+  source. An overlay that maps `MSH-10` changes the id with it. A record then never pairs the
+  real id with a surrogate body. Each writer reads the id with the reader it already used, so
+  the two can differ on an id that is not ASCII:
+  - The sink parses the body as its ACK does. That reads bytes as UTF-8 and replaces a byte it
+    cannot decode, so two ids that differ only there get the same id. It writes `null` when
+    the body does not parse, or holds a character latin-1 cannot encode.
+  - The tee reads only the first line, as its relay does, as latin-1. It writes `null` when that
+    line holds no `MSH-10`, or the body holds a character latin-1 cannot encode.
+- **`received_at` is the real time the message was captured.** No rule touches it, and an `MSH-7`
+  rule does not shift it. The sink writes its own clock at capture, and the tee writes the
+  relay's receive time. It is a full date and time, one more reason the output is not Safe Harbor
+  de-identified (next section).
+- **A message the `CaptureSink` anonymizer refuses is dropped and counted in `anon_failed`.** The
+  sink logs one WARNING per drop that names the exception class. It never logs the exception's
+  text or a traceback, because an anonymizer's error can quote the body it refused.
+
+With no anonymizer, the sink writes the body as received, and the id its ACK echoed.
+
 ### Dates and locations: mapped, and still NOT Safe Harbor de-identified
 
 **The default rules map these Safe Harbor date and location fields. The output is NOT Safe Harbor

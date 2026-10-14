@@ -341,3 +341,34 @@ the file alone does not heal it on a reload; an operator start or a restart does
 or left down by `auto_start = false` is not checked at start or at a reload; it is checked when it
 is built. A DR park clears a lane's failed record, so the first reload after a DR release builds
 that lane and checks it.
+
+## Amendment (2026-10-11, vault BACKLOG #3008) — a `FhirLookup` that fails to build is isolated like a lane
+
+**Status:** Accepted. Owner ruling R3 of 2026-10-05 chose "Isolate it like a lane". That it covers
+every start, not only the first, is a Manager decision under the owner's standing driver rules,
+2026-10-11, not an owner ruling. Built in the same change.
+
+**Context.** §1 left "the lookup executor" to the backstop as a graph-wide error. Since BACKLOG
+#2193 the `FhirLookup` read hop takes the revocation refusal, so one off-box https lookup with no
+CRL and no attestation unwound the whole start. On a clustered node the graph supervisor caught
+the refusal, logged "will retry" and never ran the graph.
+
+**Decision.** At start, `RegistryRunner.start()` builds the `FhirLookup` executor with per-lookup
+isolation (`_build_fhir_lookup_executor(isolated=...)`). A lookup that fails to build is kept on
+the executor as failed and named in `/status` as `fhir_lookups_failed` while the graph runs. Once
+the start succeeds it is logged at ERROR and alerted as `connection_stopped` under
+`fhir_lookup:<name>`. A start that a later step unwinds still logs it at ERROR, but sends no alert,
+since the alert says the engine continues. Every read on it raises `FhirLookupError` before
+anything is sent, so a Handler that lets the error through takes the error path. A Handler that
+catches `FhirLookupError` decides for itself, as it does for any failed read. The rest of the
+graph starts. A first start, a restart and a clustered node's start on promotion all run this
+path. A reload is unchanged: its build check still refuses the whole reload while the lookup is
+refused, as it does for a lane, and a reload with the cause fixed builds the lookup again. A DR
+activation is a reload, so a passive box whose lookup is refused starts, and its activation is
+refused, the same as for a refused lane. A failure that no single lookup's build reproduces stays
+graph-wide and still reaches the backstop. The `DatabaseLookup` executor is unchanged and still
+graph-wide.
+
+**Not changed.** Rule 1 of the 2026-10-06 amendment still refuses the start for a refused
+`FhirLookup` CA. That check runs in the engine's registry preflight, before the runner starts, and
+#3008 did not move it.
