@@ -45,7 +45,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tee import __version__, mefor_api
+from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
 from tee.anon.leak import CoverageTally
@@ -671,9 +671,18 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, or anything else)
             continue
+        # The id is read from the anonymized body, with the reader the relay used for row.control_id,
+        # so it follows the rules; it is None when that body has no MSH-10. received_at is the
+        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). The surrogates
+        # are ASCII today, but this runs outside the catch above, so a character latin-1 cannot
+        # hold must give None rather than end the run.
+        try:
+            control_id, _ = mllp.peek_fields(anon.encode("latin-1"))
+        except UnicodeEncodeError:
+            control_id = None
         lines.append(
             json.dumps(
-                {"control_id": row.control_id, "raw": anon, "received_at": row.at},
+                {"control_id": control_id, "raw": anon, "received_at": row.at},
                 ensure_ascii=False,
             )
         )
