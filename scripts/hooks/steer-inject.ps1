@@ -72,22 +72,14 @@ function Write-Context([string]$Text) {
     [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
 }
 
-# Say a fault once per cooldown per key, never on every tool call. A stamp that cannot be read or
-# written means the notice is emitted: noise is the safe failure of a silencer, never quiet.
+# Say a fault once per cooldown per key, never on every tool call. Without the helper there is no
+# throttle (Test-CcxSayOnce lives there), so the notice is said every time: noise, never quiet.
 function Write-FaultOnce([string]$Key, [string]$Text) {
     $emit = $true
-    try {
-        $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-steer-fault/$(Get-CcxShortHash $Key).stamp"
-        $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
-        if ($prev) {
-            $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
-            if ($mins -ge 0 -and $mins -lt $FAULT_COOLDOWN_MINUTES) { $emit = $false }
-        }
-        if ($emit) {
-            New-Item -ItemType Directory -Force -Path (Split-Path $stamp) | Out-Null
-            Set-Content -LiteralPath $stamp -Value ((Get-Date).ToString('o')) -Encoding ascii
-        }
-    } catch { $emit = $true }
+    if (Get-Command Test-CcxSayOnce -ErrorAction SilentlyContinue) {
+        $emit = Test-CcxSayOnce -Key $Key -Minutes $FAULT_COOLDOWN_MINUTES `
+            -Dir (Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-steer-fault')
+    }
     if ($emit) { Write-Context $Text }
 }
 

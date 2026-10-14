@@ -170,14 +170,12 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
             # $script:StampWho names the session when the gate never reached its directory. git would
             # then answer for where the gate started, the primary under the desktop app, and every
             # worktree session would share one stamp, so one session's notice would silence the rest.
-            $who = "shared"
-            $top = $null
-            if ($script:StampWho) { $who = $script:StampWho }
-            else { $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null) }
-            if ($top) {
-                $who = (Split-Path ([string]$top).Trim() -Leaf) -replace '[^A-Za-z0-9._-]+', '-'
-                if (-not $who) { $who = "shared" }
+            $who = $script:StampWho
+            if (-not $who) {
+                $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+                if ($top) { $who = (Split-Path ([string]$top).Trim() -Leaf) -replace '[^A-Za-z0-9._-]+', '-' }
             }
+            if (-not $who) { $who = "shared" }
             $stamp = Join-Path $dir "gate-unresolved/$who.$Slug.stamp"
             $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
             if ($prev) {
@@ -265,7 +263,7 @@ if ($hasHelper) {
         # A relative path is read against the session's cwd. One the gate cannot use leaves it reading
         # against where it started, so an allow from there is not an all-clear.
         $base = (Get-Location).ProviderPath
-        $p = Get-CcxHookPayloadCwd -Text $raw
+        $p = Get-CcxHookPayloadCwd -Payload $hook
         if ($p.Cwd) { $base = $p.Cwd }
         elseif ($p.Named) {
             $degraded = "$($p.Reason), and the edit names the relative path $target"

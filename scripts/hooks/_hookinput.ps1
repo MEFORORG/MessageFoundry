@@ -84,11 +84,16 @@ function Get-CcxHookPayloadCwd {
       .DESCRIPTION
         Named is $false when the input names no cwd at all, which is not a fault. Cwd is the resolved
         directory when it exists. Reason says why a named cwd could not be used.
+
+        -Payload takes input already parsed, so a caller holding one does not parse it twice.
     #>
-    param([string] $Text)
+    param([string] $Text, [object] $Payload)
     $out = [pscustomobject]@{ Named = $false; Cwd = $null; Reason = '' }
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $out }
-    try { $payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { return $out }
+    $payload = $Payload
+    if ($null -eq $payload) {
+        if ([string]::IsNullOrWhiteSpace($Text)) { return $out }
+        try { $payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { return $out }
+    }
     if ($null -eq $payload -or $payload -isnot [pscustomobject] -or -not $payload.PSObject.Properties['cwd']) { return $out }
     $dir = [string]$payload.cwd
     if ([string]::IsNullOrWhiteSpace($dir)) { return $out }
@@ -111,6 +116,30 @@ function Get-CcxShortHash {
     try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) }
     finally { $sha.Dispose() }
     return -join ($bytes[0..3] | ForEach-Object { $_.ToString('x2') })
+}
+
+function Test-CcxSayOnce {
+    <#
+      .SYNOPSIS
+        $true when a throttled notice should be said now, and stamps it. One stamp per $Key.
+
+      .DESCRIPTION
+        A stamp younger than $Minutes keeps the notice quiet. A stamp dated in the future does not,
+        or clock skew would silence it forever. A stamp that cannot be read or written answers $true:
+        noise is the safe failure of a silencer.
+    #>
+    param([string] $Key, [string] $Dir, [int] $Minutes = 30)
+    try {
+        $stamp = Join-Path $Dir "$(Get-CcxShortHash $Key).stamp"
+        $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
+        if ($prev) {
+            $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
+            if ($mins -ge 0 -and $mins -lt $Minutes) { return $false }
+        }
+        New-Item -ItemType Directory -Force -Path $Dir -ErrorAction Stop | Out-Null
+        Set-Content -LiteralPath $stamp -Value ((Get-Date).ToString('o')) -Encoding ascii -ErrorAction Stop
+    } catch { }
+    return $true
 }
 
 function ConvertTo-CcxNormPath {
@@ -192,24 +221,6 @@ function Get-CcxGitCommonDir {
     catch { return $null }
 }
 
-function Get-CcxHookWorktree {
-    <#
-      .SYNOPSIS
-        The worktree root the hook input's `cwd` sits in: Named, Root and Reason.
-
-      .DESCRIPTION
-        Walks up from `cwd` to the first directory holding `.git`. It does not check which repository
-        that is, or whether it is the session's own; Resolve-CcxHookSession does both.
-    #>
-    param([string] $Text)
-    $p = Get-CcxHookPayloadCwd -Text $Text
-    $out = [pscustomobject]@{ Named = $p.Named; Root = $null; Reason = $p.Reason }
-    if (-not $p.Cwd) { return $out }
-    $out.Root = Get-CcxWorktreeRoot $p.Cwd
-    if (-not $out.Root) { $out.Reason = "the hook input names cwd $($p.Cwd), which is inside no checkout" }
-    return $out
-}
-
 function Resolve-CcxHookSession {
     <#
       .SYNOPSIS
@@ -222,7 +233,6 @@ function Resolve-CcxHookSession {
           Root    the worktree root Dir sits in; $null with Dir.
           Reason  set only when the input NAMED a cwd and Dir is $null: the fault to say aloud.
           Note    set when Dir is the pinned worktree and not the `cwd`: why the `cwd` was not used.
-          Outside $true when the `cwd` exists but sits in no checkout, which a caller may accept.
 
         The header gives the two checks and the pin. $StartDir is where the hook started, and its
         repository is the one this hook serves. A hook started outside every checkout has no
@@ -233,11 +243,14 @@ function Resolve-CcxHookSession {
         [string] $StartDir = (Get-Location).ProviderPath,
         # Read the pin, never write it. For a hook that promises to write nowhere but its own store
         # (mail-drain) or runs before every tool call (steer-inject); the SessionStart hooks write it.
-        [switch] $ReadOnly
+        [switch] $ReadOnly,
+        # A `cwd` that exists but sits in no checkout is answered for as it is, with no Root, rather
+        # than as a fault. For mail-drain, whose -AnchorRepo case is exactly that.
+        [switch] $AllowOutside
     )
     $out = [pscustomobject]@{
         Named = $false; Dir = $null; Root = $null; Reason = ''; Note = ''
-        SessionId = ''; Event = ''; Payload = $null; Outside = $false
+        SessionId = ''; Event = ''; Payload = $null
     }
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         try { $out.Payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { $out.Payload = $null }
@@ -249,7 +262,7 @@ function Resolve-CcxHookSession {
         if ($props['hook_event_name']) { $out.Event = [string]$props['hook_event_name'].Value }
     }
 
-    $p = Get-CcxHookPayloadCwd -Text $Text
+    $p = Get-CcxHookPayloadCwd -Payload $out.Payload
     $out.Named = $p.Named
     if (-not $p.Named) { return $out }
 
@@ -261,8 +274,11 @@ function Resolve-CcxHookSession {
     if (-not $why) {
         $root = Get-CcxWorktreeRoot $p.Cwd
         if (-not $root) {
+            if ($AllowOutside) {
+                $out.Dir = $p.Cwd
+                return $out
+            }
             $why = "the hook input names cwd $($p.Cwd), which is inside no checkout"
-            $out.Outside = $true
         }
         else {
             $common = Get-CcxGitCommonDir $root

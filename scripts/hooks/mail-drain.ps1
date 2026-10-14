@@ -728,15 +728,11 @@ try {
     $session = $null
     if ($hasHelper) {
         $stdinRaw = Read-CcxHookInput
-        # Read-only: this drain writes nowhere outside its mail root. The SessionStart hooks pin.
-        $session = Resolve-CcxHookSession -Text $stdinRaw -ReadOnly
+        # Read-only: this drain writes nowhere outside its mail root; the SessionStart hooks pin. A cwd
+        # in no checkout is the -AnchorRepo case, not a fault: the queue below is located from the
+        # anchor and the box keyed on that cwd, as before.
+        $session = Resolve-CcxHookSession -Text $stdinRaw -ReadOnly -AllowOutside
         $cwdFault = $session.Reason
-        # A cwd in no checkout is the -AnchorRepo case, not a fault: the queue below is located from
-        # the anchor and the box keyed on that cwd, as before.
-        if ($cwdFault -and $session.Outside) {
-            $cwdFault = ''
-            $session.Dir = [string]$session.Payload.cwd
-        }
     }
     elseif ([Console]::IsInputRedirected) { try { $stdinRaw = [Console]::In.ReadToEnd() } catch { $stdinRaw = '' } }
     $hook = $null
@@ -815,22 +811,14 @@ try {
     # outside the mail root, which the receipt sweep owns. A stamp that cannot be read or written
     # means the line is said: noise is the safe failure of a silencer.
     if ($cwdFault) {
+        # Per session AND per queue, so one repository's notice never silences another's. Without the
+        # helper there is no throttle, and the line is said every time.
+        $who = if ($sessionId) { 'sid:' + $sessionId } elseif ($hook -and $hook.cwd) { 'cwd:' + [string]$hook.cwd } else { 'reader:' + $PSScriptRoot }
         $emit = $true
-        try {
-            # Per session AND per queue, so one repository's notice never silences another's.
-            $who = if ($sessionId) { 'sid:' + $sessionId } elseif ($hook -and $hook.cwd) { 'cwd:' + [string]$hook.cwd } else { 'reader:' + $PSScriptRoot }
-            $who += '|' + $root
-            $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-mail-nobox/$(Get-CcxShortHash $who).stamp"
-            $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
-            if ($prev) {
-                $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
-                if ($mins -ge 0 -and $mins -lt $NO_BOX_COOLDOWN_MINUTES) { $emit = $false }
-            }
-            if ($emit) {
-                New-Item -ItemType Directory -Force -Path (Split-Path $stamp) -ErrorAction Stop | Out-Null
-                Set-Content -LiteralPath $stamp -Value ((Get-Date).ToString('o')) -Encoding ascii -ErrorAction Stop
-            }
-        } catch { $emit = $true }
+        if ($hasHelper) {
+            $emit = Test-CcxSayOnce -Key "$who|$root" -Minutes $NO_BOX_COOLDOWN_MINUTES `
+                -Dir (Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-mail-nobox')
+        }
         if ($emit) {
             Write-Injection -Event $eventName -Text (
                 "[mefor-mail] NO BOX. $((Get-Clean $cwdFault 300)), so this drain cannot tell which box is this " +

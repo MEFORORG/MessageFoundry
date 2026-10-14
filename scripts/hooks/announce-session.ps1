@@ -446,9 +446,9 @@ try {
     }
 
     # The real run says this in section 9b, after the kill switch and the settled check.
+    $cwdWhy = if ($cwdFault) { (Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?' } else { '' }
     if ($cwdFault -and $SelfTest) {
-        $why = (Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?'
-        Write-Output "[announce -SelfTest] $why; a real run would announce nothing."
+        Write-Output "[announce -SelfTest] $cwdWhy; a real run would announce nothing."
     }
 
     if (-not $SelfTest) {
@@ -515,22 +515,11 @@ try {
         # is not told. ONCE PER 30 MINUTES PER SESSION, because this runs on every prompt. A stamp that
         # cannot be read or written means the line is said: noise is the safe failure of a silencer.
         if ($cwdFault) {
-            $faultStamp = Join-Path $StateDir "fault-$markerKey.stamp"
+            # Without the helper there is no throttle, and the line is said every time.
             $say = $true
-            try {
-                $prev = Get-Item -LiteralPath $faultStamp -ErrorAction SilentlyContinue
-                if ($prev) {
-                    $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
-                    if ($mins -ge 0 -and $mins -lt 30) { $say = $false }
-                }
-                if ($say) {
-                    New-Item -ItemType Directory -Force -Path $StateDir -ErrorAction Stop | Out-Null
-                    Set-Content -LiteralPath $faultStamp -Value (Get-Date).ToString('o') -Encoding ascii -ErrorAction Stop
-                }
-            } catch { $say = $true }
+            if ($hasHelper) { $say = Test-CcxSayOnce -Key "fault:$markerKey" -Dir (Join-Path $StateDir 'fault') -Minutes 30 }
             if ($say) {
-                $why = (Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?'
-                Write-Output "[announce] $why, so this hook cannot tell which checkout this session is in and announced nothing. Said once per 30 minutes while it lasts."
+                Write-Output "[announce] $cwdWhy, so this hook cannot tell which checkout this session is in and announced nothing. Said once per 30 minutes while it lasts."
                 Write-Receipt 'ERROR' @{ note = $cwdFault }
             }
             exit 0

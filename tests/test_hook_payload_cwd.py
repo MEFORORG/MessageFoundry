@@ -111,13 +111,17 @@ def test_the_helper_walks_up_to_the_worktree_root(tmp_path: Path) -> None:
     _, wt = _primary_with(tmp_path, "linked")
     sub = wt / "deep" / "er"
     sub.mkdir(parents=True)
-    got = _helper(tmp_path, "Get-CcxHookWorktree -Text $t", _raw({"cwd": str(sub)}))
+    got = _helper(tmp_path, "@{ Root = Get-CcxWorktreeRoot '" + str(sub) + "' }", _raw({}))
     assert _same_dir(got["Root"], wt), got
 
 
 def test_the_helper_says_no_cwd_is_not_a_fault(tmp_path: Path) -> None:
-    got = _helper(tmp_path, "Get-CcxHookWorktree -Text $t", _raw({"session_id": "s1"}))
-    assert got == {"Named": False, "Root": None, "Reason": ""}, got
+    got = _helper(
+        tmp_path,
+        "Resolve-CcxHookSession -Text $t | Select-Object Named, Dir, Reason",
+        _raw({"session_id": "s1"}),
+    )
+    assert got == {"Named": False, "Dir": None, "Reason": ""}, got
 
 
 # --------------------------------------------------------------------------------------------------
