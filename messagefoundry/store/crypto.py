@@ -563,7 +563,9 @@ class UnauthenticatedCipherError(CipherError):
     """No configured key's AEAD tag verified the value (BACKLOG #2593).
 
     The name ends in ``CipherError`` on purpose: ``safe_exc`` renders the type name into stored
-    reasons and ``last_error`` text, which operators and tests match on that token.
+    reasons, and this is the error a plain decrypt miss raises, which read ``CipherError: ...``
+    before it existed (``tests/test_restore_verify.py`` matches that token). Not every subclass
+    keeps the token: :class:`~messagefoundry.store.cell_tag.CellTagError` does not.
 
     :class:`AesGcmCipher` raises it, and only it can mean the cell was sealed for another place:
     wrong associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is
