@@ -89,6 +89,17 @@ this line.**
 
 ### Security
 
+- **The audit page shows where each entry came from.** `/ui/audit` has a Client column, which
+  shows the address the engine recorded for the entry, or a dash when no client was in scope.
+  An operator tracing a run of refused sign-ins can now see their source on the page, not only in
+  the export. No seam change: `AuditEntry.client` was already sent. (vault BACKLOG #3197)
+- **A forged federated sign-in callback no longer cancels the real one.** A callback to
+  `/ui/oidc/callback` that does not carry the flow's own `state` now keeps the flow cookie, so
+  the real IdP return can still finish the sign-in. That covers an `error=` or malformed callback
+  too, which the engine now ends only when its `state` matches. Any page can send a browser to
+  that URL with the cookie, and clearing it ended the sign-in in flight. Seam change:
+  `AuthService` gains `abandon_oidc_login`, and `LoginOutcome` and `OidcStepUp` carry
+  `flow_consumed`, which the route reads instead of a reason slug. (vault BACKLOG #3198)
 - **Changing a second factor now offers to sign out your other sessions.** Confirming a TOTP
   enrolment, turning TOTP off, adding a passkey and removing one each end with an offer to end
   every other session and keep this one (ASVS 7.4.3). The enrolment confirm shows it below the

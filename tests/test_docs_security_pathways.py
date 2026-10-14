@@ -2162,6 +2162,36 @@ def _flat(text: str) -> str:
     return " ".join(text.split())
 
 
+#: Sentences CONFIGURATION.md carried about a CRL's signature that the code does not bear out
+#: (vault BACKLOG #3506). ``tests/test_crl_signature_at_start.py`` holds a test for each fact.
+_RETRACTED_CRL_SIGNATURE_CLAIMS = (
+    # Not when the engine cannot check with that key, nor when the name differs only in case.
+    "A start refuses it when the CRL names the CA's key and that key did not sign it",
+    # A version that returns after another that was logged is logged again.
+    "logged once per engine process for each version of the file",
+    # Too wide the other way: a version that returns after one that logged nothing is not.
+    "an earlier version that returns is logged again",
+    # A CA file that a CRL setting also names is signature-checked.
+    "The engine never checks its signature",
+)
+#: Sentences the guide must keep, each for a fact a reader acts on.
+_REQUIRED_CRL_SIGNATURE_SENTENCES = (
+    "an earlier version is logged again when it returns after another version that was logged",
+    "the engine does not check its signature, at a start or at a reload",
+)
+
+
+def test_the_guide_keeps_the_corrected_crl_signature_sentences() -> None:
+    """Here, not beside the behaviour tests, so the docs-only lane runs it (``DOC_GUARDS``)."""
+    text = _flat(_CONFIG_DOC.read_text(encoding="utf-8"))
+    # Control: the guide still has the paragraph these sentences sit in.
+    assert "A start checks each CRL's signature too" in text
+    for claim in _RETRACTED_CRL_SIGNATURE_CLAIMS:
+        assert claim not in text, f"CONFIGURATION.md makes a retracted claim again: {claim!r}"
+    for sentence in _REQUIRED_CRL_SIGNATURE_SENTENCES:
+        assert sentence in text, f"CONFIGURATION.md no longer says: {sentence!r}"
+
+
 def _table_a_row(attribute: str) -> str:
     """One Table A row, whitespace-flattened, found by its Attribute cell."""
     table = next(t for t in _tables(_heading_block(_H_TABLE_A)) if t[0][0] == "Attribute")

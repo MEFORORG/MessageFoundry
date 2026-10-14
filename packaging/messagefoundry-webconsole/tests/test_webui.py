@@ -8238,6 +8238,129 @@ async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) 
     assert row["client"] == "192.0.2.46"
 
 
+@pytest.mark.parametrize(
+    ("reason", "slug"),
+    [
+        ("start_non_navigation_fetch", "non_navigation_fetch"),
+        ("start_failed", "start_failed"),
+        ("callback_non_navigation_fetch", "non_navigation_fetch"),
+        ("idp_error", "idp_error"),
+        ("malformed_callback", "malformed_callback"),
+    ],
+)
+async def test_every_other_oidc_route_reject_records_the_client(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, reason: str, slug: str
+) -> None:
+    """Vault BACKLOG #3197. The other five ``/ui/oidc`` route rejects, beside the cookie-less
+    callback above: each writes its closed-set reason under ``auth.login_failed`` with the caller's
+    address, so a spray of any of them shows its source (#2132). The control for each arm is its
+    own reason: the row asserted is the one this reject writes, not a row from some other refusal."""
+    from messagefoundry.auth import oidc as _oidc
+
+    service = _oidc_service(engine)
+    await service.initialize()
+    probe = {"Sec-Fetch-Mode": "cors"}
+    async with _oidc_client(engine, service, peer="192.0.2.47") as c:
+        if reason == "start_non_navigation_fetch":
+            r = await c.post("/ui/oidc/start", headers=probe, follow_redirects=False)
+        elif reason == "start_failed":
+
+            async def refuse(**_kw: object) -> tuple[str, str]:
+                raise _oidc.FlowError("refused")
+
+            monkeypatch.setattr(service, "begin_oidc_login", refuse)
+            r = await c.post("/ui/oidc/start", follow_redirects=False)
+        else:
+            # A real flow, because an error= or malformed callback is audited under its own reason
+            # only once its state matches (BACKLOG #3198).
+            start = await c.post("/ui/oidc/start", follow_redirects=False)
+            state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+            query = {
+                "callback_non_navigation_fetch": "?code=abc&state=xyz",
+                "idp_error": "?error=access_denied&state=" + quote(state),
+                "malformed_callback": "?state=" + quote(state),
+            }[reason]
+            headers = probe if reason == "callback_non_navigation_fetch" else {}
+            r = await c.get("/ui/oidc/callback" + query, headers=headers, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/login?e=oidc_failed"
+        if reason == "callback_non_navigation_fetch":
+            # BACKLOG #3198: a refusal that consumed nothing keeps the flow cookie, so a same-site
+            # fetch cannot clear it and cancel the sign-in in flight.
+            assert "mf_oidc_flow" not in r.headers.get("set-cookie", "")
+    rows = [
+        a
+        for a in await engine.store.list_audit(action="auth.login_failed")
+        if json.loads(a["detail"] or "{}").get("reason") == slug
+    ]
+    assert len(rows) == 1, rows
+    assert rows[0]["client"] == "192.0.2.47"
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["?error=access_denied", "?error=access_denied&state=forged", "?code=abc", "?state=forged"],
+    ids=["error-no-state", "error-wrong-state", "code-no-state", "no-code-wrong-state"],
+)
+async def test_a_forged_error_or_malformed_callback_keeps_the_sign_in_in_flight(
+    engine: Engine, query: str
+) -> None:
+    """BACKLOG #3198. RED when: the sign-in leg ends its flow on an ``error=`` or malformed callback
+    without checking ``state``. Any page can send the browser here with the SameSite=Lax flow
+    cookie, so that let a forged ``?error=`` cancel the sign-in in flight. The forged callback is
+    refused as ``state_mismatch`` and keeps the flow and the cookie. The control is the IdP's own
+    ``error=`` with the flow's ``state``, which ends the flow and clears the cookie."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    assert service._oidc_flows is not None
+    async with _oidc_client(engine, service) as c:
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        flow_id = c.cookies.get("mf_oidc_flow")
+        assert flow_id
+
+        forged = await c.get("/ui/oidc/callback" + query, follow_redirects=False)
+        assert forged.status_code == 303
+        assert forged.headers["location"] == "/ui/login?e=oidc_failed"
+        assert "mf_oidc_flow" not in forged.headers.get("set-cookie", "")
+        assert service._oidc_flows.peek(flow_id) is not None
+        assert any('"reason": "state_mismatch"' in d for d in await _oidc_audits(engine))
+
+        real = await c.get(
+            "/ui/oidc/callback?error=access_denied&state=" + quote(state), follow_redirects=False
+        )
+        assert real.status_code == 303
+        assert "mf_oidc_flow=" in real.headers.get("set-cookie", "")
+        assert service._oidc_flows.peek(flow_id) is None
+        assert any('"reason": "idp_error"' in d for d in await _oidc_audits(engine))
+
+
+async def test_a_forged_state_callback_keeps_the_flow_and_its_cookie(engine: Engine) -> None:
+    """BACKLOG #3198: a callback with a wrong ``state`` consumes nothing. Any page can send the
+    browser here with the SameSite=Lax flow cookie, so clearing that cookie, or popping the flow,
+    would let a forged callback cancel the sign-in in flight. The flow and the cookie both wait for
+    the real IdP return."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        flow_id = c.cookies.get("mf_oidc_flow")
+        assert flow_id
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "authcode", "state": "forged-" + state},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/login?e=flow_binding_missing"
+        assert "mf_oidc_flow" not in r.headers.get("set-cookie", "")
+        assert c.cookies.get("mf_oidc_flow") == flow_id
+        assert service._oidc_flows is not None
+        assert service._oidc_flows.peek(flow_id) is not None
+        assert any("state_mismatch" in d for d in await _oidc_audits(engine))
+
+
 async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) -> None:
     """The IdP redirect back is LEGITIMATELY Sec-Fetch-Site: cross-site. If a same-origin assertion
     were added here every real login would 403 while every hermetic test still passed."""

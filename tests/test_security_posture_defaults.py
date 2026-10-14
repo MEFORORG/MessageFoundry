@@ -2930,7 +2930,7 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         # a loaded config reports and the [security] floor covers. Off, it is also refused at exposure
         # by the __main__ gates. An embedder that builds AuthSettings itself is not reported.
         "require_mfa",
-        "ad_tls_verify",  # gated by weakened_tls_escape_permitted
+        "ad_tls_verify",  # refused at LdapAuthenticator construction (vault BACKLOG #3230)
         # Gated by no serve-time refusal of its own: off, it mints every OIDC session with no factor
         # met, and while require_mfa is on that session owes an engine factor at the access gate.
         "oidc_require_mfa_claim",

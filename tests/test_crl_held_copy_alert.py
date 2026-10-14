@@ -34,7 +34,15 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from messagefoundry.config.loaded_crls import held_contexts, held_crl_copies
+from messagefoundry.config import loaded_crls
+from messagefoundry.config.loaded_crls import (
+    ReloadRefusal,
+    clear_reload_refusal,
+    crl_fingerprint,
+    held_contexts,
+    held_crl_copies,
+    record_reload_refusal,
+)
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.config.tls_policy import (
     TrustAnchor,
@@ -59,17 +67,33 @@ class _Ca:
     name: x509.Name
     pem: bytes
 
-    def crl(self, *, days: float, number: int) -> bytes:
-        """A CRL this CA signed, revoking nothing, whose nextUpdate is ``days`` from now."""
+    def crl(
+        self,
+        *,
+        days: float,
+        number: int,
+        starts_in_days: float = 0.0,
+        key: ec.EllipticCurvePrivateKey | None = None,
+        delta: bool = False,
+    ) -> bytes:
+        """A CRL naming this CA, revoking nothing, whose nextUpdate is ``days`` from now. It takes
+        effect ``starts_in_days`` from now, is signed by ``key`` in place of the CA's own, and is a
+        delta CRL when ``delta`` (the last three for BACKLOG #3176)."""
         now = datetime.datetime.now(datetime.UTC)
-        crl = (
+        builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(self.name)
-            .last_update(now - datetime.timedelta(hours=1, minutes=number))
+            .last_update(
+                now
+                - datetime.timedelta(hours=1, minutes=number)
+                + datetime.timedelta(days=starts_in_days)
+            )
             .next_update(now + datetime.timedelta(days=days))
             .add_extension(x509.CRLNumber(number), False)
-            .sign(self.key, hashes.SHA256())
         )
+        if delta:
+            builder = builder.add_extension(x509.DeltaCRLIndicator(number - 1), True)
+        crl = builder.sign(key or self.key, hashes.SHA256())
         return crl.public_bytes(serialization.Encoding.PEM)
 
 
@@ -554,3 +578,255 @@ def test_the_syslog_forwarder_records_its_ca_bundle_crl(ca: _Ca, tmp_path: Path)
     copies = held_crl_copies(bundle)
     assert [(c.ca_bundle, c.setting) for c in copies] == [(True, "[logging].forward_tls_ca_file")]
     assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+# --- BACKLOG #3176: CA-file remedies that would restart into a refusal -----------------------------
+
+
+def _replaced_bundle(ca: _Ca, tmp_path: Path, new_crl: bytes) -> tuple[ssl.SSLContext, Path]:
+    """A hop that loaded a CA file whose CRL lapses in about five days, after which the operator
+    put ``new_crl`` in its place."""
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+    hop = _hop(bundle, crl)
+    bundle.write_bytes(ca.pem + new_crl)
+    return hop, bundle
+
+
+def _bundle_detail(bundle: Path) -> str:
+    sink, mine = _bundle_scan(bundle)
+    assert len(mine) == 1
+    held_copy, detail, _ = sink.crl_notes[mine[0]]
+    assert held_copy is True  # the hop's five-day copy is the sooner date
+    return detail
+
+
+def test_a_not_yet_valid_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # Alone for its issuer, a CRL not in effect yet is the one OpenSSL picks, and it refuses every
+    # peer under that issuer with "CRL is not yet valid". Before the fix this read "Restart".
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=2))
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Replace the CRL in the CA file with one in effect now, or wait")
+    assert "Restart the engine" not in detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_badly_signed_crl_put_in_the_ca_file_is_not_answered_with_a_restart(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # The CRL names this CA but another key signed it. OpenSSL checks that only at the handshake,
+    # so a restart loads it and then every handshake it judges fails. Before the fix: "Restart".
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3, key=_another_ca().key))
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Replace the CRL in the CA file with one its CA signed")
+    assert "Restart the engine" not in detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+@pytest.mark.parametrize("kind", ["delta", "garbled"])
+def test_a_crl_the_engine_cannot_judge_in_the_ca_file_is_fixed_before_a_restart(
+    ca: _Ca, tmp_path: Path, kind: str
+) -> None:
+    # The two ways a CA file's CRL cannot be judged: a delta CRL, which only the strict reading
+    # refuses (before the fix it read "Restart"), and a block that does not parse at all.
+    garbled = b"-----BEGIN X509 CRL-----\nbm90IGEgQ1JM\n-----END X509 CRL-----\n"
+    new_crl = ca.crl(days=90, number=3, delta=True) if kind == "delta" else garbled
+    hop, bundle = _replaced_bundle(ca, tmp_path, new_crl)
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith(
+        "Replace the CRL in the CA file with one the engine can judge before restarting"
+    )
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_file_crl_minutes_from_taking_effect_gets_no_clock_skew(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # A CRL setting's start allows five minutes of skew; a CA file's CRL meets no check at start,
+    # and OpenSSL allows none, so a CRL two minutes out still refuses peers until then.
+    two_minutes_out = (63 + 2) / (24 * 60)  # crl() starts an hour and `number` minutes back
+    hop, bundle = _replaced_bundle(
+        ca, tmp_path, ca.crl(days=90, number=3, starts_in_days=two_minutes_out)
+    )
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Replace the CRL in the CA file with one in effect now, or wait")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_ca_file_the_scan_cannot_stage_keeps_the_held_copy_date(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A disk that refuses the private copy says nothing about the file. The held copy's date and a
+    # check-first remedy must survive it, not fall back to the file's later date.
+    hop, bundle = _replaced_bundle(ca, tmp_path, ca.crl(days=90, number=3))
+
+    def _no_room(pem: bytes) -> Any:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("messagefoundry.pipeline.cert_expiry.staged_crl", _no_room)
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Check the CRL in the CA file before restarting")
+    assert "PermissionError" in detail
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_control_a_good_crl_from_an_issuer_the_ca_file_does_not_list_still_restarts(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # THE CONTROL for the signature check's scope. The CRL's issuer is not in this CA file: it
+    # may be an intermediate the peer sends, so the file is not refused for it, and a refreshed
+    # CA file is still a restart's to apply.
+    hop, bundle = _replaced_bundle(ca, tmp_path, _another_ca().crl(days=90, number=3))
+
+    detail = _bundle_detail(bundle)
+
+    assert detail.startswith("Restart the engine to apply the CA file")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def _shared_as_crl_and_ca_file(ca: _Ca, tmp_path: Path) -> tuple[list[ssl.SSLContext], Path]:
+    """One file that hop A loads as its CRL setting and hop B as its CA file, then refreshed."""
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_bytes(ca.pem)
+    both = tmp_path / "ca-and-crl.pem"
+    both.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+    hops = [_hop(ca_file, both), _hop(both, crl)]
+    both.write_bytes(ca.pem + ca.crl(days=80, number=3))
+    return hops, both
+
+
+def _row_detail(path: Path) -> str:
+    sink = _RecordingSink()
+    runner = CertExpiryRunner(
+        lambda: [MonitoredCert("tls.crl_file", str(path), kind="crl")],
+        CertMonitorSettings(warn_days=30),
+        alert_sink=sink,
+    )
+    runner.run_once(now=time.time())
+    assert [c[3] for c in sink.crl_calls] == [5]
+    return sink.crl_notes[0][1]
+
+
+def test_a_file_held_as_a_crl_and_as_a_ca_file_leads_with_the_restart(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # Before the fix: "A reload is pending ..." then "... needs a restart either way", and the
+    # alert instance kept only the first. Only a restart clears the CA file's copy, so that leads.
+    hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
+
+    detail = _row_detail(both)
+
+    assert detail.startswith("Restart the engine once the reload has applied the file")
+    assert "A reload is pending" not in detail
+    assert "either way" not in detail
+    assert "[tls].crl_file" in detail
+    assert "[tls].internal_ca_file" in detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+
+
+def test_a_refused_reload_of_such_a_file_keeps_its_remedy_first(ca: _Ca, tmp_path: Path) -> None:
+    # A refusal's remedy leads its reason (review round 2 of #2319, untested until now). The CA-file
+    # hop's restart comes after both, as a next step: a "Wait" remedy says not to restart yet.
+    hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
+    remedy = "Wait: the engine applies the file once its CRL takes effect"
+    record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), "why", remedy))
+    try:
+        detail = _row_detail(both)
+    finally:
+        clear_reload_refusal(both)
+
+    assert detail.startswith(f"{remedy}. Reason: why. Once the file is applied, a hop that ")
+    assert "either way" not in detail
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+
+
+def test_a_refusal_that_already_says_restart_gets_no_second_restart(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # A reload refused with "Restart the engine" never applies the file, so a clause that waits for
+    # it to be applied would send the operator after an event that never comes.
+    hops, both = _shared_as_crl_and_ca_file(ca, tmp_path)
+    remedy = "Restart the engine to apply the file"
+    record_reload_refusal(both, ReloadRefusal(crl_fingerprint(both.read_bytes()), "why", remedy))
+    try:
+        detail = _row_detail(both)
+    finally:
+        clear_reload_refusal(both)
+
+    assert detail.startswith(f"{remedy}. Reason: why. Held by: ")
+    assert all(hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF for hop in hops)
+
+
+# --- BACKLOG #3176: a failure grouping the rows, or recording a CA-file CRL -------------------------
+
+
+def test_a_failure_grouping_the_crl_rows_costs_only_the_shared_rows_note(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Before the fix the grouping ran before the loop, so it raised out of run_once and no row was
+    # judged or alerted that pass. Now it is logged once, and only shared_with is lost.
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=5.5, number=1))
+    cert = tmp_path / "cert.pem"
+    cert.write_bytes(ca.pem)
+
+    def _broken(rows: object) -> dict[str, tuple[str, ...]]:
+        raise RuntimeError("synthetic grouping failure")
+
+    monkeypatch.setattr("messagefoundry.pipeline.cert_expiry._rows_by_crl_file", _broken)
+    rows = [MonitoredCert("tls.crl_file", str(crl), kind="crl"), MonitoredCert("api", str(cert))]
+    sink = _RecordingSink()
+    runner = CertExpiryRunner(lambda: rows, CertMonitorSettings(warn_days=500), alert_sink=sink)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
+        checks = runner.run_once(now=time.time())
+
+    assert [c.label for c in checks] == ["tls.crl_file", "api"]
+    assert [c[0] for c in sink.cert_calls] == ["api"]
+    assert [c[0] for c in sink.crl_calls] == ["tls.crl_file"]
+    assert sink.crl_notes == [(False, "", ())]
+    errors = [r for r in caplog.records if "could not group the CRL rows" in r.getMessage()]
+    assert len(errors) == 1
+
+
+def test_a_failure_recording_a_ca_file_crl_is_logged_as_a_defect_not_a_bad_crl(
+    ca: _Ca, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Before the fix a ValueError from the record fell into the clause for a CRL the monitor
+    # cannot judge, and told the operator to move a good CRL.
+    real = loaded_crls.record_crl_load
+
+    def _broken(*args: Any, **kwargs: Any) -> None:
+        if kwargs.get("ca_bundle"):
+            raise ValueError("synthetic record failure")
+        real(*args, **kwargs)  # the CRL setting's own record, untouched
+
+    monkeypatch.setattr(loaded_crls, "record_crl_load", _broken)
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.tls_policy"):
+        hop = _hop(bundle, crl)
+
+    lines = [(r.levelno, r.getMessage()) for r in caplog.records]
+    assert any(level == logging.ERROR and "could not record the CRL" in m for level, m in lines)
+    assert not any("cannot judge" in m for _, m in lines)
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF

@@ -33,6 +33,12 @@ _SALT = "b193-salt-0123456789abcdef"
 _HEADER = r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1"
 _ADAPTERS = (engine_anonymize, tee_anonymize)
 _EACH_ADAPTER = pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+# Marked per test, on the ones that reach the engine's scanner, so the rest still run on an
+# installed wheel (vault BACKLOG #3004).
+_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
+_NO_SCANNER = pytest.mark.skipif(
+    not _SCANNER.exists(), reason="the engine leak-check needs scripts/security/scan_forbidden.py"
+)
 
 
 def _msg(*segments: str) -> str:
@@ -256,6 +262,7 @@ def _site_message(*segments: str) -> str:
     return _msg(_HEADER, "PID|1||12345^^^HOSP^MR||DOE^JOHN", *segments)
 
 
+@_NO_SCANNER
 @_SURROGATES
 def test_the_control_values_have_the_shape_of_a_site_code(
     module: Any, century_site_prefix: str
@@ -265,6 +272,7 @@ def test_the_control_values_have_the_shape_of_a_site_code(
         assert module.SITE_CODE_RE.fullmatch(value), value
 
 
+@_NO_SCANNER
 @pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
 def test_a_year_and_month_date_survives_the_site_code_pass(
     checked: Callable[..., str], century_site_prefix: str
@@ -274,6 +282,7 @@ def test_a_year_and_month_date_survives_the_site_code_pass(
     assert _field_of(out, "EVN-2") == _FILLED
 
 
+@_NO_SCANNER
 @pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
 def test_a_date_typed_obx5_survives_the_site_code_pass(
     checked: Callable[..., str], century_site_prefix: str
@@ -282,6 +291,7 @@ def test_a_date_typed_obx5_survives_the_site_code_pass(
     assert _field_of(out, "OBX-5") == _FILLED
 
 
+@_NO_SCANNER
 @_EACH_ADAPTER
 def test_a_site_code_outside_a_date_field_is_still_scrubbed(
     adapter: Callable[..., str], century_site_prefix: str
@@ -295,6 +305,7 @@ def test_a_site_code_outside_a_date_field_is_still_scrubbed(
         assert value != _SITE_CODE and len(value) == len(_SITE_CODE), address
 
 
+@_NO_SCANNER
 @_EACH_ADAPTER
 def test_a_date_of_birth_field_is_not_exempt(
     adapter: Callable[..., str], century_site_prefix: str
@@ -309,6 +320,7 @@ def test_a_date_of_birth_field_is_not_exempt(
     )
 
 
+@_NO_SCANNER
 @_SURROGATES
 def test_the_leak_check_skips_only_a_value_the_date_kind_wrote(
     module: Any, century_site_prefix: str
@@ -326,6 +338,7 @@ def test_the_leak_check_skips_only_a_value_the_date_kind_wrote(
     assert flagged(_FILLED + "~" + _SITE_CODE)  # one bad repetition spoils the field
 
 
+@_NO_SCANNER
 @_SURROGATES
 def test_the_exemption_never_reaches_an_msh_line(module: Any, century_site_prefix: str) -> None:
     """Both adapters apply a DATE rule to an MSH field (BACKLOG #2265), but the exemption does not
@@ -337,6 +350,7 @@ def test_the_exemption_never_reaches_an_msh_line(module: Any, century_site_prefi
     assert _FILLED not in module.scrub_message_site_codes(text, engine_keying.Keyer(_SALT), rules)
 
 
+@_NO_SCANNER
 def test_a_date_rule_on_an_msh_field_is_applied_and_still_not_exempt(
     century_site_prefix: str,
 ) -> None:
@@ -368,6 +382,7 @@ def test_a_date_rule_on_an_msh_field_is_applied_and_still_not_exempt(
     assert zpd == "ZPD|" + _FILLED
 
 
+@_NO_SCANNER
 @_SURROGATES
 def test_a_path_with_a_second_non_date_rule_is_not_exempt(
     module: Any, century_site_prefix: str
@@ -424,6 +439,7 @@ def test_a_drop_or_a_redact_is_not_recorded_as_an_emptied_date(adapter: Callable
     assert blanked == []
 
 
+@_NO_SCANNER
 @pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
 def test_the_coverage_report_names_every_emptied_date_field_once(
     checked: Callable[..., str],
@@ -438,6 +454,7 @@ def test_the_coverage_report_names_every_emptied_date_field_once(
     assert [report.blanked_fields for report in reports] == [("EVN-2", "OBX-5")]
 
 
+@_NO_SCANNER
 @pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
 def test_the_coverage_report_is_empty_when_nothing_was_emptied(
     checked: Callable[..., str],
@@ -447,6 +464,7 @@ def test_the_coverage_report_is_empty_when_nothing_was_emptied(
     assert [report.blanked_fields for report in reports] == [()]
 
 
+@_NO_SCANNER
 @pytest.mark.parametrize(
     ("checked", "leak"),
     ((engine_anonymize_checked, engine_leak), (tee_anonymize_checked, tee_leak)),
@@ -469,6 +487,7 @@ def test_the_run_summary_counts_emptied_date_fields_and_never_shows_a_value(
     assert "emptied" not in quiet  # no sentence at all when nothing was emptied
 
 
+@_NO_SCANNER
 @pytest.mark.parametrize("leak", (engine_leak, tee_leak), ids=("engine", "tee"))
 def test_a_bare_leak_report_cannot_know_what_was_emptied(leak: Any) -> None:
     """The report is built from the output, where an emptied field looks like an absent one. Only

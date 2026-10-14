@@ -64,7 +64,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, paddin
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -86,7 +86,7 @@ from messagefoundry.transports.base import (
     float_setting,
     register_destination,
 )
-from messagefoundry.transports.email import checked_envelope
+from messagefoundry.transports.email import checked_envelope, refuse_unverified_smtp_credential
 
 __all__ = ["DirectDestination"]
 
@@ -326,15 +326,15 @@ class DirectDestination(DestinationConnector):
         password = s.get("password")
         self.username: str | None = str(username) if username else None
         self.password: str | None = str(password) if password else None
-        self.use_tls = bool(s.get("use_tls", True))
+        self.use_tls = bool_setting(s, "use_tls", default=True)
         # #323: server-certificate verification on the TLS hop, kept byte-identical to
         # EmailDestination's spelling. This connector's TLS and AUTH handling is a copy of that
         # connector's, so the two must not drift; its envelope check is imported from
         # transports/email.py (checked_envelope, vault BACKLOG #2870).
-        self.tls_verify = bool(s.get("tls_verify", True))
+        self.tls_verify = bool_setting(s, "tls_verify", default=True)
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
-        self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
+        self.tls_check_hostname = bool_setting(s, "tls_check_hostname", default=True)
         self.timeout: float = float_setting(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="Direct destination"
         )
@@ -401,9 +401,17 @@ class DirectDestination(DestinationConnector):
         self._probe_build()
 
         # STARTTLS-by-default posture, identical to EmailDestination: the S/MIME body already protects
-        # PHI, but the SMTP session still carries envelope metadata + any AUTH credentials, so cleartext
-        # SMTP is refused unless the project-wide dev escape is set, and credentials are NEVER sent over
-        # a cleartext channel.
+        # PHI, but the SMTP session still carries envelope metadata, so cleartext SMTP is refused
+        # unless the project-wide dev escape is set. The credential refusal is Email's, and runs
+        # first for Email's reason: no lever the arms below name lifts it (vault BACKLOG #3230).
+        refuse_unverified_smtp_credential(
+            "Direct destination",
+            connection=config.name,
+            username=self.username,
+            use_tls=self.use_tls,
+            tls_verify=self.tls_verify,
+            tls_check_hostname=self.tls_check_hostname,
+        )
         if not self.use_tls:
             # #323: read through the CLAMPED escape, not the raw insecure_tls_allowed(). This call site
             # was the last unclamped one in the file, sitting one branch away from the clamped arm
@@ -427,11 +435,6 @@ class DirectDestination(DestinationConnector):
                     "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
                     "or with no posture) — use STARTTLS (the default)"
                 )
-            if self.username is not None:
-                raise ValueError(
-                    "Direct destination sends SMTP authentication credentials over cleartext (use_tls=false); "
-                    "refused — credentials require STARTTLS/implicit TLS"
-                )
             logger.warning(
                 "Direct destination %s has TLS disabled (use_tls=false); the SMTP session crosses the "
                 "network in CLEARTEXT (dev/trusted-network only)",
@@ -443,32 +446,12 @@ class DirectDestination(DestinationConnector):
                 raise ValueError(
                     "Direct destination tls_verify=false disables server-certificate verification on "
                     f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED. The "
-                    "S/MIME body still protects the clinical payload, but envelope metadata and any "
-                    "SMTP authentication credential are exposed to an on-path attacker presenting any "
-                    "certificate. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file for the "
-                    f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+                    "S/MIME body still protects the clinical payload, but envelope metadata is exposed "
+                    "to an on-path attacker presenting any certificate. Use a trusted CA "
+                    "(tls_ca_file, or [tls].internal_ca_file for the instance), or set "
+                    f"{INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
                     "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
                     "has no effect while enforcing, the default, or with no posture)."
-                )
-            if self.username is not None:
-                raise ValueError(
-                    "Direct destination sends SMTP authentication credentials over an unverified TLS session "
-                    "(tls_verify=false); refused — credentials require a verified TLS session"
-                )
-        else:
-            # BACKLOG #1314: the THIRD weakening axis. The chain IS verified here, but with
-            # `tls_check_hostname=false` the peer NAME is not, so any certificate chaining to the
-            # configured anchor is accepted whatever it was issued to -- the AUTH exchange then
-            # hands the credential to a peer whose identity was never established.
-            #
-            # ABSOLUTE, like the two arms above, and deliberately keyed on no escape: in both of
-            # them the escape governs the BODY posture and never the CREDENTIAL. A third arm keeps
-            # that split, so a hop cannot attest its way to a credentialed unverified-name session.
-            if not self.tls_check_hostname and self.username is not None:
-                raise ValueError(
-                    "Direct destination sends SMTP authentication credentials over a TLS session whose peer "
-                    "NAME is unverified (tls_check_hostname=false); refused — credentials "
-                    "require a session bound to the host, not merely to the trust anchor"
                 )
         # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
         # DIRECT WITH NO SMTP CREDENTIAL does not take a RevocationHopGuard even though the hop now

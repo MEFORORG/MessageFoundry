@@ -225,6 +225,21 @@ def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
     return False if value is None else require_flag(value, key)
 
 
+def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    """A boolean connector setting, where an explicit ``None`` means ``default``, as absence does.
+
+    ``bool(settings.get(key, True))`` reads an explicit ``None`` as ``False``, which turns a
+    default-on check such as ``tls_verify`` OFF (vault BACKLOG #3230). Any other value is read with
+    ``bool()``, as before; this changes only what ``None`` means.
+
+    Use it for a transport setting with a default, such as a TLS check, and read it the same way in
+    every connector and every reader that reports on it, so the two cannot disagree. Use
+    :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin),
+    which defaults off and must refuse a value that is not a real ``bool``."""
+    value = settings.get(key)
+    return default if value is None else bool(value)
+
+
 def _check_flag_with_reason(
     flag: bool, reason: str | None, *, flag_name: str, reason_name: str, flag_means: str, why: str
 ) -> None:

@@ -82,6 +82,7 @@ __all__ = [
     "record_crl_load",
     "record_reload_refusal",
     "reload_refusal",
+    "reload_refusals",
     "replace_held_copy",
     "snapshot",
 ]
@@ -327,6 +328,16 @@ def reload_refusal(
     with _LOCK:
         refusal = _REFUSED.get(_path_key(path))
     return _matching(refusal, fingerprint)
+
+
+def reload_refusals() -> dict[str, ReloadRefusal]:
+    """Every refusal on record now, by path key (:func:`crl_path_key`), as a copy.
+
+    For a caller that must tell a refusal that still stands from one that was cleared, whatever
+    the last reload pass returned (vault BACKLOG #2904). A pass returns nothing for a file it
+    could not read, and nothing when it failed, while the refusal stays on record."""
+    with _LOCK:
+        return dict(_REFUSED)
 
 
 def _matching(refusal: ReloadRefusal | None, fingerprint: tuple[int, int]) -> ReloadRefusal | None:

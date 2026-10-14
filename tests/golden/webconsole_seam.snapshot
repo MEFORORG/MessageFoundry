@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-05d283512c738b8b
+c96bfcbec6050c00
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -131,9 +131,11 @@ record_repeated_credential: (conn: 'Request | WebSocket', credential: 'str') -> 
 AuthService: class; its members are the AuthService section
 Elevation: constructor (token: 'str | None' = None, session_lost: 'bool' = False, recovery_codes: 'tuple[str, ...]' = (), locked: 'bool' = False, idp_step_up_required: 'bool' = False, directory_unconfirmed: 'bool' = False) -> None; fields: directory_unconfirmed, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
 FEDERATED_BINDING_CHANGED: attribute: str
+LoginOutcome: constructor (ok: 'bool', token: 'str | None' = None, identity: 'Identity | None' = None, must_change_password: 'bool' = False, error: 'str | None' = None, mfa_required: 'bool' = False, reason: 'str | None' = None, roles_gained: 'RolesGained | None' = None, flow_consumed: 'bool' = True) -> None; fields: error, flow_consumed, identity, mfa_required, must_change_password, ok, reason, roles_gained, token; properties: none
 MfaStatus: constructor (enabled: 'bool', enrolled_at: 'float | None', recovery_codes_remaining: 'int', required: 'bool', webauthn_enrolled: 'bool' = False) -> None; fields: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled; properties: none
 NotifyEmailAlreadySet: exception (RuntimeError < Exception < BaseException)
-OidcStepUp: constructor (elevation: 'Elevation', return_to: 'str' = '/ui', reason: 'str | None' = None, error: 'str | None' = None) -> None; fields: elevation, error, reason, return_to; properties: ok
+OidcStepUp: constructor (elevation: 'Elevation', return_to: 'str' = '/ui', reason: 'str | None' = None, error: 'str | None' = None, flow_consumed: 'bool' = True) -> None; fields: elevation, error, flow_consumed, reason, return_to; properties: ok
+RolesGained: constructor (username: 'str', roles: 'frozenset[str]') -> None; fields: roles, username; properties: none
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_MFA: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_PASSWORD: attribute: str
@@ -151,6 +153,7 @@ STEP_UP_ACTION_WEBAUTHN_DELETE: attribute: str
 STEP_UP_ACTION_WEBAUTHN_ENROLL: attribute: str
 
 ## AuthService members reached by the console
+abandon_oidc_login: (self, flow_id: 'str', *, state: 'str | None', reason: 'str', client: 'str | None') -> 'bool'
 abandon_oidc_step_up: (self, flow_id: 'str', *, state: 'str | None', reason: 'str', client: 'str | None') -> 'OidcStepUp'
 action_step_up_required: property -> 'bool'
 admin_write_retry_after: (self, actor: 'str') -> 'int'

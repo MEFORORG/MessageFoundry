@@ -445,9 +445,8 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 def insecure_tls_allowed() -> bool:
     """Whether the explicit dev escape to permit insecure TLS overrides is set (ASVS 12.3.2).
 
-    Certificate-validation overrides (``ad_tls_verify=false`` for LDAPS, ``trust_server_certificate
-    =true`` for SQL Server) are MITM-able, so they now **refuse** at startup unless
-    ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
+    Certificate-validation overrides (``trust_server_certificate=true`` for SQL Server, for one) are
+    MITM-able, so they now **refuse** at startup unless ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
     server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -480,11 +479,11 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
     ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and the anonymous FTPS ``tls_verify=false`` context (a credential on FTPS verify-off or on plain
-    ``ftp`` is refused outright, vault BACKLOG #2636), **and — since #329 —**
-    the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
-    acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
-    cleartext-``http`` hops. Pass the construction-time
+    and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
+    unknown-host-key acceptance for a login with no ``password``
+    (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
+    cleartext-``http`` hops. The credential hops it no longer reaches are named once, in
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
@@ -1696,9 +1695,9 @@ class ApiSettings(_Section):
 class TlsSettings(_Section):
     """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
-    A small, shared fallback for outbound connectors that verify a downstream *server* certificate
-    (MLLP/DICOM/FTPS today), and the inbound FTPS poller, which dials out too (vault BACKLOG
-    #2370). By default the OS trust store roots verify the peer; a hospital estate
+    A small, shared fallback read by at least these: the outbound connectors that verify a downstream
+    *server* certificate, such as MLLP, DICOM and FTPS, and the inbound FTPS poller, which dials out
+    too (vault BACKLOG #2370). By default the OS trust store roots verify the peer; a hospital estate
     whose internal endpoints present a PRIVATE / internal-CA cert can pin that CA here once instead of
     installing it box-globally or repeating a per-connection ``tls_ca_file``. This is a CLIENT trust
     anchor — it selects WHICH roots verify the peer, it NEVER disables verification — so it composes
@@ -1717,9 +1716,10 @@ class TlsSettings(_Section):
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
     # PEM path to a file of CRLs for OUTBOUND hops and the FTPS poller (BACKLOG #299, #2370). NOT a
-    # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
-    # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
-    # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
+    # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
+    # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
+    # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
+    # context and sets VERIFY_CRL_CHECK_LEAF.
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
@@ -4766,6 +4766,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
         # _ALERT_CONTROL_EVENT_TYPES below.
         "config_changed",
+        # vault BACKLOG #2904: the CRL reload refused a replaced CRL file, so running TLS contexts
+        # keep the copy they hold. Keyed `crl_reload:<path>`, with a process suffix where several
+        # engine processes share the store, which no connection can be named.
+        "crl_reload_refused",
         # vault BACKLOG #2613: the security-signal rule layer over the audit stream. Each detector
         # has its own type; pipeline/security_signals.py SECURITY_SIGNAL_TYPES mirrors this block, and
         # a test pins that each is here. None is connection-scoped.

@@ -80,6 +80,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
     _check_hop_attestation,
     _check_revocation_attestation,
+    bool_setting,
     check_db_connect_timeout,
     flag_from_settings,
     require_hop_reason,
@@ -757,10 +758,11 @@ def refuse_resolved_verify_off(
     connector refuses a client cert with verification off when it is built."""
     if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
         return
-    if not settings["verify_tls"] and settings.get("tls_ca_file"):
+    # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
+    if not bool_setting(settings, "verify_tls", default=True) and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false, empty "
-            "or unset value, which verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false or "
+            "empty value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 
@@ -1505,6 +1507,10 @@ def _is_secret_header(name: str, value: object = None) -> bool:
     ``MONITORING_READ``. The asymmetry is not close, so this errs toward redacting -- but the VALUE arm
     is kept narrow (auth-scheme prefixes and JWTs only) rather than "long and high-entropy", because
     masking every long header value would quietly destroy the view rather than protect it.
+
+    **It is also a security control, not only a mask.** ``transports.rest.http_credentials_sent``
+    reads it to decide whether a ``verify_tls=false`` hop carries a credential (vault BACKLOG
+    #3230), so narrowing it narrows that no-escape refusal too.
     """
     if _looks_like_a_credential_value(value):
         return True
@@ -3678,8 +3684,9 @@ def DICOMweb(
         "DICOMweb",
         tls_ca_file,
         # Unlike REST/FHIR/SOAP there is no token hop here that would still read it.
+        # A Python None is the default, on, as the connector reads it (vault BACKLOG #3230).
         unread=None
-        if verify_tls
+        if verify_tls is None or verify_tls
         else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
     )
     _check_tls_ca_pin("DICOMweb", tls_ca_pin, tls_ca_file)
@@ -4236,8 +4243,7 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
-    # unless a hand-built spec sets tls_check_hostname=False. That key, and tls_verify=False, are
-    # refused outright when a username or password is set (vault BACKLOG #2636).
+    # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -4263,12 +4269,9 @@ def Ftp(
     """An **FTP** (``tls=False``) or **FTPS** (``tls=True`` — explicit TLS) endpoint, source **and**
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
-    Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
-    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
-    the server certificate is verified, name included: a hand-built spec that sets
-    ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
-    refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    A ``username`` or ``password`` is **refused** over plain ``ftp`` (use ``tls=True`` for FTPS, or
+    :func:`Sftp`), and over FTPS with a check off; docs/SECURITY-LOOSENING.md, *No escape sends a
+    credential to an unverified peer*, states the rule. Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
     ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
 
@@ -5864,8 +5867,10 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    value = settings.get("tls_check_hostname", True)
-    return isinstance(value, EnvRef) or not value
+    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
+    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+        return True
+    return not bool_setting(settings, "tls_check_hostname", default=True)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
