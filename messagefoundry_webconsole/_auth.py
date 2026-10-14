@@ -1125,7 +1125,9 @@ def _issue_continuation(request: Request, next_path: str) -> None:
       a bookmark, or a link opened from outside the browser, such as one in an email, and a crafted
       link of that kind must not pre-arm a grant. The page asks again, and the re-auth from the
       console's own navigation then issues it. A client that sends no ``Sec-Fetch-Site`` at all is
-      judged by its ``Origin``, as the origin check judges it. A window-only unlock page (one that
+      judged only by the origin check, and a top-level GET carries no ``Origin`` either, which that
+      check accepts. So on a browser without Fetch Metadata, a link opened from outside the browser
+      still issues the page; this rule does not close that case. A window-only unlock page (one that
       binds no action) is never issued: it always continues, so an entry would only fill the
       per-session cap and evict a pending ``auto_retry`` issue."""
     token = session_token(request)

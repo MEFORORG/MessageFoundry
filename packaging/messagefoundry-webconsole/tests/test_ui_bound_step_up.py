@@ -473,6 +473,56 @@ async def test_a_crafted_reauth_toward_an_unlock_page_mints_nothing_bound(engine
         assert again.status_code == 200 and "Nothing ran" in again.text
 
 
+async def test_an_unlock_page_issued_during_a_crafted_reauth_keeps_its_issue(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-auth toward an unlock page that was not issued when it started mints nothing. If another
+    tab is issued that page while the password check runs, this re-auth must neither spend that
+    issue nor answer with the auto-submit form, which is only for a body-less POST action. The other
+    tab's own re-auth then still mints and redirects to the page."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    real_reauth = service.reauth
+
+    async def reauth_while_another_tab_is_issued(*args: Any, **kwargs: Any) -> Any:
+        _issue_continuation(_get_request(page, kwargs["token"]), page)
+        return await real_reauth(*args, **kwargs)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        monkeypatch.setattr(service, "reauth", reauth_while_another_tab_is_issued)
+        crafted = await c.post(
+            "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert crafted.status_code == 200 and "Nothing ran" in crafted.text
+        monkeypatch.setattr(service, "reauth", real_reauth)
+        # The other tab's issue survived, so its re-auth mints and goes back to the page.
+        other = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert other.status_code == 303 and other.headers["location"] == page
+        assert (await c.get(page)).status_code == 200
+
+
+def _get_request(path: str, token: str) -> Request:
+    """A same-origin GET for ``path`` on the session ``token``, as a gate refusal sees it."""
+    return Request(
+        {
+            "type": "http",
+            "app": FastAPI(),  # a bare app: no public_origin, so the Host fallback judges
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "query_string": b"",
+            "server": ("127.0.0.1", 8765),
+            "headers": [
+                (b"host", b"127.0.0.1:8765"),
+                (b"sec-fetch-site", b"same-origin"),
+                (b"cookie", f"mf_session={token}".encode()),
+            ],
+        }
+    )
+
+
 async def test_a_link_opened_from_outside_the_browser_issues_nothing(engine: Engine) -> None:
     """A GET with ``Sec-Fetch-Site: none`` (a typed URL, a bookmark, a link in an email) is refused
     without issuing the page, so a crafted link to the page itself pre-arms nothing. The page asks

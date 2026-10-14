@@ -1905,9 +1905,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Vault BACKLOG #2764: only for a continuation that will run. A `next` the console did not
         # issue to this session takes no grant, because ADR 0077 derives the grant's purpose from
         # `next` itself, and a forged one would otherwise bind the proof to the forged action.
-        # Read once, before the await: the redirect below follows what was minted, so an entry that
-        # lapses or is evicted during the re-auth cannot leave a bound grant behind a page that says
-        # nothing ran.
+        # Read once, before the await: the unlock branch below follows what was minted, so an unlock
+        # entry that lapses or is evicted during the re-auth still redirects to the page its grant
+        # names. The auto-retry branch keys on the later spend instead, so an auto-retry entry that
+        # lapses during the await leaves its single-use grant unspent behind the "nothing ran" page,
+        # until the grant's own lifetime ends.
         continues = continues_after_reauth(action, token, next_)
         pre_rotation = token
         pw_elevation = await auth.reauth(
@@ -1968,12 +1970,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # unissued one ends on the page that says nothing ran, which is what the re-auth form told
         # the operator. A window-only unlock page always continues; it has no grant to pre-arm.
         # The unlock branch follows `continues`, what was minted, not the spend; the auto-retry
-        # branch keys on the spend, so two tabs racing one issue auto-submit it once.
-        issued = consume_continuation(pre_rotation, next_)
+        # branch keys on the spend, so two tabs racing one issue auto-submit it once. An unlock page
+        # that minted nothing spends nothing: another tab may have been issued that page during the
+        # await, and its own re-auth needs the issue. An unlock page never takes the auto-submit
+        # form, which is only for a body-less POST action.
+        unlock = is_unlock_action(next_)
+        issued = (continues or not unlock) and consume_continuation(pre_rotation, next_)
         rekey_continuations(pre_rotation, token)
-        if is_unlock_action(next_) and continues:
+        if unlock and continues:
             return _keep_session(RedirectResponse(next_, status_code=303), token)
-        if issued:
+        if issued and not unlock:
             return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)
         return _keep_session(
             HTMLResponse(pages.reauth_nothing_ran(action.label, reauth_landing(identity))), token

@@ -361,7 +361,8 @@ def test_each_proof_in_route_route_spends_before_it_holds_or_runs_anything() -> 
     must be on :data:`_BEFORE_THE_SPEND`, and every return before it must be ``_held_reply``."""
     routes = _proof_in_route_routes()
     # Positive control: the walk finds the routes that take their proof in the route, by name:
-    # the two vault BACKLOG #2625 moved and the two exports (owner ruling 2026-10-13, #3241 R2).
+    # the two vault BACKLOG #2625 moved, the two exports and edit-resend (owner ruling 2026-10-13,
+    # #3241 R1 and R2).
     assert set(routes) == {
         "purge_connection",
         "reload_config",

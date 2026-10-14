@@ -1623,8 +1623,9 @@ def require_step_up_action(
     ``proof_in_route=True`` moves the step-up decision into the route. The route must call
     :func:`spend_step_up_action` before it holds or runs anything. The rest still runs here. That
     is at least the permissions, pacing, the MFA gate, the new-address check and the
-    factor-binding refusal. Purge and reload use it (vault BACKLOG #2625), and so does export,
-    which spends after its own input check (owner ruling 2026-10-13, #3241 R2). A repeat that only
+    factor-binding refusal. At least purge, reload (vault BACKLOG #2625), export and edit-resend
+    use it; export and edit-resend spend after their own input checks (owner ruling 2026-10-13,
+    #3241 R1 and R2). ``grep proof_in_route=True`` finds the live set. A repeat that only
     rejoins the requester's open dual-control hold then needs a live session window
     (:func:`step_up_window_live`), and no new proof. ``tests/test_bound_step_up_hold_rejoin.py``
     pins what each such route may do before its spend."""

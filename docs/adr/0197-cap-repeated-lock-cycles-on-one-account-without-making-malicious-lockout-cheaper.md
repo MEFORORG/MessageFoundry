@@ -1497,6 +1497,8 @@ deadline). From the store call on, a refusal keeps the spend, because the store 
 The console calls the handler in-process after its own spend, so the refund reaches both planes.
 
 **What it does not change.** Amendment A's rule that a refund can never mint, extend or restore an
-expired grant. A request that wrote nothing is the only kind refunded. Single use still holds: the
-write spends the proof. `tests/test_bound_step_up_injection.py` pins a pre-write refusal refunding
+expired grant. Only a request refused before its message-store write is refunded. Such a request
+may still have written an audit row, such as `message_edit_resend_reject` or
+`auth.channel_denied`, so one proof can drive repeated audited refusals, each limited by the
+admin-write pacing. Single use still holds: the message-store write spends the proof. `tests/test_bound_step_up_injection.py` pins a pre-write refusal refunding
 and a store-call refusal keeping the spend.
