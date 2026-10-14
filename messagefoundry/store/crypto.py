@@ -558,6 +558,15 @@ class CipherError(Exception):
     JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
+class CipherAuthenticationError(CipherError):
+    """No configured key's AEAD tag verified the value (BACKLOG #2593).
+
+    The one :class:`CipherError` that can mean the cell was sealed for another place: wrong
+    associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is not
+    UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift."""
+
+
 class AuditKeyVersionRefusedError(CipherError):
     """Transit refused an audit MAC pinned to one key version, and still answers under the latest.
 
@@ -1590,7 +1599,7 @@ class AesGcmCipher(_UnmarkedPolicy):
             raise CipherError(
                 f"decrypted value is not valid UTF-8 (key_id={key_id!r}); the row is corrupt"
             )
-        raise CipherError(
+        raise CipherAuthenticationError(
             f"no configured key decrypts this value (key_id={key_id!r}); if rotating, supply the "
             "prior key via MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
         )

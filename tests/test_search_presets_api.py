@@ -11,6 +11,10 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import Request
+from starlette.responses import Response
 
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
@@ -285,7 +289,17 @@ async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Pat
         me = await service.store.get_user_by_username("op")
         them = await service.store.get_user_by_username("op2")
         assert me is not None and them is not None
-        transport = httpx.ASGITransport(app=create_app(keyed, auth=service))
+        app = create_app(keyed, auth=service)
+        # Keep each HTTPException the app raises, so the 423's own chain can be read (BACKLOG #1796).
+        raised: list[StarletteHTTPException] = []
+
+        async def _keep(request: Request, exc: Exception) -> Response:
+            assert isinstance(exc, StarletteHTTPException)
+            raised.append(exc)
+            return await http_exception_handler(request, exc)
+
+        app.add_exception_handler(StarletteHTTPException, _keep)
+        transport = httpx.ASGITransport(app=app)
         alerts: list[tuple[str, str]] = []
         cipher.set_tag_failure_hook(lambda table, reason: alerts.append((table, reason)))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -309,6 +323,10 @@ async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Pat
             side.commit()
             r = await c.get("/search/layered", params={"presets": planted}, headers=h)
             assert r.status_code == 423, r.text
+            # Raised after the handler, so neither the CellTagError nor the cipher's error rides on it.
+            refusal = raised[-1]
+            assert refusal.status_code == 423
+            assert refusal.__context__ is None and refusal.__cause__ is None
 
             gone = await mk(h, "moved away")
             side.execute("UPDATE search_presets SET owner_user_id=? WHERE id=?", (them.id, gone))

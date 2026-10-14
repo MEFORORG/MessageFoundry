@@ -12,11 +12,13 @@ the on-open seal pass, rotation and the restore-verify cell list.
 from __future__ import annotations
 
 import ast
+import base64
 import pathlib
 import sqlite3
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import messagefoundry
 from messagefoundry.store import MessageStore
@@ -32,6 +34,7 @@ from messagefoundry.store.cell_tag import (
 from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
 from messagefoundry.store.crypto import (
     AesGcmCipher,
+    CipherAuthenticationError,
     CipherError,
     aad_cell_name,
     cell_aad,
@@ -99,6 +102,42 @@ def test_open_message_cell_refuses_a_moved_cell_and_alerts() -> None:
     with pytest.raises(CipherError) as missing:
         open_message_cell(other, "raw", sealed, message_id="m1", channel_id="A")
     assert not isinstance(missing.value, CellTagError)
+
+
+def test_only_a_failed_tag_is_drift_and_a_corrupt_row_keeps_the_ciphers_error() -> None:
+    """A corrupt cell under a held key is not drift: no alert, and the cipher's own error names it.
+
+    Attack arm: a cell opened under another row's tag fails its AEAD tag and is drift. Controls:
+    bad base64, and a plaintext whose tag VERIFIED but is not UTF-8, both under a held key, are a
+    corrupt row (BACKLOG #2308), so they must not read as a moved cell."""
+    key_b64 = generate_key()
+    cipher = make_cipher(key_b64, write_v2=True)
+    assert isinstance(cipher, AesGcmCipher)
+    seen: list[str] = []
+    cipher.set_tag_failure_hook(lambda table, reason: seen.append(reason))
+    sealed = cipher.encrypt("SYNTH", aad=message_cell_aad("raw", message_id="cr1", channel_id="A"))
+    with pytest.raises(CellTagError) as moved:
+        open_message_cell(cipher, "raw", sealed, message_id="cr1", channel_id="B")
+    assert isinstance(moved.value.__cause__, CipherAuthenticationError)
+    assert len(seen) == 1
+
+    # One extra base64 character leaves a length that cannot decode.
+    bad_b64 = sealed + "A"
+    assert cipher.holds_key_for(bad_b64)  # the marker still names a held key
+    with pytest.raises(CipherError, match="bad base64") as corrupt:
+        open_message_cell(cipher, "raw", bad_b64, message_id="cr2", channel_id="A")
+    assert not isinstance(corrupt.value, CellTagError)
+
+    # v1 seals with no associated data, so a hand-built value can hold bytes that are not UTF-8.
+    key_id = make_cipher(key_b64).encrypt("x").split(":")[2]
+    nonce = bytes(12)
+    blob = AESGCM(base64.b64decode(key_b64)).encrypt(nonce, b"SYNTH" + bytes([0xFF]), None)
+    not_utf8 = f"mfenc:v1:{key_id}:{base64.b64encode(nonce + blob).decode('ascii')}"
+    assert cipher.holds_key_for(not_utf8)
+    with pytest.raises(CipherError, match="not valid UTF-8") as undecodable:
+        open_message_cell(cipher, "raw", not_utf8, message_id="cr3", channel_id="A")
+    assert not isinstance(undecodable.value, CellTagError)
+    assert len(seen) == 1  # neither corrupt row alerted
 
 
 class _NoKeyringView:

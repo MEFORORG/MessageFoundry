@@ -38,7 +38,12 @@ import time
 from collections.abc import Callable, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any, Concatenate, Final, Protocol
 
-from messagefoundry.store.crypto import NO_STORE_ID, CipherError, cell_aad
+from messagefoundry.store.crypto import (
+    NO_STORE_ID,
+    CipherAuthenticationError,
+    CipherError,
+    cell_aad,
+)
 from messagefoundry.store.queue_tag import is_tag_failure
 from messagefoundry.store.row_seal import seal_bytes
 
@@ -196,14 +201,15 @@ def open_tagged_cell(
     """Open ``stored`` under ``aad``. ``None`` reads as ``None``, and a blank or unmarked value goes to
     the cipher's own policy, as the store's ``_dec`` does.
 
-    A marked value that fails under a key this process holds (:func:`is_tag_failure`) raises
-    :class:`CellTagError` and raises the ``integrity_drift`` alert. A key or format problem raises the
-    cipher's own error."""
+    A marked value whose AEAD tag fails under a key this process holds (:func:`is_tag_failure`)
+    raises :class:`CellTagError` and raises the ``integrity_drift`` alert. A key or format problem
+    raises the cipher's own error, and so does a corrupt row: bad base64, or a verified plaintext
+    that is not UTF-8. Neither is drift, and the cipher's error already names it."""
     if stored is None:
         return None
     try:
         return cipher.decrypt(stored, aad=aad)
-    except CipherError as exc:
+    except CipherAuthenticationError as exc:
         # Only an in-process keyring can say it holds the key a marker names. A cipher that cannot
         # (Vault Transit) also wraps an unreachable provider in CipherError, so there a failure keeps
         # the cipher's own error rather than reading as an integrity failure.
