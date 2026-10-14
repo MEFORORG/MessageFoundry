@@ -10,31 +10,30 @@ rise into one ``remote_debug_refused`` audit row and one ``remote_debug_refused`
 
 **One row and one alert for each pass, with a count.** The injecting process chooses how often it
 tries. However many scripts were refused since the last pass, the pass writes one row and raises
-one alert, and each says how many. A pass runs when the watch starts, every
+one alert, and each says how many. So the audit log gains at most one row, and the sink one alert,
+for each pass, whatever the rate. A pass runs when the watch starts, every
 :data:`CHECK_INTERVAL_SECONDS` after that, and once more as it stops. The interval starts when a
-pass ends, and a pass may wait :data:`_ROW_SECONDS` for its row, so a hung store spaces passes, and
-alerts, about twice the interval apart. So the audit log gains at most one row, and the sink one
-alert, for each pass, whatever the rate.
+pass ends. A pass may also wait :data:`_ROW_SECONDS` for its row, so where the store hangs, passes
+come about twice the interval apart.
 
 **No file name.** The injecting process chooses the script's name too, so neither the row nor the
 alert carries it. The name stays in the guard's WARNING line, which bounds and escapes it.
 
 **Counted from the start of the process.** The first pass reports every refusal since the process
 started, so one made before the engine opened its store is recorded. The loop makes one more pass
-as it stops, for a refusal in the last interval. A process that is killed loses at most the
-refusals since its last pass; the guard's WARNING lines still have them. The count belongs to the
-process and each watch keeps its own marks, so a second watch in one process would report the
-earlier refusals again. An engine builds one, and ``serve`` builds one engine.
+as it stops, for a refusal in the last interval. A process that is killed has no row or alert for
+the refusals since its last pass. The guard's WARNING lines still have them. The count belongs to
+the process, but each watch keeps its own marks. So a second watch in one process would report the
+earlier refusals again. An engine builds one watch, and ``serve`` builds one engine.
 
-**``serve`` only.** The engine starts this watch, and of the ``messagefoundry`` commands only
-``serve`` builds an engine. ``supervise``, ``rotate-key``, ``backup`` and the rest build no engine
-and no notifier, so a refusal there is the guard's WARNING line and nothing more, even where the
-command opens the store itself, as ``rotate-key`` and ``backup`` do. An engine
-shard starts with the interface off (``messagefoundry/childenv.py``), so its count never moves.
-An application that builds its own engine runs this watch too, but the count rises only where the
-guard is in the process. Importing ``messagefoundry.__main__`` installs it, and so does calling
-``install_remote_debug_guard``. Without either, such an application's count stays at 0, so it
-writes no row and raises no alert.
+**Every engine runs it. Of the commands, only ``serve`` builds an engine.** ``supervise``,
+``rotate-key``, ``backup`` and the rest build no engine and no notifier. A refusal there is the
+guard's WARNING line and nothing more. That holds even for ``rotate-key`` and ``backup``, which open
+the store themselves. An engine shard starts with the interface off
+(``messagefoundry/childenv.py``), so its count never moves. An application that builds its own
+engine runs this watch too. Its count rises only where the guard is in the process: an import of
+``messagefoundry.__main__`` installs it, and so does a call to ``install_remote_debug_guard``.
+Without either, the count stays at 0, and the watch writes no row and raises no alert.
 
 **It reads the count, not whether the guard answers.** The count rises wherever the hook runs. That
 includes the state where an earlier audit hook raises on the engine's probe event: the posture then
@@ -45,13 +44,18 @@ counted.
 **Each is owed each refusal once.** The row and the alert keep a mark each, and a mark moves only
 once its own call succeeded. The alert is raised first, because it does not block: a slow or
 refusing store cannot hold back the page. A store that refuses the row leaves the row's mark where
-it was, and the next pass writes one row with the larger count; the alert is not raised again for
-those refusals. A sink that raises is retried the same way. The pass at stop has no next pass, so
-a row it cannot write is lost, and :meth:`RemoteDebugRefusalWatch.stop` cancels that pass after
-:data:`_STOP_SECONDS`. Rows' ``count`` values can overlap, because a write cut off after it
-committed is written again, so the latest row's ``total`` is the figure to read. A notifier whose
-queue is full drops the event without raising, so the alert mark moves anyway; its alert-instance
-row is still written before the queue is tried.
+it was. The next pass then writes one row with the larger count, and does not raise the alert
+again for those refusals. A sink that raises is retried the same way, by the next pass.
+
+**The pass at stop has no next pass.** A row or an alert it cannot deliver is lost, though its
+ERROR line still says the next pass retries. :meth:`RemoteDebugRefusalWatch.stop` also cancels the
+loop if it has not finished after :data:`_STOP_SECONDS`. Refusals that no pass had read by then
+get no alert, and those whose row no pass had written get no row.
+
+Rows' ``count`` values can overlap, because a write cut off after it committed is written again.
+So the latest row's ``total`` is the figure to read. A notifier whose queue is full drops the
+event without raising, so the alert mark moves anyway. Its alert-instance row is still written
+before the queue is tried.
 
 **The alert has no inverse.** A refusal is an event, not a state that can clear, so nothing
 resolves the alert instance. An operator does.
@@ -88,7 +92,8 @@ ALERT_SUBJECT = "remote_debug:refused"
 CHECK_INTERVAL_SECONDS = 30.0
 #: How long :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it.
 _STOP_SECONDS = 5.0
-#: How long one audit row may take before the pass gives it up for the next pass to retry.
+#: How long one audit row may take before the pass gives it up. The next pass retries it, but the
+#: pass at stop has no next pass, so a row it gives up is lost.
 _ROW_SECONDS = CHECK_INTERVAL_SECONDS
 
 
@@ -170,7 +175,8 @@ class RemoteDebugRefusalWatch:
         try:
             await self.run_once()
         except Exception:
-            # A mark a failed pass did not move is reported by the next one.
+            # A mark a failed pass did not move is reported by the next one. The pass at stop has
+            # none, so what it failed to report is lost.
             log.exception("remote-debug refusal check failed; the next pass retries")
 
     async def run_once(self) -> None:
@@ -195,8 +201,9 @@ class RemoteDebugRefusalWatch:
         )
         # ``actor="system"``: no user acted, as for the other rows a background task writes.
         # Bounded: passes run one after another, so a write that hung would stop every later
-        # alert. A write cut off by the bound is retried by the next pass; one that committed as
-        # it was cut off is written twice, the safer of the two failures.
+        # alert. A write cut off by the bound is retried by the next pass, except at stop, where
+        # there is none and the row is lost. One that committed as it was cut off is written
+        # twice, the safer of the two failures.
         # AUDIT_WRITE_DEFECTS: the alert has gone already, so a defect may raise. ``_pass`` logs
         # it as a failed check rather than as a store that refused the row.
         return await write_audit_soft(
@@ -219,7 +226,8 @@ class RemoteDebugRefusalWatch:
             self._alert_sink.remote_debug_refused(self._subject, count=count, total=total)
         except Exception:
             # A sink that breaks its never-raise contract must not stop the next pass, which
-            # raises the alert again with the count so far.
+            # raises the alert again with the count so far. At stop there is no next pass, so
+            # the alert is lost.
             log.exception(
                 "remote-debug refusal watch: the remote_debug_refused alert could not be "
                 "raised, and the next pass raises it with the count so far"

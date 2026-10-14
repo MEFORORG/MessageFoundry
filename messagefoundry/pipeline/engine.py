@@ -1762,7 +1762,9 @@ class Engine:
         # Vault BACKLOG #2742: write one audit row and raise one alert for the scripts the
         # remote-debugging guard refused since the last pass. Not leader-gated: the count is this
         # process's own, so a standby reports its own too, and names itself in the alert key as
-        # the intake monitor does. Only `serve` builds an engine, so only `serve` runs this.
+        # the intake monitor does. Of the commands, only `serve` builds an engine. An application
+        # that builds its own engine runs this too. Its count stays 0 unless the guard is in its
+        # process; the watch's module docstring says how the guard gets there.
         if self._remote_debug_watch is None:
             self._remote_debug_watch = RemoteDebugRefusalWatch(
                 self.store, alert_sink=self._alert_sink, node=self.instance_identity

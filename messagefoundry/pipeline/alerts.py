@@ -758,14 +758,12 @@ class AlertSink(Protocol):
         Raised at most once per pass of
         :class:`~messagefoundry.pipeline.remote_debug_watch.RemoteDebugRefusalWatch`, on the event
         loop, however many scripts were refused, so the injecting process does not set the rate.
-        The engine runs that watch, and of the commands only ``serve`` builds one, so only
-        ``serve`` raises this. An application that builds its own engine runs the watch too, but
-        its count stays at 0 unless the guard is in its process. An import of
-        ``messagefoundry.__main__`` puts it there, and so does a call to
-        :func:`~messagefoundry.remotedebug.install_remote_debug_guard`. It is not a
-        connection-scoped event, so no rule's ``control_action`` fires on it, and the colon keeps
-        ``name`` outside the connection-name grammar. Nothing resolves it: a refusal is an event,
-        not a state that can clear, so an operator resolves the instance. The ``remote_debug_refused`` audit row is the durable
+        The engine runs that watch. Of the commands, only ``serve`` builds an engine, so only
+        ``serve`` raises this. The watch's module docstring says when an application that builds
+        its own engine raises it too. It is not a connection-scoped event, so no rule's
+        ``control_action`` fires on it, and the colon keeps ``name`` outside the connection-name
+        grammar. Nothing resolves it: a refusal is an event, not a state that can clear, so an
+        operator resolves the instance. The ``remote_debug_refused`` audit row is the durable
         record."""
         ...
 
