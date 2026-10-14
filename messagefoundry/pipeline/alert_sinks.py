@@ -1154,8 +1154,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
         # Vault BACKLOG #3229: every administrator_granted call pops the _last_sent key built from
-        # the no_enabled_administrator alert type and the granted target, so a loss after a re-grant
-        # is not held back by the earlier loss's cooldown. The pop builds that key with its own
+        # the no_enabled_administrator alert type and the granted target, so a loss after an
+        # administrator_granted re-grant is not held back by the earlier loss's cooldown. A
+        # reconciler re-grant calls no administrator_granted, so it pops nothing. The pop builds that key with its own
         # f-string in `_emit`'s key format; tests/test_directory_last_admin_alert.py pins the match.
         # Only a `user:` target can match a loss key, so an `ad-group:` grant pops nothing. _last_sent is
         # per process, so this clears the cooldown in this process only. _occurrences and _suspended
