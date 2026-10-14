@@ -143,17 +143,14 @@ def _step_up_landing(
         # issue (#2764), so a fresh flow started from this page continues only to an unlock target;
         # the page says so. (After a state mismatch the original flow is still staged and its real
         # return would still continue -- the conservative wording errs toward "nothing will run".)
-        # An unlock page that binds an action continues only when issued (owner ruling
-        # 2026-10-13, #3241 R3), and this cross-site return carries no session cookie to ask with,
-        # so only a window-only unlock page is promised a continuation here.
-        refused_action = lookup_ui_action(next_)
+        # An action-bound unlock page arrives here as return_to only when the start leg found it
+        # issued, and that leg leaves its issue unspent (owner ruling 2026-10-13, #3241 R3), so the
+        # retry this page offers still continues to it.
         resp = reauth_idp_response(
             deps,
             auth,
             next_,
-            continues=refused_action is not None
-            and refused_action.unlock
-            and refused_action.action is None,
+            continues=is_unlock_action(next_),
             error=outcome.error,
             status_code=403,
         )

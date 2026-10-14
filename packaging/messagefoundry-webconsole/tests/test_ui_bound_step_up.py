@@ -31,10 +31,17 @@ from _ui_clients import (
     seed_message,
     ui_client,
 )
+from fastapi import FastAPI
+from starlette.requests import Request
 
 from messagefoundry.auth import Role
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._auth import (
+    _issue_continuation,
+    continuation_issued,
+    lookup_ui_action,
+)
 
 NO_SUCH = "0" * 32
 EDITED = ADT.replace("DOE^JANE", "DOE^JOHN")
@@ -446,3 +453,37 @@ async def test_a_link_opened_from_outside_the_browser_issues_nothing(engine: Eng
         r = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
         assert r.status_code == 303 and r.headers["location"] == page
         assert (await c.get(page)).status_code == 200
+
+
+def test_a_window_only_unlock_page_is_never_issued() -> None:
+    """A window-only unlock page (one binding no action) always continues, so a gate refusing it
+    records nothing: an entry would only fill the per-session cap and evict a pending auto-retry
+    issue. CONTROL: the same refusal toward an action-bound unlock page is recorded."""
+    token = "t" * 43
+    window_only, bound = "/ui/ad-groups", "/ui/connections/purge-confirm"
+    wo_action, bound_action = lookup_ui_action(window_only), lookup_ui_action(bound)
+    assert wo_action is not None and wo_action.unlock and wo_action.action is None
+    assert bound_action is not None and bound_action.unlock and bound_action.action is not None
+
+    def _get(path: str) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "app": FastAPI(),  # a bare app: no public_origin, so the Host fallback judges
+                "method": "GET",
+                "scheme": "http",
+                "path": path,
+                "query_string": b"",
+                "server": ("127.0.0.1", 8765),
+                "headers": [
+                    (b"host", b"127.0.0.1:8765"),
+                    (b"sec-fetch-site", b"same-origin"),
+                    (b"cookie", f"mf_session={token}".encode()),
+                ],
+            }
+        )
+
+    _issue_continuation(_get(window_only), window_only)
+    assert not continuation_issued(token, window_only)
+    _issue_continuation(_get(bound), bound)
+    assert continuation_issued(token, bound)

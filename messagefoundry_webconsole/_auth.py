@@ -989,8 +989,9 @@ _REAUTH_CONTINUATION_SESSIONS_MAX = 4096
 
 class _IssuedContinuations:
     """The continuations this process issued, each bound to ONE session (#2764): ``auto_retry``
-    actions, and since owner ruling 2026-10-13 (#3241 R3) ``unlock`` pages too, because the re-auth
-    toward an unlock page mints its action-bound grant only when the page was issued.
+    actions, and since owner ruling 2026-10-13 (#3241 R3) ``unlock`` pages that bind an action too,
+    because the re-auth toward such a page mints its grant only when the page was issued. A
+    window-only unlock page is never recorded: it always continues.
 
     ``/ui/reauth`` used to auto-submit whichever registered action its ``next`` named, and nothing
     recorded that the server had asked for it, so a typed, bookmarked or clicked link to
