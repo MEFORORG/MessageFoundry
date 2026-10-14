@@ -137,7 +137,10 @@ channel config) with one section per group, plus **environment-variable override
 CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 ```
 
-- File location: `./messagefoundry.toml` by default, or `--service-config <path>`.
+- File location: `./messagefoundry.toml` by default, or `--service-config <path>`. **Under the
+  Windows service, `serve` and `supervise` refuse to start without `--service-config`**, so the
+  service never reads whatever file sits in its working directory. A start from a shell keeps the
+  default. [SERVICE.md, *Install*](SERVICE.md#install) says how to register the file.
 - **Secrets** (e.g. a DB password) should come from **env** (or a secret reference), never plaintext
   in the file — env wins over the file so a deployment can inject them.
 - Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
