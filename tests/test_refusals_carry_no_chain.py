@@ -45,6 +45,7 @@ from starlette.requests import Request
 
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.api import app as api_app
+from messagefoundry.api import message_scope
 from messagefoundry.api.message_scope import read_scoped_message
 from messagefoundry.api.models import ChannelInfo
 from messagefoundry.apiclient.client import ApiError, _decode
@@ -909,9 +910,11 @@ async def test_the_reload_guard_keeps_the_value_file_off_the_chain(
 # ---- api/message_scope.py: the integrity 423 chains no cell-tag failure (BACKLOG #2593) -------
 
 
-async def test_an_integrity_refused_message_423_carries_no_chain() -> None:
-    """The 423 is raised after the handler, so neither the CellTagError nor the cipher's error under
-    it, nor through their tracebacks the store frame that opened the row's other cells, is on it."""
+async def test_an_integrity_refused_message_423_carries_no_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 423 is raised after the handler, so its ``__cause__``/``__context__`` chain is empty: the
+    CellTagError and the cipher's error under it are not on it. This walks the chain, not frames."""
 
     async def _get_message(_message_id: str) -> dict[str, Any] | None:
         try:
@@ -928,3 +931,16 @@ async def test_an_integrity_refused_message_423_carries_no_chain() -> None:
     _assert_bare(caught.value)
     # Control: without refuse_integrity the same row reads as absent, as before.
     assert await read_scoped_message(engine, identity, "m-1", request) is None
+    # Out of scope it is audited and absent even with refuse_integrity, so a 423 never says it exists.
+    denied: list[str | None] = []
+
+    async def _audit(_engine: object, _identity: object, channel: str | None, _ip: object) -> None:
+        denied.append(channel)
+
+    monkeypatch.setattr(message_scope, "audit_channel_denied", _audit)
+    monkeypatch.setattr(message_scope, "client_ip", lambda _request: None)
+    outsider: Any = SimpleNamespace(can_access_channel=lambda _channel: False)
+    assert (
+        await read_scoped_message(engine, outsider, "m-1", request, refuse_integrity=True) is None
+    )
+    assert denied == ["IB_A"]
