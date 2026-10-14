@@ -440,8 +440,8 @@ _FLAG_REFUSAL = (
     "refusing to start: this engine runs as the Windows service 'MessageFoundry' and was started "
     "with no --service-config"
 )
-#: A service started with no settings file passes the flag refusal only when it has the flag, so
-#: each refusal case names whether it passes one.
+#: Each refusal case says whether it passes --service-config. The store-key case passes one, so
+#: the flag refusal, which comes first, does not hide the key refusal it tests.
 _REFUSALS = pytest.mark.parametrize(
     ("posture", "with_flag", "reason"),
     [(_KEY_LISTED, True, _KEY_REFUSAL), (_A_SERVICE, False, _FLAG_REFUSAL)],
@@ -589,6 +589,16 @@ def test_only_a_known_service_with_no_settings_flag_is_refused() -> None:
         if reason is not None:
             assert "'MessageFoundry'" in reason and "-ServiceConfig <path>" in reason
         assert missing_service_config_refusal(posture, r"C:\mf\messagefoundry.toml") is None
+
+
+def test_a_service_refuses_a_relative_settings_flag() -> None:
+    """A relative --service-config with no --project-root is read from the working directory, the
+    file the flag refusal exists to keep out. The caller passes the flag anchored under the root,
+    so a relative flag with a root arrives absolute."""
+    for relative in ("messagefoundry.toml", r"settings\messagefoundry.toml", r"\mf\settings.toml"):
+        reason = missing_service_config_refusal(_A_SERVICE, relative)
+        assert reason is not None and "the relative --service-config" in reason, relative
+        assert missing_service_config_refusal(_A_SHELL, relative) is None
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the Windows probe reads this host")

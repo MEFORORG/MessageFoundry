@@ -2465,8 +2465,9 @@ def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: s
 
 def _missing_service_config_refused(service_config: str | None, *, fleet: str = "") -> bool:
     """Vault BACKLOG #2626 step 2: True, with the reason printed, when this start is the Windows
-    service and has no ``--service-config``. Called before the settings load, so the service never
-    reads a ``messagefoundry.toml`` from its working directory. A start from a shell is unchanged.
+    service and has no absolute ``--service-config``. ``service_config`` is the flag anchored under
+    ``--project-root``. Called before the settings load, so the service never reads a
+    ``messagefoundry.toml`` from its working directory. A start from a shell is unchanged.
     ``serve`` and ``supervise`` both call it; ``fleet`` says the supervisor refuses for its
     engine shards."""
     from messagefoundry.serviceenv import missing_service_config_refusal, service_env_posture
@@ -2547,7 +2548,7 @@ def _serve(args: argparse.Namespace) -> int:
     config_dir = anchor_under_root(args.config, root, cwd=cwd)
     assert config_dir is not None  # args.config always has a string default
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
-    if _missing_service_config_refused(args.service_config):
+    if _missing_service_config_refused(service_config):
         return 2
 
     # Only pass flags the user actually supplied so they override env/file but an unset flag doesn't.
@@ -4863,7 +4864,7 @@ def _supervise(args: argparse.Namespace) -> int:
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
     # Each engine shard is started with the same --service-config, so each would refuse.
     if _missing_service_config_refused(
-        args.service_config,
+        service_config,
         fleet="Every engine shard would refuse to start; refusing to start the fleet.",
     ):
         return 2

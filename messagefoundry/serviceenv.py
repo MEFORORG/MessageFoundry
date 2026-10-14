@@ -47,6 +47,7 @@ import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import PureWindowsPath
 from typing import Protocol
 
 from messagefoundry.service_status import is_safe_service_name
@@ -403,22 +404,30 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
 def missing_service_config_refusal(
     posture: ServiceEnvPosture, service_config: str | None
 ) -> str | None:
-    """Why ``serve`` or ``supervise`` must not start as a service with no ``--service-config``,
-    or None (vault BACKLOG #2626, step 2).
+    """Why ``serve`` or ``supervise`` must not start as a service without an absolute
+    ``--service-config``, or None (vault BACKLOG #2626, step 2).
 
-    With no flag, the engine reads whatever ``messagefoundry.toml`` sits in its working
-    directory, or none. A service should start from a settings file it was registered with, by
-    absolute path. The refusal applies only when the reading found the service, so a start from a
-    shell, the developer loop, is unchanged. An ``UNOBSERVABLE`` reading with no service name
-    settles nothing either way and does not refuse, for the reason the module docstring gives."""
-    if service_config is not None or posture.service_name is None:
+    ``service_config`` is the flag as anchored under ``--project-root``. With no flag, or a
+    relative one and no root, the engine reads a ``messagefoundry.toml`` from its working
+    directory. A service should start from the settings file it was registered with, by absolute
+    path. The refusal applies only when the reading found the service, so a start from a shell, the
+    developer loop, is unchanged. An ``UNOBSERVABLE`` reading with no service name settles nothing
+    either way and does not refuse, for the reason the module docstring gives. A service runs only
+    on Windows, so the path is read as a Windows path on every platform."""
+    if posture.service_name is None:
+        return None
+    if service_config is None:
+        started = "no --service-config"
+    elif not PureWindowsPath(service_config).is_absolute():
+        started = f"the relative --service-config {service_config!r} and no --project-root"
+    else:
         return None
     return (
         f"this engine runs as the Windows service {posture.service_name!r} and was started with "
-        "no --service-config, so it would read whatever messagefoundry.toml sits in its working "
-        "directory. Register the settings file by absolute path: run install-service.ps1 again "
-        "with -ServiceConfig <path>, or `messagefoundry service install` with --service-config "
-        '<path>. See docs/SERVICE.md, "Install"'
+        f"{started}, so it would read a messagefoundry.toml from its working directory. Register "
+        "the settings file by absolute path: run install-service.ps1 again with -ServiceConfig "
+        "<path>, or `messagefoundry service install` with --service-config <path>. See "
+        'docs/SERVICE.md, "Install"'
     )
 
 
