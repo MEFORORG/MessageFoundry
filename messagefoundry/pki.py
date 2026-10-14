@@ -393,7 +393,13 @@ class CrlSignature:
 
     ``where`` names the block and its issuer, for a message. ``state`` is one of five. A CA "fits"
     when its subject equals the CRL's issuer name exactly and it fits the CRL's Authority Key
-    Identifier (:func:`_akid_fit`).
+    Identifier (:func:`_akid_fit`). "Exactly" is ``cryptography``'s name comparison, in which
+    letter case counts. OpenSSL's comparison is looser: it folds the case of ASCII letters, at
+    least. So a listed CA whose name differs from the issuer's only in the case of ASCII letters
+    is ``unlisted`` here, while OpenSSL takes it for the issuer and judges peers by the CRL.
+    Measured 2026-10-13 on CPython 3.14.6 with OpenSSL 3.5.7: such a CRL, badly signed and
+    naming that CA's key, started with the warning and then failed its handshake with ``CRL
+    signature failure``. Every text that describes ``unlisted`` must stay true of that case.
 
     * ``verified``: a CA that fits verifies the CRL.
     * ``bad``: **proven** badly signed. The CRL's key identifier equals a fitting CA's Subject Key
@@ -475,36 +481,42 @@ def _signature_state(
 
 
 def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
-    """Why some CRL in ``pem`` is not signed by a CA in ``ca_ders``, or ``None`` when each one is.
+    """Why a CA in ``ca_ders`` is not confirmed to have signed some CRL in ``pem``, or ``None``
+    when each CRL is confirmed.
 
-    The flag is True when a CA for the CRL's issuer was found and its key does not verify the CRL,
-    and False when no such CA was found. A block that fails to verify is reported over one whose CA
-    was not found, wherever it sits in the file. OpenSSL checks a CRL's signature at the handshake,
-    not at the load. So OpenSSL itself loads a CRL with the right issuer name and Authority Key
-    Identifier but a bad signature, and then every handshake it judges fails with ``CRL signature
-    failure``. The running-hop reload calls this before a live load, because a load cannot be
-    undone (BACKLOG #299).
+    The flag is True when a listed CA fits the CRL and none verifies it, whether the check failed
+    or could not run, and False when no listed CA fits. :class:`CrlSignature` says what "fits"
+    means. A block with the True flag is reported over one with the False flag, wherever it sits
+    in the file. OpenSSL checks a CRL's signature at the handshake, not at the load. So OpenSSL
+    itself loads a CRL with the right issuer name and Authority Key Identifier but a bad
+    signature, and then every handshake it judges fails with ``CRL signature failure``. The
+    running-hop reload calls this before a live load, because a load cannot be undone
+    (BACKLOG #299).
 
     **The flag is wider than what a start refuses (vault BACKLOG #2905).** It is True for every
     :class:`CrlSignature` state but ``verified`` and ``unlisted``. A start refuses only ``bad``,
     the proven case, and loads the other two with a warning. So the reload holds back some files
     that a start would load.
 
-    A CA counts as a CRL's issuer when its subject equals the CRL's issuer name exactly, it fits the
-    CRL's AKID, and its key verifies the CRL. A CA that does not parse is ignored. ``pem`` must be
-    bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
+    A CA that does not parse is ignored. ``pem`` must be bytes :func:`judge_every_crl` accepted;
+    a block that does not parse raises ``ValueError``."""
     unlisted: str | None = None
     for signature in judge_crl_signatures(pem, ca_ders):
         if signature.state == "unlisted":
-            # Go on: a block that is known to be badly signed is the stronger finding.
+            # Go on: a block that is known to be badly signed is the stronger finding. The words
+            # are the start warning's (``tls_policy._UNCONFIRMED_SIGNATURE``); a test holds the
+            # two together.
             unlisted = unlisted or (
-                f"{signature.where} names no CA certificate this hop lists as its issuer"
+                f"{signature.where}: the engine matched it to no CA certificate this hop lists "
+                "(it compares the issuer name exactly, letter case included, and then the CRL's "
+                "authority key identifier, where it carries one)"
             )
         elif signature.state != "verified":
             return (
-                f"{signature.where} does not verify against the key of the CA certificate this "
-                "hop trusts for that issuer. A handshake that OpenSSL checks against that CA's "
-                "key by this CRL fails with 'CRL signature failure'",
+                f"{signature.where}: the engine could not confirm its signature with the key "
+                "of the CA certificate this hop trusts for that issuer. The check failed or "
+                "could not run. Where that key did not sign the CRL, a handshake that OpenSSL "
+                "checks against that CA's key by this CRL fails with 'CRL signature failure'",
                 True,
             )
     return None if unlisted is None else (unlisted, False)
@@ -555,7 +567,10 @@ def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
     it is not proof. The key is then asked directly (:func:`_verify_with`), and only its
     ``InvalidSignature`` counts as proof. Everything else is ``None``: a key or an algorithm
     ``cryptography`` does not support, a key of another kind than the signature, and a
-    ``ValueError`` or ``TypeError`` from either call."""
+    ``ValueError`` or ``TypeError`` from either call. So is a signature the key accepts after
+    ``is_signature_valid`` refused it. Measured 2026-10-13 with ``cryptography`` 50.0.2: an RSA
+    PKCS1v15 signature over SHA-1 that the CA did make reads ``None`` that way, and a forged one
+    reads False."""
     try:
         key = ca.public_key()
         if crl.is_signature_valid(key):  # type: ignore[arg-type]
