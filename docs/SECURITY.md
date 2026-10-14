@@ -423,10 +423,12 @@ The engine then tells the operators in two ways:
 
 Only a role change raises them. When the directory disables or deletes the account instead, the
 reconciler ends its sessions but leaves its stored role, so the account still counts as an enabled
-Administrator. No alert fires, and `provision-admin` still refuses. On PostgreSQL and SQL Server, a
-console removal that races a directory one can also go unreported: the directory's write does not
-take the console guard's lock. At least one more path raises no alert: when the count of
-Administrators cannot be read, the engine logs the fault and stops there.
+Administrator. No `no_enabled_administrator` alert fires, and `provision-admin` still refuses. On
+PostgreSQL and SQL Server, a console removal that races a directory role change can leave no enabled
+Administrator with no `no_enabled_administrator` alert: the directory's role write does not take the
+console guard's lock. At least one more path raises no `no_enabled_administrator` alert: if the
+engine cannot read whether an enabled Administrator remains, it logs the fault and sends no alert.
+The role write, the session revocation and the caller's own audit row still happen.
 
 The cost is that a site whose Administrators all come from the directory can end up with none
 (vault BACKLOG #2711). With no enabled Administrator left, `provision-admin` runs again at the host,

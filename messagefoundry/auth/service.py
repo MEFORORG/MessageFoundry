@@ -7351,8 +7351,9 @@ class AuthService:
 
         It fires only when this write took Administrator from an enabled account and none is left.
         The count is read after the write, so when two directory demotions race, the later read
-        sees both writes and reports. A console removal racing a directory one is not covered: the
-        console guard is one store transaction (vault BACKLOG #2779), and this read is not.
+        sees both writes and reports. On PostgreSQL and SQL Server, a console removal racing a
+        directory one is not covered: the console guard is one store transaction (vault BACKLOG
+        #2779), and this read is not.
 
         **Nothing here raises, a defect included.** It runs right after the role write and before
         the caller's session revocation, its notice and, on the reconciler, the rest of the pass
