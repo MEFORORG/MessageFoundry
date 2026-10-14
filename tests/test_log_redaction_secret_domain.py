@@ -1755,13 +1755,16 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     # would red on a stdlib method being removed, for a reason that has nothing to do with this
     # pattern. A misspelled member fails the check below anyway: the name it should have been is then
     # uncovered.
-    uncovered = {
+    public = [
         name
         for name in dir(re.Pattern)
-        if not name.startswith("_")
-        and callable(getattr(re.Pattern, name, None))
-        and name not in _PATTERN_APPLICATIONS
-    }
+        if not name.startswith("_") and callable(getattr(re.Pattern, name, None))
+    ]
+    # An empty or near-empty walk proves nothing, and "nothing uncovered" over it would pass. The
+    # floor sits well under the real count on purpose: it catches a blind walk, and it must not red
+    # on a stdlib method being added or removed.
+    assert len(public) >= 5, f"re.Pattern showed only {sorted(public)} as public callables"
+    uncovered = {name for name in public if name not in _PATTERN_APPLICATIONS}
     assert not uncovered, (
         f"re.Pattern applies a pattern to text through {sorted(uncovered)} and _PATTERN_APPLICATIONS "
         "does not name it, so the recorder below cannot see it fire. Add it rather than letting the "
