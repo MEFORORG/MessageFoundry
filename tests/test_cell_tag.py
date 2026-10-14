@@ -38,8 +38,8 @@ from messagefoundry.store.cell_tag import (
 from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
 from messagefoundry.store.crypto import (
     AesGcmCipher,
-    CipherAuthenticationError,
     CipherError,
+    UnauthenticatedCipherError,
     aad_cell_name,
     cell_aad,
     generate_key,
@@ -127,7 +127,7 @@ def test_only_a_failed_tag_is_drift_and_a_corrupt_row_is_contained_without_it(
     with pytest.raises(CellTagError) as moved:
         open_message_cell(cipher, "raw", sealed, message_id="cr1", channel_id="B")
     assert moved.value.drift and not isinstance(moved.value, CorruptCellError)
-    assert isinstance(moved.value.__cause__, CipherAuthenticationError)
+    assert isinstance(moved.value.__cause__, UnauthenticatedCipherError)
     assert len(seen) == 1
 
     # One extra base64 character leaves a length that cannot decode.

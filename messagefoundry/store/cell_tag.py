@@ -42,8 +42,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol
 
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
-    CipherAuthenticationError,
     CipherError,
+    UnauthenticatedCipherError,
     cell_aad,
 )
 from messagefoundry.store.queue_tag import is_tag_failure
@@ -246,7 +246,7 @@ def open_tagged_cell(
         ):
             raise
         # Only a tag that failed under every held key can mean the cell was sealed elsewhere.
-        kind = CellTagError if isinstance(exc, CipherAuthenticationError) else CorruptCellError
+        kind = CellTagError if isinstance(exc, UnauthenticatedCipherError) else CorruptCellError
         err = kind(table, column, row_id, channel_id)
         _alert(cipher, err)
         raise err from exc
