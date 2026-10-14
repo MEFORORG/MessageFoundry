@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 # api._ui_seam — never the console package), so it imports and the engine boots with the console ABSENT.
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
+    _GROUP_MAX,
     AdGroupMap,
     AdGroupMapEntry,
     AdGroupScopeEntry,
@@ -74,6 +75,7 @@ from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
+    ExportStopped,
     RepeatedCredentialError,
     alert_administrator_granted,
     alert_directory_administrator_granted,
@@ -86,6 +88,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     pending_credential_deadline_for,
     public_route,
+    recheck_standing,
     record_repeated_credential,
     require,
     require_reauth_only_action,
@@ -147,7 +150,9 @@ from messagefoundry.auth.service import (
     UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import SessionRecord, UserRecord
 
 _VALID_ROLE_IDS = {role.value for role in Role}
@@ -190,7 +195,8 @@ def _session_info(session: SessionRecord, current_token_hash: str) -> SessionInf
         last_used_at=session.last_used_at,
         expires_at=session.expires_at,
         client=session.client,
-        current=session.token_hash == current_token_hash,
+        # Constant-time (ASVS 11.2.4, BACKLOG #1167): both sides are session token hashes.
+        current=constant_time_equal(session.token_hash, current_token_hash),
     )
 
 
@@ -392,10 +398,10 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
 #: How many refused group keys the 400 names before it only counts the rest.
 _GROUPS_NAMED = 3
 
-#: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(256)``.
-#: The request model allows 512 characters, and canonical form can be longer than what was typed,
-#: so a key past this would fail inside the store's write with a 500 rather than a 400.
-_STORED_GROUP_MAX = 256
+#: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(512)``,
+#: the request model's cap (BACKLOG #3187). Canonical form can outgrow what was typed, so the
+#: route checks it again; past this, the store's write would fail with a 500, not a 400.
+_STORED_GROUP_MAX = _GROUP_MAX
 
 
 def _canonical_group_dns(groups: list[str]) -> list[str]:
@@ -461,6 +467,26 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         return await http_exception_handler(request, exc)
 
     app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
+
+    async def _row_seal_refused(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2592: the store refused a write because the row it read fails its integrity
+        # seal, and wrote nothing. Any route that edits an account or a session can meet it; it is
+        # a refused change, so a 409 with a fixed text, never the row and never a 500. Logged with
+        # the row's kind, since this path does not pass the service loader that audits and alerts.
+        assert isinstance(exc, RowSealError)
+        _log.warning(
+            "a write to a %s row was refused: its integrity seal does not verify (BACKLOG #2592)",
+            exc.kind,
+        )
+        return await http_exception_handler(
+            request,
+            HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"the {exc.kind} record fails its integrity check, so the change was refused",
+            ),
+        )
+
+    app.add_exception_handler(RowSealError, _row_seal_refused)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
@@ -751,7 +777,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Satisfy the current session's second factor with a TOTP code or a single-use recovery code.
         Authenticated but **not** step-up/MFA-gated (this is *how* a session becomes MFA-satisfied);
         rate-limited like login. A wrong code is a 401 and changes nothing. A directory account the
-        directory does not confirm is a 403, and its code is not checked (BACKLOG #2023).
+        directory does not confirm is a 403, and its code is not checked (BACKLOG #2023). An
+        ``oidc`` session that already met its factor is a 403 with ``X-Step-Up-Via: idp``, and its
+        code is not checked either (BACKLOG #2142).
 
         The session is RE-KEYED on success (ASVS 7.2.4) and the new bearer token is in the body:
         this is the exact transition — pre-MFA to MFA-satisfied — that must not happen in place."""
@@ -763,6 +791,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
         elevation = await service.verify_mfa(token, body.code, client=client)
         if elevation.token is None:
+            if elevation.idp_step_up_required:
+                # BACKLOG #2142, ADR 0142 Amendment F: an oidc session that already met its factor
+                # owes no code, and a code opens no window for it. The code was not read, and the
+                # token still authenticates, so a 403 naming the leg that works, with the header
+                # /me/reauth's own refusal sends.
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "this session was signed in through the identity provider and owes no code;"
+                    " step up there through the web console at /ui/reauth",
+                    headers={"X-Step-Up-Via": "idp"},
+                )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
                 # 403 rather than the 401 that would send the client back to sign-in.
@@ -1928,6 +1967,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         until: EpochSeconds | None = Query(
             None, description="inclusive upper bound on the epoch-float ts"
         ),
+        token: str | None = Depends(bearer_token_dependency),
     ) -> StreamingResponse:
         """Stream the filtered audit trail as a downloadable CSV report (BACKLOG #170), so a compliance
         officer can produce a scoped, offline audit report without a downstream SIEM.
@@ -1955,7 +1995,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The later pages are read after the 200 status and the ``audit.export`` row, so a body that
         ends before ``count`` rows -- a store failure, a disconnect, a page that comes back short --
-        cannot change either. The engine log records how many of ``count`` rows were sent."""
+        cannot change either. The engine log records how many of ``count`` rows were sent.
+
+        The caller is resolved again from ``token`` before each page is sent (BACKLOG #1154). A
+        failed standing stops the stream. So does a caller who may now read fewer rows than the
+        export started with. A stop records ``audit.export.stopped`` and aborts. The JSON route
+        reads ``token`` from the bearer, and the console's ``/ui/audit/export`` passes its cookie
+        session."""
+        # A direct caller that passed no token hands on the Depends marker. Refuse it here, before
+        # the audit.export row, so a wiring fault never reads as a revoked grant in the trail.
+        if not isinstance(token, str):
+            raise TypeError("export_audit needs the caller's session token")
         page_size = min(limit, _AUDIT_EXPORT_PAGE)
 
         async def _page(size: int, before_id: int | None) -> Sequence[Any]:
@@ -2008,14 +2058,68 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             client=client_ip(request),
         )
 
+        touch_every = service.session_idle_seconds / 4
+        start_exclusion = audit_exclusion_for(identity)
+
+        async def _stop_reason(touch: bool) -> str | None:
+            """Why the export must stop before its next page, or ``None`` to send it. Asked per
+            page rather than per row. A page is one store read and one chunk, so a change lands
+            within one page. Per row would add a session lookup for each of up to 1,000,000 rows."""
+            current = await recheck_standing(
+                service, token, Permission.AUDIT_EXPORT, activity=touch
+            )
+            if current is None:
+                return "standing_changed"
+            # The pages are read with the starting identity's exclusion. If the caller may now
+            # read fewer rows, as after losing users:manage, the export stops. If it may read the
+            # same rows or more, it goes on: the start already hid at least as much.
+            exclusion = audit_exclusion_for(current)
+            if exclusion is not None and exclusion != start_exclusion:
+                return "scope_changed"
+            return None
+
         async def _iter_csv() -> AsyncIterator[str]:
             buf = io.StringIO()
             writer = csv.writer(buf)
             writer.writerow(["ts", "actor", "action", "channel_id", "client", "detail"])
             page, remaining = first, count
+            stopped: str | None = None
+            # A flowing download is the caller's own act, so it moves the idle clock at most every
+            # quarter of the idle window, as the message export does. The clock starts now because
+            # the gate has just moved it. A stall of about three quarters of the window can still
+            # idle the session, and the next page's re-check then ends both.
+            last_touch = time.monotonic()
             try:
                 yield buf.getvalue()
                 while page:
+                    touch = time.monotonic() - last_touch >= touch_every
+                    if touch:
+                        last_touch = time.monotonic()
+                    stopped = await _stop_reason(touch)
+                    if stopped is not None:
+                        # Counts only, never a row.
+                        _log.warning(
+                            "audit export by %s stopped after %d of %d rows: %s",
+                            identity.username,
+                            count - remaining,
+                            count,
+                            stopped,
+                        )
+                        await service.store.record_audit(
+                            "audit.export.stopped",
+                            actor=identity.username,
+                            detail=json.dumps(
+                                {
+                                    "count": count,
+                                    "streamed": count - remaining,
+                                    "reason": stopped,
+                                }
+                            ),
+                            client=client_ip(request),
+                        )
+                        raise ExportStopped(
+                            f"audit export stopped after {count - remaining} of {count} rows"
+                        )
                     # One chunk per page, not per row. Neutralize spreadsheet formula injection
                     # (CWE-1236) in every string cell before it reaches the CSV a compliance officer
                     # may open in Excel/Sheets.
@@ -2044,8 +2148,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             finally:
                 # The 200 and the audit.export row are already out, so an early end -- an
                 # exception, a cancel, a closed generator, a short page -- can only be logged. The
-                # row count is metadata, never a body.
-                if remaining > 0:
+                # row count is metadata, never a body. A stop has logged its own line.
+                if remaining > 0 and stopped is None:
                     _log.warning(
                         "audit export by %s ended early: %d of %d rows sent",
                         identity.username,

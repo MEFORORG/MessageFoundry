@@ -241,7 +241,7 @@ def test_install_service_shellexecute_args(monkeypatch: pytest.MonkeyPatch) -> N
     rec = _recorded_dispatch(monkeypatch)
 
     assert (
-        install_service(r"C:\repo\install-service.ps1", "dev")
+        install_service(r"C:\repo\install-service.ps1", "dev", config=_CFG)
         is service_control.ServiceControlOutcome.DISPATCHED
     )
     assert rec.calls == [
@@ -249,24 +249,58 @@ def test_install_service_shellexecute_args(monkeypatch: pytest.MonkeyPatch) -> N
             None,
             "runas",
             os.path.join(_SYSDIR, "WindowsPowerShell", "v1.0", "powershell.exe"),
-            '-NoExit -ExecutionPolicy Bypass -File "C:\\repo\\install-service.ps1" -Environment "dev"',
+            '-NoExit -ExecutionPolicy Bypass -File "C:\\repo\\install-service.ps1" -Environment "dev"'
+            ' -Config "C:\\hl7\\config"',
             _SYSDIR,
             1,
         )
     ]
 
 
+_CFG = r"C:\hl7\config"
+
+
 def test_install_params_builds_expected_string() -> None:
-    assert _install_params("script.ps1", "staging") == (
+    assert _install_params("script.ps1", "staging", config=_CFG) == (
         '-NoExit -ExecutionPolicy Bypass -File "script.ps1" -Environment "staging"'
+        r' -Config "C:\hl7\config"'
     )
+
+
+def test_install_params_passes_the_service_config() -> None:
+    """``-ServiceConfig`` follows ``-Config`` when one is named (vault BACKLOG #2626)."""
+    params = _install_params(
+        "script.ps1", "dev", config=_CFG, service_config=r"\\host\share\messagefoundry.toml"
+    )
+    assert params.endswith(
+        r' -Config "C:\hl7\config" -ServiceConfig "\\host\share\messagefoundry.toml"'
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "config",  # relative: the elevated child would resolve it in the system directory
+        r"\hl7\config",  # rooted, but with no drive
+        r'C:\hl7\a" -Evil "x',  # a quote would end the argument
+        "C:\\hl7\\",  # a backslash before the closing quote escapes it
+        "C:\\hl7\\a\nb",  # a control character
+        r"C:\hl7\a|b",  # a character Windows refuses in a path
+    ],
+)
+@pytest.mark.parametrize("field", ["config", "service_config"])
+def test_install_params_rejects_unsafe_paths(bad: str, field: str) -> None:
+    """Both paths are quoted into an elevated command line, so each is vetted before it is."""
+    config, service_config = (bad, None) if field == "config" else (_CFG, bad)
+    with pytest.raises(ValueError, match="unsafe .*path"):
+        _install_params("script.ps1", "dev", config=config, service_config=service_config)
 
 
 @pytest.mark.parametrize("bad", [";", "&", '"', "a b", "$x", "`", "a/b", "a\\b", "a&b", ""])
 def test_install_params_rejects_unsafe_environment(bad: str) -> None:
     """The env name is interpolated into an elevated PowerShell line — reject shell metacharacters."""
     with pytest.raises(ValueError, match="unsafe environment name"):
-        _install_params("script.ps1", bad)
+        _install_params("script.ps1", bad, config=_CFG)
 
 
 def test_control_service_rejects_unsafe_name_before_platform_check(
@@ -311,9 +345,18 @@ def test_install_service_off_windows_is_unsupported_but_still_validates(
 ) -> None:
     """Off Windows install is a no-op (UNSUPPORTED) — but env validation still runs (it's platform-independent)."""
     monkeypatch.setattr(service_control.sys, "platform", "linux")
-    assert install_service("script.ps1", "dev") is service_control.ServiceControlOutcome.UNSUPPORTED
+    assert (
+        install_service("script.ps1", "dev", config=_CFG)
+        is service_control.ServiceControlOutcome.UNSUPPORTED
+    )
     with pytest.raises(ValueError, match="unsafe environment name"):
-        install_service("script.ps1", "bad;env")
+        install_service("script.ps1", "bad;env", config=_CFG)
+    # A POSIX path is not a Windows path, but off Windows the answer is UNSUPPORTED, not a path
+    # error the operator could not act on.
+    assert (
+        install_service("script.ps1", "dev", config="/srv/mefor/cfg")
+        is service_control.ServiceControlOutcome.UNSUPPORTED
+    )
 
 
 @pytest.mark.parametrize(
@@ -342,7 +385,7 @@ def test_install_service_reads_the_shellexecute_return(
 
     monkeypatch.setattr(service_control.sys, "platform", "win32")
     monkeypatch.setattr(service_control.ctypes, "windll", _Windll, raising=False)
-    assert install_service("script.ps1", "dev") is outcome
+    assert install_service("script.ps1", "dev", config=_CFG) is outcome
 
 
 @pytest.mark.parametrize("name", ["dev", "staging", "prod", "env-1", "env_2", "a.b", "A9"])
@@ -373,6 +416,41 @@ def test_cli_install_unsafe_env_exits_2(
     """``service install --env '<unsafe>'`` surfaces the env-validation ValueError as exit 2."""
     monkeypatch.setattr(service_control, "install_script_path", lambda: Path("install-service.ps1"))
     monkeypatch.setattr(service_control.sys, "platform", "linux")
-    rc = main(["service", "install", "--env", "bad;env"])
+    rc = main(["service", "install", "--env", "bad;env", "--config", "cfg"])
     assert rc == 2
     assert "unsafe environment name" in capsys.readouterr().err
+
+
+def test_cli_install_unsafe_config_exits_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``service install --config '<unsafe>'`` surfaces the path ValueError as exit 2, before any
+    elevation (vault BACKLOG #2626). This pins the plumbing only: off Windows the made-absolute path
+    is a POSIX one, which fails for that reason too. ``test_install_params_rejects_unsafe_paths``
+    pins each rule on its own."""
+    elevated: list[object] = []
+
+    class _Windll:
+        class shell32:  # noqa: N801
+            @staticmethod
+            def ShellExecuteW(*a: object) -> int:  # noqa: N802
+                elevated.append(a)
+                return 42
+
+    monkeypatch.setattr(service_control, "install_script_path", lambda: Path("install-service.ps1"))
+    monkeypatch.setattr(service_control.sys, "platform", "win32")
+    monkeypatch.setattr(service_control.ctypes, "windll", _Windll, raising=False)
+    rc = main(["service", "install", "--env", "dev", "--config", "a|b"])
+    assert rc == 2
+    assert "unsafe config path" in capsys.readouterr().err
+    assert elevated == []
+
+
+def test_cli_install_off_windows_says_windows_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Off Windows a well-formed install reports Windows-only, not a path error."""
+    monkeypatch.setattr(service_control, "install_script_path", lambda: Path("install-service.ps1"))
+    monkeypatch.setattr(service_control.sys, "platform", "linux")
+    assert main(["service", "install", "--env", "dev", "--config", "cfg"]) == 1
+    assert "Windows-only" in capsys.readouterr().err

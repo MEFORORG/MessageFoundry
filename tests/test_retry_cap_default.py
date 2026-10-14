@@ -92,7 +92,9 @@ async def test_the_cap_bounds_the_outage_window_it_buys(store: MessageStore) -> 
         claimed = await store.claim_ready(now=t, destination_name="d1")
         assert claimed, f"the lane stalled at t={t} after {attempts} attempts"
         attempts += 1
-        next_at = await store.mark_failed(claimed[0].id, "partner unreachable", retry, now=t)
+        next_at = (
+            await store.mark_failed(claimed[0].id, "partner unreachable", retry, now=t)
+        ).retry_at
         if next_at is None:  # dead-lettered: the cap is exhausted
             break
         t = next_at

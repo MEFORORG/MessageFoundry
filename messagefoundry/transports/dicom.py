@@ -118,6 +118,8 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    count_setting,
+    float_setting,
     peer_ip_allowed,
     positive_cap,
     register_destination,
@@ -565,9 +567,15 @@ class DicomScpSource(SourceConnector):
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
         )
-        self._max_associations = int(s.get("max_associations", 10))
-        self._max_pdu_size = int(s.get("max_pdu_size", 16384))
-        self._timeout = float(s.get("timeout_seconds", 30.0))
+        self._max_associations = count_setting(
+            s.get("max_associations", 10), knob="max_associations", transport="DICOM-SCP source"
+        )
+        self._max_pdu_size = count_setting(
+            s.get("max_pdu_size", 16384), knob="max_pdu_size", transport="DICOM-SCP source"
+        )
+        self._timeout = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOM-SCP source"
+        )
         # Association-rate pacing (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). The keys are NOT
         # max_messages_per_second/message_burst and are not read through mllp._pacing_settings, because
         # the UNIT here is an association, not a message — see _pace_association for why a message-rate
@@ -1199,7 +1207,8 @@ def _client_ssl_context(
     1.2+ floor. Built once at construction so a bad cert/key fails at build (dry-run/``check``), not at
     the first delivery — the client mirror of :func:`_server_ssl_context`. ``tls_key_password`` decrypts
     a passphrase-encrypted mTLS client key (``env()``-sourced, mirroring MLLP). ``name`` is the
-    connection's, for a refusal of an unreadable ``tls_ca_file`` to name (vault BACKLOG #2370).
+    connection's, for a refusal of an unreadable ``tls_ca_file`` to name (vault BACKLOG #2370), and
+    a suite refusal too (BACKLOG #3096).
 
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
     the connection names no ``tls_ca_file`` of its own: an internal hop verifies against the org internal
@@ -1229,9 +1238,12 @@ def _client_ssl_context(
         # empty-bytes callback as the backstop, so no client key reaches OpenSSL's TTY prompt.
         load_connection_cert_chain(ctx, cert, key, s.get("tls_key_password"))
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    # BACKLOG #3096: a suite refusal names the connection when the caller passed one, as the runner
+    # does, so an operator with several DICOM destinations knows which one to fix.
+    connector = f"DICOM destination {name!r}" if name else "DICOM destination"
     # See the SCP listener above: narrow first (ADR 0188), assert second, both visible here.
-    apply_connection_tls_ciphers(ctx, s, connector="DICOM destination")  # opt-in per-hop suite list
-    harden_cipher_suites(ctx, connector="DICOM destination")  # assert forward secrecy (ASVS 12.1.2)
+    apply_connection_tls_ciphers(ctx, s, connector=connector)  # opt-in per-hop suite list
+    harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
     # #129 (ADR 0094): opt-in granular expiry-only relaxation — honour an expired downstream PACS cert
     # while STILL validating chain + hostname (verification stays ON; default off = byte-identical).
@@ -1283,9 +1295,19 @@ class DicomScuDestination(DestinationConnector):
             knob="max_object_bytes",
             transport="DICOM-SCU destination",
         )
-        self._max_pdu_size = int(s.get("max_pdu_size", 16384))
-        self._timeout = float(s.get("timeout_seconds", 30.0))
-        self._connect_timeout = float(s.get("connect_timeout", 10.0))
+        self._max_pdu_size = count_setting(
+            s.get("max_pdu_size", 16384), knob="max_pdu_size", transport="DICOM-SCU destination"
+        )
+        self._timeout = float_setting(
+            s.get("timeout_seconds", 30.0),
+            knob="timeout_seconds",
+            transport="DICOM-SCU destination",
+        )
+        self._connect_timeout = float_setting(
+            s.get("connect_timeout", 10.0),
+            knob="connect_timeout",
+            transport="DICOM-SCU destination",
+        )
         # Build the client TLS context now so a bad cert/key fails at construction (check/dry-run), not
         # at the first delivery (like the SCP / MLLP / REST). #190 (ADR 0093): thread the instance [tls]
         # internal-CA trust-anchor policy so an internal hop that names no tls_ca_file of its own verifies

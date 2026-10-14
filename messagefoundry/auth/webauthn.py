@@ -320,6 +320,13 @@ class ChallengeCache:
 
     def put(self, key: tuple[str, str], user_id: str, challenge: bytes) -> None:
         """Stage ``challenge`` for ``key``, enforcing the per-user and global bounds."""
+        # ASVS 11.2.4 discharge (BACKLOG #1167; Manager decision 2026-10-10, M1, taken under the
+        # owner's standing driver rule and not an owner ruling). The `key not in` here, and the dict
+        # lookups in pop and peek, are hash-table probes, not comparisons under 11.2.4. A probe runs
+        # `==` on a stored key only after the two keys' full hashes are equal. Python salts str
+        # hashes per process by default, so a caller cannot aim a probe at another session's key.
+        # The probe key is also the SHA-256 of the caller's OWN session token, so the caller cannot
+        # steer its characters toward a stored digest either.
         now = self._clock()
         self._prune(now)
         if key not in self._entries:
@@ -338,6 +345,7 @@ class ChallengeCache:
 
     def pop(self, key: tuple[str, str]) -> PendingCeremony | None:
         """Consume the pending ceremony for ``key`` (single-use); None if absent or expired."""
+        # A dict lookup, discharged for ASVS 11.2.4 (BACKLOG #1167, M1); put says why.
         entry = self._entries.pop(key, None)
         if entry is None or entry.deadline <= self._clock():
             return None
@@ -348,6 +356,7 @@ class ChallengeCache:
 
         For a caller that must answer "no ceremony" the same way whether or not a later check
         refuses the request first (BACKLOG #2389). :meth:`pop` stays the single-use consume."""
+        # A dict lookup, discharged for ASVS 11.2.4 (BACKLOG #1167, M1); put says why.
         entry = self._entries.get(key)
         if entry is None or entry.deadline <= self._clock():
             return None
@@ -371,7 +380,7 @@ class ChallengeCache:
         """
         # Constant-time (ASVS 11.2.4, BACKLOG #1167): the key is a session token hash, and `==` stops
         # at the first differing character. The comprehension already visits every entry. The dict
-        # lookups in put and pop still hash and compare the key; those are left as they are.
+        # lookups in put, pop and peek are discharged, not converted; put says why.
         moved = [
             (k, e) for k, e in self._entries.items() if constant_time_equal(k[0], old_token_hash)
         ]

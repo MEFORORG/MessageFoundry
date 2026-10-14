@@ -45,13 +45,14 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -78,6 +79,7 @@ from messagefoundry.transports.rest import (
     auth_challenge_refused,
     egress_route_from_settings,
     enforce_outbound_length_limits,
+    http_credentials_sent,
     http_family_trust_anchor,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
@@ -218,7 +220,9 @@ class DicomWebDestination(DestinationConnector):
             # BACKLOG #1241: and the control-char screen alone is not enough for a value that becomes a
             # path SEGMENT — refuse at construction, where the operator sees it, not at the URL layer.
             _reject_non_uid(self.study_uid, "study_uid")
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="DICOMweb destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the STOW-RS dicom+json response. Default False → returns None, byte-identical.
         self.capture_response: bool = bool(s.get("capture_response", False))
@@ -238,8 +242,7 @@ class DicomWebDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
-        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_dest = self._proxy.for_host(self.base_url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
         self._headers = self._build_headers(s)
         if proxy_dest is not None:
@@ -267,7 +270,7 @@ class DicomWebDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        if bool(s.get("verify_tls", True)):
+        if bool_setting(s, "verify_tls", default=True):
             # #1180 (ADR 0093): the client trust anchor for this STOW-RS hop.
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
@@ -301,6 +304,7 @@ class DicomWebDestination(DestinationConnector):
                 self.base_url,
                 connector="DICOMweb destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.DICOMWEB, s),
                 attested=attested,
             )
             if guard is not None:
@@ -459,7 +463,8 @@ class DicomWebDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send_url(self.base_url)
+            # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
+            self._hop_guard.assert_delivery_url(self.base_url, connector="DICOMweb")
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,

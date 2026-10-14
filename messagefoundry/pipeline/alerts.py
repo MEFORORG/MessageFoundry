@@ -34,6 +34,7 @@ __all__ = [
     "LoggingAlertSink",
     "config_changed_detail",
     "crl_expiry_detail",
+    "crl_reload_refused_detail",
     "intake_pause_detail",
 ]
 
@@ -107,6 +108,31 @@ def crl_expiry_detail(*, held_copy: bool, detail: str, shared_with: tuple[str, .
         if held_copy or detail:
             also += "; a held copy is matched by its file, so each of those rows reports it too"
         parts.append(f"{also}.")
+    return " ".join(parts)
+
+
+def crl_reload_refused_detail(
+    *, remedy_class: str, stale_contexts: int, remedy: str, start_refuses: bool = False
+) -> str:
+    """The one-line description of a ``crl_reload_refused`` alert both sinks show (vault BACKLOG
+    #2904). Fixed words, a count and the engine's own remedy sentence: nothing read from the CRL.
+
+    The alert instance's reason column keeps only about the first 200 characters, so the class
+    and the count lead. A warning not to restart yet comes next, ahead of a remedy that names a
+    restart, because a reader may see only the start of the line. The reason is not part of this
+    alert, because it quotes CRL issuer names and dates; the reload's ERROR line has it."""
+    parts = [
+        f"CRL reload refused ({remedy_class}): {stale_contexts} running TLS context(s) keep the "
+        "copy they hold."
+    ]
+    if start_refuses:
+        parts.append(
+            "A start refuses this file too until its CRL takes effect, so do not restart before "
+            "then."
+        )
+    if remedy:
+        parts.append(f"{remedy}.")
+    parts.append("The crl_reload ERROR line in the engine log gives the reason.")
     return " ".join(parts)
 
 
@@ -291,6 +317,56 @@ class AlertSink(Protocol):
         two causes with opposite remedies."""
         ...
 
+    def crl_reload_refused(
+        self,
+        name: str,
+        *,
+        path: str,
+        remedy_class: str,
+        stale_contexts: int,
+        remedy: str,
+        start_refuses: bool = False,
+    ) -> None:
+        """The CRL reload refused to apply a replaced CRL file, so running TLS contexts keep the
+        copy they hold (vault BACKLOG #2904). A revocation added to the new file is not enforced
+        on those hops until the file is applied. :meth:`crl_expiry` cannot say this: it speaks
+        only once the held copy nears its ``nextUpdate``.
+
+        ``name`` is ``crl_reload:<path>``, with ``@node:<id>`` or ``@shard:<id>`` appended where
+        several engine processes share the store, because each process holds its own contexts.
+        ``<path>`` is the CRL file's absolute path, case-folded on Windows, and shortened to a
+        checksum plus its tail when long. ``path`` is the file's absolute path, case kept, as the
+        reload reads it; a relative path in a setting appears here in its absolute form.
+        ``remedy_class`` is
+        a short token for what the operator does next (``restart``, ``fix_file``, ``wait`` and so
+        on; ``pipeline/crl_reload.py`` holds the set). ``stale_contexts`` counts the contexts
+        still on the old copy when the alert was raised. ``remedy`` is the engine's own fixed
+        sentence for that class. ``start_refuses`` is True when the remedy names a restart and a
+        start would refuse the file too, until one of its CRLs takes effect.
+
+        **No CRL contents.** The refusal's reason quotes CRL issuer names and dates, so it stays
+        in the engine log and is never passed here. Not a connection-scoped event: one CRL file
+        can serve many hops, and the colon keeps ``name`` outside the connection-name grammar.
+
+        Raised once per file version, as the reload's ERROR line is logged: again only when the
+        file's bytes change or the reason does. Emitted on the event loop by
+        :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`;
+        :meth:`crl_reload_applied` is its auto-resolving inverse."""
+        ...
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        """The INVERSE of :meth:`crl_reload_refused`: the refusal for the CRL file at ``path`` no
+        longer stands on this process. The file was applied to every context that held an older
+        copy, or it was put back to the bytes they hold, or no context holds it any more. Also
+        raised when the runner stops, because a restart rebuilds every context from the file.
+
+        Emits **no** notification (a recovery needs no page); it exists so durable alert-state
+        (ADR 0044) **auto-resolves** the open ``crl_reload_refused`` instance for the same
+        ``name``. Raised only for an alert this runner raised, and only once the refusal is gone
+        from the record: a pass that could not read the file, or that failed, clears nothing. A
+        process that dies without stopping leaves its alert open, for an operator to resolve."""
+        ...
+
     def secret_rotation_due(
         self,
         name: str,
@@ -373,8 +449,10 @@ class AlertSink(Protocol):
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         """A held dual-control request was RELEASED by an approver whose account changed after the
-        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
-        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. It is
+        request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``), or an
+        interrupted release was RESOLVED by such an account (BACKLOG #2125). The act went ahead:
+        this flags it and refuses nothing. ``name`` is ``approval:<approval id>`` for a release and
+        ``approval:<approval id>:resolve`` for a resolution, so each is its own instance. It is
         not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898),
         and the colon keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``.
@@ -815,6 +893,34 @@ class LoggingAlertSink:
                 path,
             )
 
+    def crl_reload_refused(
+        self,
+        name: str,
+        *,
+        path: str,
+        remedy_class: str,
+        stale_contexts: int,
+        remedy: str,
+        start_refuses: bool = False,
+    ) -> None:
+        # The reload has already logged the refusal at ERROR, with its reason. This line is the
+        # alert's own record on this stream, and it leaves the reason out as the notifier does.
+        log.warning(
+            "ALERT crl_reload_refused: %r CRL file %s: %s",
+            name,
+            path,
+            crl_reload_refused_detail(
+                remedy_class=remedy_class,
+                stale_contexts=stale_contexts,
+                remedy=remedy,
+                start_refuses=start_refuses,
+            ),
+        )
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the runner already logged at INFO.
+        log.debug("ALERT crl_reload_applied: %r CRL file %s is no longer refused", name, path)
+
     def secret_rotation_due(
         self,
         name: str,
@@ -885,8 +991,9 @@ class LoggingAlertSink:
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
         log.warning(
-            "ALERT approval_approver_provenance: %s request %r was released by an approver whose "
-            "account changed after the request (%s)",
+            "ALERT approval_approver_provenance: %s request %r was released (key approval:<id>) "
+            "or resolved (key approval:<id>:resolve) by an account that changed after the "
+            "request (%s)",
             operation,
             name,
             ", ".join(changed),
@@ -1073,6 +1180,27 @@ UPLOADED_FILE_TABLE = "uploaded_file"
 UPLOAD_CIPHER_SUBJECT = "upload-cipher"
 
 
+#: The ``integrity_drift`` subject for an authority row whose integrity seal did not verify (BACKLOG
+#: #2592). Its own subject, so it throttles and routes apart from the cipher and the audit chain.
+AUTHORITY_SEAL_SUBJECT = "authority-seal"
+
+
+def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call raises
+    ``integrity_drift`` under :data:`AUTHORITY_SEAL_SUBJECT` with the given reason.
+
+    The reason names a row kind and a short id prefix, never a row value, so it carries no PHI.
+    Never raises: an alert failure must not change what a sign-in or a request resolves to."""
+
+    def _raise(reason: str) -> None:
+        try:
+            sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning("authority-seal integrity alert could not be delivered")
+
+    return _raise
+
+
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:
     """Raise the refusal alert for an unmarked value in ``table.column``: ``upload-cipher`` for the
     uploaded-file store, ``store-cipher`` for everything else.
@@ -1120,3 +1248,37 @@ def store_cipher_refusal_forwarder(
             loop.call_soon_threadsafe(alert_store_cipher_refusal, sink, table, column)
 
     return _refused
+
+
+#: The ``integrity_drift`` subject for a queue row whose payload failed the tag its own routing fields
+#: build (BACKLOG #2593). Its own subject, so it throttles and routes apart from the cipher refusal.
+QUEUE_TAG_SUBJECT = "queue-tag"
+
+
+def alert_cell_tag_failure(sink: AlertSink, table: str, reason: str) -> None:
+    """Raise ``integrity_drift`` for a store cell that failed its row tag. The reason names a stage
+    and a short row-id prefix, never a row value, so it carries no PHI. Never raises."""
+    subject = QUEUE_TAG_SUBJECT if table == "queue" else f"{table}-tag"
+    try:
+        sink.integrity_drift(subject, reason=reason, drift_count=1)
+    except Exception:  # noqa: BLE001 — an alert-sink failure must never undo the dead-letter
+        log.warning("cell-tag integrity alert could not be delivered")
+
+
+def cell_tag_failure_forwarder(
+    sink: AlertSink, loop: asyncio.AbstractEventLoop
+) -> Callable[[str, str], None]:
+    """A cipher tag-failure hook that raises :func:`alert_cell_tag_failure` on ``sink``, hopping onto
+    ``loop`` when it fires on another thread (the shape of :func:`store_cipher_refusal_forwarder`)."""
+
+    def _failed(table: str, reason: str) -> None:
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            alert_cell_tag_failure(sink, table, reason)
+        else:
+            loop.call_soon_threadsafe(alert_cell_tag_failure, sink, table, reason)
+
+    return _failed

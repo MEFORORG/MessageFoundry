@@ -2201,6 +2201,11 @@ def test_plain_loopback_is_not_instance_exposed(
 _TRUSTED_PROXY_EXPOSURE_DESC = (
     "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
 )
+# The words the MFA warning and the dual-control warning share on that shape, up to the setting each
+# one names. A test must match past this point to say which of the two it saw (vault BACKLOG #3102).
+_TRUSTED_PROXY_WARNING_OPENING = (
+    f"warning: {_TRUSTED_PROXY_EXPOSURE_DESC} in a PHI-carrying environment ('prod') with"
+)
 
 
 def _trusted_proxy_only_api(tmp_path: Path) -> str:
@@ -2252,8 +2257,11 @@ def test_trusted_proxies_only_loopback_warns_mfa_and_not_undeclared_proxy(
     )
     assert rc == 0
     err = capsys.readouterr().err
-    assert f"warning: {_TRUSTED_PROXY_EXPOSURE_DESC} in a PHI-carrying environment" in err
-    assert "require_mfa off" in err
+    # One unbroken string, from the MFA warning alone (vault BACKLOG #3102). The dual-control warning
+    # opens with the same words, and it prints here too because approvals are off. A match on the
+    # shared opening passes on that warning, so it never showed which field the MFA warning named.
+    # The next test is the control: it sees the look-alike print with this string absent.
+    assert f"{_TRUSTED_PROXY_WARNING_OPENING} [security].require_mfa off" in err
     assert "is set with no declared TLS terminator" not in err
 
 
@@ -2273,8 +2281,9 @@ def test_trusted_proxies_only_loopback_warns_dual_control(
     )
     assert rc == 0
     err = capsys.readouterr().err
-    assert f"warning: {_TRUSTED_PROXY_EXPOSURE_DESC} in a PHI-carrying environment" in err
-    assert "[approvals].enabled off" in err
+    assert f"{_TRUSTED_PROXY_WARNING_OPENING} [approvals].enabled off" in err
+    # The MFA warning opens with the same words. It must stay quiet here, with require_mfa on.
+    assert f"{_TRUSTED_PROXY_WARNING_OPENING} [security].require_mfa off" not in err
 
 
 def test_trusted_proxies_only_loopback_meets_the_memory_declaration_opt_in(
@@ -2299,6 +2308,71 @@ def test_trusted_proxies_only_loopback_meets_the_memory_declaration_opt_in(
     err = capsys.readouterr().err
     assert "this EXPOSED production PHI instance" in err
     assert "ASVS 11.7.1" in err
+
+
+# --- vault BACKLOG #3102: the exposure description reads the exposure predicate ---------------------
+#
+# `exposure_desc` used to work the exposure rule out a second time, beside `instance_exposed`. The two
+# agreed, but only because someone kept them in step by hand. `_exposure_description` now takes
+# `_serve`'s own `instance_exposed`, and its branches only choose which field to name.
+
+
+@pytest.mark.parametrize(
+    ("api", "expected"),
+    [
+        ({}, ""),
+        ({"host": "0.0.0.0"}, "API bound to non-loopback host '0.0.0.0'"),
+        (
+            {"tls_terminated_upstream": True, "trusted_proxies": ["10.0.0.1"]},
+            "admin interface reached through a declared reverse proxy "
+            "([api].tls_terminated_upstream)",
+        ),
+        (
+            {"trusted_proxies": ["10.0.0.1"], "tls_cert_file": "operator-cert.pem"},
+            _TRUSTED_PROXY_EXPOSURE_DESC,
+        ),
+        (
+            # An off-loopback bind wins over a proxy: the bind is the field the operator set first.
+            {
+                "host": "0.0.0.0",
+                "tls_terminated_upstream": True,
+                "trusted_proxies": ["10.0.0.1"],
+            },
+            "API bound to non-loopback host '0.0.0.0'",
+        ),
+    ],
+)
+def test_exposure_description_names_the_field_the_operator_set(
+    api: dict[str, object], expected: str
+) -> None:
+    from messagefoundry.__main__ import _exposure_description
+    from messagefoundry.config.settings import ApiSettings, ServiceSettings
+
+    settings = ServiceSettings(api=ApiSettings.model_validate(api))
+    # `exposed` is passed the way `_serve` passes it: its own `instance_exposed`.
+    exposed = not settings.api.host_is_browser_origin
+    assert _exposure_description(settings, exposed=exposed) == expected
+    # Empty exactly when the instance is not exposed.
+    assert bool(expected) is exposed
+
+
+def test_exposure_description_follows_the_flag_not_its_own_reading() -> None:
+    # Two calls where the flag disagrees with the fields, which `_serve` never makes. They show
+    # which of the two the function reads. Worked out by hand again, both come out wrong.
+    from messagefoundry.__main__ import _exposure_description
+    from messagefoundry.config.settings import ApiSettings, ServiceSettings
+
+    proxied = ServiceSettings(
+        api=ApiSettings(trusted_proxies=["10.0.0.1"], tls_cert_file="operator-cert.pem")
+    )
+    # Not exposed by the flag, with a proxy field set: no description.
+    assert _exposure_description(proxied, exposed=False) == ""
+    # Exposed by the flag through a term this function does not name yet: still a description, and
+    # one that blames none of the three fields it does know.
+    unnamed = _exposure_description(ServiceSettings(), exposed=True)
+    assert unnamed
+    assert "[api]." not in unnamed
+    assert "non-loopback" not in unnamed
 
 
 def test_undeclared_proxy_warns_about_single_factor_admin(
@@ -2337,6 +2411,14 @@ def test_undeclared_proxy_warns_about_single_factor_admin(
         "every account with no second factor enrolled is single-factor over the network, and the "
         "MFA-at-exposure refusal cannot see it" in err
     )
+    # Vault BACKLOG #3102: the remedy names both ways to declare a proxy. It named only the
+    # terminator, and a re-encrypting proxy named in [api].trusted_proxies counts as exposed too
+    # (the test_trusted_proxies_only_* cases above drive that shape).
+    assert "naming the proxy in [api].trusted_proxies" in err
+    assert "[api].tls_terminated_upstream=true if it terminates TLS" in err
+    assert "[api].tls_cert_file if it re-encrypts" in err
+    # Declaring the proxy is not a way round MFA: it is what makes the refusal apply.
+    assert "the MFA-at-exposure gate then applies" in err
     assert "proxy posture is undeclared" not in err, (
         "the ADR 0068 §8 heuristic fired after all — re-check whether this arm is still needed, and "
         "correct the docs either way"

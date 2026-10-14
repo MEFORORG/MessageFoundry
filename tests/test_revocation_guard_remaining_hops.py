@@ -243,6 +243,49 @@ def test_the_guard_capture_does_not_depend_on_the_root_logger(
         parent.propagate = saved[0]
 
 
+def _plain_handler_sees_the_guard_line(*, disabled: bool) -> bool:
+    """Whether a plain handler on the guard's logger, with no capture, sees a guard WARN line."""
+    guard_logger = logging.getLogger(_GUARD_LOGGER)
+    guard_logger.disabled = disabled
+    control = _GuardLog([guard_logger])
+    guard_logger.addHandler(control)
+    try:
+        with active_hop_posture(NOT_ENFORCING):
+            DicomScuDestination(_scu(REMOTE))
+    finally:
+        guard_logger.removeHandler(control)
+    return control.has("revocation")
+
+
+def test_the_guard_capture_clears_a_disabled_guard_logger() -> None:
+    """The third state the capture's docstring names: the guard's logger itself ``disabled``, as
+    ``logging.config.dictConfig`` leaves an existing logger under ``disable_existing_loggers``. A
+    disabled logger drops a record before any handler runs, so the capture must clear the flag for
+    the block, and put it back after (BACKLOG #2987).
+
+    The CONTROL is the same build with a plain handler on the logger, its level set and
+    ``logging.disable`` cleared, so the flag is the only thing left that could drop the line. With
+    the flag set it sees nothing; with the flag cleared it sees the line. So the flag really drops
+    it, and the pass above is the capture's doing."""
+    guard_logger = logging.getLogger(_GUARD_LOGGER)
+    saved = (guard_logger.disabled, guard_logger.level, logging.root.manager.disable)
+    guard_logger.disabled = True
+    try:
+        with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
+            DicomScuDestination(_scu(REMOTE))
+        assert log.has("revocation"), log.state()
+        assert guard_logger.disabled is True  # put back on exit
+
+        guard_logger.setLevel(logging.WARNING)
+        logging.disable(logging.NOTSET)
+        assert not _plain_handler_sees_the_guard_line(disabled=True)
+        assert _plain_handler_sees_the_guard_line(disabled=False)
+    finally:
+        guard_logger.disabled = saved[0]
+        guard_logger.setLevel(saved[1])
+        logging.disable(saved[2])
+
+
 # --- FhirLookupExecutor: the live read hop (transports/fhir.py) ------------------------------------
 
 
@@ -261,6 +304,9 @@ def test_a_fhir_lookup_read_hop_is_refused_when_it_checks_no_revocation() -> Non
         _lookup({"url": f"https://{REMOTE}/fhir"})
     # The refusal names the lookup, in the lookup namespace, so an operator can find the declaration.
     assert "connection 'fhir_lookup:epic';" in str(exc.value)
+    # A lookup only reads, so its refusal says so (BACKLOG #2987). The destinations keep "delivers".
+    assert "sends read requests over verified https" in str(exc.value)
+    assert "delivers" not in str(exc.value)
 
 
 def test_a_fhir_lookup_read_hop_is_admitted_when_a_crl_reaches_its_own_opener(
@@ -562,19 +608,29 @@ def test_an_ftps_upload_that_verifies_nothing_takes_no_revocation_guard(
     """Disjoint gates. ``tls_verify=false`` has no verified certificate whose revocation could
     matter, so its own refusal owns it under an enforcing posture. Where the escape permits the hop,
     the guard is not taken at all: a non-enforcing posture WARNs on every guarded hop, and no such
-    line appears here. The connector's own verify-off warning, read through the same capture, is
-    what shows the capture was live when it saw no revocation line."""
+    line appears here. The connector's own verify-off warning shows the verify-off arm ran.
+
+    What shows the capture was live on the GUARD's logger is a line from that logger in the same
+    block: a verifying upload to a second host, built after the subject, whose guard WARNs. A
+    connector-logger line alone would prove the capture of a logger the absent line never uses
+    (BACKLOG #2987)."""
     with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="tls_verify=false") as exc:
         RemoteFileDestination(_ftps(REMOTE, tls_verify=False))
     assert "revocation" not in str(exc.value)
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    control_host = "10.0.0.6"  # non-loopback, never dialled, and not a substring of REMOTE
     with (
         active_hop_posture(NOT_ENFORCING),
         _guard_log(_GUARD_LOGGER, remotefile_module.logger.name) as log,
     ):
         RemoteFileDestination(_ftps(REMOTE, tls_verify=False))
+        RemoteFileDestination(_ftps(control_host))
     assert log.has("verification is DISABLED"), log.state()
-    assert not log.has("revocation"), log.state()
+    revocation = [m for m in log.messages if "revocation" in m]
+    # The control: the guard's own logger was captured in this block.
+    assert any(control_host in m for m in revocation), log.state()
+    # The subject: every revocation line is the control's, so none is the subject's.
+    assert all(control_host in m and REMOTE not in m for m in revocation), log.state()
 
 
 def test_an_anonymous_plain_ftp_upload_is_the_cleartext_refusal_not_this_one() -> None:

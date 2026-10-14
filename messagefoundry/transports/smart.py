@@ -60,7 +60,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, float_setting
 from messagefoundry.transports.bounded_read import (
     MAX_TOKEN_RESPONSE_BYTES,
     EgressReplyError,
@@ -76,6 +76,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
+    auth_challenge_refused,
     ech_readdressed_request,
     enforce_outbound_length_limits,
     hop_declarations_from_settings,
@@ -142,7 +143,9 @@ def request_token(
     A failure names ``endpoint`` and a status, reason or error class, never the request or the reply
     body, because the body carries the bearer token. A request that cannot be encoded for the wire
     still raises its own ``ValueError``, as it did before BACKLOG #2054. ``connector`` names the hop
-    in a refusal of the reply body, and holds no URL (BACKLOG #2060)."""
+    in a refusal of the reply body, and holds no URL (BACKLOG #2060). A web proxy's Digest challenge
+    the engine will not answer raises the subclass ``rest.auth_challenge_refused`` builds, a
+    permanent configuration fault (BACKLOG #2989)."""
     body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
     return _parse_token_reply(body, endpoint=endpoint)
 
@@ -175,9 +178,10 @@ def _read_token_reply(
         # not answer (a hash other than SHA-256, or a challenge it cannot parse) with an HttpAuthError.
         # That is a ValueError, and it escaped this function's DeliveryError contract. Fixed text: the
         # refusal names the peer's own algorithm token, which stays on the cause only.
-        raise DeliveryError(
-            f"{endpoint} was not reached: the web proxy's authentication challenge was refused"
-        ) from exc
+        # BACKLOG #2989: the same classification the delivery hop gives this refusal. A plain
+        # DeliveryError here retried a refusal that no retry can clear. Only an http:// token
+        # endpoint reaches this arm: through a CONNECT tunnel urllib raises the 407 as an OSError.
+        raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
         # well (BACKLOG #2052). It is already a retryable DeliveryError with a fixed reason, so it
@@ -333,9 +337,7 @@ class _TokenEndpointProvider(abc.ABC):
         # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical).
-        token_proxy = (
-            proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
-        )
+        token_proxy = proxy.for_host(token_url) if proxy else None
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
         # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
@@ -432,7 +434,10 @@ class _TokenEndpointProvider(abc.ABC):
     def access_token(self) -> str:
         """A valid bearer token — cached until it nears expiry, otherwise freshly acquired. Blocking
         (a token ``POST``); the connector calls it inside its off-loop ``send()`` worker. Raises
-        :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails."""
+        :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails,
+        except for a web proxy's refused Digest challenge, which raises the permanent configuration
+        fault :func:`~messagefoundry.transports.rest.auth_challenge_refused` builds (BACKLOG #2989).
+        """
         with self._lock:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token
@@ -689,8 +694,16 @@ def token_provider_from_settings(
         private_key_password=(
             str(s["smart_private_key_password"]) if s.get("smart_private_key_password") else None
         ),
-        expiry_skew_seconds=float(s.get("smart_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW)),
-        timeout_seconds=float(s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT)),
+        expiry_skew_seconds=float_setting(
+            s.get("smart_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW),
+            knob="smart_expiry_skew_seconds",
+            transport="SMART",
+        ),
+        timeout_seconds=float_setting(
+            s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
+            knob="smart_timeout_seconds",
+            transport="SMART",
+        ),
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
         attested=attested,

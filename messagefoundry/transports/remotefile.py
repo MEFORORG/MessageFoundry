@@ -6,15 +6,19 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
 
 - ``sftp`` — SSH file transfer (paramiko, the ``[sftp]`` extra — lazily imported, so installs that
   never use SFTP skip it). **Host-key verification is ON by default**; an unknown key is refused
-  unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and logged loudly when it is),
-  mirroring the SQL Server backend's weakened-TLS posture.
+  unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+  ``[security].enforcement = warn`` (and logged loudly when it is), mirroring the SQL Server
+  backend's weakened-TLS posture. The escape never reaches a ``password`` login.
 - ``ftp`` — plain FTP (stdlib ``ftplib``). Cleartext: credentials over plain ``ftp`` are **refused**
-  outright, with no escape (use ``ftps``/``sftp``; vault BACKLOG #2636).
+  (use ``ftps``/``sftp``).
 - ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted. **The
   server certificate and hostname are verified by default** (a verifying :class:`ssl.SSLContext`, not
   ftplib's no-verify stdlib fallback); ``tls_verify=false`` drops verification only when the explicit
-  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture,
-  and only on an anonymous hop: with a credential it is refused outright (vault BACKLOG #2636).
+  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn`` (and
+  is logged loudly), mirroring the MLLP outbound posture, and only on an anonymous hop.
+
+Each credential refusal above follows one rule, stated once in docs/SECURITY-LOOSENING.md, *No
+escape sends a credential to an unverified peer*.
 
 **Destination** uploads each payload to ``remote_dir``/``filename`` (``{HL7-path}`` placeholders
 resolved via :func:`render_filename`). The write goes to a temp name then a **rename** to the final
@@ -58,6 +62,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+import fnmatch
 import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are refused (see _validate_common); FTPS/SFTP are the encrypted defaults
 import hashlib
 import io
@@ -78,6 +83,7 @@ from messagefoundry.config.models import (
     ContentType,
     Destination,
     Source,
+    bool_setting,
     flag_from_settings,
     remote_file_protocol,
 )
@@ -113,6 +119,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    float_setting,
     intake_open,
     poll_interval,
     positive_cap,
@@ -201,6 +208,42 @@ def _is_contained_name(name: object) -> bool:
     # A drive-relative path ("C:x.hl7") resolves against the drive's CWD on Windows and contains no
     # separator, so the checks above cannot see it. Two chars, ASCII letter, then a colon.
     return not (len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":")
+
+
+#: Shortest gap, in seconds, between two WARNINGs that a poll refused entries listed in another form
+#: (see :func:`_is_other_listing_form`). The condition is a server's fixed listing format, so it
+#: holds on every poll; one line per poll would bury the rest of the log.
+OTHER_FORM_WARNING_SECONDS = 900.0
+
+#: Last parts of a listing entry that name no file, so ``pattern`` never matches them (BACKLOG #1130).
+_NOT_A_FILE_NAME = frozenset({"", ".", ".."})
+
+
+def _is_other_listing_form(name: str, remote_dir: str) -> bool:
+    """True if ``name``, which has a ``/`` and so is refused by :func:`_is_contained_name`, reads as
+    an entry of ``remote_dir`` in a listing form this connector does not accept, rather than as a
+    traversal attempt (BACKLOG #1130).
+
+    Two tests, both needed. The name has none of the traversal shapes: no ``..`` anywhere, no
+    ``\\``, no ``:`` (a drive or a stream), no leading ``//`` (a network path, which names another
+    host), and no control character. And its parent directory's
+    last part is ``remote_dir``'s last part. So for ``remote_dir = "/in"``, a resolved absolute path
+    (``/srv/ftp/in/a.hl7``) or one relative to the server's current directory (``in/a.hl7``)
+    qualifies, and ``/etc/a.hl7``, ``//host/share/a.hl7`` and ``in/sub/a.hl7`` do not. It is refused
+    all the same; only the log line differs. Doubt goes to the traversal side, so ``/in/a..b.hl7``
+    logs as traversal: misreading an attack as a format mismatch is the worse error."""
+    leaf = posixpath.basename(remote_dir.rstrip("/"))
+    parent = posixpath.dirname(name).rstrip("/")
+    return (
+        bool(leaf)
+        and "/" in name
+        and parent.rpartition("/")[2] == leaf
+        and not name.startswith("//")
+        and ".." not in name
+        and "\\" not in name
+        and ":" not in name
+        and not has_control_char(name)
+    )
 
 
 def _where(host: str, path: str) -> str:
@@ -385,6 +428,63 @@ def _ftp_size(ftp: ftplib.FTP, path: str) -> int | None:
         return None
 
 
+#: The one permanent ``NLST`` reply read as an empty directory rather than a failure (BACKLOG
+#: #1130): code 550 with the text ``No files found``, which wu-ftpd and some other NLST-only servers
+#: send for an empty one. Anything else stays a failure, including ``550 No such file or
+#: directory``, since that also answers a directory that is not there.
+_NLST_EMPTY_REPLY = re.compile(r"550[ -]\s*no files found\b", re.IGNORECASE)
+
+
+def _ftp_nlst(ftp: ftplib.FTP, remote_dir: str) -> list[str]:
+    """``NLST`` of ``remote_dir``, with the empty-directory refusal :data:`_NLST_EMPTY_REPLY`
+    matches read as no entries. Every other permanent reply raises, for ``_op`` to map.
+
+    Some servers send that reply for a missing directory too, and a mistyped ``remote_dir`` must
+    not poll as empty for good. So the directory is confirmed with ``CWD`` first, then the session
+    is returned to where ``PWD`` found it, since later commands may use relative paths. A refused
+    or unreadable reply to any of the three raises the original ``NLST`` reply, as before this
+    check; a transient one raises as itself. So does a ``PWD`` reply with no quoted path: ``pwd()``
+    returns ``''`` for it, and ``cwd('')`` sends ``CWD .``, which would leave the session inside
+    ``remote_dir``. The round trips are paid only on this reply.
+
+    A directory the account may enter but not list still reads as empty, if the server answers
+    it with this reply: ``CWD`` cannot tell that case apart.
+
+    The check runs after the ``NLST`` handler ends, so neither the ``NLST`` reply nor a ``PWD`` or
+    ``CWD`` reply rides on the other's ``__context__``. A caller that reaches this inside its own
+    handler, as ``publish`` does after a refused ``RNTO``, still chains that handler's error, as
+    any raise there does."""
+    try:
+        return ftp.nlst(remote_dir)
+    except ftplib.error_perm as exc:
+        if not _NLST_EMPTY_REPLY.match(str(exc)):
+            raise
+        refusal = exc
+    try:
+        if not _ftp_dir_confirmed(ftp, remote_dir):
+            raise refusal
+    finally:
+        del refusal  # the frame would hold its own traceback in a cycle
+    # The reply text past the match is the server's, and may name a path: not logged.
+    logger.debug("The remote-file connector read NLST reply 550 No files found as empty")
+    return []
+
+
+def _ftp_dir_confirmed(ftp: ftplib.FTP, remote_dir: str) -> bool:
+    """Whether ``CWD`` enters ``remote_dir`` and then puts the session back where ``PWD`` found it.
+
+    A refused or unreadable reply confirms nothing; a transient one raises as itself."""
+    try:
+        home = ftp.pwd()
+        if not home:  # '' cannot put the session back, so it confirms nothing
+            return False
+        ftp.cwd(remote_dir)
+        ftp.cwd(home)
+    except (ftplib.error_perm, ftplib.error_reply, ftplib.error_proto):
+        return False
+    return True
+
+
 class _BoundedSink:
     """Accumulates retrieved chunks and refuses at the first byte past ``limit``.
 
@@ -417,11 +517,17 @@ class _Listed(NamedTuple):
     """One regular file in a remote listing. ``size`` is 0 where the server reports none. ``mtime``
     is the server's own modification-time text (SFTP ``st_mtime`` in seconds, FTP ``MLSD``
     ``modify``), or ``None`` where it reports none. It is compared for equality only, never parsed,
-    so a server's own format and resolution carry through unchanged."""
+    so a server's own format and resolution carry through unchanged.
+
+    ``other_form`` is set only by the FTP ``NLST`` fallback, on an entry the listing guard will
+    refuse that :func:`_is_other_listing_form` reads as an unsupported listing form (BACKLOG #1130).
+    Every other listing leaves it False, so a refused name from SFTP or ``MLSD`` always logs as
+    traversal."""
 
     name: str
     size: int
     mtime: str | None
+    other_form: bool = False
 
 
 class _RemoteClient(abc.ABC):
@@ -527,8 +633,9 @@ def _ftps_ssl_context(
     silently accepted, so the encrypted FTPS channel is MITM-able. We verify the server certificate and
     hostname by default and only drop verification behind the explicit, loudly-logged dev escape.
 
-    Fail-fast (build time): ``tls_verify=false`` without ``MEFOR_ALLOW_INSECURE_TLS`` raises, exactly
-    like the MLLP path, so a misconfiguration is refused at construction rather than silently insecure.
+    Fail-fast (build time): ``tls_verify=false`` raises unless ``MEFOR_ALLOW_INSECURE_TLS`` is set on
+    an instance at ``[security].enforcement = warn``, exactly like the MLLP path, so a
+    misconfiguration is refused at construction rather than silently insecure.
     Optional mTLS via ``tls_cert_file``/``tls_key_file`` (passphrase ``tls_key_password``).
 
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
@@ -540,16 +647,12 @@ def _ftps_ssl_context(
     does not take that key, so ``connections.toml`` cannot set it either, but a hand-built
     ``ConnectionSpec`` can, and this context honours it, so the warning lives here.
 
-    With a ``username`` or ``password`` set, both ``tls_verify=false`` and ``tls_check_hostname=false``
-    are refused outright, with no escape (vault BACKLOG #2636, mirroring the SMTP credential arms of
-    #323 and #1314). The escape governs only an anonymous hop."""
-    verify = bool(settings.get("tls_verify", True))
-    # Vault BACKLOG #2636: the FTPS twin of the two SMTP credential arms (#323 and #1314, in email.py
-    # and direct.py). ABSOLUTE and keyed on no escape: the escape below may govern the BODY posture
-    # of an anonymous hop, never the CREDENTIAL, because login() hands the credential to whichever
-    # peer the session reached. Keyed on either half, as the plain-ftp credential guard is. Checked
-    # BEFORE the escape arm, unlike SMTP, so a credentialed hop is never told to set an escape that
-    # cannot unlock it.
+    A ``username`` or ``password`` with either check off is refused (vault BACKLOG #2636). The rule
+    is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified
+    peer*."""
+    verify = bool_setting(settings, "tls_verify", default=True)
+    # Keyed on either half, as the plain-ftp credential guard is. Checked BEFORE the escape arm, so a
+    # credentialed hop is never told to set an escape that cannot unlock it.
     has_credential = bool(settings.get("username") or settings.get("password"))
     if not verify and has_credential:
         # No chain and no name: an on-path peer presenting any certificate captures the login.
@@ -558,7 +661,7 @@ def _ftps_ssl_context(
             "TLS session (tls_verify=false); refused -- credentials require a verified TLS session. "
             "Leave tls_verify on (the default) with a trusted CA (tls_ca_file), or use sftp."
         )
-    check_hostname = bool(settings.get("tls_check_hostname", True))
+    check_hostname = bool_setting(settings, "tls_check_hostname", default=True)
     if not check_hostname and has_credential:
         # The chain IS verified (the arm above refused the rest), but with the name check off any
         # certificate chaining to the anchor is accepted whatever host it names -- on the system
@@ -835,7 +938,11 @@ class _FtpClient(_RemoteClient):
         self._user = settings.get("username")
         self._password = settings.get("password")
         self._tls = tls
-        self._timeout = float(settings.get("connect_timeout", 30.0))
+        self._timeout = float_setting(
+            settings.get("connect_timeout", 30.0),
+            knob="connect_timeout",
+            transport="REMOTEFILE ftp",
+        )
         # Build the verifying TLS context once, fail-fast (build_check) — mirrors the SFTP host-key
         # posture: a verify-disabled ftps without the escape is refused here, not silently insecure.
         # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy (verify path only).
@@ -926,7 +1033,7 @@ class _FtpClient(_RemoteClient):
         # 5.3.2): a basename fold would read ../x/a.hl7 as a.hl7.
         spellings = {remote_dir + "/", remote_dir.rstrip("/") + "/"} if remote_dir else set()
         prefixes = sorted(spellings, key=len, reverse=True)  # longest first: "/in//" before "/in/"
-        for name in ftp.nlst(remote_dir):
+        for name in _ftp_nlst(ftp, remote_dir):
             base = next((name[len(p) :] for p in prefixes if name.startswith(p)), name)
             if base in (".", ".."):
                 continue
@@ -934,7 +1041,7 @@ class _FtpClient(_RemoteClient):
             # server-chosen name the guard has not judged. It still lists, unsized, so the poll
             # loop's own _is_contained_name refusal counts and logs it.
             if not _is_contained_name(base):
-                out.append(_Listed(base, 0, None))
+                out.append(_Listed(base, 0, None, _is_other_listing_form(base, remote_dir)))
                 continue
             # A directory or an un-sizable entry lists as 0 (the oversize check skips it).
             size = _ftp_size(ftp, posixpath.join(remote_dir, base))
@@ -963,7 +1070,7 @@ class _FtpClient(_RemoteClient):
         # The basename fold is kept here on purpose, unlike in _list: these names are only compared,
         # to keep a publish from taking a name already present, so folding can only make a name
         # look taken. No path is built from them.
-        names = {posixpath.basename(name) for name in ftp.nlst(remote_dir)}
+        names = {posixpath.basename(name) for name in _ftp_nlst(ftp, remote_dir)}
         return names - {".", ".."}
 
     def retrieve(self, path: str, *, max_bytes: int | None = None) -> bytes:
@@ -1490,12 +1597,35 @@ def _sftp_rsa_bits(private_key: object) -> int | None:
     return key.key_size if isinstance(key, rsa.RSAPrivateKey) else None
 
 
+class _RefuseUnknownHostKey:
+    """The missing-host-key policy for an SFTP login that sends a ``password`` (vault BACKLOG #3230).
+
+    It refuses, as paramiko's ``RejectPolicy`` does, but names the connection and the fix. paramiko
+    reads a policy by its ``missing_host_key`` method alone, so this need not subclass its
+    ``MissingHostKeyPolicy``, and paramiko stays a lazy import. The refusal runs before
+    authentication, so the password is never sent to the unknown server."""
+
+    def __init__(self, paramiko: Any, *, name: str) -> None:
+        self._error: type[Exception] = paramiko.SSHException
+        self._name = name
+
+    def missing_host_key(self, client: object, hostname: str, key: object) -> None:
+        raise self._error(
+            f"{hop_name_prefix(self._name)}REMOTEFILE sftp would send its password to {hostname!r}, "
+            "whose host key is not in known_hosts; refused, with no escape. Add the server's host "
+            "key to the file the known_hosts setting names, or to the system known_hosts."
+        )
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
-    explicit dev escape is set, in which case ``AutoAddPolicy`` is used and a warning is logged."""
+    explicit dev escape is set, in which case ``AutoAddPolicy`` is used and a warning is logged. A
+    login that sends a ``password`` never takes the escape (vault BACKLOG #3230): its unknown host
+    key is refused by :class:`_RefuseUnknownHostKey`, whatever the posture."""
 
-    def __init__(self, settings: dict[str, Any]) -> None:
+    def __init__(self, settings: dict[str, Any], *, name: str = "") -> None:
+        self._name = name
         self._host = str(settings["host"])
         self._port = int(settings.get("port", 22))
         self._user = settings.get("username")
@@ -1504,7 +1634,11 @@ class _SftpClient(_RemoteClient):
         # Read only to refuse it: a key_password never reaches paramiko (BACKLOG #2423).
         _refuse_sftp_key_wrap(self._private_key, settings.get("key_password"))
         self._known_hosts = settings.get("known_hosts")
-        self._timeout = float(settings.get("connect_timeout", 30.0))
+        self._timeout = float_setting(
+            settings.get("connect_timeout", 30.0),
+            knob="connect_timeout",
+            transport="REMOTEFILE sftp",
+        )
         # Fail fast at construction (build_check time): an unknown-host-key posture without the escape
         # must never silently weaken to auto-accept. #329: read the escape through the ADR-0092 clamp
         # (weakened_tls_escape_permitted_here consults the active construction posture, exactly like the
@@ -1512,7 +1646,23 @@ class _SftpClient(_RemoteClient):
         # enforcing-PHI posture the escape is INERT — the accept-unknown policy then stays RejectPolicy
         # and an unknown host key is refused at connect (:392-394), as today. Off the construction gate
         # (posture unstamped) the escape is refused since vault BACKLOG #2354 (it used to be unclamped).
-        self._accept_unknown = weakened_tls_escape_permitted_here()
+        # A password login is outside the escape altogether (vault BACKLOG #3230): AutoAddPolicy would
+        # hand the password to whichever server answered. A key-only login keeps the escape.
+        escape = weakened_tls_escape_permitted_here()
+        self._accept_unknown = escape and not self._password
+        if escape and self._password and not self._known_hosts:
+            # Said at build, so the operator learns it before a delivery is refused at connect.
+            # Only with no known_hosts file named: that is where the escape would have been
+            # relied on. A named file is taken to hold the key; the connect still checks it.
+            logger.warning(
+                "%sREMOTEFILE sftp %s logs in with a password and names no known_hosts file. "
+                "%s, though set on an instance at [security].enforcement = warn, does not let a "
+                "password login accept an unknown host key, so a key missing from the system "
+                "known_hosts is refused at connect. Add the server's host key to known_hosts.",
+                hop_name_prefix(self._name),
+                self._host,
+                INSECURE_TLS_ESCAPE_ENV,
+            )
         if self._accept_unknown:
             logger.warning(
                 "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "
@@ -1589,6 +1739,12 @@ class _SftpClient(_RemoteClient):
         client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy() if self._accept_unknown else paramiko.RejectPolicy()
         )
+        if self._password:
+            # __init__ never sets _accept_unknown for a password login, so the policy above is
+            # RejectPolicy. This one refuses the same keys, with text that names the connection
+            # and the fix (vault BACKLOG #3230). Kept apart from the call above so that call reads
+            # as it did before, which CodeQL's dismissed alert 13 is matched against.
+            client.set_missing_host_key_policy(_RefuseUnknownHostKey(paramiko, name=self._name))
         pkey = self._load_key(paramiko)
         # Constrain the MAC proposal to the approved set (BACKLOG #1171), and the cipher proposal to
         # its own approved set. Both are passed on every connect, not behind a setting: a control an
@@ -1848,7 +2004,7 @@ def _make_client(
     verify)."""
     protocol = remote_file_protocol(settings)
     if protocol == "sftp":
-        return _SftpClient(settings)
+        return _SftpClient(settings, name=name)
     if protocol == "ftp":
         return _FtpClient(settings, tls=False)
     if protocol == "ftps":
@@ -1926,12 +2082,9 @@ def _validate_common(
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):
-        # Plain FTP puts the credential itself on the wire in the clear. Vault BACKLOG #2636: ABSOLUTE,
-        # keyed on no escape and no posture, as the SMTP cleartext-credential arm is (email.py,
-        # direct.py) and as the two FTPS credential arms in _ftps_ssl_context are. This was clamped
-        # (#200, ADR 0092 decision 2) and the escape released it on a non-enforcing instance, which
-        # left the cleartext rung weaker than the verify-off FTPS rung above it. Keyed on either half.
-        # The anonymous plain-ftp hop is governed by the hop guard below and is unchanged.
+        # Plain FTP puts the credential itself on the wire in the clear (vault BACKLOG #2636; the rule
+        # is in docs/SECURITY-LOOSENING.md). Keyed on either half. The anonymous plain-ftp hop is
+        # governed by the hop guard below.
         raise ValueError(
             f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in CLEARTEXT; "
             "refused -- credentials require an encrypted, verified session. Use ftps (tls=True) or "
@@ -2233,15 +2386,14 @@ class RemoteFileSource(SourceConnector):
 
     def __init__(self, config: Source) -> None:
         s = config.settings
-        _validate_common(
-            s, connection=None if config.name is None else inbound_record_name(config.name)
-        )
+        # The connection's record name (inbound:<name>), or "" for an unnamed source. BACKLOG #1130
+        # also names it in the other-listing-form WARNING (see _log_other_form).
+        self._connection = "" if config.name is None else inbound_record_name(config.name)
+        _validate_common(s, connection=self._connection or None)
         # Vault BACKLOG #2370: the poller verifies its FTPS server under [tls], as the outbound does,
         # and its warnings and refusals spell it inbound:<name>, as _validate_common above does.
         self._client = _make_client(
-            s,
-            trust_anchor_policy=config.trust_anchor_policy,
-            name="" if config.name is None else inbound_record_name(config.name),
+            s, trust_anchor_policy=config.trust_anchor_policy, name=self._connection
         )
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
@@ -2296,6 +2448,9 @@ class RemoteFileSource(SourceConnector):
         # ingests its files. None = always poll (single-node / direct callers / tests) — identical.
         self._leader_gate: Callable[[], bool] | None = None
         self._skipping = False  # whether the last tick was gated out (for a single transition log)
+        # BACKLOG #1130: when the other-listing-form WARNING last fired (None = not since the
+        # condition last cleared).
+        self._other_form_warned_at: float | None = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -2385,8 +2540,6 @@ class RemoteFileSource(SourceConnector):
         return False
 
     async def _poll_once(self) -> None:
-        import fnmatch
-
         assert self._handler is not None
         await asyncio.to_thread(self._client.ensure_dir, self._processed_dir)
         await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
@@ -2395,8 +2548,14 @@ class RemoteFileSource(SourceConnector):
         # Keyed so two entries that list one name never compare a None mtime with a str.
         listing = sorted(entries, key=lambda entry: (entry.name, entry.size))
         self._prune_settle(listing)
+        # Counted over the whole listing, not in the loop below, which can stop early. Only an entry
+        # the pattern would have read counts. So a narrow pattern such as *.hl7 skips a subdirectory
+        # or a stray file, but a broad one such as * counts them, since NLST cannot tell a directory
+        # from a file. An entry whose last part is empty, "." or ".." names no file and never counts.
+        self._log_other_form(sum(1 for e in listing if e.other_form and self._reads(e.name)))
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
-        for position, (name, size, mtime) in enumerate(listing):
+        for position, entry in enumerate(listing):
+            name, size, mtime = entry.name, entry.size, entry.mtime
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
             if self._at_ceiling(disposed, len(listing) - position):
@@ -2408,23 +2567,31 @@ class RemoteFileSource(SourceConnector):
                 # leave-mode dedup key), and a per-consumer check would keep missing one: the
                 # consumer set grew at every measurement pass and never shrank.
                 # NOT quarantined: moving it would join the hostile name onto a directory, which is
-                # the very operation being refused. Left in place and logged, so an operator sees it
-                # every poll rather than once. No name is logged: this arm has refused the name as an
-                # unsafe path component, so it is the one place that must not hand it to `safe_name`
-                # either — the host:dir and the fact of a refusal are the signal.
+                # the very operation being refused. Left in place, and logged on every poll rather
+                # than once, except for the other-form entry described below. No name is logged:
+                # this arm has refused the name as an unsafe path component, so it is the one place
+                # that must not hand it to `safe_name` either. The host:dir and the fact of a
+                # refusal are the signal.
                 #
                 # This comment used to justify that by asserting "names are not logged at INFO+
                 # elsewhere in this source". Nine WARNING sites below falsified it (BACKLOG #1748),
                 # which made a real control rest on a false premise (CLAUDE.md §11, SDS-3.7). Those
                 # sites now route through `safe_name`, so the claim would be true today — it is gone
                 # anyway, because this arm's reason never depended on what the others do.
-                logger.warning(
-                    "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
-                    "(not a single safe name); left in place, not retrieved",
-                    _where(self._host, self._remote_dir),
-                )
+                #
+                # An FTP NLST entry in another listing form, with no traversal shape, gets no line
+                # here (BACKLOG #1130). It was counted above instead, and logged at most every
+                # OTHER_FORM_WARNING_SECONDS, so an operator can tell a server's listing format from
+                # an attack. One the pattern would not read is refused with no line at all: like a
+                # bare name the pattern skips, it is not a file this poller would ever read.
+                if not entry.other_form:
+                    logger.warning(
+                        "REMOTEFILE %s: a listing entry was refused as an unsafe path component "
+                        "(not a single safe name); left in place, not retrieved",
+                        _where(self._host, self._remote_dir),
+                    )
                 continue
-            if not fnmatch.fnmatch(name, self._pattern):
+            if not self._reads(name):
                 continue
             path = posixpath.join(self._remote_dir, name)
             # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
@@ -2733,6 +2900,42 @@ class RemoteFileSource(SourceConnector):
         full = posixpath.join(self._remote_dir, name)
         identity = f"{full}\x00{size}" if mtime is None else f"{full}\x00{size}\x00{mtime}"
         return hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _reads(self, name: str) -> bool:
+        """Whether ``pattern``, a file-name glob, matches ``name``: the one test the poll loop
+        and the other-form count share, so the two cannot drift. A name with a ``/`` is judged by
+        its last part, since an NLST entry in another listing form (BACKLOG #1130) names the file
+        as a path. A bare name is its own last part. A last part that is empty (an entry ending in
+        ``/``), ``.`` or ``..`` names no file, so it never matches, even under ``*``."""
+        leaf = posixpath.basename(name)
+        return leaf not in _NOT_A_FILE_NAME and fnmatch.fnmatch(leaf, self._pattern)
+
+    def _log_other_form(self, count: int) -> None:
+        """WARN that ``count`` FTP ``NLST`` entries this poll, each one the pattern would have read,
+        were refused for naming a path in another listing form (BACKLOG #1130; see
+        :func:`_is_other_listing_form`). At most one WARNING per
+        :data:`OTHER_FORM_WARNING_SECONDS`, DEBUG on the polls between, and a poll with none clears
+        the clock so a recurrence warns at once. No name is logged, for the reason the unsafe-name
+        arm in :meth:`_poll_once` gives: the guard has refused these names."""
+        if not count:
+            self._other_form_warned_at = None
+            return
+        now = time.monotonic()
+        last = self._other_form_warned_at
+        warn = last is None or now - last >= OTHER_FORM_WARNING_SECONDS
+        if warn:
+            self._other_form_warned_at = now
+        logger.log(
+            logging.WARNING if warn else logging.DEBUG,
+            "REMOTEFILE %s%s: %d NLST listing entr%s named a path, not a bare name or one under "
+            "remote_dir/, so the server's listing form looks unsupported; refused and left in "
+            "place, not retrieved. Logged at WARNING at most every %d s while it persists",
+            f"{self._connection} " if self._connection else "",
+            _where(self._host, self._remote_dir),
+            count,
+            "y" if count == 1 else "ies",
+            int(OTHER_FORM_WARNING_SECONDS),
+        )
 
     def _log_undetectable_skip(self, name: str, size: int, file_key: str) -> None:
         """Say, once per file version per process, that a leave-mode file was skipped as already

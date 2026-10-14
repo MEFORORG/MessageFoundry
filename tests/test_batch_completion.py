@@ -116,7 +116,9 @@ async def test_mark_batch_done_skips_a_vanished_member(store: Any) -> None:
 
 async def test_mark_batch_failed_transient_repends_all_to_one_deadline(store: Any) -> None:
     _mids, ids = await _n_outbound(store, 3)
-    next_at = await store.mark_batch_failed(ids, "transient boom", RetryPolicy(), now=300.0)
+    next_at = (
+        await store.mark_batch_failed(ids, "transient boom", RetryPolicy(), now=300.0)
+    ).retry_at
     assert next_at is not None and next_at > 300.0  # rescheduled, not dead-lettered
     # All 3 are PENDING again on the lane, re-claimable as the same prefix (strict FIFO).
     depth, _ = await store.pending_depth("OB1")
@@ -130,7 +132,7 @@ async def test_mark_batch_failed_exhausted_deadletters_all(store: Any) -> None:
     result = await store.mark_batch_failed(
         ids, "permanent-ish", RetryPolicy(max_attempts=1), now=300.0
     )
-    assert result is None  # dead-lettered → no reschedule float
+    assert result.retry_at is None and result.dead == 3  # dead-lettered, all three
     assert await store.count_dead(allowed_channels=None) == 3
     depth, _ = await store.pending_depth("OB1")
     assert depth == 0

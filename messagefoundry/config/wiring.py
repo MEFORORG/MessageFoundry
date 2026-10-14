@@ -37,6 +37,7 @@ import importlib.util
 import inspect
 import ipaddress
 import logging
+import math
 import os
 import re
 import sys
@@ -79,6 +80,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
     _check_hop_attestation,
     _check_revocation_attestation,
+    bool_setting,
     check_db_connect_timeout,
     flag_from_settings,
     require_hop_reason,
@@ -160,6 +162,10 @@ __all__ = [
     "message_type_of",
     "MessageTypeError",
     "config_py_files",
+    "config_source_trust_paths",
+    "assert_trusted_start_paths",
+    "install_trust_paths",
+    "untrusted_install_paths",
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
@@ -747,10 +753,11 @@ def refuse_resolved_verify_off(
     connector refuses a client cert with verification off when it is built."""
     if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
         return
-    if not settings["verify_tls"] and settings.get("tls_ca_file"):
+    # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
+    if not bool_setting(settings, "verify_tls", default=True) and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false, empty "
-            "or unset value, which verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false or "
+            "empty value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 
@@ -875,6 +882,23 @@ def DatabaseRef(
             check_db_connect_timeout(connect_timeout, "DatabaseRef")
         except ValueError as exc:
             raise WiringError(str(exc)) from None
+    # The same holds for acquire_timeout: a bool or a NaN would otherwise be refused only at the first
+    # sync, after start, so `messagefoundry check` passed it (BACKLOG #3432). The sync reads it again,
+    # by the same rule, because an env() ref is resolved only then.
+    if not isinstance(acquire_timeout, EnvRef):
+        # Imported here: messagefoundry.transports imports this module at its top level.
+        from messagefoundry.transports.base import float_setting
+
+        # The refusal is raised outside the handler, so it carries no exception chain.
+        refusal: str | None = None
+        try:
+            float_setting(
+                acquire_timeout, knob="acquire_timeout", transport="DATABASE reference source"
+            )
+        except ValueError as exc:
+            refusal = str(exc)
+        if refusal is not None:
+            raise WiringError(refusal)
     return ReferenceSourceSpec(
         "database",
         {
@@ -987,8 +1011,9 @@ def DatabaseLookup(
     ``ERROR``; the result is never truncated. The ceiling is charged at the fetch, so an over-broad
     statement does not buffer its whole result in the transform worker first. ``0`` removes it.
 
-    Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
-    ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
+    Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is refused unless
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
     allowlist, like a DATABASE source — point the engine only at allowed hosts. Example::
 
         DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
@@ -1087,7 +1112,7 @@ def FhirLookup(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -1131,7 +1156,10 @@ def FhirLookup(
     FHIR writes stay on the :func:`FHIR` outbound). The dial-out is gated by the **fail-closed**
     ``[egress].allowed_http`` allowlist (the same arm the FHIR outbound + SMART token endpoint use) — point
     the engine only at allowed hosts. Put secrets (``bearer_token`` / ``basic_*`` / SMART keys) in
-    :func:`env`. TLS is on by default; weakening it needs ``MEFOR_ALLOW_INSECURE_TLS``. The pure
+    :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1474,6 +1502,10 @@ def _is_secret_header(name: str, value: object = None) -> bool:
     ``MONITORING_READ``. The asymmetry is not close, so this errs toward redacting -- but the VALUE arm
     is kept narrow (auth-scheme prefixes and JWTs only) rather than "long and high-entropy", because
     masking every long header value would quietly destroy the view rather than protect it.
+
+    **It is also a security control, not only a mask.** ``transports.rest.http_credentials_sent``
+    reads it to decide whether a ``verify_tls=false`` hop carries a credential (vault BACKLOG
+    #3230), so narrowing it narrows that no-escape refusal too.
     """
     if _looks_like_a_credential_value(value):
         return True
@@ -1830,7 +1862,7 @@ def MLLP(
     | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
-    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
+    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
     # too unless tls_check_hostname=False.
@@ -1957,7 +1989,8 @@ def MLLP(
     A negative value is rejected at wiring. ``tls_key_password`` decrypts a passphrase-encrypted
     ``tls_key_file`` (supply it via ``env()`` so the secret stays out of config — mirrors the API
     listener's ``MEFOR_API_TLS_KEY_PASSWORD``); omit it for an unencrypted key. ``tls_verify=False``
-    (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) —
+    (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+    ``[security].enforcement = warn`` (loud warning) —
     exactly like LDAPS / SQL Server. TLS is TLS 1.2+ and composes with the ``[egress].allowed_mllp``
     allowlist (both enforced). ``tls_allow_expired=True`` (outbound, #129 / ADR 0094) is the **granular**
     alternative to ``tls_verify=False`` for the narrow real-world case of a partner whose server
@@ -2494,10 +2527,29 @@ def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
 
     for name in ("reply_timeout", "reply_write_timeout"):
         value = settings[name]
-        if not isinstance(value, int | float) or value <= 0:
+        # A bool is an int, and NaN and inf pass `<= 0`, so each is refused by name (BACKLOG #3432).
+        # The connector reads the same keys by the rule in transports/base.py float_setting.
+        # math.isfinite() raises OverflowError on an int too large for a float, such as 10**400 or a
+        # long TOML integer, so that int is refused by name here instead, outside the handler.
+        too_large = False
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                float(value)
+            except OverflowError:
+                too_large = True
+        if too_large:
             raise WiringError(
-                f"Http {name} must be a positive number of seconds — got {value!r}. It bounds a "
-                "blocked HTTP turn; an unbounded or zero budget is not a timeout"
+                f"Http {name} is not a valid float value (value withheld): it is too large for a float"
+            )
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise WiringError(
+                f"Http {name} must be a finite positive number of seconds (value withheld). It "
+                "bounds a blocked HTTP turn; an unbounded or zero budget is not a timeout"
             )
 
     if settings["reply_on_timeout"] not in ("504", "202"):
@@ -2654,6 +2706,8 @@ def File(
     decompress: Literal["gzip"]
     | None = None,  # inbound: "gzip" gunzips each drop before the sniff/scan/split
     max_decompressed_bytes: int | None = 64 * 1024 * 1024,  # inbound: decompression-bomb ceiling
+    max_decompressed_members: int
+    | None = 1024,  # inbound: gzip members one drop may hold; None = the default, never off
 ) -> ConnectionSpec:
     """A File endpoint. Inbound polls ``directory`` for ``pattern``; outbound writes ``filename``
     (atomically). ``encoding`` is the file charset (outbound). ``max_file_bytes`` mirrors
@@ -2687,7 +2741,9 @@ def File(
     body and appends ``.gz`` to the rendered name. Inbound ``decompress="gzip"`` gunzips each dropped
     file **before** the HL7 sniff, the pre-ingest AV scan, and the batch split; ``max_decompressed_bytes``
     (default 64 MiB, None/0 disables) caps the *decompressed* size — a decompression-bomb guard the
-    compressed-only ``max_file_bytes`` cannot provide. A corrupt/oversized archive is moved to
+    compressed-only ``max_file_bytes`` cannot provide. ``max_decompressed_members`` (default 1024)
+    caps how many gzip members one drop may hold, and cannot be turned off; raise it for a BGZF feed,
+    which is one member per 64 KiB block. A corrupt/oversized archive is moved to
     ``.error`` (never accept-and-dropped). Multi-entry zip / raw deflate stay Handler-composed via
     ``messagefoundry.parsing.compression``."""
     settings: dict[str, Any] = {
@@ -2709,6 +2765,7 @@ def File(
         "compress": compress,
         "decompress": decompress,
         "max_decompressed_bytes": max_decompressed_bytes,
+        "max_decompressed_members": max_decompressed_members,
     }
     if credential_username is not None or credential_password is not None:
         # A share credential is being configured — the password is a secret and must never be inline
@@ -2827,7 +2884,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -2918,6 +2975,10 @@ def FHIR(
     update_url_form: Literal[
         "transaction", "path"
     ] = "transaction",  # how an update/if-match is sent; "path" puts the id in the URL (a listed loosening)
+    allowed_entry_methods: list[str]
+    | None = None,  # transaction/batch only, and no default there: the entry verbs a Bundle may carry (#2804)
+    allowed_entry_types: list[str]
+    | None = None,  # transaction/batch only: the entry resource types it may name; unset = any (#2804)
     headers: dict[str, str]
     | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (SMART/OAuth; use env())
@@ -2926,7 +2987,7 @@ def FHIR(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -2955,7 +3016,9 @@ def FHIR(
     ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``POST {base}`` with a one-entry
     ``transaction`` Bundle whose entry is ``PUT {ResourceType}/{id}`` (so the message-derived id never
     appears in the request URL; vault BACKLOG #1965), ``transaction``/``batch`` → ``POST {base}`` with the
-    Bundle. ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
+    Bundle, whose every entry must fit ``allowed_entry_methods`` (required there, no default) and the
+    optional ``allowed_entry_types``, or the message is dead-lettered unsent (vault BACKLOG #2804).
+    ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
     idempotency/concurrency levers: ``if-none-exist`` (conditional create, ``If-None-Exist`` header),
     ``conditional-update`` (search-based ``PUT`` with ``conditional_query`` in the URL), ``if-match``
     (version-aware update, sent like ``update``, whose ETag is derived from the resource's
@@ -2988,6 +3051,24 @@ def FHIR(
         "FHIR",
         capture_response_headers=capture_response_headers,
         proxy_no_proxy=proxy_no_proxy,
+        allowed_entry_methods=allowed_entry_methods,
+        allowed_entry_types=allowed_entry_types,
+    )
+    # vault BACKLOG #2804: checked here as well as in FhirDestination, so the loaded graph cannot
+    # hold a transaction/batch connection with no entry allow-list. Lazy, as the smart-scope
+    # advisory's import of the same module is.
+    from messagefoundry.transports.fhir import DEFERRED_ENTRY_LIST, entry_screen_settings
+
+    def load_time(value: object) -> object:
+        # An env() standing for the whole list: its default is what an unset key resolves to, so
+        # that is checked now. With no default its items are known only at build, where
+        # FhirDestination checks them; it still counts as set.
+        if isinstance(value, EnvRef):
+            return DEFERRED_ENTRY_LIST if value.default is _UNSET else value.default
+        return value
+
+    entry_screen_settings(
+        interaction, load_time(allowed_entry_methods), load_time(allowed_entry_types)
     )
     return ConnectionSpec(
         ConnectorType.FHIR,
@@ -2999,6 +3080,8 @@ def FHIR(
             "conditional": conditional,
             "conditional_query": conditional_query,
             "update_url_form": update_url_form,
+            "allowed_entry_methods": allowed_entry_methods,
+            "allowed_entry_types": allowed_entry_types,
             "headers": headers or {},
             "bearer_token": bearer_token,
             "basic_user": basic_user,
@@ -3031,8 +3114,8 @@ def Email(
     subject: str | EnvRef = "",  # static Subject (a per-message subject is a Phase-2 follow-up)
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless tls_hop_attested or cleartext_accepted is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3045,18 +3128,22 @@ def Email(
     ``recipients`` with a static ``subject``. STARTTLS by default (``use_tls=True``) on the ``587``
     submission port; port ``465`` is implicit TLS (``SMTP_SSL``). Optional ``username``/``password`` do
     SMTP ``AUTH`` (over a **verified** TLS session only — a cleartext- or unverified-credential config
-    is refused). Disabling TLS (``use_tls=False``) is MITM-able and refused unless
-    ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning), like LDAPS / SQL Server / MLLP.
+    is refused). Disabling TLS (``use_tls=False``) sends the message in cleartext. It is refused
+    unless the connection declares ``tls_hop_attested`` or ``cleartext_accepted``, each with its
+    reason, or ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+    ``[security].enforcement = warn`` (loud warning).
 
     **The server certificate is verified** (``tls_verify=True``, #323) — chain, hostname and strict RFC
     5280 flags, anchored to the OS roots, a per-connection ``tls_ca_file``, or the instance-wide
     ``[tls].internal_ca_file`` (ADR 0093). ``smtplib``'s own default context verifies **nothing**
     (``CERT_NONE``/``check_hostname=False``), so before #323 ``use_tls=True`` bought encryption without
     authentication. Point ``tls_ca_file`` at your relay's CA PEM for a private-CA server;
-    ``tls_verify=False`` is a trusted-network dev/test escape, refused on an enforcing production-PHI
-    instance even with ``MEFOR_ALLOW_INSECURE_TLS``, and it also refuses SMTP ``AUTH``.
-    The egress host is gated by ``[egress].allowed_smtp``, and every recipient's domain by the
-    deny-by-default ``[egress].allowed_recipient_domains`` (an empty list refuses the destination). Put
+    ``tls_verify=False`` is a trusted-network dev/test setting, refused unless
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``, and it
+    also refuses SMTP ``AUTH``.
+    The egress host is gated by ``[egress].allowed_smtp``, and every recipient's domain and the
+    sender's domain by the deny-by-default ``[egress].allowed_recipient_domains`` (an empty list
+    refuses the destination; the sender is listed because bounces go to it). Put
     secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
@@ -3104,8 +3191,8 @@ def Direct(
     subject: str | EnvRef = "",  # static Subject
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3314,7 +3401,7 @@ def DICOMweb(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -3354,8 +3441,9 @@ def DICOMweb(
         "DICOMweb",
         tls_ca_file,
         # Unlike REST/FHIR/SOAP there is no token hop here that would still read it.
+        # A Python None is the default, on, as the connector reads it (vault BACKLOG #3230).
         unread=None
-        if verify_tls
+        if verify_tls is None or verify_tls
         else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
     )
     _check_tls_ca_pin("DICOMweb", tls_ca_pin, tls_ca_file)
@@ -3480,7 +3568,7 @@ def Database(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3571,7 +3659,7 @@ def DatabasePoll(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3595,8 +3683,9 @@ def DatabasePoll(
     high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
     whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
     (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
-    ``env()``; TLS is on by default (weakening needs ``MEFOR_ALLOW_INSECURE_TLS``); the polled ``server``
-    is gated by ``[egress].allowed_db``.
+    ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
+    ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
 
     ``poll_max_rows`` mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one poll
     fetches at most this many rows and leaves the rest of the result set in the table for the next poll.
@@ -3717,7 +3806,7 @@ def Soap(
     basic_user: str | EnvRef | None = None,
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3862,7 +3951,8 @@ def Sftp(
     uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
-    refused) — accepting an unknown key needs ``MEFOR_ALLOW_INSECURE_TLS``. Put secrets (``password``/
+    refused) — ``MEFOR_ALLOW_INSECURE_TLS`` accepts an unknown key only at
+    ``[security].enforcement = warn``. Put secrets (``password``/
     ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
     refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
@@ -3910,8 +4000,7 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
-    # unless a hand-built spec sets tls_check_hostname=False. That key, and tls_verify=False, are
-    # refused outright when a username or password is set (vault BACKLOG #2636).
+    # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3937,12 +4026,9 @@ def Ftp(
     """An **FTP** (``tls=False``) or **FTPS** (``tls=True`` — explicit TLS) endpoint, source **and**
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
-    Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
-    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
-    the server certificate is verified, name included: a hand-built spec that sets
-    ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
-    refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    A ``username`` or ``password`` is **refused** over plain ``ftp`` (use ``tls=True`` for FTPS, or
+    :func:`Sftp`), and over FTPS with a check off; docs/SECURITY-LOOSENING.md, *No escape sends a
+    credential to an unverified peer*, states the rule. Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
     ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
 
@@ -5538,8 +5624,10 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    value = settings.get("tls_check_hostname", True)
-    return isinstance(value, EnvRef) or not value
+    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
+    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+        return True
+    return not bool_setting(settings, "tls_check_hostname", default=True)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
@@ -7064,6 +7152,54 @@ def config_py_files(directory: Path) -> list[Path]:
     return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
 
 
+#: How every config-source refusal of a load begins.
+_CONFIG_SOURCE_LEAD = "refusing to load config from"
+
+#: The folder Python's source loader reads compiled modules from. A matching cache file there runs
+#: in place of the source beside it, so whoever can write it changes the code a load runs.
+_BYTECODE_CACHE_DIR = "__pycache__"
+
+
+def config_source_trust_paths(directory: Path) -> list[Path]:
+    """Every path in ``directory`` whose writer could change what a load of it runs or reads.
+
+    The directory and each ``*.py`` (:func:`config_py_files`), and, when they exist, the
+    ``__pycache__`` folder and each entry in it, ``connections.toml``, and the ``codesets`` folder
+    with each table the loader reads from it. Both config-source trust checks walk this list (vault
+    BACKLOG #2626 step 3, #2596 step 4).
+
+    **The cache folder is the reason for the list.** The loader uses Python's ordinary source loader,
+    which runs a matching ``.pyc`` in place of the ``.py`` and never compares the two. The checks
+    used to read the ``.py`` alone, so a cache file nobody vetted could run under a source that
+    passed (vault BACKLOG #2596).
+
+    **Not on the list:** the value file and the settings file, which sit outside the config
+    directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
+    folders above ``directory``."""
+    # Lazy: connections_file imports this module (no circular import at load time).
+    from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
+
+    paths = [directory, *config_py_files(directory)]
+    cache = directory / _BYTECODE_CACHE_DIR
+    if cache.is_dir():
+        paths.append(cache)
+        paths.extend(sorted(cache.iterdir()))
+    connections = directory / CONNECTIONS_FILE_NAME
+    if connections.exists():
+        paths.append(connections)
+    codesets = directory / CODESETS_DIR_NAME
+    if codesets.is_dir():
+        paths.append(codesets)
+        # The loader's own rule (code_sets.load_code_sets): a file whose suffix, in lower case, is
+        # .csv or .toml. Matched the same way here, so a table spelled .CSV is vetted on POSIX too.
+        paths.extend(
+            p
+            for p in sorted(codesets.iterdir())
+            if p.is_file() and p.suffix.lower() in (".csv", ".toml")
+        )
+    return paths
+
+
 def _config_module_name(path: Path) -> str:
     # Derive a collision-free module name from the resolved absolute path (not just the stem):
     # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
@@ -7618,7 +7754,7 @@ def _evaluate_config_dacl(
     reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
     process token could not be read) **skips** the owner comparison here, because there is nothing to
     compare an owner against. This function does not refuse on it; the caller does.
-    :func:`_enforce_windows_config_source` refuses an unreadable token before any path is evaluated
+    :func:`_enforce_windows_paths` refuses an unreadable token before any path is evaluated
     (BACKLOG #1654), so the skip is reached only when an honoured
     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has downgraded that refusal, and the ACE pass still runs
     for that load.
@@ -7662,7 +7798,7 @@ class _WinPathSecurity:
     """What the Win32 read of one candidate path returned, before any policy is applied.
 
     :func:`_win32_config_source_probes` fills this in with ctypes, and
-    :func:`_enforce_windows_config_source` decides on it. The split lets every error arm of the Windows
+    :func:`_enforce_windows_paths` decides on it. The split lets every error arm of the Windows
     check run on the Linux CI leg: a test hands the enforcer a fake reader at this boundary instead of
     replacing the check itself (BACKLOG #1654). The enforcer reads the fields in order, and the first
     one that failed is the one its refusal names."""
@@ -7692,11 +7828,21 @@ class _WinConfigSourceProbes:
     owner_in_admins: Callable[[str], bool | None]
 
 
-def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProbes) -> None:
-    """Refuse the config source unless the directory and each ``*.py`` read clean and pass the policy.
+def _enforce_windows_paths(
+    paths: Sequence[Path],
+    probes: _WinConfigSourceProbes,
+    *,
+    lead: str,
+    refuse: Callable[[str], None],
+    first_is_required: bool = False,
+) -> None:
+    """Hand ``refuse`` a reason for each path in ``paths`` that does not read clean and pass the
+    policy. Each message starts with ``lead``.
 
-    The candidate set matches POSIX: the directory plus every ``*.py``, ``_*.py`` helpers included.
-    A NULL DACL is a refusal, and so is anything :func:`_evaluate_config_dacl` rejects.
+    For a config load ``paths`` is :func:`config_source_trust_paths`: the directory, every ``*.py``
+    with ``_*.py`` helpers included, and the cache, connections and code-set files, the same set the
+    POSIX arm reads. With ``first_is_required``, a not-found read of the first path refuses outright: that is the
+    config directory itself. Any other path that is gone by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -7714,19 +7860,25 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
     wider ``except OSError: continue`` that this change leaves as it is.
 
     Kept free of ctypes so the whole decision is testable on every platform."""
+    if not paths:
+        return
     if probes.self_sid is None:
-        _refuse_unsafe_config_source(
-            f"refusing to load config from {directory}: this process's own user SID could not be "
-            f"read, so the owner of the config source cannot be vetted; see docs/SERVICE.md"
+        refuse(
+            f"{lead} {paths[0]}: this process's own user SID could not be read, so the owner "
+            f"of each path cannot be vetted; see docs/SERVICE.md"
         )
-    for path in [directory, *config_py_files(directory)]:
+    for index, path in enumerate(paths):
         sec = probes.read_path(path)
-        if sec.status in _WIN_PATH_GONE_ERRORS and path != directory and not os.path.lexists(path):
+        if (
+            sec.status in _WIN_PATH_GONE_ERRORS
+            and not (first_is_required and index == 0)
+            and not os.path.lexists(path)
+        ):
             continue
         if sec.status != 0:
             detail = f": {sec.status_text}" if sec.status_text else ""
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: its owner and DACL could not be read (Win32 "
+            refuse(
+                f"{lead} {path}: its owner and DACL could not be read (Win32 "
                 f"error {sec.status}{detail}), so it cannot be shown safe to execute; see "
                 f"docs/SERVICE.md for required permissions"
             )
@@ -7734,20 +7886,20 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
         # A NULL DACL means "no DACL present": everyone is implicitly allowed full control. That is an
         # observed insecure state, not an inability to read one.
         if not sec.dacl_present:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: it has no DACL at all (a null DACL: everyone "
+            refuse(
+                f"{lead} {path}: it has no DACL at all (a null DACL: everyone "
                 f"implicitly has full control); see docs/SERVICE.md for required permissions"
             )
             continue
         if sec.owner_sid is None:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: its owner SID could not be resolved, so it "
+            refuse(
+                f"{lead} {path}: its owner SID could not be resolved, so it "
                 f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
             )
             continue
         if sec.aces is None:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path}: its DACL could not be enumerated, so it "
+            refuse(
+                f"{lead} {path}: its DACL could not be enumerated, so it "
                 f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
             )
             continue
@@ -7755,26 +7907,42 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
             sec.owner_sid, sec.aces, probes.self_sid, probes.owner_in_admins
         )
         if reason is not None:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from writable-by-others path {path}: {reason}; "
+            refuse(
+                f"{lead} writable-by-others path {path}: {reason}; "
                 f"see docs/SERVICE.md for required permissions"
             )
 
 
-def _assert_safe_config_source_windows(directory: Path) -> None:
-    """Windows NTFS-DACL/owner check mirroring the POSIX guard (SEC-003).
+def _assert_safe_config_source_windows(
+    paths: Sequence[Path],
+    *,
+    lead: str,
+    refuse: Callable[[str], None],
+    first_is_required: bool = False,
+) -> None:
+    """Windows NTFS-DACL/owner check mirroring the POSIX guard (SEC-003), over ``paths``.
 
     Reads the Win32 inputs through :func:`_win32_config_source_probes` and hands them to the pure
-    :func:`_enforce_windows_config_source`, which makes every decision, including what a failed read
-    means. All ctypes work stays behind the ``sys.platform == 'win32'`` guard so mypy/lint pass on the
-    Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`)."""
+    :func:`_enforce_windows_paths`, which makes every decision, including what a failed read means.
+    All ctypes work stays behind the ``sys.platform == 'win32'`` guard so mypy/lint pass on the
+    Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`).
+
+    **The one Windows seam.** The config load and the ``serve`` start check (vault BACKLOG #2626)
+    both read through it, so the test suites replace this one name with clean readers on win32,
+    where the checkout's own access list grants ``BUILTIN\\Users`` write."""
     if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
         return
-    _enforce_windows_config_source(directory, _win32_config_source_probes())
+    _enforce_windows_paths(
+        paths,
+        _win32_config_source_probes(),
+        lead=lead,
+        refuse=refuse,
+        first_is_required=first_is_required,
+    )
 
 
 def _win32_config_source_probes() -> _WinConfigSourceProbes:
-    """Build the ctypes/advapi32 readers for :func:`_enforce_windows_config_source`.
+    """Build the ctypes/advapi32 readers for :func:`_enforce_windows_paths`.
 
     Nothing here decides. Each reader reports what it could and could not read, and the enforcer
     turns a failed read into a refusal."""
@@ -8181,21 +8349,52 @@ def _assert_safe_config_source(directory: Path) -> None:
     uid; when the engine runs as root, only a root owner is trusted** -- the owner rule
     :func:`messagefoundry.auth.anchor_path.posix_path_verdict` applies to a trust anchor. A
     root-owned, read-only config is therefore accepted under a service-account engine. This check
-    reads only the directory and its ``*.py`` (following links), not the directories above it, as
-    that function does; docs/SERVICE.md states what the layout then still depends on. On Windows the
-    equivalent
-    NTFS-DACL check now runs in-process
-    (:func:`_assert_safe_config_source_windows`, SEC-003): the directory and each ``*.py``
-    owner/DACL is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
+    reads the paths :func:`config_source_trust_paths` lists (following links): the directory, its
+    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables. It does not read the
+    directories above it, as that function does; docs/SERVICE.md states what the layout then still
+    depends on. On Windows the equivalent NTFS-DACL check now runs in-process
+    (:func:`_assert_safe_config_source_windows`, SEC-003): the owner and DACL of each of those
+    paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
     principal a write-class right, **or when its owner is neither the engine's own account nor an
     administrator** (the Windows counterpart of that foreign-uid arm, CONFIG-2) — no longer a silent
     no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
     if not directory.is_dir():
         return
+    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
+    # writable/foreign-owned helper is just as much an injection vector (review M-21).
+    _check_trusted_paths(
+        config_source_trust_paths(directory),
+        lead=_CONFIG_SOURCE_LEAD,
+        refuse=_refuse_unsafe_config_source,
+        first_is_required=True,
+    )
+
+
+def _check_trusted_paths(
+    paths: Sequence[Path],
+    *,
+    lead: str,
+    refuse: Callable[[str], None],
+    first_is_required: bool = False,
+) -> None:
+    """Hand ``refuse`` a reason for each path in ``paths`` the config-source policy would refuse:
+    the owner and DACL on Windows, the mode and owning uid on POSIX. Every caller of the policy, the
+    config load and the ``serve`` start check, comes through here."""
     if sys.platform == "win32":
-        _assert_safe_config_source_windows(directory)
-        return
-    if os.name != "posix":
+        _assert_safe_config_source_windows(
+            paths, lead=lead, refuse=refuse, first_is_required=first_is_required
+        )
+    elif os.name == "posix":
+        _enforce_posix_paths(paths, lead=lead, refuse=refuse)
+
+
+def _enforce_posix_paths(
+    paths: Sequence[Path], *, lead: str, refuse: Callable[[str], None]
+) -> None:
+    """Hand ``refuse`` a reason for each path in ``paths`` another account could write: a group- or
+    world-writable mode, or an owner other than root or the engine's own effective uid. Each message
+    starts with ``lead``. A path that cannot be stat'ed is skipped."""
+    if sys.platform == "win32":  # pragma: no cover - callers reach this arm off Windows only
         return
     # The EFFECTIVE uid is the account the executed code runs as, so it is the one to compare. Called
     # directly: os.geteuid exists on every POSIX platform, and a missing one must fail loudly rather
@@ -8205,17 +8404,14 @@ def _assert_safe_config_source(directory: Path) -> None:
     # root engine trusts only root (the set collapses to {0}): any other owner could rewrite code
     # that then runs as root.
     trusted_uids = frozenset({0, euid})
-    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
-    # writable/foreign-owned helper is just as much an injection vector (review M-21).
-    candidates = [directory, *config_py_files(directory)]
-    for path in candidates:
+    for path in paths:
         try:
             st = path.stat()
         except OSError:
             continue
         if st.st_mode & _GROUP_WORLD_WRITABLE:
-            _refuse_unsafe_config_source(
-                f"refusing to load config from group/world-writable path {path} "
+            refuse(
+                f"{lead} group/world-writable path {path} "
                 f"(mode {oct(st.st_mode & 0o777)}); see docs/SERVICE.md for required permissions"
             )
             continue
@@ -8223,11 +8419,90 @@ def _assert_safe_config_source(directory: Path) -> None:
         # escalation vector even at 0644 -- that user can rewrite it (CONFIG-2 / review M-21).
         if st.st_uid not in trusted_uids:
             trusted = "root" if euid == 0 else f"root or uid {euid}"
-            _refuse_unsafe_config_source(
-                f"refusing to load config from {path} owned by uid {st.st_uid} -- the engine runs as "
+            refuse(
+                f"{lead} {path} owned by uid {st.st_uid} -- the engine runs as "
                 f"uid {euid} and trusts only an owner that is {trusted}; that owner could rewrite "
                 "the executed code (see docs/SERVICE.md)"
             )
+
+
+# --- the serve start check (vault BACKLOG #2626 step 3) ------------------------------------------------
+#
+# The config tree is checked by every load, above. A start also reads two files that sit outside it,
+# and runs code from two places nothing checked. Each goes through the policy above, so there is one
+# answer to "who can write this path" for config and for start, on each platform.
+
+
+def _file_and_folder(files: Iterable[Path]) -> list[Path]:
+    """Each file in ``files`` that exists, then the folder it sits in, each path once.
+
+    The folder counts because whoever can write it can replace the file. A file that does not exist
+    is left out with its folder, because nothing reads it. The value file is read again on every
+    reload, and each of those reads checks it again (``serve``'s ``env_values``), so one created
+    after the start is checked when it is first read."""
+    return list(
+        dict.fromkeys(
+            path
+            for file in files
+            if file.is_file()
+            for path in (file.absolute(), file.absolute().parent)
+        )
+    )
+
+
+def assert_trusted_start_paths(
+    files: Iterable[Path], *, lead: str = "refusing to start from"
+) -> None:
+    """Refuse a start that reads a settings file or value file another account could write.
+
+    ``files`` are the settings file and the value file this start reads. Each one that exists is
+    checked with the folder it sits in, by the config-source policy: on Windows the owner and DACL,
+    on POSIX the mode and the owning uid. A refusal raises :class:`WiringError` through
+    :func:`_refuse_unsafe_config_source`, so the clamped ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``
+    escape downgrades it exactly as it does a config refusal (vault BACKLOG #2599). Each message
+    starts with ``lead``, so a re-read of the value file on reload says what it refused.
+
+    Neither file is code, but each one steers code: the settings file sets the posture, the DR hook
+    command, the reload roots and the egress lists, and the value file feeds every ``env()`` lookup
+    in the graph. A writer of either would own the service at its next start (vault BACKLOG #2626
+    step 3).
+
+    **Not checked**, at least: the folders above each file's own folder, and a file named in the
+    settings that the start reads later, such as a key, certificate or CRL file. Those have their
+    own checks where they are read, or none."""
+    _check_trusted_paths(_file_and_folder(files), lead=lead, refuse=_refuse_unsafe_config_source)
+
+
+def install_trust_paths() -> list[Path]:
+    """The interpreter this process runs, the folder it is in, the ``messagefoundry`` package
+    folder, its ``__init__.py``, and its ``__pycache__`` folder when there is one.
+
+    Not every module in the package: a whole-package walk was declined (vault BACKLOG #1432)."""
+    package = Path(__file__).resolve().parent.parent
+    paths: list[Path] = []
+    if sys.executable:
+        interpreter = Path(sys.executable)
+        paths += [interpreter, interpreter.parent]
+    paths += [package, package / "__init__.py"]
+    cache = package / _BYTECODE_CACHE_DIR
+    if cache.is_dir():
+        paths.append(cache)
+    return paths
+
+
+def untrusted_install_paths() -> list[str]:
+    """Why the interpreter or the package folder fails the config-source policy, one line each, or
+    nothing when both pass. **Reported, never refused** (vault BACKLOG #2626 step 3).
+
+    Refusing these at start would end every service that runs from a checkout a broad principal can
+    write. Whether the project may end those services is an open owner question, the same one that
+    holds the installer's refusal of such an ``-AppExe`` (#2626 step 1), so the start names them and
+    goes on."""
+    reasons: list[str] = []
+    _check_trusted_paths(
+        install_trust_paths(), lead="the engine runs code from", refuse=reasons.append
+    )
+    return reasons
 
 
 def _exec_module(path: Path, helpers: _HelperImporter) -> None:

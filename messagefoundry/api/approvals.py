@@ -50,7 +50,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
 from messagefoundry.audit_write import write_audit_soft
@@ -939,10 +939,11 @@ class ApprovalGate:
                     self._flag_approver_provenance(
                         approval_id,
                         operation=operation,
-                        approver=approver,
+                        actor=approver,
                         requester=requester,
                         changed=changed,
                         client=client,
+                        act="release",
                     ),
                     approval_id,
                 )
@@ -1325,11 +1326,14 @@ class ApprovalGate:
         ``password_changed_at``, so the first release by each approver after such a change is flagged
         with no credential change behind it.
 
-        **It must not block a release.** A read failure is logged and reads as "nothing changed"."""
+        **It must not block a release.** A read failure is logged and reads as "nothing changed".
+
+        :meth:`resolve_interrupted` runs it on the resolver too, against the same request time
+        (BACKLOG #2125)."""
         try:
             user = await self._store.get_user(approver_user_id)
         except Exception:  # noqa: BLE001 - detection only; the release must not fail on it
-            log.exception("could not read approver account %s to check it", approver_user_id)
+            log.exception("could not read acting account %s to check it", approver_user_id)
             return []
         if user is None:
             return []
@@ -1349,31 +1353,44 @@ class ApprovalGate:
         approval_id: str,
         *,
         operation: str,
-        approver: str,
+        actor: str,
         requester: str,
         changed: list[str],
         client: str | None,
+        act: Literal["release", "resolve"],
     ) -> None:
-        """Audit and alert a release whose approver account changed after the request
-        (:meth:`_approver_changes`). Best effort: the release has already happened."""
+        """Audit and alert a release, or a resolution, whose acting account changed after the
+        request (:meth:`_approver_changes`). Best effort: the act has already happened.
+
+        ``act`` is ``release`` for :meth:`approve` and ``resolve`` for :meth:`resolve_interrupted`
+        (BACKLOG #2125). Both write the same audit action and raise the same alert type. One
+        request can carry one of each, so the row's ``act`` field says which account it flags, and
+        a resolve's alert is keyed ``approval:<id>:resolve``. Under the release's key it would fold
+        into the release's open instance and fall inside its re-alert window, and page nobody."""
         await self._record_audit_soft(
             approval_id,
             "approval.approver_provenance",
-            actor=approver,
+            actor=actor,
             detail=json.dumps(
                 {
                     "approval_id": approval_id,
                     "operation": operation,
                     "requester": requester,
                     "changed": changed,
+                    "act": act,
                 }
             ),
-            client=client,  # ADR 0150: the approver's address, matching this row's actor
-            context="the release went ahead",
+            client=client,  # ADR 0150: the acting account's address, matching this row's actor
+            context=(
+                "the release went ahead" if act == "release" else "the resolution was recorded"
+            ),
         )
         try:
+            key = (
+                f"approval:{approval_id}" if act == "release" else f"approval:{approval_id}:resolve"
+            )
             self._alert_sink.approval_approver_provenance(
-                f"approval:{approval_id}", operation=operation, changed=tuple(changed)
+                key, operation=operation, changed=tuple(changed)
             )
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
             log.exception("approval %s: the approver-provenance alert failed to emit", approval_id)
@@ -1486,6 +1503,12 @@ class ApprovalGate:
         The row keeps the releasing approver in its ``approver`` column, because that column says who
         released it. The resolver is recorded only in the audit row.
 
+        **A resolver whose account changed after the request is flagged, never refused (BACKLOG
+        #2125).** The check is :meth:`_approver_changes`, run on the resolver as approve runs it on
+        the approver. A flagged resolution writes ``approval.approver_provenance`` with ``act``
+        ``resolve`` and raises the same alert. Seat decision under owner delegation 2026-10-08, not
+        an owner ruling.
+
         **The move and its ``approval.resolved`` row are ONE write (vault BACKLOG #2255)**, so a
         resolved row always names its resolver and the outcome they recorded. If that write fails
         the call answers 503, pages ``audit_write_failed``, and the row stays ``interrupted``. A
@@ -1518,32 +1541,49 @@ class ApprovalGate:
             )
         if str(requester_user_id) == resolver_user_id:
             raise ApprovalError(403, "you cannot resolve your own request")
+        # BACKLOG #2125 (docstring above): read before the write, as approve reads before its claim.
+        changed = await self._approver_changes(resolver_user_id, float(row["requested_at"]))
+        operation = str(row["operation"])
+        requester = str(row["requester"])
         releaser = None if row["approver"] is None else str(row["approver"])
         detail = json.dumps(
             {
                 "approval_id": approval_id,
-                "operation": str(row["operation"]),
-                "requester": str(row["requester"]),
+                "operation": operation,
+                "requester": requester,
                 "approver": releaser,
                 "outcome": outcome,
                 "status": status,
                 "interrupted_at": (None if row["decided_at"] is None else float(row["decided_at"])),
             }
         )
-        await self._shielded(
-            self._record_resolution(
+
+        async def _resolve_then_flag() -> None:
+            # One shielded unit: a resolution that raised (409, 503) is not flagged, and a cancel
+            # cannot skip the flag of one that moved the row, as approve's `finally` cannot.
+            await self._record_resolution(
                 approval_id,
                 status=status,
                 releaser=releaser,
                 resolver=resolver,
                 detail=detail,
                 client=client,
-            ),
-            approval_id,
-        )
+            )
+            if changed:
+                await self._flag_approver_provenance(
+                    approval_id,
+                    operation=operation,
+                    actor=resolver,
+                    requester=requester,
+                    changed=changed,
+                    client=client,
+                    act="resolve",
+                )
+
+        await self._shielded(_resolve_then_flag(), approval_id)
         return {
-            "operation": str(row["operation"]),
-            "requested_by": str(row["requester"]),
+            "operation": operation,
+            "requested_by": requester,
             "approved_by": releaser,
             "resolved_by": resolver,
             "outcome": outcome,

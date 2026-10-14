@@ -478,19 +478,27 @@ async def test_test_connection_failure_raises_delivery_error(
 # --- [egress].allowed_smtp deny-by-default / host gate ----------------------------------------------
 
 
-#: The recipient domain every host-gate test below lists, so those tests exercise the host arm alone.
-_RCPT_DOMAINS = ["y.org"]
+#: The sender :func:`_email_dest` uses, and its domain. The list also gates the sender's domain
+#: (vault BACKLOG #2912), so every list below that is not about the sender names it.
+_SENDER_DOMAIN = "x.org"
+_SENDER = "s@" + _SENDER_DOMAIN
+
+#: The domains every host-gate test below lists, so those tests exercise the host arm alone.
+_RCPT_DOMAINS = ["y.org", _SENDER_DOMAIN]
 
 
 def _email_dest(
-    host: str, port: int = 587, recipients: list[str] | str | None = None
+    host: str,
+    port: int = 587,
+    recipients: list[str] | str | None = None,
+    sender: Any = _SENDER,
 ) -> Destination:
     return Destination(
         name="OB_EMAIL",
         type=ConnectorType.EMAIL,
         settings={
             "host": host,
-            "sender": "s@x.org",
+            "sender": sender,
             "recipients": ["r@y.org"] if recipients is None else recipients,
             "port": port,
         },
@@ -538,8 +546,10 @@ def test_allowed_smtp_deny_by_default_honours_set_list() -> None:
 
 
 def _relay_listed(domains: list[str]) -> EgressSettings:
-    """The relay host is listed, so only the recipient-domain arm can refuse."""
-    return EgressSettings(allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=domains)
+    """The relay host and the sender's domain are listed, so only the recipients can refuse."""
+    return EgressSettings(
+        allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=[*domains, _SENDER_DOMAIN]
+    )
 
 
 @pytest.mark.parametrize(
@@ -604,6 +614,106 @@ def test_recipient_domains_empty_refuses_every_email_destination(egress: EgressS
         )
 
 
+# --- the sender's domain is gated by the same list (vault BACKLOG #2912) -----------------------------
+
+
+def _sender_gate(sender: Any, domains: list[str]) -> None:
+    """Run the check with the relay and the recipient's domain listed, so only the sender can
+    refuse."""
+    e = EgressSettings(
+        allowed_smtp=["smtp.hospital.example"],
+        allowed_recipient_domains=["hospital.example", *domains],
+    )
+    dest = _email_dest("smtp.hospital.example", recipients=["a@hospital.example"], sender=sender)
+    check_egress_allowed(dest, e)
+
+
+@pytest.mark.parametrize(
+    ("sender", "domains"),
+    [
+        ("engine@sender.example", ["sender.example"]),
+        ("engine@SENDER.Example", ["sender.example"]),  # the match ignores case, both ways
+        ("engine@sender.example", ["Sender.EXAMPLE"]),
+        ("engine@mail.sender.example", ["mail.sender.example"]),  # a listed subdomain passes
+        ("engine@hospital.example", []),  # the recipients' own domain is a listed domain
+    ],
+)
+def test_a_listed_sender_domain_passes(sender: str, domains: list[str]) -> None:
+    _sender_gate(sender, domains)
+
+
+@pytest.mark.parametrize(
+    ("sender", "domains"),
+    [
+        ("engine@partner.example", []),  # recipients listed, the sender's domain is not
+        ("engine@partner.example", ["sender.example"]),
+        ("engine@mail.sender.example", ["sender.example"]),  # a subdomain needs its own entry
+        ("engine@sender.example", ["mail.sender.example"]),  # and a parent is not a subdomain
+        ("engine@notsender.example", ["sender.example"]),  # a listed domain as a suffix
+    ],
+)
+def test_an_unlisted_sender_domain_is_refused_and_named(sender: str, domains: list[str]) -> None:
+    domain = sender.rpartition("@")[2].lower()
+    with pytest.raises(WiringError, match="sender domain") as refused:
+        _sender_gate(sender, domains)
+    text = str(refused.value)
+    assert repr(domain) in text
+    assert "allowed_recipient_domains" in text and "bounces" in text
+    # The error names the domain, never the full address.
+    assert sender not in text and sender.lower() not in text
+
+
+def test_an_unlisted_sender_domain_is_refused_when_the_destination_is_built() -> None:
+    # build_destination is the load, reload and start path; it runs the check before construction.
+    from messagefoundry.transports.base import build_destination
+
+    dest = _email_dest(
+        "smtp.hospital.example", recipients=["a@hospital.example"], sender="e@partner.example"
+    )
+    e = EgressSettings(
+        allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=["hospital.example"]
+    )
+    with pytest.raises(WiringError, match="EMAIL sender domain 'partner.example'"):
+        build_destination(dest, egress=e)
+    # Control: the same destination builds once the sender's domain is listed.
+    listed = EgressSettings(
+        allowed_smtp=["smtp.hospital.example"],
+        allowed_recipient_domains=["hospital.example", "partner.example"],
+    )
+    assert isinstance(build_destination(dest, egress=listed), EmailDestination)
+
+
+def test_an_empty_list_refuses_the_sender_on_its_own() -> None:
+    # The recipient arm runs first and refuses an empty list itself, so call the sender arm
+    # directly: it must fail closed on its own terms, not lean on the recipient arm.
+    from messagefoundry.transports.egress import _check_email_sender_domain
+
+    dest = _email_dest("smtp.hospital.example", sender="e@hospital.example")
+    with pytest.raises(WiringError, match="EMAIL sender domain .*empty list permits no sender"):
+        _check_email_sender_domain(dest, frozenset())
+
+
+@pytest.mark.parametrize(
+    ("sender", "why"),
+    [
+        (None, "names no sender address"),
+        ("", "names no sender address"),
+        (["e@hospital.example"], "names no sender address"),
+        ("Ops <e@hospital.example>", "an EMAIL sender does not read back"),
+        ("e@hospital.example.", "an EMAIL sender has .*empty label"),
+        ("-e@hospital.example", "an EMAIL sender has a local part that starts with a hyphen"),
+    ],
+    ids=["missing", "empty", "not-a-string", "display-name", "trailing-dot", "leading-hyphen"],
+)
+def test_a_sender_the_gate_cannot_read_is_refused(sender: Any, why: str) -> None:
+    # A listed domain does not rescue a sender that is not one plain address: a gate that could not
+    # read the domain has not passed it.
+    with pytest.raises(WiringError, match=why) as refused:
+        _sender_gate(sender, [])
+    if isinstance(sender, str) and sender:
+        assert sender not in str(refused.value)
+
+
 def _address_of_length(local_len: int, total_len: int) -> str:
     """A plain address with a local part of ``local_len`` octets and ``total_len`` overall, ending
     in ``hospital.example``. Long domains use three 63-octet labels plus one sized to fit."""
@@ -633,7 +743,7 @@ def test_the_rfc_5321_size_limits_are_the_boundary(
 ) -> None:
     address = _address_of_length(local_len, total_len)
     domain = address.rpartition("@")[2]
-    e = EgressSettings(allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=[domain])
+    e = _relay_listed([domain])
     dest = _email_dest("smtp.hospital.example", recipients=[address])
     if allowed:
         check_egress_allowed(dest, e)
@@ -837,6 +947,88 @@ def test_a_lone_surrogate_in_the_subject_is_refused_at_load(code: int) -> None:
     with pytest.raises(ValueError, match="'subject' holds a lone surrogate") as caught:
         EmailDestination(dest)
     assert subject not in str(caught.value)
+
+
+#: RFC 2047 encoded words that hold no control character as text and decode to one. The first is
+#: the row's own example (vault BACKLOG #3206): the base64 is short, and the parser still reads NULs.
+_ENCODED_CONTROL_SUBJECTS = {
+    "utf16-nul": "=?utf-16?b?AAA?=",
+    "utf8-nul": "=?utf-8?b?AA==?=",
+    "del-mid-subject": "Referral =?utf-8?q?=7F?= note",
+    "carriage-return": "=?utf-8?q?a=0Db?=",
+    "crlf": "=?utf-8?q?a=0D=0ABcc:_x?=",
+    "next-line": "=?utf-8?q?=C2=85?=",
+    "line-separator": "=?utf-8?q?=E2=80=A8?=",
+}
+
+
+@pytest.mark.parametrize(
+    "subject", _ENCODED_CONTROL_SUBJECTS.values(), ids=_ENCODED_CONTROL_SUBJECTS.keys()
+)
+def test_an_encoded_word_subject_that_decodes_to_a_control_character_is_refused_at_load(
+    subject: str,
+) -> None:
+    # CONTROL for the instrument: as text the subject is clean, so only the header read can refuse
+    # it, and the header read does hold a control character.
+    assert not email_module._holds_control_char(subject)
+    probe = EmailMessage()
+    probe["Subject"] = subject
+    assert email_module._holds_control_char(str(probe["Subject"]))
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings["subject"] = subject
+    with pytest.raises(ValueError, match="'subject' holds an encoded word that decodes") as caught:
+        EmailDestination(dest)
+    assert subject not in str(caught.value)
+
+
+@pytest.mark.parametrize("subject", ["=?utf-16?b?AAA?=", "=?utf-8?b?AA==?=", "x =?utf-8?q?=7F?= y"])
+def test_the_refused_subject_would_have_put_a_raw_control_byte_on_the_wire(subject: str) -> None:
+    """What the load refusal prevents, measured on the email package itself: the generator writes
+    the decoded control character raw into the ``Subject:`` line."""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    [line] = [
+        raw
+        for raw in msg.as_bytes(policy=email.policy.SMTP).split(b"\r\n")
+        if raw[:8] == b"Subject:"
+    ]
+    assert b"\x00" in line or b"\x7f" in line, line
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "",
+        "Result ready",
+        "Result  ready ",  # runs of spaces and a trailing one read back unchanged
+        "=?utf-8?b?UsOpZg==?=",  # an encoded word that decodes to plain text is still allowed
+        "=?utf-8?b?AA==",  # not an encoded word (no closing ?=), so nothing decodes
+        "long " * 40,  # folded when written; the fold adds no control character to the value
+    ],
+)
+def test_a_subject_whose_header_read_is_clean_still_loads(subject: str) -> None:
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings["subject"] = subject
+    built = EmailDestination(dest)._build_message("PID|1|synthetic")
+    assert not email_module._holds_control_char(str(built["Subject"]))
+
+
+def test_a_subject_the_header_class_cannot_take_is_refused_at_load_by_type_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe sets the subject once at load, so a fault the header class raises is a load
+    refusal instead of a failure at every send (vault BACKLOG #3206, item 6a). The text checks
+    refuse every shape known to raise there, so they are switched off to reach the probe's arm."""
+    monkeypatch.setattr(email_module, "has_lone_surrogate", lambda _value: False)
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    subject = f"Referral {_LONE_SURROGATE} note"
+    dest.settings["subject"] = subject
+    with pytest.raises(ValueError, match="'subject' cannot be set as a header") as caught:
+        EmailDestination(dest)
+    text = str(caught.value)
+    assert "UnicodeEncodeError" in text
+    assert "Referral" not in text and "note" not in text
+    assert caught.value.__context__ is None, "the chain must not hold the error that names it"
 
 
 def test_a_non_ascii_subject_that_can_be_encoded_is_written_as_utf8() -> None:
@@ -1267,6 +1459,39 @@ def test_credentials_over_a_fully_verified_hop_still_construct() -> None:
     # POSITIVE CONTROL. Proves the new gate can be PASSED, so the test above is not green merely
     # because EmailDestination refuses every credentialed construction.
     EmailDestination(_dest(username="svc", password="pw"))
+
+
+_WEAK_HOPS = [{"use_tls": False}, {"tls_verify": False}, {"tls_check_hostname": False}]
+_HOP_LEVERS: list[dict[str, Any]] = [
+    {},
+    {"tls_hop_attested": True, "tls_hop_attested_reason": "on-box relay in a unit test"},
+    {"cleartext_accepted": True, "cleartext_reason": "accepted in a unit test"},
+]
+
+
+@pytest.mark.parametrize("weak", _WEAK_HOPS, ids=["cleartext", "verify-off", "name-off"])
+@pytest.mark.parametrize("lever", _HOP_LEVERS, ids=["none", "attested", "accepted"])
+def test_a_credential_refusal_names_the_connection_and_only_levers_that_fix_it(
+    weak: dict[str, bool], lever: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3230: on an enforcing instance a credentialed weak hop used to meet the body
+    refusal first, which offered the escape, tls_hop_attested or cleartext_accepted. None of those
+    lifts the credential refusal, so it now runs first and names only settings that do."""
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    config = Destination(
+        name="OB_EMAIL",
+        type=ConnectorType.EMAIL,
+        settings=_dest(username="svc", password="synthetic", **weak).settings,
+        **lever,
+    )
+    with pytest.raises(ValueError, match="authentication credentials") as info:
+        EmailDestination(config)
+    message = str(info.value)
+    assert "connection 'OB_EMAIL'" in message
+    assert "No escape, posture or attestation lifts this" in message and "tls_ca_file" in message
+    for lever_name in (INSECURE_TLS_ESCAPE_ENV, "tls_hop_attested", "cleartext_accepted"):
+        assert lever_name not in message
+    assert "synthetic" not in message
 
 
 async def test_tls_verify_false_with_escape_builds_an_unverified_context(

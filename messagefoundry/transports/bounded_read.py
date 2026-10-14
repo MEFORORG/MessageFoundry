@@ -22,19 +22,21 @@ refuse is a *reply* to a request the engine made.
 Where it surfaces inside a delivery, the worker retries the delivery and then dead-letters it,
 as it does for any reply the engine could not read (a timeout mid-read, a reset socket). A token
 endpoint's over-cap reply is one such case, when a delivery mints its bearer before it sends. At
-least a probe, the alert webhook and a ``fhir_lookup`` raise the error to their own caller
-instead, and nothing retries those.
+least a probe and a ``fhir_lookup`` raise the error to their own caller instead, and nothing
+retries those. So does the alert webhook, unless the reply is a 2xx: see :func:`drain_2xx_reply`.
 
 A delivery that already holds a 2xx status is different, because a retry would send again a
 request the partner answered 2xx (vault BACKLOG #2180).
 :func:`read_2xx_reply_text` reads that body and states the rule. In short, an over-cap body
-there is either dropped with a WARNING or refused for good with code :data:`REPLY_TOO_LARGE_CODE`,
-which is a dead-letter cause the bound did not have before. Each destination's ``_post`` says
-which, and ``docs/CONNECTIONS.md`` has the table. The four HTTP destinations all read their 2xx
-reply through it.
+there is either dropped, which the delivery worker records on the message and then logs, or
+refused for good with code :data:`REPLY_TOO_LARGE_CODE`, which is a dead-letter cause the bound
+did not have before. Each destination's ``_post`` says which, and ``docs/CONNECTIONS.md`` has
+the table. The four HTTP destinations all read their 2xx reply through it.
 
-**Only the byte bound is covered.** At least a reply that is truncated or misframed after a 2xx
-still retries, and so sends the request again.
+The same helper handles a 2xx body that is truncated or misframed, under the same rule and with
+codes of its own (BACKLOG #2989). A peer that closes cleanly part-way is a truncated reply. At least
+a read that times out, or that a connection reset (an error, not a clean close) cuts off part-way
+through a 2xx body is not covered: those still retry, and so send the request again.
 
 **A ceiling is not a completeness check, and this module once carried only the ceiling** (BACKLOG
 #1575). Bounding the read answered "did the peer send too much?" and nothing answered "did the peer
@@ -107,13 +109,14 @@ refused before anything enters the tunnel.
 is about the request, not the reply. It lives here because :func:`build_strict_opener` is the one
 place every engine urllib opener is built. See :class:`LoopbackDirectProxyHandler`.
 
-**A proxy URL that carries credentials is refused unless it is written** ``https://`` (vault
-BACKLOG #2572, ASVS 12.2.1). The same handler makes that check, for the same reason. See
-:class:`ProxyCredentialsRefusedError`, which also says what the check does not cover.
+**A credential from a proxy URL never reaches a proxy in cleartext** (vault BACKLOG #2572, #3410,
+ASVS 12.2.1). The same handler makes that check, for the same reason. See
+:class:`ProxyCredentialsRefusedError`, which states the rule and what it does not cover.
 """
 
 from __future__ import annotations
 
+import base64
 import email.message
 import email.parser
 import functools
@@ -124,21 +127,25 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
-from typing import Any, Protocol, cast
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, cast, overload
 
-from messagefoundry.config.tls_policy import is_loopback_hop_host
+from messagefoundry.config.tls_policy import is_loopback_hop_host, verifies_peer_fully
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
     "MAX_TOKEN_RESPONSE_BYTES",
+    "REPLY_MISFRAMED_CODE",
     "REPLY_TOO_LARGE_CODE",
+    "REPLY_TRUNCATED_CODE",
     "AmbiguousFramingError",
     "EgressReplyError",
     "LoopbackDirectProxyHandler",
     "MalformedReplyHeadError",
+    "NoRedirectHandler",
     "ProxyCredentialsRefusedError",
     "ResponseTooLargeError",
     "StrictHTTPHandler",
@@ -149,6 +156,7 @@ __all__ = [
     "drain_bounded",
     "hop_identity",
     "is_never_proxied_host",
+    "is_proxy_credential_header_name",
     "read_2xx_reply_text",
     "read_bounded",
     "read_bounded_text",
@@ -232,9 +240,13 @@ class TruncatedResponseError(EgressReplyError):
 
     A :class:`~messagefoundry.transports.base.DeliveryError`, therefore transient and retryable,
     for the same reason :class:`ResponseTooLargeError` is: a connection cut mid-body is a peer-side
-    or network fault, and the next attempt may well complete. Promoting it to a permanent
-    :class:`~messagefoundry.transports.base.NegativeAckError` would dead-letter a message on a
-    dropped socket.
+    or network fault, and the next attempt may well complete.
+
+    **Except after a 2xx on a delivery** (BACKLOG #2989). There a retry would re-send a request
+    the partner answered 2xx, so :func:`read_2xx_reply_text` stops it. Where the engine needs the
+    body, that is a permanent refusal: a peer or a middlebox that closes the socket cleanly
+    before the declared length dead-letters the message once, by design, rather than re-sending
+    it. Only a read that fails with an error, such as a reset or a timeout, is still retried.
     """
 
 
@@ -258,6 +270,9 @@ class AmbiguousFramingError(EgressReplyError):
     dead-letters it when the policy runs out. It is not a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError`, because a misframed reply may come
     from an intermediary on one path rather than from the partner itself.
+
+    A destination that reads its 2xx reply through :func:`read_2xx_reply_text` does not let a
+    misframed body travel that far, because a retry would re-send the request (BACKLOG #2989).
     """
 
     def __init__(self, message: str, *, reason: str) -> None:
@@ -683,6 +698,7 @@ class StrictHTTPHandler(urllib.request.HTTPHandler):
     """urllib's ``http`` handler, reading each reply with :class:`StrictHTTPResponse`."""
 
     def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        _refuse_proxy_credentials_on_this_leg(req, context=None)
         return self.do_open(_StrictHTTPConnection, req)
 
 
@@ -694,7 +710,9 @@ class StrictHTTPSHandler(urllib.request.HTTPSHandler):
     """
 
     def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
-        return self.do_open(_StrictHTTPSConnection, req, context=_tls_context_of(self))
+        context = _tls_context_of(self)
+        _refuse_proxy_credentials_on_this_leg(req, context=context)
+        return self.do_open(_StrictHTTPSConnection, req, context=context)
 
 
 def _tls_context_of(handler: urllib.request.HTTPSHandler) -> Any:
@@ -747,13 +765,25 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
 
     :func:`build_strict_opener` puts this on every opener it builds, in place of the stock class.
 
-    **It also refuses a proxy whose URL carries credentials and is not written** ``https://``
-    (vault BACKLOG #2572). :class:`ProxyCredentialsRefusedError` says what is refused and what is
-    not. The check is made here, per request, because this method sees the proxy from every source:
-    the environment, the system settings, and a ``proxy_url`` an operator configured. It is not
-    made when the handler is built. Shared openers are built at import, and a refusal there would
-    stop the engine starting over a proxy that many of its hops never use.
+    **It also refuses a request that would send a web-proxy credential to a proxy in cleartext**
+    (vault BACKLOG #2572, #3410, #3416). :class:`ProxyCredentialsRefusedError` states the rule.
+    The check is made here, per request and per proxy, because this method sees every proxy a
+    request is handed to, from every source: the environment, the system settings, and a
+    ``proxy_url`` an operator configured. It is not made when the handler is built. Shared openers
+    are built at import, and a refusal there would stop the engine starting over a proxy that many
+    of its hops never use.
+
+    ``caller_header_admitted`` is set only by a connection whose ``proxy_user`` credential its
+    posture-keyed guard admitted when the connection was built
+    (``transports.rest.ProxyConfig``). It lets that caller-set header across a cleartext proxy leg,
+    the one exception :class:`ProxyCredentialsRefusedError` states, and nowhere else.
     """
+
+    def __init__(
+        self, proxies: Mapping[str, str] | None = None, *, caller_header_admitted: bool = False
+    ) -> None:
+        super().__init__(None if proxies is None else dict(proxies))
+        self.caller_header_admitted = caller_header_admitted
 
     def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> Any:  # noqa: A002
         try:
@@ -763,46 +793,114 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
             host = None
         if is_never_proxied_host(host):
             return None  # not rewritten, so the scheme's own handler dials the host itself
-        _refuse_cleartext_proxy_credentials(req, proxy)
+        _refuse_cleartext_proxy_credentials(
+            req, proxy, _proxies_of(self), caller_header_admitted=self.caller_header_admitted
+        )
         return super().proxy_open(req, proxy, type)
 
 
-#: The fixed text of the proxy-credential refusal. It names no part of the proxy URL, because the
-#: part it is about is a password. It does not suggest an ``https://`` proxy either, for the reason
-#: :class:`ProxyCredentialsRefusedError` gives.
+#: The fixed texts of the proxy-credential refusals. None names any part of the proxy URL, because
+#: the part they are about is a password. The first does not suggest an ``https://`` proxy either,
+#: for the reason :class:`ProxyCredentialsRefusedError` gives.
 _CLEARTEXT_PROXY_CREDENTIALS = (
-    "the web proxy for this request carries credentials in its URL and is not an https:// proxy, "
-    "or its URL cannot be read. Those credentials would cross to the proxy in cleartext. Take the "
-    "credentials out of the proxy URL; refusing to send (vault BACKLOG #2572)"
+    "a web proxy credential for this request would cross to a proxy in cleartext: on a leg with "
+    "no TLS, on a CONNECT sent before any TLS, or from a proxy URL that cannot be read. Take the "
+    "credentials out of the proxy URL, or out of proxy_user and proxy_password; refusing to send "
+    "(vault BACKLOG #2572, #3410, #3416)"
+)
+_DIRECT_PROXY_CREDENTIALS = (
+    "this request carries a web proxy credential and would go direct, past every proxy, so the "
+    "credential would reach the destination itself; refusing to send (vault BACKLOG #3417)"
+)
+_UNSENDABLE_PROXY_HEADER = (
+    "this request holds a header named like Proxy-Authorization that can never be sent: "
+    "http.client refuses its name or its value; correct the header name"
+)
+_UNVERIFIED_PROXY_TLS = (
+    "this request would send a web proxy credential over TLS that does not fully verify the "
+    "proxy: certificate verification is off, an expired certificate is allowed, or the host name "
+    "is not checked; refusing to send (vault BACKLOG #3418)"
 )
 
 
 class ProxyCredentialsRefusedError(urllib.error.URLError):
-    """A request would send credentials from its proxy's URL to that proxy in cleartext.
+    """A request would send a web-proxy credential where it could be read on the way.
 
-    urllib turns a user and a password in a proxy URL into a ``Proxy-Authorization: Basic``
-    header. Refused by :class:`LoopbackDirectProxyHandler`, on every opener
-    :func:`build_strict_opener` makes, under every ``[security].enforcement`` setting. The proxy
-    may come from ``HTTP_PROXY`` or ``HTTPS_PROXY``, from the system proxy settings, or from a
-    connection's ``proxy_url``. The opener holds no posture and no connection, and a proxy from
-    the environment has no acceptance field. So this refusal has no acceptance and no exception
-    for a proxy on a loopback address, like the Vault hop's twin,
-    ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). Nothing refuses a
-    connection's own ``proxy_url`` when the connection is built: such a connection builds, and
-    each send is refused.
+    A web-proxy credential is a ``Proxy-Authorization`` header on a request. urllib makes one from
+    a user and a password in a proxy URL, and a caller may set one, as a connection's
+    ``proxy_user`` does. Raised on every opener :func:`build_strict_opener` makes. The proxy may
+    come from ``HTTP_PROXY`` or ``HTTPS_PROXY``, from the system proxy settings, or from a
+    connection's ``proxy_url``. The opener holds no posture, and a proxy from the environment has
+    no acceptance field. So a credential from a proxy URL has no acceptance and no exception for a
+    proxy on a loopback address, like the Vault hop's twin,
+    ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). Building a connection
+    does not refuse a credential in its own ``proxy_url``, so its sends meet the rule below. With
+    ``[security].require_nonstatic_credentials`` on, ``serve`` refuses a credential written into
+    ``proxy_url`` at start unless ``static_credential_accepted`` names the hop (BACKLOG #1182).
 
-    **Refused:** a proxy URL holding a user and a password, unless it is written ``https://``. A
-    value with no scheme counts as not ``https://``. So does a value urllib cannot parse, when it
-    holds an ``@``: urllib would refuse that one itself, with text that quotes it.
+    **The rule.** A web-proxy credential is refused on any leg where it could be read on the way:
+    in cleartext to any proxy, a second, different proxy included; on a request that goes direct,
+    past every proxy, where the destination would read it; and over TLS whose context does not
+    require the proxy's certificate, match its host name, or check its dates. A destination's
+    relaxed TLS settings apply to that leg too, because the leg to the proxy uses the same context.
+    A credential that rides a ``CONNECT`` is judged as cleartext, whatever TLS follows it.
 
-    **Not refused:** a request that sends the proxy nothing. That is a loopback target, a host on
-    urllib's own bypass list, and a URL with a user and no password, which urllib does not turn
-    into a header.
+    **The one exception covers cleartext legs only.** A caller-set header that its connection
+    admitted when it was built is sent on the cleartext leg to the proxy that connection's
+    ``transports.rest.ProxyConfig`` names. The admitting check is the connection's posture-keyed
+    guard, ``transports.rest.refuse_cleartext_credential_hop``. It admits a ``proxy_user``
+    credential in at least these cases: under ``[security].enforcement = warn``, where it logs a
+    WARNING, and when the connection declares ``cleartext_accepted`` or ``tls_hop_attested``. The
+    connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
+    header in its plain spelling only, under a name that is a ``str`` and no subclass of one. A
+    header named with any other character at either end is never admitted, and none is sent.
+    Each is judged once in a request, and the answer is kept on the request:
+    :func:`_proxy_header_verdicts` says how. One that could be sent is refused on every leg, a
+    verified TLS leg included: neither urllib nor a proxy is sure to take that spelling as the
+    proxy's own. One that can never be sent is not refused by this rule at all; the list below
+    says what happens to it. The exception never covers
+    a request that goes direct. It never covers a header whose value reads, by ``str()``, as
+    the credential a proxy URL in the handler's map makes, including one a request carries on to
+    a second proxy. :func:`_proxy_header_verdicts` says when that text is read. A value that is
+    not a ``str`` may be sent as other text than it reads as, which the list below names as
+    outside this check. **A TLS leg whose context does not fully verify the proxy is
+    refused regardless**, admitted or not, because that guard never reads the TLS context.
 
-    **Not refused, and not safe either:** a credentialed proxy written ``https://``. urllib opens
-    TLS to such a proxy only for an ``http`` target on an opener with no ``https`` proxy. For an
-    ``https`` target it opens plain TCP and sends ``CONNECT`` with the credential header before
-    any TLS. ``tests/test_proxy_url_credentials_refused.py`` measures both on the wire.
+    So an admitted header may cross a cleartext leg but not an unverified TLS leg. That asymmetry
+    is reachable only through a hand-built proxy map that sends ``http`` to an ``https://`` proxy.
+    ``ProxyConfig`` maps both schemes to one proxy, so an ``http`` target rides a ``CONNECT`` and is
+    judged as cleartext; it never reaches the unverified TLS check.
+
+    urllib keeps the header when it hands a request on to the next proxy (vault BACKLOG #3410),
+    and its redirect handler copies it onto a new request. So the check reads the header on the
+    request as well as the current proxy's URL, and :func:`build_strict_opener` refuses redirects.
+    Writing the proxy ``https://`` does not make a leg safe by itself. For an ``https`` target,
+    urllib sends ``CONNECT`` with the header before any TLS. A proxy value with no scheme is read
+    as cleartext. An unparseable value that holds an ``@`` is refused too. urllib's own error would
+    quote it.
+
+    One measured example of a leg let through is an ``http`` target sent to a credentialed
+    ``https://`` proxy whose own host urllib's bypass list names, on an opener whose context fully
+    verifies. That send reaches the proxy over TLS. It is an example, not a list.
+    ``tests/test_proxy_url_credentials_refused.py`` pins at least that example on the wire.
+
+    **Outside this check**, at least:
+
+    * A proxy credential carried in any header but ``Proxy-Authorization``. Which names count as
+      that header is :func:`is_proxy_credential_header_name`'s to say. It reads the characters a
+      name holds. A name object that answers ``title()`` with another name is sent under that
+      other name, and this check reads only the one it holds.
+    * A spelling of that name, other than the plain one, which ``http.client`` can never send.
+      Once every refusal above has had its turn, the request fails with the class of error
+      ``http.client`` raises for it, a ``ValueError`` or a ``TypeError``, and not with this
+      error. :func:`_refuse_a_proxy_header_that_can_never_be_sent` explains.
+    * The value of a plainly spelled header, where it is not a ``str``. The rule matches
+      ``str()`` of the value to a proxy URL. ``http.client`` sends a ``bytes`` value as it is,
+      and any other by what its ``encode`` gives. So at least a ``bytes`` value that holds a
+      proxy URL's credential is not matched to it.
+    * Which roots the TLS leg trusts. The check reads how the context verifies, not what it
+      trusts, so a context on the system store accepts any publicly trusted certificate for the
+      proxy's host.
 
     A :class:`urllib.error.URLError`, on purpose. It is the class urllib raises for a request it
     could not send, so each hop treats this refusal as it treats that. At least the REST, SOAP,
@@ -814,16 +912,33 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     """
 
 
-def _refuse_cleartext_proxy_credentials(req: urllib.request.Request, proxy: str) -> None:
-    """Raise :class:`ProxyCredentialsRefusedError` if ``req`` would send ``proxy`` the credentials
-    in its URL in cleartext. Called after the loopback rule, which sends the proxy nothing."""
+def _refuse_cleartext_proxy_credentials(
+    req: urllib.request.Request,
+    proxy: str,
+    proxies: Mapping[str, str],
+    *,
+    caller_header_admitted: bool,
+) -> None:
+    """Raise :class:`ProxyCredentialsRefusedError` if ``req`` would carry a web-proxy credential to
+    ``proxy`` in cleartext. ``proxies`` is the handler's own map. Called after the loopback rule,
+    which sends the proxy nothing."""
     # Raised here, outside any handler, so no parser error that quotes the URL rides on the refusal.
-    if _sends_cleartext_proxy_credentials(req, proxy):
+    if _sends_cleartext_proxy_credentials(
+        req, proxy, proxies, caller_header_admitted=caller_header_admitted
+    ):
         raise ProxyCredentialsRefusedError(_CLEARTEXT_PROXY_CREDENTIALS)
 
 
-def _sends_cleartext_proxy_credentials(req: urllib.request.Request, proxy: str) -> bool:
-    """The reading behind the refusal, made exactly as ``ProxyHandler.proxy_open`` reads ``proxy``."""
+def _sends_cleartext_proxy_credentials(
+    req: urllib.request.Request,
+    proxy: str,
+    proxies: Mapping[str, str],
+    *,
+    caller_header_admitted: bool,
+) -> bool:
+    """The reading behind the cleartext refusal. ``proxy`` is read exactly as
+    ``ProxyHandler.proxy_open`` reads it, and the request's own ``Proxy-authorization`` header is
+    read as well."""
     try:
         # Private, but it is the parser proxy_open runs, so the two readings cannot differ.
         scheme, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
@@ -831,10 +946,332 @@ def _sends_cleartext_proxy_credentials(req: urllib.request.Request, proxy: str) 
         # urllib raises this error itself, for every request, and its text quotes the value. So a
         # value that could hold credentials is refused first, in fixed text. Any other is left to it.
         return "@" in proxy
-    if not (user and password) or (scheme or "").lower() == "https":
+    # A header an earlier proxy_open put on this request rides along to this proxy (vault BACKLOG
+    # #3410), and so does one a redirect copied, and one a caller set (vault BACKLOG #3416).
+    carried = _proxy_credential_headers(req)
+    # An admission covers the header its connection made, which is spelled plainly. urllib moves
+    # only that spelling into a CONNECT, so any other would stay on the request sent inside the
+    # tunnel, and the destination would read it. So no other spelling is ever admitted.
+    oddly_spelled = not all(verdict.plain for verdict in carried)
+    admitted = caller_header_admitted and not oddly_spelled
+    values = _judged_texts(carried)
+    if not _is_from_a_proxy_url(values, user, password, proxies) and (not carried or admitted):
         return False
     # urllib dials a host on its own bypass list direct, and adds no proxy header to that request.
-    return not (req.host and urllib.request.proxy_bypass(req.host))
+    # A header already on it would then reach the destination, which the strict handlers refuse.
+    if req.host and urllib.request.proxy_bypass(req.host):
+        return False
+    # The TLS leg. urllib then hands the request back to the opener, so an https proxy that takes
+    # it is checked here again, with req.type now "https". The strict https handler checks that
+    # its context verifies the proxy. An oddly spelled header does not cross even that leg: a
+    # proxy that did not take it as its own could pass it on to the destination.
+    return oddly_spelled or not (req.type == "http" and (scheme or "").lower() == "https")
+
+
+def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, context: object) -> None:
+    """Refuse a web-proxy credential on the connection a strict handler is about to open.
+
+    Every request an engine opener sends is opened here, so this sees the final shape of each leg,
+    whichever proxy handler ran before it, or none. ``context`` is the TLS context the leg would
+    use, or ``None`` for plain ``http``. A plainly spelled header on a ``CONNECT`` tunnel is left
+    alone: it rides in the cleartext ``CONNECT``, which :class:`LoopbackDirectProxyHandler` judged
+    when it set the tunnel. So is one on a plain ``http`` request to a proxy, for the same reason.
+
+    **No header in another spelling of the name gets past here.** The verdicts are read once,
+    from :func:`_proxy_header_verdicts`, and each such header the request holds is refused on
+    its verdict. One that could be sent is a credential on its way out. The two refusals above
+    the loop take it where they apply, and the loop takes it where they do not. A proxy handler
+    refuses it first on every leg it sets up, so the loop is reached only by a request routed
+    to a proxy some other way. One that can never be sent is refused last. Only a plainly
+    spelled header can leave here, as it could before the rule read any other spelling.
+    """
+    verdicts = _proxy_header_verdicts(req)
+    # This check matches no text, and reads each one all the same: :func:`_judged_texts` says why.
+    _judged_texts(verdicts)
+    if any(verdict.judged for verdict in verdicts) and not getattr(req, "_tunnel_host", None):
+        if not req.has_proxy():
+            # Direct: no proxy rewrote this request, so the destination would read the header.
+            raise ProxyCredentialsRefusedError(_DIRECT_PROXY_CREDENTIALS)
+        if context is not None and not verifies_peer_fully(context):
+            # The TLS leg to an https proxy, on a context that does not authenticate it. No
+            # admission is read here: the guard that admits a caller-set header never looks at
+            # this context.
+            raise ProxyCredentialsRefusedError(_UNVERIFIED_PROXY_TLS)
+    for verdict in verdicts:
+        if verdict.judged and not verdict.plain:
+            # The class and text the proxy handler refuses this spelling with, on any leg.
+            raise ProxyCredentialsRefusedError(_CLEARTEXT_PROXY_CREDENTIALS)
+    # Last, as http.client's own refusal came last before: every credential refusal above, and
+    # the proxy handler's, has had its turn by now.
+    _refuse_a_proxy_header_that_can_never_be_sent(verdicts)
+
+
+def _is_from_a_proxy_url(
+    carried: Collection[str], user: str | None, password: str | None, proxies: Mapping[str, str]
+) -> bool:
+    """Whether a leg's credential comes from a proxy URL: this proxy's own user and password, or a
+    ``carried`` header value that one of ``proxies`` would make (vault BACKLOG #3410)."""
+    return bool(user and password) or not _proxy_url_credentials(proxies).isdisjoint(carried)
+
+
+_PLAIN_NAME = "proxy-authorization"
+
+
+def is_proxy_credential_header_name(name: str | bytes) -> bool:
+    """Whether ``name`` is the ``Proxy-Authorization`` header, however it is spelled.
+
+    Every rule that asks which names are that header asks here, so they cannot drift apart. The
+    letter case is ignored. So is every character at either end that cannot be part of a header
+    name: whitespace, a control character, a NUL. ``http.client`` sends at least a name that ends
+    in a space, a tab, a NUL or a DEL as it is written, and a proxy may read each as the plain
+    name. A name that differs in any other way is another header, which the rule on
+    :class:`ProxyCredentialsRefusedError` leaves out.
+
+    A ``bytes`` name is read as the wire would carry it. ``http.client`` sends one byte for byte,
+    so it is decoded as latin-1, one character for each byte. The name's own characters are
+    read, through no method a subclass could replace.
+
+    :func:`_is_spelled_plainly` asks a narrower question about a name this function accepts:
+    whether urllib itself would take it for the header.
+    """
+    text = str(name, "latin-1") if isinstance(name, bytes) else name
+    return _PROXY_CREDENTIAL_NAME.fullmatch(text) is not None
+
+
+def _is_spelled_plainly(name: str | bytes) -> bool:
+    """Whether ``name`` is ``Proxy-Authorization`` with nothing around it, in any letter case.
+    ``do_open`` title-cases each name, so this is the set of spellings it moves into a ``CONNECT``.
+    It looks the name up as a ``str``, so a ``bytes`` name is never one of them. Nor is an object
+    of a ``str`` subclass. Its ``title()`` is its own to answer, so its characters do not say
+    what ``do_open`` would send."""
+    return type(name) is str and name.lower() == _PLAIN_NAME
+
+
+def _proxy_header_items(req: urllib.request.Request) -> list[tuple[str | bytes, Any]]:
+    """Each header on ``req`` that :func:`is_proxy_credential_header_name` accepts: the name it
+    is stored under, and its value as stored. urllib annotates a name as ``str``, but nothing
+    stops a caller storing ``bytes``, and ``http.client`` sends either. The unredirected ones
+    come first, as ``do_open`` sends them, and then the ones in ``headers``.
+
+    **A name held in both stores is read from both.** ``do_open`` sends one of the two values,
+    and which one has changed between Python releases. Measured: 3.14.6 sends the unredirected
+    one, and 3.14.8 sends the one in ``headers``. A reading that dropped either would judge the
+    value that stays behind on one of them. So neither is dropped, and no name is compared
+    with another or used as a dictionary key here: a name object's own ``__eq__`` decides
+    nothing.
+    """
+    items = [*req.unredirected_hdrs.items(), *req.headers.items()]
+    return [
+        (name, value)
+        for name, value in cast("list[tuple[str | bytes, Any]]", items)
+        if is_proxy_credential_header_name(name)
+    ]
+
+
+def _refusal_by_http_client(name: str | bytes, value: Any) -> type[Exception] | None:
+    """The class of error ``http.client`` raises for this header, or ``None`` if it would send it.
+
+    Asked of the library itself, with the call ``do_open`` makes: the name title-cased, and the
+    value as stored. So the answer follows its rule in every Python version. The connection is
+    the class the strict ``http`` handler opens, and it is never opened: nothing is connected
+    and no name is resolved, because ``putrequest`` and ``putheader`` only fill a buffer.
+
+    A ``ValueError`` is a name or a value the library will not send, and ``UnicodeEncodeError``
+    is one. A ``TypeError`` is a value of a type it cannot send, such as ``None``. Both are
+    caught, because this answer is the header's verdict, and an error that escaped here would
+    come before a credential refusal that applies. Nothing else is caught. Any other error says
+    nothing about the header, so it stops the request where it is raised.
+
+    **Only :func:`_verdict_on` asks this, and a header that got an answer is not asked about
+    again while its request keeps that verdict.** :func:`_proxy_header_verdicts` says how long
+    that is, and which header counts as one not seen before. A second call could get another
+    answer: from a value whose ``encode`` fails once, or a name whose ``title()`` changes. An
+    error that is no verdict leaves nothing to keep, so that header is asked about again at the
+    next check, and the request stops there again.
+    """
+    probe = _StrictHTTPConnection("localhost")
+    probe.putrequest("GET", "/")
+    try:
+        probe.putheader(name.title(), value)
+    except ValueError:
+        return ValueError
+    except TypeError:
+        return TypeError
+    return None
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class _ProxyHeaderVerdict:
+    """What the rule decided about one header whose name reads as ``Proxy-Authorization``.
+
+    Compared by identity only. A generated ``==`` would ask the name and the value, and a
+    name object's answer must decide nothing here."""
+
+    #: The name and the value as the request stores them: the two objects that were judged.
+    name: str | bytes
+    value: Any
+    #: Whether :func:`_is_spelled_plainly` accepts the name.
+    plain: bool
+    #: The class of error ``http.client`` raises for the header, when it is a spelling other
+    #: than the plain one that can never be sent. ``None`` for every header the rule judges.
+    refusal: type[Exception] | None
+
+    @property
+    def judged(self) -> bool:
+        """Whether the rule judges this header. The other verdict is that it can never be sent.
+        A plainly spelled header always is judged. Another spelling is, unless ``http.client``
+        refuses it. Every reader of a verdict asks here, so the word has one meaning."""
+        return self.refusal is None
+
+
+def _verdict_on(name: str | bytes, value: Any) -> _ProxyHeaderVerdict:
+    """Judge one header. Nothing else asks ``http.client`` about one."""
+    if _is_spelled_plainly(name):
+        return _ProxyHeaderVerdict(name, value, plain=True, refusal=None)
+    refusal = _refusal_by_http_client(name, value)
+    return _ProxyHeaderVerdict(name, value, plain=False, refusal=refusal)
+
+
+def _judged_texts(verdicts: Collection[_ProxyHeaderVerdict]) -> list[str]:
+    """``str()`` of the value of each header in ``verdicts`` that the rule judges, read now.
+
+    At least the cleartext check and the check that opens the connection call this, each time
+    they read a request's headers, and no text is kept from one check to the next:
+    :func:`_proxy_header_verdicts` says why. The cleartext check matches the texts to the proxy
+    URLs. A value whose text cannot be read cannot be judged, so its own error stops the request
+    at whichever check reads it, before that check lets anything through.
+    """
+    return [str(verdict.value) for verdict in verdicts if verdict.judged]
+
+
+#: The attribute a request keeps its verdicts under, from one check to the next.
+_VERDICTS_ATTR = "_mefor_proxy_header_verdicts"
+
+
+def _proxy_header_verdicts(req: urllib.request.Request) -> tuple[_ProxyHeaderVerdict, ...]:
+    """The verdict on each header of ``req`` whose name reads as ``Proxy-Authorization``, in the
+    order ``do_open`` sends them. Every check on a request reads its headers here.
+
+    **A header is judged once, and the answer is kept on the request.** A request is checked
+    more than once while it is opened: by the proxy handler, perhaps by a second one, and by
+    the strict handler that opens the connection. Each check walks the headers the request
+    holds at that moment, because urllib may add one in between. A header an earlier walk
+    judged keeps its verdict while the request holds the same two objects, through a second
+    open too. Only a header not seen before is judged: one stored under another name object,
+    or holding another value object. A verdict is dropped at the next check after the request
+    stops holding its header. Until that check the request still holds the value judged.
+
+    **What is kept, and what is not.** A verdict keeps two answers: whether the name is the
+    plain spelling, and whether ``http.client`` would send the header. The first is read from
+    an exact ``str``, which cannot change. The second is asked for another spelling only, and
+    either answer to it ends in a refusal. What the value reads as is never kept, because a
+    value object can change its text in place. A check that needs the text reads ``str()`` of
+    each judged value when it runs, through :func:`_judged_texts`. So when the check that
+    matches a value to a proxy URL runs, it matches the text the value has then, at a second
+    open too.
+
+    This closes a gap. Asked twice, a value whose ``encode`` fails once and then works was
+    first a header that can never be sent, and then one that can. The rule left it out on the
+    first answer, the refusal for an unsendable header passed it on the second, and it went
+    out. With one answer the readers agree, and either verdict ends in a refusal.
+
+    A verdict is matched to a header by the identity of the two objects and never by ``==``,
+    so a name object cannot answer its way to another header's verdict.
+    """
+    kept: dict[tuple[int, int], _ProxyHeaderVerdict] = vars(req).setdefault(_VERDICTS_ATTR, {})
+    held: dict[tuple[int, int], _ProxyHeaderVerdict] = {}
+    for name, value in _proxy_header_items(req):
+        # A kept verdict holds both objects, so neither id can have passed to another object.
+        key = (id(name), id(value))
+        verdict = kept.get(key)
+        if verdict is None:
+            # Kept at once, so an error raised over a later header does not lose this answer.
+            verdict = kept[key] = _verdict_on(name, value)
+        held[key] = verdict
+    for key in [key for key in kept if key not in held]:
+        del kept[key]
+    return tuple(held.values())
+
+
+def _proxy_credential_headers(req: urllib.request.Request) -> tuple[_ProxyHeaderVerdict, ...]:
+    """Each ``Proxy-Authorization`` header on ``req`` that the rule judges. The name is read by
+    :func:`is_proxy_credential_header_name`.
+
+    urllib stores a header under ``str.capitalize()`` of its name, but ``do_open`` sends every
+    header it holds, so a key stored in another case would still reach the wire. So would one
+    stored with whitespace after it, beside a plainly spelled one. Every match is returned for
+    that reason: one value must not hide another.
+
+    One kind of match is left out: a spelling other than the plain one that ``http.client`` can
+    never send. :func:`_refuse_a_proxy_header_that_can_never_be_sent` takes those.
+    """
+    return tuple(verdict for verdict in _proxy_header_verdicts(req) if verdict.judged)
+
+
+def _refuse_a_proxy_header_that_can_never_be_sent(
+    verdicts: tuple[_ProxyHeaderVerdict, ...],
+) -> None:
+    """Raise if ``verdicts`` holds a spelling of ``Proxy-Authorization``, other than the plain
+    one, that ``http.client`` can never send.
+
+    At least a name that starts with a space, one that holds a line feed or a colon, and one
+    that will not encode as ASCII are such names. No request could carry one, so it is a fault
+    in what the caller wrote and not a credential on its way out. Before the rule read these
+    spellings, ``http.client`` refused such a request itself, after every credential refusal
+    had run. This keeps the class of that error and that place in the order. At least the REST
+    send maps a ``ValueError`` to a permanent refusal, where the credential refusal is retried,
+    and a retry cannot mend a header name.
+
+    The error has the class ``http.client`` raises for the first such header in the order
+    ``do_open`` sends them: a ``ValueError``, or a ``TypeError`` for a value that is ``None``,
+    for one. Its text is fixed, because that library's own would quote the name or the value.
+    Where a name is held in both stores, the unredirected header counts first here, whichever
+    of the two ``do_open`` would send.
+
+    It reads the verdicts and asks ``http.client`` nothing. So a header judged unsendable is
+    refused here even where a second question would have found it sendable by then.
+    """
+    for verdict in verdicts:
+        if verdict.refusal is not None:
+            # Raised here, outside any handler, so no http.client error rides on it.
+            raise verdict.refusal(_UNSENDABLE_PROXY_HEADER)
+
+
+def _proxy_url_credentials(proxies: Mapping[str, str]) -> set[str]:
+    """Each ``Proxy-authorization`` value urllib would make from a URL in ``proxies``.
+
+    Built the way ``ProxyHandler.proxy_open`` builds it, so a header on a request can be matched to
+    a proxy URL. A value that will not parse makes no header, so it adds nothing here.
+    """
+    made: set[str] = set()
+    for value in proxies.values():
+        try:
+            _, user, password, _ = urllib.request._parse_proxy(value)  # type: ignore[attr-defined]
+        except ValueError:
+            continue
+        if user and password:
+            pair = f"{urllib.parse.unquote(user)}:{urllib.parse.unquote(password)}"
+            made.add("Basic " + base64.b64encode(pair.encode()).decode("ascii"))
+    return made
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow HTTP redirects (ASVS 15.3.2): a 3xx could divert a PHI-bearing POST to an
+    unintended host, and urllib would copy the request's headers onto the new request, a proxy
+    credential included (vault BACKLOG #3417). Returning ``None`` makes urllib raise the 3xx as an
+    ``HTTPError`` instead of following it, so the delivery is classified (permanent) rather than
+    silently redirected. :func:`build_strict_opener` puts one on every opener it builds."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
 
 
 #: The handler types that may open an ``http`` or ``https`` URL on a strict opener. The proxy
@@ -867,6 +1304,10 @@ def build_strict_opener(
     loopback host direct. A ``ProxyHandler`` subclass that does not derive from the loopback-direct
     handler is refused with :class:`TypeError`.
     To build an opener that uses no proxy at all, pass ``ProxyHandler({})``.
+
+    Every opener built here refuses redirects (vault BACKLOG #3417). Where the caller supplies no
+    :class:`NoRedirectHandler`, one is added, so urllib's default redirect handler never is. Any
+    other redirect handler, urllib's own included, is refused with :class:`TypeError`.
     """
     built: list[urllib.request.BaseHandler | type[urllib.request.BaseHandler]] = []
     for handler in handlers:
@@ -887,6 +1328,13 @@ def build_strict_opener(
                 f"{_name_of(handler)} could send a loopback hop through its proxy; "
                 "build_strict_opener takes only urllib's own ProxyHandler or the loopback-direct one"
             )
+        elif _is_a(handler, urllib.request.HTTPRedirectHandler) and not _is_a(
+            handler, NoRedirectHandler
+        ):
+            raise TypeError(
+                f"{_name_of(handler)} could follow a redirect; build_strict_opener takes only "
+                "the no-redirect handler"
+            )
         elif not _is_a(handler, _OPENS_STRICTLY) and any(
             callable(getattr(handler, m, None)) for m in _OPEN_METHODS
         ):
@@ -905,6 +1353,9 @@ def build_strict_opener(
     # same environment that one would.
     if not any(_is_a(h, LoopbackDirectProxyHandler) for h in built):
         built.append(LoopbackDirectProxyHandler())
+    # Supplied for the same reason: build_opener then adds no redirect handler that follows one.
+    if not any(_is_a(h, NoRedirectHandler) for h in built):
+        built.append(NoRedirectHandler())
     return urllib.request.build_opener(*built)
 
 
@@ -939,6 +1390,11 @@ def _is_a(handler: object, kinds: type | tuple[type, ...]) -> bool:
 _TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
 _TOKEN = f"[{_TCHARS}]+"
 _FIELD_NAME = re.compile(_TOKEN)
+#: ``Proxy-Authorization`` in any ASCII letter case, with any run of characters that no field
+#: name can hold at either end. Matched whole, so a long name costs linear time.
+_PROXY_CREDENTIAL_NAME = re.compile(
+    rf"[^{_TCHARS}]*{_PLAIN_NAME}[^{_TCHARS}]*", re.ASCII | re.IGNORECASE
+)
 #: A folded line break inside a raw field value, which RFC 9112 section 5.2 lets a user agent
 #: accept in a response, and the controls RFC 9110 section 5.5 forbids in a value (HTAB allowed).
 _OBS_FOLD = re.compile(r"\r?\n[ \t]")
@@ -1201,8 +1657,45 @@ def read_bounded_text(
     return read_bounded(reader, limit=limit, connector=connector).decode(encoding, errors="replace")
 
 
-#: The ``code`` of the permanent refusal :func:`read_2xx_reply_text` raises.
+#: The ``code`` of the permanent refusal :func:`read_2xx_reply_text` raises for a body over the bound.
 REPLY_TOO_LARGE_CODE = "reply-too-large"
+#: The ``code`` it raises for a body that stopped short of the length the peer declared.
+REPLY_TRUNCATED_CODE = "reply-truncated"
+#: The ``code`` it raises for a body framed in a way RFC 9112 does not allow.
+REPLY_MISFRAMED_CODE = "reply-misframed"
+
+
+def _shown_2xx_status(reader: object) -> int | None:
+    """``reader.status`` when it is an integer from 200 to 299, else ``None``.
+
+    The guard a body after a 2xx passes before it is dropped rather than raised. It
+    fails closed: a reader with no status, or one it cannot show as an integer, is not taken for a
+    2xx. Shared by :func:`read_2xx_reply_text` and :func:`drain_2xx_reply`.
+    """
+    status = getattr(reader, "status", None)
+    return status if isinstance(status, int) and 200 <= status < 300 else None
+
+
+@overload
+def read_2xx_reply_text(
+    reader: _SupportsRead,
+    *,
+    limit: int = ...,
+    connector: str,
+    encoding: str,
+    body_is_needed: Literal[True],
+) -> str: ...
+
+
+@overload
+def read_2xx_reply_text(
+    reader: _SupportsRead,
+    *,
+    limit: int = ...,
+    connector: str,
+    encoding: str,
+    body_is_needed: bool,
+) -> str | ReplyBodyDropped: ...
 
 
 def read_2xx_reply_text(
@@ -1212,58 +1705,113 @@ def read_2xx_reply_text(
     connector: str,
     encoding: str,
     body_is_needed: bool,
-) -> str:
+) -> str | ReplyBodyDropped:
     """:func:`read_bounded_text` for the body of a delivery's reply, once its 2xx status is in.
 
     Call it where the status is already known to be 2xx. In a destination's ``_post`` that is
     inside ``with opener.open(...)``, because urllib raises every other status as an ``HTTPError``.
     The helper checks this itself, and fails closed: unless ``reader.status`` is an integer from
-    200 to 299, an over-cap body raises as :func:`read_bounded_text` raises it. So an over-cap
+    200 to 299, a body it cannot read raises as :func:`read_bounded_text` raises it. So such a
     body from a reader with another status, or with none it can show, is never recorded as
-    delivered here. An in-cap body is returned whatever the status: that is the caller's to judge.
+    delivered here. An in-cap, complete body is returned whatever the status: that is the
+    caller's to judge.
 
-    The partner answered 2xx, so an over-cap body must not cause a re-send (vault BACKLOG #2180).
-    What it does cause depends on ``body_is_needed``, which says who reads the body. This is the
-    one place in code that states the rule:
+    The partner answered 2xx, so a body the engine cannot read must not cause a re-send. Three
+    kinds are handled, and each has its own code: a body over the bound (:data:`REPLY_TOO_LARGE_CODE`,
+    vault BACKLOG #2180), a body cut short of its declared length (:data:`REPLY_TRUNCATED_CODE`),
+    and a misframed body (:data:`REPLY_MISFRAMED_CODE`), the last two since BACKLOG #2989. What
+    each causes depends on ``body_is_needed``, which says who reads the body. This is the one
+    place in code that states the rule:
 
     * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
-      without it. Returns ``""`` and logs a WARNING. The WARNING carries ``connector``, the
-      status and the bound, and no byte of the reply.
+      without it. Returns a :class:`~messagefoundry.transports.base.ReplyBodyDropped` with the
+      status, the bound and, for a truncated or misframed body, what was wrong with it, and no
+      byte of the reply. Nothing is logged here: the destination hands it back from ``send``, and
+      the delivery worker logs the WARNING after the store write that records the delivery and
+      the drop (vault BACKLOG #3040 items 2 and 5).
     * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
-      permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
-      :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
-      the engine could not read is not recorded as delivered.
+      permanent :class:`~messagefoundry.transports.base.NegativeAckError` with the code, so the
+      row dead-letters once and is not sent again. A reply the engine could not read is not
+      recorded as delivered.
+
+    Who decided the rule for each kind, and on what authority, is recorded once, in ADR 0095
+    Amendment B.1.
 
     Which FHIR writes need the body is stated at the call in ``transports/fhir.py``.
 
-    Only the byte bound is handled here. A truncated or misframed reply still raises as
-    :func:`read_bounded_text` raises it, and is still retried.
+    A peer that closes cleanly before its declared length is a truncated body. At least a read
+    that times out, or one a connection reset cuts off, is not handled here. Those raise as they
+    did, and are still retried.
     """
     try:
         return read_bounded_text(reader, limit=limit, connector=connector, encoding=encoding)
-    except ResponseTooLargeError:
-        status = getattr(reader, "status", None)
-        if not (isinstance(status, int) and 200 <= status < 300):
+    except MalformedReplyHeadError:
+        # A bad head leaves no status worth trusting. It is refused inside opener.open() today,
+        # and this arm keeps it off the 2xx path if a reader ever raises it later.
+        raise
+    except (ResponseTooLargeError, TruncatedResponseError, AmbiguousFramingError) as exc:
+        status = _shown_2xx_status(reader)
+        if status is None:
             raise
-        # A 2xx is handled below, outside the handler. The traceback reaches the frame that holds
-        # the bytes read so far, a whole bound of them, and an error raised in here would keep
-        # that frame alive on its __context__ until the worker let go of it.
+        # Only fixed text leaves the handler. A 2xx is handled below, outside it. The traceback
+        # reaches the frame that holds the bytes read so far, and an error raised in here would
+        # keep that frame alive on its __context__ until the worker let go of it.
+        if isinstance(exc, ResponseTooLargeError):
+            code, fault = REPLY_TOO_LARGE_CODE, f"is over the {limit}-byte bound"
+        elif isinstance(exc, TruncatedResponseError):
+            code, fault = REPLY_TRUNCATED_CODE, "ended before its declared length"
+        else:
+            # The reason is fixed text from this module, never a byte the peer sent.
+            code, fault = REPLY_MISFRAMED_CODE, f"is misframed ({exc.reason})"
     if body_is_needed:
-        # The stored error is cut at 200 characters, so the code and "not sent again" come first
-        # and the advice last. It does not say the partner accepted the request: the body that
-        # could not be read is where a Fault, a failed-instance list or a failed entry status
-        # would be.
+        # The row keeps only 200 characters of this, so the code and the advice come first and
+        # the connection name, which has no length cap, comes last (vault BACKLOG #3040 items
+        # 4 and 6). It does not say the partner accepted the request: the body that could not
+        # be read is where a Fault, a failed-instance list or a failed entry status would be.
         raise NegativeAckError(
-            f"{connector}: {REPLY_TOO_LARGE_CODE}, not sent again. A 2xx reply body is over the "
-            f"{limit}-byte bound and is needed here. Check the partner before a replay",
-            code=REPLY_TOO_LARGE_CODE,
+            f"{code}, not sent again. A 2xx reply body {fault} and is needed here. Check the "
+            f"partner before a replay ({connector})",
+            code=code,
             permanent=True,
         )
+    # An over-cap drop carries no fault: ReplyBodyDropped words that case from its own bound.
+    return ReplyBodyDropped(
+        status=status, limit=limit, fault=None if code == REPLY_TOO_LARGE_CODE else fault
+    )
+
+
+def drain_2xx_reply(
+    reader: _SupportsRead,
+    *,
+    limit: int = DEFAULT_MAX_RESPONSE_BYTES,
+    connector: str,
+) -> None:
+    """:func:`drain_bounded` for a reply whose 2xx status is the whole answer.
+
+    The alert webhook's drain. Nothing reads its body, so an over-cap body after a 2xx is dropped
+    with a WARNING, which carries ``connector``, the status and the bound, and no byte of the
+    reply, and the call returns. The WARNING is logged here, because an alert has no message row
+    for a store write to come first. Vault BACKLOG #3040 items 2 and 5 cover deliveries only.
+    Owner ruling 2026-10-12 (#3040 item 1) extends the 2026-10-05 principle, "decide by who reads
+    the body", to the alert webhook. Any other status, or none the reader can show, still raises
+    :class:`ResponseTooLargeError`.
+
+    A function of its own rather than a change to :func:`drain_bounded`, because the connection
+    probes share that drain and keep the raise.
+    """
+    try:
+        drain_bounded(reader, limit=limit, connector=connector)
+        return
+    except ResponseTooLargeError:
+        status = _shown_2xx_status(reader)
+        if status is None:
+            raise
+        # Logged below, outside the handler, so the traceback that reaches the bytes read so far
+        # is let go first.
     logger.warning(
         "%s answered with status %s and a response body over the %d-byte bound; "
-        "the body is dropped and the message is recorded as delivered",
+        "the body is dropped and the 2xx is taken as the partner's answer",
         connector,
         status,
         limit,
     )
-    return ""

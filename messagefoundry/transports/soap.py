@@ -63,7 +63,7 @@ from xml.sax.handler import (  # nosec B406 — see _assert_well_formed_fragment
 from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string escaper, not a parser
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.config.tls_policy import (
     SYSTEM_TRUST_ANCHOR,
     TrustAnchor,
@@ -78,7 +78,9 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    count_setting,
     encode_wire_body,
+    float_setting,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -109,6 +111,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
     enforce_signature_header_limits,
+    http_credentials_sent,
     http_family_trust_anchor,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
@@ -330,7 +333,9 @@ class SoapDestination(DestinationConnector):
         self.url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("SOAP", config.name)
-        self.timeout: float = float(s.get("timeout_seconds", 30.0))
+        self.timeout: float = float_setting(
+            s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="SOAP destination"
+        )
         self.encoding: str = s.get("encoding", "utf-8")
         self.version: str = str(s.get("soap_version", "1.1"))
         if self.version not in ("1.1", "1.2"):
@@ -356,7 +361,11 @@ class SoapDestination(DestinationConnector):
         self.ws_username: str | None = s.get("ws_username") or s.get("basic_user") or None
         self.ws_password: str | None = s.get("ws_password") or s.get("basic_password") or None
         self.ws_password_type: str = str(s.get("ws_password_type", "text"))
-        self.ws_timestamp_ttl_seconds: int = int(s.get("ws_timestamp_ttl_seconds", 300))
+        self.ws_timestamp_ttl_seconds: int = count_setting(
+            s.get("ws_timestamp_ttl_seconds", 300),
+            knob="ws_timestamp_ttl_seconds",
+            transport="SOAP destination",
+        )
         self._ws_mode: bool = self.ws_addressing or self.ws_security
 
         # Non-deterministic generators — instance attributes so tests can inject a fixed clock / UUID /
@@ -387,8 +396,7 @@ class SoapDestination(DestinationConnector):
             cleartext_reason=accept_reason,
             connection=config.name,
         )
-        dest_host = urllib.parse.urlsplit(self.url).hostname or ""
-        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)
@@ -428,6 +436,7 @@ class SoapDestination(DestinationConnector):
         anchor = http_family_trust_anchor(
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
+        verify = bool_setting(s, "verify_tls", default=True)
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -438,7 +447,7 @@ class SoapDestination(DestinationConnector):
                 host=urllib.parse.urlsplit(self.url).hostname or "",
                 trust_anchor=anchor,
             )
-        elif bool(s.get("verify_tls", True)):
+        elif verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
@@ -460,6 +469,7 @@ class SoapDestination(DestinationConnector):
                 self.url,
                 connector="SOAP destination",
                 connection=config.name,
+                credentials=http_credentials_sent(ConnectorType.SOAP, s),
                 attested=attested,
             )
             if guard is not None:
@@ -474,7 +484,6 @@ class SoapDestination(DestinationConnector):
         # SMART is FHIR/REST-only) injected per-request in _post, OR HTTP Digest folded into the opener.
         # Both None (default) → byte-identical. Mutually exclusive with each other.
         from messagefoundry.transports.http_auth import (
-            HttpAuthError,
             bearer_provider_from_settings,
             digest_handler_from_settings,
         )
@@ -517,7 +526,7 @@ class SoapDestination(DestinationConnector):
         #
         # Below every statement that builds or replaces `self._opener`, and no opener with
         # tls_allow_expired: see refuse_unrevoked_verified_hop.
-        if bool(s.get("verify_tls", True)):
+        if verify:
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.url,
@@ -654,7 +663,7 @@ class SoapDestination(DestinationConnector):
         if self.client_cert_file:
             if scheme != "https":
                 raise ValueError("SOAP client certificate requires an https url (ADR 0015)")
-            if not bool(s.get("verify_tls", True)):
+            if not bool_setting(s, "verify_tls", default=True):
                 raise ValueError(
                     "SOAP client cert is incompatible with verify_tls=false — the peer must be "
                     "verified (ADR 0015)"
@@ -859,7 +868,8 @@ class SoapDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send_url(self.url)
+            # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
+            self._hop_guard.assert_delivery_url(self.url, connector="SOAP")
         # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")

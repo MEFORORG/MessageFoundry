@@ -20,6 +20,7 @@ goes stale silently, and the field list is the thing that must not be re-enumera
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -44,7 +45,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # `parse_reviewed_by` is the loader's own check on a structured `reviewed_by` (BACKLOG #2168), taken
 # for the same reason: the writer must refuse exactly what the loader would, and a second copy of the
 # rule is a second place for it to drift.
+#
+# `_DATE_RE` is the loader's date shape, taken for that reason too (BACKLOG #2865).
 from scorecard import (  # noqa: E402
+    _DATE_RE,
     REVIEWED_BY_KEYS,
     UNRECORDED,
     ScorecardError,
@@ -273,8 +277,66 @@ _NAMED_CONTROLS = ("anchor_repair",)
 #: The field the writer records INSTEAD, so consuming the instruction does not destroy the evidence.
 #: `anchor_provenance._repairs_declared` counts cells that declare a repair and its docstring says
 #: nothing else in the record marks one. That reader is why this exists: plain data, carrying the
-#: date of the pass, read as an instruction by nothing.
+#: date of the repair, read as an instruction by nothing.
+#:
+#: THE PAYLOAD STATES THE DATE (BACKLOG #2865). The writer used to take it from `last_verified`,
+#: which can be older than the repair, and so moved cell 1.2.2's witness back from 2026-10-01 to
+#: 2026-09-28. A declared repair must now give its own date, and no write moves the witness earlier.
 _REPAIR_WITNESS = "anchor_repaired_at"
+
+
+def _iso_date(value: object) -> datetime.date | None:
+    """`value` as a date when it is one written YYYY-MM-DD, else None. The shape check runs first
+    because `date.fromisoformat` also accepts ``20260927``. A TOML date literal, which `tomllib`
+    reads as a `date`, counts too, so an unquoted witness still holds the backwards check."""
+    if type(value) is datetime.date:
+        return value
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _comment_lines(text: str) -> list[tuple[int, str]]:
+    """``(line index, line)`` for every line of `text` that holds a TOML comment (BACKLOG #2865).
+
+    `render` builds a cell from its parsed form, so any comment in the span it replaces is lost. A
+    `#` inside a string is not a comment, so this tracks the four string forms rather than matching
+    lines: a refusal on a value such as ``"see #1369"`` would make that cell unwritable.
+    """
+    lines = text.split("\n")
+    found: list[tuple[int, str]] = []
+    i, n = 0, len(text)
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote is None:
+            if ch == "#":
+                line = text.count("\n", 0, i)
+                found.append((line, lines[line]))
+                i = text.find("\n", i)
+                if i < 0:
+                    break
+            elif ch in "\"'":
+                quote = ch * 3 if text.startswith(ch * 3, i) else ch
+                i += len(quote)
+            else:
+                i += 1
+        elif ch == "\\" and quote[0] == '"':
+            i += 2  # an escape in a basic string; the escaped character never closes it
+        elif text.startswith(quote, i):
+            # A multi-line string may end in up to two more quote marks than its delimiter, and the
+            # delimiter is the LAST three, so the whole run closes it.
+            run = len(quote)
+            while len(quote) == 3 and run < 5 and text.startswith(quote[0], i + run):
+                run += 1
+            i += run
+            quote = None
+        else:
+            i += 1
+    return found
 
 
 def _control_keys() -> tuple[str, ...]:
@@ -308,8 +370,9 @@ def _surface_name(where: tuple[str, ...]) -> str:
 
 def _written_text(cell: dict[str, Any]) -> dict[tuple[str, ...], str]:
     """``{where it lands: its text}`` for everything the PAYLOAD writes into the record (BACKLOG
-    #1884). Not quite everything the record gains: `render` also derives `anchor_repaired_at` from
-    `last_verified`, and that copy is not a separate surface here.
+    #1884). Not quite everything the record gains: when it migrates a legacy `anchor_repair` flag,
+    `render` fills `anchor_repaired_at` with the literal `UNRECORDED`, which is not a surface here.
+    A declared repair's date is the payload's own `anchor_repaired_at`, so it is scanned like any key.
 
     Surfaces are keyed by TUPLE -- ``(key,)`` or ``(subtable, key)`` -- so a top-level key that
     happens to be spelled like a pooled sub-table name cannot overwrite that surface.
@@ -509,17 +572,24 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # for #1369 quietly decayed the single counter it was chosen to preserve, on the exact path the
     # banner advertises as the migration. Silent, green, and in the direction that looks like success.
     #
-    # PRECEDENCE, because the two paths carry different dates and clobbering is not symmetric:
-    #   1. the PAYLOAD declares a repair -- a fresh, dated event, so it WINS and overwrites;
-    #   2. otherwise the LIVE cell carries the legacy control -- a migration, so the witness takes
-    #      the date the record ALREADY held for that cell, and FILLS ONLY. An existing
-    #      `anchor_repaired_at` on either side is newer evidence than a legacy flag with no date of
-    #      its own, so it is never overwritten by this branch.
+    # THE DATE IS NEVER TAKEN FROM `last_verified` (BACKLOG #2865). That date can be older than the
+    # repair, and the first path below overwrote a later witness with it, moving cell 1.2.2's back
+    # from 2026-10-01 to 2026-09-28. The two paths now:
+    #   1. the PAYLOAD declares a repair -- a fresh event, and the payload states its date in
+    #      `anchor_repaired_at`, which `merged` carries like any other key. `main` refuses a repair
+    #      with no date and any date earlier than the record's; the raise here stops a direct
+    #      caller writing a guess;
+    #   2. otherwise the LIVE cell carries the legacy control -- a migration, which FILLS ONLY. A
+    #      legacy flag carries no date of its own, so the witness says `UNRECORDED` rather than
+    #      inventing one. An existing `anchor_repaired_at` on either side is kept.
     # A cell that was never repaired matches neither, so this cannot manufacture a witness.
     if cell.get("anchor_repair"):
-        merged[_REPAIR_WITNESS] = str(cell.get("last_verified", ""))
+        if _iso_date(cell.get(_REPAIR_WITNESS)) is None:
+            raise ValueError(
+                f"{cell.get('id')}: declared anchor_repair but states no {_REPAIR_WITNESS} date"
+            )
     elif (live or {}).get("anchor_repair") and not merged.get(_REPAIR_WITNESS):
-        merged[_REPAIR_WITNESS] = str((live or {}).get("last_verified", ""))
+        merged[_REPAIR_WITNESS] = UNRECORDED
     for key, value in merged.items():
         if key in _ORDERED or key in _SUBTABLES or key in _controls:
             continue
@@ -544,7 +614,15 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
 
 
 def block_spans(text: str) -> dict[str, tuple[int, int]]:
-    """Map cell id -> (start, end) character offsets of its whole top-level [[cell]] block."""
+    """Map cell id -> (start, end) character offsets of its whole top-level [[cell]] block.
+
+    The block ends at its last line of content (BACKLOG #2865). Blank lines and UNINDENTED comment
+    lines after it, up to the next `[[cell]]` or the end of the file, belong to the file rather than
+    to the cell, such as a section divider, so a rewrite of the cell leaves them in place. An
+    indented comment there belongs to the cell's last entry, so it stays in the span, where `main`
+    refuses to drop it. Only a comment `_comment_lines` finds outside a string is trimmed, so a
+    multi-line string's last line stays in.
+    """
     starts = [m.start() for m in re.finditer(r"^\[\[cell\]\]$", text, re.M)]
     spans: dict[str, tuple[int, int]] = {}
     for i, s in enumerate(starts):
@@ -552,7 +630,21 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
         m = re.search(r'^id = "([^"]+)"$', text[s:e], re.M)
         if not m:
             raise SystemExit(f"a [[cell]] block at offset {s} has no id")
-        spans[m.group(1)] = (s, e)
+        lines = text[s:e].split("\n")
+        keep = len(lines)
+        while keep > 1 and (not lines[keep - 1].strip() or lines[keep - 1].startswith("#")):
+            keep -= 1
+        if any(line.startswith("#") for line in lines[keep:]):
+            # Rare, so the tokenizer runs only here: confirm each trimmed `#` is a comment.
+            comments = {k for k, _ in _comment_lines(text[s:e])}
+            keep = len(lines)
+            while keep > 1 and (
+                not lines[keep - 1].strip()
+                or (lines[keep - 1].startswith("#") and keep - 1 in comments)
+            ):
+                keep -= 1
+        # Every kept line ends with its newline, which `render`'s output ends with too.
+        spans[m.group(1)] = (s, min(e, s + sum(len(line) + 1 for line in lines[:keep])))
     return spans
 
 
@@ -808,6 +900,55 @@ def main(argv: list[str] | None = None) -> int:
                     f"{c.get('id')}: declared anchor_repair but the verdict differs from the "
                     "record; that is a rescore, not a repair"
                 )
+        # THE REPAIR WITNESS IS THE PAYLOAD'S, AND IT NEVER MOVES BACKWARDS (BACKLOG #2865). A
+        # declared repair must date itself, with a real date, not in the future, and no earlier
+        # than the record's. Echoing the record's value, or omitting it, is no change. Only a
+        # declared repair sets or changes the witness, or the record would date a repair that never
+        # ran. The one exception is a record that holds a repair with no date -- the legacy flag,
+        # or the `UNRECORDED` it migrates to -- where an ordinary payload may supply the date.
+        stated = c.get(_REPAIR_WITNESS, _ABSENT)
+        if anchor_repair or not _held(_REPAIR_WITNESS, c, live):
+            new = _iso_date(stated)
+            old = _iso_date(live.get(_REPAIR_WITNESS))
+            undated = bool(live.get("anchor_repair")) or (_REPAIR_WITNESS in live and old is None)
+            if stated is _ABSENT:
+                problems.append(
+                    f"{c.get('id')}: declared anchor_repair but states no {_REPAIR_WITNESS}. Give "
+                    "the date of this repair, YYYY-MM-DD; the writer no longer takes it from "
+                    "last_verified"
+                    + (
+                        ". If the payload only echoes the record's legacy anchor_repair flag, drop "
+                        f"it and the writer records {_REPAIR_WITNESS} as {UNRECORDED!r}"
+                        if live.get("anchor_repair")
+                        else ""
+                    )
+                )
+            elif not (anchor_repair or undated):
+                problems.append(
+                    f"{c.get('id')}: would set {_REPAIR_WITNESS} from "
+                    f"{_printable(repr(live.get(_REPAIR_WITNESS)))} to {_printable(repr(stated))} "
+                    "without declaring anchor_repair. Only a declared repair sets or changes it"
+                )
+            elif new is None:
+                problems.append(
+                    f"{c.get('id')}: {_REPAIR_WITNESS} must be a real date written YYYY-MM-DD; "
+                    f"got {_printable(repr(stated))}"
+                )
+            # One day of slack, so a repair dated in UTC is not refused on a Central evening.
+            elif new > datetime.date.today() + datetime.timedelta(days=1):
+                problems.append(f"{c.get('id')}: {_REPAIR_WITNESS} {new} is in the future")
+            elif old is not None and new < old:
+                problems.append(
+                    f"{c.get('id')}: {_REPAIR_WITNESS} would move backwards, from {old} to {new}. "
+                    "A repair is never dated before the one the record already holds"
+                )
+            elif anchor_repair and new == old:
+                # Not refused: two repairs on one day share a date. But a payload copied from the
+                # live cell carries the last repair's date, and that is the mistake to catch.
+                print(
+                    f"  note: {c.get('id')} declares a repair dated {new}, the same date as the "
+                    "repair the record already holds. If this repair was later, state its date."
+                )
         # Every field `render` always writes, derived so the two cannot drift apart.
         required = tuple(k for k in _ORDERED if k not in _OPTIONAL_ORDERED)
         if not anchor_repair:
@@ -971,6 +1112,28 @@ def main(argv: list[str] | None = None) -> int:
     # re-read could splice into text another session changed after the guards looked at it.
     text = live_text
     spans = block_spans(text)
+
+    # A COMMENT IN A CELL WOULD BE LOST, SO THE WRITE STOPS (BACKLOG #2865). `render` builds the
+    # cell from its parsed form, which keeps no comment. Carrying them over is not attempted: a
+    # person decides where each one belongs, and a loud stop beats a silent loss. Every commented
+    # cell is named at once, so one run shows the whole job. An unindented comment after a cell's
+    # last line is outside its span (`block_spans`) and survives the rewrite.
+    commented = [
+        (c["id"], text.count("\n", 0, spans[c["id"]][0]) + 1, found)
+        for c in payload
+        if c["id"] in spans and (found := _comment_lines(text[slice(*spans[c["id"]])]))
+    ]
+    if commented:
+        print("REFUSING: this rewrite would drop the comments inside these cells:")
+        for cell_id, first, found in commented:
+            for k, line in found:
+                print(f"  cell {_printable(cell_id)}, line {first + k}: {_printable(line.strip())}")
+        print(
+            "  The writer rebuilds a cell from its parsed form, which keeps no comment. Remove "
+            "each comment by hand, move it unindented below the cell's last line, or carry its "
+            "text into a field such as review_notes, then re-run."
+        )
+        return 1
 
     edits = []
     for c in payload:

@@ -1295,6 +1295,13 @@ async def _interrupted_row(engine: Engine, requester: str, requester_user_id: st
         requested_at=time.time() - 60.0,
         expires_at=None,
     )
+    await _interrupt(engine, approval_id)
+    return approval_id
+
+
+async def _interrupt(engine: Engine, approval_id: str) -> None:
+    """Claim a pending row as 'executing' by 'releaser', then cut it off to 'interrupted'. The
+    request time is left as it was."""
     assert await engine.store.decide_pending_approval(
         approval_id, status="executing", approver="releaser", decided_at=time.time() - 30.0
     )
@@ -1305,7 +1312,21 @@ async def _interrupted_row(engine: Engine, requester: str, requester_user_id: st
         decided_at=time.time() - 20.0,
         from_status="executing",
     )
-    return approval_id
+
+
+class _StaleRead:
+    """``store``, except that every request-row read returns ``stale``. Drives two resolvers who
+    both read 'interrupted' at once, so the second passes the status check and meets the guard."""
+
+    def __init__(self, store: Any, stale: Any) -> None:
+        self._store = store
+        self._stale = stale
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    async def get_pending_approval(self, _approval_id: str) -> Any:
+        return self._stale
 
 
 def _resolve_url(approval_id: str) -> str:
@@ -1528,15 +1549,7 @@ async def test_a_resolve_that_loses_the_race_answers_409(engine: Engine) -> None
 
     approval_id = await _interrupted_row(engine, "maker", "maker-id")
     stale = await engine.store.get_pending_approval(approval_id)
-
-    class _StaleRead:
-        def __getattr__(self, name: str) -> Any:
-            return getattr(engine.store, name)
-
-        async def get_pending_approval(self, _approval_id: str) -> Any:
-            return stale
-
-    gate = ApprovalGate(_StaleRead(), ON, resolve_identity=_resolve)
+    gate = ApprovalGate(_StaleRead(engine.store, stale), ON, resolve_identity=_resolve)
     first = await gate.resolve_interrupted(
         approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
     )
@@ -1626,6 +1639,37 @@ async def test_a_cancel_during_the_status_write_still_records_the_resolution(
 
     await _eventually(_recorded)
     assert await _status_of(engine, approval_id) == "resolved_applied"
+
+
+async def test_a_cancel_during_the_resolution_still_writes_the_resolvers_flag(
+    engine: Engine,
+) -> None:
+    """BACKLOG #2125: the resolver's provenance flag runs inside the shielded resolution write, so a
+    cancel landing in the status write cannot skip it, as approve's ``finally`` cannot."""
+    from tests._pending_approval_store_contract import _resolve
+
+    approval_id = await _interrupted_row(engine, "maker", "maker-id")
+    store = _held_store(engine, "decide:resolved_applied", approver_changed=True)
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
+    task = asyncio.create_task(
+        gate.resolve_interrupted(
+            approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
+        )
+    )
+    await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+    task.cancel()
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, _WAIT_S)
+
+    async def _flagged() -> bool:
+        return bool(await engine.store.list_audit(action="approval.approver_provenance"))
+
+    await _eventually(_flagged)
+    assert await _status_of(engine, approval_id) == "resolved_applied"
+    [row] = await engine.store.list_audit(action="approval.approver_provenance")
+    assert str(row["actor"]) == "a"
+    assert json.loads(str(row["detail"]))["act"] == "resolve"
 
 
 # --- BACKLOG #2087: a shielded outcome write logs once, is per gate, and is drained at shutdown ---

@@ -58,13 +58,14 @@ from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
     crl_expiry_detail,
+    crl_reload_refused_detail,
     intake_pause_detail,
 )
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
-from messagefoundry.transports.bounded_read import build_strict_opener
+from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
 from messagefoundry.transports.email import checked_envelope
 
 __all__ = [
@@ -144,6 +145,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     # raised under the "directory-reconciler-referral" label once no referral stands.
     "ad_reconcile_breaker_cleared": "ad_reconcile_aborted",
     "ad_reconcile_hold_released": "ad_reconcile_held",
+    # #2904: a CRL file the reload no longer refuses resolves the open refusal for the same file
+    # on the same process.
+    "crl_reload_applied": "crl_reload_refused",
 }
 
 _T = TypeVar("_T")
@@ -300,22 +304,11 @@ def _render_subject(template: str, values: Mapping[str, str]) -> str:
     return rendered.replace("\r", " ").replace("\n", " ")
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _NoRedirectHandler(NoRedirectHandler):
     """Refuse to follow HTTP redirects on the outbound webhook POST (ASVS 15.3.2): a 3xx could
     divert the alert to an unintended host or be chained to probe an internal endpoint. Returning
     ``None`` makes urllib raise on the redirect instead of following it, so the send fails (logged)
     — the safe default for a fire-and-forget webhook."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        return None
 
 
 def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
@@ -446,10 +439,8 @@ class WebhookTransport:
         )
         # Bounded so the drain cannot be turned into a memory exhaustion by a webhook host that
         # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily for the
-        # same reason as the length gate above. An over-cap reply raises ResponseTooLargeError, which
-        # the notifier's fan-out treats like any other failed sink send: the alert is not delivered
-        # here, and the engine's own message flow is untouched.
-        from messagefoundry.transports.bounded_read import drain_bounded
+        # same reason as the length gate above.
+        from messagefoundry.transports.bounded_read import drain_2xx_reply
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
         with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
@@ -458,7 +449,12 @@ class WebhookTransport:
             # failing the drain on a short reply would report an alert as undelivered when the host
             # took it. The byte bound still applies -- an unbounded drain is a memory exhaustion
             # whether or not anyone reads the bytes.
-            drain_bounded(resp, connector=f"alert webhook {host}")
+            #
+            # An over-cap body after a 2xx counts as delivered, with a WARNING: owner ruling
+            # 2026-10-12 (#3040 item 1), which extends the owner ruling of 2026-10-05, "decide by
+            # who reads the body", to this sink. Nothing reads this body. The label is fixed, so
+            # the WARNING does not carry the configured host.
+            drain_2xx_reply(resp, connector="alert webhook")
 
 
 #: The name the alerts SMTP hop logs under. The security notifier registers its verification-off
@@ -985,8 +981,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         Vault BACKLOG #2319: a date that is a running hop's held copy says so. The event gains
         ``held_copy``, ``shared_with`` and a ``detail`` only when there is something to say, so a
-        plain CRL alert's payload is what it was. ``detail`` also becomes the alert instance's
-        reason, which the store cuts to about 200 characters, so it leads with the remedy."""
+        plain CRL alert's payload is what it was. The event's ``detail`` is
+        :func:`~messagefoundry.pipeline.alerts.crl_expiry_detail`: the held-copy marker, then the
+        scan's ``detail``, then the other rows. It also becomes the alert instance's reason, which
+        the store cuts to about 200 characters, so the marker and the scan's remedy lead."""
         event: dict[str, Any] = {
             "type": "cert_expiry",
             "connection": f"{name} (CRL)",
@@ -1001,6 +999,50 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if note := crl_expiry_detail(held_copy=held_copy, detail=detail, shared_with=shared_with):
             event["detail"] = note
         self._emit(event)
+
+    def crl_reload_refused(
+        self,
+        name: str,
+        *,
+        path: str,
+        remedy_class: str,
+        stale_contexts: int,
+        remedy: str,
+        start_refuses: bool = False,
+    ) -> None:
+        # Vault BACKLOG #2904: the reload refused a replaced CRL file. `crl_reload:<path>[@<process>]`
+        # stands in for "connection", so each file on each engine process is its own instance and
+        # throttle key. The payload is the path, a class token, a count and fixed words: the
+        # refusal's reason quotes CRL issuer names and dates, so it is never passed in. `detail` is
+        # what the instance's reason column shows, built by the helper the logging sink uses. The
+        # runner raises this once per file version, so a second version refused inside the
+        # cooldown while the alert is still open updates the instance and does not page again.
+        # crl_reload_applied ends that cooldown, so it never throttles a refusal after a clear.
+        event: dict[str, Any] = {
+            "type": "crl_reload_refused",
+            "connection": name,
+            "path": path,
+            "remedy_class": remedy_class,
+            "stale_contexts": stale_contexts,
+            "detail": crl_reload_refused_detail(
+                remedy_class=remedy_class,
+                stale_contexts=stale_contexts,
+                remedy=remedy,
+                start_refuses=start_refuses,
+            ),
+        }
+        if start_refuses:
+            # Only when there is something to say, as crl_expiry adds its held-copy keys.
+            event["start_refuses"] = True
+        self._emit(event)
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        # #2904: the INVERSE -- no page; auto-resolves the open crl_reload_refused via _AUTO_RESOLVE.
+        # It also ends the cooldown for that file. The runner raises a refusal once per file
+        # version and sends no reminders, so a refusal that follows this clear inside the cooldown
+        # would otherwise be throttled and never paged at all.
+        self._last_sent.pop(f"crl_reload_refused:{name}", None)
+        self._record_state({"type": "crl_reload_applied", "connection": name}, "info")
 
     def secret_rotation_due(
         self,
@@ -1076,16 +1118,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def approval_approver_provenance(
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
-        # BACKLOG #315: a release went ahead with an approver account that changed after the request.
-        # `approval:<id>` stands in for "connection", so each flagged release is its own instance
-        # (the key's grammar is on AlertSink). The slugs land in the reason column. No PHI.
+        # BACKLOG #315, #2125: a release or a resolve went ahead with an account that changed after
+        # the request. `approval:<id>` (a release) or `approval:<id>:resolve` stands in for
+        # "connection", so each flagged act is its own instance (the key's grammar is on
+        # AlertSink). The slugs land in the reason column. No PHI.
         self._emit(
             {
                 "type": "approval_approver_provenance",
                 "connection": name,
                 "operation": operation,
                 "changed": list(changed),
-                "reason": "approver account changed after the request: " + ", ".join(changed),
+                # "acting": the approver on a release, the resolver on a resolve. The key says which.
+                "reason": "acting account changed after the request: " + ", ".join(changed),
             }
         )
 

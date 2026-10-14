@@ -21,9 +21,10 @@ from harness.load.enginepoll import EnginePoller
 from harness.load.metrics import Counters, Histogram, LatencySummary
 from harness.load.profile import LoadProfile, Phase, Slo
 
-SCHEMA_VERSION = 4  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
+SCHEMA_VERSION = 5  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
 # copies_per_message (the #207 sizing proxy — a COPY COUNT, never a byte figure; ADR 0141);
-# 3 to 4: totals.refused_sends (sends the harness refused to frame, ADR 0205 rule 1)
+# 3 to 4: totals.refused_sends (sends the harness refused to frame, ADR 0205 rule 1);
+# 4 to 5: the poller's own cost and txn_per_message_poller_removed (vault BACKLOG #2794)
 
 # Exit codes (shared with the CLI).
 EXIT_OK = 0
@@ -139,6 +140,25 @@ class EngineSummary:
     # so a 0 delta over acked traffic is an unwired counter, not a zero-copy run.
     body_copies: int = 0
     copies_per_message: float | None = None
+    # vault BACKLOG #2794 -- the poller's OWN commits, measured rather than assumed. A signed-in
+    # request commits a session stamp, and a grant audit too under
+    # [security].audit_all_authorization_decisions, so `committed_txns` above carries the poller as
+    # well as the pipeline. The runner calibrates at
+    # idle (EnginePoller.calibrate): `poller_commits_per_sample_measured` commits over
+    # `poller_requests_per_sample` requests. The run made `poller_requests` requests between the
+    # baseline and final /stats reads, so the poller's share is requests x that rate.
+    # `txn_per_message_poller_removed` is the raw figure with that share taken off; the raw one
+    # stays beside it. Both poller figures are None -- "not measured" -- when the calibration
+    # failed, or when the raw figure is itself not measured (an unwired counter calibrates to a
+    # flat 0, which is no evidence the poller is free). A renewal's sign-in is not in the share:
+    # `poller_renewals` says how many runs it left in.
+    poller_samples: int = 0
+    poller_requests: int = 0
+    poller_renewals: int = 0
+    poller_requests_per_sample: int = 0
+    poller_commits_per_sample_measured: int | None = None
+    txn_per_message_poller_removed: float | None = None
+    poller_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +236,22 @@ class RunReport:
                 ),
                 "copies_per_message_backend": self.engine.db_backend,
                 "copies_per_message_unit": "body copies (NOT bytes)",
+                # vault BACKLOG #2794: the poller's own cost, measured at idle, and txn/msg with it
+                # taken off. `null` => NOT MEASURED, never a fabricated 0. See EngineSummary.
+                "poller_samples": self.engine.poller_samples,
+                "poller_requests": self.engine.poller_requests,
+                "poller_renewals": self.engine.poller_renewals,
+                "poller_requests_per_sample": self.engine.poller_requests_per_sample,
+                "poller_commits_per_sample_measured": (
+                    self.engine.poller_commits_per_sample_measured
+                ),
+                "txn_per_message_poller_removed": (
+                    round(self.engine.txn_per_message_poller_removed, 3)
+                    if self.engine.txn_per_message_poller_removed is not None
+                    else None
+                ),
+                # Why the figure above is null, so a banked artifact can tell the cases apart.
+                "poller_note": self.engine.poller_note,
             },
             "no_loss": {
                 "ok": self.no_loss.ok,
@@ -311,6 +347,25 @@ class RunReport:
             else "not measured"
         )
         lines.append(f"txn/msg (measured): {measured} (committed_txns={e.committed_txns})")
+        # vault BACKLOG #2794: the same figure with the poller's own commits taken off, beside the
+        # raw one rather than in place of it. The poller's cost is measured at idle on this engine,
+        # so the line carries the arithmetic a reader needs to check it.
+        poller = f"{e.poller_samples} samples"
+        if e.poller_renewals:
+            poller += f", {e.poller_renewals} renewals left in"
+        per = e.poller_commits_per_sample_measured
+        if e.txn_per_message_poller_removed is not None and per is not None:
+            share = e.poller_requests * per / e.poller_requests_per_sample
+            removed = (
+                f"{e.txn_per_message_poller_removed:.2f}/msg ({e.poller_requests} poller requests "
+                f"x {per} commits per {e.poller_requests_per_sample}-request sample measured at "
+                f"idle = {share:.0f} commits removed; {poller})"
+            )
+        else:
+            removed = (
+                f"not measured ({e.poller_note}; {e.poller_requests} poller requests, {poller})"
+            )
+        lines.append(f"txn/msg (engine, poller removed): {removed}")
         # #207 loose end 2: the SIZING proxy, beside the measured txn/msg. The label carries BOTH
         # caveats into the operator's terminal — the backend (SQLite dedups an identical fan-out to one
         # copy, SQL Server writes N, and the rig/production backend is SQL Server) and "NOT bytes"
@@ -814,6 +869,36 @@ def _engine_summary(
     copies_per_message = (
         body_copies / message_count if message_count > 0 and body_copies > 0 else None
     )
+    poller_requests = (final.poller_requests - base.poller_requests) if base and final else 0
+    poller_renewals = (final.poller_renewals - base.poller_renewals) if base and final else 0
+    calibration = poller.calibration
+    per_sample: int | None = None
+    requests_per_sample = 0
+    removed: float | None = None
+    if calibration is None:
+        note: str | None = "the poller was not calibrated"
+    elif calibration.commits_per_sample is None:
+        note = calibration.note or "the calibration was not taken"
+    elif txn_per_message_measured is None:
+        # An unwired counter calibrates to 0 as well, so its 0 is not evidence (#207, #2643).
+        note = "the raw figure is not measured"
+    elif calibration.requests_per_sample <= 0:
+        note = "the calibration counted no requests"
+    else:
+        note = None
+        per_sample = calibration.commits_per_sample
+        requests_per_sample = calibration.requests_per_sample
+        poller_commits = poller_requests * per_sample / requests_per_sample
+        engine_commits = committed_txns - poller_commits
+        if engine_commits > 0:
+            removed = engine_commits / message_count
+        else:
+            # A run that acked messages committed something, so nothing left over means the idle
+            # calibration overstated the poller (an engine busy with its own work at idle).
+            note = (
+                f"the poller's measured share ({poller_commits:.0f}) is not below "
+                f"committed_txns ({committed_txns})"
+            )
     return EngineSummary(
         db_backend,
         journal,
@@ -827,6 +912,13 @@ def _engine_summary(
         txn_per_message_measured,
         body_copies,
         copies_per_message,
+        poller_samples=len(samples),
+        poller_requests=poller_requests,
+        poller_renewals=poller_renewals,
+        poller_requests_per_sample=requests_per_sample,
+        poller_commits_per_sample_measured=per_sample,
+        txn_per_message_poller_removed=removed,
+        poller_note=note,
     )
 
 

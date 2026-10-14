@@ -117,7 +117,7 @@ async def test_mark_failed_returns_next_attempt_at(store: MessageStore) -> None:
     )
     item = (await store.claim_ready(now=200.0))[0]
     # attempts is post-increment (=1) → backoff = 5.0 * 2**0; rescheduled at now + 5.
-    next_at = await store.mark_failed(item.id, "transient", RetryPolicy(), now=1000.0)
+    next_at = (await store.mark_failed(item.id, "transient", RetryPolicy(), now=1000.0)).retry_at
     assert next_at == pytest.approx(1005.0)
 
 
@@ -127,9 +127,11 @@ async def test_mark_failed_returns_none_on_dead_letter_and_missing(store: Messag
     )
     item = (await store.claim_ready(now=200.0))[0]
     # max_attempts=1 with attempts already 1 → dead-letter: nothing to re-claim, no timer.
-    assert await store.mark_failed(item.id, "boom", RetryPolicy(max_attempts=1), now=1000.0) is None
+    assert (
+        await store.mark_failed(item.id, "boom", RetryPolicy(max_attempts=1), now=1000.0)
+    ).dead == 1
     # A vanished row is equally not re-claimable.
-    assert await store.mark_failed("no-such-row", "x", RetryPolicy(), now=1000.0) is None
+    assert (await store.mark_failed("no-such-row", "x", RetryPolicy(), now=1000.0)).dead == 0
 
 
 # --- the armed retry wake (the pinned at-least-once case) ------------------------

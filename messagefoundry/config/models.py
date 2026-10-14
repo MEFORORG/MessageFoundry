@@ -166,13 +166,33 @@ class Priority(str, Enum):  # noqa: UP042
 
 
 class InternalErrorPolicy(str, Enum):  # noqa: UP042
-    """What an outbound delivery worker does when an **internal/code error** (a non-``DeliveryError``
-    exception escaping a connector's ``send`` — our bug, not the partner's) hits a message.
+    """What a worker does when an **internal/code error** hits a message: on an outbound's delivery
+    worker, at least an ``Exception`` other than a ``DeliveryError`` escaping a connector's
+    ``send`` (our bug, not the partner's); on an inbound's router and transform workers, at least a
+    router or handler raise. A per-outbound ``internal_error`` sets it for that outbound's
+    delivery worker. The ``[delivery]``
+    ``internal_error`` default sets it for every other delivery worker and for every router and
+    transform worker.
 
     ``CONTINUE`` (default): error-and-continue — dead-letter the offending row (replayable) and move
-    on, so a code bug can't wedge the whole lane. ``STOP``: halt the connection's delivery worker and
-    raise a ``connection_stopped`` alert, leaving the message queued for replay — for operators who
-    would rather a lane freeze (and page someone) than auto-dead-letter on an unexpected error.
+    on, so a code bug can't wedge the whole lane. ``STOP``: halt the worker and raise a
+    ``connection_stopped`` alert — for operators who would rather a lane freeze (and page someone)
+    than auto-dead-letter on an unexpected error.
+
+    **STOP and the retry cap (vault BACKLOG #3211).** STOP hands the row to ``mark_failed``, which
+    dead-letters it only when its attempts, counting the one that just failed, have reached a finite
+    ``max_attempts``. This bounds a stop and re-arm loop on a row that always crashes. A batched
+    outbound hands the whole batch to ``mark_batch_failed``, which decides from the first member
+    still present: when that member has reached the cap, the dead-letter takes every member still
+    present, whatever its own attempts. A WARNING says when a stop dead-letters, and names at most
+    10 of the affected messages.
+
+    The delivery cap is the outbound's own ``retry`` policy's ``max_attempts`` when it has one
+    (code-first ``retry=RetryPolicy(...)``, or ``[outbound.retry]`` in ``connections.toml``), and
+    ``[delivery] retry_max_attempts`` otherwise. The router and transform workers always take
+    ``[delivery] retry_max_attempts``. How to replay a dead-lettered row is in
+    ``docs/USER-GUIDE.md``, *A lane stopped processing*.
+
     Partner rejections (``NegativeAckError``) and transport failures are unaffected — this governs
     only the engine-internal-error case.
     """
@@ -203,6 +223,21 @@ def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
     every factory cannot cross a refusal on a truthy string."""
     value = settings.get(key)
     return False if value is None else require_flag(value, key)
+
+
+def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    """A boolean connector setting, where an explicit ``None`` means ``default``, as absence does.
+
+    ``bool(settings.get(key, True))`` reads an explicit ``None`` as ``False``, which turns a
+    default-on check such as ``tls_verify`` OFF (vault BACKLOG #3230). Any other value is read with
+    ``bool()``, as before; this changes only what ``None`` means.
+
+    Use it for a transport setting with a default, such as a TLS check, and read it the same way in
+    every connector and every reader that reports on it, so the two cannot disagree. Use
+    :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin),
+    which defaults off and must refuse a value that is not a real ``bool``."""
+    value = settings.get(key)
+    return default if value is None else bool(value)
 
 
 def _check_flag_with_reason(

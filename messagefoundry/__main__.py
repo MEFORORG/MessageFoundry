@@ -756,8 +756,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     cert_import = cert_sub.add_parser(
         "import",
         help="import a PKCS#12/.pfx bundle into cert.pem / key.pem / ca-chain.pem. The passphrase is "
-        "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written 0600 and refuses to "
-        "overwrite an existing key",
+        "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written owner-only (mode 0600 "
+        "on POSIX, a restrictive access list on Windows) and refuses to overwrite an existing key",
     )
     cert_import.add_argument(
         "--pfx", required=True, help="path to the PKCS#12/.pfx bundle to import"
@@ -802,13 +802,21 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "self-signed",
         help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
         "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
-        "it); key.pem is written 0600 and refuses to overwrite an existing key",
+        "it); key.pem is written owner-only (mode 0600 on POSIX, a restrictive access list on "
+        "Windows). It refuses to overwrite an existing cert.pem or key.pem, and removes the key it "
+        "wrote if cert.pem cannot be written",
     )
     cert_self_signed.add_argument(
-        "--cn", required=True, help="certificate common name (also added as a DNS SAN)"
+        "--cn",
+        required=True,
+        help="certificate common name (also added as a SAN: an IP SAN for an IP address, else DNS)",
     )
     cert_self_signed.add_argument(
-        "--san", action="append", default=None, metavar="DNS", help="an extra DNS SAN (repeatable)"
+        "--san",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="an extra SAN, a hostname or an IP address (repeatable)",
     )
     cert_self_signed.add_argument(
         "--days", type=int, default=365, help="validity in days (default 365)"
@@ -1316,6 +1324,18 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="active environment the service runs as (required for `install`; passed to "
         "install-service.ps1 as -Environment, i.e. serve --env)",
     )
+    service.add_argument(
+        "--config",
+        default=None,
+        help="config directory the service loads (required for `install`; passed to "
+        "install-service.ps1 as an absolute -Config, i.e. serve --config)",
+    )
+    service.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings file (messagefoundry.toml) for `install`; passed to "
+        "install-service.ps1 as an absolute -ServiceConfig, i.e. serve --service-config",
+    )
 
     return parser, _DISPATCH
 
@@ -1420,7 +1440,10 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        reg = load_config(config_dir)
+        # This load imports the author's config modules ahead of the subcommand's own load, so a
+        # print() in one would reach stdout before any command redirects it (vault BACKLOG #2727).
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir)
     except (WiringError, FileNotFoundError, OSError):
         # A config that doesn't load is reported by the subcommand's own validate/load path with a
         # precise message; don't pre-empt it here (and don't claim a missing env file for it). OSError
@@ -2332,6 +2355,114 @@ def _start_logging(
     return None
 
 
+def _exposure_description(settings: ServiceSettings, *, exposed: bool) -> str:
+    """What made this instance exposed, as the start of a ``serve`` exposure message. Empty when it
+    is not exposed.
+
+    ``exposed`` is ``_serve``'s own ``instance_exposed``, passed in. Whether the instance is exposed
+    is not worked out again here, so this text cannot call an instance exposed that the arms do
+    not, or the reverse (vault BACKLOG #3102). The branches below only choose which field to name.
+    They name the one the operator set, so a loopback bind that only trusts a proxy (re-encrypting
+    to an operator certificate) is told ``[api].trusted_proxies``, not a terminator it never
+    declared (vault BACKLOG #2251).
+
+    The last line covers a term added to the exposure rule and not named here yet. Its text is true
+    of any exposed instance, so a new term gets a vague message rather than a wrong one."""
+    if not exposed:
+        return ""
+    api = settings.api
+    if not api.is_loopback:
+        return f"API bound to non-loopback host {api.host!r}"
+    if api.tls_terminated_upstream:
+        return (
+            "admin interface reached through a declared reverse proxy "
+            "([api].tls_terminated_upstream)"
+        )
+    if api.trusted_proxies:
+        return "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
+    return "admin interface reachable from beyond this host"
+
+
+def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str) -> dict[str, Any]:
+    """This instance's environment values: the value file
+    :func:`~messagefoundry.config.environments.values_file_path` names, plus the ``MEFOR_VALUE_*``
+    environment. ``serve`` hands it to the Engine as the ``env_values_provider``, so it runs at
+    start and again on every reload."""
+    import os
+
+    from messagefoundry.config.environments import load_environment_values, values_file_path
+    from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
+    from messagefoundry.redaction import safe_exc
+
+    # Guarded HERE because this is the one site that knows the value file's PATH, and because this
+    # function is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
+    # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
+    # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
+    # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
+    # WiringError is the type both the serve gate and that route already understand, so
+    # raising it puts an unreadable value file in the same audited 422 arm as every other bad
+    # config. load_environment_values itself stays unguarded: its other callers are out of scope.
+    #
+    # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
+    # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
+    # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
+    # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
+    # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
+    # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
+    # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
+    # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
+    # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
+    # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
+    # keeps the exception type and bounds the length.
+    #
+    # Vault BACKLOG #2626 step 3: the start check vetted the value file once, but this function
+    # reads it again on every reload. So each read vets it again first, and a file edited or
+    # created after the start is not read unvetted. Outside the try below, because WiringError
+    # is a ValueError and that arm would wrap the refusal as a read failure.
+    env_file = values_file_path(base_dir, dir_name, environment)
+    assert_trusted_start_paths([env_file], lead="refusing to read environment values from")
+    try:
+        return load_environment_values(
+            base_dir=base_dir,
+            dir_name=dir_name,
+            environment=environment,
+            environ=os.environ,
+        )
+    except (ValueError, RecursionError, OSError) as exc:
+        # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
+        # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
+        # and RecursionError derives from RuntimeError). The serve gate catches WiringError
+        # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
+        # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
+        # an embedder's arbitrary callable, while this one wraps our own call into a function that
+        # returns a dict or raises.
+        refusal = safe_exc(exc)
+    # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
+    # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
+    # bytes on .object, so chaining either would carry every credential the file holds. `from None`
+    # would not do: it leaves __context__ set.
+    raise WiringError(f"could not read environment values from {env_file}: {refusal}")
+
+
+def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: str = "") -> bool:
+    """Vault BACKLOG #2626 step 3: True, with the reason printed, when another account could write
+    the settings file or the value file this start reads.
+
+    Both sit outside the config tree, which every load checks, and whoever can write either one
+    steers the service. The settings file is the one ``load_settings`` read for ``service_config``.
+    ``serve`` and ``supervise`` both call this, in the same place among their gates, so a fleet
+    whose engine shards would each refuse is refused before any is spawned; ``fleet`` says so."""
+    from messagefoundry.config.settings import settings_file_path
+    from messagefoundry.config.wiring import WiringError, assert_trusted_start_paths
+
+    try:
+        assert_trusted_start_paths([settings_file_path(service_config), env_file])
+    except WiringError as exc:
+        print(f"error: {exc}{f'. {fleet}' if fleet else ''}", file=sys.stderr)
+        return True
+    return False
+
+
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
     # because a script injected before the hook is in place runs. It is NOT first in the process:
@@ -2492,6 +2623,18 @@ def _serve(args: argparse.Namespace) -> int:
     startup_refused = startup_refusal(startup)
     if startup_refused is not None and enforcing:
         print(f"error: refusing to start: {startup_refused}.", file=sys.stderr)
+        return 2
+
+    # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
+    # else the working directory (unchanged default). Resolved here, ahead of the trust check below
+    # and of the startup log that names it, because the standalone-repo / NSSM footgun is a
+    # silently-wrong path.
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+
+    env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
+    env_file = values_file_path(env_base, settings.environments.dir, env_name)
+
+    if _start_files_refused(service_config, env_file):
         return 2
 
     # Vault BACKLOG #2595 and #2601: a store key in this engine's own Windows service environment,
@@ -2719,6 +2862,23 @@ def _serve(args: argparse.Namespace) -> int:
 
     for _env_line in unread_env_warnings(settings):
         logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
+    # BACKLOG #1125 (owner ruling 2026-10-11): an environment proxy must not attach silently. Named
+    # as soon as logging reaches its handlers, before the first hop that could use it.
+    from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
+
+    warn_ambient_proxy(logging.getLogger(__name__))
+
+    # Vault BACKLOG #2626 step 3: the interpreter and the engine package, read by the same policy as
+    # the config tree and reported here, after configure_logging, so the lines reach the operator's
+    # handlers. Not a refusal; wiring.untrusted_install_paths says why.
+    from messagefoundry.config.wiring import untrusted_install_paths
+
+    for _install_line in untrusted_install_paths():
+        logging.getLogger(__name__).warning(
+            "%s. Install the engine where only administrators can write (docs/SERVICE.md, "
+            "'Install the engine where only administrators can write')",
+            _install_line,
+        )
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
@@ -2866,13 +3026,6 @@ def _serve(args: argparse.Namespace) -> int:
                     skew,
                 )
 
-    # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
-    # else the working directory (unchanged default). Resolved once here so the startup log shows the
-    # exact file env() values come from — the standalone-repo / NSSM footgun is a silently-wrong path.
-    from messagefoundry.config.environments import resolve_values_base_dir
-
-    env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
-    env_file = env_base / settings.environments.dir / f"{env_name}.toml"
     # Announce the active environment + posture so an operator can see which env() values resolve and
     # the tier in effect (the env is required — there is no silent default). Every instance carries
     # patient data (BACKLOG #1279), so there is no data class to report: the PHI gates always apply.
@@ -3364,9 +3517,9 @@ def _serve(args: argparse.Namespace) -> int:
             "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
-    # Only the two advisories below read this: instance_exposed plus the serve_ui term. The refusing
-    # arms read instance_exposed alone, since serve_ui is rewritten in place above (BACKLOG #326,
-    # #2218, vault BACKLOG #2251).
+    # Only the two advisories below read this: instance_exposed plus the serve_ui term. At least the
+    # MFA-at-exposure, dual-control and ADR 0152 arms read instance_exposed alone, since serve_ui is
+    # rewritten in place above (BACKLOG #326, #2218, vault BACKLOG #2251).
     ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
@@ -3466,7 +3619,7 @@ def _serve(args: argparse.Namespace) -> int:
     # commonest shape of this posture it does not print at all. Citing it as the compensating control
     # would have rested that control on a premise measurement contradicts.
 
-    # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
+    # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an exposed instance serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
     # [security].require_mfa adds an engine second factor (TOTP or a passkey) for every account
     # that [security].require_mfa_scope covers: every account under the default, not the
@@ -3499,20 +3652,8 @@ def _serve(args: argparse.Namespace) -> int:
     # it points back at the sentence that names it rather than printing it twice.
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     directory_exception = ", with the OIDC exception above" if oidc_exception else ""
-    # What made this instance exposed, named once for the MFA and dual-control arms below. It names
-    # the field the operator set, so a loopback bind that only trusts a proxy (re-encrypting to an
-    # operator certificate) is told [api].trusted_proxies, not a terminator it never declared
-    # (vault BACKLOG #2251). Empty when not exposed, and read only when admin_exposed.
-    exposure_desc = (
-        f"API bound to non-loopback host {settings.api.host!r}"
-        if not settings.api.is_loopback
-        else "admin interface reached through a declared reverse proxy "
-        "([api].tls_terminated_upstream)"
-        if settings.api.tls_terminated_upstream
-        else "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
-        if settings.api.trusted_proxies
-        else ""
-    )
+    # Named once for the MFA and dual-control arms below, and read only when admin_exposed.
+    exposure_desc = _exposure_description(settings, exposed=instance_exposed)
     if admin_exposed and not settings.auth.require_mfa:
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
@@ -3565,13 +3706,17 @@ def _serve(args: argparse.Namespace) -> int:
     if not instance_exposed and settings.api.public_origin and not settings.auth.require_mfa:
         print(
             "warning: [security].web_console_public_address is set with no declared TLS terminator "
-            "on a PHI instance "
+            "and no [api].trusted_proxies on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
             "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
             f"over the network{oidc_exception}, and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
-            "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
-            "trusted_proxies, or set [security].require_mfa=true.",
+            "exposure signal the engine can verify). Set [security].require_mfa=true. If a proxy "
+            "does serve that origin, also declare it by naming the proxy in [api].trusted_proxies, "
+            "with [api].tls_terminated_upstream=true if it terminates TLS or an operator "
+            "[api].tls_cert_file if it re-encrypts to the engine. A declared proxy counts as "
+            "exposed, so with require_mfa still off the MFA-at-exposure gate then applies, and a "
+            "declared terminator has start requirements of its own (docs/CONFIGURATION.md).",
             file=sys.stderr,
         )
 
@@ -3678,6 +3823,22 @@ def _serve(args: argparse.Namespace) -> int:
     # call needs. Before #1026 this comment named three conditions while the gate had four, and the
     # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
     # instance sits behind a declared terminator under `enforce`, and it did not.
+    #
+    # NOT EVERY EXPOSED POSTURE IS PROBED (vault BACKLOG #3102). `instance_exposed` also counts a
+    # set `trusted_proxies` with no declared terminator (vault BACKLOG #2251): a proxy that
+    # re-encrypts to an operator certificate. This gate and the refusal above it read
+    # `tls_terminated_upstream`, not `instance_exposed`, so that shape is never probed and may leave
+    # `public_origin` unset. Two facts, and neither says the gap is safe:
+    #  1. On the hop the engine serves there, its own listener enforces the floor: api/tls.py sets
+    #     `minimum_version` from `[api].tls_min_version`, which the loader holds to 1.2 or 1.3.
+    #  2. The browser's hop still ends at the proxy, as it does behind a terminator. Nothing at
+    #     start measures that proxy's floor, and that shape owes no attestation of it either:
+    #     the only gate that asks for `proxy_tls_min_version` is the terminator gate.
+    # Widening this gate is a new control: it would add a start refusal for an unset origin on this
+    # shape, and make that start depend on the proxy being reachable. The terminator case took an
+    # owner ruling (BACKLOG #1026). No ruling covers this shape, so the gate is not widened in
+    # passing here; vault BACKLOG #3102 is where the question was raised. The cost to a running site
+    # is not the reason: there are none (CLAUDE.md section 0).
     if settings.api.tls_terminated_upstream and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 
@@ -4165,54 +4326,16 @@ def _serve(args: argparse.Namespace) -> int:
     # MEFOR_VALUE_* env, anchored at env_base (above). The active environment is the single selector
     # [ai].environment. Passed as a provider (re-read on each reload, not just startup) so a promote
     # picks up edited values without a service restart (review M-23) — the anchor is fixed per process.
-    import os
-
-    from messagefoundry.config.environments import load_environment_values
+    # _read_environment_values says what each read checks and how a failure travels.
     from messagefoundry.config.wiring import WiringError
     from messagefoundry.redaction import safe_exc
 
-    def env_values() -> dict[str, Any]:
-        # Guarded HERE because this is the one site that knows the value file's PATH, and because this
-        # closure is the Engine's env_values_provider: it is re-invoked on EVERY reload, not only at
-        # startup. Unguarded, a malformed environments/<env>.toml escaped a reload as a raw
-        # TOMLDecodeError, which POST /config/reload answers as a 500 with no audit row, since that
-        # route arms ConfigReloadDenied, FileNotFoundError and WiringError only (BACKLOG #1652).
-        # WiringError is the type both the serve gate below and that route already understand, so
-        # raising it puts an unreadable value file in the same audited 422 arm as every other bad
-        # config. load_environment_values itself stays unguarded: its other callers are out of scope.
-        #
-        # What travels, MEASURED against this repo's safe_exc rather than assumed, because a premise
-        # is what a leak control rests on (SDS-3.7). The file's PATH is named deliberately -- it is
-        # the one thing the operator acts on. tomllib NEVER echoes a VALUE: every shape reports a
-        # position instead ("Illegal character '\n' (at line 1, column 36)", "Invalid value (at line
-        # 1, column 15)"). It DOES echo a KEY or TABLE name in the duplicate shapes ("Duplicate
-        # inline table key 'epic_mrn_key'", "Cannot declare ('db_prod',) twice"), and redact() does
-        # not scrub a lone lowercase identifier -- so a key name can reach this message. That is
-        # accepted: a key name is the diagnosis the operator needs, no configured secret is a key,
-        # and the CONTAINMENT that matters holds anyway -- POST /config/reload renders a constant
-        # body and a constant audit detail, so nothing from this sentence reaches either. safe_exc
-        # keeps the exception type and bounds the length.
-        try:
-            return load_environment_values(
-                base_dir=env_base,
-                dir_name=settings.environments.dir,
-                environment=env_name,
-                environ=os.environ,
-            )
-        except (ValueError, RecursionError, OSError) as exc:
-            # ValueError covers tomllib.TOMLDecodeError and UnicodeDecodeError; RecursionError covers
-            # a deeply nested value file (measured on 3.14: `a = ` + 600 `[` recurses past the limit,
-            # and RecursionError derives from RuntimeError). The gate below now catches WiringError
-            # ONLY, so a shape missing from this tuple reaches the operator as the bare traceback that
-            # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
-            # an embedder's arbitrary callable, while this one wraps our own call into a function that
-            # returns a dict or raises.
-            refusal = safe_exc(exc)
-        # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
-        # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
-        # bytes on .object, so chaining either would carry every credential the file holds. `from None`
-        # would not do: it leaves __context__ set.
-        raise WiringError(f"could not read environment values from {env_file}: {refusal}")
+    env_values = functools.partial(
+        _read_environment_values,
+        base_dir=env_base,
+        dir_name=settings.environments.dir,
+        environment=env_name,
+    )
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
@@ -4476,9 +4599,16 @@ def _serve(args: argparse.Namespace) -> int:
         # GET /logging/level next to the (possibly runtime-overridden) effective level.
         configured_log_level=settings.logging.level,
         # #285 (ASVS 6.7.1): the operator-supplied auth-path trust anchors (OIDC / AD / api-mTLS client
-        # CA) the lifespan + /config/reload preflight for ACL + optional SHA-256 pin. Empty when none is
+        # CA), plus the settings CAs an engine hop dials with (vault BACKLOG #3188), that the
+        # lifespan + /config/reload preflight for ACL + optional SHA-256 pin. Empty when none is
         # configured → dormant, byte-identical. `enforcing` is the [security].enforcement refuse/warn dial.
-        trust_anchor_specs=collect_anchor_specs(settings.auth, settings.api),
+        trust_anchor_specs=collect_anchor_specs(
+            settings.auth,
+            settings.api,
+            tls=settings.tls,
+            alerts=settings.alerts,
+            log_settings=settings.logging,
+        ),
         trust_anchors_enforcing=enforcing,
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,
@@ -4767,6 +4897,24 @@ def _supervise(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Vault BACKLOG #2626 step 3: the settings-file and value-file check each engine shard's
+    # `serve` makes next, at the same place among its gates. Without it here, a file another
+    # account can write would refuse every engine shard, and the supervisor would only restart
+    # them. The value file is anchored as each engine shard anchors it: the forwarded
+    # --project-root, else [environments].base_dir.
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+
+    env_file = values_file_path(
+        resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd),
+        settings.environments.dir,
+        env_name,
+    )
+    if _start_files_refused(
+        service_config,
+        env_file,
+        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
+    ):
+        return 2
     for startup_entry in startup_loosenings(startup):
         security_lines.append(startup_entry)
         logging.getLogger(__name__).warning(
@@ -4875,6 +5023,10 @@ def _supervise(args: argparse.Namespace) -> int:
     if logging_refused is not None:
         return logging_refused
     _log_static_credential_outcome(sc_outcome)
+    # BACKLOG #1125: the supervisor's own store open and pair renewal can go through it too.
+    from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
+
+    warn_ambient_proxy(logging.getLogger(__name__))
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
@@ -4938,7 +5090,8 @@ def _validate(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     config_dir, _ = resolved
-    diags = validate_config(config_dir)
+    with _author_prints_to_stderr():
+        diags = validate_config(config_dir)
     if args.json:
         print(
             json.dumps(
@@ -4965,7 +5118,8 @@ def _graph(args: argparse.Namespace) -> int:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
-        reg = load_config(config_dir, allow_empty=True)
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -5091,7 +5245,11 @@ def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
     ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
     one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
     the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
-    ``_print_json`` still write to the real stdout (vault BACKLOG #1187)."""
+    ``_print_json`` still write to the real stdout (vault BACKLOG #1187).
+
+    ``validate``, ``graph`` and the anchor helper's own load wrap their config load the same way
+    (vault BACKLOG #2727). Nothing enforces the wrap: a command that loads a config without it
+    still lets a print reach stdout."""
     return contextlib.redirect_stdout(sys.stderr)
 
 
@@ -5420,6 +5578,14 @@ def _import(args: argparse.Namespace) -> int:
             "\nReview the `# TODO: Corepoint ...` markers in the generated modules and hand-finish them, "
             "then run: messagefoundry check --config " + str(args.out)
         )
+    # Every generated endpoint is undeployed, whatever mapped (BACKLOG #1130), so say so every time:
+    # a fully mapped import would otherwise read as ready to run while the engine binds nothing.
+    # The wording holds for both layers: an XML endpoint is a placeholder to replace, a JSON one is
+    # export text to review, and the generated module's own TODO says which.
+    print(
+        "\nEvery endpoint is emitted deployed=False and binds nothing. Follow the endpoint TODO in "
+        "each generated module, then drop deployed=False."
+    )
     return 0
 
 
@@ -5462,6 +5628,8 @@ def _service(args: argparse.Namespace) -> int:
     A declined UAC prompt or a failed elevation exits 1 with the reason on stderr, so a wrapper
     script never reads a refused action as success (vault BACKLOG #2787). A service already in the
     requested state exits 0, so ``stop`` and ``start`` are idempotent."""
+    import os
+
     from messagefoundry import service as svc
 
     action = args.action
@@ -5476,6 +5644,15 @@ def _service(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.config is None:
+            # The installer has no default config directory (vault BACKLOG #2626), so asking here
+            # saves a UAC prompt that would only end at the installer's own refusal.
+            print(
+                "error: `service install` requires --config <dir> (the config directory the "
+                "service loads, passed to install-service.ps1 as -Config)",
+                file=sys.stderr,
+            )
+            return 2
         script = svc.install_script_path()
         if script is None:
             print(
@@ -5485,7 +5662,16 @@ def _service(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            launched = svc.install_service(str(script), args.env)
+            # Absolute here: the elevated installer starts in the system directory, so it would
+            # resolve a relative path there rather than where the operator typed it.
+            launched = svc.install_service(
+                str(script),
+                args.env,
+                config=os.path.abspath(args.config),
+                service_config=(
+                    None if args.service_config is None else os.path.abspath(args.service_config)
+                ),
+            )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -5658,7 +5844,7 @@ def _cert_import(args: argparse.Namespace) -> int:
     else:
         _safe_print(f"Imported .pfx into {out_dir}:")
         _safe_print(f"  cert:     {cert_path}")
-        _safe_print(f"  key:      {key_path} (private; 0600)")
+        _safe_print(f"  key:      {key_path} (private; {_key_protection()})")
         if wrote_ca:
             _safe_print(f"  ca-chain: {ca_path} ({len(cas)} CA cert(s))")
         else:
@@ -5858,44 +6044,120 @@ _SELF_SIGNED_PLACEHOLDER_NOTE = (
 )
 
 
+def _key_protection() -> str:
+    """How :func:`_write_private_key` restricts key.pem on THIS platform, for the console line."""
+    if sys.platform == "win32":
+        return "restricted to SYSTEM, Administrators and this account"
+    return "mode 0600"
+
+
+def _san_labels(names: list[str]) -> str:
+    """Label each SAN as the certificate holds it, ``IP:`` or ``DNS:``. It asks the minting
+    classifier, ``pki._general_names``, so the console cannot disagree with the minted file."""
+    import ipaddress
+
+    from messagefoundry import pki
+
+    # An iPAddress entry's value is an ipaddress object and a DNSName's a str. Testing the value
+    # keeps `cryptography` out of this module, which the crypto inventory gate holds it to.
+    ip_types = (ipaddress.IPv4Address, ipaddress.IPv6Address)
+    return ", ".join(
+        f"IP:{gn.value}" if isinstance(gn.value, ip_types) else f"DNS:{gn.value}"
+        for gn in pki._general_names(names)
+    )
+
+
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
-    Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
-    which refuses to overwrite it (cert.pem has no such guard). Prints
-    :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
+    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem or key.pem before
+    it mints, and both writes are exclusive, so a file that appears meanwhile is still never
+    replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
+    line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
+
+    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
+    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
+    from messagefoundry.api.tls import _unlink_generated
 
     if args.days <= 0:
         return _cert_fail("--days must be a positive integer", as_json=args.json)
     out_dir = Path(args.out_dir)
+    cert_path = out_dir / "cert.pem"
+    key_path = out_dir / "key.pem"
+    refuse_cert = (
+        f"refusing to overwrite an existing certificate file: {cert_path} (remove it first)"
+    )
+    refuse_key = f"refusing to overwrite an existing key file: {key_path} (remove it first)"
+    if cert_path.exists():
+        return _cert_fail(refuse_cert, as_json=args.json)
+    if key_path.exists():
+        return _cert_fail(refuse_key, as_json=args.json)
+
     sans = args.san or []
-    cert_pem, key_pem = pki.make_self_signed(args.cn, sans, args.days)
+    try:
+        cert_pem, key_pem = pki.make_self_signed(args.cn, sans, args.days)
+    except OverflowError:
+        # The validity end falls past the last date a datetime can hold.
+        return _cert_fail(
+            f"cannot mint the certificate: --days {args.days} is too large, it ends after the "
+            "year 9999",
+            as_json=args.json,
+        )
+    except ValueError as exc:
+        # A common name over 64 characters, or a common name or --san not in ASCII. The text
+        # names the rejected value and never carries key material.
+        return _cert_fail(f"cannot mint the certificate: {exc}", as_json=args.json)
 
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
 
-    cert_path = out_dir / "cert.pem"
-    key_path = out_dir / "key.pem"
     try:
         _write_private_key(key_path, key_pem)
     except FileExistsError:
-        return _cert_fail(
-            f"refusing to overwrite an existing key file: {key_path} (remove it first)",
-            as_json=args.json,
-        )
+        return _cert_fail(refuse_key, as_json=args.json)
     except OSError as exc:
         return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
-    cert_path.write_bytes(cert_pem)
 
-    dns = list(dict.fromkeys([args.cn, *sans]))
+    # Exclusive create: a cert.pem that appeared after the check above is still never replaced.
+    cert_created = False
+    try:
+        with cert_path.open("xb") as fh:
+            cert_created = True
+            fh.write(cert_pem)
+    except BaseException as exc:
+        # BaseException, so an interrupt between the two writes still cleans up; it is re-raised.
+        # Remove only what THIS run wrote, never a file that was already there.
+        removed: list[str] = []
+        left: list[str] = []
+        for path in (key_path, cert_path) if cert_created else (key_path,):
+            try:
+                _unlink_generated(path)
+            except FileNotFoundError:
+                continue  # already gone, so nothing is left to remove
+            except OSError:
+                left.append(str(path))
+            else:
+                removed.append(str(path))
+        if not isinstance(exc, OSError):
+            raise
+        reason = (
+            refuse_cert if isinstance(exc, FileExistsError) else f"cannot write {cert_path}: {exc}"
+        )
+        if removed:
+            reason += f"; removed {', '.join(removed)}, which this run wrote"
+        if left:
+            reason += f"; could not remove {', '.join(left)}, so remove it before running again"
+        return _cert_fail(reason, as_json=args.json)
+
+    names = list(dict.fromkeys([args.cn, *sans]))
     result: dict[str, object] = {
         "cert": str(cert_path),
         "key": str(key_path),
         "cn": args.cn,
-        "sans": dns,
+        "sans": names,
         "days": args.days,
         "note": _SELF_SIGNED_PLACEHOLDER_NOTE,
     }
@@ -5904,8 +6166,8 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
     else:
         _safe_print(f"Wrote a self-signed PLACEHOLDER certificate to {out_dir}:")
         _safe_print(f"  cert: {cert_path}")
-        _safe_print(f"  key:  {key_path} (private; 0600)")
-        _safe_print(f"  CN={args.cn}  SAN(DNS)={', '.join(dns)}  valid {args.days} day(s)")
+        _safe_print(f"  key:  {key_path} (private; {_key_protection()})")
+        _safe_print(f"  CN={args.cn}  SAN={_san_labels(names)}  valid {args.days} day(s)")
         _safe_print(f"  NOTE: {_SELF_SIGNED_PLACEHOLDER_NOTE}.")
     return 0
 
@@ -6826,7 +7088,11 @@ def _refuse_an_unauditable_write(store: Store) -> None:
     account, ``admin-unlock`` clears the lockout. Without this, a refused audit append lands after
     those writes, so the change is made and nothing records who made it. The case that reaches it: a
     keyed chain opened from a shell with no key, under a stale audited opt-out that let the open
-    through."""
+    through.
+
+    ``admin-set-notify-email`` writes its audit row first, and calls this anyway: the refusal it
+    raises exits 2, could not start, where the append's own refusal could not be told apart from a
+    busy store, which exits 1 (BACKLOG #2124)."""
     refusal = store.audit_append_refusal()
     if refusal is not None:
         raise _UnauditableWrite(
@@ -7399,7 +7665,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except (StoreKeylessError, CipherError) as exc:
         # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
         # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
-        return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
+        # Either way the store could not be opened, so exit 2, as the keyless checks beside it
+        # exit (BACKLOG #2124, a seat decision under owner delegation 2026-10-08, not an owner
+        # ruling).
+        _emit_error(f"{_sentence(exc)} Nothing was written", as_json=args.json)
+        return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -7668,7 +7938,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     **THE AUDIT ROW IS APPENDED BEFORE THE ADDRESS IS WRITTEN.** The two are separate commits, so one
     order or the other can leave them disagreeing. A keyed store opened from a shell without its key
     (the key sits in the service's NSSM environment) opens fine and then refuses a keyless append;
-    written the other way round, the address would land unaudited. This order can instead leave an
+    written the other way round, the address would land unaudited. That refusal is asked before the
+    append and exits 2, could not start; a store that refuses the append for another reason, such
+    as a busy one, exits 1 (BACKLOG #2124). This order can instead leave an
     audit row for a write that then failed; the command then appends a ``..._failed`` row and says
     so rather than reporting OK. An unaudited change to where security notices go is the worse of
     the two.
@@ -7714,8 +7986,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     wanted = args.username.strip()
     actor = f"cli:{getpass.getuser()}"
     # Store failures a refused write can raise on every backend (BACKLOG #1983). `RuntimeError` covers
-    # the audit chain's keyed-append refusal and the store's own acquire timeout; `OSError` a server
-    # backend's lost connection; the rest are the drivers' own bases, which subclass neither.
+    # at least the store's own acquire timeout. The chain's in-memory key check (no key in this
+    # shell, or the current range's key not held) is asked before the append, so that refusal does
+    # not arrive here (BACKLOG #2124); a failure the check cannot predict still can. `OSError` covers
+    # a server backend's lost connection; the rest are the drivers' own bases, which subclass neither.
     store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
 
     async def run() -> tuple[str, str, str]:
@@ -7755,11 +8029,16 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # PHI-free, and the address itself is left out, as `provision-admin` records only
             # whether one was set. The actor names the OS user, as `admin-unlock` does.
             detail = json.dumps({"username": user.username})
+            # The chain's key check, asked before the append: no key in this shell, or the current
+            # range's key not held. Exit 2 below, as `admin-unlock` exits on it (BACKLOG #2124, a
+            # seat decision under owner delegation 2026-10-08, not an owner ruling).
+            _refuse_an_unauditable_write(store)
             try:
                 await store.record_audit("auth.admin_notify_email_set", actor=actor, detail=detail)
             except store_errors as exc:
-                # The chain refused the append (no key in this shell, the current range's key not
-                # held, or a running engine holding the write lock). Nothing has been written yet.
+                # Any other refusal of the append, such as a running engine holding the write lock
+                # or a pool acquire that timed out. A busy store is not "could not start", so it
+                # keeps exit 1. Nothing has been written yet.
                 return ("audit-refused", user.username, str(exc))
             try:
                 await store.set_user_notify_email(user.id, email=address)
@@ -7784,14 +8063,28 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     try:
         outcome, username, extra = run_guarded(run())
-    # #1916, #1780, #3054 (no key): could not start
-    except (KeylessAuditChainRefused, StoreNotFoundError, _StoreKeyUnresolved) as exc:
+    # #1916, #1780, #3054 (no key): could not start. And #2124: the chain's key check refused the
+    # audit row, which `admin-unlock` exits 2 on with the same text (a seat decision under owner
+    # delegation 2026-10-08, not an owner ruling).
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _StoreKeyUnresolved,
+        _UnauditableWrite,
+    ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if outcome == "open-refused":
+        # The store could not be opened, so the command could not start: exit 2, the code ADR 0171
+        # Amendment C gives "could not start" (BACKLOG #2124, a seat decision under owner
+        # delegation 2026-10-08, not an owner ruling). A `CipherError` here is raised by the open,
+        # before the command reads an account, so it is the same "could not start" as a
+        # `StoreKeylessError`. Exit 1 stays a refusal about the account.
+        _emit_error(f"{_sentence(extra)} Nothing was written", as_json=args.json)
+        return 2
     refusals = {
-        "open-refused": f"{extra}. Nothing was written",
         "no-such-user": f"no account named {username!r}",
         "not-admin": f"the account {username!r} is not an Administrator; the start gate asks only "
         "about enabled Administrators",
@@ -8772,10 +9065,25 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     try:
         active_key = resolve_active_key(settings.store)
-    except _key_unresolved() as exc:
+    except _key_unresolved() + (ValueError,) as exc:
         # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
         # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
-        print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
+        #
+        # ValueError (vault BACKLOG #3247): under key_provider=vault the Vault client build can
+        # refuse with a bare one, which reached the dispatch floor and exited 1, an aborted
+        # rotation's code. Taken whole, subclasses too, as `build_store_cipher` takes the same
+        # refusal when the open below meets it: it comes from the settings or the key provider, and
+        # only the key is resolved here, so nothing a store holds can reach this arm.
+        #
+        # Printed through `codec_safe_str`, not as `{exc}`. One ValueError here is a
+        # UnicodeDecodeError from a DPAPI key file that unprotects to bytes that are not ASCII, and
+        # its own text quotes a byte of the key. Every other text is printed whole.
+        from messagefoundry.redaction import codec_safe_str
+
+        print(
+            f"error: cannot load the active key for rotation: {codec_safe_str(exc)}",
+            file=sys.stderr,
+        )
         return 2
     if not active_key:
         print(

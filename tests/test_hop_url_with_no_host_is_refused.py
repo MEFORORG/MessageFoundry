@@ -43,7 +43,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.transports import build_destination, rest
-from messagefoundry.transports.base import DeliveryError, DestinationConnector
+from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import oauth2_cc_provider_from_settings
 from messagefoundry.transports.rest import (
@@ -269,9 +269,11 @@ def test_a_send_to_a_url_with_no_host_is_refused_and_sends_nothing(
     assert opener.calls == 1  # control: with its real host, the same call reaches the opener
 
     setattr(dest, attr, f"http://{authority}/x")
-    # The type _post already raises for a refused hop (test_hop_refusal_http pins it).
-    with pytest.raises(InsecureHopRefused, match="names no host"):
+    # The type _post raises for a refused hop (test_hop_refusal_http pins it): since BACKLOG #2989
+    # a configuration fault, with the raw refusal on the cause.
+    with pytest.raises(NegativeAckError, match="names no host") as err:
         dest._post(*post_args)  # type: ignore[attr-defined]
+    assert isinstance(err.value.__cause__, InsecureHopRefused)
     assert opener.calls == 1  # refused before a byte crossed
 
 

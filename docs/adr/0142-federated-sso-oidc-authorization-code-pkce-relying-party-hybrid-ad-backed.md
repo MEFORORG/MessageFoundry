@@ -179,7 +179,10 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
   (`expired`, `auth_time_stale`) instead of minting a dead session. The federated step-up in Amendment B
   never extends the cap. Local and AD session expiry are still unchanged.]*
 - **AC-7** — IF a callback arrives without a matching flow cookie, THEN THE SYSTEM SHALL refuse and
-  audit `flow_binding_missing`, even when `state` and `code` are otherwise valid.
+  audit `flow_binding_missing`, even when `state` and `code` are otherwise valid. IF a callback
+  carries the cookie but not the flow's own `state`, including an `error=` or malformed callback,
+  THEN THE SYSTEM SHALL refuse it and consume nothing, keeping the flow and its cookie for the real
+  IdP return (BACKLOG #3198).
   → `packaging/messagefoundry-webconsole/tests/test_webui.py` <!-- console-package suite -->
 
 - **AC-8** — WHILE the IdP is unreachable, THE SYSTEM SHALL continue to serve local, LDAPS, and Kerberos
@@ -533,7 +536,10 @@ B.1 left the verification of what comes back to the build. These are its criteri
   test and a freshness test, is refused as `step_up_subject_mismatch` (BACKLOG #2143). IF the directory no
   longer returns the account by its immutable id, THEN THE SYSTEM SHALL refuse with
   `not_in_directory`, and a row with no immutable id SHALL be refused with
-  `directory_object_id_missing` rather than looked up by name. IF a role stored on the account is
+  `directory_object_id_missing` rather than looked up by name. IF the directory's answer does not
+  carry the row's own immutable id, THEN THE SYSTEM SHALL refuse with `directory_object_id_missing`
+  (no id) or `directory_identity_conflict` (another id), before its groups are read (BACKLOG
+  #3174). IF a role stored on the account is
   not among the roles its current directory groups map to, THEN THE SYSTEM SHALL refuse with
   `directory_roles_demoted`, write no roles, and leave the session as it was (BACKLOG #2154). Only a
   lost role refuses, and channel scope is not compared.
@@ -680,3 +686,57 @@ that shows while the IdP is failing, rather than a link any caller can hide.
 - Any other `http.client` exception also reads as transport, `BadStatusLine` among them, even
   where a reply did arrive, such as a header line over the length limit. So does a refusal the
   engine makes before it sends, such as a proxy URL carrying credentials.
+
+---
+
+## Amendment F (2026-10-11) — a TOTP or recovery code opens no step-up window on an OIDC session (BACKLOG #2142)
+
+> **Status: a seat decision under owner delegation 2026-10-08, not an owner ruling.** The vault's
+> owner-rulings runbook for that date records it under *#2142 (batch 240)* as delegated and
+> reviewed. It extends R3 of the vault's 2026-09-23 ASVS owner rulings, which accepted Amendment B,
+> to a case R3 does not name. The extension is the seat's, not the owner's. This amendment does not
+> change the status line at the top of this ADR.
+
+Amendment B sent an OIDC session's step-up back to the IdP, and AC-13 refused a password for it. It
+was silent on the TOTP gate. `AuthService.verify_mfa` still stamped `reauth_at` for every session,
+so an OIDC session whose holder had enrolled an engine TOTP could open its step-up window with a code
+alone, with no IdP round trip. On a first deployment with federation on, that would have bypassed
+the leg Amendment B chose.
+
+- **A good code still completes a pending second factor.** It marks the session MFA-verified, clears
+  the second-step counter and re-keys the session (ASVS 7.2.4), as before.
+- **It no longer opens the window or moves the address anchor.** For a session whose
+  `auth_mechanism` is `oidc`, `verify_mfa` skips `mark_session_reauthed` and the new-address dedupe
+  restart that pairs with it. Both run in one store statement, so the address re-anchor goes with
+  the window. That session re-anchors only at the IdP: `complete_oidc_step_up` already stamps
+  `reauth_at` and the callback's address in one statement and restarts the dedupe (AC-18). No new
+  store method was added.
+- **The known-address record still learns the address.** A factor was proved from it, so
+  `verify_mfa` still records it, as the IdP leg records its own. This is the sign-in signal's
+  baseline (vault BACKLOG #2145), not the session's anchor.
+- **Every other session is unchanged.** A local or Kerberos session's code still opens the window
+  and re-anchors the session.
+
+**AC-19 (a code is not an OIDC step-up)** — WHEN `verify_mfa` accepts a TOTP or recovery code for a
+session minted by the federated login, THE SYSTEM SHALL mark a pending second factor met and rotate
+the session, and SHALL NOT stamp `reauth_at` or move the session's client address. IF that session
+has already met its factor, THEN THE SYSTEM SHALL refuse the code with `idp_step_up_required` before
+reading it, spending no code and charging nothing. A session minted
+by password SHALL still have its window opened and its address re-anchored by the same code. Pinned in
+`tests/test_oidc_step_up.py`.
+
+**The cost, stated.** An OIDC session that owes an engine factor proves it at the MFA gate and then
+still needs the IdP step-up before its first window-gated action. An action-bound route already
+needed that step-up for its grant, so this adds a round trip only on the routes that ride the
+session window. The code also no longer re-anchors the session, so an OIDC operator who proves the
+factor from a new address still trips the new-client-IP signal (`admin_new_ip_step_up`) there,
+and clears it only by the IdP step-up from that address.
+
+**A code on an OIDC session that has already met its factor is refused unread.** It would complete
+nothing and open nothing, so verifying it would only spend a TOTP step or a single-use recovery
+code. `verify_mfa` refuses it before the code is read, as `reauth` refuses a password, and returns
+`idp_step_up_required`. It audits `auth.mfa_failed` with `reason=idp_step_up_required`, spends no
+code, and charges nothing to the lockout; the route's rate-limit budget is still drawn. `POST
+/auth/mfa-verify` answers 403 with `X-Step-Up-Via: idp`, and `POST /ui/mfa` sends the browser to
+`/ui`, as its GET does for any satisfied session. The check runs before the account-lock check,
+because neither account lock refuses the IdP leg.

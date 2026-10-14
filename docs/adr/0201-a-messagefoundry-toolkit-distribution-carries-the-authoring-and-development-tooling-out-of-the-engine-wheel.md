@@ -152,6 +152,15 @@ checkout do not reach what runs until someone reinstalls. The web console has li
 toolkit cannot: `anon/leak.py` and `anon/surrogates.py` find `scripts/security/` by walking up from
 `__file__`, and from `site-packages/` that walk never reaches the repository.
 
+> **Corrected 2026-10-12 (BACKLOG #2996).** The sentence above describes the two loaders as they
+> stood when this ADR was written. Neither walks up from `__file__` now. Each builds one fixed
+> path, `scripts/security/` under the folder that holds the package, and never searches the tree
+> for it: `anon/leak.py` since BACKLOG #2344, and `anon/surrogates.py` since BACKLOG #2995. The
+> paragraph's point still holds. From `site-packages/` that one path is not in the repository, so
+> a frozen copy would not find the checkout's `scripts/security/`. For `anon/leak.py`,
+> [`docs/DANGEROUS-FUNCTIONALITY.md`](../DANGEROUS-FUNCTIONALITY.md) says why that folder is the
+> limit, in the paragraph that starts "`anon/leak.py` loads one file by path".
+
 ## Decision
 
 **Build a third sibling distribution, `messagefoundry-toolkit`, released in lockstep with the engine.

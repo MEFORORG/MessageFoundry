@@ -45,7 +45,7 @@ from messagefoundry.pipeline.wiring_runner import (
     _FusedTransformResult,
     _ItemOutcome,
 )
-from messagefoundry.store import MessageStatus, MessageStore, OutboxItem, Stage
+from messagefoundry.store import FailOutcome, MessageStatus, MessageStore, OutboxItem, Stage
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
@@ -131,8 +131,9 @@ def _spy_dead_letter(monkeypatch: pytest.MonkeyPatch, store: MessageStore) -> _S
 def _spy_mark_failed(monkeypatch: pytest.MonkeyPatch, store: MessageStore) -> _Spy:
     mf = _Spy()
 
-    async def _mf(item_id: str, reason: str, policy: Any) -> None:
+    async def _mf(item_id: str, reason: str, policy: Any) -> FailOutcome:
         mf.calls.append((item_id, reason, policy))
+        return FailOutcome(retry_at=1.0, head_id=item_id, attempts=1)  # re-pended
 
     monkeypatch.setattr(store, "mark_failed", _mf)
     return mf
@@ -363,6 +364,7 @@ async def test_routed_xform_exc_stop(store: MessageStore, monkeypatch: pytest.Mo
     assert outcome == (_ItemOutcome.STOPPED, None)
     assert mf.calls and mf.calls[0][0] == "rtd-1"
     assert mf.calls[0][1].startswith("handler error (transform stopped):")
+    assert mf.calls[0][2] is runner._delivery_defaults
     assert cs.calls == [("IB", "handler ValueError on rtd-1")]
 
 
@@ -525,4 +527,5 @@ async def test_apply_transform_internal_error_stop(
     out = await runner._apply_transform_internal_error("IB", _routed_item(), ValueError("x"))
     assert out == (_ItemOutcome.STOPPED, None)
     assert mf.calls[0][1].startswith("handler error (transform stopped):")
+    assert mf.calls[0][2] is runner._delivery_defaults
     assert cs.calls[0] == ("IB", "handler ValueError on rtd-1")

@@ -26,10 +26,12 @@ import io
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -192,13 +194,21 @@ def test_an_engine_that_does_not_answer_is_unreachable_and_not_a_refusal() -> No
 
 
 @contextlib.contextmanager
-def _engine_answering(status: int, size: int) -> Iterator[str]:
-    """A loopback HTTP server that answers every request with ``status`` and ``size`` bytes."""
+def _engine_answering(status: int, size: int, *, states_length: bool = True) -> Iterator[str]:
+    """A loopback HTTP server that answers every request with ``status`` and ``size`` bytes.
+
+    With ``states_length`` false the answer has no ``Content-Length`` and ends when the server
+    closes, so the client can only count what arrives."""
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _answer(self) -> None:
+            # Read the request body first (BACKLOG #3394). A socket closed with received bytes
+            # still unread sends a reset instead of a normal close, and Windows then throws away
+            # the answer the client has not read: the sign-in POST read as ConnectionAbortedError.
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.send_response(status)
-            self.send_header("Content-Length", str(size))
+            if states_length:
+                self.send_header("Content-Length", str(size))
             self.end_headers()
             self.wfile.write(b"x" * size)
 
@@ -217,27 +227,64 @@ def _engine_answering(status: int, size: int) -> Iterator[str]:
         server.server_close()
 
 
+@pytest.mark.parametrize("states_length", [True, False], ids=["stated", "unstated"])
 @pytest.mark.parametrize("status", [200, 401])
 def test_an_answer_past_the_reply_cap_is_refused_and_one_at_it_is_read_whole(
-    monkeypatch: pytest.MonkeyPatch, status: int
+    monkeypatch: pytest.MonkeyPatch, status: int, states_length: bool
 ) -> None:
     """ASVS 5.1.1 (BACKLOG #1127): the rig reads each engine answer under ``MAX_API_REPLY_BYTES``,
-    on the success path and the HTTP-error path alike, and never cuts one short."""
+    on the success path and the HTTP-error path alike, and never cuts one short, whether or not
+    the answer states its length."""
     monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 100_000)
-    with _engine_answering(status, 100_000) as base:
+    with _engine_answering(status, 100_000, states_length=states_length) as base:
         assert rigadmin._call("GET", f"{base}/stats", cacert=None) == (status, b"x" * 100_000)
-    with _engine_answering(status, 100_001) as base, pytest.raises(rigadmin.RigReplyRefused):
+    with (
+        _engine_answering(status, 100_001, states_length=states_length) as base,
+        pytest.raises(rigadmin.RigReplyRefused),
+    ):
         rigadmin._call("GET", f"{base}/stats", cacert=None)
 
 
+@pytest.mark.parametrize("status", [200, 401])
+def test_a_stated_length_past_the_cap_is_refused_before_any_of_the_answer_is_read(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """An engine that states an over-cap length and then sends nothing is refused for size at once,
+    on the success path and the HTTP-error path. Counting alone would wait out the read timeout
+    and report an engine that did not answer, not the limit."""
+    monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 1_000)
+    monkeypatch.setattr(rigadmin, "_HTTP_TIMEOUT_S", 2.0)
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        server.settimeout(10.0)
+        done = threading.Event()
+
+        def headers_only() -> None:
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(f"HTTP/1.1 {status} X\r\nContent-Length: 5000\r\n\r\n".encode())
+                done.wait(10.0)
+
+        peer = threading.Thread(target=headers_only, daemon=True)
+        peer.start()
+        base = f"http://127.0.0.1:{server.getsockname()[1]}"
+        try:
+            with pytest.raises(rigadmin.RigReplyRefused, match="states a length"):
+                rigadmin._call("GET", f"{base}/stats", cacert=None)
+        finally:
+            done.set()
+            peer.join(10.0)
+
+
+@pytest.mark.parametrize("states_length", [True, False], ids=["stated", "unstated"])
 def test_a_sign_in_answer_past_the_reply_cap_reads_as_no_answer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, states_length: bool
 ) -> None:
     """A node polled for its status treats an over-cap answer as no answer and asks again; its
     sign-in must read the same way, not as a refused credential that ends the run."""
     monkeypatch.setattr(rigadmin, "MAX_API_REPLY_BYTES", 1_000)
     with (
-        _engine_answering(200, 5_000) as base,
+        _engine_answering(200, 5_000, states_length=states_length) as base,
         pytest.raises(rigadmin.RigUnreachable, match="limit") as caught,
     ):
         rigadmin.sign_in(base, RigAdmin("rig-operator", "ab" * 24))
@@ -265,6 +312,155 @@ def test_an_answer_that_ends_before_its_stated_length_is_no_answer(status: int) 
         with pytest.raises(rigadmin.RigUnreachable, match="stated length"):
             rigadmin._call("GET", f"{base}/stats", cacert=None)
         peer.join(10.0)
+
+
+#: ``struct linger``: two ``u_short`` in Winsock, two ``int`` elsewhere.
+_LINGER = "HH" if sys.platform == "win32" else "ii"
+
+
+@contextlib.contextmanager
+def _peer_that_breaks_off(status: int, *, reset: bool) -> Iterator[str]:
+    """A loopback peer that sends ``status``, a ``Content-Length`` of 5000 and 100 bytes of it.
+
+    It then stalls until the test ends, or with ``reset`` it ends the connection with a reset. Either
+    way the client is mid-body, where a read raises rather than returns."""
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        server.settimeout(10.0)
+        done = threading.Event()
+
+        def break_off() -> None:
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(
+                    f"HTTP/1.1 {status} X\r\nContent-Length: 5000\r\n\r\n".encode() + b"x" * 100
+                )
+                if reset:
+                    time.sleep(0.2)  # the client is now blocked reading the rest of the body
+                    # Linger on, with a zero timeout: close() sends a reset, not a normal close.
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(_LINGER, 1, 0))
+                else:
+                    done.wait(10.0)
+
+        peer = threading.Thread(target=break_off, daemon=True)
+        peer.start()
+        try:
+            yield f"http://127.0.0.1:{server.getsockname()[1]}"
+        finally:
+            done.set()
+            peer.join(10.0)
+
+
+@pytest.mark.parametrize("reset", [False, True], ids=["stalls", "resets"])
+@pytest.mark.parametrize("status", [401, 503, 200])
+def test_an_answer_that_stalls_or_resets_mid_body_is_no_answer_on_a_refusal_too(
+    monkeypatch: pytest.MonkeyPatch, status: int, reset: bool
+) -> None:
+    """BACKLOG #1127: a refusal's body used to be read outside the guard, so a 401 that stalled
+    mid-body raised a raw ``TimeoutError``, and a caller that asks again on ``RigUnreachable``
+    crashed. A refusal that breaks off now reads as no answer, in the words a success uses."""
+    monkeypatch.setattr(rigadmin, "_HTTP_TIMEOUT_S", 1.0)
+    with (
+        _peer_that_breaks_off(status, reset=reset) as base,
+        pytest.raises(rigadmin.RigUnreachable) as caught,
+    ):
+        rigadmin._call("GET", f"{base}/stats", cacert=None)
+    assert not isinstance(caught.value, rigadmin.RigReplyRefused)
+    # The exact reason, so a reset that arrived as a normal close (and read as a short answer)
+    # cannot pass for the refusal path this test is about.
+    reason = "ConnectionResetError" if reset else "TimeoutError"
+    assert str(caught.value) == f"the engine did not answer ({reason})"
+
+
+class _CountingServer:
+    """A loopback HTTP server that records each request's path and ``Authorization`` header."""
+
+    def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        self.seen: list[tuple[str, str | None]] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                outer.seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(status)
+                for name, value in {**headers, "Content-Length": str(len(body))}.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = _answer
+
+            def log_message(self, *args: object) -> None:  # keep the test output quiet
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def __enter__(self) -> _CountingServer:
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_redirect_is_never_followed_and_the_bearer_never_leaves(code: int) -> None:
+    """BACKLOG #1127: urllib follows a 3xx by default, reading its body with no limit and carrying
+    the ``Authorization`` header to the new host. That gets around the reply cap and the loopback
+    rule. The rig follows none, and names the status but never where it pointed."""
+    with (
+        _CountingServer(200, {}, b'{"ok": true}') as elsewhere,
+        _CountingServer(code, {"Location": f"{elsewhere.base}/stolen"}, b"x" * 64) as engine,
+    ):
+        with pytest.raises(rigadmin.RigUnreachable, match=f"redirect \\(HTTP {code}\\)") as caught:
+            rigadmin._call("GET", f"{engine.base}/stats", cacert=None, bearer="held-session")
+        assert engine.seen == [("/stats", "Bearer held-session")]
+        assert elsewhere.seen == [], "the redirect was followed"
+        assert elsewhere.base.rsplit(":", 1)[1] not in str(caught.value)
+        assert "stolen" not in str(caught.value)
+
+        # CONTROL: the hit count is a working instrument. A normal 200 at the other server is read
+        # and counted, and urllib's stock redirect handler, given the same redirect, follows it
+        # with the bearer. No proxy, so a machine's own proxy setting cannot move the request.
+        assert rigadmin._call("GET", f"{elsewhere.base}/ok", cacert=None) == (200, b'{"ok": true}')
+        assert elsewhere.seen == [("/ok", None)]
+        stock = urllib.request.Request(
+            f"{engine.base}/stats", headers={"Authorization": "Bearer held-session"}
+        )
+        no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with no_proxy.open(stock, timeout=10.0) as followed:
+            followed.read()
+        assert elsewhere.seen[-1] == ("/stolen", "Bearer held-session")
+
+
+def test_a_loopback_engine_is_dialled_direct_when_a_proxy_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1127: with ``HTTP_PROXY`` set and no ``NO_PROXY``, urllib sends a request for
+    ``http://127.0.0.1`` to the proxy, which would read the sign-in password and the bearer in
+    clear. The rig dials a loopback engine direct, as the engine's own openers do."""
+    for name in ("no_proxy", "NO_PROXY", "http_proxy", "HTTP_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    with (
+        _CountingServer(200, {}, b"proxied") as proxy,
+        _CountingServer(200, {}, b"direct") as engine,
+    ):
+        monkeypatch.setenv("http_proxy", proxy.base)
+        status, raw = rigadmin._call("GET", f"{engine.base}/stats", cacert=None, bearer="held")
+        assert (status, raw) == (200, b"direct")
+        assert engine.seen == [("/stats", "Bearer held")]
+        assert proxy.seen == [], "the loopback request went through the proxy"
+
+        # CONTROL: stock urllib, under the same environment, hands the request to the proxy.
+        stock = urllib.request.Request(
+            f"{engine.base}/stats", headers={"Authorization": "Bearer held"}
+        )
+        with urllib.request.build_opener().open(stock, timeout=10.0) as proxied:
+            assert proxied.read() == b"proxied"
+        assert proxy.seen == [(f"{engine.base}/stats", "Bearer held")]
 
 
 # --- the one session per process ---------------------------------------------

@@ -103,6 +103,7 @@ __all__ = [
     "StaticCredentialVerdict",
     "apply_static_credential_gate",
     "evaluate_static_credential_gate",
+    "http_hop_credentials",
     "make_static_credential_guard",
     "resolved_secret_refs",
     "run_static_credential_gate",
@@ -183,6 +184,28 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     return out
 
 
+def _http_token(ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool) -> bool:
+    """Whether the hop sends a minted SMART or OAuth2 bearer. DICOMweb builds no token provider, and
+    a ``FhirLookup`` builds SMART only."""
+    return ctype is not ConnectorType.DICOMWEB and (
+        _smart(settings) or (not lookup and _oauth2(settings))
+    )
+
+
+def http_hop_credentials(
+    ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
+) -> list[str]:
+    """Every credential an HTTP-family hop puts on the wire, minted or static, by name. Empty when
+    it sends none.
+
+    The connectors' refusal of a credential over ``verify_tls = false`` reads this (vault BACKLOG
+    #3230), so the two agree on every credential this module reads.
+    A credential written into the literal ``headers`` table, or into the ``url`` query, is not a
+    setting this module reads; the refusal adds those itself (``transports.rest.http_credentials_sent``)."""
+    token = _http_token(ctype, settings, lookup=lookup)
+    return (["minted bearer token"] if token else []) + _http_static(ctype, settings, token)
+
+
 def _http_hop(
     name: str,
     ctype: ConnectorType,
@@ -194,7 +217,7 @@ def _http_hop(
     """One HTTP-family hop. DICOMweb cannot take the SMART or OAuth2 composition and has no
     client-certificate arm, so it alone has no compliant kind. A ``FhirLookup`` takes SMART only."""
     compliant_kind = ctype is not ConnectorType.DICOMWEB
-    token = compliant_kind and (_smart(settings) or (not lookup and _oauth2(settings)))
+    token = _http_token(ctype, settings, lookup=lookup)
     static = _http_static(ctype, settings, token)
     if static:
         return StaticCredentialHop(

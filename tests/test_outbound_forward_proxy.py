@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import logging
 import threading
 import urllib.error
 import urllib.request
@@ -512,7 +513,9 @@ def test_parameter_names_are_matched_case_insensitively() -> None:
 def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
     """The OAuth2/SMART token opener carries the same proxy Digest handler. Its refusal is an
     HttpAuthError, which is a ValueError, and that escaped the token reply's DeliveryError contract.
-    Any other ValueError is an unencodable request and keeps its own type."""
+    Any other ValueError is an unencodable request and keeps its own type. Since BACKLOG #2989 the
+    refusal is the permanent configuration fault the delivery hop raises, which is still a
+    DeliveryError; ``tests/test_digest_refusal_classification.py`` pins its code."""
     from messagefoundry.transports.base import DeliveryError
     from messagefoundry.transports.smart import request_token
 
@@ -525,7 +528,7 @@ def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
 
     req = urllib.request.Request("http://127.0.0.1:9/token")
     refused = HttpAuthError("the web proxy's HTTP Digest challenge names algorithm 'MD5'")
-    with pytest.raises(DeliveryError, match="challenge was refused") as refused_ei:
+    with pytest.raises(DeliveryError, match="will not answer it") as refused_ei:
         request_token(_Opener(refused), req, timeout=1, endpoint="tok", connector="c")  # type: ignore[arg-type]
     # The peer's algorithm token stays on the cause, off the stored last_error text.
     assert "MD5" not in str(refused_ei.value)
@@ -599,6 +602,143 @@ def test_intranet_bypass_ipv6() -> None:
     )
     assert dest2._opener is not _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
     assert "Proxy-Authorization" in dest2._headers  # type: ignore[attr-defined]
+
+
+#: Named by urllib's own bypass list below, port and all, and by no ``proxy_no_proxy`` entry.
+_URLLIB_BYPASSED = "https://svc.partner.invalid:8443/x"
+_PROXIED = {"http": LOOPBACK_PROXY, "https": LOOPBACK_PROXY}
+
+
+@pytest.fixture
+def no_proxy_names_the_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``NO_PROXY`` names the target with its port, which urllib matches only against the host
+    with its port (vault BACKLOG #3442)."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "svc.partner.invalid:8443,auth.partner.invalid:8443")
+
+
+def _assert_kept_uncredentialed(opener: urllib.request.OpenerDirector) -> None:
+    """The connection's proxy handler stays, so a host the list stops naming still reaches this
+    proxy. It admits no caller-set header, and no Digest handler answers for it."""
+    ph = _proxy_handler(opener)
+    assert ph is not None and ph.proxies == _PROXIED
+    assert getattr(ph, "caller_header_admitted") is False  # noqa: B009
+    assert not any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in opener.handlers)
+
+
+@pytest.mark.parametrize("ctype", list(_FACTORY))
+def test_a_host_on_urllibs_bypass_list_gets_no_proxy_credential(
+    ctype: ConnectorType, no_proxy_names_the_target: None
+) -> None:
+    """Every destination type reads urllib's list through its URL, so the port entry matches and no
+    ``Proxy-Authorization`` goes on a request urllib sends direct (vault BACKLOG #3442)."""
+    dest = _build(
+        ctype, _URLLIB_BYPASSED, proxy=LOOPBACK_PROXY, proxy_user="pu", proxy_password="pw"
+    )
+    assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
+    _assert_kept_uncredentialed(dest._opener)  # type: ignore[attr-defined]
+
+
+def test_the_token_and_lookup_hops_read_urllibs_bypass_list(
+    no_proxy_names_the_target: None,
+) -> None:
+    with active_hop_posture(_WARN_DIAL):
+        cfg = proxy_config_from_settings(
+            {"proxy_url": LOOPBACK_PROXY, "proxy_user": "pu", "proxy_password": "pw"},
+            dest_scheme="https",
+            connection=None,
+        )
+        ex = FhirLookupExecutor(
+            {
+                "epic": {
+                    "url": _URLLIB_BYPASSED,
+                    "proxy_url": LOOPBACK_PROXY,
+                    "proxy_user": "pu",
+                    "proxy_password": "pw",
+                }
+            },
+            egress=permitting({"proxy_url": LOOPBACK_PROXY}),
+        )
+    assert isinstance(cfg, ProxyConfig)
+    for provider in (
+        OAuth2ClientCredentialsProvider(
+            token_url="https://auth.partner.invalid:8443/token",
+            client_id="cid",
+            client_secret="s3cr3t",
+            proxy=cfg,
+        ),
+        SmartBackendTokenProvider(
+            token_url="https://auth.partner.invalid:8443/token",
+            client_id="cid",
+            private_key=_rsa_pem(),
+            proxy=cfg,
+        ),
+    ):
+        assert "Proxy-Authorization" not in provider._proxy_auth
+        _assert_kept_uncredentialed(provider._opener)
+    _assert_kept_uncredentialed(ex._opener["epic"])
+
+
+_OVERRIDE_WARNING = "urllib's own bypass list"
+
+
+def _override_warnings(
+    caplog: pytest.LogCaptureFixture, level: int = logging.WARNING
+) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno == level and _OVERRIDE_WARNING in r.getMessage()]
+
+
+def test_an_explicit_credentialed_proxy_the_environment_overrides_warns_once(
+    no_proxy_names_the_target: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.rest"):
+        _build(
+            ConnectorType.REST,
+            _URLLIB_BYPASSED,
+            proxy=LOOPBACK_PROXY,
+            proxy_user="pu",
+            proxy_password="pw",
+        )
+    records = _override_warnings(caplog)
+    assert len(records) == 1
+    assert "OB" in records[0].getMessage()
+    for part in ("svc.partner.invalid", "127.0.0.1", "pu", "pw"):
+        assert part not in records[0].getMessage().replace("OB", ""), part
+
+
+@pytest.mark.parametrize(
+    ("proxy", "infos"),
+    [
+        pytest.param("default", 0, id="default"),
+        pytest.param(LOOPBACK_PROXY, 1, id="explicit-no-credential"),
+    ],
+)
+def test_no_override_warning_without_an_explicit_credentialed_proxy(
+    no_proxy_names_the_target: None, caplog: pytest.LogCaptureFixture, proxy: str, infos: int
+) -> None:
+    """``proxy_url = "default"`` means "follow the system's proxy settings", bypass list included,
+    so following it is not an override and is not logged. An explicit proxy with no credential to
+    withhold is overridden all the same, so it is logged at INFO, as a loopback target is."""
+    with caplog.at_level(logging.INFO, logger="messagefoundry.transports.rest"):
+        _build(ConnectorType.REST, _URLLIB_BYPASSED, proxy=proxy)
+    assert _override_warnings(caplog) == []
+    assert len(_override_warnings(caplog, logging.INFO)) == infos
+
+
+def test_control_a_port_the_entry_does_not_name_is_proxied_with_its_credential(
+    no_proxy_names_the_target: None,
+) -> None:
+    dest = _build(
+        ConnectorType.REST,
+        "https://svc.partner.invalid:9443/x",
+        proxy=LOOPBACK_PROXY,
+        proxy_user="pu",
+        proxy_password="pw",
+    )
+    assert dest._headers["Proxy-Authorization"].startswith("Basic ")  # type: ignore[attr-defined]
+    assert getattr(_proxy_handler(dest._opener), "caller_header_admitted") is True  # type: ignore[attr-defined]  # noqa: B009
 
 
 def test_proxy_bypasses_unit() -> None:

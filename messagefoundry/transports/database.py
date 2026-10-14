@@ -59,6 +59,7 @@ from messagefoundry.config.models import (
     ConnectorType,
     Destination,
     Source,
+    bool_setting,
     check_db_connect_timeout,
     hop_attestation_from_settings,
 )
@@ -87,6 +88,8 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    count_setting,
+    float_setting,
     intake_open,
     poll_interval,
     register_destination,
@@ -123,9 +126,9 @@ def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bo
 
     A per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by other
     means — a proxy-terminated / trusted-segment DB link). Otherwise this stays a **STRICT verify-off
-    cell** (decision 5): refused for **both staging and prod PHI** unless the global
-    ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and that escape is **CLAMPED to non-production**
-    (decision 2) so it can never relax a production hop.
+    cell** (decision 5): refused unless the global ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and
+    that escape works only at ``[security].enforcement = warn`` (decision 2), so it can never relax
+    an enforcing hop.
 
     The escape question is the shared :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`,
     so this cell and every other weakened-TLS cell answer it in one place. ``posture`` is the
@@ -194,7 +197,7 @@ def _build_dsn(
     only by a SQL Server Always-On read replica and is a no-op otherwise, and a statement guard is a
     shape test on text. The control that actually refuses a write is the privilege of the account this
     DSN dials, which only the operator can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
-    encrypt = bool(s.get("encrypt", True))
+    encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
         attested=attested, posture=current_hop_posture()
@@ -829,8 +832,8 @@ def _build_connection(
     only, since the SQL Server preset refuses rather than warns."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
-        weakened = bool(s.get("trust_server_certificate", False)) or not bool(
-            s.get("encrypt", True)
+        weakened = bool(s.get("trust_server_certificate", False)) or not bool_setting(
+            s, "encrypt", default=True
         )
         return (
             _build_dsn(s, read_only=read_only, attested=attested, connection=connection),
@@ -1300,8 +1303,14 @@ class DatabaseDestination(DestinationConnector):
         self._login_timeout = _login_timeout(
             s, f"DATABASE connection {config.name!r}", dialect=self._dialect
         )
-        self._pool_max = int(s.get("pool_max", 5))
-        self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
+        self._pool_max = count_setting(
+            s.get("pool_max", 5), knob="pool_max", transport="DATABASE destination"
+        )
+        self._acquire_timeout = float_setting(
+            s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
+            knob="acquire_timeout",
+            transport="DATABASE destination",
+        )
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
         # ADR 0013: capture the statement's result-set (its RETURNING/OUTPUT rows). Default False →
@@ -1320,8 +1329,16 @@ class DatabaseDestination(DestinationConnector):
         self.capture_response: bool = (
             bool(s.get("capture_response", False)) or self.capture_out_params
         )
-        self._capture_max_rows = int(s.get("capture_max_rows", 100))
-        self._capture_max_bytes = int(s.get("capture_max_bytes", 256 * 1024))
+        self._capture_max_rows = count_setting(
+            s.get("capture_max_rows", 100),
+            knob="capture_max_rows",
+            transport="DATABASE destination",
+        )
+        self._capture_max_bytes = count_setting(
+            s.get("capture_max_bytes", 256 * 1024),
+            knob="capture_max_bytes",
+            transport="DATABASE destination",
+        )
 
     async def _get_pool(self) -> Any:
         if self._pool is not None:
@@ -1605,8 +1622,14 @@ class DatabaseSource(SourceConnector):
             f"DATABASE connection {None if config.name is None else inbound_record_name(config.name)!r}",
             dialect=self._dialect,
         )
-        self._pool_max = int(s.get("pool_max", 5))
-        self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
+        self._pool_max = count_setting(
+            s.get("pool_max", 5), knob="pool_max", transport="DATABASE source"
+        )
+        self._acquire_timeout = float_setting(
+            s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
+            knob="acquire_timeout",
+            transport="DATABASE source",
+        )
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
         self._handler: InboundHandler | None = None
@@ -2030,12 +2053,16 @@ class DatabaseLookupExecutor:
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
             self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
-            self._pool_max[cname] = int(s.get("pool_max", 5))
+            self._pool_max[cname] = count_setting(
+                s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
+            )
             self._login_timeout[cname] = _login_timeout(
                 s, f"DatabaseLookup {cname!r}", dialect="sqlserver"
             )
-            self._acquire_timeout[cname] = float(
-                s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)
+            self._acquire_timeout[cname] = float_setting(
+                s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT),
+                knob="acquire_timeout",
+                transport=f"DatabaseLookup {cname!r}",
             )
             self._max_rows[cname] = _lookup_max_rows(s.get("max_rows"), cname)
         self._pools: dict[str, Any] = {}

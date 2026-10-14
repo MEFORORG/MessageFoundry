@@ -62,6 +62,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
+    float_setting,
     intake_open,
     poll_interval,
     positive_cap,
@@ -81,6 +82,7 @@ __all__ = [
     "_content_matches_declared",
     "_looks_like_hl7",
     "DEFAULT_MAX_DECOMPRESSED_BYTES",
+    "DEFAULT_MAX_DECOMPRESSED_MEMBERS",
 ]
 
 logger = logging.getLogger(__name__)
@@ -122,6 +124,18 @@ SETTLE_MISS_LIMIT = 3
 # Because the batch split, the sniff, and every downstream stage run on the decompressed bytes, bounding
 # the decompressed output also bounds post-split expansion. None/0 (in any spelling) disables the cap.
 DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# When `decompress="gzip"` is set, this caps how many gzip members one drop may hold (BACKLOG #1129).
+# The same figure as `gzip_decompress`'s `max_members` default, pinned by a test. A BGZF file (the
+# blocked gzip that genomics tools write) is one member per 64 KiB block, so a drop near the
+# decompressed-byte ceiling trips this cap first; an operator raises it per connection. The codec's
+# member cap cannot be turned off, so neither can this one: None and "" take the default, and zero in
+# any spelling is refused at build.
+DEFAULT_MAX_DECOMPRESSED_MEMBERS = 1024
+_MEMBER_CAP_OFF_HINT = (
+    "the gzip member cap cannot be switched off; leave it unset or None for the default of "
+    f"{DEFAULT_MAX_DECOMPRESSED_MEMBERS} members, or raise it"
+)
 
 # How long FileSource.stop() waits for the poll task before it gives up on a blocked share call
 # (BACKLOG #1620). A dead SMB/UNC share blocks each call for the OS redirector's timeout, tens of
@@ -327,6 +341,30 @@ def _validate_compression(value: object, knob: str) -> str | None:
     raise ValueError(
         f"file connector {knob}={value!r} is not supported (allowed: {supported}, or omit for none)"
     )
+
+
+def _member_cap(value: object) -> int:
+    """Read ``max_decompressed_members`` (BACKLOG #1129): a positive count of gzip members.
+
+    Unset, ``None`` and ``""`` (an env var set but empty) take :data:`DEFAULT_MAX_DECOMPRESSED_MEMBERS`.
+    Zero is refused in every spelling rather than read as "off", because ``gzip_decompress`` has no
+    off switch for its member cap, and silently substituting the default would hide that from an
+    operator who wrote 0 meaning "no cap". This is the ``max_header_bytes`` rule on the HTTP source."""
+    if value is None or value == "":
+        return DEFAULT_MAX_DECOMPRESSED_MEMBERS
+    cap = positive_cap(
+        value,
+        int,
+        knob="max_decompressed_members",
+        transport="file source",
+        off_hint=_MEMBER_CAP_OFF_HINT,
+    )
+    if cap is None:  # zero, in some spelling
+        raise ValueError(
+            "file source max_decompressed_members must be above zero "
+            f"(value withheld; {_MEMBER_CAP_OFF_HINT})"
+        )
+    return cap
 
 
 def _probe_dir_writable(directory: Path) -> None:
@@ -636,7 +674,9 @@ class FileSource(SourceConnector):
         self._root_real = self.directory.resolve()
         self.pattern: str = s.get("pattern", "*")
         self.poll_seconds: float = poll_interval(s, default=1.0, transport="file source")
-        self.min_age_seconds: float = float(s.get("min_age_seconds", 0.0))
+        self.min_age_seconds: float = float_setting(
+            s.get("min_age_seconds", 0.0), knob="min_age_seconds", transport="file source"
+        )
         self.after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self.after_read not in ("move", "delete", "leave"):
             raise ValueError(
@@ -691,6 +731,18 @@ class FileSource(SourceConnector):
             knob="max_decompressed_bytes",
             transport="file source",
         )
+        if self.decompress is not None and self.max_decompressed_bytes is None:
+            # Turning the bomb guard off is documented, so it is allowed, but it is said once at build
+            # so it is never silent (BACKLOG #1129). Off without decompress changes nothing, so that
+            # case says nothing. The line names the setting, never its value.
+            logger.warning(
+                "file source %s: max_decompressed_bytes is off, so a compressed drop inflates with "
+                "no byte ceiling; set a positive value to bound it",
+                config.name or self.directory,
+            )
+        # Caps the gzip members in one drop (BACKLOG #1129). Only consulted when `decompress` is set,
+        # but read at build either way, like `max_decompressed_bytes`, so a typo fails early.
+        self.max_decompressed_members: int = _member_cap(s.get("max_decompressed_members"))
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
         self.error_dir = self.directory / s.get("error_subdir", ".error")
         self._handler: InboundHandler | None = None
@@ -1004,7 +1056,10 @@ class FileSource(SourceConnector):
                 # decompressed body — it is PHI).
                 try:
                     raw = await asyncio.to_thread(
-                        gzip_decompress, raw, max_output_bytes=self.max_decompressed_bytes
+                        gzip_decompress,
+                        raw,
+                        max_output_bytes=self.max_decompressed_bytes,
+                        max_members=self.max_decompressed_members,
                     )
                 except CompressionError as exc:
                     logger.warning(

@@ -276,8 +276,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > certificate revocation checking** — stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately
 > attempts none — so on the **shipped default** (a PHI-classified instance at
 > `[security].enforcement = enforce`) a **verifying** outbound TLS hop to a **non-loopback** host is
-> **refused at construction** (`messagefoundry check` / dry-run / reload / the `serve` pre-flight), not
-> merely warned. **At least nine** hops carry that gate — the connection-level ones are
+> **refused at construction** (`messagefoundry check`, dry-run, reload, and the live build when
+> `serve` starts), not merely warned. **At least nine** hops carry that gate — the connection-level ones are
 > **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), EMAIL/SMTP, and a connection's SMART token
 > endpoint**, and since BACKLOG #2193 **the DICOM C-STORE SCU with `tls=true`, an FTPS upload, a
 > `Direct()` relay that sets a `username`, and an https `FhirLookup` read**, plus some that are not
@@ -915,7 +915,7 @@ figure stops matching the constant named beside it.
 
 | Surface | Permitted type | Extension | Maximum size | Unpacked size |
 |---|---|---|---|---|
-| `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB |
+| `file`: local drop directory, `File(...)` | the inbound's declared `content_type` (default `hl7v2`), content-sniffed against that declaration; see the policy below | chosen by `pattern` (default `*.hl7`); the type check reads content, not the extension | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB (`transports/file.py`) | no unpacking unless `decompress="gzip"` is set; then `max_decompressed_bytes`, default `DEFAULT_MAX_DECOMPRESSED_BYTES` = 64 MiB, and `max_decompressed_members`, default `DEFAULT_MAX_DECOMPRESSED_MEMBERS` = 1,024 |
 | `remotefile`: SFTP or FTP drop directory, `Sftp(...)` / `Ftp(...)` ([Remote file](#remote-file--sftp--ftp)) | as for `file` | chosen by `pattern` (default `*.hl7`) | `max_file_bytes`, default `DEFAULT_MAX_FILE_BYTES` = 16 MiB, charged against the listed size and again against the bytes read | no unpacking on intake; the connector has no `decompress` setting |
 | `dimse`: DICOM C-STORE SCP, an inbound `DICOM(...)`; its size, peer and TLS settings are under [DICOM](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025) | DICOM objects in the SCP's accepted presentation contexts | not applicable; objects arrive over DIMSE | `max_object_bytes`, default `DEFAULT_MAX_OBJECT_BYTES` = 128 MiB (`transports/dicom.py`), charged before decode | a Deflated Explicit VR LE object is inflated in bounded memory before decode, capped at the lesser of `max_object_bytes` and `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Setting `max_object_bytes` to `0` or `None` does not remove either cap; the DICOM section says what it does instead |
 | `http`: web-service listener, `Http(...)` ([HTTP](#http-web-service-listener--http-inbound-only-adr-0023)) | the inbound's declared `content_type` | not applicable; a request body | `max_body_bytes`, default `DEFAULT_MAX_BODY_BYTES` = 16 MiB (`transports/http_listener.py`); headers `DEFAULT_MAX_HEADER_BYTES` = 64 KiB | no unpacking on intake. The listener decodes no `Content-Encoding` and no transfer coding. It refuses a body whose `Transfer-Encoding` is exactly `chunked`, and reads any other body as sent, up to the cap |
@@ -932,7 +932,7 @@ figure stops matching the constant named beside it.
 | `harness/drivers/mllp.py` (`MLLPDriver`), `harness/mllp.py` (`SendWorker`, the Compose and Send tabs), `harness/load/sender.py` (`PersistentConnection`), `harness/fuzz/transport.py` (`WireMLLPDriver`), `harness/drivers/tcp.py` (`TcpDriver`), `harness/drivers/x12.py` (`X12Driver`) and `harness/drivers/http.py` (`HttpDriver`): at least these harness clients read what the engine under test answers to each message they send, each under a stated maximum, and the rig API row below gives the load rig's own API reads; and `messagefoundry/apiclient/client.py`, the API client the harness and the web console share, reading each API response body. The engine is another party here, as in the rows above, although these start no server | an ACK or other reply frame, an X12 interchange, an HTTP inbound's answer, or an API response. A reply is read for its acknowledgement code or receipt and shown or counted; an API response is decoded as JSON | not applicable; a reply on the client's own connection | MLLP: `DEFAULT_MAX_FRAME_BYTES` = 16 MiB per reply frame, the engine's MLLP default. A larger frame is refused, never buffered whole and never cut short: the driver and the Compose and Send tabs record the send as failed with `reply refused`, and the load sender counts it in `frame_refusals` and its transport errors, closes the connection without calling it an engine close, and reconnects. The fuzzer caps a reply frame at `_MAX_REPLY_BYTES` = 1 MiB, because an ACK is a few hundred bytes, and all one case reads back at `_MAX_EXCHANGE_BYTES` = 16 MiB; past either, the case's outcome is `malformed`, a finding. TCP: the driver reads at most `DEFAULT_MAX_MESSAGE_BYTES` = 16 MiB, plus at most one 64 KiB read past it, and a reply frame over 16 MiB is recorded as no reply. X12: the same, at `DEFAULT_MAX_INTERCHANGE_BYTES` = 16 MiB. HTTP: the driver reads at most `MAX_REPLY_BYTES` = 64 KiB of an answer and leaves the rest unread, so a longer answer is cut there rather than refused; the driver reads it only for the engine's `message_id` receipt or an error status. API client: `MAX_RESPONSE_BYTES` = 128 MiB per response body, eight times the per-message cap because a message body comes back JSON-escaped at up to six bytes per byte; a larger body raises `ApiError` and none of it is kept | no unpacking. The API client lets `httpx` decode a `Content-Encoding`, and charges the cap on the decoded bytes |
 | `harness/load/shardcert_ladder.py` (`read_node_log`, behind the three timing aggregators) and `harness/load/failover.py` (`EngineNode.log_tail`): the load rig's reads of the log each engine node writes. The rig keeps a node log only when `MEFOR_BENCH_KEEP_NODE_LOGS` names a directory, and the timing aggregators read only those kept logs. The rig starts the engine and opens the file its output goes to, but the engine under test writes the content, so it counts as another party's | a node log, read for its timing lines or, on a failed start, for its last lines | not applicable; the rig names each log itself, `<node_id>.log` | `MAX_NODE_LOG_BYTES` = 1 GiB per log, 64 times the per-message cap: the timing aggregators read a whole log, and an INFO-level node log stays far below that in a rung's hold. Reads go through the same bounded reader as the watch pane, but follow a symlink: the rig names each path itself. A larger log, or one that is not a regular file, is refused before it is read, logged with its path and size and never its content, and contributes nothing, the same as a missing log; none of it is read in part. `log_tail` reads only the last `limit` bytes, 4,000 by default, and never the rest | no unpacking |
 | `harness/load/coord.py` (`FileDropCoord.read`): the two-box rig's coordination messages, which the other box writes into a directory both share, a mount or a synced folder. Another host writes them, so they count | a JSON object of counts, ports and timestamps, one per file | `<run_id>.<name>.json`, a name the rig builds; nothing else in the directory is read | `MAX_COORD_MESSAGE_BYTES` = 1 MiB per message; a real one is a few KiB. Read through the same bounded reader as the watch pane, but a symlink is followed, so the cap and the regular-file check apply to its target. A larger file, or one that is not a regular file, raises `CoordMessageRefused` naming the file and the reason, which stops the run with that reason rather than being polled again until a timeout that would name the wrong cause. It is not a timeout, so no caller that treats a missing optional message as absent swallows it; not every command turns it into a clean abort yet, and where none catches it the run ends with a traceback | no unpacking |
-| `harness/load/rigadmin.py` (the rig's sign-in, and its `get` command), `harness/load/failover.py` (`EngineNode`'s `/health`, `/cluster/status` and `/stats` polls), `harness/load/shardcert.py` (its `/health` wait) and `harness/drivers/dimse.py` (`DimseDriver`, which reads the engine SCP's C-STORE responses): the rig API row. These are the load rig's own reads of the engine API, and the DIMSE driver's reads of the engine's SCP. The connscale, estate and ingress-probe runners poll through `EngineNode` and sign in through `rigadmin`, so these caps cover them too. The engine under test is another party here, as in the rows above | a JSON answer, or for `get`, an answer from any route. For the DIMSE driver: the association accept, the C-STORE response and the release | not applicable; an answer on the client's own connection | `rigadmin`: `MAX_API_REPLY_BYTES` = 128 MiB per answer, the API client's `MAX_RESPONSE_BYTES`, because `get` reads any route, a message body included. It reads in 64 KiB pieces and never cuts an answer short. A larger answer raises `RigReplyRefused` and none of it is kept. Callers treat that as an engine that did not answer, the same as an answer that ends before its stated length. `failover` and `shardcert`: `MAX_STATUS_REPLY_BYTES` = 1 MiB per answer, because each is a role or a few counters. The answer is streamed. A larger one is logged by path and limit and treated as no answer, the same as a node that is down. DIMSE: `MAX_ASSOCIATION_READ_BYTES` = 1 MiB per association, for the accept, the response and the release together. pynetdicom reads any PDU length a peer announces, so the driver charges the cap in the socket before each read, and a PDU that would pass it is never read. The driver then records `reply refused`, although the engine may have stored the object. A status that came back inside the cap stands, even if the release then passes it | no unpacking. `failover` asks for no content coding and charges the cap on the bytes as sent, so a compressed answer is never inflated; it fails to parse instead |
+| `harness/load/rigadmin.py` (the rig's sign-in, and its `get` command), `harness/load/failover.py` (`EngineNode`'s `/health`, `/cluster/status` and `/stats` polls), `harness/load/shardcert.py` (its `/health` wait) and `harness/drivers/dimse.py` (`DimseDriver`, which reads the engine SCP's C-STORE responses): the rig API row. These are the load rig's own reads of the engine API, and the DIMSE driver's reads of the engine's SCP. The connscale, estate and ingress-probe runners poll through `EngineNode` and sign in through `rigadmin`, so these caps cover them too. The engine under test is another party here, as in the rows above | a JSON answer, or for `get`, an answer from any route. For the DIMSE driver: the association accept, the C-STORE response and the release | not applicable; an answer on the client's own connection | `rigadmin`: `MAX_API_REPLY_BYTES` = 128 MiB per answer, the API client's `MAX_RESPONSE_BYTES`, because `get` reads any route, a message body included. An answer whose `Content-Length` is over the cap is refused before any of it is read. Any other answer is read in 64 KiB pieces and never cut short. A larger answer raises `RigReplyRefused` and none of it is kept. Callers treat that as an engine that did not answer, the same as an answer that ends before its stated length. A refusal's body is read the same way, and a body that stalls or breaks off is no answer on a refusal as on a success. `rigadmin` follows no redirect: a 3xx is refused unread and named by its status alone, so the session's bearer never follows one to another host. It also dials a loopback engine direct when a web proxy is set, so a proxy never reads the sign-in password or the bearer on an `http` hop. `failover` and `shardcert`: `MAX_STATUS_REPLY_BYTES` = 1 MiB per answer, because each is a role or a few counters. The answer is streamed. A larger one is logged by path and limit and treated as no answer, the same as a node that is down. Both keep httpx's default, which follows no redirect. DIMSE: `MAX_ASSOCIATION_READ_BYTES` = 1 MiB per association, for the accept, the response and the release together. pynetdicom reads any PDU length a peer announces, so the driver charges the cap in the socket before each read, and a PDU that would pass it is never read. The driver then records `reply refused`, although the engine may have stored the object. A status that came back inside the cap stands, even if the release then passes it | no unpacking. `failover` asks for no content coding and charges the cap on the bytes as sent, so a compressed answer is never inflated; it fails to parse instead |
 | `capture_response` / `reingress_to`: a partner's reply captured from an outbound, and re-ingressed through a `Loopback()` inbound when `reingress_to` is set ([ADR 0013](adr/0013-query-response-orchestration.md)) | whatever the partner returns on that hop. A re-ingressed reply does not pass the `Loopback()` inbound's listener checks, so the read bound in this row is its bound | not applicable; a reply on the outbound's own connection | the outbound's own read bound: `DEFAULT_MAX_RESPONSE_BYTES` = 16 MiB (`transports/bounded_read.py`) on REST, SOAP, FHIR and DICOMweb; `max_frame_bytes` on MLLP and TCP; `max_interchange_bytes` on X12; `capture_max_rows`, default 100, plus a fixed byte cap on a database outbound, both checked only after the whole result set is fetched | no unpacking on capture |
 
 Two limits apply after intake. The first covers the rows keyed by a connector type, the first eight.
@@ -956,7 +956,17 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
   name or content fails the checks in `parsing/sniff.py`. `gzip_decompress` caps the number of gzip
   members at `max_members`, default 1024 (BACKLOG #1129). A gzip stream has no member list to read
   first. So the codec counts each member as it starts, and refuses the one past the cap before it
-  inflates. A Handler is ordinary Python, though, and can unpack with any library instead, such as
+  inflates. Each decompressor checks its caps in a trial pass before the real one (BACKLOG #1129).
+  The trial pass inflates the whole input in bounded chunks, keeps none of the output, and refuses a
+  stream the moment it would pass the byte ceiling or, for gzip, the member cap. The zip member cap
+  is read from the central directory before either pass. Only a stream it admits is
+  inflated again for real, so an over-cap stream is refused with no output kept. The cost is that an
+  admitted stream is inflated twice. That is less than double the time, because the real pass also
+  copies its output; [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)
+  records a measurement. The trial pass is skipped
+  only where it has nothing to refuse: with `max_output_bytes=None` on `deflate_decompress`,
+  `deflate_decompress_with_tail` and `zip_decompress`. `gzip_decompress` always runs it, because its
+  member cap cannot be turned off. A Handler is ordinary Python, though, and can unpack with any library instead, such as
   `gzip` or `zipfile` directly. The engine then sets no bound, and the Handler author owns the
   unpacked-size limit.
 
@@ -1094,9 +1104,15 @@ its own policy block below):
   `decompress="gzip"` is enabled it gunzips each drop **before** the content sniff, the AV scan, and the
   batch split (so all three see the real bytes), and `max_decompressed_bytes` (default 64 MiB) caps the
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
-  provide (ASVS 5.2.3). The gunzip also refuses a drop of more gzip members than `gzip_decompress`'s
-  `max_members` default (see *Unpacking a payload* above), with no per-connection setting. Members
-  that inflate to nothing pass any byte ceiling, so the member count is its own limit. A corrupt,
+  provide (ASVS 5.2.3). The gunzip also refuses a drop of more gzip members than
+  `max_decompressed_members` (default 1024, BACKLOG #1129). Members that inflate to nothing pass any
+  byte ceiling, so the member count is its own limit. A BGZF file, the blocked gzip that genomics
+  tools write, is one member per 64 KiB block. So a BGZF drop near the 64 MiB byte ceiling trips the
+  member cap first, and a site with that feed raises `max_decompressed_members` for that connection.
+  The member cap cannot be turned off: unset or `None` takes the default, and `0` in any spelling is
+  refused when the inbound connection is built. Both caps are checked in a trial pass that keeps no output,
+  before the real gunzip runs (see *Unpacking a payload* above), so each admitted drop is inflated
+  twice. A corrupt,
   over-ceiling or over-cap archive is **quarantined to `.error`, never accept-and-dropped**, and the
   decompressed body is never logged. Multi-entry zip stays Handler-composed.
 - **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize file, or one
@@ -1212,7 +1228,8 @@ rules are recorded once, in
 [ADR 0105's 2026-09-28 amendment](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md). The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
 which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
 reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,
-`text/csv`, and the raster image types), matched case-folded and length-bounded. Everything else is served
+and the raster image types), matched case-folded and length-bounded. A `text/csv` label is served as
+`text/plain`, for the reason given below. Everything else is served
 as `application/octet-stream` -- every **browser-active** type (`text/html`, `image/svg+xml`,
 `application/hta`), every type nobody listed, and every non-clean or over-long value. The direction
 matters: the earlier control listed the browser-active subtypes to refuse, which asked a reviewer to prove
@@ -1237,6 +1254,22 @@ against the document rather than against the serving origin, and the declared ty
 moment the file is on disk. The instrument for the local-open threat would be content scanning, which this
 route does not do.
 
+`text/csv` gets the other answer, by a decision recorded beside the same table. A document the sender
+labelled `text/csv` downloads as `text/plain` with a `.txt` name. A sender can start a cell with `=`, and
+a spreadsheet evaluates that cell when it opens the file. The route serves a CSV's stored bytes as they
+are, so the `.txt` name is what keeps a double-click away from a spreadsheet. The comment beside the
+table holds the reasoning and the limits. At least these limits matter to an operator:
+
+- **Do not give a downloaded attachment a `.csv` name to open it.** Renaming it, or importing it into a
+  spreadsheet, still evaluates its cells.
+- The message page's attachment list still shows the sender's `text/csv` label, so the `.txt` name is
+  expected. The page carries no note that says so.
+- Which program opens a `.txt` file is set by your own host. Nobody has tested this route against a
+  browser or a spreadsheet.
+- Only the exact label `text/csv` is covered. Another spelling, such as `application/csv` or
+  `text/csv; charset=utf-8`, downloads as `application/octet-stream` with a `.bin` name, like any
+  unlisted type. The first limit applies to that file too.
+
 ### Remote file — `Sftp(...)` / `Ftp(...)`
 
 **One** connector type (`REMOTEFILE`) with two factories, each **source *and* destination** — the `File(...)`
@@ -1250,17 +1283,15 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `weakened_tls_escape_permitted_here()`** — like the `tls_verify` / `encrypt` cells elsewhere in this
   document, so on a production-PHI enforcing instance the escape is inert and an unknown host key stays
   refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
-  instance.
+  instance. A login with a `password` never takes the escape: its unknown host key is refused in
+  every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)).
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
-  A hand-built spec that turns either check off (`tls_verify = false` or `tls_check_hostname = false`)
-  while a `username` or `password` is set is **refused outright**, with no escape variable or posture
-  to unlock it (vault BACKLOG #2636, as `Email`/`Direct` refuse a credentialed hop; they key on
-  `username` alone, FTP on either half); the escape governs only an anonymous FTPS hop.
-  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused outright**, with
-  no escape variable or posture to unlock it (the credential itself would cross in the clear; vault
-  BACKLOG #2636) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
+  A `username` or `password` is refused over plain FTP, and over FTPS with either check off
+  (`tls_verify = false` or `tls_check_hostname = false`, from a hand-built spec). Either half
+  counts. The rule is in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
+  Use FTPS or `Sftp(...)` instead; an *anonymous* plain-FTP hop is governed by
   the [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) declaration below.
 
 | Setting | Dir | Default | Meaning |
@@ -1274,7 +1305,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS poll has no such gate |
-| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false`, which is refused outright when a `username` or `password` is set (#129, ADR 0094; vault BACKLOG #2636). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` on an anonymous login (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | both | — | **`Ftp` only, FTPS** (vault BACKLOG #2371) — the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
@@ -1321,6 +1352,41 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   `remotefile._ftp_connect_refusal`, and the 4xx rule in `remotefile._FtpClient._connect`. Why an
   unclear login refusal is read as a credential fault is in `remotefile._names_connection_limit`.
   A busy reply that also carries a credential word stops the lane too.
+- **An FTP server without `MLSD` must name `NLST` entries in one of two forms (BACKLOG #1130).** The
+  poller lists with `MLSD` and falls back to `NLST` when the server refuses it. It accepts an `NLST`
+  entry in only two forms:
+  - a bare name, such as `a.hl7`;
+  - `remote_dir` exactly as configured, then `/` and a bare name, such as `/in/a.hl7`. A trailing
+    slash on `remote_dir` may be kept or dropped.
+
+  Any other form is refused, which is deliberate. That covers at least a resolved absolute path
+  (`/srv/ftp/in/a.hl7` for `remote_dir = "in"`) and a path relative to the server's current
+  directory (`in/a.hl7` for `remote_dir = "/in"`). Rewriting a path to its last part would read
+  `../x/a.hl7` as `a.hl7`, so the poller refuses rather than rewrites. A refused entry stays on the
+  server and is never read.
+
+  Only an `NLST` entry can name a path legitimately, so only an `NLST` entry can get the WARNING
+  that the server's listing form looks unsupported. The entry must pass three tests:
+  - its parent directory has the same last part as `remote_dir`;
+  - it has no `..`, `\`, `:`, leading `//` or control character;
+  - `pattern` matches its file name, the part after the last `/`. An entry ending in `/` or `/.`
+    has no file name, so it never passes.
+
+  That WARNING names the connection and a count, never a file. It repeats at most every 15 minutes
+  while the condition lasts. An entry that passes the first two tests but not the third is refused
+  with no line, as is any file the pattern skips. Any other refused name, such as `/etc/a.hl7`, is
+  treated as traversal. It logs its own WARNING on every poll, also with no file name. Where a
+  server's `NLST` form is refused, set `remote_dir` to the spelling the server echoes back, or
+  enable `MLSD` on the server.
+- **An empty directory is not an error on an `NLST`-only FTP server (BACKLOG #1130).** Some such
+  servers answer `NLST` on an empty directory with `550 No files found`. The connector reads that
+  exact reply as an empty listing. Any other permanent reply still fails, including `550 No such
+  file or directory`, since that also answers a directory that is not there. Some servers send
+  `550 No files found` for a missing directory too, so the connector first confirms the directory
+  exists with `CWD`, then returns to the directory `PWD` reported. A mistyped `remote_dir` still
+  fails. So does a server whose `PWD` reply quotes no directory, since the connector could not
+  return to it. `CWD` cannot tell an empty directory from one the account may enter but not list,
+  so that one polls as empty if the server answers it the same way.
 - **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
   `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
   nothing else. A server missing either fails the handshake with a permanent `SFTP connection
@@ -1416,7 +1482,7 @@ one.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
@@ -1435,12 +1501,12 @@ the four HTTP destinations, and their own sections point here.
 
 | Destination | Write | `capture_response` | An over-size body after a 2xx |
 |---|---|---|---|
-| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped. The message gets a `reply_dropped` event, and then a WARNING names the connection and the message |
 | REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
 | SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
 | DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
 | FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
-| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | off | **delivered**, with the same event and WARNING |
 | FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
 
 **Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
@@ -1459,8 +1525,18 @@ its entry statuses.
 
 A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
 may have applied it. On SOAP, on DICOMweb, and on a FHIR update sent as a transaction, the unread
-body may instead have held a rejection. Its stored error carries the code `reply-too-large`. Check the partner's own record before you replay it. A
-reply that is cut short or misframed after a 2xx is a separate case, and the lane still retries it.
+body may instead have held a rejection. Its stored error carries the code `reply-too-large`. Check the partner's own record before you replay it.
+
+**A 2xx reply cut short or misframed (BACKLOG #2989).** A body that ends before the length the
+partner declared, or one framed in a way RFC 9112 does not allow, follows the same table. Where the
+table says delivered, the body is dropped, the message gets a `reply_dropped` event that says
+what was wrong with it, and then a WARNING says the same. Where it says
+permanent refusal, the code is `reply-truncated` or `reply-misframed` instead of `reply-too-large`.
+Either way the request is sent once. A partner or a middlebox that closes the connection cleanly
+before the declared length counts as cut short, so where the body is needed that message
+dead-letters once. The owner's ruling covers the over-size body only; who decided these two, and
+on what authority, is recorded in ADR 0095 Amendment B.1. At least a read that times out, or one
+that a connection reset cuts off, is a separate case, and the lane still retries it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
@@ -1474,19 +1550,39 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 `bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
 by this rule. It has its own, below.
 
-**A proxy URL with credentials is refused unless it is written `https://` (vault BACKLOG #2572).**
-`urllib` sends a `user:password@` from a proxy URL to the proxy as a `Proxy-Authorization: Basic`
-header. Such a proxy is refused before each request, whether it comes from `proxy_url`, from
+**Engine openers refuse a web-proxy credential on the legs where it could be read on the way,
+with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That covers a user and password in a proxy URL
+and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. A connection with such a `proxy_url` still builds, and each send then fails with this
-error. The error names no part of the proxy URL, and `[security].enforcement` does not relax it. A
-request that goes direct is not refused: one to a loopback host, or to a host that `NO_PROXY` or the
-system bypass list names. A connection's own `proxy_no_proxy` is not that list. A host it names
-skips the connection's `proxy_url` and still follows a proxy from the environment.
-**Writing the proxy `https://` is not refused, and it does not protect the credentials either:**
-`urllib` sends `CONNECT`, with the credential header, before any TLS. Take the credentials out of
-the proxy URL.
+broker. The error names no part of the proxy URL. Which legs are refused, and the one exception
+for a `proxy_user` credential its connection admitted when it was built, which covers cleartext
+legs only, are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
+a leg it lets through and what it does not check.
+
+A credential in a connection's own `proxy_url` is not checked when the connection is built, so its
+sends meet the rule above. With `[security].require_nonstatic_credentials` on, `serve` refuses a
+credential written into `proxy_url` at start instead, unless `static_credential_accepted` names
+the hop (see *Static credentials on every backend hop*). A `proxy_user` credential is checked when
+the connection is built, for a proxy written either way. It is refused there unless the proxy is
+on the box or the connection declares `cleartext_accepted` or `tls_hop_attested`. That check
+follows the posture, so under `[security].enforcement = warn` it logs a WARNING and the connection
+builds. A connection's own `proxy_no_proxy` is not urllib's bypass list. A host it names skips the
+connection's `proxy_url` and still follows a proxy from the environment.
+
+A `proxy_user` connection to a host urllib's own bypass list names (`NO_PROXY`, or the Windows
+proxy override list) sends direct with no proxy credential, and logs a WARNING (vault BACKLOG
+#3442). A connection that sets `proxy_user` and also writes a `Proxy-Authorization` into `headers`
+fails to build (vault BACKLOG #3443). Its proxy handler admits a caller-set `Proxy-Authorization`
+in the plain spelling once the `proxy_user` credential passes, so it could not tell a static
+header spelled that way from its own. A static header in any other spelling of that name fails
+the build too, and the opener never admits one. The rule is on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py).
+
+Which legs reach the proxy with no TLS is in
+[CONFIGURATION.md](CONFIGURATION.md#serve-names-an-environment-proxy-at-start). Take the credentials
+out of the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
@@ -1961,7 +2057,7 @@ unrecognized fault is treated as permanent (so a rejected request can't loop the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
 + HTTP status. A 2xx whose body is over the byte bound cannot be inspected, so it is a permanent refusal
-and is not sent again: see *A 2xx reply over the byte bound* under REST.
+and is not sent again: see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, secrets via `env()`). Delivery is **at-least-once**, so a retry **re-sends** —
@@ -2099,7 +2195,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `host` | str / `env()` | — (required) | SMTP server host. |
-| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain is not checked against `[egress].allowed_recipient_domains`. |
+| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain must be listed in `[egress].allowed_recipient_domains`, like a recipient's, because bounces and replies can carry the message body. |
 | `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. An entry with a line break is refused at load too. |
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
@@ -2128,8 +2224,8 @@ counts" in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) is the rule, a
 
 **The recipients are gated too, and that gate is deny-by-default.** `allowed_smtp` gates only the
 relay hop, so every address in `recipients` must also sit in a domain listed in
-`[egress].allowed_recipient_domains`. An empty list refuses every `Email()` destination. The
-matching rules are in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress).
+`[egress].allowed_recipient_domains`. So must the `sender`'s domain, since bounces go there. An
+empty list refuses every `Email()` destination. The matching rules are in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress).
 
 Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
@@ -2188,7 +2284,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
 | `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`). Setting a `username` makes the relay a credential hop: to an off-box host it is then **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). With no `username` the relay carries no revocation gate |
-| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set, and SMTP `AUTH` over cleartext is **refused outright**. **WARNING: this is not the same posture as `Email(...)` — the shipped enforcing default does not close it.** `Direct()` consults the **raw** escape variable directly: it does **not** route through the shared cleartext-hop authority, so `[security].enforcement = enforce` does **not** clamp it and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). With the variable set, a cleartext-SMTP Direct hop crosses on a production-PHI enforcing instance. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
+| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set on an instance at `[security].enforcement = warn`, and SMTP `AUTH` over cleartext is **refused outright**. This is not the same posture as `Email(...)`: `Direct()` reads that clamped escape directly and does **not** route through the shared cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). CORRECTED 2026-10-13: this row said the escape was read raw, so that an enforcing instance would not close the hop; the read has been clamped since #323. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
 | `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
 | `encoding` | `utf-8` | charset the body is encoded with before signing |
 
@@ -2196,7 +2292,12 @@ these messages, and the SMTP relay accepts them before anyone tries.
 is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
 key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
 is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
-to a certificate from an untrusted issuer). The connector then signs and encrypts one fixed synthetic body.
+to a certificate from an untrusted issuer). All three of `signing_key`, `recipient_cert` and every
+`trust_anchor` in the file must also hold an allowed key type: RSA of at least 2048 bits, EC on P-256, P-384
+or P-521, Ed25519 or Ed448. A DSA key is refused at any size, and so is any other type (BACKLOG #3384). These
+are the same types the XML signature check allows. Today an Ed25519 or Ed448 key works only as a
+`trust_anchor`: the signing library takes RSA and EC signers only, and the envelope takes RSA recipients only.
+The connector then signs and encrypts one fixed synthetic body.
 So a fault that would fail every S/MIME build also fails here. That covers at least a crypto library or
 OpenSSL build that refuses the algorithms, and a line break inside `subject`. It does not cover the SMTP hop:
 the relay can still refuse a `sender` or recipient at send time.
@@ -2268,6 +2369,8 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
 | `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) |
+| `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load. Refused on any other interaction. Both lists take an `env()` for the whole list: its default is checked at load, and the value it resolves to when the connection is built. A bad item is named by position, never quoted. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
+| `allowed_entry_types` | — (any type) | (vault BACKLOG #2804) `transaction`/`batch` only: the resource types an entry's `request.url` may name, such as `["Patient", "Encounter"]`. Unset means any type. Refused on any other interaction |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
@@ -2282,14 +2385,50 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 
 **Interactions.** The `interaction` plus the `ResourceType`/`id` (read from the outgoing body with the cheap
 `FhirPeek`, no typed parse) derive the method + path off the base `url`. A `transaction`/`batch` POSTs the
-`Bundle` to the base — the FHIR **server** applies it (transaction = all-or-nothing, batch = independent per
-entry); the engine never orchestrates cross-entry atomicity.
+`Bundle` to the base, and the FHIR **server** applies it (transaction = all-or-nothing, batch = independent
+per entry); the engine never orchestrates cross-entry atomicity. The engine does screen every entry first,
+as [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) says.
 
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
 is in the **URL** query), and `if-match` (optimistic lock on a known id via an ETag derived from the
 resource's `meta.versionId`, sent as the entry's `request.ifMatch`).
+
+#### A Bundle connection screens every entry
+
+On `transaction` and `batch`, each Bundle entry names its own method and URL. **If a Handler forwards a
+Bundle it received, the sender chooses them.** It can use every method, URL form and resource type your
+lists allow, with this connection's credentials. Set the lists to what the feed needs and no more. A feed
+that only creates and updates wants `allowed_entry_methods=["POST", "PUT"]`, and it should name its types.
+
+The engine checks the whole Bundle before it sends a byte (vault BACKLOG #2804). It refuses the message
+when any of these hold:
+
+1. The body is not JSON, is not a `Bundle`, or its `Bundle.type` is not the connection's interaction.
+2. A JSON object anywhere in the body repeats a key. The engine and the server might read different
+   values out of one body, so neither reading is trusted.
+3. `entry` is not a list, an entry is not an object, or an entry has no `request` object.
+4. An entry's `request.method` is not one of `allowed_entry_methods`.
+5. An entry's `request.url` does not fit its method. A `POST` takes `Type` only. Every other verb takes
+   `Type/id` or `Type?query`. The type and id follow the FHIR grammars, so neither can carry a
+   `$operation`, percent-encoding, `_search`, `_history`, an absolute URL or an extra path segment. The
+   query must be one or more `name=value` pairs joined by `&`, with no empty name or value. It must hold
+   no whitespace, `#`, backslash, control character or percent-encoded control character such as `%0A`.
+   Other percent-encoding in a query stays allowed, because a search value often needs it.
+6. The URL's type is not in `allowed_entry_types`, when that list is set.
+7. A `POST` or `PUT` entry carries a `resource` whose `resourceType` is not the URL's type.
+
+A refusal is permanent. The message is recorded as `ERROR` and dead-lettered, and no part of the Bundle is
+sent. The error names the entry's index, its method and the rule it broke. It never names the URL or its
+query, which can carry identifiers. The engine sends the Bundle exactly as the Handler built it; the check
+reads a copy. The one-entry Bundle the engine builds itself for an `update` is not screened.
+
+`Type?query` stays open to `PUT`, because per-entry conditional URLs are how a Bundle does what a
+connection-level `conditional` does. The engine checks a query's shape, not what its parameters mean. A
+conditional `DELETE` whose only criterion the server ignores can still match every resource of the type,
+so leave `DELETE` off the list unless the feed needs it. The `smart-scope` advisory that `messagefoundry check` prints does not yet read
+`allowed_entry_methods`.
 
 #### An update keeps the resource id out of the URL
 
@@ -2319,7 +2458,7 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
-  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under REST.
+  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
@@ -2397,7 +2536,7 @@ never an error). On an error status the HTTP code decides, refined by the `Opera
 `incomplete`), or `408`/`429` → retry; any other 4xx / refused 3xx → **dead-letter**. The HTTP status wins
 when in doubt (a 5xx stays transient). `OperationOutcome`/reply bodies are **not** echoed into errors/logs
 (they may carry PHI) — only the HTTP status + a redacted URL. For a 2xx whose body is over the byte bound,
-see *A 2xx reply over the byte bound* under REST.
+see *A 2xx reply over the byte bound* under [REST](#rest--rest).
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, cleartext-credential refusal, optional detached-JWS signing, secrets via `env()`).
@@ -2743,7 +2882,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
 a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
 over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
-again: see *A 2xx reply over the byte bound* under REST. **PHI:** the response can
+again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python
@@ -2910,6 +3049,12 @@ anyone can recompute it.
 Every other MAC is refused, unencrypted bags or not, because it runs the passphrase through the
 PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's default
 included. It also holds when the passphrase is empty, as in `cryptography`'s `NoEncryption` output.
+
+A key inside an encrypted part of the bundle is checked too (BACKLOG #1352). `cert import` opens
+each encrypted part with the passphrase and holds every key in it to the same floor before anything
+decrypts the key. To be opened, a part must use PBKDF2 and AES-CBC. OpenSSL 3's default export
+and the re-export command below write that. A part under scrypt, or under any other cipher, is
+refused. Other `-certpbe` choices, such as ARIA, Camellia or 3DES, are among those.
 
 The passphrase comes from `MEFOR_PFX_PASSWORD`. A bundle whose passphrase is empty needs that
 variable set to the empty string; unset means no passphrase. PowerShell and cmd cannot set an empty
@@ -3093,7 +3238,7 @@ outbound(
 | Does it turn any check off? | No. Chain, host name and expiry checks stay on. It only chooses which CAs do the verifying. |
 | What about `[tls].crl_file`? | On a hop that reads the `[tls]` block, it still applies and turns on leaf revocation checking. That CRL file must then carry a CRL from this CA too, or every handshake on the hop fails. An inbound `Ftp()` poller reads the `[tls]` block too, since vault BACKLOG #2370, so this applies to it as well. |
 | Does it reach a token endpoint? | Yes. Where a connection signs in through SMART or OAuth2, the token hop trusts the same file, even when `verify_tls = false`. If the authorization server chains to a different CA, put that CA in the same PEM file. That also widens the data hop to it. No separate token-hop setting exists, by decision for now (vault BACKLOG #2370). |
-| What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop still reads it, as the row above says. |
+| What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop would still read it, but a connection that signs in through SMART or OAuth2 with `verify_tls = false` is refused at build, because the minted bearer would cross the unverified data hop ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). So that pairing now matters only over an `http://` data url. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
 | What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
@@ -3793,10 +3938,10 @@ reading this page already applies to a file the scan never opened.
 | SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on opening the SFTP session (BACKLOG #1936), on **each read** from the established SFTP channel, and on each step of an upload that stops making progress (BACKLOG #2082). All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where a gap is left | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, a rejected host key is **permanent**, and an authentication refusal is permanent and flagged as a credential fault. A banner, key-exchange or authentication timeout, a connection dropped before the key exchange completes, and an `OSError`/`EOFError` are transient (BACKLOG #1999; the bullet under [Remote file](#remote-file--sftp--ftp) says where the rules are stated). After connect, a missing remote path is permanent, and at least the session-open and read timeouts are transient. With `validate_directory` on, the pre-upload directory check re-raises any failure but a credential refusal as transient, these included. A write that stops making progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per step, BACKLOG #2082), an `EOFError` and a helper thread that cannot start are transient; a `paramiko.SFTPError` is permanent. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient, with at least two exceptions: a 5xx reply, and a 4xx at the login that names the credential. While the session opens, both are classed as the bullet under [Remote file](#remote-file--sftp--ftp) states (BACKLOG #2083). After it opens, a 5xx is permanent | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
-| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
+| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed. A Digest challenge the engine will not answer (`auth-challenge-refused`, ADR 0095 Amendment B) and a send-time hop refusal (`insecure-hop-refused`) are configuration faults: under the default `credential_fault_policy` the lane stops and the queue stays. A 2xx reply body that is over the bound, cut short or misframed is never sent again; the *A 2xx reply over the byte bound* table under REST says whether it is delivered or refused | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
-| FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | a lookup failure raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
-| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent | `RetryPolicy` |
+| FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
+| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest) | `RetryPolicy` |
 | DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future | the association is released by pynetdicom; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent | `RetryPolicy` |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |

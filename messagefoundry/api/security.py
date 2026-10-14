@@ -1119,8 +1119,8 @@ _STEP_UP_DETAIL = "step-up re-verification required; POST /me/reauth then retry"
 #: session, the web console's IdP step-up, much as ``POST /me/reauth``'s own refusal does. It
 #: promises no JSON retry: that leg runs in a browser and re-keys the session it steps up, so a
 #: bearer client cannot finish it (docs/SECURITY.md says which gates such a client can never
-#: pass). It does not name ``POST /auth/mfa-verify``, although a TOTP code there does stamp the
-#: window for an account that holds one: whether it should is BACKLOG #2142's open question.
+#: pass). It does not name ``POST /auth/mfa-verify``: a code there opens no window for such a
+#: session (BACKLOG #2142, ADR 0142 Amendment F).
 _IDP_STEP_UP_DETAIL = (
     "step-up re-verification required; this session steps up at the identity provider, in a"
     " browser, through the web console at /ui/reauth, not with a password"
@@ -1522,7 +1522,8 @@ def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: I
 def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus **step-up re-verification** (ASVS 7.5.3): the caller's session must
     have re-proved its credential -- at a local login that owes no factor, via ``POST /me/reauth``,
-    or with a code at ``POST /auth/mfa-verify`` (``verify_mfa`` stamps the window), or at their
+    or with a code at ``POST /auth/mfa-verify`` (``verify_mfa`` stamps the window, except on an
+    ``oidc`` session, BACKLOG #2142), or at their
     console twins -- within ``[auth].step_up_max_age_seconds``. A directory login opens no window
     (BACKLOG #1144). Gates the highly sensitive admin / replay / config flows; a stale session is
     refused with 403 (the console then prompts to re-authenticate and retries). An ``oidc``
@@ -1859,13 +1860,26 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     return identity
 
 
+class ExportStopped(RuntimeError):
+    """A running export lost its caller's standing, so the stream aborts (BACKLOG #1154). The
+    bulk message export and the audit export raise it.
+
+    The response has already started, so no status code can say so. Raising aborts the transfer,
+    and the client sees an incomplete download rather than a short file that looks complete. The
+    server logs the raise twice: ``_unhandled_exception`` writes an ERROR line naming this type,
+    and uvicorn writes a traceback. Returning without the final body message would avoid
+    that, but the ``@app.middleware("http")`` layers would then finish the response cleanly,
+    which is the short file this exists to prevent."""
+
+
 async def recheck_standing(
     auth: AuthService, token: str | None, *permissions: Permission, activity: bool = False
 ) -> Identity | None:
     """Resolve the caller again, mid-response, or ``None`` once it may no longer have the data.
 
-    For a response that outlives its gate: the ``/ws/stats`` feed asks before every frame, and the
-    bulk message export asks before every row (BACKLOG #1154, ASVS 8.3.2). The gate resolved the
+    For a response that outlives its gate: the ``/ws/stats`` feed asks before every frame, the bulk
+    message export before every row, and the audit export before every page (BACKLOG #1154, ASVS
+    8.3.2). The gate resolved the
     identity once. Without this, a session revoked, a role withdrawn or a channel scope narrowed
     after that point would not reach a response already running.
 

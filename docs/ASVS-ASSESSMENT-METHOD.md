@@ -41,7 +41,8 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
 
 1. **Does the requirement apply to this product on the declared scope (§2)?**
    No → **`na`**, and write the rationale. No rationale, no `na`. Rule 1 scopes out a whole
-   requirement, never one limb of it, and a cell grades every limb (§1.1b).
+   requirement, never one limb of it, and a cell grades every limb (§1.1b). §1.1d says how a limb
+   that applies only when a feature is used is graded.
 2. **Has this cell been read against the ASVS requirement text at a known commit?**
    No → **`unverified`**. *This is not a Pass.* **CAUTION:** It is also **not** "nobody looked" — the earlier
    lineage graded these cells. What it graded them against was a paraphrase, because the ASVS 5.0.0
@@ -98,7 +99,9 @@ recur; all three are now settled.
    argument**, and accepting it would make rule 4's first limb unfalsifiable: *every* off-by-default
    control removes its own trigger, so the argument is available to all of them and discriminates
    between none of them. A property predicated of an object the shipped default never creates is not
-   *satisfied*.
+   *satisfied*. Since the owner ruling of 2026-10-11 (§1.1d), that sentence covers an object that
+   some configuration of the shipped artifacts can create. An object that no configuration can
+   create is §1.1d's case.
 3. **"No code change could improve the cell, so a `partial` manufactures a phantom remediation item."**
    Rejected as a ground, and usually **false on the facts** as well. Before offering it, name the change
    that would make the verb hold on a stock install and say why it is impossible. Flipping a default,
@@ -144,6 +147,30 @@ repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
 
 **The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
 it stands.
+
+**Three questions R2 left open are answered by Manager decision (2026-10-11).** Engine PR 1488 wrote
+R2 into this section and routed four questions it did not decide. The batch 309 Manager seat
+answered the first three under the owner's driver rule, which tells that seat to decide calls like
+these itself. They are not owner rulings, and the owner may overturn any of them. The record is
+MD-19, MD-20 and MD-21 of `docs/security/ASVS-MANAGER-RULINGS-2026-10-11-BATCH309.md`, pending in
+the `MessageFoundry-vault` repository on vault branch `b309-rulings-and-cells`. §1.1d answers the
+fourth.
+
+1. A reverse proxy that the assessed posture (§2.2) names cannot meet a host-substrate limb. The
+   proxy is not one of the five software artifacts that §2 assesses, so a cell grades what those
+   artifacts ship. The one route to `pass` for such a limb is an engine gate that refuses to start
+   when the limb's precondition is absent. That is rule 4's second limb, and §1.1a says what it
+   requires. A gate that an operator's declaration clears falls under rule 4's text on relaxations
+   and ruling R8 (§1.1). This decision does not extend them.
+2. R2 recorded no accepted consequence, though §1.1a's ruling did. This decision states one, and the
+   owner has not accepted it. A limb that only the host substrate can meet never reaches `pass`
+   unless an engine gate of the kind item 1 names exists. Neither does its cell. This decision rules
+   out `pass` and nothing more: rules 2 to 6 still pick the verdict. A cell that moves down for this
+   reason is a §2.2 cause-4 movement.
+3. R2 does not reach the 5.4.3 row in §1.2. R2 bars scoping out one limb, and that row scopes out the
+   whole requirement under rule 1. The row already says its verdict depends on the enterprise
+   covering those paths. It is closed by owner decision (2026-08-02), and R2 gives no ground to
+   reopen it.
 
 ### 1.1c What counts as documentation: a docstring or a code comment does not (owner ruling, 2026-10-08), and the method's reading of what does
 
@@ -209,6 +236,56 @@ The first ruling was given in session on 2026-10-08, after adversarial review, a
 rulings file there is pending. As in §1.1a, this document records the rule and deliberately not a
 list of the cells it moves.
 
+### 1.1d A conditional limb is met when no configuration can reach its condition (owner ruling, 2026-10-11)
+
+Some requirements carry a limb that applies only when a feature is used: *if Y is used, then the
+software must do Z*. R2 (§1.1b) keeps every such limb in scope. This section says how a cell grades
+one.
+
+1. If no configuration of the shipped artifacts can reach Y, the limb is met.
+2. If some configuration can turn Y on, grade the limb under §1.1a, which grades the shipped default.
+
+Branch 2 does not skip a rule. Rules 2 to 6 still run in order, and §1.1a governs where Y ships off.
+
+This ruling does not say whether operator-authored Router or Handler code counts as a
+configuration. That code can import any library. Until someone decides it, a cell whose verdict
+turns on that question is `needs-review`, the verdict §1 gives a cell blocked on a decision.
+
+Four limits come with the two-branch rule.
+
+1. Only a limb is met this way. A requirement can be conditional as a whole. If no configuration
+   can reach its Y, it still goes to rule 1, as the 10.5.5 row in §1.2 does. If some configuration
+   can turn that Y on, rule 1 does not fire.
+2. The vacuity argument in §1.1a item 2 does not reach a Y that no configuration can create. That
+   item now says so.
+3. Show that Y is unreachable with an instrument, and never assert it. The instrument must answer
+   that question and not a narrower one. A search for one token shows only that the token is absent
+   (§3). At least one cell in the record carried an unreachable claim that a later pass found false.
+4. Applying the rule raises at least one cell. That is a §2.2 cause-4 movement, and no code changed.
+   As §1.1a explains, this document records the rule and deliberately not the cells it moves. The
+   owner rulings file below names that cell.
+
+**One consequence is flagged, and nobody has decided it.** Limit 1 may change the rule under which
+at least one cell is graded today. That cell is a candidate for a re-read. The owner rulings file
+named below names it.
+
+**Which parts are the owner's.** On 2026-10-11 the owner was asked about the two-branch rule above.
+The question said adversarial review had upheld it with amendments. Two of the three options
+adopted the split. The owner chose the one that also raises a cell, not the one that holds the cell
+at `needs-review`. The four limits are those amendments. Their wording is the
+batch 309 Manager seat's, after adversarial review, and the owner was not asked about them one by
+one. Some text here is neither the ruling nor its amendments. It is this section's reading, added
+in code review. At least these passages are that reading:
+
+- the paragraph after the two branches, and the one on operator-authored code;
+- in limit 1, the words *"If no configuration can reach its Y"*, and the last sentence;
+- in limit 3, the two sentences on what the instrument must answer;
+- the cause-4 sentence in limit 4, and the flagged consequence.
+
+The ruling was given in session. Its record is B309-R3 of
+`docs/security/OWNER-RULINGS-2026-10-11-BATCH309.md`, pending in the `MessageFoundry-vault`
+repository on vault branch `b309-rulings-and-cells`.
+
 ### 1.2 Worked examples — the ones that actually broke
 
 These are the real disputes. They are here so the next assessor reaches the same answer.
@@ -241,7 +318,7 @@ Per ASVS's guidance, stated as what **is** included rather than what is excluded
 **Included:** the MessageFoundry engine, the web console, the IDE extension, the test harness
 (`harness/`, distributed separately as the harness wheel), and the operator-run scripts, assessed as
 source, at a named commit, against **all 345 ASVS 5.0.0 requirements** at **Level 3**. The
-operator-run scripts are `scripts/service/`, less the one file named below, and any script the
+operator-run scripts are `scripts/service/` and any script the
 operator documentation tells a deployer to run; the rest of `scripts/` (CI, development, ASVS, benchmark, coordination and release
 tooling) is not included, and neither is `tee/`, the tee relay.
 
@@ -256,13 +333,27 @@ Each part of that rests on an owner ruling of 2026-10-02, recorded in the vault 
 * **R4** answered *"No"* for `tee/`, the tee relay. It ships in no wheel, and it is outside the
   scope although `docs/TEE-RELAY.md` tells a site to run it.
 
-**Two files are classified by a Manager's reading, not by the owner, and the owner may overrule
-it.** That reading is recorded in the same vault file, under R3. Both are out:
+`samples/config`, the example site configuration, is out of the scope, by owner ruling of
+2026-10-12. That ruling is R5 of `docs/security/ASVS-OWNER-RULINGS-2026-10-12-3050.md`, in the
+vault. R8 of the same file confirms it, asked with the code defaults below in its premise. The
+directory ships in no wheel. The ruling names that directory only; the scope sentence above
+classifies the rest of `samples/`. In-scope code still points at `samples/config` by default: at
+least the engine CLI's `--config` default, the IDE extension's config directory setting, and
+`scripts/service/install-service.ps1`. That code is graded as in-scope code. The samples it loads
+are not assessed as shipped code, because R8 declined the option that would have made them so.
 
-* `scripts/service/measure-store-access.ps1` sits under `scripts/service/`, but
-  `docs/DANGEROUS-FUNCTIONALITY.md` calls it *"A CI measurement, not a deployment step"*. That
-  document also says how to run it, on a disposable host, which a later reading may weigh
-  differently.
+**`scripts/service/measure-store-access.ps1` is in, by owner ruling of 2026-10-05.** That ruling is
+R1 of `docs/security/ASVS-OWNER-RULINGS-2026-10-05-112.md`, in the vault. It replaced a Manager's
+reading under R3 of the 2026-10-02 file, and that file's R3 text still puts the script out. The
+earlier reading rested on `docs/DANGEROUS-FUNCTIONALITY.md`, which calls the script *"A CI
+measurement, not a deployment step"*. The option the owner chose said its writer had not read that
+reason. The ruling governs all the same, and reopening it is the owner's call. The script sits
+under `scripts/service/`, so the scope sentence above covers it with no exception. A cell graded
+while the script was read as out is stale on this point until someone re-reads it.
+
+**One file is classified by a Manager's reading, not by the owner, and the owner may overrule
+it.** That reading is recorded in the 2026-10-02 vault file, under R3. The file is out:
+
 * `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
   `messagefoundry/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
   engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
@@ -553,10 +644,11 @@ and the table prints the date in its own column either way.
 - No ruling says what the stamps hold for a cell that never had a full read.
 
 **Tools written before these rulings may read the stamps differently.** This section governs what an
-assessor writes, and the tools follow it. At least two do not yet. The writer,
-`scripts/asvs/apply.py`, dates an anchor repair from the payload's `last_verified`. The rendered
-page's `Verdict bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing
-the tools into line is unfiled work.
+assessor writes, and the tools follow it. At least one does not yet. The rendered page's `Verdict
+bases` line counts `verified_at` values as the trees the verdicts rest on. Bringing it into line is
+unfiled work. The writer, `scripts/asvs/apply.py`, dated an anchor repair from the payload's
+`last_verified` until BACKLOG #2865. A repair payload now states its own `anchor_repaired_at`, and
+the writer refuses one that does not, or one dated before the repair the record already holds.
 
 The first ruling was given in session on 2026-10-08, after adversarial review, and the other two on
 2026-10-09. All are recorded on pull requests in the `MessageFoundry-vault` repository, and a

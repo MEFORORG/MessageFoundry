@@ -60,7 +60,7 @@ store/crypto). Its environment is an allowlist, not the engine's own
 (:mod:`messagefoundry.childenv`, which also says why that is not a boundary by itself).
 On top of that address-space boundary the child adds defence-in-depth: a
 forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus a
-POSIX ``RLIMIT_AS`` memory cap when available), and a fail-closed refusal of the live
+POSIX memory cap when available), and a fail-closed refusal of the live
 ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop, which a process boundary
 breaks — forwarding them over IPC is a documented next-phase residual). The import guard is
 **defence-in-depth only** — a module imported before it goes up keeps a live reference, so the
@@ -176,8 +176,12 @@ class SandboxPolicy:
     pathological busy-loop Router/Handler can never wedge intake), and it is enforced **only** at
     ``mode=subprocess``: the in-process path has no timeout at all. There is no ``RLIMIT_CPU``, so
     CPU that admin code spends outside a call has no bound (ADR 0087, amendment of 2026-10-07).
-    ``mem_mb`` adds a POSIX ``RLIMIT_AS`` backstop *inside* the child where the ``resource`` module
-    exists (a no-op on Windows). ``startup_seconds`` bounds the one-time child bootstrap (config load)."""
+    ``mem_mb`` adds a POSIX memory backstop *inside* the child where the ``resource`` module exists
+    (a no-op on Windows). On Linux it is headroom above the loaded graph: ``RLIMIT_DATA`` at the
+    worker's ``VmData`` once ``load_config`` has run, plus ``mem_mb``. Elsewhere on POSIX it is an
+    absolute ``RLIMIT_AS`` cap. A call that hits it is reported as the memory cap, and its worker is
+    recycled (ADR 0087, amendment of 2026-10-11). ``startup_seconds`` bounds the one-time child
+    bootstrap (config load)."""
 
     mode: SandboxMode
     wall_seconds: float = 5.0
@@ -612,6 +616,28 @@ class SandboxSession:
         # this generation's reads.
         self._responses = queue.Queue()
         self._generation += 1
+        # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
+        # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
+        # decision: the config-source escape and the enforcement dial that unlocks it (vault
+        # BACKLOG #2599). The child runs ``load_config`` itself, so with only the escape it
+        # would refuse a directory its parent loaded at ``warn``. The dial is a posture
+        # switch, not a secret, and every spelling of it the parent's check read crosses, so
+        # the child's check reads the same variables. The operator's
+        # ``[sandbox].pass_environment`` names cross with them.
+        env = worker_environment(
+            extra_names=(
+                INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+                *security_enforcement_env_names(),
+                *self.policy.pass_environment,
+            )
+        )
+        # At most one glibc malloc arena besides the main one, where the worker's memory cap is
+        # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
+        # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
+        # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
+        # operator's own value, named in pass_environment, wins.
+        if self.policy.mem_mb is not None and sys.platform.startswith("linux"):
+            env.setdefault("MALLOC_ARENA_MAX", "2")
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
@@ -627,21 +653,7 @@ class SandboxSession:
             bufsize=0,
             close_fds=True,
             start_new_session=sys.platform != "win32",
-            # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
-            # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
-            # decision: the config-source escape and the enforcement dial that unlocks it (vault
-            # BACKLOG #2599). The child runs ``load_config`` itself, so with only the escape it
-            # would refuse a directory its parent loaded at ``warn``. The dial is a posture
-            # switch, not a secret, and every spelling of it the parent's check read crosses, so
-            # the child's check reads the same variables. The operator's
-            # ``[sandbox].pass_environment`` names cross with them.
-            env=worker_environment(
-                extra_names=(
-                    INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
-                    *security_enforcement_env_names(),
-                    *self.policy.pass_environment,
-                )
-            ),
+            env=env,
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
         # BOTH drains start before anything that can raise between here and the boot frame write. For
@@ -925,6 +937,16 @@ class SandboxSession:
             # peer — it reaps the worker and leaves this proven answer standing.)
             self._reject_unsolicited(proc, "after")
             if not resp.ok:
+                if resp.kind == codec.FAIL_MEMORY:
+                    # The worker exits after this reply. Reap it now, so the next dispatch starts a
+                    # fresh one rather than writing to a worker on its way out (vault BACKLOG #3133).
+                    if proc is self._proc:
+                        self._kill(proc)
+                    # The worker's text names the cap it set, or says it set none.
+                    raise SandboxError(
+                        f"sandbox {phase} {name!r} ran out of memory, and its worker was "
+                        f"recycled: {resp.error}"
+                    )
                 verdict = "denied" if resp.kind == "denied" else "failed"
                 raise SandboxError(f"sandbox {verdict} {phase} {name!r}: {resp.error}")
             return resp.result

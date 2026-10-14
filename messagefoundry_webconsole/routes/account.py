@@ -31,6 +31,7 @@ from messagefoundry.auth.service import (
     NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.credential import constant_time_equal
 
 from .. import pages
 from .._auth import (
@@ -599,7 +600,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 "last_used_at": s.last_used_at,
                 "expires_at": s.expires_at,
                 "client": s.client,
-                "current": s.token_hash == current,
+                # Constant-time (ASVS 11.2.4, BACKLOG #1167): both are session token hashes.
+                "current": constant_time_equal(s.token_hash, current),
             }
             for s in sessions
         ]

@@ -564,6 +564,9 @@ R10 of 2026-09-23 graded the cell `partial` on exactly that gap.
    allow-list `_INERT_ATTACHMENT_TYPES`, else `application/octet-stream`. Engine PR 948 made that change
    in code without amending this ADR; this sentence records it. An SVG label is not on the list, so a
    sanitized SVG is still declared `application/octet-stream` with a `.bin` download name.
+   *Added 2026-10-12 (vault BACKLOG #2802):* one label is declared as a type it does not name. A `text/csv`
+   label is declared `text/plain` with a `.txt` download name, through `_ATTACHMENT_SERVED_AS`. The
+   decision and its limits are recorded beside the table in `api/app.py`.
 
 **How an SVG is recognised.** Only markup can be an SVG. Markup here means bytes whose first byte,
 after any whitespace, NUL or byte-order mark, is `<`. No SVG reader renders anything else, so a PDF

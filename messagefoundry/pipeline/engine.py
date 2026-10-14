@@ -54,6 +54,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    cell_tag_failure_forwarder,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
@@ -83,7 +84,7 @@ from messagefoundry.pipeline.secret_rotation import (
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
-from messagefoundry.pipeline.sharding import owned_destination_set
+from messagefoundry.pipeline.sharding import join_shard_names, owned_destination_set
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
@@ -854,8 +855,7 @@ class Engine:
         # DR decision is never a cluster-wide config bump.
         try:
             if rr is not None:
-                await self.preflight_settings()
-                await self.preflight_registry(rr.registry)
+                await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
                 await rr.reload()
@@ -892,6 +892,44 @@ class Engine:
                         "failed too; POST /config/reload closes them"
                     )
             raise
+
+    async def _dr_preflight(self, registry: Registry) -> None:
+        """The settings and registry preflights a DR activation runs before its reload, bounded by
+        ``[dr].takeover_timeout_seconds`` (vault BACKLOG #3094, item 3).
+
+        They read trust-anchor files, which may sit on a share at the failed site, and they run
+        under the coordinator's lock, so with no bound a share that stops answering held every
+        later activate and release too. A timeout cancels them and raises ``TimeoutError``, which
+        the caller rolls back like any refusal. The reload that follows is not bounded here.
+        Cancelling it partway rolls back a takeover the VIP has already moved for, and the runner
+        gives each lane's first build its own isolation (ADR 0048, the vault BACKLOG #3263
+        amendment).
+
+        The cancel frees the lock, not the read. A read blocked on a share that does not answer
+        sits in a default-executor thread, which a cancel cannot stop, so that thread may stay
+        stuck. Each retry against the same dead share can strand one more, and enough of them
+        could use up the default executor.
+
+        It tells the coordinator while it runs (:meth:`DrCoordinator.note_profile_preflight`), so
+        an abort here says the preflight stopped the activation and makes no claim that a listener
+        was bound (vault BACKLOG #3094)."""
+        coord = self._dr_coordinator
+        if coord is not None:
+            coord.note_profile_preflight(True)
+        timeout = self._dr_settings.takeover_timeout_seconds
+        bound = asyncio.timeout(timeout)
+        try:
+            async with bound:
+                await self.preflight_settings()
+                await self.preflight_registry(registry)
+        except TimeoutError as exc:
+            if not bound.expired():
+                raise  # a TimeoutError from inside the preflight is its own error
+            raise TimeoutError(
+                f"the trust-anchor preflight did not answer within {timeout:g}s"
+            ) from exc
+        if coord is not None:
+            coord.note_profile_preflight(False)
 
     async def _dr_config_drift(self) -> dict[str, object]:
         """The provenance fields a DR activation records: the activated graph's digest, and whether
@@ -1466,6 +1504,11 @@ class Engine:
             return
         sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
         setter(store_cipher_refusal_forwarder(sink, asyncio.get_running_loop()))
+        # BACKLOG #2593: a queue row whose payload fails its own tag is dead-lettered by the store,
+        # which reaches this sink the same way, through the cipher.
+        tag_setter = getattr(cipher, "set_tag_failure_hook", None)
+        if callable(tag_setter):
+            tag_setter(cell_tag_failure_forwarder(sink, asyncio.get_running_loop()))
         self._cipher_refusal_armed = cipher
 
     def _disarm_cipher_refusal_alert(self) -> None:
@@ -1474,6 +1517,9 @@ class Engine:
         setter = getattr(cipher, "set_refusal_hook", None)
         if callable(setter):
             setter(None)
+        tag_setter = getattr(cipher, "set_tag_failure_hook", None)
+        if callable(tag_setter):
+            tag_setter(None)
 
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
@@ -1702,9 +1748,13 @@ class Engine:
         # BACKLOG #299: apply a replaced CRL file to the running hops that hold the old copy. Not
         # gated on [cert_monitor]: turning the expiry alert off must not also stop a revocation
         # reaching a running hop. Not leader-gated: each process holds its own TLS contexts. Its cap
-        # is a [cert_monitor] setting all the same, read whatever warn_days is.
+        # is a [cert_monitor] setting all the same, read whatever warn_days is. Vault BACKLOG #2904:
+        # it raises crl_reload_refused for a file it refuses, and names this process in the alert
+        # key, as the intake monitor does, because each process holds its own contexts.
         self._crl_reload_runner = CrlReloadRunner(
-            max_reloads=(self._cert_monitor_settings or CertMonitorSettings()).crl_max_reloads
+            max_reloads=(self._cert_monitor_settings or CertMonitorSettings()).crl_max_reloads,
+            alert_sink=self._alert_sink,
+            node=self.instance_identity,
         )
         self._crl_reload_runner.start()
         # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and
@@ -2491,7 +2541,9 @@ class Engine:
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             try:
-                self._env_values = dict(self._env_values_provider())
+                # Off the event loop: the CLI provider reads the value file and, before that, its
+                # owner and access list (vault BACKLOG #2626), like every other file the engine reads.
+                self._env_values = dict(await asyncio.to_thread(self._env_values_provider))
             except WiringError:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
@@ -2538,8 +2590,9 @@ class Engine:
                 # universe here would leave this shard claiming by a NEW map while siblings claim by
                 # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
                 # others get none (ACKed messages stall with no alert). Fail closed instead.
-                old_ids = ",".join(running.all_shard_ids) if running.all_shard_ids else "<single>"
-                new_ids = ",".join(registry.all_shard_ids) if registry.all_shard_ids else "<single>"
+                old, new = running.all_shard_ids, registry.all_shard_ids
+                old_ids = join_shard_names(old) if old else "<single>"
+                new_ids = join_shard_names(new) if new else "<single>"
                 raise WiringError(
                     f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
                     "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "

@@ -193,6 +193,20 @@ _BODY_DIGEST_LEN = 32  # bytes — HMAC-SHA256 key
 #: The algorithm name an audit row records beside each body digest.
 BODY_DIGEST_ALG = "hmac-sha256"
 
+# Row integrity seals (BACKLOG #2592). Two HKDF-SHA256 steps, each the shape of
+# `_derive_audit_mac_key`. The AUTHORIZATION ROOT is derived from the DEK under its own purpose label,
+# so it is a different key from the audit key, the rotation-fingerprint key and every data key, and a
+# data-key roll never touches it. The ROW-SEAL KEY is derived from that root under a second label
+# followed by the store id. Both labels are fixed-length, so `label || store_id` is unambiguous.
+_AUTHZ_ROOT_INFO = b"mefor/root/authz/v1"
+_ROW_SEAL_INFO = b"mefor/row-seal/v1"
+# Domain label for :func:`row_seal_key_id`, the id a stored seal names its key by.
+_ROW_SEAL_KEY_ID_INFO = b"mefor/row-seal-key-id/v1\x00"
+_AUTHZ_KEY_LEN = 32  # bytes — HMAC-SHA256 key
+#: The store id the row-seal key is derived with until a store id is minted (BACKLOG #2592). Empty,
+#: so the derivation is well defined now and changes by construction once a real id is supplied.
+NO_STORE_ID: bytes = b""
+
 # Per-store data sub-key (ADR 0196, BACKLOG #2070). The cell-bound writer seals under
 # HKDF-SHA256(DEK, salt=None, info=_STORE_DATA_KEY_INFO || store_salt), not under the DEK itself. Each
 # store mints a random salt when it is created, so a fresh store is a fresh AES key by construction,
@@ -295,14 +309,19 @@ UPLOADED_FILE_AAD_TABLE = "uploaded_file"
 #: AAD. Never the row key and never the value, so an implementation may forward it to an alert.
 UnmarkedRefusalHook = Callable[[str, str], None]
 
+#: Called when a store cell fails the tag its own row builds (BACKLOG #2593), with the table and a
+#: PHI-free reason. The store cannot reach the AlertSink; the engine arms this to forward it.
+TagFailureHook = Callable[[str, str], None]
+
 
 class _UnmarkedPolicy:
     """What a KEYED cipher does with a stored value that carries no ``mfenc:`` marker (BACKLOG #1169,
     ASVS 11.3.3).
 
     **It refuses, by default.** A keyed store writes only marked ciphertext into a cipher-covered
-    column, and the at-open sweep seals legacy plaintext only on a surface that holds no ciphertext
-    yet. So once a key is configured, a non-blank unmarked value in a covered column is a stripped
+    column, and the at-open sweep seals legacy plaintext only on a surface that is still unsealed:
+    not yet recorded in the store's ``keyed_surface`` table and holding no ciphertext (BACKLOG
+    #3383). So once a key is configured, a non-blank unmarked value in a covered column is a stripped
     marker or a planted row. Returning it as plaintext -- what this seam did before -- is exactly where
     the AEAD tag's protection against modification was lost: substitution has a tag to fail, and a
     downgrade to plaintext has none, so only a refusal can stop it.
@@ -318,6 +337,24 @@ class _UnmarkedPolicy:
 
     _allow_unmarked: bool
     _refusal_hook: UnmarkedRefusalHook | None
+    # A class default, so a subclass that never calls _init_unmarked_policy still reports nowhere.
+    _tag_failure_hook: TagFailureHook | None = None
+
+    def set_tag_failure_hook(self, hook: TagFailureHook | None) -> None:
+        """Register the callback fired when a cell fails its row tag (``None`` clears it). The same
+        thread-safety rule as :meth:`set_refusal_hook` applies (BACKLOG #2593)."""
+        self._tag_failure_hook = hook
+
+    def report_tag_failure(self, table: str, reason: str) -> None:
+        """Fire the tag-failure hook. Anything it raises is swallowed, so an alert never changes
+        what the caller already did with the row (BACKLOG #2593)."""
+        hook = self._tag_failure_hook
+        if hook is None:
+            return
+        try:
+            hook(table, reason)
+        except Exception:  # noqa: BLE001 — an alert failure must never change the caller's outcome
+            _log.debug("cipher tag-failure hook raised; the dead-letter itself still stands")
 
     def _init_unmarked_policy(self, allow_unmarked: bool) -> None:
         self._allow_unmarked = allow_unmarked
@@ -386,6 +423,25 @@ def report_unmarked(cipher: Cipher, table: str, column: str) -> None:
     report = getattr(cipher, "report_unmarked", None)
     if callable(report):
         report(table, column)
+
+
+def report_sealed_surface(
+    logger: logging.Logger, cipher: Cipher, table: str, column: str, pending: int
+) -> None:
+    """Log and alert that the at-open sweep left ``pending`` unmarked values on a SEALED surface.
+
+    One text for all three backends' sweeps, logged under the calling backend's ``logger``. The
+    alert names the cell only, never a row or a value (BACKLOG #1169). It fires now, not only on a
+    read, so a planted row nobody reads still reaches an alert."""
+    logger.warning(
+        "cipher column %s.%s is sealed and holds %d unmarked value(s); they were NOT sealed and "
+        "every read of them is refused (a stripped marker or a planted row). Set "
+        "[store].allow_unmarked_ciphertext only if they are known to be legitimate",
+        table,
+        column,
+        pending,
+    )
+    report_unmarked(cipher, table, column)
 
 
 # --- in-use memory hygiene (ASVS 13.3.3 / 11.7.2) — all best-effort, see the module docstring -------
@@ -595,6 +651,10 @@ class Cipher(Protocol):
 
     def audit_mac_fn(self) -> AuditMacFn | None: ...
 
+    def authz_root(self) -> bytes | None: ...
+
+    def retired_authz_roots(self) -> Sequence[bytes]: ...
+
 
 def _fingerprint(key: bytes | bytearray) -> str:
     """A stable, self-identifying ``key_id``: first ``_KEY_ID_LEN`` hex of SHA-256(key). One-way
@@ -629,6 +689,47 @@ def audit_key_id(mac_key: bytes) -> str:
     from the at-rest ``key_id`` in ``mfenc:`` markers and reveals nothing either key could be
     recovered from."""
     return hashlib.sha256(_AUDIT_KEY_ID_INFO + mac_key).hexdigest()[:_KEY_ID_LEN]
+
+
+def _derive_authz_root(dek: bytes | bytearray) -> bytes:
+    """The authorization root: HKDF-SHA256 over the store DEK under ``mefor/root/authz/v1``
+    (BACKLOG #2592).
+
+    Called on the live DEK at cipher construction, before :func:`_install_key` wipes it, exactly as
+    :func:`_derive_audit_mac_key` is. Only the derived root is kept. Row seals are keyed from it by
+    :func:`derive_row_seal_key`, never from the DEK or the audit key."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=_AUTHZ_KEY_LEN, salt=None, info=_AUTHZ_ROOT_INFO)
+    return hkdf.derive(bytes(dek))
+
+
+def derive_row_seal_key(authz_root: bytes, store_id: bytes) -> bytes:
+    """The row-seal key: HKDF-SHA256 over the authorization root, HKDF salt ``None``, ``info`` the
+    label ``mefor/row-seal/v1`` followed by ``store_id`` (BACKLOG #2592).
+
+    A different store id gives an independent key, so a seal made for one store does not verify
+    for another. Until a store id is minted the caller passes :data:`NO_STORE_ID`."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_AUTHZ_KEY_LEN,
+        salt=None,
+        info=_ROW_SEAL_INFO + bytes(store_id),
+    )
+    return hkdf.derive(authz_root)
+
+
+def row_seal_key_id(seal_key: bytes) -> str:
+    """The stable, non-secret id a stored seal names its key by (BACKLOG #2592).
+
+    A one-way digest of the DERIVED seal key under its own label, the way :func:`audit_key_id` names
+    an audit key. So it changes whenever the root or the store id changes, and reveals nothing either
+    key could be recovered from."""
+    return hashlib.sha256(_ROW_SEAL_KEY_ID_INFO + seal_key).hexdigest()[:_KEY_ID_LEN]
 
 
 def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
@@ -903,6 +1004,14 @@ class IdentityCipher:
         """No isolated-module MAC — the identity cipher's chain is in-process keyless SHA-256."""
         return None
 
+    def authz_root(self) -> None:
+        """No DEK, so no authorization root: a keyless store writes and checks no row seals."""
+        return None
+
+    def retired_authz_roots(self) -> Sequence[bytes]:
+        """No DEK, so no retired roots either."""
+        return ()
+
 
 class AesGcmCipher(_UnmarkedPolicy):
     """AES-256-GCM **keyring** cipher with M9 crypto-agility. Encrypts with the active key; decrypts
@@ -936,6 +1045,12 @@ class AesGcmCipher(_UnmarkedPolicy):
         # Derive the audit-chain HMAC key from the LIVE active DEK before _install_key zeroizes it (#190).
         # Only the derived key is retained; the raw DEK is never held as an attribute.
         self._audit_mac_key = _derive_audit_mac_key(active_key)
+        # BACKLOG #2592: the authorization root, from the same live active DEK at the same point. Only
+        # the ACTIVE key's root: a session seal verifies under the newest root generation alone.
+        self._authz_root = _derive_authz_root(active_key)
+        # The retired keys' roots, derived at the same point. A seal never verifies under one: they
+        # only let a row sealed before a key change be recognised as such (BACKLOG #2592).
+        self._retired_authz_roots = tuple(_derive_authz_root(key) for key in retired_keys)
         # BACKLOG #1904: one audit key per keyring entry, RETIRED keys included, derived the same way and
         # at the same point (before _install_key zeroizes the DEK). A chain keyed under a key that has
         # since been rotated to retired must still verify; deriving from the active key alone made the
@@ -1092,6 +1207,20 @@ class AesGcmCipher(_UnmarkedPolicy):
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
 
+    def holds_key_for(self, stored: str) -> bool:
+        """Whether this keyring holds the key the marker of ``stored`` names (BACKLOG #2593).
+
+        Lets a caller tell a cell whose AEAD tag fails under a key it holds (the cell does not
+        belong where it is) from one sealed under a key that is not configured. False for an
+        unmarked or malformed value. Reads only the marker, never the ciphertext."""
+        if not stored.startswith(MARKER_PREFIX):
+            return False
+        try:
+            key_id, _salt, _blob = self._parse(stored)
+        except CipherError:
+            return False
+        return key_id in self._keyring
+
     def audit_mac_key(self) -> bytes:
         """The HKDF-derived HMAC key for the tamper-evident audit chain (#190-B). Keys the
         ``audit_row_hash`` chain so it cannot be forged without the DEK. Non-secret to *hold* here (it
@@ -1109,6 +1238,16 @@ class AesGcmCipher(_UnmarkedPolicy):
         isolated-module MAC — so no ``audit_mac_fn`` provider. Keeping this ``None`` leaves the default
         ``aesgcm`` audit chain BYTE-IDENTICAL to pre-ADR-0138."""
         return None
+
+    def authz_root(self) -> bytes:
+        """The authorization root derived from the ACTIVE DEK (BACKLOG #2592). Row seals are keyed
+        from it (:func:`derive_row_seal_key`). Held in-process like the audit key; never logged."""
+        return self._authz_root
+
+    def retired_authz_roots(self) -> Sequence[bytes]:
+        """The authorization roots of the retired keys (BACKLOG #2592). No seal is verified under
+        one; they only name the keys a row sealed before a key change was sealed under."""
+        return self._retired_authz_roots
 
     # --- persisted per-key invocation bound (ASVS 11.3.4) --------------------
 
@@ -1361,6 +1500,9 @@ class AesGcmCipher(_UnmarkedPolicy):
     def _candidates(self, key_id: str, salt: bytes | None) -> Iterator[AESGCM]:
         """The keys to try on one value: the named DEK first, then every other one in keyring order.
 
+        :meth:`decrypt` relies on this order: its fast path is index 0 when the name is in the
+        keyring (BACKLOG #1167). Change the order and that fast path must change with it.
+
         For a v4 value each is that DEK's sub-key for the value's salt, derived only when reached, so
         the common case (the named key opens it) derives at most one."""
         ordered = [key_id] if key_id in self._keyring else []
@@ -1392,40 +1534,44 @@ class AesGcmCipher(_UnmarkedPolicy):
         # Try the named key first (the fast path for current-format rows), then every other key — this
         # transparently decrypts legacy key_id='0' rows and rows written under a retired key mid-rotation.
         #
-        # BACKLOG #1167 (ASVS 11.2.4) EXAMINED THIS SHORT-CIRCUIT AND IS DELIBERATELY LEAVING IT.
-        # It is a literal short-circuit return inside a cryptographic loop, so it looks like the verb's
-        # target, and the sibling one in `_verify_second_factor` WAS a real leak and was fixed (ADR
-        # 0170). This one is not, for three independent reasons — any one of which is sufficient:
+        # BACKLOG #1167 (ASVS 11.2.4). MANAGER DECISION 2026-10-10, taken under the owner's standing
+        # driver rule and NOT an owner ruling; the owner may still overrule it. This comment used to
+        # reserve the read-cost trade below to the owner by name; the owner answered that question
+        # with the driver rule, and the Manager decided it.
         #
-        #   1. THE INPUT IS NOT ATTACKER-SUPPLIED. `stored` comes from the store, not from a request.
-        #      Submitting chosen ciphertext here already requires database write access.
-        #   2. WHAT THE TIMING REVEALS IS ALREADY IN PLAINTEXT. The candidate count varies with which
-        #      key encrypted the row — and `key_id` is parsed out of `stored` two lines above, because
-        #      the marker publishes it. The "leak" is a value the same string hands over for free.
-        #   3. THE PER-CANDIDATE COST IS A GMAC TAG CHECK. Microseconds, and constant-time inside
-        #      `cryptography`. The recovery-code walk mattered because each step was a ~64 MiB argon2id.
+        # The fast path keeps its early exit. It tries first the key the marker's PLAINTEXT `key_id`
+        # names, and stops if that key opens the row. Its timing shows only whether the named key
+        # opened it. `_candidates` yields the named key first; this loop relies on that order.
         #
-        # AND THE "FIX" WOULD COST SOMETHING REAL: forcing all candidates would tag-check every row
-        # against every retired key on every read, multiplying store read cost through a rotation, to
-        # conceal a value the ciphertext already prints. Recorded here rather than left to be
-        # rediscovered — an unreported non-defect gets "fixed" by the next reader.
+        # The FALLBACK has no early exit. It runs when the marker names no configured key (a legacy
+        # key_id='0' row, a key not in the keyring) or when the named key fails. It used to stop at
+        # the first key that verified, so its timing told which configured key sealed the row, and no
+        # header field says that. Now it tries EVERY remaining key, keeps the first plaintext that
+        # verified, and decides only after the loop. The decrypted value and the CipherError texts
+        # are unchanged. One thing does change: an error other than InvalidTag from a later key, which
+        # the old loop never reached, now surfaces.
         #
-        # NOT a licence to reuse this argument elsewhere: #1167 names extending it to the recovery-code
-        # walk as the one move that would NOT be an honest pass. It is scoped to this loop.
+        # THE COST, ON FALLBACK ROWS ONLY: one tag check per keyring key on every read. For a v4 row
+        # it is also one sub-key derivation per keyring key, and each takes a slot in the bounded
+        # sub-key cache, so fallback reads across many salts evict sooner. A row whose named key opens
+        # it pays nothing extra. The earlier reasons for leaving the short-circuit (the input comes
+        # from the store, not a request; the per-key cost is a constant-time GMAC check) still
+        # describe the impact. They never answered the absolute verb, and the decision above does.
         #
-        # AND IT ANSWERS IMPACT, NOT CONFORMANCE — do not read the three reasons above as closing the
-        # ASVS question. 11.2.4's verb is ABSOLUTE: no short-circuit operations in comparisons,
-        # calculations or returns. This is a short-circuit return whether or not the value it leaks is
-        # secret, so the cell stays PARTIAL on this loop by design, and its record named closing BOTH
-        # this and the recovery-code walk as what would earn the pass — before either was written, so
-        # the arithmetic is not after-the-fact. Both statements are true at once: no vulnerability
-        # here, and no conformance either. Whether the read-cost trade above is worth paying to reach
-        # the absolute verb is an OWNER call, not an assessor's and not this comment's.
-        for aes in self._candidates(key_id, salt):
+        # NOT a licence to reuse any of this reasoning for the recovery-code walk: #1167 names that as
+        # the one move that would NOT be an honest pass.
+        named = key_id in self._keyring
+        decrypted: bytes | None = None
+        for index, aes in enumerate(self._candidates(key_id, salt)):
             try:
-                decrypted = aes.decrypt(nonce, ct, gcm_aad)
+                opened = aes.decrypt(nonce, ct, gcm_aad)
             except InvalidTag:
                 continue
+            if decrypted is None:
+                decrypted = opened  # the first key that verified wins, as before
+            if named and index == 0:
+                break  # the fast path: the marker named this key in plaintext
+        if decrypted is not None:
             # Copy the plaintext into an owned, lockable buffer so its mutable lifetime is bounded and it
             # is wiped after decoding. RESIDUAL (documented): `cryptography.decrypt` returns an IMMUTABLE
             # `bytes` we cannot scrub, and the returned `str` is immutable too — both linger until GC.
@@ -1434,7 +1580,7 @@ class AesGcmCipher(_UnmarkedPolicy):
             try:
                 # A UnicodeDecodeError's .object is the decrypted plaintext, so it is suppressed and
                 # the refusal raised after the block, chaining nothing (BACKLOG #2308, the Transit
-                # twin's shape). The tag verified, so no other key is tried: the row is corrupt.
+                # twin's shape). The tag verified, so the row is corrupt, whatever other keys said.
                 with contextlib.suppress(UnicodeDecodeError):
                     return pt.decode("utf-8")
             finally:

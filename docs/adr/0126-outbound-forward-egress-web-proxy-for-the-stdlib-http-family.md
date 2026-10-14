@@ -48,7 +48,8 @@ token calls would be a bug). Off by default → byte-identical.
 - an `http(s)://host:port` URL → an explicit forward-proxy address used for both http and https
   destinations.
 An `[egress].proxy_url` (+ `[egress].proxy_no_proxy`) supplies a **site-wide default** the http-family
-egress inherits unless the connection overrides it. Credentials stay per-connection.
+egress inherits unless the connection overrides it. Credentials stay per-connection. [Corrected
+2026-10-12: true of the credential keys, not of a proxy URL's own `user:password@`; see Amendment D.]
 
 **#127 — credential types (Basic shipped for all; Digest shipped for http destinations; NTLM/Windows
 deferred).** `proxy_auth_type` ∈ `{basic, digest, ntlm, windows}`, with `proxy_user`/`proxy_password`
@@ -111,7 +112,7 @@ ACK-on-receipt, and the no-"channel"-element rule are untouched.
   → `tests/test_outbound_forward_proxy.py::test_basic_proxy_auth_preemptive_header`
 - **AC-5** — IF a proxy credential would ride a cleartext `http` proxy hop on a production-PHI instance,
   THEN THE SYSTEM SHALL refuse at construction **regardless of the destination scheme** (a loopback proxy
-  is allowed).
+  is allowed). Widened by Amendment E to a proxy written `https://`.
   → `tests/test_outbound_forward_proxy.py::test_cleartext_proxy_hop_credential_refused`
 - **AC-6** — IF `proxy_auth_type="digest"` targets an https destination, THEN THE SYSTEM SHALL refuse at
   construction (digest-over-`CONNECT` unsupported); IF `proxy_auth_type` ∈ {ntlm, windows}, THEN THE
@@ -229,7 +230,7 @@ lookup. So it covers exactly the hosts the guards call on-box, and a host they c
 to the proxy. The guards refuse a cleartext hop to such a host, so none is a hop the engine judged
 on-box. It is also a rule of the engine's `urllib` openers only. A client built on another HTTP
 library is outside it: the operator API client and the `tee` tool follow the environment proxy even
-for a loopback address.
+for a loopback address. [Corrected 2026-10-12: the operator API client does not; see Amendment D.]
 
 - **`ProxyConfig.for_host` returns `None` for a loopback target**, as it does for a `proxy_no_proxy`
   match. The opener would dial that host direct anyway, so the pre-emptive `Proxy-Authorization`
@@ -238,7 +239,9 @@ for a loopback address.
   INFO. **Not covered:** urllib's own bypass list (`NO_PROXY`, or the system's override list) can
   also send a request direct, and `for_host` does not read that list. A proxy credential header
   can still accompany such a request. That predates this amendment and is a follow-up recorded
-  for the maintainer ledger.
+  for the maintainer ledger. [Corrected 2026-10-12: refused at send time; see Amendment E.
+  Corrected again 2026-10-12: `for_host` now reads that list too, so such a request carries no
+  header and goes direct (vault BACKLOG #3442).]
 - **The ECH sidecar opener passes `ProxyHandler({})`**, so that hop uses no proxy at all. The
   token-endpoint hop is re-addressed to the same sidecar on the token provider's opener, which
   does read the environment, so there the loopback rule is what keeps it direct. For that to hold,
@@ -258,6 +261,57 @@ needs those settings first, each gated by `allowed_proxy`, and is left as a late
   → `tests/test_loopback_hop_never_proxied.py`
 
 Vault BACKLOG #2579.
+
+### Amendment C (2026-10-11) — the proxy gets a framing requirement, and an environment proxy is named
+
+An owner ruling of 2026-10-11 on BACKLOG #1125 grades each hop in the request chain by who owns it.
+A hop the engine wrote or contracted decides the verdict. A hop the operator deploys gets a framing
+requirement in the deployment documents. A proxy the environment supplies must not attach
+silently, or must be disclosed. This ADR's proxy is of the last two kinds.
+
+- **A `proxy_url` proxy is operator-deployed.** It now carries a framing requirement. For an
+  `https://` destination it only tunnels, so it has nothing to frame. For an `http://` destination,
+  or behind a TLS-inspecting proxy, it must not re-frame the engine's request, must refuse an
+  ambiguous partner reply, and must not reuse its partner connection after a reply it could not
+  frame. The rules are in [CONFIGURATION.md, `[egress]`](../CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries).
+- **An environment proxy is ambient, and `serve` now names it.** Amendment B kept the urllib
+  openers reading the environment, for the reason it gives. So the ruling's other branch applies:
+  `serve` and `supervise` each log one static WARNING at start, naming each proxy that is set and
+  the hops that may read one (`transports/ambient_proxy.py`, `tests/test_ambient_proxy_disclosure.py`).
+  It makes no per-hop claim. What it says, and the per-hop facts, are in
+  [CONFIGURATION.md](../CONFIGURATION.md#serve-names-an-environment-proxy-at-start).
+
+### Amendment D (2026-10-12) — two statements above were wrong
+
+BACKLOG #1125. This amendment changes no behaviour. It corrects two sentences that the code
+contradicts. The sentences stay in place, each marked with a pointer here.
+
+- **The Decision's "Credentials stay per-connection."** It holds for the credential keys.
+  `[egress]` has no `proxy_user` or `proxy_password`, and the config file refuses a key the model
+  does not define. It does not hold for a `user:password@` written into `[egress].proxy_url`
+  itself. That field has no validator. Each connection that sets no `proxy_url` of its own
+  inherits the whole URL (`_apply_egress_proxy_default` in `pipeline/wiring_runner.py`). The
+  guidance stands: put proxy credentials on each connection. The
+  [`[egress]` key table](../CONFIGURATION.md#egress) says what applies to such a URL.
+- **Amendment B's "the operator API client ... follow[s] the environment proxy".** It does not.
+  `EngineClient._open_transport` in `apiclient/client.py` builds httpx with `trust_env=False`
+  (BACKLOG #2318), and `tests/test_apiclient_ignores_env_proxy.py` pins it. The `tee` tool half of
+  the sentence is still true: it calls plain `urlopen`, which reads the environment proxy.
+
+### Amendment E (2026-10-12) — a proxy written `https://` gets no pass
+
+The guard above and AC-5 named only a cleartext `http` proxy hop. A `proxy_url` maps both schemes
+to one proxy. So urllib sends a `proxy_user` credential to it in a `CONNECT` before any TLS, for an
+`https` target and an `http` target alike, even when the proxy is written `https://`. The guard now
+judges that credential as cleartext for a proxy written either way (vault BACKLOG #3416). The
+send-time rule (vault BACKLOG #3417, #3418), with its one exception for a credential this guard
+admitted, is stated once on `ProxyCredentialsRefusedError` in
+[`transports/bounded_read.py`](../../messagefoundry/transports/bounded_read.py).
+
+That exception admits a connection's header, not one header. So a connection with `proxy_user`
+that also writes a `Proxy-Authorization` into its static `headers` is refused when it is built.
+Under Digest the static header would otherwise cross the cleartext leg on that admission (vault
+BACKLOG #3443).
 
 ## Deviations from the phase doc
 

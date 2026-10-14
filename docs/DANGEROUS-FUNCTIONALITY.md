@@ -12,7 +12,7 @@ can shape. None of it is a defect. All of it is worth knowing about before you d
 
 ## What this page covers
 
-Five things:
+Six things:
 
 1. **The engine wheel** -- the `messagefoundry` distribution itself.
 2. **The deployment path the project documents** -- the container image in `docker/`, and the
@@ -22,9 +22,11 @@ Five things:
 5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.
    It holds the authoring commands that ADR 0201 is moving out of the engine wheel, such as
    `adr-analyze`. The scans in sections 4, 5 and 7 read it with the engine.
+6. **The test harness**, `harness`, shipped as the `messagefoundry-harness` distribution
+   (section 11).
 
 The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
-deployment path in. It says nothing about the other three, so each is here for its own reason:
+deployment path in. It says nothing about the other four, so each is here for its own reason:
 
 - The web console runs inside the engine's own process.
 - The extension ships to the same operators.
@@ -32,9 +34,11 @@ deployment path in. It says nothing about the other three, so each is here for i
   engine's command table, `CLI_TIERS` in `messagefoundry/cli_surface.py`, and ADR 0201 moves
   those commands out of the engine wheel a slice at a time. A site must not leave this page by
   moving between wheels.
+- The test harness is here by an owner ruling of 2026-10-02, which put `harness/` in the assessed
+  scope (vault BACKLOG #2883). Until then this page left it out by choice.
 
-Shipping at the engine's version is not a reason on its own. See the test harness under "What is
-deliberately not here".
+Shipping at the engine's version is not a reason on its own. The harness does ship at that
+version, and the ruling is what brought it in.
 
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
@@ -57,6 +61,7 @@ on its own.
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
 | 9 | Processes, terminals and webview scripts | VS Code extension | Runs the CLI on open and on save, once you trust the workspace |
 | 10 | Writing server-built HTML into the page | Web console | On |
+| 11 | Processes, import by name, config modules, a function swap, parsing | Test harness | Only when someone runs a harness command |
 
 ---
 
@@ -140,8 +145,10 @@ these: `auth/ldap.py` probes two `pyspnego` modules to learn whether Kerberos is
 builds that path from its own location and searches no other folder. In a source checkout the
 folder is the repository root, so the file is the repository's own scanner. From an installed wheel
 the folder is the one that holds the installed package files, normally `site-packages`. The wheel
-ships no such file, so the leak check refuses to run there. A file at that path in a folder above
-the install is never read. Whoever can write the folder that holds the package can already change
+ships no such file, so the leak check refuses to run there. So the leak check needs a source
+checkout, which an editable install (`pip install -e .`) also gives, or a scanner file that
+someone placed beside the installed package. A file at that path in a folder above the install is
+never read. Whoever can write the folder that holds the package can already change
 what the process imports, so that folder is the limit. The loader serves the de-identification
 leak check only, and is not on the message path.
 
@@ -649,8 +656,11 @@ or compression library:
   The File connector's `decompress=` option uses its gzip reader, and a Handler may call any of the
   three. Every decompress call must name an output ceiling, or pass `None` on purpose for none. The
   reader enforces a ceiling as it goes, so a decompression bomb stops there rather than expanding
-  in memory. The File
+  in memory. A trial pass that keeps no output checks the byte ceiling, and for gzip the member
+  cap, before the real decompression starts (BACKLOG #1129). The File
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
+  A connection with `decompress=` set and that ceiling off logs one warning when it is built.
+  Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
   A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
   after the archive. Each member's name must be a safe relative path, and its bytes must match the
   type its extension names. Members come back as bytes in memory; this module writes no file.
@@ -716,7 +726,9 @@ Other switches on `install-service.ps1` change more than the service:
 
 - `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
-  directory and of everything in it. Without the switch, the script only adds a read grant.
+  directory and of everything in it. It does the same to the value file's folder, and to the
+  settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
+  Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
   keyed by program name. So they affect every process with that name on the machine, not only the
   engine.
@@ -889,6 +901,151 @@ loader in the engine, which executes every config module again.
 
 ---
 
+## 11. The test harness
+
+`messagefoundry-harness` is a tool for testing an engine. It ships as its own distribution, and
+the engine wheel holds none of it. A harness command never runs inside the engine. It runs with the
+rights of whoever starts it, on the machine they start it on. The harness's `config/` modules are
+the exception: an engine the harness starts loads and runs them in its own process. Paths in this
+section are under `harness/`.
+
+The harness is built for synthetic messages. Treat that as a rule for its operator, not a
+property of the code. At least `load/corpus.py` replays a file of captured messages the operator
+names, meant to be de-identified first, and `reconcile/capture.py` records whatever an engine
+sends it. So what the harness carries is only as clean as what its operator gives it.
+
+It holds at least four of the classes above, and one of its own. This section is a floor, not a
+full list. No harness module imports `ctypes`, or an archive or compression library, itself. That
+is a claim about imports only. At least `sinks/dimse.py` inflates a compressed data set a peer
+sends it, through the engine's own bounded inflate helper.
+
+**Process starts.** 7 harness modules start a process, each from an argument list:
+
+| Module | What it runs | When | Form |
+|---|---|---|---|
+| `__main__.py` | `git rev-parse HEAD` | Stamping a load report with the commit it ran at | argument list |
+| `acceptance/runner.py` | `pytest`, under the harness's own interpreter | `python -m harness.acceptance`, unless `--no-pytest` is given | argument list |
+| `load/failover.py` | `messagefoundry serve`, once per engine node | A run that starts its own engine, at least the failover and connection-scale runs | argument list |
+| `load/shardcert.py` | `messagefoundry serve --shard`, and the harness again as a sender or a sink | The engine-shard certification runs | argument list |
+| `load/connscale/batchbox.py` | The harness again, as `connscale-remote` | A batch drive split over several sender processes | argument list |
+| `load/connscale/probe.py` | `powershell` on Windows, and `lsof` on a POSIX machine with no `/proc` | Sampling a started engine's handles, CPU time and memory | argument list |
+| `load/rigadmin.py` | Itself, to provision the rig account, and the command its caller names | Before a run's engine starts, and when `rigadmin run` wraps a command in a sign-in | argument list |
+
+**What holds the starts, and what does not.** No start asks for a shell. That is all that holds
+them. At least five things are open:
+
+- `load/connscale/probe.py` hands `powershell -Command` one string it builds at run time, and
+  PowerShell parses that string. What holds it is that the only part that varies is a list of
+  process ids, each an integer. The Form column cannot show this.
+- Nothing pins a program's path. The harness runs `git`, `powershell` and `lsof` by bare name, so
+  Windows may find a copy in the working directory before the one on `PATH`.
+- Each Python child starts as `python -m <module>` with no `-P`. So the child's working directory
+  comes first on its import path, unless the caller's environment sets `PYTHONSAFEPATH`. A file
+  there named like a module the child imports would load in its place. One start differs: the
+  provisioning child runs `load/rigadmin.py` by file path with `-P`.
+- No start takes its environment from `messagefoundry/childenv.py`, and
+  `tests/test_child_process_environment.py` does not read the harness. So the check that holds
+  every engine start to that module does not reach a harness start. Some harness tests do check
+  what one child is handed, at least `tests/test_rig_admin.py` for the provisioning child and the
+  `rigadmin run` child.
+- `rigadmin run` signs in, then starts the command its caller names with `--token=<session>`
+  added. The session is an argument of that child. It is visible wherever the machine shows a
+  process's command line.
+
+**An engine the harness starts runs with checks loosened.** `load/failover.py` gives each engine
+node at least these, unless the run sets them itself: `MEFOR_SECURITY_ENFORCEMENT=warn`,
+`MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI=true`, `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=false` and
+`MEFOR_SECURITY_REQUIRE_MFA=false`. On Windows it adds `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`. It
+passes `--allow-insecure-bind` when the run binds the inbound listener off loopback. Some runs go
+further. `load/multishard.py` and `load/shardcert.py` set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`
+and `MEFOR_ALLOW_INSECURE_TLS=1` for their engines on every platform, whatever the run's own
+environment says. These suit a synthetic load graph. An engine started this way would not protect
+real messages, so never point one at them.
+
+**Import by name.** 2 harness modules import a module named at run time:
+
+- `_discover.py` imports every module in a harness package whose name does not start with `_`.
+  At least four packages use it: `drivers`, `endpoints`, `scenarios` and `sinks`. Each passes its own name,
+  and the module names come from the package's own folder. So a `.py` file dropped into one of
+  those folders is imported the next time a harness command loads that package, and its top-level
+  code runs. What holds it is the permissions on the folder the harness is installed in, and
+  nothing else.
+- `acceptance/probes.py` imports `pyodbc`, by a name fixed in the code, to list the ODBC drivers.
+
+**Config modules.** 1 harness module calls the engine's config loader in its own process:
+
+- `load/shardcert.py` loads `harness/config/shardcert`, a path it resolves from the working
+  directory. Section 2 says what a load does: every module in that folder runs, here with the
+  harness's rights. A run started from another folder loads whatever sits at that path there.
+
+Every engine the harness starts also loads the config folder the run gives it, and executes it
+(section 1). The runners name that folder the same way, as `harness/config/<name>` under the
+working directory. At least the failover, connection-scale, estate and `multishard` runs do. So a
+harness command started from another folder would make its engine run whatever sits at that path
+there, not the folder the harness ships. That engine may also carry
+`MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`, described above, which eases the engine's check on who can
+write its config folder.
+
+**Emptying a message store.** At least `load/connscale/runner.py` and `load/shardcert.py` open the
+store that the `MEFOR_STORE_*` variables name and delete rows from it before a step. The first
+clears the pipeline tables. The second also clears at least the `state`, `leader_lease`, `nodes`
+and `cluster_config` tables, and ignores any error from a delete. A run on a machine whose
+environment names a store that holds real messages would delete them, and could clear that
+store's cluster records too. Run the harness only where those variables name a test store.
+
+**A run-time function swap.** This class is the harness's own. `provision-admin` reads the new
+password from a terminal and takes it no other way. A test rig has no terminal. So
+`load/rigadmin.py` imports the engine's command module and replaces its `_read_new_password`
+function with one that returns a password the rig holds. It then calls the shipped command's
+`main`. The rest of `provision-admin` runs as shipped.
+
+What holds it:
+
+- The swap runs only in a `rigadmin provision` process, and changes nothing on disk. Either
+  `provision` started that process as a child, or a workflow step ran the command itself.
+- No engine module imports the harness, so no shipped command gains a password path.
+- The password comes from the `MEFOR_RIG_ADMIN_PASSWORD` environment variable. The process takes
+  it out of its own environment before any engine code runs.
+- The shipped command refuses a store that already has an enabled Administrator, and the swap
+  does not change that.
+
+What it means: on a store with no enabled Administrator, whoever can run the harness with access
+to that store can create one with no terminal and no authenticator app. The swap passes
+`--no-totp`, and sets `MEFOR_SECURITY_REQUIRE_MFA=false` in that process.
+
+**Parsing.** Section 7's six patterns, run over the harness, find these modules:
+
+| What it reads | Where it comes from | Harness modules |
+|---|---|---|
+| Engine API answers | An engine the run started, or the one `--engine` names | `load/failover.py`, `load/rigadmin.py` |
+| An engine's replies to what the harness sends | The engine under test | `drivers/dimse.py`, `drivers/http.py`, `load/sender.py` |
+| What an engine delivers to a harness sink | The engine under test, and anything else that connects on loopback | `scenarios/http.py`, `sinks/dimse.py`, `sinks/email.py` |
+| Files a run or its operator wrote | A path on the command line, or a folder the run's processes share | `__main__.py`, `acceptance/runner.py`, `load/connscale/batchbox.py`, `load/coord.py`, `load/corpus.py`, `reconcile/compare.py` |
+| Nothing | These only build or write the format | `acceptance/report.py`, `load/connscale/report.py`, `load/report.py`, `scenarios/_dimse_dataset.py` |
+
+`acceptance/runner.py` reads the JUnit file its own `pytest` child wrote, with the standard
+library's `xml.etree`, not `defusedxml`. `load/rigadmin.py` also reads the JSON the shipped
+`provision-admin` prints.
+
+The scan reaches only what the six patterns reach, and those were written for the engine. They do
+not see a module that parses through the engine's own `messagefoundry.parsing` or
+`messagefoundry.mllpcodec` packages, and most harness readers do. So the harness holds more readers
+than the table names. At least these: the other sinks under `sinks/`, `load/sink.py` and
+`reconcile/capture.py`, each of which reads what an engine or any other peer sends it.
+
+`sinks/__init__.py` states the rule that a sink under `sinks/` which listens binds `127.0.0.1`
+only. That rule does not cover every harness listener. `load/sink.py` and `reconcile/capture.py`
+bind the host the run gives them. Each defaults to `127.0.0.1`, and so do most `--sink-host`
+options. At least one default is every interface: `harness batch-driver` binds its sinks on
+`0.0.0.0` unless `--sink-host` says otherwise, and `run_batch_driver` in
+`load/connscale/batchbox.py` has the same default. A listener bound that way reads frames from any
+host that can connect. The engine side has the same shape. At least `harness shardcert-engine`,
+`harness shardcert-engine-ladder` and `harness batch-engine` default `--inbound-bind-host` to
+`0.0.0.0`, so the engine they start listens for messages on every interface. This page's test
+reads neither the rule nor the bind addresses.
+
+---
+
 ## What is deliberately not here
 
 **Your Routers and Handlers.** The engine cannot know what they do. If yours shell out, call a
@@ -898,18 +1055,12 @@ in your own documentation.
 **Third-party components.** [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) designates the risky ones.
 Per-library decisions that matter to a deploying operator are recorded in the ADRs cited above.
 
-**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, and it
-does start processes. It ships at the engine's version, as the toolkit does. But none of its commands
-is a row in `CLI_TIERS`, it holds none of the code ADR 0201 moves out of the engine wheel, and it
-does not run inside the engine. The extension's reason, shipping to the same operators, would reach it. So
-leaving it out is a choice about this page, not a claim that it holds none of these classes.
-
 ## Keeping this page true
 
 When you add a site in any class above, add it here in the same change. A highlight that has
 quietly gone stale is worse than none, because a reader takes its silence for absence.
 
-A test checks the lists and counts in six sections. `tests/test_dangerous_functionality_doc.py`
+A test checks the lists and counts in seven sections. `tests/test_dangerous_functionality_doc.py`
 reads the code and fails when one of these no longer matches it:
 
 - the section 4 table: a new process start, or a start that changes form, such as a new
@@ -927,9 +1078,17 @@ reads the code and fails when one of these no longer matches it:
   `execFile`, any VS Code task, and any use of `cluster`, `worker_threads` or `process.dlopen`, and
   when a file its `innerHTML` sentence names is missing or writes no HTML into its page;
 - section 10: the count of HTML writes. It also checks that the console's Python starts no
-  process, imports no `ctypes` or archive library, and imports nothing by name.
+  process, imports no `ctypes` or archive library, and imports nothing by name;
+- section 11: the harness's process-start table and its form column, the import-by-name list and
+  the config-loader list, each with its count, and the parser table. A new `ctypes` or archive
+  import under `harness/` fails too. So does a new assignment to an attribute of an imported
+  module, or one the section does not name.
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.
 Some things no test checks. They include what a script grants, what holds a site, and sections 1,
 2, 3 and 6. In section 7, no test checks which table a parse site belongs in, or whether either
-hand-read table is complete. Keep that prose true by hand.
+hand-read table is complete. In section 11, no test checks the settings a harness-started engine
+is given, the store reset, the listener bind addresses, or which row a parse site belongs in. The
+import-by-name and config-loader checks match the called name, so a call through another name
+passes unseen. The swap check sees an assignment or a `setattr` on a name the module imported, and
+nothing less direct. Keep that prose true by hand.

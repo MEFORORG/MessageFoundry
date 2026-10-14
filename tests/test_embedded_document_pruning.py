@@ -356,7 +356,10 @@ async def test_runner_enabled_for_document_pruning_only(store: MessageStore) -> 
     # The low-disk floor (BACKLOG #290) is turned off here: it ships on and enables the runner on a
     # SQLite store by itself, which would make both assertions below say nothing about pruning. The
     # hourly WAL truncate ships on too since vault BACKLOG #2619, and is turned off for the same reason.
-    no_floor = RetentionSettings(min_free_disk_mb=0, wal_checkpoint_seconds=0)
+    # So does the audit-log growth warning since BACKLOG #1421, on every backend.
+    no_floor = RetentionSettings(
+        min_free_disk_mb=0, wal_checkpoint_seconds=0, audit_log_warn_rows=0
+    )
     runner = RetentionRunner(store, no_floor, clock=lambda: 5 * DAY, registry_source=lambda: reg)
     assert runner.enabled is True
 

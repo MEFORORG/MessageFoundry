@@ -54,6 +54,7 @@ from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES, render_filena
 from messagefoundry.transports.remotefile import (
     _APPROVED_SFTP_CIPHERS,
     _APPROVED_SFTP_MACS,
+    OTHER_FORM_WARNING_SECONDS,
     RETRIEVE_CHUNK_BYTES,
     RemoteFileDestination,
     RemoteFileSource,
@@ -61,6 +62,8 @@ from messagefoundry.transports.remotefile import (
     _FtpClient,
     _ftps_ssl_context,
     _is_contained_name,
+    _is_other_listing_form,
+    _Listed,
     _RemoteClient,
     _RemoteError,
     _RemoteOversize,
@@ -1431,6 +1434,108 @@ def test_sftp_unknown_host_key_accepted_with_escape(
     assert client._accept_unknown is True  # AutoAddPolicy will be selected (logged loudly)
 
 
+class _PolicyCallingSSHClient(_FakeSSHClient):
+    """Calls the chosen policy's ``missing_host_key`` for an unknown key, as paramiko's ``connect``
+    does before authentication. Records whether authentication was reached."""
+
+    authenticated = False
+
+    def connect(self, **kw: Any) -> None:
+        if isinstance(self.policy, _RejectPolicy):
+            raise _SSHException("Server host key not found in known_hosts")
+        if not isinstance(self.policy, _AutoAddPolicy):
+            self.policy.missing_host_key(self, kw["hostname"], object())
+        type(self).authenticated = True
+
+
+class _PolicyCallingParamiko(_FakeParamiko):
+    SSHClient = _PolicyCallingSSHClient
+
+
+def test_sftp_password_login_never_takes_the_escape(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3230: the escape would auto-accept an unknown host key, and the password would
+    then go to whichever server answered. A password login refuses the unknown key instead, before
+    it authenticates, with text naming the connection and the fix."""
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _PolicyCallingParamiko)
+    _PolicyCallingSSHClient.authenticated = False
+    with caplog.at_level(logging.WARNING):
+        client = _SftpClient(
+            {
+                "host": "h",
+                "port": 22,
+                "remote_dir": "/in",
+                "username": "svc",
+                "password": "synthetic",
+            },
+            name="OB_SFTP",
+        )
+    assert client._accept_unknown is False
+    # Said at build, before any delivery is refused at connect.
+    assert any(
+        "connection 'OB_SFTP'" in r.getMessage() and "logs in with a password" in r.getMessage()
+        for r in caplog.records
+    )
+    with pytest.raises(_RemoteError) as ei:
+        client.list_dir("/in")
+    assert ei.value.permanent is True
+    message = str(ei.value)
+    assert "connection 'OB_SFTP'" in message and "known_hosts" in message
+    assert "with no escape" in message and "MEFOR_ALLOW_INSECURE_TLS" not in message
+    assert "synthetic" not in message
+    assert _PolicyCallingSSHClient.authenticated is False  # refused before any password crossed
+
+
+@pytest.mark.parametrize("escape", [True, False])
+def test_sftp_password_build_warning_fires_only_where_the_escape_would_have_applied(
+    escape: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The build-time WARNING is for a password login the escape would have let through: the
+    escape is permitted and no known_hosts file is named. A named file, or no escape, is quiet."""
+    monkeypatch.setattr(remotefile, "weakened_tls_escape_permitted_here", lambda: escape)
+    base = {"host": "h", "port": 22, "remote_dir": "/in", "username": "svc", "password": "x"}
+
+    def warned(settings: dict[str, Any]) -> bool:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            _SftpClient(settings, name="OB_SFTP")
+        return any("logs in with a password" in r.getMessage() for r in caplog.records)
+
+    assert warned(base) is escape
+    assert warned({**base, "known_hosts": "known_hosts"}) is False
+
+
+def test_sftp_password_login_with_a_known_hosts_file_still_refuses_an_unknown_key(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quiet at build is not a weaker connect: the unknown key is refused before authentication."""
+    monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _PolicyCallingParamiko)
+    _PolicyCallingSSHClient.authenticated = False
+    client = _SftpClient(
+        {
+            "host": "h",
+            "port": 22,
+            "remote_dir": "/in",
+            "username": "svc",
+            "password": "synthetic",
+            "known_hosts": "known_hosts",
+        },
+        name="OB_SFTP",
+    )
+    with pytest.raises(_RemoteError, match="with no escape"):
+        client.list_dir("/in")
+    assert _PolicyCallingSSHClient.authenticated is False
+
+
+def test_sftp_key_only_login_keeps_the_escape(escape_at_warn: None) -> None:
+    """The control arm: a login with no password is outside this row and still takes the escape."""
+    client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in", "username": "svc"})
+    assert client._accept_unknown is True
+
+
 def _sftp_connect_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Drive ``_SftpClient._connect`` against the fake paramiko and return what it passed to connect.
 
@@ -2310,6 +2415,142 @@ async def test_a_folded_nlst_entry_is_refused_by_the_poll_loop(
     assert client.ops == []
 
 
+class _NlstRefusingFtp(_NlstOnlyFtp):
+    """An NLST-only server that answers ``NLST`` with one permanent reply (BACKLOG #1130)."""
+
+    def __init__(
+        self,
+        reply: str,
+        *,
+        dir_exists: bool = True,
+        pwd_error: ftplib.Error | None = None,
+        pwd_reply: str = '257 "/home" is the current directory',
+        home_refused: bool = False,
+    ) -> None:
+        super().__init__([])
+        self._reply = reply
+        self._dir_exists = dir_exists
+        self._pwd_error = pwd_error
+        self._pwd_reply = pwd_reply
+        self._home_refused = home_refused
+        self.cwds: list[str] = []
+
+    def nlst(self, path: str) -> list[str]:
+        raise ftplib.error_perm(self._reply)
+
+    def pwd(self) -> str:
+        if self._pwd_error is not None:
+            raise self._pwd_error
+        return ftplib.parse257(self._pwd_reply)  # what ftplib.FTP.pwd returns for this reply
+
+    def cwd(self, path: str) -> str:
+        if path == "/home" and self._home_refused:
+            raise ftplib.error_perm("550 /home: Permission denied")
+        if path != "/home" and not self._dir_exists:
+            raise ftplib.error_perm("550 No such file or directory")
+        self.cwds.append(path)
+        return "250 OK"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    ["550 No files found", "550 No files found.", "550-no files found", "550 NO FILES FOUND"],
+)
+def test_an_nlst_empty_directory_refusal_lists_nothing(reply: str) -> None:  # #1130
+    # Some NLST-only servers refuse NLST on an empty directory. That is an empty poll, not a
+    # permanent failure, on the poll listing and on the publish listing alike.
+    ftp = _NlstRefusingFtp(reply)
+    assert _FtpClient._list(ftp, "/in") == []  # type: ignore[arg-type]
+    assert ftp.cwds == ["/in", "/home"]  # the directory was confirmed, and the session put back
+    assert _FtpClient._names(_NlstRefusingFtp(reply), "/in") == set()  # type: ignore[arg-type]
+
+
+def test_an_nlst_empty_reply_for_a_missing_directory_still_fails() -> None:  # #1130
+    # Some servers send the empty-directory reply for a directory that is not there. A mistyped
+    # remote_dir must fail as before, not poll as empty for good.
+    ftp = _NlstRefusingFtp("550 No files found", dir_exists=False)
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._list(ftp, "/inbx")  # type: ignore[arg-type]
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._names(ftp, "/inbx")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "pwd_error",
+    [
+        ftplib.error_perm("502 Command not implemented"),
+        ftplib.error_reply("200 Not a PWD reply"),  # what parse257 raises for a non-257 reply
+        ftplib.error_proto("garbage"),
+    ],
+    ids=["refused", "unreadable", "protocol"],
+)
+def test_a_pwd_that_fails_raises_the_original_nlst_reply(pwd_error: ftplib.Error) -> None:  # #1130
+    # The check confirms nothing, so the NLST reply raises as it did before the check existed.
+    ftp = _NlstRefusingFtp("550 No files found", pwd_error=pwd_error)
+    with pytest.raises(ftplib.error_perm, match="No files found") as caught:
+        _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert ftp.cwds == []
+    assert caught.value.__context__ is None  # the PWD reply is the server's text
+
+
+def test_a_pwd_with_no_quoted_path_raises_the_original_nlst_reply() -> None:  # #1130
+    # ftplib reads no home from an unquoted 257, and cwd("") sends CWD ., which succeeds and would
+    # leave the session inside remote_dir. So the check stops before any CWD.
+    ftp = _NlstRefusingFtp("550 No files found", pwd_reply="257 /home is cwd")
+    with pytest.raises(ftplib.error_perm, match="No files found"):
+        _FtpClient._list(ftp, "in")  # type: ignore[arg-type]
+    assert ftp.cwds == []
+
+
+def test_a_refused_return_to_home_raises_the_original_nlst_reply() -> None:  # #1130
+    # remote_dir was entered, but the session could not be put back, so nothing is confirmed.
+    ftp = _NlstRefusingFtp("550 No files found", home_refused=True)
+    with pytest.raises(ftplib.error_perm, match="No files found") as caught:
+        _FtpClient._names(ftp, "/in")  # type: ignore[arg-type]
+    assert ftp.cwds == ["/in"]
+    # The refused CWD reply names a path, so it must not ride on the raised reply's chain.
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("failing", ["pwd", "cwd", "cwd /home"])
+def test_a_transient_reply_during_the_check_raises_as_itself(failing: str) -> None:  # #1130
+    # A 421 is transient, so it must reach _op as error_temp and retry, not as the permanent 550.
+    # "cwd /home" fails only the return trip, after remote_dir was entered.
+    ftp = _NlstRefusingFtp("550 No files found")
+    transient = ftplib.error_temp("421 Service not available")
+    method, _, only = failing.partition(" ")
+    real = getattr(ftp, method)
+
+    def refuse(*args: str) -> str:
+        if only and args != (only,):
+            return str(real(*args))
+        raise transient
+
+    setattr(ftp, method, refuse)
+    with pytest.raises(ftplib.error_temp) as caught:
+        _FtpClient._list(ftp, "/in")  # type: ignore[arg-type]
+    assert caught.value is transient
+    assert caught.value.__context__ is None  # nor does the NLST reply ride on it
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "550 No such file or directory",  # also answers a directory that is not there
+        "550 Permission denied",
+        "530 Not logged in",
+        "553 No files found",  # the text alone is not enough: the code must be 550
+        "550 Files found: none of them yours",
+    ],
+)
+def test_any_other_nlst_refusal_still_fails(reply: str) -> None:  # #1130
+    with pytest.raises(ftplib.error_perm):
+        _FtpClient._list(_NlstRefusingFtp(reply), "/in")  # type: ignore[arg-type]
+    with pytest.raises(ftplib.error_perm):
+        _FtpClient._names(_NlstRefusingFtp(reply), "/in")  # type: ignore[arg-type]
+
+
 # --- the key names ARE the control -------------------------------------------------------------
 #
 # This pair exists because the shipped control was INERT and every test in this file stayed green.
@@ -2465,6 +2706,218 @@ async def test_remote_source_unsafe_name_refusal_still_logs_no_name_at_all(
     assert "MRN123456789" not in sink.text
     assert SAFE_NAME_LABEL.search(sink.text) is None  # no label either — the name is not touched
     assert IDENTIFIER_SHAPE.search(sink.text) is None
+
+
+_TRAVERSAL_LINE = "refused as an unsafe path component"
+_OTHER_FORM_LINE = "the server's listing form looks unsupported"
+
+
+class _NlstListingClient(_HostileListingClient):
+    """A client whose listing is what ``_FtpClient._list`` makes of an NLST-only server's reply,
+    so each entry carries the ``other_form`` flag the real NLST fallback sets."""
+
+    def list_entries(self, remote_dir: str) -> list[_Listed]:
+        return _FtpClient._list(_NlstOnlyFtp(self._names), remote_dir)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("remote_dir", "name"),
+    [
+        ("/in", "/srv/ftp/in/a.hl7"),  # a resolved absolute path
+        ("/in", "in/a.hl7"),  # relative to the server's current directory
+        ("/in/", "/data/in/a.hl7"),
+        ("in", "/srv/ftp/in/a.hl7"),
+    ],
+)
+def test_a_path_into_remote_dir_with_no_traversal_shape_is_another_listing_form(
+    remote_dir: str, name: str
+) -> None:  # #1130
+    assert _is_contained_name(name) is False
+    assert _is_other_listing_form(name, remote_dir) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../x/a.hl7",
+        "/srv/in/../in/a.hl7",
+        "/srv/in/a..b.hl7",  # doubt goes to the traversal side
+        r"srv\in/a.hl7",
+        "C:/in/a.hl7",
+        "/srv/in/a.hl7:stream",
+        "/srv/in/a\nb.hl7",
+        "/etc/a.hl7",  # another directory
+        "//host/share/a.hl7",
+        "//srv/in/a.hl7",  # a network path, even with a share named like remote_dir
+        "in/sub/a.hl7",  # a subdirectory
+        "./a.hl7",
+        "/",
+        "C:evil.hl7",  # no slash: a single name the guard refused for another reason
+        "a.hl7",
+    ],
+)
+def test_a_traversal_shape_or_another_directory_is_not_another_listing_form(
+    name: str,
+) -> None:  # #1130
+    assert _is_other_listing_form(name, "/in") is False
+
+
+def test_no_entry_is_another_listing_form_of_the_root() -> None:  # #1130
+    # "/" has no last part to match, and its own prefix form is accepted outright.
+    assert _is_other_listing_form("/srv/a.hl7", "/") is False
+
+
+def test_only_the_nlst_fallback_flags_another_listing_form() -> None:  # #1130
+    listed = _FtpClient._list(_NlstOnlyFtp(["/srv/in/a.hl7", "/etc/b.hl7", "c.hl7"]), "/in")  # type: ignore[arg-type]
+    assert [(e.name, e.other_form) for e in listed] == [
+        ("/srv/in/a.hl7", True),
+        ("/etc/b.hl7", False),
+        ("c.hl7", False),
+    ]
+
+
+async def test_another_listing_form_logs_its_own_warning_without_a_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # A server whose NLST names entries as resolved absolute paths gets them refused. The operator
+    # sees one name-free WARNING with the connection and the count, not the traversal one.
+    names = ["/data/in/MRN123456789_ADT.hl7", "/data/in/MRN987654321_ORU.hl7"]
+    client = _NlstListingClient(names)
+    src = _src(monkeypatch, client)
+    src._connection = "inbound:IB_ACME_ADT"
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _OTHER_FORM_LINE in sink.text
+    assert "inbound:IB_ACME_ADT" in sink.text
+    assert "2 NLST listing entries" in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+    assert "MRN" not in sink.text
+    assert SAFE_NAME_LABEL.search(sink.text) is None
+    assert client.ops == []
+
+
+async def test_another_listing_form_counts_only_entries_the_pattern_would_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # Under the default *.hl7, a subdirectory or a stray file in the other form loses nothing, so it
+    # raises neither line.
+    client = _NlstListingClient(["/data/in/archive", "/data/in/README.txt"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _OTHER_FORM_LINE not in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+
+
+async def test_another_listing_form_matches_the_pattern_against_the_file_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # pattern is a file-name glob. An entry named as a path is judged by its last part, so a
+    # pattern that does not start with "*" still counts it, and the operator gets the WARNING.
+    client = _NlstListingClient(["/data/in/ADT_1.hl7", "/data/in/ORU_1.hl7"])
+    src = _src(monkeypatch, client, pattern="ADT_*.hl7")
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert "1 NLST listing entry named a path" in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+    assert src._other_form_warned_at is not None
+    assert client.ops == []
+
+
+@pytest.mark.parametrize("entry", ["/data/in/", "/data/in/."])
+async def test_another_listing_form_naming_no_file_is_not_counted_even_under_star(
+    monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:  # #1130
+    # The last part is "" or ".", and fnmatch matches both against "*". Neither names a file, so
+    # neither may count; the file beside it does, which shows the count is armed.
+    client = _NlstListingClient([entry, "/data/in/a.hl7"])
+    src = _src(monkeypatch, client, pattern="*")
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert "1 NLST listing entry named a path" in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+    assert client.ops == []
+
+
+async def test_another_listing_form_is_not_counted_on_a_match_of_its_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # The reverse: "*in*" matches the full path through its directory, but not the file name, so
+    # the poller would not read it and the entry raises no line.
+    client = _NlstListingClient(["/data/in/README.txt"])
+    src = _src(monkeypatch, client, pattern="*in*")
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _OTHER_FORM_LINE not in sink.text
+    assert _TRAVERSAL_LINE not in sink.text
+    assert src._other_form_warned_at is None
+
+
+async def test_a_path_from_any_other_listing_still_logs_as_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # Only the FTP NLST fallback can carry a path legitimately. The same name from SFTP or MLSD
+    # keeps the per-poll traversal WARNING.
+    client = _HostileListingClient(["/data/in/a.hl7"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert _TRAVERSAL_LINE in sink.text
+    assert _OTHER_FORM_LINE not in sink.text
+
+
+async def test_another_listing_form_warning_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # The clock is moved by back-dating the last WARNING, not by patching time.monotonic, which
+    # the event loop reads too.
+    client = _NlstListingClient(["/data/in/a.hl7"])
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+
+    async def warnings() -> int:
+        with filtered_sink(_REMOTE_LOGGER) as sink:
+            await src._poll_once()
+        return sink.text.count(_OTHER_FORM_LINE)
+
+    def back_date(seconds: float) -> None:
+        assert src._other_form_warned_at is not None
+        src._other_form_warned_at -= seconds
+
+    assert await warnings() == 1
+    back_date(OTHER_FORM_WARNING_SECONDS - 60)
+    assert await warnings() == 0  # inside the window: DEBUG only
+    back_date(60)
+    assert await warnings() == 1  # the window has passed
+    # A poll with none clears the clock, so a recurrence warns at once.
+    client._names = []
+    assert await warnings() == 0
+    assert src._other_form_warned_at is None
+    client._names = ["/data/in/a.hl7"]
+    assert await warnings() == 1
+
+
+async def test_a_traversal_name_beside_another_form_still_logs_the_traversal_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # #1130
+    # An absolute path outside remote_dir is traversal-shaped too: it keeps the per-poll WARNING.
+    client = _NlstListingClient(
+        ["../../drops/MRN123456789_ADT.hl7", "/etc/MRN555555555.hl7", "/data/in/a.hl7"]
+    )
+    src = _src(monkeypatch, client)
+    src._handler = _RecordingHandler()
+    with filtered_sink(_REMOTE_LOGGER) as sink:
+        await src._poll_once()
+    assert sink.text.count(_TRAVERSAL_LINE) == 2
+    assert "1 NLST listing entry named a path" in sink.text
+    assert "MRN" not in sink.text
+    assert client.ops == []
 
 
 def test_sftp_real_handshake_still_needs_an_etm_mac_beside_gcm(

@@ -662,8 +662,11 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     )
 
     presented = {"first": codes[0], "last": codes[-1], "wrong": "ZZZZ-9999"}[present]
+    # The checked record, read after the enrolment: the verify walks the codes its seal covers.
+    verified = await service._load_user(user.id)
+    assert verified is not None
     calls["n"] = 0
-    ok = await service._verify_second_factor(user, presented)
+    ok = await service._verify_second_factor(verified, presented)
 
     assert ok is (present != "wrong"), why
     assert calls["n"] == slots, (
@@ -716,13 +719,15 @@ async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason
     # A fixed arrival moment, so the step cannot roll over between minting and verifying the code.
     arrived = 1_900_000_000.0
     code = totp.totp(secret, now=arrived)
+    verified = await service._load_user(user.id)  # the checked record, after the enrolment
+    assert verified is not None
     if present == "replayed":
-        assert await service._verify_second_factor(user, code, arrived=arrived) is True
+        assert await service._verify_second_factor(verified, code, arrived=arrived) is True
     elif present == "wrong":
         code = f"{(int(code) + 1) % 1_000_000:06d}"
 
     used.clear()
-    ok = await service._verify_second_factor(user, code, arrived=arrived)
+    ok = await service._verify_second_factor(verified, code, arrived=arrived)
 
     assert ok is expect_ok
     expected = [] if expect_ok else walk

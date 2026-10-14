@@ -810,6 +810,70 @@ def test_an_existing_store_with_no_administrator_still_prompts_and_provisions(
     )
 
 
+@pytest.mark.parametrize("error", ["StoreKeylessError", "CipherError"])
+def test_a_store_the_probe_cannot_open_is_could_not_start(
+    error: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The "an Administrator exists" probe meets a store it cannot open: encrypted rows and no key in
+    this shell (``StoreKeylessError``), or a row the key cannot read (``CipherError``, BACKLOG
+    #2308). Exit 2, as the keyless checks beside it exit, before the prompt (BACKLOG #2124, a seat
+    decision under owner delegation 2026-10-08, not an owner ruling). It exited 1 before."""
+    from messagefoundry.store import crypto
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _no_prompt(monkeypatch)
+    db = tmp_path / "never.db"
+    raised = getattr(crypto, error)
+
+    async def unopenable(*_a: object, **_k: object) -> MessageStore:
+        raise raised("state: a row this open cannot read")
+
+    monkeypatch.setattr("messagefoundry.store.base.open_store", unopenable)
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    assert main([*argv, "--db", str(db), "--json"]) == 2
+    message = json.loads(capsys.readouterr().out)["error"]
+    assert "a row this open cannot read" in message and "Nothing was written" in message
+
+
+def test_a_store_sealed_under_another_key_is_could_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real case behind the stand-in above: the store holds a row sealed under one key, and this
+    shell holds another. The probe's open refuses, so exit 2 before the prompt (BACKLOG #2124)."""
+    import sqlite3
+
+    monkeypatch.chdir(tmp_path)
+    sealing_key = generate_key()
+    db = tmp_path / "sealed.db"
+
+    # A plaintext state row in a store no key has opened yet, sealed by the first keyed open: the
+    # migration path the store's own encryption tests use. Synthetic value, no message content. It is
+    # planted BEFORE that open, because a keyed open records every cipher surface as keyed (BACKLOG
+    # #3383), and a plaintext row written there afterwards is refused as a plant, not sealed.
+    async def create_keyless() -> None:
+        store = await MessageStore.open(db)
+        await store.close()
+
+    asyncio.run(create_keyless())
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
+        ("ns", "k", json.dumps({"v": 1}), 0.0, "m1"),
+    )
+    con.commit()
+    con.close()
+    _existing_empty_store(db, sealing_key)
+    _key_in_this_shell(monkeypatch)  # a different key from the one the row is sealed under
+    _no_prompt(monkeypatch)
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    rc = main([*argv, "--db", str(db), "--json"])
+    message = json.loads(capsys.readouterr().out)["error"]
+    assert rc == 2, message
+    # The CipherError arm's text, not another could-not-start refusal that also exits 2.
+    assert "no configured key decrypts" in message and message.endswith("Nothing was written")
+
+
 # --- BACKLOG #2034: the trust-anchor enforcement dial reaches this command -----------------------
 
 

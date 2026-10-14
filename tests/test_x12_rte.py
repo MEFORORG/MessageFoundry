@@ -735,7 +735,9 @@ async def test_x12_over_rest_bare_body_reingresses_and_routes(store: MessageStor
     )
     rest._opener = _Opener(_Resp(200, _271()))  # type: ignore[attr-defined]
     resp = await rest.send(EDI)
-    assert resp is not None and resp.outcome == "accepted" and "ST*271" in resp.body
+    assert (
+        isinstance(resp, DeliveryResponse) and resp.outcome == "accepted" and "ST*271" in resp.body
+    )
 
     def route_271(msg: Any) -> list[str]:
         return ["h_loop"] if "271" in X12Peek.parse(msg.raw).transaction_ids() else []
@@ -775,7 +777,11 @@ async def test_x12_over_soap_envelope_into_x12_loopback_errors_not_dropped(
     )
     soap._opener = _Opener(_Resp(200, envelope.encode()))  # type: ignore[attr-defined]
     resp = await soap.send("<env/>")
-    assert resp is not None and resp.outcome == "accepted" and "soap:Envelope" in resp.body
+    assert (
+        isinstance(resp, DeliveryResponse)
+        and resp.outcome == "accepted"
+        and "soap:Envelope" in resp.body
+    )
 
     def route_x12(msg: Any) -> list[str]:
         X12Peek.parse(
