@@ -533,7 +533,7 @@ def _safe_diagnostic(text: str) -> str:
 
 
 def _escape_only(text: str, *, fallback: str) -> str:
-    """Escape control characters and nothing else — for the two strings that are NOT diagnostics.
+    """Escape the log alphabet and nothing else — for the two strings that are NOT diagnostics.
 
     The rolled-aside PATH and the SINK LABEL both reach the notice, ``GET /status`` and the stderr
     last-resort line, and both can carry the forged-line hazard: a newline is a legal filename
@@ -545,7 +545,19 @@ def _escape_only(text: str, *, fallback: str) -> str:
 
     Unlike :func:`_safe_diagnostic` this IS idempotent: escaping adds no control characters, so a
     second pass finds nothing to do. When a value IS hostile the escaped form deliberately stops
-    being the literal: an operator un-escaping one path beats a notice that can forge a log line."""
+    being the literal: an operator un-escaping one path beats a notice that can forge a log line.
+
+    THE ESCAPE IS THE WHOLE LOG ALPHABET, NOT ONLY THE NEWLINE, AND THAT COST IS ACCEPTED (BACKLOG
+    #2976 item 4). Since vault BACKLOG #2815, :func:`scrub_control_chars` escapes the whole log
+    alphabet, which ``controlchars._escapes_in_a_log_line`` states once. So a legitimate
+    rolled-aside file name holding a character from it shows
+    escaped on ``GET /status``, in the notice and in the stderr line. At least these could appear in
+    a real name: a zero-width joiner or non-joiner, a soft hyphen and a byte-order mark. Most
+    escapes are JSON's own spelling, such as ``\\u200d``, which an operator can read back to the
+    name on disk. A lone surrogate is the exception: it shows as its hex after a doubled backslash,
+    so it reads as text naming the code point (``controlchars._log_escape`` says why). A
+    bidirectional override in a path is the same kind of hazard as a newline: it changes what a
+    reader sees. So the path takes the log's alphabet rather than a narrower one of its own."""
     return _guarded(scrub_control_chars, text, fallback=fallback)
 
 

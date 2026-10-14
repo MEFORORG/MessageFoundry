@@ -108,6 +108,8 @@ _NONE_MEANS: dict[str, str] = {
     "channel_id": "any inbound connection",
     "destination_name": "any destination",
     "config_dir": "the engine's startup config directory",
+    # A held reload's digest (vault BACKLOG #2596): with none, the engine refuses the release.
+    "fingerprint": "no config digest was taken, so the engine will refuse this release",
 }
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it

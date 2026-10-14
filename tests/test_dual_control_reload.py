@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -54,6 +55,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
+from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
 from tests.test_trust_anchors import _block
 
 PW = "a-strong-test-passphrase"
@@ -752,23 +754,32 @@ async def test_a_released_reload_whose_config_dir_vanished_answers_422_and_recor
 
 
 async def test_a_released_reload_outside_the_reload_roots_answers_422_and_records_it(
-    engine: Engine, tmp_path: Path
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The guard holds a reload before the engine resolves its directory, so a held request can name
-    a directory outside the reload roots. Before vault BACKLOG #2459 its release raised
-    ConfigReloadDenied as a 500. It now answers 422 with the inline route's detail and its
-    denied row."""
-    elsewhere = tmp_path / "elsewhere"
-    _write_valid_config(elsewhere, tmp_path / "in2", tmp_path / "out2")
+    """A held request's directory can leave the reload roots before its release, for one when a
+    restart narrows them. Before vault BACKLOG #2459 its release raised ConfigReloadDenied as a
+    500. It now answers 422 with the inline route's detail and its denied row. A directory already
+    outside the roots is refused at request time instead (vault BACKLOG #2596), so the roots
+    narrow here between the hold and the release."""
+    from messagefoundry.pipeline import ConfigReloadDenied
+
+    def _narrowed(_config_dir: object) -> Path:
+        raise ConfigReloadDenied("outside the reload roots")
+
     service = await _service(engine)
-    approval_id, r = await _hold_then_release(engine, service, {"config_dir": str(elsewhere)})
+    approval_id, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: monkeypatch.setattr(engine, "_resolve_reload_target", _narrowed),
+    )
     assert r.status_code == 422, r.text  # not 403, which means self-approval on this route
     assert r.json()["detail"] == "config directory is not an allowed reload root"
     denied = [
         json.loads(row["detail"])
         for row in await engine.store.list_audit(action="config_reload_denied")
     ]
-    assert denied == [{"requested": str(elsewhere), "dry_run": False}]
+    assert denied == [{"requested": None, "dry_run": False}]
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None and str(row["status"]) == "failed"
 
@@ -1097,3 +1108,729 @@ async def test_a_released_reload_audits_an_unreadable_inbound_ca_as_trust_anchor
         assert failed == [{"requested": None, "dry_run": False, "reason": "trust_anchor"}]
     finally:
         await engine.stop()
+
+
+# --- vault BACKLOG #2596, step 3: the approval names the bytes, and the release checks them ------
+
+
+def _held_params(row: Any) -> dict[str, Any]:
+    assert row is not None
+    params: dict[str, Any] = json.loads(str(row["params"]))
+    return params
+
+
+def _edit_with_marker(cfg: Path, marker: Path) -> None:
+    """Rewrite cfg.py so that loading it leaves ``marker`` behind, proving whether it ran."""
+    src = (cfg / "cfg.py").read_text(encoding="utf-8")
+    (cfg / "cfg.py").write_text(
+        f"open({str(marker)!r}, 'w').write('ran')\n" + src, encoding="utf-8"
+    )
+
+
+def _editing_load(cfg: Path, marker: Path, *, then_raise: bool = False) -> Any:
+    """A ``load_config`` that loads ``cfg``, then edits it as a writer would mid-release."""
+    from messagefoundry.config.wiring import load_config
+
+    def _load(path: Path) -> Any:
+        registry = load_config(path)
+        _edit_with_marker(cfg, marker)
+        if then_raise:
+            raise WiringError("the edited module does not load")
+        return registry
+
+    return _load
+
+
+async def _failed_reload_rows(engine: Engine) -> list[dict[str, Any]]:
+    return [
+        json.loads(r["detail"])
+        for r in await engine.store.list_audit(action="config_reload_failed")
+    ]
+
+
+async def _digest_mismatch_rows(engine: Engine) -> list[dict[str, Any]]:
+    return [d for d in await _failed_reload_rows(engine) if d.get("reason") == "digest_mismatch"]
+
+
+async def test_a_held_reload_names_the_config_digest_taken_at_request_time(
+    engine: Engine, tmp_path: Path
+) -> None:
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {})
+    assert r.status_code == 200, r.text
+    params = _held_params(await engine.store.get_pending_approval(approval_id))
+    assert params["fingerprint"] == config_fingerprint(tmp_path / "cfg")
+    # The released reload's row records the very digest the approver released.
+    rows = await engine.store.list_audit(action="config_reload")
+    assert [json.loads(row["detail"])["fingerprint"] for row in rows] == [params["fingerprint"]]
+
+
+async def test_a_release_after_the_config_was_edited_is_refused_before_any_of_it_runs(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The approver saw one set of bytes; the requester, or anyone with write on the directory,
+    changed them before the release. Before this the release loaded whatever was on disk."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+
+    cfg, marker = tmp_path / "cfg", tmp_path / "ran.txt"
+    approved = config_fingerprint(cfg)
+    service = await _service(engine)
+    live = engine.registry_runner
+    before = live.registry if live is not None else None
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        approval_id, r = await _hold_then_release(
+            engine, service, {}, between=lambda: _edit_with_marker(cfg, marker)
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "the config changed after this reload was requested; request the reload again"
+    )
+    assert not marker.exists(), "the edited module ran before the refusal"
+    rr = engine.registry_runner
+    assert (rr.registry if rr is not None else None) is before  # nothing swapped
+    assert await engine.store.list_audit(action="config_reload") == []
+    assert await _digest_mismatch_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "reason": "digest_mismatch",
+            "approved_fingerprint": approved,
+            "current_fingerprint": config_fingerprint(cfg),
+        }
+    ]
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+    assert len(await engine.store.list_audit(action="approval.failed")) == 1
+    assert any("changed after its approval" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_an_edit_made_while_the_release_loads_is_refused_before_the_swap(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second check: the bytes matched before load_config and changed during it. The digest
+    taken before the swap, the one the audit row records, must still be the approved one."""
+    editing = _editing_load(tmp_path / "cfg", tmp_path / "unused.txt")
+    service = await _service(engine)
+    live = engine.registry_runner
+    before = live.registry if live is not None else None
+    _approval_id, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", editing),
+    )
+    assert r.status_code == 422, r.text
+    rr = engine.registry_runner
+    assert (rr.registry if rr is not None else None) is before  # nothing swapped
+    assert len(await _digest_mismatch_rows(engine)) == 1
+    assert await engine.store.list_audit(action="config_reload") == []
+
+
+async def test_a_hold_that_captured_no_digest_is_refused_at_release(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an approval that names no bytes cannot release any."""
+
+    async def _none(_config_dir: object) -> None:
+        return None
+
+    monkeypatch.setattr(engine, "reload_target_digest", _none)
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "this request named no config digest, so it cannot be released; request the reload again"
+    )
+    assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] is None
+    [row] = [
+        json.loads(r["detail"])
+        for r in await engine.store.list_audit(action="config_reload_failed")
+    ]
+    assert row["reason"] == "no_approved_digest"
+    assert row["approved_fingerprint"] is None and isinstance(row["current_fingerprint"], str)
+    assert await engine.store.list_audit(action="config_reload") == []
+
+
+async def test_a_repeat_after_an_edit_is_a_new_request_not_a_rejoin(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The digest is part of what a hold captures, so a repeat joins an open request only while the
+    bytes are the ones that request named. The control is a repeat with nothing edited."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        op = await _token(c, "op")
+        first = (await c.post("/config/reload", json={}, headers=op)).json()["approval_id"]
+        again = (await c.post("/config/reload", json={}, headers=op)).json()["approval_id"]
+        assert again == first  # the control: same bytes, same request
+        _edit_with_marker(tmp_path / "cfg", tmp_path / "unused.txt")
+        edited = (await c.post("/config/reload", json={}, headers=op)).json()["approval_id"]
+        assert edited != first
+
+
+async def test_an_ungated_reload_takes_no_request_time_digest(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inline reload holds nothing, so it binds nothing and reads the directory no extra time."""
+
+    async def _must_not_run(_config_dir: object) -> str:
+        raise AssertionError("an ungated reload took a request-time digest")
+
+    monkeypatch.setattr(engine, "reload_target_digest", _must_not_run)
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED) as c:
+        r = await c.post("/config/reload", json={}, headers=await _token(c, "deployer"))
+    assert r.status_code == 200, r.text
+
+
+async def test_an_unreadable_vcs_head_does_not_refuse_an_unchanged_release(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The approval binds content. A git HEAD that cannot be read loses the whole fingerprint
+    detail, so the binding must not rest on that detail, or every held reload would be refused."""
+    import messagefoundry.config.fingerprint as fp_mod
+
+    def _bad_head(_start: Path) -> str | None:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(fp_mod, "_git_head", _bad_head)
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {})
+    assert r.status_code == 200, r.text
+    params = _held_params(await engine.store.get_pending_approval(approval_id))
+    assert isinstance(params["fingerprint"], str)
+    assert r.json()["result"]["failures"] == ["config_fingerprint"]  # reported, not refused
+    assert await _digest_mismatch_rows(engine) == []
+
+
+# --- vault BACKLOG #2596, step 3 follow-ups: a refused release changes nothing, and says why -----
+
+
+async def test_a_release_refused_at_the_second_check_keeps_the_running_env_values(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The release re-reads the environment's values before it loads. A refusal after that read
+    must not leave the new values on the running graph, which no approver saw."""
+    from messagefoundry.config.wiring import load_config
+
+    values = {"HOST": "approved.example.invalid"}
+    monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(values))
+    await engine.reload_detail(dry_run=False)  # a live runner, on the first values
+    runner = engine.registry_runner
+    assert runner is not None
+    eng_any, runner_any = cast(Any, engine), cast(Any, runner)
+    assert eng_any._env_values == runner_any._env_values == {"HOST": "approved.example.invalid"}
+    editing = _editing_load(tmp_path / "cfg", tmp_path / "unused.txt")
+
+    def _between() -> None:
+        values["HOST"] = "unreviewed.example.invalid"
+        monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", editing)
+
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(engine, service, {}, between=_between)
+    assert r.status_code == 422, r.text
+    assert len(await _digest_mismatch_rows(engine)) == 1
+    assert engine.registry_runner is runner
+    assert eng_any._env_values == runner_any._env_values == {"HOST": "approved.example.invalid"}
+    # The control: an unrefused reload does apply the new values, so the assert above can fail.
+    monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", load_config)
+    await engine.reload_detail(dry_run=False)
+    assert eng_any._env_values == runner_any._env_values == {"HOST": "unreviewed.example.invalid"}
+
+
+async def test_a_swap_that_rolls_back_restarts_intake_on_the_old_env_values(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The values go live with the swap, and the swap itself can still fail and roll back to the
+    old graph. The rollback restarts the old graph's intake on the old values, not the new ones."""
+    first, second = {"HOST": "first.example.invalid"}, {"HOST": "second.example.invalid"}
+    values = dict(first)
+    monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(values))
+    await engine.reload_detail(dry_run=False)
+    runner = engine.registry_runner
+    assert runner is not None
+    eng_any, runner_any = cast(Any, engine), cast(Any, runner)
+    restarted_on: list[dict[str, Any]] = []
+    real_start = runner_any._checked_inbound_start
+
+    async def _recording_start(name: str) -> None:
+        restarted_on.append(dict(runner_any._env_values))
+        await real_start(name)
+
+    async def _failing_reconcile(_old: object, _new: object) -> None:
+        raise RuntimeError("an outbound connection failed to close")
+
+    monkeypatch.setattr(runner, "_checked_inbound_start", _recording_start)
+    monkeypatch.setattr(runner, "_reconcile_outbounds", _failing_reconcile)
+    values.update(second)
+    with pytest.raises(RuntimeError):
+        await engine.reload_detail(dry_run=False)
+    assert restarted_on and restarted_on[-1] == first  # the rollback's restart
+    assert eng_any._env_values == runner_any._env_values == first
+
+
+async def test_a_dry_run_checks_the_new_env_values_without_applying_them(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = {"HOST": "first.example.invalid"}
+    monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(values))
+    await engine.reload_detail(dry_run=False)
+    runner = engine.registry_runner
+    assert runner is not None
+    checked: list[object] = []
+    real_check = runner.build_check
+
+    def _recording_check(registry: Any, *env_values: Any) -> None:
+        # Passes on only what it was given, so a call without the values fails the assert below
+        # rather than the spy (the round-2 review).
+        checked.append(env_values[0] if env_values else None)
+        real_check(registry, *env_values)
+
+    monkeypatch.setattr(runner, "build_check", _recording_check)
+    values["HOST"] = "second.example.invalid"
+    await engine.reload_detail(dry_run=True)
+    assert checked == [{"HOST": "second.example.invalid"}]
+    eng_any, runner_any = cast(Any, engine), cast(Any, runner)
+    assert eng_any._env_values == runner_any._env_values == {"HOST": "first.example.invalid"}
+
+
+@pytest.mark.parametrize("breaks_at", ["load", "preflight"])
+async def test_a_tamper_that_also_breaks_the_graph_is_audited_as_a_digest_mismatch(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, breaks_at: str
+) -> None:
+    """An edit during the release that leaves a bad graph was audited as ``invalid_config``, so an
+    audit filter on ``digest_mismatch`` never saw the tamper. ``load``: the edited module fails to
+    load. ``preflight``: it loads, and a later check would refuse it; that check must not run."""
+    editing = _editing_load(
+        tmp_path / "cfg", tmp_path / "unused.txt", then_raise=breaks_at == "load"
+    )
+    preflights: list[object] = []
+
+    async def _refusing_preflight(registry: object, _values: object) -> None:
+        preflights.append(registry)
+        raise WiringError("the edited graph is refused")
+
+    def _between() -> None:
+        monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", editing)
+        monkeypatch.setattr(engine, "_registry_preflight", _refusing_preflight)
+
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(engine, service, {}, between=_between)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "the config changed after this reload was requested; request the reload again"
+    )
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_mismatch"]
+    assert preflights == []
+
+
+async def test_a_load_failure_on_the_approved_bytes_is_still_invalid_config(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: with nothing edited, a bad graph is a bad graph."""
+
+    def _fails(_path: Path) -> Any:
+        raise WiringError("bad graph")
+
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", _fails),
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "invalid configuration"
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["invalid_config"]
+
+
+async def test_a_digest_that_cannot_be_taken_at_release_says_so(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not "the config changed": nothing shows it did, and a new request would meet the same
+    failure. The release names its own reason, and the cause is logged at WARNING. A file the
+    digest cannot read fails it closed: before the round-3 review it was skipped, and the digest of
+    the rest refused this as ``digest_mismatch``, or released it with that file unbound."""
+    unreadable = {"on": False}
+    _unreadable(monkeypatch, "cfg.py", when=unreadable)
+    service = await _service(engine)
+    with caplog.at_level(logging.WARNING):
+        approval_id, r = await _hold_then_release(
+            engine, service, {}, between=lambda: unreadable.update(on=True)
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "the engine could not read the config to check it against this request's approval; "
+        "see the engine log"
+    )
+    approved = _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"]
+    assert await _failed_reload_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "reason": "digest_unavailable",
+            "approved_fingerprint": approved,
+            "current_fingerprint": None,
+        }
+    ]
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("config content digest failed" in m and "Permission denied" in m for m in warnings)
+    assert not any("changed after its approval" in m for m in warnings)
+    assert await engine.store.list_audit(action="config_reload") == []
+
+
+@pytest.mark.parametrize(
+    ("target", "status", "action"),
+    [
+        ("outside", 403, "config_reload_denied"),
+        ("missing", 404, "config_reload_failed"),
+    ],
+)
+async def test_a_hold_whose_target_cannot_resolve_is_refused_and_not_filed(
+    engine: Engine, tmp_path: Path, target: str, status: int, action: str
+) -> None:
+    """Its release could only be refused, so a second approver would spend a review on nothing.
+    The request is refused and audited as the inline reload refuses it, and no hold is filed."""
+    outside = tmp_path / "elsewhere"
+    _write_valid_config(outside, tmp_path / "in2", tmp_path / "out2")
+    config_dir = str(outside if target == "outside" else tmp_path / "cfg" / "missing")
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        op = await _token(c, "op")
+        r = await c.post("/config/reload", json={"config_dir": config_dir}, headers=op)
+        assert r.status_code == status, r.text
+        # The control: a target that resolves is still held.
+        assert (await c.post("/config/reload", json={}, headers=op)).status_code == 202
+    pending = await engine.store.list_pending_approvals(now=0.0, limit=10)
+    assert len(pending) == 1
+    assert json.loads(str(pending[0]["params"]))["config_dir"] is None
+    assert len(await engine.store.list_audit(action=action)) == 1
+
+
+# --- vault BACKLOG #2596, round 3: the approval digest fails closed, and round 2 is pinned -------
+
+
+def _unresolvable(_config_dir: object) -> Path:
+    raise PermissionError(13, "Permission denied", "a parent of the config directory")
+
+
+async def test_a_request_made_while_a_file_is_unreadable_is_refused_and_files_no_hold(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The request-time digest fails closed too. Before the round-3 review it skipped the file and
+    named the digest of the rest, so a release could load that file with no approval covering it.
+    With no digest, the release could only be refused, so no hold is filed."""
+    unreadable = {"on": True}
+    _unreadable(monkeypatch, "cfg.py", when=unreadable)
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        op = await _token(c, "op")
+        r = await c.post("/config/reload", json={}, headers=op)
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"] == (
+            "the engine could not read the config to take its digest for this request; "
+            "see the engine log"
+        )
+        unreadable["on"] = False
+        # The control: the same request, with the file readable, is held.
+        assert (await c.post("/config/reload", json={}, headers=op)).status_code == 202
+    assert len(await engine.store.list_pending_approvals(now=0.0, limit=10)) == 1
+    assert await _failed_reload_rows(engine) == [
+        {
+            "requested": None,
+            "dry_run": False,
+            "reason": "digest_unavailable",
+            "approved_fingerprint": None,
+            "current_fingerprint": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize("approvals", [GATED, NOT_GATED], ids=["held", "inline"])
+async def test_a_target_the_engine_cannot_list_is_unreadable_not_missing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approvals: ApprovalsSettings
+) -> None:
+    """A parent the service account cannot traverse, or a directory it cannot list, fails the
+    listing with an access error. ``is_dir`` answered False for the first, so it was audited as a
+    missing directory, and an ungated reload of the second loaded an empty graph and was audited
+    as ``invalid_config``. Both are refused as ``unreadable``, with no hold filed."""
+    cfg = (tmp_path / "cfg").resolve()
+    real_scandir = os.scandir
+
+    def _scandir(path: Any) -> Any:
+        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == cfg:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, approvals, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        monkeypatch.setattr(os, "scandir", _scandir)
+        r = await c.post("/config/reload", json={}, headers=op)
+        monkeypatch.undo()
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"] == (
+            "the engine could not read the config directory; see the engine log"
+        )
+    assert await engine.store.list_pending_approvals(now=0.0, limit=10) == []
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+async def test_a_file_added_during_the_load_and_left_unreadable_is_not_released(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest the audit row records skips a file it cannot read, so on its own it matched the
+    approval with the added file unbound. The fail-closed digest runs first."""
+    from messagefoundry.config.wiring import load_config
+
+    cfg = tmp_path / "cfg"
+    unreadable = {"on": False}
+    _unreadable(monkeypatch, "extra.py", when=unreadable)
+
+    def _load(path: Path) -> Any:
+        registry = load_config(path)
+        (cfg / "extra.py").write_text("X = 1\n", encoding="utf-8")
+        unreadable["on"] = True
+        return registry
+
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: monkeypatch.setattr("messagefoundry.pipeline.engine.load_config", _load),
+    )
+    assert r.status_code == 422, r.text
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["digest_unavailable"]
+    assert await engine.store.list_audit(action="config_reload") == []
+
+
+async def test_a_directory_moved_away_after_the_resolve_is_refused_as_missing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing directory digested as an empty bundle, so a move after the resolve was audited as
+    an edit, ``digest_mismatch``. It is a missing directory, and docs/SECURITY.md says so."""
+    cfg = tmp_path / "cfg"
+    real = engine._existing_reload_target
+
+    async def _then_moved(config_dir: str | Path | None) -> Path:
+        path = await real(config_dir)
+        cfg.rename(tmp_path / "moved")
+        return path
+
+    service = await _service(engine)
+    _approval_id, r = await _hold_then_release(
+        engine,
+        service,
+        {},
+        between=lambda: monkeypatch.setattr(engine, "_existing_reload_target", _then_moved),
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "config directory not found"
+    assert await _failed_reload_rows(engine) == [
+        {"requested": None, "dry_run": False, "reason": "not_found"}
+    ]
+
+
+async def test_a_release_whose_directory_cannot_be_resolved_is_refused_and_recorded(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An OSError other than FileNotFoundError escaped the refusals the executor catches, so the
+    approve answered 500 with no config_reload_failed row (the round-2 review's F6)."""
+    service = await _service(engine)
+    with caplog.at_level(logging.WARNING):
+        approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: monkeypatch.setattr(engine, "_resolve_reload_target", _unresolvable),
+        )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "the engine could not read the config directory; see the engine log"
+    )
+    assert await _failed_reload_rows(engine) == [
+        {"requested": None, "dry_run": False, "reason": "unreadable"}
+    ]
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+    assert any(
+        "config reload target could not be resolved" in rec.getMessage() for rec in caplog.records
+    )
+
+
+@pytest.mark.parametrize("approvals", [GATED, NOT_GATED], ids=["held", "inline"])
+async def test_a_request_whose_directory_cannot_be_resolved_is_refused_and_files_no_hold(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, approvals: ApprovalsSettings
+) -> None:
+    """Held, it used to file a hold with no digest that its release could only refuse. Inline, it
+    answered 500 with no row. Both are now the audited refusal."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, approvals, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        monkeypatch.setattr(engine, "_resolve_reload_target", _unresolvable)
+        r = await c.post("/config/reload", json={}, headers=op)
+        assert r.status_code == 422, r.text
+        monkeypatch.undo()
+        # The control: the same request with a target that resolves.
+        again = await c.post("/config/reload", json={}, headers=op)
+        assert again.status_code == (202 if approvals is GATED else 200), again.text
+    pending = await engine.store.list_pending_approvals(now=0.0, limit=10)
+    assert len(pending) == (1 if approvals is GATED else 0)
+    assert [d["reason"] for d in await _failed_reload_rows(engine)] == ["unreadable"]
+
+
+async def test_a_refused_hold_is_recorded_inside_an_outliving_operation(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route's comment says every refusal past the hold is inside an outliving operation, so a
+    request deadline cannot cut its row short. The refusal of a hold ran outside one (F4)."""
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    ended: list[tuple[str, int]] = []
+    real_run = OutlivingOperations.run
+
+    async def _spy(self: OutlivingOperations, coro: Any, label: str) -> Any:
+        async def _watched() -> Any:
+            try:
+                return await coro
+            finally:
+                rows = await engine.store.list_audit(action="config_reload_failed")
+                ended.append((label, len(rows)))
+
+        return await real_run(self, _watched(), label)
+
+    monkeypatch.setattr(OutlivingOperations, "run", _spy)
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        r = await c.post(
+            "/config/reload",
+            json={"config_dir": str(tmp_path / "cfg" / "missing")},
+            headers=await _token(c, "op"),
+        )
+    assert r.status_code == 404, r.text
+    assert ended == [("refused config reload", 1)]  # the row is written inside the operation
+
+
+async def test_a_reload_cancelled_after_its_swap_committed_keeps_the_new_env_values(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2 reads the values back from the runner whatever the swap's outcome. A cancellation
+    after the swap committed left the engine on the old values while the runner ran the new ones."""
+    first, second = {"HOST": "first.example.invalid"}, {"HOST": "second.example.invalid"}
+    values = dict(first)
+    monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(values))
+    await engine.reload_detail(dry_run=False)
+    runner = engine.registry_runner
+    assert runner is not None
+
+    async def _cancelled() -> None:
+        raise asyncio.CancelledError
+
+    # The first await after the swap commits (RegistryRunner.reload, step 3a).
+    monkeypatch.setattr(runner, "_reconcile_schedulers", _cancelled)
+    values.update(second)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.reload_detail(dry_run=False)
+    eng_any, runner_any = cast(Any, engine), cast(Any, runner)
+    assert engine.registry_runner is runner
+    assert eng_any._env_values == runner_any._env_values == second
+
+
+async def test_a_first_load_whose_runner_cannot_be_built_restores_the_env_values(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no runner yet, the values go live before the runner is built. Round 2 moved the build
+    inside the block that puts them back, so a build that raises leaves the old values."""
+    assert engine.registry_runner is None
+    eng_any = cast(Any, engine)
+    before = dict(eng_any._env_values)
+    new = {"HOST": "new.example.invalid"}
+    monkeypatch.setattr(engine, "_env_values_provider", lambda: dict(new))
+    real_add = engine.add_registry
+
+    def _refused(_registry: Any) -> Any:
+        raise RuntimeError("the runner could not be built")
+
+    monkeypatch.setattr(engine, "add_registry", _refused)
+    with pytest.raises(RuntimeError):
+        await engine.reload_detail(dry_run=False)
+    assert engine.registry_runner is None
+    assert eng_any._env_values == before
+    # The control: with the build working, the same reload applies the new values.
+    monkeypatch.setattr(engine, "add_registry", real_add)
+    await engine.reload_detail(dry_run=False)
+    assert eng_any._env_values == new
+
+
+async def test_a_digest_refusal_after_a_failed_load_does_not_carry_the_load_error(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2 raises the digest refusal after the load's handler, so the load error rides neither
+    ``__cause__`` nor ``__context__``, where a TOMLDecodeError would keep a whole value file
+    (BACKLOG #2307)."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+    from messagefoundry.pipeline import ApprovedConfig, ConfigDigestMismatch
+
+    cfg = tmp_path / "cfg"
+    approval = ApprovedConfig(config_fingerprint(cfg))
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.engine.load_config",
+        _editing_load(cfg, tmp_path / "unused.txt", then_raise=True),
+    )
+    with pytest.raises(ConfigDigestMismatch) as refused:
+        await engine.reload_detail(dry_run=False, approval=approval)
+    assert refused.value.__cause__ is None
+    assert refused.value.__context__ is None
+
+
+# --- vault BACKLOG #2596, PR 2239 review: a name no directory can have is missing -------------
+
+
+@pytest.mark.parametrize("name", INVALID_DIR_NAMES)
+@pytest.mark.parametrize("approvals", [GATED, NOT_GATED], ids=["held", "inline"])
+async def test_a_name_no_directory_can_have_is_refused_as_missing(
+    engine: Engine, tmp_path: Path, approvals: ApprovalsSettings, name: str
+) -> None:
+    """``is_dir`` answered False for such a name, so the reload answered 404 ``not_found``. Listing
+    the target instead raised the OS error, and the reload answered 422 ``unreadable``. No
+    directory can have the name, so it is missing again, held or inline, and no hold is filed."""
+    config_dir = str(tmp_path / "cfg" / name)
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, approvals, raise_app_exceptions=False) as c:
+        op = await _token(c, "op")
+        r = await c.post("/config/reload", json={"config_dir": config_dir}, headers=op)
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"] == "config directory not found"
+    assert await engine.store.list_pending_approvals(now=0.0, limit=10) == []
+    assert await _failed_reload_rows(engine) == [
+        {"requested": config_dir, "dry_run": False, "reason": "not_found"}
+    ]
+
+
+@pytest.mark.parametrize("name", INVALID_DIR_NAMES)
+async def test_the_gated_engine_path_refuses_a_name_no_directory_can_have_as_missing(
+    engine: Engine, tmp_path: Path, name: str
+) -> None:
+    """:meth:`Engine.reload_target_digest` and an approval-bound reload both raise
+    ``FileNotFoundError``, not ``ConfigDirUnreadable``. Both refuse at the target check, before any
+    digest is taken. The strict digest's own rule for such a name is pinned in
+    tests/test_config_fingerprint.py."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+    from messagefoundry.pipeline import ApprovedConfig
+
+    config_dir = tmp_path / "cfg" / name
+    with pytest.raises(FileNotFoundError):
+        await engine.reload_target_digest(config_dir)
+    approval = ApprovedConfig(config_fingerprint(tmp_path / "cfg"))
+    with pytest.raises(FileNotFoundError):
+        await engine.reload_detail(config_dir, approval=approval)

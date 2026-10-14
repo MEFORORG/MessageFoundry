@@ -14,6 +14,7 @@ after its own input checks. Upload resend also needs ``messages:edit``. The JSON
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -67,6 +68,44 @@ async def test_config_reload_takes_its_own_proof(engine: Engine) -> None:
         assert _reauth_next(ran) is None, ran.headers
         again = await c.post("/ui/config/reload", headers=SAME_ORIGIN)
         assert _reauth_next(again) == "/ui/config/reload"  # single use
+
+
+async def test_a_console_reload_held_by_dual_control_names_its_config_digest(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #2596, step 3, through the console seam: the console calls the reload core
+    with no params of its own, so the core must take the digest the release is checked against."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+    from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import outbound, File\n"
+        f"outbound('FILE-OUT_T_ADT', File(directory={str(tmp_path / 'out')!r}))\n",
+        encoding="utf-8",
+    )
+    gated = ApprovalsSettings(enabled=True, operations=["config_reload"], min_dwell_seconds=0.0)
+    engine = await Engine.create(
+        tmp_path / "ui.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await auth_service(engine)
+        await provision(service, "adm", [Role.ADMINISTRATOR.value])
+        async with ui_client(engine, service, approvals=gated) as c:
+            await cookie_login(c, "adm")
+            await mint_bound_proof(c, "/ui/config/reload")
+            held = await c.post("/ui/config/reload", headers=SAME_ORIGIN)
+            assert _reauth_next(held) is None, held.headers
+        [pending] = await engine.store.list_pending_approvals(now=0.0)
+        assert str(pending["operation"]) == "config_reload"
+        params = json.loads(str(pending["params"]))
+        assert params["fingerprint"] == config_fingerprint(cfg)
+    finally:
+        await engine.stop()
 
 
 async def test_purge_takes_its_own_proof(engine: Engine) -> None:
