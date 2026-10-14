@@ -4766,6 +4766,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
         # _ALERT_CONTROL_EVENT_TYPES below.
         "config_changed",
+        # vault BACKLOG #2904: the CRL reload refused a replaced CRL file, so running TLS contexts
+        # keep the copy they hold. Keyed `crl_reload:<path>`, with a process suffix where several
+        # engine processes share the store, which no connection can be named.
+        "crl_reload_refused",
         # vault BACKLOG #2613: the security-signal rule layer over the audit stream. Each detector
         # has its own type; pipeline/security_signals.py SECURITY_SIGNAL_TYPES mirrors this block, and
         # a test pins that each is here. None is connection-scoped.

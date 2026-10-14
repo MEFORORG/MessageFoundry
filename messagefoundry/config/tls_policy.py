@@ -347,7 +347,8 @@ def harden_crl_check(
     check flag set.
 
     A sixth, since vault BACKLOG #2905 (owner ruling 2026-10-05): a CRL that is proven badly
-    signed. :func:`_check_crl_signatures` says what counts as proof. It runs last of all, once
+    signed. :class:`~messagefoundry.pki.CrlSignature` says what counts as proof. The check is
+    :func:`_check_crl_signatures`. It runs last of all, once
     OpenSSL is known to hold exactly the CRLs judged, so it hides none of the refusals above. A
     signature it cannot confirm, short of proof, loads with one warning for the file.
 
@@ -555,9 +556,16 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
 
 
 #: Why a start could not confirm a CRL's signature, by :class:`~messagefoundry.pki.CrlSignature`
-#: state, in the words of the one warning :func:`_check_crl_signatures` logs.
+#: state, in the words of the one warning :func:`_check_crl_signatures` logs. ``unlisted`` says
+#: what the engine did, not what the CA list holds: a listed CA whose name differs from the
+#: issuer's only in letter case reads ``unlisted`` too, and OpenSSL can still use that CA
+#: (:class:`~messagefoundry.pki.CrlSignature` says when).
 _UNCONFIRMED_SIGNATURE = {
-    "unlisted": "no CA certificate this hop lists has that name and the key the CRL names",
+    "unlisted": (
+        "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
+        "exactly, letter case included, and then the CRL's authority key identifier, where it "
+        "carries one)"
+    ),
     "unproven": (
         "a listed CA has that name and its key does not verify the CRL, but the CRL does not "
         "name that CA's key, so a renewed CA key could explain it"
@@ -575,19 +583,21 @@ def _check_crl_signatures(
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
 
     **Only the proven case refuses.** That is :class:`~messagefoundry.pki.CrlSignature` state
-    ``bad``: the CRL names a listed CA's key by key identifier, and that key does not verify it.
+    ``bad``, and that class says what counts as proof.
     OpenSSL checks a CRL's signature only at the handshake. Before this, such a file started clean
     and then failed every handshake it judged, with a TLS error that does not name the CRL. An
     unverified CRL already failed closed there, so what this adds is the diagnosis, at start.
 
     **Everything short of proof loads, with one warning.** That covers at least a CRL that names
-    no key, a key the engine cannot check with, and an issuer the hop does not list. The last is the usual
-    case in a two-tier PKI, where the peer sends the intermediate that issued the CRL, so it must
-    not log per hop. The warning is one line for the file, and
-    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` says how often it is
-    logged. A judgment that fails for any other reason is logged at ERROR, once, and the file
-    loads: this is a diagnosis, and a defect in it must not stop a start. That failure discards
-    the whole judgment, a proven bad CRL in the same file included.
+    no key, a key the engine cannot check with, and a CRL the engine matches to no listed CA. The
+    last is the usual case in a two-tier PKI, where the peer sends the intermediate that issued
+    the CRL, so it must not log per hop. The warning is one line for the file, and
+    :func:`~messagefoundry.config.loaded_crls.first_unconfirmed_signature` decides how often it is
+    logged. That function is asked only when there is a line to log. So it holds the last file
+    version that logged one, and an earlier version is logged again only when it returns after
+    another that logged one. A judgment that fails for any other reason is logged at ERROR,
+    once, and the file loads: this is a diagnosis, and a defect in it must not stop a start. That
+    failure discards the whole judgment, a proven bad CRL in the same file included.
 
     **Each CRL is judged on its own, as the expired-CRL refusal judges them.** So a badly signed
     copy refuses the file even beside a newer, good CRL from the same issuer, which OpenSSL
