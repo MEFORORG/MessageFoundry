@@ -162,10 +162,6 @@ class RemoteDebugRefusalWatch:
         write a row for the same refusals."""
         async with self._passing:
             total = self._read()
-            # The count only rises in one process. A lower reading is a count that was put back,
-            # which only a test does, and it is measured from there.
-            self._audited = min(self._audited, total)
-            self._alerted = min(self._alerted, total)
             if total > self._audited and await self._record(total - self._audited, total):
                 self._audited = total
             if total > self._alerted and self._raise(total - self._alerted, total):

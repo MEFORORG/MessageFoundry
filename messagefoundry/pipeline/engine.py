@@ -3048,11 +3048,6 @@ class Engine:
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
             self._log_forward_watch = None
-        # Its last pass may write an audit row and raise an alert, so it stops here, well before
-        # the store closes and before the alert-state drain at the end.
-        if self._remote_debug_watch is not None:
-            await self._remote_debug_watch.stop()
-            self._remote_debug_watch = None
         if self._secret_rotation_runner is not None:
             await self._secret_rotation_runner.stop()
         if self._update_check_runner is not None:
@@ -3079,6 +3074,12 @@ class Engine:
         if self._intake_monitor is not None:
             await self._intake_monitor.stop()
             self._intake_monitor = None
+        # Vault BACKLOG #2742: after the graph, so a script refused during the drain is still
+        # reported by the watch's last pass. That pass may write an audit row and raise an alert,
+        # so it runs while the store is open, and ahead of the alert-state drain at the end.
+        if self._remote_debug_watch is not None:
+            await self._remote_debug_watch.stop()
+            self._remote_debug_watch = None
         # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
         # unused remainder of this process's reserved block and unhooks the refill signal, so anything
         # that encrypts after it runs is charged against no reservation with no checkpointer left to

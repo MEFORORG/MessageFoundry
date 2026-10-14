@@ -47,7 +47,6 @@ from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, remote_debug_refused_detail
 from messagefoundry.pipeline.intake_bound import INTAKE_SUBJECT_MAX_LENGTH
 from messagefoundry.pipeline.remote_debug_watch import (
-    ALERT_SUBJECT,
     AUDIT_ACTION,
     CHECK_INTERVAL_SECONDS,
     RemoteDebugRefusalWatch,
@@ -55,8 +54,9 @@ from messagefoundry.pipeline.remote_debug_watch import (
 from messagefoundry.remotedebug import REMOTE_SCRIPT_EVENT, RemoteScriptRefused
 from messagefoundry.store.base import AuditStore
 from messagefoundry.store.store import MessageStore
+from tests import test_remote_debug_guard as _guard_tests
 from tests._ast_sites import call_sites, code_names, parse_source
-from tests._refusal_log_capture import until
+from tests._refusal_log_capture import TOKEN, assert_no_token, until
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
 from tests.test_alert_state import _drain as _drain_state
@@ -65,21 +65,20 @@ from tests.test_alert_state import _RecordingStore
 _REPO = Path(__file__).resolve().parents[1]
 _ENGINE = _REPO / "messagefoundry"
 
-#: A file name the injecting process might choose. Distinctive, so its absence from a row is a
-#: finding and not an accident of the search.
-PLANTED_NAME = "zqx-planted-script-name.py"
+#: A file name the injecting process might choose. It holds the shared planted token, so the
+#: shared scan finds it, and its absence from a row is a finding and not an accident.
+PLANTED_NAME = f"{TOKEN}-script.py"
 PLANTED_PATH = os.path.join("some", "directory", PLANTED_NAME)
+
+# The guard suite's fixture, bound here by name so pytest finds it in this module too: a count at
+# zero and a private report queue for each test, both put back afterwards. One copy, so a new
+# piece of guard state is isolated in one place.
+reports = _guard_tests.reports
 
 
 @pytest.fixture
-def refuse(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
-    """Refuse one injected script, through the guard's real hook function.
-
-    The count starts at zero and is put back afterwards, because it is module state that later
-    tests in this process read. The report queue is private, so the reporter thread already
-    running in this process cannot take a name a test here wants to read."""
-    monkeypatch.setattr(remotedebug, "_reports", queue.SimpleQueue())
-    monkeypatch.setattr(remotedebug, "_refused", 0)
+def refuse(reports: queue.SimpleQueue[str]) -> Callable[..., None]:
+    """Refuse one injected script, through the guard's real hook function."""
 
     def _refuse(path: str = PLANTED_PATH, *, times: int = 1) -> None:
         for _ in range(times):
@@ -142,7 +141,8 @@ def _on(store: object, **kw: Any) -> RemoteDebugRefusalWatch:
 # --- one row for each pass, with a count ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("refusals", [3, 1])
+# 500 is the flood: the injecting process sets the rate, and a pass still adds one row.
+@pytest.mark.parametrize("refusals", [3, 1, 500])
 async def test_the_refusals_between_two_passes_make_one_row_with_their_count(
     store: MessageStore, refuse: Callable[..., None], refusals: int
 ) -> None:
@@ -190,17 +190,6 @@ async def test_two_passes_with_refusals_in_each_make_two_rows(
     ]
 
 
-async def test_a_flood_between_two_passes_is_still_one_row(
-    store: MessageStore, refuse: Callable[..., None]
-) -> None:
-    """The injecting process sets the rate. However many it tries, a pass adds one row."""
-    watch = _on(store)
-    refuse(times=500)
-    await watch.run_once()
-    (row,) = await _rows(store)
-    assert row["detail"]["count"] == 500
-
-
 async def test_the_first_pass_counts_from_the_start_of_the_process(
     store: MessageStore, refuse: Callable[..., None]
 ) -> None:
@@ -235,7 +224,7 @@ async def test_the_file_name_is_in_the_warning_and_not_in_the_row(
 
     (raw,) = await store.recent_audit_of([AUDIT_ACTION], limit=5)
     assert PLANTED_NAME not in json.dumps(raw, default=str)
-    assert "zqx" not in json.dumps(raw, default=str)
+    assert TOKEN not in json.dumps(raw, default=str)
     # CONTROL: the hook did see that name, and the guard's WARNING line carries it. So the name
     # was there to leak, and the search above could have found it.
     queued = remotedebug._reports.get_nowait()
@@ -258,7 +247,8 @@ async def test_a_refused_row_is_logged_without_a_file_name(
     (record,) = caplog.records
     assert record.levelno == logging.ERROR
     assert "remote_debug_refused audit row failed" in record.getMessage()
-    assert PLANTED_NAME not in record.getMessage() and '"count": 1' in record.getMessage()
+    assert '"count": 1' in record.getMessage()
+    assert_no_token(caplog.records)  # message, args and traceback
 
 
 # --- a row the store refuses is owed -------------------------------------------------------------
@@ -300,24 +290,10 @@ async def test_two_passes_at_once_write_one_row(refuse: Callable[..., None]) -> 
     assert [(d["count"], d["total"]) for _a, _actor, d in slow.written] == [(3, 3)]
 
 
-async def test_a_count_that_was_put_back_is_measured_from_there(
-    refuse: Callable[..., None], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    refusing = _RefusingStore()
-    watch = _on(refusing)
-    refuse(times=6)
-    await watch.run_once()
-    monkeypatch.setattr(remotedebug, "_refused", 0)
-    await watch.run_once()
-    refuse(times=2)
-    await watch.run_once()
-    assert [(d["count"], d["total"]) for _a, _actor, d in refusing.written] == [(6, 6), (2, 2)]
-
-
 # --- one alert for each pass, with a count -------------------------------------------------------
 
 
-@pytest.mark.parametrize("refusals", [3, 1])
+@pytest.mark.parametrize("refusals", [3, 1, 500])
 async def test_the_refusals_between_two_passes_make_one_alert_with_their_count(
     refuse: Callable[..., None], refusals: int
 ) -> None:
@@ -355,16 +331,6 @@ async def test_two_passes_with_refusals_in_each_raise_two_alerts(
     assert [(count, total) for _name, count, total in sink.alerts] == [(2, 2), (5, 7)]
 
 
-async def test_a_flood_between_two_passes_is_still_one_alert(
-    refuse: Callable[..., None],
-) -> None:
-    sink = _Sink()
-    watch = _on(_RefusingStore(), alert_sink=sink)
-    refuse(times=500)
-    await watch.run_once()
-    assert sink.alerts == [("remote_debug:refused", 500, 500)]
-
-
 async def test_the_file_name_is_in_the_warning_and_not_in_the_alert(
     refuse: Callable[..., None], caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -390,8 +356,9 @@ async def test_the_file_name_is_in_the_warning_and_not_in_the_alert(
         "remote_debug_refused",
         "remote_debug:refused",
     )
-    for carrier in (repr(event), repr(state.upserts), caplog.text):
-        assert PLANTED_NAME not in carrier and "zqx" not in carrier
+    for carrier in (repr(event), repr(state.upserts)):
+        assert TOKEN not in carrier
+    assert_no_token(caplog.records)  # the alert's own log lines, and the failed-row ERROR
     # CONTROL: the hook did see that name, and the guard's WARNING line carries it. So the name
     # was there to leak, and the search above could have found it.
     queued = remotedebug._reports.get_nowait()
@@ -522,11 +489,6 @@ def test_every_shipped_sink_implements_the_alert() -> None:
     assert callable(getattr(AlertSink, "remote_debug_refused", None))
 
 
-def test_the_audit_action_and_the_alert_kind_are_one_word() -> None:
-    assert AUDIT_ACTION == "remote_debug_refused"
-    assert ALERT_SUBJECT == "remote_debug:refused"
-
-
 def test_the_subject_names_the_process_and_is_no_connection_name() -> None:
     lone = _on(_RefusingStore())
     node = _on(_RefusingStore(), node="node:engine-b")
@@ -635,9 +597,12 @@ async def test_a_loop_task_cancelled_elsewhere_does_not_cancel_the_stop(
 
 
 def test_the_interval_is_the_one_the_documents_state() -> None:
-    """One row a pass, so the interval is the bound on rows. ``docs/SECURITY-LOOSENING.md`` gives
-    it as 30 seconds, and a shorter one would let the injecting process add rows faster."""
-    assert CHECK_INTERVAL_SECONDS == 30.0
+    """One row a pass, so the interval is the bound on rows, and the operator documents state
+    it. A shorter one would let the injecting process add rows faster than they say."""
+    seconds = f"{CHECK_INTERVAL_SECONDS:g} seconds"
+    assert seconds == "30 seconds"
+    for doc in ("docs/SECURITY-LOOSENING.md", "changelog.d/2742.added.md"):
+        assert f"every {seconds}" in (_REPO / doc).read_text(encoding="utf-8"), doc
 
 
 # --- the engine runs it, and only serve builds an engine -----------------------------------------
@@ -711,7 +676,8 @@ def _construction_sites(name: str) -> list[str]:
     sites = []
     for path in sorted(_ENGINE.rglob("*.py")):
         text = path.read_text(encoding="utf-8")
-        if name in text and call_sites(parse_source(text), name):
+        # The text test is only a cheap first cut: a call needs the name and a bracket.
+        if f"{name}(" in text and call_sites(parse_source(text), name):
             sites.append(path.relative_to(_ENGINE).as_posix())
     return sites
 
@@ -791,13 +757,10 @@ def _second_cause(tmp_path: Path, mode: str) -> dict[str, Any]:
     script = tmp_path / "second_cause.py"
     script.write_text(_SECOND_CAUSE, encoding="utf-8")
     out = tmp_path / f"{mode}.json"
-    env = dict(os.environ)
-    env.pop("PYTHON_DISABLE_REMOTE_DEBUG", None)
-    env["PYTHONPATH"] = str(_REPO)
     try:
         proc = subprocess.run(
             [sys.executable, str(script), mode, str(out)],
-            env=env,
+            env=_guard_tests._child_env(),
             capture_output=True,
             text=True,
             timeout=50,  # under the suite's per-test watchdog, so a hung child is reported here
