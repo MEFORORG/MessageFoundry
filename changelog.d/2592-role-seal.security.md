@@ -18,6 +18,10 @@
   from the role map re-seals that map only when it verifies. Built-in roles still resolve from code;
   their rows are sealed by the role seed at each start and grant nothing either way. `rotate-key`
   re-seals each role and both maps under the active key after checking them, and leaves one that
-  fails as it is. A reconcile pass reads each map once. New column `roles.seal` and table
+  fails as it is. A reconcile pass reads each map once. Because a failing role map grants
+  nothing, a directory sign-in or reconcile pass that reads it writes the account's directory
+  roles as none, and the roles come back only at the account's next sign-in or pass after the map
+  is repaired. A seal stops a role or map forged outside the store, not an older sealed copy put
+  back: a writer who kept a role row or a whole map with its seal can restore it. New column `roles.seal` and table
   `authority_set_seal` on SQLite, Postgres and SQL Server. A keyless store, and the `vault_transit`
   provider, write and check no seal yet. (vault BACKLOG #2592)
