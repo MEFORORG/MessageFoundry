@@ -214,11 +214,18 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
 
     The same construction :class:`~messagefoundry.auth.service.AuthService` runs (BACKLOG #296).
     Nothing is signed or sent to the identity provider, but a ``*_ref`` credential is read from the
-    ``[secrets]`` provider, which for Vault is a network read."""
+    ``[secrets]`` provider, which for Vault is a network read.
+
+    **That read is judged strictly, whatever** ``[security].enforcement`` **says.** The provider is
+    built with no posture, and the Vault revocation guard reads ``None`` as enforcing (vault
+    BACKLOG #2983). ``verify``'s store opens hold no posture either (vault BACKLOG #2354), so the
+    one command judges both Vault hops by the same rule: an off-box Vault crosses only on its own
+    ``[secrets].vault_revocation_attested`` pair, never on a ``warn`` instance's warning.
+    :func:`_revocation_row` does take the posture, because it reports the decision ``serve`` would
+    make and dials nothing."""
     from messagefoundry.auth.oidc.client_auth import ClientSecretPost
     from messagefoundry.auth.service import oidc_client_auth_from_settings
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
-    from messagefoundry.config.settings import hop_posture_from_ai
 
     auth = settings.auth
     if auth.oidc_private_key_jwt:
@@ -233,12 +240,8 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
         rid, title = "fed.client_secret", "OIDC client secret resolves"
         source = "[secrets] provider reference" if auth.oidc_client_secret_ref else "environment"
     try:
-        # The posture the serve lifespan derives, so a Vault-held credential is read under the
-        # revocation rule `serve` would apply to that hop (vault BACKLOG #2983).
-        posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
-        credential = oidc_client_auth_from_settings(
-            auth, resolve_secret_provider(settings.secrets, posture=posture)
-        )
+        # No posture, on purpose: see the docstring.
+        credential = oidc_client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
     # SigningError is a ValueError; catching the base keeps this module off the signing seam.
     except (SecretProviderError, ValueError) as exc:
         return CheckResult(rid, title, Status.FAIL, str(exc))

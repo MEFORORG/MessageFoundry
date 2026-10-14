@@ -369,7 +369,8 @@ _CENSUS: list[Row] = sorted(
             "posture",
         ),
         ("verify/checks.py", "check_lockable_accounts._census", "open_store", "-"),
-        ("verify/federation.py", "_client_credential_row", "resolve_secret_provider", "posture"),
+        # Strict on purpose; `_client_credential_row`'s docstring says why.
+        ("verify/federation.py", "_client_credential_row", "resolve_secret_provider", "-"),
         ("verify/smoke.py", "check_smoke_disposition._poll", "open_store", "-"),
         ("verify/smoke.py", "check_store_connectivity._open_close", "open_store", "-"),
         ("verify/smoke.py", "newest_message_id._newest", "open_store", "-"),
@@ -459,7 +460,6 @@ _DERIVATIONS = sorted(
         ("api/app.py", "create_managed_app.lifespan", _SERVE_DIAL),
         ("api/app.py", "create_managed_app.lifespan", _SERVE_DIAL),
         ("checks.py", "_check_build", "settings.security.enforcement"),
-        ("verify/federation.py", "_client_credential_row", "settings.security.enforcement"),
         ("verify/federation.py", "_revocation_row", "settings.security.enforcement"),
     ]
 )

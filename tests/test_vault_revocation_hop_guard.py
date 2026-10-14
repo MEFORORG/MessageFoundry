@@ -929,3 +929,70 @@ def test_the_serve_path_upload_cipher_is_built_under_the_instance_posture(
         )
     assert ("vault_revocation_attested" not in str(caught.value)) is crosses
     assert dials == ([(_HOST, 8200)] if crosses else [])
+
+
+def _verify_settings(enforcement: str, attested: bool, store_path: str) -> Any:
+    """An instance whose OIDC client secret and store key are both held in an off-box Vault."""
+    from messagefoundry.config.settings import ServiceSettings
+
+    return ServiceSettings.model_validate(
+        {
+            "security": {"enforcement": enforcement},
+            "secrets": {"provider": "vault", **_pair(attested)},
+            "store": {"path": store_path, "key_provider": "vault", **_pair(attested)},
+            "auth": {
+                # Federated logins resolve roles through AD, so the settings demand it.
+                "ad_enabled": True,
+                "ad_server": "ldaps://ad.synthetic.test",
+                "ad_user_search_base": "DC=synthetic",
+                "ad_bind_dn": "CN=svc,DC=synthetic",
+                "ad_bind_password": "synthetic",  # nosec B105 - a made-up test value
+                "ad_domain": "synthetic.test",
+                "oidc_enabled": True,
+                "oidc_issuer": "https://idp.synthetic.test",
+                "oidc_client_id": "mefor-console",
+                "oidc_client_secret_ref": "mefor/oidc",
+                "oidc_authorization_endpoint": "https://idp.synthetic.test/authorize",
+                "oidc_token_endpoint": "https://idp.synthetic.test/token",
+                "oidc_jwks_uri": "https://idp.synthetic.test/jwks",
+                "oidc_allowed_endpoints": ["idp.synthetic.test"],
+            },
+            "api": {"public_origin": "https://ops.synthetic.test"},
+        }
+    )
+
+
+@pytest.mark.parametrize("enforcement", ["warn", "enforce"])
+def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
+    enforcement: str, monkeypatch: pytest.MonkeyPatch, dials: list[object], tmp_path: Any
+) -> None:
+    """``verify`` holds no posture for its store opens (vault BACKLOG #2354), so it holds none for
+    its secrets read either: one command judges both Vault hops by one rule. A ``warn`` instance
+    is not a way across here, as it is in ``serve``; only the hop's own pair is.
+    RED before the repair: on ``warn`` the client-credential row derived the serve posture, so the
+    secrets hop crossed with a WARNING and dialled the Vault while the store row refused.
+    Mutation: pass ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
+    ``_client_credential_row``."""
+    from messagefoundry.verify.federation import _client_credential_row
+    from messagefoundry.verify.model import Status
+    from messagefoundry.verify.smoke import check_store_connectivity
+
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", _OFF_BOX)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _OFF_BOX)
+    store = tmp_path / "store.db"
+    store.write_bytes(b"")  # the store row's file gate looks for the file before it opens it
+
+    refused = _verify_settings(enforcement, False, str(store))
+    secret = _client_credential_row(refused)
+    opened = check_store_connectivity(refused.store)
+    for row, section in ((secret, "secrets"), (opened, "store")):
+        assert row.status is Status.FAIL, (row.id, row.detail)
+        assert f"[{section}].vault_revocation_attested = true" in row.detail, row.id
+    assert dials == []
+
+    # The control, on the same address: the hop's own pair, with its reason, is the way across.
+    # The read then fails on the dial this test refuses, so it reached the Vault.
+    secret = _client_credential_row(_verify_settings(enforcement, True, str(store)))
+    assert secret.status is Status.FAIL
+    assert "vault_revocation_attested" not in secret.detail
+    assert dials == [(_HOST, 8200)]
