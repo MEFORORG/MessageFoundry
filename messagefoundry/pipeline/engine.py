@@ -1762,9 +1762,9 @@ class Engine:
         # Vault BACKLOG #2742: write one audit row and raise one alert for the scripts the
         # remote-debugging guard refused since the last pass. Not leader-gated: the count is this
         # process's own, so a standby reports its own too, and names itself in the alert key as
-        # the intake monitor does. Only `serve` installs the guard, so only `serve` sees a
-        # non-zero count. An embedding application that installs the guard itself is the
-        # exception (docs/SECURITY-LOOSENING.md).
+        # the intake monitor does. Of the commands, only `serve` builds an engine. The count moves
+        # only where the guard is in the process: wherever `messagefoundry.__main__` is imported,
+        # or install_remote_debug_guard is called (docs/SECURITY-LOOSENING.md).
         if self._remote_debug_watch is None:
             self._remote_debug_watch = RemoteDebugRefusalWatch(
                 self.store, alert_sink=self._alert_sink, node=self.instance_identity

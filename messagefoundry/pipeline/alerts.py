@@ -748,12 +748,12 @@ class AlertSink(Protocol):
 
         ``name`` is ``remote_debug:refused``, with ``@node:<id>`` or ``@shard:<id>`` appended
         where several engine processes share the store, because the count is each process's own.
-        ``count`` is how many scripts were refused since this alert was last raised, and
+        ``count`` is how many scripts were refused since the sink last took this alert, and
         ``total`` how many since the process started.
 
-        **Never a script's file name.** The injecting process chooses it, so it is only in the
-        guard's WARNING line in the engine log, where there is one. Counts and this process's own
-        label only: no message content, no PHI.
+        **Never a script's file name.** The injecting process chooses it, so it stays in the
+        engine's log output, usually the guard's WARNING line (docs/SECURITY-LOOSENING.md names
+        the exceptions). Counts and this process's own label only: no message content, no PHI.
 
         Raised at most once per pass of
         :class:`~messagefoundry.pipeline.remote_debug_watch.RemoteDebugRefusalWatch`, on the event
@@ -1206,8 +1206,9 @@ class LoggingAlertSink:
         log.warning("ALERT %s: %r %s (count %d)", signal, name, detail, count)
 
     def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
-        # The guard has already logged one WARNING for each refusal, with the script's file name.
-        # This line is the alert's own record on this stream, and it carries no name.
+        # The guard usually logs one WARNING for each refusal, with the script's file name, but
+        # not always (docs/SECURITY-LOOSENING.md). This line is the alert's own record on this
+        # stream, and it carries no name.
         log.warning(
             "ALERT remote_debug_refused: %r %s",
             name,

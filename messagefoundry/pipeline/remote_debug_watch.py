@@ -17,8 +17,9 @@ pass ends. While a row is owed and the store hangs, a pass also waits :data:`_RO
 for it. Passes then come further apart than the interval.
 
 **No file name.** The injecting process chooses the script's name too, so neither the row nor the
-alert carries it. The name is only in the guard's WARNING line, which bounds and escapes it. Some
-refusals have no such line; docs/SECURITY-LOOSENING.md names the cases.
+alert carries it. Usually the name is in the guard's WARNING line, which bounds and escapes it.
+docs/SECURITY-LOOSENING.md names the cases where it is not, including one where the interpreter
+writes the full path to standard error.
 
 **Counted from the start of the process.** The first pass reports every refusal since the process
 started, so one made before the engine opened its store is recorded. The loop makes one more pass
@@ -30,8 +31,9 @@ one watch, and ``serve`` builds one engine.
 **Every engine runs it. Of the commands, only ``serve`` builds an engine.** ``supervise``,
 ``rotate-key``, ``backup`` and the rest build no engine and no notifier. A refusal there is the
 guard's WARNING line and nothing more. That holds even for ``rotate-key`` and ``backup``, which open
-the store themselves. An engine shard starts with the interface off
-(``messagefoundry/childenv.py``), so its count never moves. An application that builds its own
+the store themselves. An engine shard that ``supervise`` starts has the interface off
+(``messagefoundry/childenv.py``), so its count never moves. One started by hand runs like
+``serve``. An application that builds its own
 engine runs this watch too, and may have no guard at all. docs/SECURITY-LOOSENING.md says what
 that means, in its ``remote_debug_refused`` points.
 
@@ -43,9 +45,10 @@ counted.
 
 **Each is owed each refusal once.** The row and the alert keep a mark each, and a mark moves only
 once its own call succeeded. The alert is raised first, because it does not block: a slow or
-refusing store cannot hold back the page. A store that refuses the row leaves the row's mark where
-it was. A later pass then writes one row with the larger count, and does not raise the alert
-again for those refusals. A sink that raises is retried the same way, by a later pass.
+refusing store cannot hold back that pass's page. A store that hangs does delay later passes,
+and so their pages, as the first paragraph says. A store that refuses the row leaves the row's
+mark where it was. A later pass then writes one row with the larger count, and does not raise the
+alert again for those refusals. A sink that raises is retried the same way, by a later pass.
 
 **The pass at stop has no later pass.** A row or an alert it cannot deliver is lost.
 :meth:`RemoteDebugRefusalWatch.stop` can also cancel the loop before that pass runs.
@@ -92,7 +95,8 @@ CHECK_INTERVAL_SECONDS = 30.0
 #: How long :meth:`RemoteDebugRefusalWatch.stop` waits for the last pass before it cancels it.
 _STOP_SECONDS = 5.0
 #: How long the pass waits for one audit row before it cancels the write. The cancel can take
-#: longer to finish. A later pass retries the row; the pass at stop has none, so its row is lost.
+#: longer to finish. A later pass retries the row. At stop, the shorter :data:`_STOP_SECONDS`
+#: bound in :meth:`RemoteDebugRefusalWatch.stop` cuts in first, and no later pass retries.
 _ROW_SECONDS = CHECK_INTERVAL_SECONDS
 
 
@@ -180,7 +184,8 @@ class RemoteDebugRefusalWatch:
 
     async def run_once(self) -> None:
         """One pass: an alert, then a row, for the refusals each has not reported yet. The alert
-        does not block, so it goes first, and a store that hangs cannot hold back the page.
+        does not block, so it goes first, and a store that hangs cannot hold back this pass's
+        page.
 
         Passes take turns. A mark moves after its call, so two passes running at once would each
         write a row for the same refusals."""
