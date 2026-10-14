@@ -1153,9 +1153,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
-        # Vault BACKLOG #3229: a `user:<name>` grant ends that account's no_enabled_administrator
-        # cooldown. _last_sent is per process, so this ends it in THIS process only. The pop touches
-        # only the throttle: a suspend or a muting rule still applies, and _occurrences is kept.
+        # Vault BACKLOG #3229: the pop runs for every grant, but only a `user:<name>` key can match a
+        # no_enabled_administrator cooldown, so an `ad-group:` grant pops nothing. It ends the
+        # cooldown when the route raises this alert, after the role write. _last_sent is per
+        # process, so it ends it in THIS process only. The pop touches only the throttle: a suspend
+        # or a muting rule still applies, and _occurrences is kept.
         # Unlike crl_reload_applied it resolves nothing: the open instance stays open for an
         # operator. A reconciler re-grant raises no administrator_granted, so it does not end the
         # cooldown.
