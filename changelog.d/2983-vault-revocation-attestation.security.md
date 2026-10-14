@@ -10,7 +10,8 @@
   it, and an attested crossing logs a WARNING once per process for each hop.
   On an instance at `[security].enforcement = warn`, a caller that hands its posture to the hop
   crosses with a WARNING. A command that holds no posture is judged as enforcing, so it still
-  refuses. `check-privileges` probes each Vault under that hop's own attestation.
+  refuses. `messagefoundry verify` is one, for its secret read as well as its store opens.
+  `check-privileges` probes each Vault under that hop's own attestation.
   One gap is named and not closed: through an `https://` proxy, nothing checks revocation of
   the proxy's own certificate. See [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md).
   (`vault BACKLOG #2983`)
