@@ -24,7 +24,9 @@
     This hook tells a builder lane from the dispatcher by its worktree's name and branch, so from the
     primary it would answer for neither. Only the `cwd` field of the JSON on stdin names the worktree,
     so the hook moves there (scripts/hooks/_hookinput.ps1) before its first git call. Input with no
-    `cwd` leaves it where it started, as before. A `cwd` it cannot use is reported as a `[lane]` line.
+    `cwd` leaves it where it started, as before. After a `cd` it reads the worktree the session
+    started in; _hookinput.ps1 says how. A `cwd` it cannot use, with no such worktree to fall back
+    to, is reported as a `[lane]` line.
 #>
 [CmdletBinding()]
 param([switch]$SelfTest)
@@ -186,7 +188,7 @@ try {
     $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
     if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
     . $hookInput
-    $cwdFault = Enter-CcxHookCwd -Text (Read-CcxHookInput)
+    $cwdFault = (Enter-CcxHookSession -Text (Read-CcxHookInput)).Reason
 } catch { $cwdFault = "the hook could not read its input ($($_.Exception.Message))" }
 if ($cwdFault) {
     Say "[lane] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. What follows describes $((Get-Location).Path), where this hook runs."

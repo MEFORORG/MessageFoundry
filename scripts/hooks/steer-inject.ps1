@@ -23,13 +23,17 @@
 # session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a hook then runs
 # with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY, so this hook read
 # the primary's note and never the worktree's. Only the `cwd` field of the JSON on stdin names the
-# worktree. The hook walks up from it to the nearest `.git` (scripts/hooks/_hookinput.ps1) and reads
-# that worktree's note. Input with no `cwd` falls back to CLAUDE_PROJECT_DIR, as before.
+# worktree. The hook reads the note of the worktree it names, but only a worktree of THIS repository,
+# and only the one the session started in (scripts/hooks/_hookinput.ps1). A `cwd` that a `cd` moved
+# into a sibling, another repository, or a directory holding a bare `.git` file reads the starting
+# worktree's note, never the one there: this hook deletes what it reads and injects it as text the
+# user typed. Input with no `cwd` falls back to CLAUDE_PROJECT_DIR, as before.
 #
-# A `cwd` IT CANNOT USE READS NO NOTE. Falling back to CLAUDE_PROJECT_DIR there would read, delete
-# and inject the PRIMARY session's note into this one, so its recipient never sees it. The hook says
-# so on a `[steer]` line instead, at most once per $FAULT_COOLDOWN_MINUTES for each named cwd,
-# because it runs before every tool call. A missing helper is the same fault.
+# A `cwd` IT CANNOT USE, WITH NO STARTING WORKTREE TO FALL BACK TO, READS NO NOTE. Falling back to
+# CLAUDE_PROJECT_DIR there would read, delete and inject the PRIMARY session's note into this one, so
+# its recipient never sees it. The hook says so on a `[steer]` line instead, at most once per
+# $FAULT_COOLDOWN_MINUTES for each session, because it runs before every tool call. A missing helper
+# is the same fault.
 #
 # Fail-open: any error here must never block a tool call.
 # ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
@@ -73,10 +77,7 @@ function Write-Context([string]$Text) {
 function Write-FaultOnce([string]$Key, [string]$Text) {
     $emit = $true
     try {
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        $h = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Key))[0..3] | ForEach-Object { $_.ToString('x2') })
-        $sha.Dispose()
-        $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-steer-fault/$h.stamp"
+        $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-steer-fault/$(Get-CcxShortHash $Key).stamp"
         $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
         if ($prev) {
             $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
@@ -100,12 +101,11 @@ try {
         $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
         if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
         . $hookInput
-        $raw = Read-CcxHookInput
-        $wt = Get-CcxHookWorktree -Text $raw
-        if ($wt.Root) { $project = $wt.Root }
-        elseif ($wt.Reason) {
-            $fault = $wt.Reason
-            $faultKey = 'cwd:' + [string](Get-CcxHookPayloadCwd -Text $raw).Cwd + '|' + $wt.Reason
+        $s = Resolve-CcxHookSession -Text (Read-CcxHookInput)
+        if ($s.Root) { $project = $s.Root }
+        elseif ($s.Reason) {
+            $fault = $s.Reason
+            $faultKey = if ($s.SessionId) { 'sid:' + $s.SessionId } else { 'cwd:' + [string]$s.Payload.cwd }
         }
     } catch {
         $fault = "the hook could not read its input ($($_.Exception.Message))"

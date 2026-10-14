@@ -71,9 +71,12 @@
 
     So stdin is read FIRST, before any git call, and the hook moves into that `cwd`
     (scripts/hooks/_hookinput.ps1). Every git call, and the mail.ps1 child, then answers for the
-    session. Input with no `cwd` leaves the hook where it started, as before. A `cwd` it cannot use,
-    or a missing helper, announces NOTHING: one `[announce]` line and an ERROR receipt, because the
-    only checkout left to name is where the hook started. Inside the session's directory the hook
+    session. Input with no `cwd` leaves the hook where it started, as before. After a `cd` into a
+    sibling worktree or another repository it announces the worktree the session started in, never
+    the one the `cd` reached. A `cwd` it cannot use with nothing to fall back to, or a missing helper,
+    announces NOTHING: one `[announce]` line and an ERROR receipt, once per 30 minutes and only past
+    the kill switch and the settled check, because the only checkout left to name is where the hook
+    started. Inside the session's directory the hook
     asks git for the common dir again rather than trusting -CommonDir, which the shim resolved where
     the hook started.
 
@@ -330,7 +333,7 @@ try {
     # BEFORE ANY GIT CALL. Under the desktop app this process starts in the PRIMARY checkout, and only
     # the input's `cwd` names the worktree; see the header. Under SilentlyContinue a dot-source of a
     # missing file does not throw, so the helper is tested for first. Without it the hook cannot tell
-    # which checkout the session is in, and section 6b says so and announces nothing.
+    # which checkout the session is in, and section 9b says so and announces nothing.
     #
     # '-not $SelfTest' is UNCONDITIONAL, not conditional on redirection: measured on this host,
     # [Console]::IsInputRedirected is True from an agent shell with NO pipe at all, so a read guarded
@@ -350,8 +353,9 @@ try {
     }
     $moved = $false
     if ($hasHelper -and $raw) {
-        $cwdFault = Enter-CcxHookCwd -Text $raw
-        $moved = (-not $cwdFault) -and (Get-CcxHookPayloadCwd -Text $raw).Named
+        $session = Enter-CcxHookSession -Text $raw
+        $cwdFault = $session.Reason
+        $moved = [bool]$session.Dir
     }
 
     # --- 1. COMMON DIR -------------------------------------------------------------------------------
@@ -441,19 +445,10 @@ try {
         $script:MarkerKey = $markerKey
     }
 
-    # --- 6b. NO KNOWN CHECKOUT, NO ANNOUNCEMENT -----------------------------------------------------
-    # Section 0 could not put this hook in the session's directory, so $top is where the hook started:
-    # under the desktop app, the primary. Announcing that would tell every peer the session is in the
-    # primary, which is the defect section 0 fixes. So the hook says why, leaves a receipt, and stops.
-    if ($cwdFault) {
+    # The real run says this in section 9b, after the kill switch and the settled check.
+    if ($cwdFault -and $SelfTest) {
         $why = (Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?'
-        if ($SelfTest) {
-            Write-Output "[announce -SelfTest] $why; a real run would announce nothing."
-        } else {
-            Write-Output "[announce] $why, so this hook cannot tell which checkout this session is in and announced nothing."
-            Write-Receipt 'ERROR' @{ note = $cwdFault }
-            exit 0
-        }
+        Write-Output "[announce -SelfTest] $why; a real run would announce nothing."
     }
 
     if (-not $SelfTest) {
@@ -509,6 +504,37 @@ try {
 
         # --- 9. TERMINAL STATES: THE COLD HOT PATH --------------------------------------------------
         if ($m -and ($m.state -eq 'settled' -or $m.state -eq 'exhausted')) { exit 0 }
+
+        # --- 9b. NO KNOWN CHECKOUT, NO ANNOUNCEMENT -------------------------------------------------
+        # Section 0 could not put this hook in the session's directory, and had no starting worktree to
+        # fall back to, so $top is where the hook started: under the desktop app, the primary.
+        # Announcing that would tell every peer the session is in the primary, which is the defect
+        # section 0 fixes. So the hook says why, leaves a receipt, and stops.
+        #
+        # AFTER the kill switch and the settled check, so OFF still silences it and a settled session
+        # is not told. ONCE PER 30 MINUTES PER SESSION, because this runs on every prompt. A stamp that
+        # cannot be read or written means the line is said: noise is the safe failure of a silencer.
+        if ($cwdFault) {
+            $faultStamp = Join-Path $StateDir "fault-$markerKey.stamp"
+            $say = $true
+            try {
+                $prev = Get-Item -LiteralPath $faultStamp -ErrorAction SilentlyContinue
+                if ($prev) {
+                    $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
+                    if ($mins -ge 0 -and $mins -lt 30) { $say = $false }
+                }
+                if ($say) {
+                    New-Item -ItemType Directory -Force -Path $StateDir -ErrorAction Stop | Out-Null
+                    Set-Content -LiteralPath $faultStamp -Value (Get-Date).ToString('o') -Encoding ascii -ErrorAction Stop
+                }
+            } catch { $say = $true }
+            if ($say) {
+                $why = (Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?'
+                Write-Output "[announce] $why, so this hook cannot tell which checkout this session is in and announced nothing. Said once per 30 minutes while it lasts."
+                Write-Receipt 'ERROR' @{ note = $cwdFault }
+            }
+            exit 0
+        }
 
         # --- 10. KILL LADDER ------------------------------------------------------------------------
         # state 'checking' means the previous run did not reach the post-lookup write, which on this

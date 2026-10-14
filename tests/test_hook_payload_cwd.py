@@ -121,6 +121,109 @@ def test_the_helper_says_no_cwd_is_not_a_fault(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# Resolve-CcxHookSession: the two checks on the `cwd`, and the pin. The Lander's verdict on korus#223
+# measured a `cwd` that followed a `cd` into a sibling worktree or another repository, and the hooks
+# answered for wherever it pointed. Every probe here runs IN the primary, as the desktop app runs a
+# hook, and each case that falls back has a control that does not.
+# --------------------------------------------------------------------------------------------------
+
+
+def _resolve(repo: Path, tmp_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    probe = tmp_path / "resolve.ps1"
+    probe.write_text(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        f". '{HELPER}'\n$t = Read-CcxHookInput\n"
+        "$r = Resolve-CcxHookSession -Text $t\n"
+        "[pscustomobject]@{ Dir = $r.Dir; Reason = $r.Reason; Note = $r.Note } | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    proc = _run(probe, repo, _raw(payload))
+    return dict(json.loads(proc.stdout.decode("utf-8")))
+
+
+def _other_repo(tmp_path: Path) -> Path:
+    other = Path(os.path.realpath(tmp_path)) / "other-repo"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    return other
+
+
+def test_a_cwd_in_the_sessions_own_worktree_is_used(tmp_path: Path) -> None:
+    repo, wt = _primary_with(tmp_path, "linked")
+    got = _resolve(repo, tmp_path, {"cwd": str(wt), "session_id": "s1", "hook_event_name": "Stop"})
+    assert got["Dir"] and _same_dir(got["Dir"], wt), got
+    assert got["Reason"] == "" and got["Note"] == "", got
+
+
+def test_a_cwd_in_another_repository_is_a_fault_without_a_pin(tmp_path: Path) -> None:
+    repo, _ = _primary_with(tmp_path, "linked")
+    other = _other_repo(tmp_path)
+    got = _resolve(repo, tmp_path, {"cwd": str(other), "session_id": "s1"})
+    assert got["Dir"] is None, got
+    assert "which is in another repository" in got["Reason"], got
+
+
+def test_a_cwd_under_an_empty_git_file_is_a_fault(tmp_path: Path) -> None:
+    """A `.git` that names no git directory is not a checkout. Walking up to it alone accepted it."""
+    repo, _ = _primary_with(tmp_path, "linked")
+    fake = Path(os.path.realpath(tmp_path)) / "fake"
+    fake.mkdir()
+    (fake / ".git").write_text("", encoding="utf-8")
+    got = _resolve(repo, tmp_path, {"cwd": str(fake), "session_id": "s1"})
+    assert got["Dir"] is None and "names no git directory" in got["Reason"], got
+
+
+def test_after_a_cd_to_a_sibling_the_hook_answers_for_the_pinned_worktree(tmp_path: Path) -> None:
+    repo, wt = _primary_with(tmp_path, "linked")
+    sibling = Path(os.path.realpath(tmp_path)) / "sibling"
+    _git(repo, "worktree", "add", "-q", "-b", "sibling", str(sibling))
+    start = _resolve(
+        repo, tmp_path, {"cwd": str(wt), "session_id": "s1", "hook_event_name": "SessionStart"}
+    )
+    assert start["Dir"] and _same_dir(start["Dir"], wt), start
+    got = _resolve(
+        repo, tmp_path, {"cwd": str(sibling), "session_id": "s1", "hook_event_name": "Stop"}
+    )
+    assert got["Dir"] and _same_dir(got["Dir"], wt), "the session showed as its sibling after a cd"
+    assert "outside the worktree the session started in" in got["Note"], got
+    # The control: another session that STARTED in the sibling is answered for there.
+    other = _resolve(
+        repo, tmp_path, {"cwd": str(sibling), "session_id": "s2", "hook_event_name": "SessionStart"}
+    )
+    assert other["Dir"] and _same_dir(other["Dir"], sibling), other
+
+
+def test_after_a_cd_to_another_repository_the_hook_answers_for_the_pinned_worktree(
+    tmp_path: Path,
+) -> None:
+    repo, wt = _primary_with(tmp_path, "linked")
+    other = _other_repo(tmp_path)
+    _resolve(
+        repo, tmp_path, {"cwd": str(wt), "session_id": "s1", "hook_event_name": "SessionStart"}
+    )
+    got = _resolve(
+        repo, tmp_path, {"cwd": str(other), "session_id": "s1", "hook_event_name": "Stop"}
+    )
+    assert got["Dir"] and _same_dir(got["Dir"], wt), got
+    assert "which is in another repository" in got["Note"], got
+    assert not (other / ".git" / "mefor-coord").exists(), (
+        "nothing may be written into that repository"
+    )
+
+
+def test_a_pin_naming_a_removed_worktree_is_ignored(tmp_path: Path) -> None:
+    repo, wt = _primary_with(tmp_path, "linked")
+    _resolve(
+        repo, tmp_path, {"cwd": str(wt), "session_id": "s1", "hook_event_name": "SessionStart"}
+    )
+    _git(repo, "worktree", "remove", "--force", str(wt))
+    got = _resolve(
+        repo, tmp_path, {"cwd": str(repo), "session_id": "s1", "hook_event_name": "Stop"}
+    )
+    assert got["Dir"] and _same_dir(got["Dir"], repo), got
+
+
+# --------------------------------------------------------------------------------------------------
 # lane-level.ps1. It tells a builder lane by its worktree's name, so from the primary it answered for
 # neither lane nor dispatcher and said nothing.
 # --------------------------------------------------------------------------------------------------

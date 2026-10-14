@@ -25,8 +25,10 @@
     Only the `cwd` field of the JSON on stdin names the session's worktree. So the hook moves there
     (scripts/hooks/_hookinput.ps1) before its first git call, and presence.ps1, overlap.ps1 and every
     git call below answer for the session. Input with no `cwd` leaves it where it started, as before.
-    A `cwd` it cannot use, or a helper that is missing, becomes the banner's first line, and the
-    banner then describes the checkout the hook runs in. _hookinput.ps1 says what the `cwd` means.
+    A `cwd` in another repository or another worktree falls back to the worktree the session started
+    in, and the banner says so. A `cwd` with nothing to fall back to, or a helper that is missing,
+    becomes the banner's first line, and the banner then describes the checkout the hook runs in.
+    _hookinput.ps1 says what the `cwd` means.
 #>
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -39,7 +41,9 @@ $hookInput = Join-Path $PSScriptRoot '../hooks/_hookinput.ps1'
 try {
     if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw "scripts/hooks/_hookinput.ps1 is missing beside this hook" }
     . $hookInput
-    $cwdFault = Enter-CcxHookCwd -Text (Read-CcxHookInput)
+    $session = Enter-CcxHookSession -Text (Read-CcxHookInput)
+    $cwdFault = $session.Reason
+    if ($session.Note) { $lines += "[session-context] $($session.Note)." }
 } catch { $cwdFault = "the hook could not read its input ($($_.Exception.Message))" }
 if ($cwdFault) {
     $lines += "[session-context] COULD NOT READ THIS SESSION'S WORKTREE: $cwdFault. Everything below describes $((Get-Location).Path), where this hook runs, which may not be your worktree."
@@ -56,11 +60,22 @@ if ($root) {
         # name, once the hook runs from a subdirectory and git prints the path in full.
         $gitDir = (& git rev-parse --path-format=absolute --git-dir 2>$null)
         $commonDir = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
-        $isPrimary = ($gitDir -and $commonDir -and ("$gitDir".Trim().TrimEnd('/') -ieq "$commonDir".Trim().TrimEnd('/')))
+        # A git that does not answer leaves this UNKNOWN, never "linked": a primary read as a linked
+        # worktree loses the warning below, which is the one line this banner most needs to say.
+        $isPrimary = $null
+        if ($gitDir -and $commonDir) {
+            $isPrimary = ("$gitDir".Trim().TrimEnd('/') -ieq "$commonDir".Trim().TrimEnd('/'))
+        }
 
         $lines += ""
         $lines += "[PARALLEL SESSION ($($wt.Count) worktrees active)]"
         $lines += "This chat's worktree: $root  (branch: $branch)"
+
+        if ($null -eq $isPrimary) {
+            $lines += ""
+            $lines += "  >>> git did not say whether this is the SHARED PRIMARY checkout or your own worktree."
+            $lines += "  >>> If it is the primary, create and work in your OWN worktree before substantive edits."
+        }
 
         # Loudest, first: if this session sits in the SHARED trunk, tell it to branch into its own worktree.
         if ($isPrimary) {

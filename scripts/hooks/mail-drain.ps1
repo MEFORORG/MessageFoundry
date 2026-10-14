@@ -183,9 +183,13 @@
     that path and the drain exits silent, so that worktree's mail is never shown. The read now goes
     through scripts/hooks/_hookinput.ps1.
 
-    A `cwd` THE INPUT NAMES BUT THE DRAIN CANNOT USE READS NO BOX, and neither does a missing helper.
-    Either says "NO BOX ... NOTHING WAS READ", because silence there reads as an empty box, and any
-    other box would be another session's mail for this session's Stop to file.
+    AFTER A `cd` THE DRAIN READS THE BOX OF THE WORKTREE THE SESSION STARTED IN, not the sibling's or
+    another repository's that the `cwd` now names (scripts/hooks/_hookinput.ps1 keeps that worktree).
+
+    A `cwd` THE INPUT NAMES BUT THE DRAIN CANNOT USE, WITH NO STARTING WORKTREE TO FALL BACK TO, READS
+    NO BOX, and neither does a missing helper. Either says "NO BOX ... NOTHING WAS READ", once per
+    $NO_BOX_COOLDOWN_MINUTES and only past the OFF switch, because silence there reads as an empty box,
+    and any other box would be another session's mail for this session's Stop to file.
 
     ASCII-only on purpose; run under pwsh 7 by the hook.
 #>
@@ -718,13 +722,19 @@ try {
         . $hookInput
         $hasHelper = $true
     } catch { $cwdFault = "the drain could not load its input reader ($($_.Exception.Message))" }
+    # The session's box is the worktree it STARTED in. A `cwd` that a `cd` moved into a sibling or
+    # another repository falls back to it (scripts/hooks/_hookinput.ps1), because any other box is
+    # another session's mail, which this session's Stop would then file as read.
+    $session = $null
     if ($hasHelper) {
         $stdinRaw = Read-CcxHookInput
-        $cwdFault = (Get-CcxHookPayloadCwd -Text $stdinRaw).Reason
+        $session = Resolve-CcxHookSession -Text $stdinRaw
+        $cwdFault = $session.Reason
     }
     elseif ([Console]::IsInputRedirected) { try { $stdinRaw = [Console]::In.ReadToEnd() } catch { $stdinRaw = '' } }
     $hook = $null
-    try { $hook = $stdinRaw | ConvertFrom-Json } catch { }
+    if ($session) { $hook = $session.Payload }
+    else { try { $hook = $stdinRaw | ConvertFrom-Json } catch { } }
     # THE FALLBACK IS NOW LOAD-BEARING, not arbitrary. A payload with no hook_event_name must default to
     # a NON-CONSUMING event, because the default decides what happens to mail when the drain cannot tell
     # what woke it.
@@ -742,44 +752,9 @@ try {
     # rather than by inference. Adding a member is a measurement, not an edit.
     $consuming = ($eventName -eq 'Stop')
 
-    # NO BOX, AND SAID. The input named a directory the drain cannot use, or the drain could not read
-    # the input as UTF-8. Showing any other box here would be showing another session's mail, and on
-    # Stop this session would then file it as read. So nothing is read, and the reader is told that
-    # this silence is not an empty box.
-    #
-    # ONCE PER $NO_BOX_COOLDOWN_MINUTES FOR EACH SESSION, not at every SessionStart and Stop: a fault
-    # that persists would otherwise put this line in front of the session at the end of every turn.
-    # The stamp is outside the mail root, which the receipt sweep owns. A stamp that cannot be read or
-    # written means the line is said: noise is the safe failure of a silencer.
-    if ($cwdFault) {
-        $emit = $true
-        try {
-            $key = if ($hook -and $hook.cwd) { 'cwd:' + [string]$hook.cwd } elseif ($sessionId) { 'sid:' + $sessionId } else { 'reader:' + $PSScriptRoot }
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            $h = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($key))[0..3] | ForEach-Object { $_.ToString('x2') })
-            $sha.Dispose()
-            $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-mail-nobox/$h.stamp"
-            $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
-            if ($prev) {
-                $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
-                if ($mins -ge 0 -and $mins -lt $NO_BOX_COOLDOWN_MINUTES) { $emit = $false }
-            }
-            if ($emit) {
-                New-Item -ItemType Directory -Force -Path (Split-Path $stamp) | Out-Null
-                Set-Content -LiteralPath $stamp -Value ((Get-Date).ToString('o')) -Encoding ascii
-            }
-        } catch { $emit = $true }
-        if ($emit) {
-            Write-Injection -Event $eventName -Text (
-                "[mefor-mail] NO BOX. $((Get-Clean $cwdFault 300)), so this drain cannot tell which box is this " +
-                "session's and NOTHING WAS READ. This is not an empty box. As of $([DateTime]::UtcNow.ToString('o')). " +
-                "Said once per $NO_BOX_COOLDOWN_MINUTES minutes while it lasts."
-            )
-        }
-        exit 0
-    }
-
-    $cwd = if ($hook -and $hook.cwd) { [string]$hook.cwd } else { (Get-Location).Path }
+    # With a fault there is no session directory, so the queue is located from where the drain runs,
+    # only to reach the OFF switch and the NO BOX notice below. No box is read from it.
+    $cwd = if ($session -and $session.Dir) { [string]$session.Dir } else { (Get-Location).Path }
 
     # --- Locate the queue. Outside a repo this is not our business unless the caller passed an
     # anchor; say nothing and go.
@@ -819,6 +794,41 @@ try {
             "[mefor-mail] SUPPRESSED as of ${asOf}: the OFF switch is present at mefor-coord/mail/OFF. " +
             "Mail is still being queued and is NOT lost; it is not being shown. Remove that file to resume."
         )
+        exit 0
+    }
+
+    # --- NO BOX, AND SAID. The input named a directory the drain cannot use, with no starting worktree
+    # to fall back to, or the drain could not read the input as UTF-8. Showing any other box here would
+    # be showing another session's mail, and on Stop this session would then file it as read. So
+    # nothing is read, and the reader is told that this silence is not an empty box.
+    #
+    # AFTER the OFF switch and the mail-root check, so OFF still silences it and a repository with no
+    # mail says nothing. ONCE PER $NO_BOX_COOLDOWN_MINUTES FOR EACH SESSION, not at every SessionStart
+    # and Stop: a fault that persists would otherwise end every turn with this line. The stamp is
+    # outside the mail root, which the receipt sweep owns. A stamp that cannot be read or written
+    # means the line is said: noise is the safe failure of a silencer.
+    if ($cwdFault) {
+        $emit = $true
+        try {
+            $who = if ($sessionId) { 'sid:' + $sessionId } elseif ($hook -and $hook.cwd) { 'cwd:' + [string]$hook.cwd } else { 'reader:' + $PSScriptRoot }
+            $stamp = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-mail-nobox/$(Get-CcxShortHash $who).stamp"
+            $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
+            if ($prev) {
+                $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
+                if ($mins -ge 0 -and $mins -lt $NO_BOX_COOLDOWN_MINUTES) { $emit = $false }
+            }
+            if ($emit) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $stamp) -ErrorAction Stop | Out-Null
+                Set-Content -LiteralPath $stamp -Value ((Get-Date).ToString('o')) -Encoding ascii -ErrorAction Stop
+            }
+        } catch { $emit = $true }
+        if ($emit) {
+            Write-Injection -Event $eventName -Text (
+                "[mefor-mail] NO BOX. $((Get-Clean $cwdFault 300)), so this drain cannot tell which box is this " +
+                "session's and NOTHING WAS READ. This is not an empty box. As of ${asOf}. " +
+                "Said once per $NO_BOX_COOLDOWN_MINUTES minutes while it lasts."
+            )
+        }
         exit 0
     }
 
