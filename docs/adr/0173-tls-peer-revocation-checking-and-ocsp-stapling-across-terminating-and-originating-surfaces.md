@@ -1298,8 +1298,8 @@ unchanged for that reason: the handshake still checks no CRL and no OCSP.
   judged as enforcing.** That is at least every command that opens a store with no posture. So on
   an instance at `[security].enforcement = warn`, `serve` crosses an unattested off-box Vault
   with a warning, and such a command still refuses it. `docs/SECURITY-LOOSENING.md` names the
-  callers. `tests/test_vault_posture_census.py`
-  lists what each caller passes, and is the one place that list lives.
+  callers. `tests/test_vault_posture_census.py` lists what each caller passes, and is the one
+  place that list lives.
 - `check-privileges` builds its two Vault clients under the same rule, each with its own
   section's pair.
 

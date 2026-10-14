@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.secretprovider import SecretProviderError
-from messagefoundry.config.settings import SecretsSettings, StoreSettings
+from messagefoundry.config.settings import SecretsSettings, ServiceSettings, StoreSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopPosture,
@@ -931,10 +931,8 @@ def test_the_serve_path_upload_cipher_is_built_under_the_instance_posture(
     assert dials == ([(_HOST, 8200)] if crosses else [])
 
 
-def _verify_settings(enforcement: str, attested: bool, store_path: str) -> Any:
+def _verify_settings(enforcement: str, attested: bool, store_path: str) -> ServiceSettings:
     """An instance whose OIDC client secret and store key are both held in an off-box Vault."""
-    from messagefoundry.config.settings import ServiceSettings
-
     return ServiceSettings.model_validate(
         {
             "security": {"enforcement": enforcement},
@@ -969,9 +967,9 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     """``verify`` holds no posture for its store opens (vault BACKLOG #2354), so it holds none for
     its secrets read either: one command judges both Vault hops by one rule. A ``warn`` instance
     is not a way across here, as it is in ``serve``; only the hop's own pair is.
-    RED before the repair: on ``warn`` the client-credential row derived the serve posture, so the
-    secrets hop crossed with a WARNING and dialled the Vault while the store row refused.
-    Mutation: pass ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
+    RED before the repair, on ``warn`` only: the client-credential row derived the serve posture.
+    So the secrets hop crossed with a WARNING and dialled the Vault, while the store row refused.
+    ``[enforce]`` is the control: both versions refuse there. Mutation: pass ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
     ``_client_credential_row``."""
     from messagefoundry.verify.federation import _client_credential_row
     from messagefoundry.verify.model import Status
