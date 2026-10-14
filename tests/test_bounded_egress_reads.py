@@ -786,14 +786,28 @@ def test_the_text_variant_refuses_a_truncated_reply_before_decoding_it() -> None
         read_bounded_text(_wire(_FIXED_TRUNCATED), limit=1024, connector="c", encoding="utf-8")
 
 
-def test_rest_post_does_not_report_success_on_a_truncated_reply() -> None:
+def test_rest_post_does_not_report_a_truncated_reply_as_the_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The row's named symptom, end to end: ``REST._post`` returned ``('hello', 200, {})`` for a
-    reply the peer never finished sending, and the delivery worker counts a returned status as
-    delivered. It now raises a retryable DeliveryError instead."""
+    reply the peer never finished sending, so the fragment stood as the partner's answer.
+
+    It raised a retryable ``TruncatedResponseError`` from BACKLOG #1575, which re-sent a request
+    the partner had answered 2xx. Since BACKLOG #2989 the reply follows the over-cap rule: with
+    capture off nothing reads the body, so the fragment is dropped and the message is delivered.
+    ``_post`` hands back a ``ReplyBodyDropped`` that says what was wrong and logs nothing; the
+    delivery worker records it and then logs the WARNING (vault BACKLOG #3040 items 2 and 5).
+    ``tests/test_over_cap_2xx_reply_is_sent_once.py`` covers capture on, and the worker."""
     dest = _rest()
     dest._opener = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
-    with pytest.raises(TruncatedResponseError, match="REST connection 'OB_REST'"):
-        dest._post("<payload/>")
+    with caplog.at_level(logging.WARNING):
+        body, status = dest._post("<payload/>")[:2]
+    assert status == 200
+    assert isinstance(body, ReplyBodyDropped)
+    assert body.status == 200
+    assert body.problem == "ended before its declared length"
+    assert "hello" not in body.detail
+    assert caplog.records == []
 
 
 def test_rest_post_still_returns_a_complete_reply() -> None:

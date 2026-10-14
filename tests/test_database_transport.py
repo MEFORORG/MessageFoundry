@@ -200,6 +200,16 @@ def test_build_dsn_rejects_server_injection(bad: str) -> None:
         _build_dsn({"server": bad, "database": "d", "username": "u", "password": "p"})
 
 
+def test_build_dsn_an_explicit_none_encrypt_takes_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3230: ``encrypt = None`` read as off, so without the escape this build was
+    refused as a weakened hop. It now takes the default, as absence does."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    dsn = _build_dsn({"server": "s", "database": "d", "encrypt": None})
+    assert dsn.rstrip(";").endswith("Encrypt=yes;TrustServerCertificate=no")
+
+
 def test_build_dsn_weak_tls_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with pytest.raises(ValueError):

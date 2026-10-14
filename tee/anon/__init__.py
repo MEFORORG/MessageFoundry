@@ -28,8 +28,24 @@ from pathlib import Path
 
 from .hl7 import anonymize_message
 from .keying import Keyer
-from .leak import LeakReport, coverage_clause, leak_check, leak_report, refusal_advice
-from .rules import DEFAULT_RULES, AnonError, FieldRule, RuleError, SurrogateKind, load_rules
+from .leak import (
+    LeakReport,
+    coverage_clause,
+    leak_check,
+    leak_report,
+    message_version,
+    refusal_advice,
+)
+from .rules import (
+    DEFAULT_RULES,
+    AnonError,
+    FieldRule,
+    RuleError,
+    SurrogateKind,
+    kept_defaults,
+    load_rules,
+    retargeted_defaults,
+)
 
 __all__ = [
     "DEFAULT_RULES",
@@ -42,9 +58,12 @@ __all__ = [
     "SurrogateKind",
     "anonymize",
     "anonymize_checked",
+    "kept_defaults",
     "leak_check",
     "leak_report",
     "load_rules",
+    "message_version",
+    "retargeted_defaults",
 ]
 
 
@@ -93,7 +112,9 @@ def anonymize_checked(
     structural PHI-shape detectors over the fields no rule matched. ``require_live_denylist`` (default
     off) makes a non-live token source a refusal cause; ``require_full_coverage`` (default off)
     refuses any present field no rule scrubs and no ``keep`` names, other than set ids, PID-8 and
-    PV1-2, and a kept field is still scanned; ``on_report`` receives the :class:`LeakReport`
+    PV1-2, and a kept field is still scanned; a line that is a bare segment id and passed is in
+    the report under its own address, undecided unless a rule or a ``keep`` names any field of
+    that segment (BACKLOG #3001); ``on_report`` receives the :class:`LeakReport`
     on the clean path and on a leak-check refusal, not when :func:`anonymize` raises :class:`AnonError`. The error names token categories and field shapes/addresses only, never a value.
     A clean return is not proof of PHI-free output: a name, an undashed number or a date in an
     unmapped field passes, so surface the ``on_report`` coverage on the clean path (BACKLOG #1710).
@@ -103,8 +124,11 @@ def anonymize_checked(
     effective = rules if rules is not None else load_rules(overlay)
     blanked: list[str] = []
     output = anonymize(raw, salt=salt, rules=effective, blanked=blanked)
+    # The version of the INPUT: a rule on MSH-12 has put a surrogate in the output, and a
+    # surrogate version can leave out a bare id the real version defines (BACKLOG #3004).
     report = replace(
-        leak_report(output, rules=effective), blanked_fields=tuple(sorted(set(blanked)))
+        leak_report(output, rules=effective, version=message_version(raw)),
+        blanked_fields=tuple(sorted(set(blanked))),
     )
     if on_report is not None:
         on_report(report)

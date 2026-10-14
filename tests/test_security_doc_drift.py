@@ -1433,6 +1433,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
     ("test_docs_security_pathways.py", "_config_row"): "slices a CONFIGURATION.md table row",
     (
         "test_docs_security_pathways.py",
+        "test_the_guide_keeps_the_corrected_crl_signature_sentences",
+    ): (
+        "absence of four retired CRL-signature sentences in CONFIGURATION.md, and presence of two "
+        "kept ones (vault BACKLOG #3506); the code they describe is pinned by calling it in "
+        "tests/test_crl_signature_at_start.py"
+    ),
+    (
+        "test_docs_security_pathways.py",
         "test_the_ninth_sweep_states_the_local_pathway_after_amendment_a",
     ): (
         "absence of eight retired SECURITY.md and CONFIGURATION.md sentences (BACKLOG #1133); the "

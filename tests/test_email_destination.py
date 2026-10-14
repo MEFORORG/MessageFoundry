@@ -1461,6 +1461,39 @@ def test_credentials_over_a_fully_verified_hop_still_construct() -> None:
     EmailDestination(_dest(username="svc", password="pw"))
 
 
+_WEAK_HOPS = [{"use_tls": False}, {"tls_verify": False}, {"tls_check_hostname": False}]
+_HOP_LEVERS: list[dict[str, Any]] = [
+    {},
+    {"tls_hop_attested": True, "tls_hop_attested_reason": "on-box relay in a unit test"},
+    {"cleartext_accepted": True, "cleartext_reason": "accepted in a unit test"},
+]
+
+
+@pytest.mark.parametrize("weak", _WEAK_HOPS, ids=["cleartext", "verify-off", "name-off"])
+@pytest.mark.parametrize("lever", _HOP_LEVERS, ids=["none", "attested", "accepted"])
+def test_a_credential_refusal_names_the_connection_and_only_levers_that_fix_it(
+    weak: dict[str, bool], lever: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3230: on an enforcing instance a credentialed weak hop used to meet the body
+    refusal first, which offered the escape, tls_hop_attested or cleartext_accepted. None of those
+    lifts the credential refusal, so it now runs first and names only settings that do."""
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    config = Destination(
+        name="OB_EMAIL",
+        type=ConnectorType.EMAIL,
+        settings=_dest(username="svc", password="synthetic", **weak).settings,
+        **lever,
+    )
+    with pytest.raises(ValueError, match="authentication credentials") as info:
+        EmailDestination(config)
+    message = str(info.value)
+    assert "connection 'OB_EMAIL'" in message
+    assert "No escape, posture or attestation lifts this" in message and "tls_ca_file" in message
+    for lever_name in (INSECURE_TLS_ESCAPE_ENV, "tls_hop_attested", "cleartext_accepted"):
+        assert lever_name not in message
+    assert "synthetic" not in message
+
+
 async def test_tls_verify_false_with_escape_builds_an_unverified_context(
     escape_at_warn: None,
     monkeypatch: pytest.MonkeyPatch,

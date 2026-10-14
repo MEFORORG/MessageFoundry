@@ -135,7 +135,9 @@ def test_a_cleartext_refusal_names_the_refused_connection() -> None:
 
 def test_a_verify_off_refusal_names_the_refused_connection() -> None:
     with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused) as exc:
-        refuse_verify_off("https", f"https://{_HOST}/x", connector="REST", connection="OB_V")
+        refuse_verify_off(
+            "https", f"https://{_HOST}/x", connector="REST", connection="OB_V", credentials=()
+        )
     assert "connection 'OB_V';" in str(exc.value)
 
 

@@ -116,6 +116,58 @@ def test_mllp_destination_with_defaults_is_silent(caplog: pytest.LogCaptureFixtu
     assert _hostname_warnings(caplog) == []
 
 
+def test_an_explicit_none_takes_the_default_on_mllp_ftps_and_email() -> None:
+    """Vault BACKLOG #3230: ``bool(settings.get(key, True))`` read an explicit ``None`` as off, so a
+    spec carrying ``tls_verify = None`` dropped verification. Each now takes the default, as absence
+    does. The FTPS spec carries a credential, so before the fix it was refused as a verify-off hop."""
+    from messagefoundry.config.models import bool_setting
+    from messagefoundry.transports.email import EmailDestination
+    from messagefoundry.transports.mllp import _mllp_ssl_context
+    from messagefoundry.transports.remotefile import _ftps_ssl_context
+
+    assert bool_setting({"k": None}, "k", default=True) is True
+    assert bool_setting({}, "k", default=True) is True
+    assert bool_setting({"k": False}, "k", default=True) is False
+    assert bool_setting({"k": None}, "k", default=False) is False
+
+    unset = {"tls_verify": None, "tls_check_hostname": None}
+    mllp = _mllp_ssl_context({"tls": True, **unset}, server=False, name="OB_X")
+    ftps = _ftps_ssl_context({"host": "h.example.invalid", "username": "svc", **unset})
+    for ctx in (mllp, ftps):
+        assert ctx is not None
+        assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True
+    email = EmailDestination(_email(use_tls=None, **unset))
+    assert (email.use_tls, email.tls_verify, email.tls_check_hostname) == (True, True, True)
+
+
+def test_an_explicit_none_is_read_alike_by_the_reports_and_the_ca_checks() -> None:
+    """Vault BACKLOG #3230: the readers that report a loosening or refuse an unread CA read ``None``
+    as the connectors do, as the default. Before, ``None`` was reported as a hostname-check-off
+    loosening, and made a CA the connector reads look unread."""
+    from messagefoundry.auth.trust_anchors import unread_ca_reason
+    from messagefoundry.config.wiring import refuse_resolved_verify_off
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_M",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={"host": "a.example.invalid", "port": 7, "tls_check_hostname": None},
+            ),
+        )
+    )
+    assert hostname_unchecked_hops(reg) == []
+    assert unread_ca_reason({"tls": True, "tls_verify": None}) is None
+    assert unread_ca_reason({"use_tls": None}) is None
+    assert unread_ca_reason({"url": "https://h.example.invalid/x", "verify_tls": None}) is None
+    refuse_resolved_verify_off(
+        ConnectorType.DICOMWEB, {"verify_tls": None, "tls_ca_file": "ca.pem"}, "OB_D"
+    )
+    # Control: an explicit False is still reported and still makes the CA unread.
+    assert unread_ca_reason({"tls": True, "tls_verify": False}) is not None
+
+
 def test_mllp_verify_off_does_not_add_a_hostname_line(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

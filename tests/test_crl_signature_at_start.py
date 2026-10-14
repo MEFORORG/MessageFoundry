@@ -31,17 +31,20 @@ from pathlib import Path
 
 import pytest
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, padding, rsa
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki as pki_module
 from messagefoundry.config import loaded_crls
 from messagefoundry.config.tls_policy import (
+    _UNCONFIRMED_SIGNATURE,
     TrustAnchor,
     build_verifying_client_context,
     harden_crl_check,
 )
+from messagefoundry.pipeline.crl_reload import BAD_SIGNATURE
 from messagefoundry.pki import crl_signature_refusal, judge_crl_signatures
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -359,6 +362,14 @@ def test_a_key_of_another_kind_than_the_signature_is_cannot_check_not_bad(tmp_pa
     hop = _hop(tmp_path / "ca.pem", tmp_path / "crl.pem")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
+    # Vault BACKLOG #3506. The reload holds this file back with BAD_SIGNATURE, and a start has
+    # just loaded it, though the CRL names the CA's key. So that remedy may promise a start
+    # refusal for the proven case only.
+    verdict = crl_signature_refusal(pem, [der])
+    assert verdict is not None and verdict[1] is True
+    assert "only where it proves the signature bad" in BAD_SIGNATURE
+    assert "names that CA's key, a start refuses" not in BAD_SIGNATURE
+
 
 @pytest.mark.parametrize("error", [ValueError, TypeError])
 def test_an_error_from_the_verification_is_cannot_check_and_warns(
@@ -403,7 +414,7 @@ def _postgres_shaped(twins: _Twins, listed: str) -> ssl.SSLContext:
 @pytest.mark.parametrize(
     ("signer", "names", "words"),
     [
-        pytest.param("new", "new", "no CA certificate this hop lists", id="unlisted"),
+        pytest.param("new", "new", "matched it to no CA certificate this hop lists", id="unlisted"),
         pytest.param("new", None, "a renewed CA key could explain it", id="unproven"),
     ],
 )
@@ -555,3 +566,149 @@ def test_a_judgment_that_fails_warns_once_and_does_not_stop_the_start(
     ]
     assert len(logged) == 1 and "RuntimeError" in logged[0]
     assert logged[0].startswith(f"{_SETTING} ({str(twins.crl)!r})")
+
+
+# --- vault BACKLOG #3506: the texts claim no more than the code does ----------------------------
+
+#: The twins' name with its letter case changed. ``cryptography`` compares names exactly, and
+#: OpenSSL folds case, so a CRL under this name is ``unlisted`` and still judges the twins' leaf.
+_NAME_IN_OTHER_CASE = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MEFOR-2905-TWIN-CA")])
+
+
+def test_the_unlisted_words_are_true_of_a_listed_ca_whose_name_differs_only_in_case(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The hop lists a CA that has the CRL's issuer name, as OpenSSL reads it, and the key the
+    CRL names. The engine still reads ``unlisted``. The warning used to say no listed CA "has
+    that name", which is the wrong cause here. This pins the words, not the matching: if the
+    matching ever folds case, change both."""
+
+    def write(signer: ec.EllipticCurvePrivateKey, *, revoke: bool = False) -> bytes:
+        serial = twins.leaf_serial if revoke else None
+        pem = _crl(signer, names=twins.new_key, name=_NAME_IN_OTHER_CASE, revoke=serial)
+        twins.crl.write_bytes(pem)
+        return pem
+
+    server = twins.server(sends_renewed=False)
+    words = _UNCONFIRMED_SIGNATURE["unlisted"]
+    assert "letter case" in words and "has that name" not in words
+
+    pem = write(twins.new_key, revoke=True)
+    assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["unlisted"]
+    with caplog.at_level("WARNING"):
+        hop = twins.hop("new")
+    (line,) = _warnings(caplog)
+    assert words in line
+    # The reload gives the same state the same words, so the two cannot drift apart.
+    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
+    assert verdict is not None and verdict[1] is False and words in verdict[0]
+
+    # The premise, on this interpreter's OpenSSL: it takes that CA for the CRL's issuer, and
+    # judges the peer by the CRL. Control: the same hop passes with a CRL that revokes nothing.
+    with pytest.raises(ssl.SSLError, match="revoked"):
+        _handshake(hop, server)
+    write(twins.new_key)
+    _handshake(twins.hop("new"), server)  # raises if refused
+    # What the configuration guide says was measured: a badly signed CRL of this kind starts,
+    # and then fails its handshake.
+    write(twins.stranger)
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(twins.hop("new"), server)
+
+
+_SHA256_WITH_RSA = bytes.fromhex("06092a864886f70d01010b")
+_SHA1_WITH_RSA = bytes.fromhex("06092a864886f70d010105")
+_SHA384_WITH_RSA = bytes.fromhex("06092a864886f70d01010c")
+
+
+def _resigned(
+    pem: bytes, signer: rsa.RSAPrivateKey, oid: bytes, digest: hashes.HashAlgorithm
+) -> bytes:
+    """``pem``, an RSA SHA-256 CRL, signed again by ``signer`` under another digest. The builder
+    refuses SHA-1. So the two algorithm identifiers are swapped by hand for ``oid``, which has
+    the same length, and the signature is replaced."""
+    der = x509.load_pem_x509_crl(pem).public_bytes(serialization.Encoding.DER)
+    assert der.count(_SHA256_WITH_RSA) == 2
+    der = der.replace(_SHA256_WITH_RSA, oid)
+    body = x509.load_der_x509_crl(der).tbs_certlist_bytes
+    try:
+        signature = signer.sign(body, padding.PKCS1v15(), digest)
+    except UnsupportedAlgorithm:
+        pytest.skip(f"this build cannot sign with {digest.name}, so the CRL cannot be minted")
+    return x509.load_der_x509_crl(der[: -len(signature)] + signature).public_bytes(_PEM)
+
+
+def test_an_rsa_sha1_crl_the_ca_signed_is_cannot_check_and_a_forged_one_is_bad(
+    tmp_path: Path,
+) -> None:
+    """A CRL that names the CA's key and that the reload holds back, while a start loads it. The
+    reload's remedy used to say a start refuses such a file. The SHA-384 CRL is the control for
+    the hand-made encoding: the same swap under a digest the library accepts reads ``verified``.
+    So ``uncheckable`` is about SHA-1, not about the swap."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca = _ca(key, key)
+    ders = [ca.public_bytes(serialization.Encoding.DER)]
+
+    good = _resigned(_crl(key, names=key), key, _SHA1_WITH_RSA, hashes.SHA1())
+    forged = _resigned(_crl(other, names=key), other, _SHA1_WITH_RSA, hashes.SHA1())
+    control = _resigned(_crl(key, names=key), key, _SHA384_WITH_RSA, hashes.SHA384())
+
+    assert [s.state for s in judge_crl_signatures(control, ders)] == ["verified"]
+    assert [s.state for s in judge_crl_signatures(good, ders)] == ["uncheckable"]
+    assert [s.state for s in judge_crl_signatures(forged, ders)] == ["bad"]
+    verdict = crl_signature_refusal(good, ders)
+    assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
+
+    ca_file, crl_file = tmp_path / "ca.pem", tmp_path / "crl.pem"
+    ca_file.write_bytes(ca.public_bytes(_PEM))
+    crl_file.write_bytes(good)
+    assert _hop(ca_file, crl_file).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    crl_file.write_bytes(forged)
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        _hop(ca_file, crl_file)
+
+
+def test_a_version_that_logs_nothing_in_between_does_not_reset_the_record(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The record is touched only when there is a line to log. So a version that verifies, or
+    # one that is refused, leaves it alone, and the first version is not logged again. The
+    # control is the A, B, A test above, where the version in between warns and the count is 3.
+    with caplog.at_level("WARNING"):
+        first = twins.write_crl("new", None)  # unproven on a hop that lists the old CA
+        twins.hop("old")
+        twins.write_crl("old", "old")  # verifies
+        twins.hop("old")
+        twins.write_crl("stranger", "old")  # proven bad
+        with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+            twins.hop("old")
+        twins.crl.write_bytes(first)
+        twins.hop("old")
+    assert len(_warnings(caplog)) == 1
+
+
+def test_a_crl_that_reaches_a_hop_through_its_ca_file_alone_is_not_signature_checked(
+    twins: _Twins, tmp_path: Path
+) -> None:
+    """The start check judges the bytes of the CRL setting's file and nothing else. A forged CRL
+    that names the listed CA's key refuses the start from the CRL setting, and loads from the CA
+    file. It is in use there: the handshake fails on it."""
+    forged = _crl(twins.stranger, names=twins.new_key)
+    bundle = tmp_path / "ca-and-crl.pem"
+    bundle.write_bytes(twins.new_ca.read_bytes() + forged)
+    # The CRL setting holds another issuer's CRL, which only turns revocation checking on.
+    twins.crl.write_bytes(_crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME))
+
+    hop = _hop(bundle, twins.crl)  # builds: the forged CRL in the CA file is not judged
+    assert hop.cert_store_stats()["crl"] == 2
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(hop, twins.server(sends_renewed=False))
+
+    # Controls. The same CRL in the CRL setting refuses. So does the same CA file once a CRL
+    # setting names it, which is why the guide says "through its CA file alone".
+    twins.crl.write_bytes(forged)
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        twins.hop("new")
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        _hop(bundle, bundle)

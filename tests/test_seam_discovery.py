@@ -192,14 +192,19 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     there by then, and ``OidcStepUp`` in ``routes/oidc.py`` was new since the filing too.
 
     Vault BACKLOG #2625 added the five constants of the injection and bulk lanes the console has a
-    route for (resend, edit-resend, upload resend, purge, reload)."""
+    route for (resend, edit-resend, upload resend, purge, reload).
+
+    Vault BACKLOG #3198 added ``LoginOutcome``, whose ``flow_consumed`` the ``/ui/oidc`` callback
+    reads, and with it ``RolesGained``, the type of one of its fields."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "Elevation",
         "FEDERATED_BINDING_CHANGED",
+        "LoginOutcome",
         "MfaStatus",
         "NotifyEmailAlreadySet",
         "OidcStepUp",
+        "RolesGained",
         "STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY",
         "STEP_UP_ACTION_ADMIN_RESET_MFA",
         "STEP_UP_ACTION_ADMIN_RESET_PASSWORD",
