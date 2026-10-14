@@ -3089,34 +3089,36 @@ class AdMapSql(NamedTuple):
     insert: str
 
 
-# SQLite's statements for each AD directory map. Postgres and SQL Server carry their own.
-_AD_MAP_SQL: Final[Mapping[str, AdMapSql]] = MappingProxyType(
-    {
-        AD_ROLE_MAP: AdMapSql(
-            read=(
-                "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal"
-                " WHERE name=?"
-                " UNION ALL"
-                " SELECT 'pair' AS k, m.ad_group AS a, m.role_id AS b, r.id IS NOT NULL AS live"
-                " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
-            ),
-            pairs="SELECT ad_group, role_id FROM ad_group_role_map",
-            clear="DELETE FROM ad_group_role_map",
-            insert="INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
-        ),
-        AD_SCOPE_MAP: AdMapSql(
-            read=(
-                "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal"
-                " WHERE name=?"
-                " UNION ALL"
-                " SELECT 'pair' AS k, ad_group AS a, channel AS b, 1 AS live FROM ad_group_scope_map"
-            ),
-            pairs="SELECT ad_group, channel FROM ad_group_scope_map",
-            clear="DELETE FROM ad_group_scope_map",
-            insert="INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)",
-        ),
-    }
+# SQLite's statements for each AD directory map, the twins of the ``AdMapSql`` tables Postgres and
+# SQL Server carry. Each is a plain named string, and each call site names one directly, because
+# ``tests/test_writer_txn_is_the_only_begin.py`` reads every ``execute`` argument in this module as
+# text and pins how many it cannot read; a statement looked up in a table at run time is one it
+# cannot. ``_AD_*_READ`` is used only by ``get_ad_map``, the rest only by ``_write_ad_map``.
+_AD_ROLE_MAP_READ: Final = (
+    "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal WHERE name=?"
+    " UNION ALL"
+    " SELECT 'pair' AS k, m.ad_group AS a, m.role_id AS b, r.id IS NOT NULL AS live"
+    " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
 )
+_AD_ROLE_MAP_PAIRS: Final = "SELECT ad_group, role_id FROM ad_group_role_map"
+_AD_ROLE_MAP_CLEAR: Final = "DELETE FROM ad_group_role_map"
+_AD_ROLE_MAP_INSERT: Final = "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)"
+_AD_SCOPE_MAP_READ: Final = (
+    "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal WHERE name=?"
+    " UNION ALL"
+    " SELECT 'pair' AS k, ad_group AS a, channel AS b, 1 AS live FROM ad_group_scope_map"
+)
+_AD_SCOPE_MAP_PAIRS: Final = "SELECT ad_group, channel FROM ad_group_scope_map"
+_AD_SCOPE_MAP_CLEAR: Final = "DELETE FROM ad_group_scope_map"
+_AD_SCOPE_MAP_INSERT: Final = "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)"
+
+
+def _is_role_map(name: str) -> bool:
+    """Whether ``name`` is the role map rather than the channel map; any other name raises, so a
+    caller can branch on the answer without an unknown name falling through to the channel map."""
+    if name not in AD_MAPS:
+        raise KeyError(name)
+    return name == AD_ROLE_MAP
 
 
 def report_unsealed_role_records(count: int) -> None:
@@ -15009,7 +15011,10 @@ class MessageStore:
 
     async def get_ad_map(self, name: str) -> AdMap:
         async with self._read() as db:
-            cur = await db.execute(_AD_MAP_SQL[name].read, (name,))
+            if _is_role_map(name):
+                cur = await db.execute(_AD_ROLE_MAP_READ, (name,))
+            else:
+                cur = await db.execute(_AD_SCOPE_MAP_READ, (name,))
             return AdMap.from_rows(name, await cur.fetchall())
 
     async def list_ad_group_role_map(self) -> list[aiosqlite.Row]:
@@ -15032,10 +15037,14 @@ class MessageStore:
         open write transaction. Reads the map, applies ``change`` and writes the result, sealed;
         :func:`ad_map_write` says when it refuses, raising :class:`RowSealError` and writing
         nothing. Returns whether anything was written."""
-        sql = _AD_MAP_SQL[name]
+        # Each statement is named at its call, not looked up; the module constants say why.
+        role = _is_role_map(name)
         cur = await self._db.execute("SELECT seal FROM authority_set_seal WHERE name=?", (name,))
         seal_row = await cur.fetchone()
-        cur = await self._db.execute(sql.pairs)
+        if role:
+            cur = await self._db.execute(_AD_ROLE_MAP_PAIRS)
+        else:
+            cur = await self._db.execute(_AD_SCOPE_MAP_PAIRS)
         current = AdMap.of(
             name,
             [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
@@ -15045,9 +15054,14 @@ class MessageStore:
         if new is None:
             return False
         if new.pairs != current.pairs:
-            await self._db.execute(sql.clear)
-            for pair in new.pairs:
-                await self._db.execute(sql.insert, pair)
+            if role:
+                await self._db.execute(_AD_ROLE_MAP_CLEAR)
+                for pair in new.pairs:
+                    await self._db.execute(_AD_ROLE_MAP_INSERT, pair)
+            else:
+                await self._db.execute(_AD_SCOPE_MAP_CLEAR)
+                for pair in new.pairs:
+                    await self._db.execute(_AD_SCOPE_MAP_INSERT, pair)
         await self._db.execute(
             "INSERT INTO authority_set_seal (name, seal) VALUES (?,?)"
             " ON CONFLICT(name) DO UPDATE SET seal=excluded.seal",

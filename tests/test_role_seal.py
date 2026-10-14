@@ -372,7 +372,10 @@ def test_the_service_reads_roles_and_the_maps_through_its_loaders() -> None:
 _SEALING: dict[str, dict[str, frozenset[str]]] = {
     "store.py": {
         "_ROLE_UPSERT": frozenset({"_write_role"}),
-        "_AD_MAP_SQL": frozenset({"get_ad_map", "_write_ad_map"}),
+        "_AD_ROLE_MAP_CLEAR": frozenset({"_write_ad_map"}),
+        "_AD_ROLE_MAP_INSERT": frozenset({"_write_ad_map"}),
+        "_AD_SCOPE_MAP_CLEAR": frozenset({"_write_ad_map"}),
+        "_AD_SCOPE_MAP_INSERT": frozenset({"_write_ad_map"}),
     },
     "postgres.py": {
         "_PG_ROLE_UPSERT": frozenset({"_write_role"}),
