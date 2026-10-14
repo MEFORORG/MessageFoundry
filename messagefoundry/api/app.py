@@ -5720,12 +5720,12 @@ def create_app(
         ``content`` or ``field_value``. Each route checks its criteria with :func:`_export_spec` and
         spends the export proof before it calls this (owner ruling 2026-10-13, #3241 R2), so a
         search selection arrives as ``spec`` and a malformed one cost no proof."""
-        # #200 (ADR 0092): a bulk-PHI read behind step-up (NOT require_phi_read), so apply the data-path
-        # hop guard explicitly before any body is decrypted — exactly as the step-up search route does.
-        enforce_phi_read_hop(request)
-        # Charged BEFORE selection: step-up pacing is NON-GET only, so without this a single actor can
-        # stream far more bodies per minute through the export GET than the per-actor budget allows
-        # through /messages/{id}/raw. Admission-time so a refused call does no store work. The POST shape
+        # #200 (ADR 0092): the data-path hop guard runs in each export route, before its spend
+        # (owner ruling 2026-10-13, #3241 R2), so it has run before any body is decrypted here.
+        # Charged BEFORE selection, and after the spend, so a refused proof is charged nothing.
+        # Step-up pacing is NON-GET only, so without this a single actor can stream far more bodies
+        # per minute through the export GET than the per-actor budget allows through
+        # /messages/{id}/raw. Admission-time so a refused call does no store work. The POST shape
         # draws on this same PHI-read bucket (its admin-write charge is a different, stricter one).
         enforce_phi_read_pacing(request, identity)
         allowed = _scope(identity)  # per-channel RBAC (None = all)
@@ -5855,10 +5855,6 @@ def create_app(
             headers={"Content-Disposition": 'attachment; filename="messages-export.ndjson"'},
         )
 
-    # LARGEST PHI surface in the cluster (bulk raw bodies → a file), on both shapes: the strongest
-    # interactive gate — a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated
-    # messages:export capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one
-    # message.
     def _export_spec(
         ids: list[str],
         *,
@@ -5885,6 +5881,10 @@ def create_app(
         except ContentSearchError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    # LARGEST PHI surface in the cluster (bulk raw bodies → a file), on both shapes: the strongest
+    # interactive gate — a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated
+    # messages:export capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one
+    # message.
     @app.get("/messages/export")
     async def export_messages_get(
         request: Request,
@@ -5913,6 +5913,7 @@ def create_app(
         operator-typed needle is PHI-shaped and a query string is logged in three places the redactor
         cannot reach. Send a needle-bearing save-all to ``POST /messages/export``. Message ids stay —
         they are engine-minted opaque identifiers, not patient data."""
+        enforce_phi_read_hop(request)
         spec = _export_spec(ids, field_path=field_path, target=target, scan_limit=scan_limit)
         await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EXPORT)
         return await export_messages(
@@ -5944,6 +5945,7 @@ def create_app(
     ) -> StreamingResponse:
         """The needle-bearing shape of the export above (BACKLOG #1184): same gate, same per-row channel
         re-check, same pre-stream audit — the selection criteria arrive in the request BODY."""
+        enforce_phi_read_hop(request)
         spec = _export_spec(
             criteria.ids,
             content=criteria.content,
@@ -6548,8 +6550,27 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(
-            require_step_up_action(STEP_UP_ACTION_MESSAGE_EDIT_RESEND, Permission.MESSAGES_EDIT)
+            require_step_up_action(
+                STEP_UP_ACTION_MESSAGE_EDIT_RESEND, Permission.MESSAGES_EDIT, proof_in_route=True
+            )
         ),
+    ) -> EditResendResult:
+        """The route over :func:`_edit_resend_core`. Its proof is spent HERE, after FastAPI has
+        validated the body, so a 422 costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); the
+        core gives the proof back for a refusal it raises before its store write. The console calls
+        the core in-process after its own spend."""
+        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+        return await _edit_resend_core(
+            message_id, body=body, engine=engine, identity=identity, request=request
+        )
+
+    async def _edit_resend_core(
+        message_id: str,
+        *,
+        body: EditResendRequest,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
     ) -> EditResendResult:
         """Edit a stored message and resubmit the EDITED body (ADR 0090 §9, BACKLOG #153). The edit is
         client-side + ephemeral (no server draft); this endpoint receives the final edited ``raw``. By
@@ -8893,7 +8914,7 @@ def create_app(
                 restart_connection=restart_connection,
                 replay_message=replay_message,
                 resend_message=resend_message,
-                edit_resend_message=edit_resend_message,
+                edit_resend_message=_edit_resend_core,
                 prior_resend=prior_resend,
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,

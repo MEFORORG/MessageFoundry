@@ -404,7 +404,7 @@ async def test_the_purge_confirm_page_holds_the_purge_proof(engine: Engine) -> N
 async def test_a_crafted_reauth_toward_an_unlock_page_mints_nothing_bound(engine: Engine) -> None:
     """Owner ruling 2026-10-13 (#3241 R3): /ui/reauth mints an unlock page's grant only when a gate
     issued that page to this session. A link straight to /ui/reauth?next=<unlock page> still
-    re-authenticates and lands on the page, which then asks again, with nothing bound."""
+    re-authenticates, then ends on the page that says nothing ran, with nothing bound."""
     service = await auth_service(engine)
     await provision(service, "op", [Role.OPERATOR.value])
     page = "/ui/connections/purge-confirm"
@@ -413,18 +413,32 @@ async def test_a_crafted_reauth_toward_an_unlock_page_mints_nothing_bound(engine
         crafted = await c.post(
             "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
         )
-        assert crafted.status_code == 303 and crafted.headers["location"] == page
-        assert _reauth_next(await c.get(page)) == page  # no grant: the page asks again
+        assert crafted.status_code == 200 and "Nothing ran" in crafted.text
         # CONTROL: the gate's own refusal issues the page, and the same re-auth then mints.
         assert _reauth_next(await c.get(page)) == page
         issued = await c.post(
             "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
         )
-        assert issued.status_code == 303
+        assert issued.status_code == 303 and issued.headers["location"] == page
         assert (await c.get(page)).status_code == 200
-        # One issue mints one grant: the purge spends it, and a second re-auth with no new refusal
-        # in between mints nothing.
-        ran = await c.post("/ui/connections/OB_X/purge/all", headers=SAME_ORIGIN)
-        assert _reauth_next(ran) is None
-        await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
-        assert _reauth_next(await c.get(page)) == page
+
+
+async def test_a_link_opened_from_outside_the_browser_issues_nothing(engine: Engine) -> None:
+    """A GET with ``Sec-Fetch-Site: none`` (a typed URL, a bookmark, a link in an email) is refused
+    without issuing the page, so a crafted link to the page itself pre-arms nothing. The page asks
+    again, and the console's own navigation then issues it."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        outside = await c.get(page, headers={"Sec-Fetch-Site": "none"})
+        assert _reauth_next(outside) == page
+        r = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert r.status_code == 200 and "Nothing ran" in r.text
+        # CONTROL: the same refusal from the console's own navigation issues it.
+        inside = await c.get(page, headers={"Sec-Fetch-Site": "same-origin"})
+        assert _reauth_next(inside) == page
+        r = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert r.status_code == 303 and r.headers["location"] == page
+        assert (await c.get(page)).status_code == 200

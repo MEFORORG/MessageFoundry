@@ -345,8 +345,10 @@ _BEFORE_THE_SPEND = frozenset(
         "_reload_hold_params",
         "_rejoin_without_proof",
         "_held_reply",
-        # The export's own input check (owner ruling 2026-10-13, #3241 R2): pure, it reads nothing.
+        # The export's own input check and its hop refusal (owner ruling 2026-10-13, #3241 R2):
+        # neither reads a store or writes anything.
         "_export_spec",
+        "enforce_phi_read_hop",
         "_scan_limit_or_default",
     }
 )
@@ -365,6 +367,7 @@ def test_each_proof_in_route_route_spends_before_it_holds_or_runs_anything() -> 
         "reload_config",
         "export_messages_get",
         "export_messages_post",
+        "edit_resend_message",
     }, sorted(routes)
     for name, func in routes.items():
         spend_at = next(

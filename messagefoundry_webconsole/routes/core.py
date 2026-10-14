@@ -1452,7 +1452,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         # Held, not spent, in the gate (vault BACKLOG #2625): the grant is spent below, after this
         # route's own input checks, so a refusal of those (direct mode with no outbound, an invalid
-        # body) costs the operator no proof. A refusal from the engine handler comes after the
+        # body) costs the operator no proof. A refusal the engine handler raises before its store
+        # write gives the proof back (owner ruling 2026-10-13, #3241 R1); any later one keeps the
         # spend, so the next submit asks again and re-opens the editor from the stored body.
         identity: Identity = Depends(
             require_ui_step_up_action(
@@ -1534,8 +1535,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         except HTTPException as exc:
             # A refused resubmit drops its spend record BEFORE the two audited reads in _reject,
-            # so a repeat waiting on it is answered at once, and the editor _reject re-renders
-            # with the same key asks for a proof again on the next submit.
+            # so a repeat waiting on it is answered at once. A refusal the engine raised before
+            # its store write has given the proof back (owner ruling 2026-10-13, #3241 R1), so the
+            # re-rendered editor's next submit asks for none; any other refusal kept the spend,
+            # and that submit asks for a proof again.
             settle_ui_action_step_up(spend, refused=True, refusal=exc)
             # str(exc.detail) carries ids only (the endpoint never interpolates the body).
             return await _reject(str(exc.detail))
@@ -1956,11 +1959,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # The issue is spent under the pre-rotation token, the key it still sits under, and then
         # the session's OTHER issued entries follow the rotation -- before any branch returns, so
         # an unlock re-auth in one tab does not strand an action another tab is confirming.
-        # An unlock page's issue is spent too (owner ruling 2026-10-13, #3241 R3), so one
-        # issue mints one grant.
+        # An unlock page that binds an action continues only when it was issued (owner ruling
+        # 2026-10-13, #3241 R3); its issue is read, not spent (consume_continuation says why). An
+        # unissued one ends on the page that says nothing ran, which is what the re-auth form told
+        # the operator. A window-only unlock page always continues; it has no grant to pre-arm.
         issued = consume_continuation(pre_rotation, next_)
         rekey_continuations(pre_rotation, token)
-        if is_unlock_action(next_):
+        if is_unlock_action(next_) and (issued or action.action is None):
             return _keep_session(RedirectResponse(next_, status_code=303), token)
         if issued:
             return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)

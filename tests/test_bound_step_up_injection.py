@@ -465,3 +465,28 @@ async def test_a_malformed_export_costs_no_proof(
         assert ok.status_code == 200 and _past_the_step_up(ok), (ok.status_code, ok.text)
         again = await _call(c, token, method, "/messages/export", good[0], good[1])
         assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EXPORT), "the export spent its proof"
+
+
+async def test_an_edit_resend_body_the_framework_refuses_costs_no_proof(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The edit-resend proof is spent in the route, after FastAPI validated the body (owner ruling
+    2026-10-13, #3241 R1 and R2), so a 422 leaves it for the corrected request."""
+    service = await _service(engine)
+    await _add(service, "adm", [Role.ADMINISTRATOR.value])
+    async with _client(engine, service, tmp_path) as c:
+        token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+        bad = await _call(
+            c, token, "POST", f"/messages/{NO_SUCH}/edit-resend", {"idempotency_key": "k1"}, None
+        )
+        assert bad.status_code == 422 and _past_the_step_up(bad), bad.status_code
+        # The same proof still opens the route: the unknown message is the handler's 404.
+        ok = await _call(
+            c,
+            token,
+            "POST",
+            f"/messages/{NO_SUCH}/edit-resend",
+            {"raw": ADT, "idempotency_key": "k1"},
+            None,
+        )
+        assert ok.status_code == 404 and _past_the_step_up(ok), ok.status_code

@@ -38,7 +38,7 @@ register_ui_action(
     Permission.APPROVALS_APPROVE,
     auto_retry=False,
     unlock=True,
-    label="Record the outcome of an interrupted release",
+    label="Return to the approvals page to approve or resolve a request",
 )
 
 

@@ -1073,18 +1073,25 @@ def continuation_issued(token: str | None, next_path: str) -> bool:
 
 
 def consume_continuation(token: str | None, next_path: str) -> bool:
-    """Spend the continuation issued to this session for ``next_path``; True only once."""
+    """Spend the continuation issued to this session for ``next_path``; True only once.
+
+    An unlock page's issue is NOT spent, only read: it lapses on its TTL. Spending it would strand
+    a retry after a refused federated step-up, whose start spends the issue before the IdP answers
+    (owner ruling 2026-10-13, #3241 R3)."""
+    if is_unlock_action(next_path):
+        return _ISSUED_CONTINUATIONS.issued(token, next_path)
     return _ISSUED_CONTINUATIONS.consume(token, next_path)
 
 
 def continues_after_reauth(action: UiWriteAction, token: str | None, next_path: str) -> bool:
     """Whether a re-auth for ``next_path`` continues to it, and so mints the grant its action names:
-    only when a gate issued it to this session, for an ``auto_retry`` action (vault BACKLOG #2764)
-    and for an ``unlock`` page alike (owner ruling 2026-10-13, #3241 R3). A crafted
-    ``/ui/reauth?next=<unlock page>`` therefore mints nothing bound; the re-auth still sends the
-    browser to the page, which then asks again. Ask it of the CURRENT token; a ceremony rotates.
-    ``action`` is kept for the callers' sake and decides nothing."""
-    del action
+    when a gate issued it to this session, for an ``auto_retry`` action (vault BACKLOG #2764) and for
+    an ``unlock`` page that binds an action alike (owner ruling 2026-10-13, #3241 R3). A crafted
+    ``/ui/reauth?next=<that page>`` therefore mints nothing bound. An unlock page that binds no
+    action (a window-only form) still always continues: there is no grant to pre-arm, and the
+    re-auth only sends the browser back to it. Ask it of the CURRENT token; a ceremony rotates."""
+    if action.unlock and action.action is None:
+        return True
     return continuation_issued(token, next_path)
 
 
@@ -1115,7 +1122,11 @@ def _issue_continuation(request: Request, next_path: str) -> None:
     * an ``unlock`` page on either method (owner ruling 2026-10-13, #3241 R3). Opening the page is a
       GET, and a gate refusing it is what issues it; the re-auth toward it then mints its grant. A
       cross-site link carries no SameSite=Strict cookie, and the origin check refuses a cross-site or
-      same-site GET, so only the operator's own navigation issues one."""
+      same-site GET. A GET with ``Sec-Fetch-Site: none`` issues nothing either: that is a typed URL,
+      a bookmark, or a link opened from outside the browser, such as one in an email, and a crafted
+      link of that kind must not pre-arm a grant. The page asks again, and the re-auth from the
+      console's own navigation then issues it. A client that sends no ``Sec-Fetch-Site`` at all is
+      judged by its ``Origin``, as the origin check judges it."""
     token = session_token(request)
     if (
         token
@@ -1123,7 +1134,12 @@ def _issue_continuation(request: Request, next_path: str) -> None:
         and len(next_path) <= _REAUTH_NEXT_MAX
         and (
             (request.method == "POST" and is_safe_ui_action(next_path))
-            or is_unlock_action(next_path)
+            or (
+                is_unlock_action(next_path)
+                and not (
+                    request.method == "GET" and request.headers.get("sec-fetch-site") == "none"
+                )
+            )
         )
         and _request_is_same_origin(request)
     ):
@@ -1138,9 +1154,10 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     deliberately not a registered continuation). Either way the value is only ever *acted on* after
     ``/ui/reauth`` re-validates it against the write-action registry, so a bad override fails closed.
 
-    An ``auto_retry`` continuation is also RECORDED against this session (vault BACKLOG #2764, see
-    :class:`_IssuedContinuations`); ``/ui/reauth`` auto-submits only a recorded one. The ``next`` in
-    the URL stays what it was, so the record, not the URL, is what authorises the auto-submit.
+    The continuation is also RECORDED against this session (vault BACKLOG #2764, and for an unlock
+    page owner ruling 2026-10-13, #3241 R3; see :func:`_issue_continuation`). ``/ui/reauth``
+    auto-submits, or mints an unlock page's grant, only for a recorded one. The ``next`` in the URL
+    stays what it was, so the record, not the URL, is what authorises it.
     """
     target = next_path if next_path is not None else request.url.path
     _issue_continuation(request, target)

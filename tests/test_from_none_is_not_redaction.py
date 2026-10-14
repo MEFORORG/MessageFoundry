@@ -249,11 +249,11 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + _NOTHING_WITHHELD + "; the store's messages carry ids, never a body",
     ),
     _Allowed(
-        f"{_APP}.edit_resend_message::KeyError" + _HTTP,
+        f"{_APP}._edit_resend_core::KeyError" + _HTTP,
         _SAFE + "KeyError carries the outbound name, which the 404 detail also quotes",
     ),
     _Allowed(
-        f"{_APP}.edit_resend_message::ResendError" + _HTTP,
+        f"{_APP}._edit_resend_core::ResendError" + _HTTP,
         _SAFE + _NOTHING_WITHHELD + "; the store's messages carry ids, never a body",
         count=2,
     ),
