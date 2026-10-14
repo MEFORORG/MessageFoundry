@@ -868,7 +868,11 @@ distinguished name, and the group read needs a DN.
 
 These probes add read-only calls the engine does not otherwise make: the token self-lookup, the
 capabilities read, Who am I and one read of the bind account's own entry. Each goes through the
-client the engine builds for that hop, with its TLS, trust anchor and cleartext refusal. Run the
+client the engine builds for that hop, with its TLS, trust anchor and cleartext refusal. A Vault
+probe is also held to that hop's revocation rule, with the hop's own
+`vault_revocation_attested` pair and this command's posture (vault BACKLOG #2983). So it reaches
+an off-box `https://` Vault only where `serve` would, and otherwise reports the hop as not
+observed, with the refusal. Run the
 command with the service's environment, so the Vault tokens and the AD bind password are the
 engine's own:
 

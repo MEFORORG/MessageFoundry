@@ -18,6 +18,9 @@
   as of 2026-10-02. §7.1 says which rows each covers. The five ODBC rows are a named gap by owner
   ruling since 2026-10-05, and their driver test is BACKLOG #3009. The paragraph below §7.1's ODBC
   table holds the ruling's limits.
+  **The three Vault hops §7.1 graded *a guard is possible* are guarded as of 2026-10-13, by owner
+  ruling of that date (vault BACKLOG #2983).** Each refuses unless its own settings pair attests,
+  and no CRL lever is built. §12 holds the ruling and its limits.
   **A hop §7.1 never found has no tracker,**
   including any no-context hop beyond those #2194 lists. The two defects on rows §7.1 grades
   *Guarded*, #2188 and #2169, are built; the §4.3 note of 2026-10-04 says how. *(Corrected
@@ -42,8 +45,8 @@
 - **Date:** 2026-08-23 (ratified 2026-09-22)
 - **Deciders:** owner (ratified the accept half 2026-09-22, owner ruling; later owner rulings
   touch at least §1.5 item 4, 2026-09-24 on PR 1502, one §7.1 row, 2026-09-27, and the ODBC rows
-  of §7.1's 2026-10-04 note, 2026-10-05, with the limits stated below that note's table) · security
-  working group
+  of §7.1's 2026-10-04 note, 2026-10-05, with the limits stated below that note's table, and the
+  three Vault rows of that note, 2026-10-13, in §12) · security working group
 - **Related:** **extends [ADR 0078](0078-certificate-revocation-posture.md)** (Accepted 2026-07-10,
   owner-ratified — that ADR made the `[api]` in-process delegation an *enforced* start-time refusal;
   this one grades the two remaining directions and records why one of them is unbuildable) ·
@@ -1047,6 +1050,8 @@ of the list above:
 - *No revocation check, a guard is possible* is an unguarded verifying hop. Section 4.3's default
   for one is *Needs a guard*, and the LDAPS row above carries that grade with no CRL setting
   reaching it either. These rows read *Needs a guard, tracked by* an item once one names them.
+  *(Since 2026-10-13 no row in this note carries this grade. The three Vault rows read *Guarded
+  by attestation*, which §12 defines.)*
 - The weakened arms the rows mention are *Verify-off* in the list's terms, and need no decision.
 
 | Hop (file, symbol) | What crosses | How it verifies the peer | Revocation check | Grade |
@@ -1056,9 +1061,9 @@ of the list above:
 | DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS keyword, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
 | `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **No revocation check, a guard is possible** |
-| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **No revocation check, a guard is possible** |
-| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **No revocation check, a guard is possible** |
+| Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
+| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
+| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits |
 
 **The ODBC hops are a named gap by owner ruling, and the driver test is still owed.** BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
@@ -1116,7 +1121,11 @@ chosen option gives for building no guard:
   off-loopback hop under `enforce`, unless a new lever were built with it. No declared egress
   terminator exists for these hops either.
 
-**What is open on the three Vault hops.** The context exists, so a guard could read it, as
+**What is open on the three Vault hops.** *(Built on 2026-10-13, under vault BACKLOG #2983;
+§12 is the record. This paragraph and its two facts are kept as written. Fact 1 no longer holds:
+each caller that holds a posture now hands it down. Fact 2's first sentence still holds. Its
+second does not: each hop now has an attestation pair.)* The context exists, so a guard could
+read it, as
 `_refuse_store_revocation` does for the PostgreSQL store. Two facts shape that build (*code*):
 
 1. **The providers hold no hop posture.** They are built from the environment.
@@ -1133,7 +1142,9 @@ chosen option gives for building no guard:
 BACKLOG #2194 says a hop that can take a guard gets a line in BACKLOG #2193. That line has not been
 added: #2193's checklist names none of these three. Until it is, #2194 stays open and is the item
 that holds these rows. So the Status line still holds where it says every open row here has a
-tracker, #2193 or #2194.
+tracker, #2193 or #2194. *(Since 2026-10-05 the three Vault rows have had a tracker of their
+own, vault BACKLOG #2983, and §12 records its build. Whether #2194 can now close is that row's
+question, and this file does not answer it.)*
 
 **The store's `ssl_root_cert` pin bears on this grading, and is not fixed here.**
 `connection_string` emits `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`
@@ -1152,12 +1163,14 @@ DIRECT; §11 lists the edit.)* Add these rows to it:
 - Five more rows are a named gap by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`, with no
   guard built. The paragraph below the table names the ruling's limits. *(Until 2026-10-11 this
   read "Five more rows wait on an owner answer, beside DIRECT.")*
-- Three more hops could take a guard, beside the seven BACKLOG #2193 tracks.
+- Three more hops could take a guard, beside the seven BACKLOG #2193 tracks. *(Since 2026-10-13
+  those three, the Vault hops, are guarded by attestation; §12.)*
 - The ODBC drivers' own revocation behaviour is still not established. BACKLOG #3009 is the test.
 
 The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
 eight as "at least these", per SDS-3.6.** This note re-read the hops the list named. It did not
-search for other hops of the same shape, and it did not grade the Vault proxy leg.
+search for other hops of the same shape, and it did not grade the Vault proxy leg. *(§12 records
+that leg as a named gap.)*
 
 ## 8. Sources that are stale, and must not be cited as current
 
@@ -1253,3 +1266,91 @@ ruling's limits and what the test must show. Other places name the ruling and po
 BACKLOG #3009 has a result, it goes in that paragraph.
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
+
+## 12. Amendment 2026-10-13 -- the three Vault hops refuse unless attested, by owner ruling (vault BACKLOG #2983)
+
+**The ruling.** §7.1's note of 2026-10-04 graded three Vault hops *No revocation check, a guard
+is possible*: the store key provider, the Transit cipher and the connector secret provider. On
+2026-10-13 the owner chose, in session, the option labelled **"Per-hop attestation
+(Recommended)"**. Its description, verbatim: *"New typed settings
+[store].vault_revocation_attested and [secrets].vault_revocation_attested, each with a mandatory
+reason; the hop refuses under enforce unless set; unknown posture counts as enforcing; reported in
+the loosenings list; no CRL lever built. Nothing new is checked on the wire."*
+
+**The new grade.** The three rows now read *Guarded by attestation, by owner ruling 2026-10-13;
+no CRL lever is built*. It means the hop runs a revocation guard, and the only way across an
+enforcing instance is the operator's own reasoned claim. It is weaker than *Guarded* with a CRL
+setting, because nothing new is checked on the wire. The rows' *Revocation check* cells are
+unchanged for that reason: the handshake still checks no CRL and no OCSP.
+
+**What was built.** Locate each by symbol.
+
+- The guard is `_refuse_an_unrevoked_vault_hop` in `transports/strict_requests.py`. It decides
+  with the shared authority, `revocation_hop_disposition`. It does not use `RevocationHopGuard`,
+  whose refusal echoes the host: a Vault refusal is fixed text that names no part of the address.
+  So a search for `RevocationHopGuard` does not find this guard.
+- It runs when a Vault client is built and again before each send. A hop is on the box only when
+  it is a loopback host reached with no proxy, read from the address the client really dials.
+- The levers are `[store].vault_revocation_attested` and `[secrets].vault_revocation_attested`,
+  each with a mandatory `vault_revocation_attested_reason`. The `[store]` pair covers the key
+  provider and the Transit cipher, which share one Vault address.
+- The posture is handed down from each caller that holds one. **A caller that holds none is
+  judged as enforcing.** That is at least every command that opens a store with no posture. So on
+  an instance at `[security].enforcement = warn`, `serve` crosses an unattested off-box Vault
+  with a warning, and such a command still refuses it. `tests/test_vault_posture_census.py`
+  lists what each caller passes, and is the one place that list lives.
+- `check-privileges` builds its two Vault clients under the same rule, each with its own
+  section's pair.
+
+**No CRL lever is built.** The ruling chose that. It is a statement about this build, not about
+the hop: the engine builds the context each Vault handshake runs on, so a CRL could reach it. The
+guard already reads whether that context checks a CRL, off the context itself, for a hop that
+is not attested. So a later CRL build can start there. It must still change the guard in at
+least two places: the refusal text, which offers the attestation alone, and the attested
+crossing's line, which is written without reading the context and says no lever is built.
+
+**What the attestation can rest on.** Not on the engine. A short-lived Vault server certificate is
+the main honest basis. `docs/SECURITY-LOOSENING.md` holds the operator's version of this, and
+says which CA each hop trusts when its CA file is unset.
+
+**The process-wide variable.** `MEFOR_TLS_REVOCATION_ATTESTED` never crosses a Vault hop under an
+enforcing or unknown posture. On an instance that is not enforcing it turns the warning into a
+silent crossing, as it does on every hop the shared authority decides. No line is logged for that
+crossing.
+
+**What "reported" means here.** At least four things, and none is an `audit` table row that
+carries the reason, because a Vault hop can be dialled before any store is open.
+
+1. `security_loosenings()` names the set pair with its reason, so `security show` and
+   `GET /security/posture` list it, and the serve-time loosening WARNING prints it at each start.
+2. The start's `config_loaded` audit row lists the switch name, without the reason.
+3. A hop that crosses an enforcing or unknown posture on its attestation logs a WARNING with the
+   reason. A hop with no attestation that crosses on a warn posture logs a WARNING that names
+   the pair. Each is written once per process for each hop. **Two crossings on a warn instance
+   log nothing:** an attested hop, and a hop crossed on the process-wide variable.
+4. `messagefoundry check` lists each set pair on its `vault-revocation-attested` line.
+
+**Named gap: the proxy leg.** Through an `https://` proxy a Vault hop has a second TLS leg, to the
+proxy. Nothing checks revocation of the proxy's certificate, no guard judges that leg, and the
+attestation does not claim it. The Vault leg's own TLS, inside the tunnel, is what protects the
+token. This leg has no tracking item.
+
+**What vault BACKLOG #2983's closing items map to.**
+
+1. *Each hop runs the guard on the context it really dials with, under the same posture rule as
+   the other guarded hops.* Built, with one difference on purpose: an unknown posture refuses
+   here, where `RevocationHopGuard` does nothing.
+2. *A CRL can reach that context, or the refusal names the attestation alone.* **The ruling
+   decided this one**: the refusal names the attestation alone, and no CRL can reach the context.
+3. *A test per hop.* `tests/test_vault_revocation_hop_guard.py`.
+4. *§7.1 regrades the three rows, and #2194 is updated.* The rows are regraded here. Updating
+   #2194 is a ledger act and is not done in this file.
+
+**Where this amendment edited the file.** At least: the Status paragraph and the Deciders line;
+the three grade cells in §7.1, whose old grade is quoted once, at the top of this section; the
+note on the interim grade's definition; the "What is open on the three Vault hops" paragraph and
+the tracker paragraph after it; the counts list; and the last sentence of §7.1. Where it added
+words to older text, the older words are kept.
+
+**What this amendment does not do.** It adds no check on the wire, builds no CRL lever, and does
+not grade any hop §7.1 did not already name.

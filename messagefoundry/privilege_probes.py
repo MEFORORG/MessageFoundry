@@ -6,7 +6,8 @@ ASVS 13.2.2).
 :mod:`messagefoundry.privilege_check` is pure and judges what these return; this module is the half
 that touches the network. Each probe goes through the client the engine already builds for that hop,
 so it carries the same TLS narrowing, trust anchor, redirect refusal and cleartext refusal, and adds
-no client of its own:
+no client of its own. A Vault probe is also held to that hop's revocation rule, with the hop's own
+attestation and the command's posture (vault BACKLOG #2983):
 
 * **Vault**, per token: ``GET /v1/auth/token/lookup-self`` for the token's policies, TTL and
   renewability, then one ``POST /v1/sys/capabilities-self`` for the exact paths the engine calls
@@ -27,6 +28,7 @@ and the TLS-suite assertion raise those). It never carries a server's error body
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 from collections.abc import Callable, Mapping
@@ -237,9 +239,18 @@ def read_vault_token(
     )
 
 
-def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
+def probe_vault(
+    consumer: VaultConsumer, settings: ServiceSettings, *, posture: HopPosture | None = None
+) -> VaultTokenReading:
     """Read the token behind one Vault consumer, with the client and paths of the provider that
-    uses it. Imports lazily, as the providers do, so the command stays light without Vault."""
+    uses it. Imports lazily, as the providers do, so the command stays light without Vault.
+
+    Each client is held to its hop's revocation rule, as the provider's own client is (vault
+    BACKLOG #2983). ``settings`` supplies the hop's own attestation: the ``[secrets]`` pair for
+    the connector-secret client and the ``[store]`` pair for the store client. ``posture`` is
+    the instance posture, and ``None`` counts as enforcing. So the probe reaches an off-box
+    ``https://`` Vault exactly where ``serve`` would, and a refusal names a setting this path
+    reads."""
     kind = consumer.kind
     if kind == "kv":
         from messagefoundry.config.secretprovider_vault import (
@@ -252,7 +263,12 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
         return read_vault_token(
             secrets_vault_token,
             secrets_vault_address,
-            secrets_vault_client,
+            functools.partial(
+                secrets_vault_client,
+                revocation_attested=settings.secrets.vault_revocation_attested,
+                revocation_reason=settings.secrets.vault_revocation_attested_reason,
+                posture=posture,
+            ),
             lambda: kv_required_capabilities(consumer.refs),
         )
     from messagefoundry.store.keyprovider_vault import (
@@ -262,18 +278,24 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
         store_vault_token,
     )
 
+    store_client = functools.partial(
+        store_vault_client,
+        revocation_attested=settings.store.vault_revocation_attested,
+        revocation_reason=settings.store.vault_revocation_attested_reason,
+        posture=posture,
+    )
     if kind == "transit":
         from messagefoundry.store.crypto_transit import transit_cipher_required_capabilities
 
         return read_vault_token(
             store_vault_token,
             store_vault_address,
-            store_vault_client,
+            store_client,
             transit_cipher_required_capabilities,
         )
     if kind == "kek":
         return read_vault_token(
-            store_vault_token, store_vault_address, store_vault_client, kek_required_capabilities
+            store_vault_token, store_vault_address, store_client, kek_required_capabilities
         )
     # Unreachable while VaultKind has three members; a fourth must be routed here, not defaulted.
     raise ValueError(f"no Vault probe for consumer kind {kind!r}")
@@ -307,7 +329,7 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
                 )
         authenticator = LdapAuthenticator(
             settings.auth,
-            secret_provider=resolve_secret_provider(settings.secrets),
+            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             posture=posture,
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
         )

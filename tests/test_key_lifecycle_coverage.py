@@ -130,6 +130,9 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/store/queue_tag.py": frozenset({_DEK}),
     "messagefoundry/store/backup_codec.py": frozenset({_DEK}),
     "messagefoundry/store/keyprovider_vault.py": frozenset({_DEK}),
+    # The provider dispatch and the built-in env and DPAPI providers, which source the DEK. In the
+    # inventory since vault BACKLOG #2983, for a type-only import of HopPosture.
+    "messagefoundry/store/keyprovider.py": frozenset({_DEK}),
     "messagefoundry/store/crypto_transit.py": frozenset({_DEK}),
     "messagefoundry/store/base.py": frozenset({_DEK}),
     "messagefoundry/store/store.py": frozenset({_DEK}),
@@ -225,6 +228,12 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/config/secretprovider_vault.py": "reads connector credentials from Vault KV over "
     "a verifying hop; the Vault token is a credential in the rotation schedule, and a key it fetches "
     "is governed by the row for the setting it fills",
+    "messagefoundry/config/secretprovider.py": "the connector-secret provider dispatch: a credential "
+    "it resolves is governed by the rotation schedule, and it names HopPosture only to hand the "
+    "caller's posture to the provider it loads (vault BACKLOG #2983)",
+    "messagefoundry/pipeline/dr.py": "the DR coordinator holds no key: it hands the store settings "
+    "and the engine's posture to the cold-seed verify in pipeline/dr_backup.py, which resolves the "
+    "DEK (vault BACKLOG #2983)",
     "messagefoundry/privilege_probes.py": _KEYLESS + "; check-privileges reads each Vault "
     "token's own policies through the providers' client builders, and the token is a credential "
     "in the rotation schedule (BACKLOG #305)",

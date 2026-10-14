@@ -303,7 +303,9 @@ def test_control_leading_whitespace_on_an_https_address_is_still_accepted() -> N
     environment line can carry it."""
     from messagefoundry.config import secretprovider_vault
 
-    secretprovider_vault._build_client("  https://vault.synthetic.test:8200", _TOKEN)
+    secretprovider_vault._build_client(
+        "  https://vault.synthetic.test:8200", _TOKEN, revocation_attested=True
+    )
 
 
 # --- the proxy cases ------------------------------------------------------------------------------
@@ -344,7 +346,9 @@ def test_control_an_https_vault_behind_an_http_proxy_is_built(
     from messagefoundry.config import secretprovider_vault
 
     monkeypatch.setenv(variable, listener.url)
-    client = secretprovider_vault._build_client("https://vault.synthetic.test:8200", _TOKEN)
+    client = secretprovider_vault._build_client(
+        "https://vault.synthetic.test:8200", _TOKEN, revocation_attested=True
+    )
     # The send goes to the proxy, which hangs up on the CONNECT: a requests error, never the
     # refusal. Mutation: refuse any proxied hop at send time; red, InsecureHopRefused.
     with pytest.raises(requests.exceptions.RequestException):
@@ -360,7 +364,9 @@ def test_a_proxy_that_appears_after_construction_is_refused_before_sending(
     each send. Mutation: drop the send-time call; red, the request reaches the proxy."""
     from messagefoundry.config import secretprovider_vault
 
-    client = secretprovider_vault._build_client(f"http://127.0.0.1:{_closed_port()}", _TOKEN)
+    client = secretprovider_vault._build_client(
+        f"http://127.0.0.1:{_closed_port()}", _TOKEN, revocation_attested=False
+    )
     monkeypatch.setenv("HTTP_PROXY", listener.url)
     with pytest.raises(InsecureHopRefused, match="well-formed https://"):
         client.adapter.get("v1/secret/data/mefor/ad")
@@ -376,7 +382,7 @@ def test_an_http_vault_behind_an_https_proxy_still_names_that_leg(
 
     monkeypatch.setenv("HTTP_PROXY", "https://127.0.0.1:9")
     with pytest.raises(_FAIL_CLOSED, match=r"https:// proxy") as caught:
-        secretprovider_vault._build_client("http://127.0.0.1:9", _TOKEN)
+        secretprovider_vault._build_client("http://127.0.0.1:9", _TOKEN, revocation_attested=False)
     _assert_refused(caught)
 
 
@@ -400,7 +406,11 @@ def test_a_client_whose_address_cannot_be_read_is_refused(
 
     with pytest.raises(InsecureHopRefused, match="well-formed https://"):
         strict_requests.mount_strict_reply_adapter(
-            _Client(), connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+            _Client(),
+            connector="Vault test hop",
+            ssl_context_factory=ssl.create_default_context,
+            revocation_attested=True,
+            attestation_section="secrets",
         )
 
 
@@ -594,7 +604,7 @@ def test_control_an_https_vault_behind_these_proxies_is_built_and_sent(
     from messagefoundry.config import secretprovider_vault
 
     monkeypatch.setenv("HTTPS_PROXY", form.format(auth=_PROXY_AUTH, port=listener.port))
-    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN, revocation_attested=True)
     with pytest.raises(requests.exceptions.RequestException):
         client.adapter.get("v1/secret/data/mefor/ad")
     assert listener.connections >= 1
@@ -621,7 +631,7 @@ def test_a_credentialed_proxy_that_appears_after_construction_is_refused_before_
     arms."""
     from messagefoundry.config import secretprovider_vault
 
-    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN, revocation_attested=True)
     monkeypatch.setenv("HTTPS_PROXY", form.format(auth=_PROXY_AUTH, port=listener.port))
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL") as caught:
         client.adapter.get("v1/secret/data/mefor/ad")
@@ -639,7 +649,10 @@ def test_proxy_manager_for_refuses_on_its_own() -> None:
     from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
     adapter = StrictReplyAdapter(
-        connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+        connector="Vault test hop",
+        ssl_context_factory=ssl.create_default_context,
+        revocation_attested=True,
+        attestation_section="secrets",
     )
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
         adapter.proxy_manager_for(f"http://{_PROXY_AUTH}@127.0.0.1:3128")
@@ -662,7 +675,11 @@ def test_a_configured_credentialed_proxy_is_refused_at_construction(
     client = hvac.Client(url=_HTTPS_VAULT, token=_TOKEN, proxies={"https": proxy})
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
         strict_requests.mount_strict_reply_adapter(
-            client, connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+            client,
+            connector="Vault test hop",
+            ssl_context_factory=ssl.create_default_context,
+            revocation_attested=True,
+            attestation_section="secrets",
         )
     assert listener.connections == 0, "a socket reached the proxy"
 
@@ -702,7 +719,11 @@ def test_the_build_check_picks_the_proxy_the_send_picks(
 
     def mount() -> None:
         strict_requests.mount_strict_reply_adapter(
-            client, connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+            client,
+            connector="Vault test hop",
+            ssl_context_factory=ssl.create_default_context,
+            revocation_attested=True,
+            attestation_section="secrets",
         )
 
     if refused:
@@ -755,7 +776,7 @@ def test_an_https_vault_whose_proxy_lookup_fails_is_still_built(
     from messagefoundry.config import secretprovider_vault
 
     _failing_proxy_lookup(monkeypatch, error)
-    secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN, revocation_attested=True)
 
 
 @_LOOKUP_ERRORS
@@ -771,11 +792,11 @@ def test_an_http_vault_whose_proxy_lookup_fails_behaves_as_before(
     address = f"http://127.0.0.1:{_closed_port()}"
     if isinstance(error, ValueError):
         with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
-            secretprovider_vault._build_client(address, _TOKEN)
+            secretprovider_vault._build_client(address, _TOKEN, revocation_attested=True)
         _assert_refused(caught)
     else:
         with pytest.raises(type(error)):
-            secretprovider_vault._build_client(address, _TOKEN)
+            secretprovider_vault._build_client(address, _TOKEN, revocation_attested=True)
 
 
 def test_a_configured_credentialed_proxy_is_refused_before_sending(
@@ -785,7 +806,7 @@ def test_a_configured_credentialed_proxy_is_refused_before_sending(
     proxies requests merged for that request, so a per-request proxy is covered."""
     from messagefoundry.config import secretprovider_vault
 
-    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN, revocation_attested=True)
     # Where hvac.Client(proxies=...) keeps them for each request.
     client.adapter._kwargs["proxies"] = {"https": f"http://{_PROXY_AUTH}@127.0.0.1:{listener.port}"}
     with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
@@ -825,7 +846,7 @@ def test_two_proxies_an_https_vault_never_sends_a_proxy_credential_in_the_clear(
     from messagefoundry.config import secretprovider_vault
 
     credentialed, a, b = two_proxies
-    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN, revocation_attested=True)
     with pytest.raises(requests.exceptions.RequestException):
         client.adapter.get("v1/secret/data/mefor/ad")
     if credentialed == "HTTPS_PROXY":
@@ -848,7 +869,7 @@ def test_two_proxies_an_http_vault_is_refused_and_reaches_neither(
 
     _, a, b = two_proxies
     with pytest.raises(_FAIL_CLOSED) as caught:
-        secretprovider_vault._build_client(_REMOTE_HTTP, _TOKEN)
+        secretprovider_vault._build_client(_REMOTE_HTTP, _TOKEN, revocation_attested=True)
     _assert_refused(caught)
     _assert_names_no_proxy_part(str(caught.value), int(a.address.rsplit(":", 1)[1]))
     assert a.connections == 0 and b.connections == 0

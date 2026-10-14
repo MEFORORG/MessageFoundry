@@ -1831,7 +1831,7 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
     _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
     recorder = _Recorder()
     monkeypatch.setattr(
-        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
+        "messagefoundry.__main__._offline_security_notifier", lambda _settings, _posture: recorder
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
@@ -1859,7 +1859,7 @@ def test_cli_says_nobody_was_told_when_the_account_had_no_address(
     _keyed_store_with_roleless_account(db, key, email=None)
     recorder = _Recorder()
     monkeypatch.setattr(
-        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
+        "messagefoundry.__main__._offline_security_notifier", lambda _settings, _posture: recorder
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     assert (

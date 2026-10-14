@@ -278,7 +278,7 @@ class _Client:
 def _active_key_failure(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> str:
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
-    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token: _Client(exc))
+    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token, **_: _Client(exc))
     with pytest.raises(KeyProviderError) as caught:
         keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()
     return str(caught.value)

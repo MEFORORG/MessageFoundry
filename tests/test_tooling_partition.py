@@ -276,6 +276,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_sds_rule_ids_are_stable.py",
         # this file: it guards the partition, so it must run wherever the partition matters
         "test_tooling_partition.py",
+        # Reads every module under messagefoundry/ and harness/ and lists each call that hands a
+        # posture toward a Vault hop (vault BACKLOG #2983). What breaks it is a new caller in the
+        # engine, which arrives as an ENGINE diff. Its one import of a test module is how it
+        # shares that module's walk of the package.
+        "test_vault_posture_census.py",
     }
 )
 

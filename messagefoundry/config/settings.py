@@ -84,6 +84,7 @@ from messagefoundry.config.models import (
     Schedule,
     SignatureAlgorithm,
     StallThreshold,
+    _check_flag_with_reason,
     _check_hop_attestation,
 )
 from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
@@ -616,6 +617,37 @@ def _environment_dial_is_warn(env: Mapping[str, str]) -> bool:
     return bool(names) and all(env[name] == SecurityEnforcement.WARN.value for name in names)
 
 
+def _check_vault_revocation_attestation(flag: bool, reason: str | None, *, section: str) -> None:
+    """Load-validate one ``vault_revocation_attested`` pair (vault BACKLOG #2983, owner ruling
+    2026-10-13). ``section`` is ``store`` or ``secrets``.
+
+    The pair says *revocation of this Vault's server certificate is covered outside the engine*.
+    It is the only thing that crosses the revocation refusal on a Vault hop under
+    ``[security].enforcement = enforce``; no CRL lever is built for these hops. So it follows the
+    three rules every flag-plus-reason pair shares (``models._check_flag_with_reason``): a reason
+    without the flag, the flag without a reason, and a blank reason each refuse at load.
+
+    The reason is also refused when it holds a control character or a lone surrogate. It is
+    written into the loosening report, and so into the serve-time WARNING and the JSON of
+    ``GET /security/posture``. A CR or LF could forge a log line there, which is the rule
+    ``models.require_hop_reason`` holds a connection's reason to. A lone surrogate cannot be
+    encoded as UTF-8, so the route could not serialize its answer; an environment value with a
+    byte that is not UTF-8 decodes to one."""
+    flag_name = f"[{section}].vault_revocation_attested"
+    reason_name = f"[{section}].vault_revocation_attested_reason"
+    _check_flag_with_reason(
+        flag,
+        reason,
+        flag_name=flag_name,
+        reason_name=reason_name,
+        flag_means="attest revocation checking for this Vault hop",
+        why="say what covers revocation of the Vault server certificate (for example, that the "
+        "certificate is short-lived, with its lifetime), so the record says what was relied on",
+    )
+    if reason is not None and (has_control_char(reason) or has_lone_surrogate(reason)):
+        raise ValueError(f"{reason_name} must not contain control characters or lone surrogates")
+
+
 class StoreSettings(_Section):
     backend: StoreBackend = StoreBackend.SQLITE
 
@@ -779,6 +811,18 @@ class StoreSettings(_Section):
     # come from MEFOR_STORE_VAULT_* env. Names a *provider*, NOT key material → not a secret, never in
     # `_FILE_SECRET_KEYS`. Unknown values fail closed at `open_store`.
     cipher_provider: str = "aesgcm"
+    # Attest that revocation of the STORE Vault's server certificate is covered outside the engine
+    # (vault BACKLOG #2983, owner ruling 2026-10-13). It covers both store hops to that Vault: the
+    # `vault` key provider and the `vault_transit` cipher, which read one address
+    # (MEFOR_STORE_VAULT_ADDR). The engine verifies that certificate and checks no CRL and no OCSP, so
+    # an off-box Vault hop is REFUSED unless this is set. What the refusal keys on, and what the
+    # attestation can and cannot do, is stated once, on
+    # transports.strict_requests._refuse_an_unrevoked_vault_hop. Setting it adds no check on the
+    # wire. The reason is MANDATORY; a flag without one, a blank one, or a reason without the flag
+    # refuses at load. It is a LOOSENING: security_loosenings() names it, with the reason. Not a
+    # secret.
+    vault_revocation_attested: bool = False
+    vault_revocation_attested_reason: str | None = None
 
     # --- Offline uploaded-logs (BACKLOG #125/#126, ADR 0134) ----------------
     # Directory holding operator-uploaded diagnostic message files (browsed offline, decoupled from any
@@ -1141,6 +1185,14 @@ class StoreSettings(_Section):
                 "trust_server_certificate=false); with verification off the hop checks no "
                 "certificate, so revocation would NOT be checked."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _vault_revocation_attestation_pair(self) -> StoreSettings:
+        """The flag and its reason travel together; why is on the helper (vault BACKLOG #2983)."""
+        _check_vault_revocation_attestation(
+            self.vault_revocation_attested, self.vault_revocation_attested_reason, section="store"
+        )
         return self
 
     @model_validator(mode="after")
@@ -4165,6 +4217,24 @@ class AiSettings(_Section):
         return prod
 
 
+def vault_revocation_attestations(
+    store: StoreSettings, secrets: SecretsSettings
+) -> list[tuple[str, str, str | None]]:
+    """Each Vault revocation attestation that is set: its switch name, the hops it covers and its
+    reason (vault BACKLOG #2983).
+
+    The one walk of the two pairs. :func:`security_loosenings` and ``messagefoundry check`` both
+    read it, so the two surfaces name a switch the same way."""
+    return [
+        (f"{section}.vault_revocation_attested", hops, held.vault_revocation_attested_reason)
+        for section, hops, held in (
+            ("store", "the store's Vault hops (the key provider and the Transit cipher)", store),
+            ("secrets", "the connector secret provider's Vault hop", secrets),
+        )
+        if held.vault_revocation_attested
+    ]
+
+
 def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> HopPosture:
     """The instance's :class:`~messagefoundry.config.tls_policy.HopPosture` for the #200 hop-refusal gate.
 
@@ -5179,9 +5249,25 @@ class SecretsSettings(_Section):
     falls through to the env value. ``vault`` reads Vault KV v2 behind the lazy ``[vault]`` extra (the SAME
     ``hvac`` dependency the store's Vault KeyProvider uses — no new dependency). This names a *provider*,
     not credential material, so it is NOT a secret. Unknown/unresolvable values fail closed at the
-    consuming credential point (config/secretprovider.py)."""
+    consuming credential point (config/secretprovider.py).
+
+    ``vault_revocation_attested`` with its mandatory ``vault_revocation_attested_reason`` attests
+    that revocation of the SECRETS Vault's server certificate is covered outside the engine (vault
+    BACKLOG #2983, owner ruling 2026-10-13). It is the ``[secrets]`` twin of the ``[store]`` pair, a
+    separate claim because the two sections may name two Vaults: see the comment on
+    ``StoreSettings.vault_revocation_attested`` for what it lifts and what it cannot do."""
 
     provider: str = "none"
+    vault_revocation_attested: bool = False
+    vault_revocation_attested_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _vault_revocation_attestation_pair(self) -> SecretsSettings:
+        """The flag and its reason travel together; why is on the helper (vault BACKLOG #2983)."""
+        _check_vault_revocation_attestation(
+            self.vault_revocation_attested, self.vault_revocation_attested_reason, section="secrets"
+        )
+        return self
 
 
 def _vip_address_problems(address: str | None, mask: str | None) -> list[str]:
@@ -8561,6 +8647,7 @@ def security_loosenings(
     approvals: ApprovalsSettings,
     cert_monitor: CertMonitorSettings,
     backup: BackupSettings,
+    secrets: SecretsSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
@@ -8590,6 +8677,8 @@ def security_loosenings(
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302),
+    ``[store].vault_revocation_attested`` and ``[secrets].vault_revocation_attested`` (vault BACKLOG
+    #2983),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
     leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
@@ -8636,7 +8725,8 @@ def security_loosenings(
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489) and the
     held list (vault BACKLOG #3123).
     ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
-    ``[backup].allow_unencrypted`` (vault BACKLOG #2302).
+    ``[backup].allow_unencrypted`` (vault BACKLOG #2302). ``secrets`` joins them for
+    ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983).
 
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
@@ -9127,6 +9217,22 @@ def security_loosenings(
                 "enforcement = enforce or otherwise",
             )
         )
+    # Vault BACKLOG #2983 (owner ruling 2026-10-13): the two Vault revocation attestations. Named
+    # whenever the flag is set, whether or not a Vault provider is selected, so the text says
+    # "wherever the refusal would apply" and claims no hop. The reason is in the entry on purpose:
+    # the entry is the record a reviewer reads, and the serve-time warning prints it.
+    out.extend(
+        (
+            switch,
+            f"revocation of the Vault server certificate on {hops} is attested as covered outside "
+            f"the engine (reason: {reason}) -- the engine verifies that certificate but its own "
+            "handshake checks no CRL and no OCSP, and the attestation adds no check. Wherever the "
+            "revocation refusal would apply to that hop it is lifted, so a revoked certificate is "
+            "caught only if what the reason names really covers it. No CRL lever is built for "
+            "these hops. It never lifts a cleartext or verify-off refusal",
+        )
+        for switch, hops, reason in vault_revocation_attestations(store, secrets)
+    )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
     # acknowledgment of it are different facts and an operator can hold either without the other. A hop
     # with verification off under enforcement=warn needs no acknowledgment to run, so keying the report

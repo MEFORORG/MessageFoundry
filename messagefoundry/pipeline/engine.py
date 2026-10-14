@@ -783,6 +783,7 @@ class Engine:
                 config_fingerprint_provider=self._dr_config_fingerprint,
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
+                hop_posture=self._hop_posture,
             )
         return self._dr_coordinator
 
@@ -1719,6 +1720,7 @@ class Engine:
                 instance=self._active_environment or "",
                 alert_sink=self._alert_sink,
                 coordinator=self._coordinator,
+                hop_posture=self._hop_posture,
             )
             self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent

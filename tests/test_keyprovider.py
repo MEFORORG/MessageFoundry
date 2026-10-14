@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import _FILE_SECRET_KEYS, StoreSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.base import resolve_active_key, resolve_decrypt_keys
 from messagefoundry.store.crypto import PREFIX, CipherError, cipher_info, make_cipher
 from messagefoundry.store.keyprovider import (
@@ -159,8 +160,9 @@ def test_external_provider_lazy_hook_wires_a_shipped_module(
     # build_provider(settings) is picked up by resolve_key_provider with no edit to the dispatch.
     captured: dict[str, Any] = {}
 
-    def _build_provider(settings: StoreSettings) -> KeyProvider:
+    def _build_provider(settings: StoreSettings, *, posture: object = None) -> KeyProvider:
         captured["settings"] = settings
+        captured["posture"] = posture
         return EnvKeyProvider(settings)
 
     fake = ModuleType("messagefoundry.store.keyprovider_vault")
@@ -172,9 +174,12 @@ def test_external_provider_lazy_hook_wires_a_shipped_module(
 
     monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
     s = StoreSettings(key_provider="vault", encryption_key="QUJD")
-    provider = resolve_key_provider(s)
+    posture = HopPosture(enforcing=False)
+    provider = resolve_key_provider(s, posture=posture)
     assert isinstance(provider, EnvKeyProvider) and provider.active_key() == "QUJD"
     assert captured["settings"] is s
+    # Vault BACKLOG #2983: the dispatch hands the caller's posture to the provider it loads.
+    assert captured["posture"] is posture
 
 
 def test_an_external_provider_that_returns_no_key_fails_closed(
@@ -183,7 +188,9 @@ def test_an_external_provider_that_returns_no_key_fails_closed(
     # BACKLOG #1998: the keyless at-rest gate counts a configured external provider as keyed before it
     # resolves, so a provider module that returned None would otherwise open under the identity cipher.
     fake = ModuleType("messagefoundry.store.keyprovider_vault")
-    fake.build_provider = EnvKeyProvider  # type: ignore[attr-defined]  # no encryption_key -> None
+    # No encryption_key, so the provider returns None. The dispatch hands every external
+    # provider the posture, which this built-in class does not take.
+    fake.build_provider = lambda settings, *, posture=None: EnvKeyProvider(settings)  # type: ignore[attr-defined]
     monkeypatch.setattr(
         "messagefoundry.store.keyprovider.importlib.import_module", lambda _name: fake
     )

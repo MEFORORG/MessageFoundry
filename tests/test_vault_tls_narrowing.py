@@ -369,13 +369,13 @@ def vault(pki: _Pki) -> Iterator[_TlsVault]:
 def _kv_client(url: str) -> Any:
     from messagefoundry.config import secretprovider_vault
 
-    return secretprovider_vault._build_client(url, _TOKEN)
+    return secretprovider_vault._build_client(url, _TOKEN, revocation_attested=True)
 
 
 def _transit_client(url: str) -> Any:
     from messagefoundry.store import keyprovider_vault
 
-    return keyprovider_vault._build_client(url, _TOKEN)
+    return keyprovider_vault._build_client(url, _TOKEN, revocation_attested=True)
 
 
 @contextlib.contextmanager
@@ -514,7 +514,12 @@ def test_a_wrong_host_name_is_refused(pki: _Pki, monkeypatch: pytest.MonkeyPatch
 def _recording_adapter(factory: Any) -> Any:
     from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
-    return StrictReplyAdapter(connector="Vault test hop", ssl_context_factory=factory)
+    return StrictReplyAdapter(
+        connector="Vault test hop",
+        ssl_context_factory=factory,
+        revocation_attested=True,
+        attestation_section="secrets",
+    )
 
 
 def test_an_https_pool_that_is_not_narrowed_is_refused_before_sending(vault: _TlsVault) -> None:
@@ -806,7 +811,7 @@ def test_a_send_time_refusal_keeps_its_text_through_the_transit_cipher(
 
     client = _transit_client("http://127.0.0.1:9")
     cipher = crypto_transit.TransitCipher(client, "mefor-store-dek")
-    monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token: client)
+    monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token, **_: client)
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-store-dek")
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
     calls: dict[str, Any] = {
@@ -831,7 +836,7 @@ def test_a_send_time_refusal_keeps_its_text_through_the_key_provider(
     from messagefoundry.store.keyprovider import KeyProviderError
 
     client = _transit_client("http://127.0.0.1:9")
-    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token: client)
+    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token, **_: client)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "mefor-kek")
     monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
     monkeypatch.setenv("HTTP_PROXY", proxy.url)

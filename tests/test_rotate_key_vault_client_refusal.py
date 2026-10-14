@@ -77,7 +77,7 @@ def test_rotate_key_exits_2_when_the_vault_client_build_refuses(
     db = _select_the_vault_provider(monkeypatch, tmp_path)
     builds = 0
 
-    def refuse(addr: str | None, token: str | None) -> object:
+    def refuse(addr: str | None, token: str | None, **_: object) -> object:
         nonlocal builds
         builds += 1
         raise refusal(_REFUSAL)
@@ -102,7 +102,7 @@ def test_a_unicode_error_at_the_key_check_does_not_print_the_byte_it_failed_on(
     Raised here from the Vault client build, which reaches the same arm. Synthetic bytes."""
     db = _select_the_vault_provider(monkeypatch, tmp_path)
 
-    def refuse(addr: str | None, token: str | None) -> object:
+    def refuse(addr: str | None, token: str | None, **_: object) -> object:
         return bytes([0x41, 0x42, 0x9C]).decode("ascii")
 
     monkeypatch.setattr(keyprovider_vault, "_build_client", refuse)

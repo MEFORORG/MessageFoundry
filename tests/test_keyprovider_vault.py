@@ -78,7 +78,7 @@ def test_vault_active_key_unwraps_and_decrypts_without_rotation(
     transit = _FakeTransit(KEY_A)
     # Substitute the client factory so no live Vault (or hvac import) is needed.
     monkeypatch.setattr(
-        keyprovider_vault, "_build_client", lambda addr, token: _FakeClient(transit)
+        keyprovider_vault, "_build_client", lambda addr, token, **_: _FakeClient(transit)
     )
 
     provider = keyprovider_vault.build_provider(StoreSettings())
@@ -102,7 +102,7 @@ def test_resolve_key_provider_wires_the_vault_module(monkeypatch: pytest.MonkeyP
     _configure_env(monkeypatch)
     transit = _FakeTransit(KEY_A)
     monkeypatch.setattr(
-        keyprovider_vault, "_build_client", lambda addr, token: _FakeClient(transit)
+        keyprovider_vault, "_build_client", lambda addr, token, **_: _FakeClient(transit)
     )
     provider = resolve_key_provider(StoreSettings(key_provider="vault"))
     assert isinstance(provider, keyprovider_vault.VaultKeyProvider)
@@ -156,7 +156,7 @@ def test_transit_failure_fails_closed_without_leaking_ciphertext(
     monkeypatch.setattr(
         keyprovider_vault,
         "_build_client",
-        lambda addr, token: _FakeClient(_BoomTransit()),  # type: ignore[arg-type]
+        lambda addr, token, **_: _FakeClient(_BoomTransit()),  # type: ignore[arg-type]
     )
     provider = keyprovider_vault.build_provider(StoreSettings())
     with pytest.raises(KeyProviderError) as excinfo:
@@ -169,7 +169,7 @@ def test_transit_failure_fails_closed_without_leaking_ciphertext(
 def test_empty_plaintext_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_env(monkeypatch)
     monkeypatch.setattr(
-        keyprovider_vault, "_build_client", lambda addr, token: _FakeClient(_FakeTransit(""))
+        keyprovider_vault, "_build_client", lambda addr, token, **_: _FakeClient(_FakeTransit(""))
     )
     provider = keyprovider_vault.build_provider(StoreSettings())
     with pytest.raises(KeyProviderError, match="empty"):
@@ -189,7 +189,7 @@ def _provider_on(
     """Wire ``transit`` in as the Vault backend and hand back a provider built against it."""
     _configure_env(monkeypatch)
     monkeypatch.setattr(
-        keyprovider_vault, "_build_client", lambda addr, token: _FakeClient(transit)
+        keyprovider_vault, "_build_client", lambda addr, token, **_: _FakeClient(transit)
     )
     return keyprovider_vault.build_provider(StoreSettings())
 

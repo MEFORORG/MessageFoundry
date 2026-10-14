@@ -85,7 +85,9 @@ def test_store_key_provider_client_refuses_redirects(monkeypatch: pytest.MonkeyP
     from messagefoundry.store import keyprovider_vault
 
     recorder = _install_fake_hvac(monkeypatch)
-    keyprovider_vault._build_client("https://vault.example:8200", "s3cr3t-token")
+    keyprovider_vault._build_client(
+        "https://vault.example:8200", "s3cr3t-token", revocation_attested=True
+    )
 
     assert len(recorder.calls) == 1, "the provider must construct exactly one client"
     assert recorder.calls[0].get("allow_redirects") is False, (
@@ -100,7 +102,9 @@ def test_secret_provider_client_refuses_redirects(monkeypatch: pytest.MonkeyPatc
     from messagefoundry.config import secretprovider_vault
 
     recorder = _install_fake_hvac(monkeypatch)
-    secretprovider_vault._build_client("https://vault.example:8200", "s3cr3t-token")
+    secretprovider_vault._build_client(
+        "https://vault.example:8200", "s3cr3t-token", revocation_attested=True
+    )
 
     assert len(recorder.calls) == 1, "the provider must construct exactly one client"
     assert recorder.calls[0].get("allow_redirects") is False, (
