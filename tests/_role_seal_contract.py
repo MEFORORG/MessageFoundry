@@ -23,6 +23,7 @@ from messagefoundry.store.row_seal import SEAL_PREFIX
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    SCOPE_SOURCE_AD,
     RoleRow,
     ad_map_seal_ok,
     role_seal_ok,
@@ -64,7 +65,8 @@ async def _listed_permissions(h: _Harness, role_id: str) -> frozenset[Permission
 
 
 async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
-    """Drive the sealed role definition and the sealed AD role map through their contract."""
+    """Drive the sealed role definition and the two sealed AD directory maps through their
+    contract."""
     sealer = store.row_sealer()
     assert sealer is not None, "the contract needs a store opened with a store key"
     h = _Harness(store, raw)
@@ -230,13 +232,30 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     assert scope.pairs == ((_GROUP, "IB_A"),)
     assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({"IB_A"})
     assert await h.service.list_ad_group_scope_map() == [(_GROUP, "IB_A")]
+    # A sign-in's scope sync keeps the directory-set scope the sealed map vouches for (control).
+    scoped = await h.account("scoped")
+    await h.store.set_user_channel_scope(scoped, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
+    scoped_user = await h.service._load_user(scoped)
+    assert scoped_user is not None
+    kept_scope = await h.service._sync_ad_channel_scope(
+        scoped_user, frozenset({Role.VIEWER}), [_GROUP]
+    )
+    assert kept_scope.channel_scope == json.dumps(["IB_A"])
     alerts_before_scope = len(h.alerts)
+    failures_before_scope = await h.seal_failures()
 
     # --- a channel inserted outside the store makes the whole map scope nothing ---------------
     await raw("INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)", (_GROUP, "*"))
     assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset()
     assert len(h.alerts) == alerts_before_scope + 1  # its own report, apart from the role map's
+    assert await h.seal_failures() == failures_before_scope + 1
     assert await h.service.list_ad_group_scope_map() == []
+    # End to end: the sign-in's sync withdraws the directory-set scope, which then denies, rather
+    # than widening it to the planted wildcard.
+    withdrawn = await h.service._sync_ad_channel_scope(
+        kept_scope, frozenset({Role.VIEWER}), [_GROUP]
+    )
+    assert withdrawn.channel_scope is None
     # Repair, and the control: the same pair through the store takes effect, sealed.
     await store.set_ad_group_scope_map([(_GROUP, "IB_A"), (_GROUP, "*")])
     assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({"IB_A", "*"})
@@ -256,5 +275,6 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     await store.set_ad_group_scope_map([(_GROUP, Role.VIEWER.value)])
     role_map = await store.get_ad_map(AD_ROLE_MAP)
     assert ad_map_seal_ok(sealer, role_map)
+    assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset({Role.VIEWER.value})
     await raw("UPDATE authority_set_seal SET seal=? WHERE name=?", (role_map.seal, AD_SCOPE_MAP))
     assert await h.service._ad_channels_for_groups([_GROUP]) == frozenset()

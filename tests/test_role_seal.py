@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Sealed role definitions and the sealed AD group-to-role map on SQLite, and the static guards
+"""Sealed role definitions and the two sealed AD directory maps on SQLite, and the static guards
 that keep them whole (BACKLOG #2592).
 
 The behavioural contract is ``tests/_role_seal_contract.py``; the Postgres and SQL Server suites
