@@ -1531,9 +1531,9 @@ async def test_every_reload_route_refuses_a_swapped_settings_anchor(
         real_reload = rr.reload
         applied: list[object] = []
 
-        async def counting(registry: Any = None) -> None:
+        async def counting(registry: Any = None, env_values: Any = None) -> None:
             applied.append(registry)
-            await real_reload(registry)
+            await real_reload(registry, env_values)
 
         # Counted at the runner, not by registry identity: the DR route re-applies the graph it
         # already holds (vault BACKLOG #3067), so its registry object never changes.
