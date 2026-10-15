@@ -400,6 +400,7 @@ from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
     authority_seal_alert,
+    no_enabled_administrator_alert,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
@@ -10272,6 +10273,9 @@ def create_managed_app(
                     # BACKLOG #2592: an authority row that fails its integrity seal is denied and
                     # raises integrity_drift on the same sink the cipher refusal uses.
                     integrity_alert=authority_seal_alert(notifier or LoggingAlertSink()),
+                    # Vault BACKLOG #3229: a directory role change that leaves no enabled
+                    # Administrator is applied, and raises no_enabled_administrator here.
+                    admin_loss_alert=no_enabled_administrator_alert(notifier or LoggingAlertSink()),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:

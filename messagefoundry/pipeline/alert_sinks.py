@@ -1154,6 +1154,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
+        # Vault BACKLOG #3229: every administrator_granted call pops the _last_sent key built from
+        # the no_enabled_administrator alert type and the granted target, so a loss after an
+        # administrator_granted re-grant is not held back by the earlier loss's cooldown. A
+        # reconciler re-grant calls no administrator_granted, so it pops nothing. The pop builds that key with its own
+        # f-string in `_emit`'s key format; tests/test_directory_last_admin_alert.py pins the match.
+        # Only a `user:` target can match a loss key, so an `ad-group:` grant pops nothing. _last_sent is
+        # per process, so this clears the cooldown in this process only. _occurrences and _suspended
+        # are kept. Unlike crl_reload_applied, this resolves no open instance.
+        self._last_sent.pop(f"no_enabled_administrator:{name}", None)
         self._emit(
             {
                 "type": "administrator_granted",
@@ -1202,6 +1211,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def ad_reconcile_hold_released(self, name: str) -> None:
         # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_held via _AUTO_RESOLVE.
         self._record_state({"type": "ad_reconcile_hold_released", "connection": name}, "info")
+
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        # Vault BACKLOG #3229: a directory role change left no enabled Administrator. `user:<username>`
+        # stands in for "connection", as on administrator_granted. `via` is the closed pair ad-sync /
+        # ad-reconcile. Never message content.
+        self._emit(
+            {
+                "type": "no_enabled_administrator",
+                "connection": name,
+                "via": via,
+                "reason": f"no enabled Administrator remains after {via}",
+            }
+        )
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         # ADR 0079 mechanism 2: a directory principal's sessions were revoked. Keyed on the username so
