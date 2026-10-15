@@ -4029,7 +4029,8 @@ class AuthService:
         except KerberosTokenRefused as exc:
             # BACKLOG #3196: audited as a failed sign-in, not a directory outage. An acceptor key
             # fault in the step (a keytab miss, a rotated service password) also lands here;
-            # kerberos_principal logs the error's class and status codes, never its text.
+            # kerberos_principal logs the error's class and status codes at WARNING, and its text
+            # only in a DEBUG traceback.
             await self._directory_reject_audit(
                 "<kerberos>", "kerberos", "token_refused", client=client, error=exc.error_type
             )

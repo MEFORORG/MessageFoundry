@@ -3628,9 +3628,13 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   (AUTH-K-AUDIT). A token the acceptor refuses is an `auth.login_failed` row with the reason
   `token_refused` and the error's type. The row never holds the error's message, because the
   message can quote the token (BACKLOG #3196). A fault in the acceptor's own key also fails this
-  way, on any host: a missing keytab entry, an SPN registered to another account, or a rotated
-  service password. So the engine log names the error's class and its numeric GSSAPI or SSPI
-  status, which tell the two apart, and never its text. While browser SSO is available, a 400
+  way on any host, for example a missing keytab entry or a rotated service password. So the
+  engine log names the error's class and its numeric GSSAPI or SSPI status at WARNING, never its
+  text. The status helps tell a key fault from a bad token but does not prove either, because the
+  caller names the ticket's principal. Only a DEBUG traceback carries the text. If the step
+  accepts the token but the principal cannot be read, the row is `auth.login_error`, reading
+  `Kerberos principal read failed` and the error's class, and the sign-in fails as a directory
+  outage. While browser SSO is available, a 400
   for a token that is not base64 writes the `malformed_token` row `GET /ui/sso` writes. A 400 for
   a missing `Negotiate` header writes no row. A 429 from the sign-in window is throttle-logged,
   never audited.

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,7 @@ from spnego._negotiate import NegotiateProxy
 from spnego._spnego import NegTokenInit, NegTokenResp
 
 from messagefoundry.api import create_app
-from messagefoundry.auth.ldap import KerberosTokenRefused, kerberos_principal
+from messagefoundry.auth.ldap import KerberosTokenRefused, LdapError, kerberos_principal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -151,9 +152,9 @@ class _KeytabMissServer:
 def test_a_gssapi_error_logs_its_status_codes_and_not_its_text(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A missing keytab entry fails in the step, as a crafted token does. The status codes are what
-    tell an operator it is configuration. Round 1 logged the provider's text, which quoted the
-    token. The audit row for the same error is pinned at the service, below."""
+    """A missing keytab entry fails in the step, as a crafted token does. The status codes help an
+    operator, but do not prove configuration: the caller names the ticket's principal. Round 1
+    logged the provider's text, which quoted the token. The audit row is pinned at the service."""
     monkeypatch.setattr(
         "messagefoundry.auth.ldap._kerberos_acceptor", lambda _s: _KeytabMissServer()
     )
@@ -305,6 +306,14 @@ async def test_the_service_audits_a_keytab_miss_by_type_and_none_of_its_text(
     await _assert_refused_rows(engine, "NoCredentialError", "192.0.2.7", count=1)
 
 
+class _SspiError(OSError):
+    """SSPI's raw error shape: an OSError whose status is ``winerror``, on every platform."""
+
+    def __init__(self) -> None:
+        super().__init__(f"QueryContextAttributes failed for {_LEAK}")
+        self.winerror = -2146893048
+
+
 class _UnreadablePrincipalServer:
     """A step that accepts the token, then a principal read that fails as SSPI's does."""
 
@@ -315,14 +324,33 @@ class _UnreadablePrincipalServer:
 
     @property
     def client_principal(self) -> str:
-        raise OSError(f"QueryContextAttributes failed for {_LEAK}")
+        raise _SspiError()
+
+
+def test_a_failed_principal_read_logs_its_status_and_keeps_no_chain(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        "messagefoundry.auth.ldap._kerberos_acceptor", lambda _s: _UnreadablePrincipalServer()
+    )
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.auth.ldap"),
+        pytest.raises(LdapError) as caught,
+    ):
+        kerberos_principal(b"token", AuthSettings())
+    assert str(caught.value) == "Kerberos principal read failed: _SspiError winerror=-2146893048"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert lines == [
+        "Kerberos sign-in could not read the accepted principal: _SspiError winerror=-2146893048"
+    ]
 
 
 async def test_a_failed_principal_read_is_audited_as_an_outage_not_a_500(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """pyspnego does not wrap this read, so an arm that caught only its SpnegoError let an OSError
-    out of the service as an unaudited 500."""
+    out of the service, and the route answered an unaudited 500."""
     monkeypatch.setattr(
         "messagefoundry.auth.ldap._kerberos_acceptor", lambda _s: _UnreadablePrincipalServer()
     )
@@ -334,7 +362,7 @@ async def test_a_failed_principal_read_is_audited_as_an_outage_not_a_500(
     assert json.loads(rows[0]["detail"]) == {
         "provider": "ad",
         "mech": "kerberos",
-        "error": "Kerberos principal read failed: OSError",
+        "error": "Kerberos principal read failed: _SspiError winerror=-2146893048",
     }
     assert _LEAK not in json.dumps(rows[0])
     assert await _rows(engine, "auth.login_failed") == []

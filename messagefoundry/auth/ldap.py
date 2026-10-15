@@ -1521,22 +1521,31 @@ def _refusal_diagnostic(exc: BaseException) -> str:
     """The log form of a refused token: class names and numeric codes, never message text.
 
     A provider's message can quote the token too. GSSAPI's names the ticket's service principal,
-    which travels in cleartext, so the caller chose it. The codes still tell a bad keytab from a bad
-    token. ``code`` is pyspnego's ``ErrorCode``. ``maj_code``, ``min_code`` and ``winerror`` are the
-    GSSAPI or SSPI status, which an operator can look up.
+    which travels in cleartext, so the caller chose it. That also means the codes do not prove a
+    configuration fault: a caller can name a principal the keytab lacks. ``code`` is pyspnego's
+    ``ErrorCode``. ``maj_code``, ``min_code`` and ``winerror`` are the GSSAPI or SSPI status, read
+    from the error itself (a raw provider error) and from the one pyspnego wrapped.
     """
     parts = [type(exc).__name__]
     code = getattr(exc, "ERROR_CODE", None)
     if isinstance(code, int):
         parts.append(f"code={int(code)}")
+    parts.extend(_status_codes(exc))
     base = getattr(exc, "base_error", None)
     if isinstance(base, BaseException):
         parts.append(f"base={type(base).__name__}")
-        for attr in ("maj_code", "min_code", "winerror"):
-            value = getattr(base, attr, None)
-            if isinstance(value, int):
-                parts.append(f"{attr}={value}")
+        parts.extend(_status_codes(base))
     return " ".join(parts)
+
+
+def _status_codes(exc: BaseException) -> list[str]:
+    """The numeric GSSAPI or SSPI status ``exc`` carries, as ``name=value`` pairs."""
+    codes = []
+    for attr in ("maj_code", "min_code", "winerror"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            codes.append(f"{attr}={value}")
+    return codes
 
 
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
@@ -1574,13 +1583,20 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     if refused is not None:
         # Raised outside the except block, so neither __cause__ nor __context__ keeps the original.
         raise KerberosTokenRefused(refused)
+    unreadable: str | None = None
     try:
         principal = server.client_principal if _kerberos_context_complete(server) else None
     except Exception as exc:
         # The step took the token, so this is the provider failing, not the caller's token. Broad,
         # because pyspnego does not wrap this read: SSPI raises an OSError and GSSAPI a GSSError, and
-        # either one outside this arm was an unaudited 500.
-        raise LdapError(f"Kerberos principal read failed: {_refusal_diagnostic(exc)}") from exc
+        # either one outside this arm was an unaudited 500. Without gssapi installed,
+        # spnego.exceptions.GSSError is Exception itself, so no narrower tuple is honest.
+        unreadable = _refusal_diagnostic(exc)
+        logger.warning("Kerberos sign-in could not read the accepted principal: %s", unreadable)
+        logger.debug("Kerberos principal read raised", exc_info=True)
+    if unreadable is not None:
+        # Severed like the refusal above, so no chained provider text rides out on the outage.
+        raise LdapError(f"Kerberos principal read failed: {unreadable}")
     if not principal:
         return None
     return str(principal).split("@", 1)[0]
